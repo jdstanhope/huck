@@ -110,7 +110,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib lexer`
+Run: `cargo test lexer`
 Expected: FAIL — `cannot find function tokenize in this scope`.
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -131,7 +131,7 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, LexError> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib lexer`
+Run: `cargo test lexer`
 Expected: PASS — 3 tests pass.
 
 - [ ] **Step 5: Commit**
@@ -214,7 +214,7 @@ Add these tests inside the existing `#[cfg(test)] mod tests` block in `src/lexer
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib lexer`
+Run: `cargo test lexer`
 Expected: FAIL — the new quote/escape tests fail (the `split_whitespace` implementation does not handle quotes). The three Task 2 tests still pass.
 
 - [ ] **Step 3: Replace `tokenize` with the full state machine**
@@ -295,7 +295,7 @@ Notes baked into this implementation:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib lexer`
+Run: `cargo test lexer`
 Expected: PASS — all 12 lexer tests pass (3 from Task 2 + 9 new).
 
 - [ ] **Step 5: Commit**
@@ -357,7 +357,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib command`
+Run: `cargo test command`
 Expected: FAIL — `cannot find type Command` / `cannot find function parse`.
 
 - [ ] **Step 3: Write the implementation**
@@ -381,7 +381,7 @@ pub fn parse(tokens: Vec<String>) -> Option<Command> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib command`
+Run: `cargo test command`
 Expected: PASS — 3 tests pass.
 
 - [ ] **Step 5: Commit**
@@ -444,7 +444,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --lib builtins`
+Run: `cargo test builtins`
 Expected: FAIL — `cannot find function is_builtin` / `builtin_exit` / type `ExecOutcome`.
 
 - [ ] **Step 3: Write the implementation**
@@ -532,7 +532,7 @@ fn builtin_exit(args: &[String]) -> ExecOutcome {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test --lib builtins`
+Run: `cargo test builtins`
 Expected: PASS — 4 tests pass.
 
 - [ ] **Step 5: Commit**
@@ -585,7 +585,7 @@ The spawned child inherits the shell's stdin/stdout/stderr by default (that is `
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cargo test --lib`
+Run: `cargo test`
 Expected: PASS — the whole library compiles and all existing tests (lexer, command, builtins) still pass. `executor` has no tests of its own; this step confirms it compiles and integrates.
 
 - [ ] **Step 3: Commit**
