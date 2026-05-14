@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command as ProcessCommand;
 
@@ -7,7 +7,8 @@ use crate::command::Command;
 
 pub fn execute(cmd: &Command) -> ExecOutcome {
     if builtins::is_builtin(&cmd.program) {
-        return builtins::run_builtin(&cmd.program, &cmd.args);
+        let mut out = io::stdout();
+        return builtins::run_builtin(&cmd.program, &cmd.args, &mut out);
     }
 
     match ProcessCommand::new(&cmd.program).args(&cmd.args).status() {
