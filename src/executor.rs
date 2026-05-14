@@ -1,19 +1,20 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{Command, Pipeline, Redirect};
 
 pub fn execute(pipeline: &Pipeline) -> ExecOutcome {
-    // INTERIM: multi-command pipelines are wired up in Task 5.
-    if pipeline.commands.len() > 1 {
-        eprintln!("shuck: pipelines not yet implemented");
-        return ExecOutcome::Continue(1);
+    if pipeline.commands.len() == 1 {
+        run_single(&pipeline.commands[0])
+    } else {
+        run_pipeline(&pipeline.commands)
     }
-    run_single(&pipeline.commands[0])
 }
+
+// ----- redirect file handling -----------------------------------------------
 
 /// The redirect files a command needs, already opened.
 struct StageFiles {
@@ -87,6 +88,8 @@ fn status_code(status: &ExitStatus) -> i32 {
         .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
 }
 
+// ----- single command -------------------------------------------------------
+
 fn run_single(cmd: &Command) -> ExecOutcome {
     let files = match open_stage_files(cmd) {
         Ok(files) => files,
@@ -132,4 +135,174 @@ fn run_subprocess(cmd: &Command, files: StageFiles) -> ExecOutcome {
             ExecOutcome::Continue(1)
         }
     }
+}
+
+// ----- multi-command pipeline -----------------------------------------------
+
+/// What a stage hands to the next stage's stdin.
+enum Carry {
+    /// First stage, or the previous stage produced nothing routable.
+    None,
+    /// A subprocess stage's piped stdout.
+    ChildStdout(ChildStdout),
+    /// A builtin stage's captured output (always small).
+    Buffer(Vec<u8>),
+}
+
+/// A pipeline stage awaiting its final status.
+enum Stage {
+    /// A builtin (or a failed spawn) that already has a status.
+    Done(i32),
+    /// A subprocess still to be waited on.
+    Process(Child),
+}
+
+fn run_pipeline(commands: &[Command]) -> ExecOutcome {
+    // Pre-flight: open every redirect file first. If any fails, run nothing.
+    let mut all_files: Vec<StageFiles> = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        match open_stage_files(cmd) {
+            Ok(files) => all_files.push(files),
+            Err(()) => return ExecOutcome::Continue(1),
+        }
+    }
+
+    let n = commands.len();
+    let mut stages: Vec<Stage> = Vec::with_capacity(n);
+    let mut carry = Carry::None;
+
+    for (i, (cmd, files)) in commands.iter().zip(all_files).enumerate() {
+        let is_last = i == n - 1;
+        let incoming = std::mem::replace(&mut carry, Carry::None);
+
+        if builtins::is_builtin(&cmd.program) {
+            // Builtins do not read stdin; whatever came in is dropped here.
+            drop(incoming);
+
+            if cmd.program == "cd" || cmd.program == "exit" {
+                // No-op inside a pipeline: shell-state effects are dropped.
+                if !is_last {
+                    carry = Carry::Buffer(Vec::new());
+                }
+                stages.push(Stage::Done(0));
+                continue;
+            }
+
+            // echo / pwd: capture output into a buffer.
+            let mut buffer: Vec<u8> = Vec::new();
+            let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer);
+            let status = match outcome {
+                ExecOutcome::Continue(code) => code,
+                ExecOutcome::Exit(code) => code,
+            };
+            match files.stdout {
+                Some(mut file) => {
+                    let _ = file.write_all(&buffer);
+                    if !is_last {
+                        carry = Carry::Buffer(Vec::new());
+                    }
+                }
+                None => {
+                    if is_last {
+                        let _ = io::stdout().write_all(&buffer);
+                    } else {
+                        carry = Carry::Buffer(buffer);
+                    }
+                }
+            }
+            stages.push(Stage::Done(status));
+            continue;
+        }
+
+        // Subprocess stage.
+        let mut process = ProcessCommand::new(&cmd.program);
+        process.args(&cmd.args);
+
+        // stdin: an explicit `<` wins; otherwise the previous stage's output.
+        let mut pending_input: Option<Vec<u8>> = None;
+        if let Some(file) = files.stdin {
+            process.stdin(Stdio::from(file));
+        } else {
+            match incoming {
+                Carry::None => {}
+                Carry::ChildStdout(child_stdout) => {
+                    process.stdin(Stdio::from(child_stdout));
+                }
+                Carry::Buffer(bytes) => {
+                    process.stdin(Stdio::piped());
+                    pending_input = Some(bytes);
+                }
+            }
+        }
+
+        // stdout: an explicit `>` wins; otherwise pipe onward unless last.
+        let pipe_onward = !is_last && cmd.stdout.is_none();
+        if let Some(file) = files.stdout {
+            process.stdout(Stdio::from(file));
+        } else if pipe_onward {
+            process.stdout(Stdio::piped());
+        }
+
+        // stderr: an explicit `2>` wins; otherwise inherit.
+        if let Some(file) = files.stderr {
+            process.stderr(Stdio::from(file));
+        }
+
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                eprintln!("shuck: command not found: {}", cmd.program);
+                if !is_last {
+                    carry = Carry::Buffer(Vec::new());
+                }
+                stages.push(Stage::Done(127));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("shuck: {}: {e}", cmd.program);
+                if !is_last {
+                    carry = Carry::Buffer(Vec::new());
+                }
+                stages.push(Stage::Done(1));
+                continue;
+            }
+        };
+
+        // Feed a preceding builtin's buffered output into this child's stdin.
+        if let Some(bytes) = pending_input {
+            if let Some(mut child_stdin) = child.stdin.take() {
+                let _ = child_stdin.write_all(&bytes);
+                // `child_stdin` drops here, closing the pipe so the child sees EOF.
+            }
+        }
+
+        if pipe_onward {
+            carry = Carry::ChildStdout(child.stdout.take().expect("stdout was set to piped"));
+        } else if !is_last {
+            // This stage redirected its stdout to a file, so the next stage
+            // has no upstream data — hand it an empty input.
+            carry = Carry::Buffer(Vec::new());
+        }
+
+        stages.push(Stage::Process(child));
+    }
+
+    // Every stage is spawned and all pipes are connected; now wait in spawn
+    // order. The pipeline's status is the last stage's status.
+    let mut last_status = 0;
+    for stage in stages {
+        match stage {
+            Stage::Done(code) => last_status = code,
+            Stage::Process(mut child) => {
+                last_status = match child.wait() {
+                    Ok(status) => status_code(&status),
+                    Err(e) => {
+                        eprintln!("shuck: {e}");
+                        1
+                    }
+                };
+            }
+        }
+    }
+    ExecOutcome::Continue(last_status)
 }
