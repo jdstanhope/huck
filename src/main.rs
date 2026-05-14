@@ -5,5 +5,5 @@ mod lexer;
 mod shell;
 
 fn main() {
-    println!("shuck: setup complete");
+    std::process::exit(shell::run());
 }
