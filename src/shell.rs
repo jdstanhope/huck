@@ -6,7 +6,7 @@ use rustyline::error::ReadlineError;
 use signal_hook::consts::SIGINT;
 
 use crate::builtins::ExecOutcome;
-use crate::command;
+use crate::command::{self, ParseError};
 use crate::executor;
 use crate::lexer::{self, LexError};
 
@@ -73,7 +73,19 @@ fn process_line(line: &str) -> ExecOutcome {
     };
 
     match command::parse(tokens) {
-        Some(cmd) => executor::execute(&cmd),
-        None => ExecOutcome::Continue(0),
+        Ok(Some(pipeline)) => executor::execute(&pipeline),
+        Ok(None) => ExecOutcome::Continue(0),
+        Err(e) => {
+            eprintln!("shuck: syntax error: {}", parse_error_message(e));
+            ExecOutcome::Continue(2)
+        }
+    }
+}
+
+fn parse_error_message(error: ParseError) -> &'static str {
+    match error {
+        ParseError::MissingCommand => "expected a command",
+        ParseError::MissingRedirectTarget => "expected a filename after redirection",
+        ParseError::RedirectTargetIsOperator => "expected a filename after redirection",
     }
 }
