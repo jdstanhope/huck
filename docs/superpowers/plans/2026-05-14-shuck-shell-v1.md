@@ -182,7 +182,7 @@ Add these tests inside the existing `#[cfg(test)] mod tests` block in `src/lexer
 
     #[test]
     fn tokenize_adjacent_runs_concatenate() {
-        assert_eq!(tokenize(r#"foo"bar baz""#).unwrap(), vec!["foo bar baz"]);
+        assert_eq!(tokenize(r#"foo"bar baz""#).unwrap(), vec!["foobar baz"]);
     }
 
     #[test]
