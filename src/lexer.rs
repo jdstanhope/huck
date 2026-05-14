@@ -113,6 +113,12 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_trailing_backslash_is_literal() {
+        // A backslash with no following character is kept literally.
+        assert_eq!(tokenize(r"echo a\").unwrap(), vec!["echo", r"a\"]);
+    }
+
+    #[test]
     fn tokenize_adjacent_runs_concatenate() {
         assert_eq!(tokenize(r#"foo"bar baz""#).unwrap(), vec!["foobar baz"]);
     }

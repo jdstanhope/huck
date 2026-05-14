@@ -25,6 +25,10 @@ pub fn run_builtin(name: &str, args: &[String]) -> ExecOutcome {
 }
 
 fn builtin_cd(args: &[String]) -> ExecOutcome {
+    if args.len() > 1 {
+        eprintln!("shuck: cd: too many arguments");
+        return ExecOutcome::Continue(1);
+    }
     let target = match args.first() {
         Some(dir) => dir.clone(),
         None => match env::var("HOME") {

@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command as ProcessCommand;
 
 use crate::builtins::{self, ExecOutcome};
@@ -10,7 +11,14 @@ pub fn execute(cmd: &Command) -> ExecOutcome {
     }
 
     match ProcessCommand::new(&cmd.program).args(&cmd.args).status() {
-        Ok(status) => ExecOutcome::Continue(status.code().unwrap_or(1)),
+        Ok(status) => {
+            // A signal-killed child has no exit code; report 128 + signal,
+            // the POSIX convention (e.g. 130 for SIGINT).
+            let code = status
+                .code()
+                .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1));
+            ExecOutcome::Continue(code)
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             eprintln!("shuck: command not found: {}", cmd.program);
             ExecOutcome::Continue(127)
