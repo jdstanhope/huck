@@ -1119,7 +1119,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 52 tests pass (26 lexer + 19 command + 7 builtins).
+Expected: PASS — 51 tests pass (26 lexer + 18 command + 7 builtins).
 
 - [ ] **Step 5: Commit**
 
@@ -1283,7 +1283,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 52 tests pass (unchanged from Task 3; the executor has no unit tests).
+Expected: PASS — 51 tests pass (unchanged from Task 3; the executor has no unit tests).
 
 - [ ] **Step 3: Manual smoke test of single-command redirections**
 
@@ -1650,7 +1650,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 52 tests pass (the executor still has no unit tests).
+Expected: PASS — 51 tests pass (the executor still has no unit tests).
 
 - [ ] **Step 3: Manual smoke test of pipelines**
 
