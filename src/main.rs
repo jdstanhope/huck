@@ -1,3 +1,9 @@
+mod builtins;
+mod command;
+mod executor;
+mod lexer;
+mod shell;
+
 fn main() {
-    println!("Hello, world!");
+    std::process::exit(shell::run());
 }
