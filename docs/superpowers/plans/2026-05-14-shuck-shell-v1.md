@@ -634,6 +634,11 @@ pub fn run() -> i32 {
         }
     };
 
+    // Tracks the exit status of the last command, so Ctrl-D (EOF) exits with
+    // it — standard shell behavior, and the consumer of `ExecOutcome::Continue`'s
+    // status. Room to grow into `$?` later.
+    let mut last_status: i32 = 0;
+
     loop {
         match editor.readline(PROMPT) {
             Ok(line) => {
@@ -642,11 +647,11 @@ pub fn run() -> i32 {
                 }
                 match process_line(&line) {
                     ExecOutcome::Exit(code) => return code,
-                    ExecOutcome::Continue(_) => {}
+                    ExecOutcome::Continue(status) => last_status = status,
                 }
             }
             Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return 0,
+            Err(ReadlineError::Eof) => return last_status,
             Err(e) => {
                 eprintln!("shuck: input error: {e}");
                 return 1;
