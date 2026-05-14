@@ -191,20 +191,26 @@ fn run_pipeline(commands: &[Command]) -> ExecOutcome {
             // echo / pwd: capture output into a buffer.
             let mut buffer: Vec<u8> = Vec::new();
             let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer);
-            let status = match outcome {
+            let mut status = match outcome {
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
             };
             match files.stdout {
                 Some(mut file) => {
-                    let _ = file.write_all(&buffer);
+                    if let Err(e) = file.write_all(&buffer) {
+                        eprintln!("shuck: {}: {e}", cmd.program);
+                        status = 1;
+                    }
                     if !is_last {
                         carry = Carry::Buffer(Vec::new());
                     }
                 }
                 None => {
                     if is_last {
-                        let _ = io::stdout().write_all(&buffer);
+                        if let Err(e) = io::stdout().write_all(&buffer) {
+                            eprintln!("shuck: {}: {e}", cmd.program);
+                            status = 1;
+                        }
                     } else {
                         carry = Carry::Buffer(buffer);
                     }
