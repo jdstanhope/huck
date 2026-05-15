@@ -239,6 +239,16 @@ mod tests {
     }
 
     #[test]
+    fn export_name_only_creates_empty_exported() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let outcome = builtin_export(&["SHUCK_NEW_VAR".to_string()], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.get("SHUCK_NEW_VAR"), Some(""));
+        assert!(shell.exported_env().any(|(k, _)| k == "SHUCK_NEW_VAR"));
+    }
+
+    #[test]
     fn export_sets_and_exports() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
