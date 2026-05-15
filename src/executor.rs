@@ -180,8 +180,11 @@ fn status_code(status: &ExitStatus) -> i32 {
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
-        SimpleCommand::Assign { .. } => {
-            unreachable!("parser does not yet produce SimpleCommand::Assign")
+        SimpleCommand::Assign { name, value } => {
+            let fields = expand(value, shell);
+            let joined = fields.join(" ");
+            shell.set(name, joined);
+            ExecOutcome::Continue(0)
         }
     }
 }
@@ -253,23 +256,31 @@ enum Stage {
 }
 
 fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome {
-    let mut resolved_stages: Vec<ResolvedCommand> = Vec::with_capacity(commands.len());
+    let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             SimpleCommand::Assign { .. } => {
-                unreachable!("parser does not yet produce SimpleCommand::Assign");
+                // Inside a multi-stage pipeline, an assignment is a no-op
+                // (its shell-state effect would only apply to a subshell,
+                // which we don't fork). Record a placeholder None so the
+                // index alignment with `all_files` and the stage loop stays
+                // correct.
+                resolved_stages.push(None);
             }
             SimpleCommand::Exec(exec) => match resolve(exec, shell) {
-                Ok(r) => resolved_stages.push(r),
+                Ok(r) => resolved_stages.push(Some(r)),
                 Err(code) => return ExecOutcome::Continue(code),
             },
         }
     }
-    let mut all_files: Vec<StageFiles> = Vec::with_capacity(resolved_stages.len());
+    let mut all_files: Vec<Option<StageFiles>> = Vec::with_capacity(resolved_stages.len());
     for r in &resolved_stages {
-        match open_stage_files(r) {
-            Ok(f) => all_files.push(f),
-            Err(()) => return ExecOutcome::Continue(1),
+        match r {
+            None => all_files.push(None),
+            Some(r) => match open_stage_files(r) {
+                Ok(f) => all_files.push(Some(f)),
+                Err(()) => return ExecOutcome::Continue(1),
+            },
         }
     }
 
@@ -277,9 +288,25 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
     let mut stages: Vec<Stage> = Vec::with_capacity(n);
     let mut carry = Carry::None;
 
-    for (i, (cmd, files)) in resolved_stages.iter().zip(all_files).enumerate() {
+    for (i, (resolved, files)) in resolved_stages.iter().zip(all_files).enumerate() {
         let is_last = i == n - 1;
         let incoming = std::mem::replace(&mut carry, Carry::None);
+
+        let cmd = match resolved {
+            Some(r) => r,
+            None => {
+                // Assign stage in a pipeline: no-op. Hand the next stage an
+                // empty input so it doesn't see the terminal stdin.
+                drop(incoming);
+                if !is_last {
+                    carry = Carry::Buffer(Vec::new());
+                }
+                stages.push(Stage::Done(0));
+                let _ = files; // Option<StageFiles>, always None here
+                continue;
+            }
+        };
+        let files = files.expect("non-Assign stage must have StageFiles");
 
         if builtins::is_builtin(&cmd.program) {
             drop(incoming);

@@ -1,5 +1,68 @@
 use crate::lexer::{Operator, Token, Word};
 
+/// If `word` looks like `NAME=value` (a leading `Literal` whose text begins
+/// with a valid identifier followed by `=`), returns `Some((name, value))`
+/// where `value` is a `Word` containing the rest of the prefix Literal
+/// followed by the remaining original parts. Otherwise `None`.
+fn try_split_assignment(word: &crate::lexer::Word) -> Option<(String, crate::lexer::Word)> {
+    use crate::lexer::WordPart;
+    let first = word.0.first()?;
+    let text = match first {
+        WordPart::Literal(s) => s,
+        _ => return None,
+    };
+    let eq = text.find('=')?;
+    let name = &text[..eq];
+    if name.is_empty() {
+        return None;
+    }
+    let mut name_chars = name.chars();
+    let first_ch = name_chars.next()?;
+    if !(first_ch == '_' || first_ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !name_chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let rest_of_first = text[eq + 1..].to_string();
+    let mut value_parts: Vec<WordPart> = Vec::with_capacity(word.0.len());
+    value_parts.push(WordPart::Literal(rest_of_first));
+    for part in word.0.iter().skip(1) {
+        let cloned = match part {
+            WordPart::Literal(s) => WordPart::Literal(s.clone()),
+            WordPart::Var { name, quoted } => WordPart::Var {
+                name: name.clone(),
+                quoted: *quoted,
+            },
+            WordPart::LastStatus { quoted } => WordPart::LastStatus { quoted: *quoted },
+            WordPart::Tilde => WordPart::Tilde,
+        };
+        value_parts.push(cloned);
+    }
+    Some((name.to_string(), crate::lexer::Word(value_parts)))
+}
+
+fn finalize_stage(
+    program: crate::lexer::Word,
+    args: Vec<crate::lexer::Word>,
+    stdin: Option<crate::lexer::Word>,
+    stdout: Option<Redirect>,
+    stderr: Option<Redirect>,
+) -> SimpleCommand {
+    if args.is_empty() && stdin.is_none() && stdout.is_none() && stderr.is_none() {
+        if let Some((name, value)) = try_split_assignment(&program) {
+            return SimpleCommand::Assign { name, value };
+        }
+    }
+    SimpleCommand::Exec(ExecCommand {
+        program,
+        args,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Redirect {
     Truncate(Word),
@@ -16,7 +79,6 @@ pub struct ExecCommand {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SimpleCommand {
     Assign { name: String, value: Word },
     Exec(ExecCommand),
@@ -105,13 +167,13 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
             }
             Token::Op(Operator::Pipe) => {
                 let prog = program.take().ok_or(ParseError::MissingCommand)?;
-                commands.push(SimpleCommand::Exec(ExecCommand {
-                    program: prog,
-                    args: std::mem::take(&mut args),
-                    stdin: stdin.take(),
-                    stdout: stdout.take(),
-                    stderr: stderr.take(),
-                }));
+                commands.push(finalize_stage(
+                    prog,
+                    std::mem::take(&mut args),
+                    stdin.take(),
+                    stdout.take(),
+                    stderr.take(),
+                ));
             }
             Token::Op(op) => {
                 let target = match iter.next() {
@@ -134,13 +196,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     }
 
     let prog = program.ok_or(ParseError::MissingCommand)?;
-    commands.push(SimpleCommand::Exec(ExecCommand {
-        program: prog,
-        args,
-        stdin,
-        stdout,
-        stderr,
-    }));
+    commands.push(finalize_stage(prog, args, stdin, stdout, stderr));
 
     Ok(Pipeline { commands })
 }
@@ -404,5 +460,80 @@ mod tests {
             ]),
             Err(ParseError::MissingCommand)
         );
+    }
+
+    fn assignment(name: &str, value: Word) -> SimpleCommand {
+        SimpleCommand::Assign { name: name.to_string(), value }
+    }
+
+    #[test]
+    fn parse_simple_assignment() {
+        let seq = parse(vec![w_tok("FOO=bar")]).unwrap().unwrap();
+        assert_eq!(seq.first.commands, vec![assignment("FOO", ww("bar"))]);
+    }
+
+    #[test]
+    fn parse_empty_value_assignment() {
+        let seq = parse(vec![w_tok("FOO=")]).unwrap().unwrap();
+        assert_eq!(seq.first.commands, vec![assignment("FOO", ww(""))]);
+    }
+
+    #[test]
+    fn parse_assignment_with_expansion_in_value() {
+        let var_part = WordPart::Var { name: "BAR".to_string(), quoted: false };
+        let prog = Token::Word(Word(vec![
+            WordPart::Literal("FOO=".to_string()),
+            var_part,
+        ]));
+        let seq = parse(vec![prog]).unwrap().unwrap();
+        let expected_value = Word(vec![
+            WordPart::Literal("".to_string()),
+            WordPart::Var { name: "BAR".to_string(), quoted: false },
+        ]);
+        assert_eq!(seq.first.commands, vec![assignment("FOO", expected_value)]);
+    }
+
+    #[test]
+    fn parse_assignment_invalid_name_is_exec() {
+        let seq = parse(vec![w_tok("1FOO=bar")]).unwrap().unwrap();
+        assert_eq!(seq.first.commands, vec![plain("1FOO=bar", &[])]);
+    }
+
+    #[test]
+    fn parse_assignment_with_arg_is_exec() {
+        let seq = parse(vec![w_tok("FOO=bar"), w_tok("baz")]).unwrap().unwrap();
+        assert_eq!(seq.first.commands, vec![plain("FOO=bar", &["baz"])]);
+    }
+
+    #[test]
+    fn parse_assignment_with_redirect_is_exec() {
+        let seq = parse(vec![
+            w_tok("FOO=bar"),
+            Token::Op(Operator::RedirOut),
+            w_tok("f"),
+        ])
+        .unwrap()
+        .unwrap();
+        match &seq.first.commands[0] {
+            SimpleCommand::Exec(e) => {
+                assert_eq!(e.program, ww("FOO=bar"));
+                assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
+            }
+            _ => panic!("expected Exec"),
+        }
+    }
+
+    #[test]
+    fn parse_assignment_in_pipeline_stage() {
+        let seq = parse(vec![
+            w_tok("FOO=bar"),
+            Token::Op(Operator::Pipe),
+            w_tok("cat"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(seq.first.commands.len(), 2);
+        assert_eq!(seq.first.commands[0], assignment("FOO", ww("bar")));
+        assert_eq!(seq.first.commands[1], plain("cat", &[]));
     }
 }
