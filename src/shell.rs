@@ -73,7 +73,7 @@ fn process_line(line: &str) -> ExecOutcome {
     };
 
     match command::parse(tokens) {
-        Ok(Some(pipeline)) => executor::execute(&pipeline),
+        Ok(Some(sequence)) => executor::execute(&sequence),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
             eprintln!("shuck: syntax error: {}", parse_error_message(e));
