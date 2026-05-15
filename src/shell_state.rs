@@ -16,7 +16,6 @@ pub struct Shell {
     last_status: i32,
 }
 
-#[allow(dead_code)]
 impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
