@@ -72,7 +72,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &Shell) -> Result<String, ()>
 fn resolve(cmd: &ExecCommand, shell: &Shell) -> Result<ResolvedCommand, i32> {
     let prog_fields = expand(&cmd.program, shell);
     if prog_fields.is_empty() {
-        eprintln!("shuck: command not found");
+        eprintln!("shuck: command not found:");
         return Err(127);
     }
     let mut iter = prog_fields.into_iter();

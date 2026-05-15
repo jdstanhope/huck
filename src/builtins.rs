@@ -178,6 +178,8 @@ mod tests {
         assert!(is_builtin("exit"));
         assert!(is_builtin("pwd"));
         assert!(is_builtin("echo"));
+        assert!(is_builtin("export"));
+        assert!(is_builtin("unset"));
         assert!(!is_builtin("ls"));
     }
 
