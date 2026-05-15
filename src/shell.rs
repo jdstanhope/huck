@@ -92,5 +92,7 @@ fn lex_error_message(error: LexError) -> &'static str {
     match error {
         LexError::UnterminatedQuote => "unterminated quote",
         LexError::BareAmpersand => "unexpected '&'",
+        LexError::InvalidVarName => "invalid variable name in '${...}'",
+        LexError::UnterminatedBrace => "unterminated '${...}'",
     }
 }
