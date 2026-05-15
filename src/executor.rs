@@ -4,16 +4,27 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 
 use crate::builtins::{self, ExecOutcome};
-use crate::command::{Command, Pipeline, Redirect, Sequence};
+use crate::command::{Command, Connector, Pipeline, Redirect, Sequence};
 
 pub fn execute(seq: &Sequence) -> ExecOutcome {
-    // INTERIM (made real in Task 3): only the first pipeline runs; any rest
-    // is reported as "not yet implemented".
-    if !seq.rest.is_empty() {
-        eprintln!("shuck: sequencing not yet implemented");
-        return ExecOutcome::Continue(1);
+    let mut status = run_pipeline(&seq.first);
+    if matches!(status, ExecOutcome::Exit(_)) {
+        return status;
     }
-    run_pipeline(&seq.first)
+    for (connector, pipeline) in &seq.rest {
+        let should_run = match connector {
+            Connector::Semi => true,
+            Connector::And => matches!(status, ExecOutcome::Continue(0)),
+            Connector::Or => matches!(status, ExecOutcome::Continue(c) if c != 0),
+        };
+        if should_run {
+            status = run_pipeline(pipeline);
+            if matches!(status, ExecOutcome::Exit(_)) {
+                return status;
+            }
+        }
+    }
+    status
 }
 
 fn run_pipeline(pipeline: &Pipeline) -> ExecOutcome {
