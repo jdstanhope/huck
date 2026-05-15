@@ -54,7 +54,10 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
             Token::Op(Operator::Semi) => Connector::Semi,
             Token::Op(Operator::And) => Connector::And,
             Token::Op(Operator::Or) => Connector::Or,
-            _ => unreachable!("parse_pipeline returns only at a sequencing op or end"),
+            _ => unreachable!(
+                "parse_pipeline leaves only sequencing ops in the iterator; \
+                 anything else it consumes itself"
+            ),
         };
         // Trailing `;` is allowed: stop here if there's nothing after it.
         if matches!(connector, Connector::Semi) && iter.peek().is_none() {
