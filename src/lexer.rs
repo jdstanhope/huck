@@ -18,8 +18,20 @@ pub enum Operator {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum WordPart {
+    Literal(String),
+    Var { name: String, quoted: bool },
+    LastStatus { quoted: bool },
+    Tilde,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Word(pub Vec<WordPart>);
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum Token {
-    Word(String),
+    Word(Word),
     Op(Operator),
 }
 
@@ -32,7 +44,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     while let Some(c) = chars.next() {
         if c.is_whitespace() {
             if has_token {
-                tokens.push(Token::Word(std::mem::take(&mut current)));
+                tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                    std::mem::take(&mut current),
+                )])));
                 has_token = false;
             }
             continue;
@@ -76,7 +90,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '|' => {
                 if has_token {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                        std::mem::take(&mut current),
+                    )])));
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
@@ -88,7 +104,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '&' => {
                 if has_token {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                        std::mem::take(&mut current),
+                    )])));
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
@@ -100,21 +118,27 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             ';' => {
                 if has_token {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                        std::mem::take(&mut current),
+                    )])));
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::Semi));
             }
             '<' => {
                 if has_token {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                        std::mem::take(&mut current),
+                    )])));
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::RedirIn));
             }
             '>' => {
                 if has_token {
-                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal(
+                        std::mem::take(&mut current),
+                    )])));
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
@@ -124,11 +148,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
             }
-            // `2>` / `2>>` — only when the `2` would otherwise start a new
-            // word (no current word being built). A `2` inside or appended to
-            // a word, e.g. `x2>f`, is ordinary text.
             '2' if !has_token && chars.peek() == Some(&'>') => {
-                chars.next(); // consume the '>'
+                chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirErrAppend));
@@ -144,7 +165,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     }
 
     if has_token {
-        tokens.push(Token::Word(current));
+        tokens.push(Token::Word(Word(vec![WordPart::Literal(current)])));
     }
     Ok(tokens)
 }
@@ -153,12 +174,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 mod tests {
     use super::*;
 
-    /// Builds an expected token list made entirely of words.
-    fn words(parts: &[&str]) -> Vec<Token> {
-        parts.iter().map(|w| Token::Word(w.to_string())).collect()
+    /// Builds a Token that holds a single-Literal Word.
+    fn w(s: &str) -> Token {
+        Token::Word(Word(vec![WordPart::Literal(s.to_string())]))
     }
 
-    // ----- existing v2 lexer tests (must keep passing) -----
+    /// Builds a Vec<Token> of all-Literal words.
+    fn words(parts: &[&str]) -> Vec<Token> {
+        parts.iter().map(|s| w(s)).collect()
+    }
 
     #[test]
     fn tokenize_simple_command() {
@@ -241,11 +265,7 @@ mod tests {
     fn tokenize_pipe_with_spaces() {
         assert_eq!(
             tokenize("a | b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Pipe),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Pipe), w("b")]
         );
     }
 
@@ -253,11 +273,7 @@ mod tests {
     fn tokenize_pipe_without_spaces() {
         assert_eq!(
             tokenize("a|b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Pipe),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Pipe), w("b")]
         );
     }
 
@@ -265,11 +281,7 @@ mod tests {
     fn tokenize_redirect_out() {
         assert_eq!(
             tokenize("ls > f").unwrap(),
-            vec![
-                Token::Word("ls".to_string()),
-                Token::Op(Operator::RedirOut),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("ls"), Token::Op(Operator::RedirOut), w("f")]
         );
     }
 
@@ -277,11 +289,7 @@ mod tests {
     fn tokenize_redirect_out_without_spaces() {
         assert_eq!(
             tokenize("ls>f").unwrap(),
-            vec![
-                Token::Word("ls".to_string()),
-                Token::Op(Operator::RedirOut),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("ls"), Token::Op(Operator::RedirOut), w("f")]
         );
     }
 
@@ -289,11 +297,7 @@ mod tests {
     fn tokenize_redirect_append() {
         assert_eq!(
             tokenize("ls >> f").unwrap(),
-            vec![
-                Token::Word("ls".to_string()),
-                Token::Op(Operator::RedirAppend),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("ls"), Token::Op(Operator::RedirAppend), w("f")]
         );
     }
 
@@ -301,11 +305,7 @@ mod tests {
     fn tokenize_redirect_in() {
         assert_eq!(
             tokenize("cat < f").unwrap(),
-            vec![
-                Token::Word("cat".to_string()),
-                Token::Op(Operator::RedirIn),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("cat"), Token::Op(Operator::RedirIn), w("f")]
         );
     }
 
@@ -313,11 +313,7 @@ mod tests {
     fn tokenize_redirect_stderr() {
         assert_eq!(
             tokenize("cmd 2> f").unwrap(),
-            vec![
-                Token::Word("cmd".to_string()),
-                Token::Op(Operator::RedirErr),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("cmd"), Token::Op(Operator::RedirErr), w("f")]
         );
     }
 
@@ -325,11 +321,7 @@ mod tests {
     fn tokenize_redirect_stderr_append() {
         assert_eq!(
             tokenize("cmd 2>> f").unwrap(),
-            vec![
-                Token::Word("cmd".to_string()),
-                Token::Op(Operator::RedirErrAppend),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("cmd"), Token::Op(Operator::RedirErrAppend), w("f")]
         );
     }
 
@@ -337,11 +329,7 @@ mod tests {
     fn tokenize_two_in_word_is_not_stderr_operator() {
         assert_eq!(
             tokenize("x2>f").unwrap(),
-            vec![
-                Token::Word("x2".to_string()),
-                Token::Op(Operator::RedirOut),
-                Token::Word("f".to_string()),
-            ]
+            vec![w("x2"), Token::Op(Operator::RedirOut), w("f")]
         );
     }
 
@@ -368,28 +356,22 @@ mod tests {
         assert_eq!(
             tokenize("a < in | b > out").unwrap(),
             vec![
-                Token::Word("a".to_string()),
+                w("a"),
                 Token::Op(Operator::RedirIn),
-                Token::Word("in".to_string()),
+                w("in"),
                 Token::Op(Operator::Pipe),
-                Token::Word("b".to_string()),
+                w("b"),
                 Token::Op(Operator::RedirOut),
-                Token::Word("out".to_string()),
+                w("out"),
             ]
         );
     }
-
-    // ----- new: sequencing operators -----
 
     #[test]
     fn tokenize_or_with_spaces() {
         assert_eq!(
             tokenize("a || b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Or),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Or), w("b")]
         );
     }
 
@@ -397,11 +379,7 @@ mod tests {
     fn tokenize_or_without_spaces() {
         assert_eq!(
             tokenize("a||b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Or),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Or), w("b")]
         );
     }
 
@@ -409,11 +387,7 @@ mod tests {
     fn tokenize_and_with_spaces() {
         assert_eq!(
             tokenize("a && b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::And),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::And), w("b")]
         );
     }
 
@@ -421,11 +395,7 @@ mod tests {
     fn tokenize_and_without_spaces() {
         assert_eq!(
             tokenize("a&&b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::And),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::And), w("b")]
         );
     }
 
@@ -443,11 +413,7 @@ mod tests {
     fn tokenize_semicolon_with_spaces() {
         assert_eq!(
             tokenize("a ; b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Semi),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Semi), w("b")]
         );
     }
 
@@ -455,11 +421,7 @@ mod tests {
     fn tokenize_semicolon_without_spaces() {
         assert_eq!(
             tokenize("a;b").unwrap(),
-            vec![
-                Token::Word("a".to_string()),
-                Token::Op(Operator::Semi),
-                Token::Word("b".to_string()),
-            ]
+            vec![w("a"), Token::Op(Operator::Semi), w("b")]
         );
     }
 
@@ -473,7 +435,6 @@ mod tests {
 
     #[test]
     fn tokenize_escaped_sequencing_operators_stay_words() {
-        // `\&` is just `&` (literal); two `\&` make `&&` (the literal word, not the op).
         assert_eq!(
             tokenize(r"echo \&\& \|\| \;").unwrap(),
             words(&["echo", "&&", "||", ";"])
@@ -485,13 +446,13 @@ mod tests {
         assert_eq!(
             tokenize("a && b || c ; d").unwrap(),
             vec![
-                Token::Word("a".to_string()),
+                w("a"),
                 Token::Op(Operator::And),
-                Token::Word("b".to_string()),
+                w("b"),
                 Token::Op(Operator::Or),
-                Token::Word("c".to_string()),
+                w("c"),
                 Token::Op(Operator::Semi),
-                Token::Word("d".to_string()),
+                w("d"),
             ]
         );
     }

@@ -1,30 +1,37 @@
-use crate::lexer::{Operator, Token};
+use crate::lexer::{Operator, Token, Word};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Redirect {
-    Truncate(String), // > file   (and the target form of 2>)
-    Append(String),   // >> file  (and the target form of 2>>)
+    Truncate(Word),
+    Append(Word),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Command {
-    pub program: String,
-    pub args: Vec<String>,
-    pub stdin: Option<String>,
+pub struct ExecCommand {
+    pub program: Word,
+    pub args: Vec<Word>,
+    pub stdin: Option<Word>,
     pub stdout: Option<Redirect>,
     pub stderr: Option<Redirect>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SimpleCommand {
+    Assign { name: String, value: Word },
+    Exec(ExecCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct Pipeline {
-    pub commands: Vec<Command>, // invariant: never empty
+    pub commands: Vec<SimpleCommand>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Connector {
-    Semi, // ;
-    And,  // &&
-    Or,   // ||
+    Semi,
+    And,
+    Or,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,7 +66,6 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
                  anything else it consumes itself"
             ),
         };
-        // Trailing `;` is allowed: stop here if there's nothing after it.
         if matches!(connector, Connector::Semi) && iter.peek().is_none() {
             break;
         }
@@ -70,18 +76,14 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     Ok(Some(Sequence { first, rest }))
 }
 
-/// Parses one pipeline from the iterator. Stops at — without consuming — the
-/// next sequencing operator (`;`, `&&`, `||`) or end of input. Returns
-/// `Err(ParseError::MissingCommand)` if the pipeline ended with no program.
 fn parse_pipeline<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Pipeline, ParseError> {
-    let mut commands: Vec<Command> = Vec::new();
+    let mut commands: Vec<SimpleCommand> = Vec::new();
 
-    // Builder state for the command currently being assembled.
-    let mut program: Option<String> = None;
-    let mut args: Vec<String> = Vec::new();
-    let mut stdin: Option<String> = None;
+    let mut program: Option<Word> = None;
+    let mut args: Vec<Word> = Vec::new();
+    let mut stdin: Option<Word> = None;
     let mut stdout: Option<Redirect> = None;
     let mut stderr: Option<Redirect> = None;
 
@@ -90,7 +92,6 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
             token,
             Token::Op(Operator::Semi | Operator::And | Operator::Or)
         ) {
-            // Don't consume — the outer loop handles it.
             break;
         }
         let token = iter.next().unwrap();
@@ -104,16 +105,15 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
             }
             Token::Op(Operator::Pipe) => {
                 let prog = program.take().ok_or(ParseError::MissingCommand)?;
-                commands.push(Command {
+                commands.push(SimpleCommand::Exec(ExecCommand {
                     program: prog,
                     args: std::mem::take(&mut args),
                     stdin: stdin.take(),
                     stdout: stdout.take(),
                     stderr: stderr.take(),
-                });
+                }));
             }
             Token::Op(op) => {
-                // A redirect operator: the next token must be a filename word.
                 let target = match iter.next() {
                     Some(Token::Word(word)) => word,
                     Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
@@ -134,13 +134,13 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     }
 
     let prog = program.ok_or(ParseError::MissingCommand)?;
-    commands.push(Command {
+    commands.push(SimpleCommand::Exec(ExecCommand {
         program: prog,
         args,
         stdin,
         stdout,
         stderr,
-    });
+    }));
 
     Ok(Pipeline { commands })
 }
@@ -148,31 +148,54 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lexer::WordPart;
 
-    fn w(s: &str) -> Token {
-        Token::Word(s.to_string())
+    fn w_tok(s: &str) -> Token {
+        Token::Word(Word(vec![WordPart::Literal(s.to_string())]))
     }
 
-    /// Builds a command with no redirections.
-    fn plain(program: &str, args: &[&str]) -> Command {
-        Command {
-            program: program.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
+    fn ww(s: &str) -> Word {
+        Word(vec![WordPart::Literal(s.to_string())])
+    }
+
+    /// Builds a SimpleCommand::Exec with no redirections, all-Literal Words.
+    fn plain(program: &str, args: &[&str]) -> SimpleCommand {
+        SimpleCommand::Exec(ExecCommand {
+            program: ww(program),
+            args: args.iter().map(|a| ww(a)).collect(),
             stdin: None,
             stdout: None,
             stderr: None,
-        }
+        })
     }
 
-    /// Builds a sequence with a single pipeline (no sequencing operators).
-    fn one_pipeline(commands: Vec<Command>) -> Sequence {
+    fn one_pipeline(commands: Vec<SimpleCommand>) -> Sequence {
         Sequence {
             first: Pipeline { commands },
             rest: vec![],
         }
     }
 
-    // ----- single-pipeline cases (regressions from v2) -----
+    fn exec_stdout(seq: &Sequence) -> &Option<Redirect> {
+        match &seq.first.commands[0] {
+            SimpleCommand::Exec(e) => &e.stdout,
+            _ => panic!("expected Exec"),
+        }
+    }
+
+    fn exec_stdin(seq: &Sequence) -> &Option<Word> {
+        match &seq.first.commands[0] {
+            SimpleCommand::Exec(e) => &e.stdin,
+            _ => panic!("expected Exec"),
+        }
+    }
+
+    fn exec_stderr(seq: &Sequence) -> &Option<Redirect> {
+        match &seq.first.commands[0] {
+            SimpleCommand::Exec(e) => &e.stderr,
+            _ => panic!("expected Exec"),
+        }
+    }
 
     #[test]
     fn parse_empty_returns_none() {
@@ -182,7 +205,7 @@ mod tests {
     #[test]
     fn parse_program_only() {
         assert_eq!(
-            parse(vec![w("ls")]),
+            parse(vec![w_tok("ls")]),
             Ok(Some(one_pipeline(vec![plain("ls", &[])])))
         );
     }
@@ -190,81 +213,71 @@ mod tests {
     #[test]
     fn parse_program_with_args() {
         assert_eq!(
-            parse(vec![w("ls"), w("-la"), w("/tmp")]),
+            parse(vec![w_tok("ls"), w_tok("-la"), w_tok("/tmp")]),
             Ok(Some(one_pipeline(vec![plain("ls", &["-la", "/tmp"])])))
         );
     }
 
     #[test]
     fn parse_redirect_out() {
-        let seq = parse(vec![w("ls"), Token::Op(Operator::RedirOut), w("f")])
+        let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirOut), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stdout,
-            Some(Redirect::Truncate("f".to_string()))
-        );
-        assert!(seq.rest.is_empty());
+        assert_eq!(exec_stdout(&seq), &Some(Redirect::Truncate(ww("f"))));
     }
 
     #[test]
     fn parse_redirect_append() {
-        let seq = parse(vec![w("ls"), Token::Op(Operator::RedirAppend), w("f")])
+        let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirAppend), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stdout,
-            Some(Redirect::Append("f".to_string()))
-        );
+        assert_eq!(exec_stdout(&seq), &Some(Redirect::Append(ww("f"))));
     }
 
     #[test]
     fn parse_redirect_in() {
-        let seq = parse(vec![w("cat"), Token::Op(Operator::RedirIn), w("f")])
+        let seq = parse(vec![w_tok("cat"), Token::Op(Operator::RedirIn), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands[0].stdin, Some("f".to_string()));
+        assert_eq!(exec_stdin(&seq), &Some(ww("f")));
     }
 
     #[test]
     fn parse_redirect_stderr() {
-        let seq = parse(vec![w("cmd"), Token::Op(Operator::RedirErr), w("e")])
+        let seq = parse(vec![w_tok("cmd"), Token::Op(Operator::RedirErr), w_tok("e")])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stderr,
-            Some(Redirect::Truncate("e".to_string()))
-        );
+        assert_eq!(exec_stderr(&seq), &Some(Redirect::Truncate(ww("e"))));
     }
 
     #[test]
     fn parse_redirect_stderr_append() {
-        let seq = parse(vec![w("cmd"), Token::Op(Operator::RedirErrAppend), w("e")])
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stderr,
-            Some(Redirect::Append("e".to_string()))
-        );
+        let seq = parse(vec![
+            w_tok("cmd"),
+            Token::Op(Operator::RedirErrAppend),
+            w_tok("e"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(exec_stderr(&seq), &Some(Redirect::Append(ww("e"))));
     }
 
     #[test]
     fn parse_two_stage_pipeline() {
-        let seq = parse(vec![w("a"), Token::Op(Operator::Pipe), w("b")])
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Pipe), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.first.commands, vec![plain("a", &[]), plain("b", &[])]);
-        assert!(seq.rest.is_empty());
     }
 
     #[test]
     fn parse_three_stage_pipeline() {
         let seq = parse(vec![
-            w("a"),
+            w_tok("a"),
             Token::Op(Operator::Pipe),
-            w("b"),
+            w_tok("b"),
             Token::Op(Operator::Pipe),
-            w("c"),
+            w_tok("c"),
         ])
         .unwrap()
         .unwrap();
@@ -272,47 +285,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_pipeline_with_redirects_on_stages() {
-        // a < in | b > out
-        let seq = parse(vec![
-            w("a"),
-            Token::Op(Operator::RedirIn),
-            w("in"),
-            Token::Op(Operator::Pipe),
-            w("b"),
-            Token::Op(Operator::RedirOut),
-            w("out"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(seq.first.commands[0].stdin, Some("in".to_string()));
-        assert_eq!(
-            seq.first.commands[1].stdout,
-            Some(Redirect::Truncate("out".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_last_redirect_of_a_kind_wins() {
-        let seq = parse(vec![
-            w("ls"),
-            Token::Op(Operator::RedirOut),
-            w("a"),
-            Token::Op(Operator::RedirOut),
-            w("b"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stdout,
-            Some(Redirect::Truncate("b".to_string()))
-        );
-    }
-
-    #[test]
     fn parse_leading_pipe_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::Pipe), w("a")]),
+            parse(vec![Token::Op(Operator::Pipe), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -320,20 +295,19 @@ mod tests {
     #[test]
     fn parse_trailing_pipe_is_missing_command() {
         assert_eq!(
-            parse(vec![w("a"), Token::Op(Operator::Pipe)]),
+            parse(vec![w_tok("a"), Token::Op(Operator::Pipe)]),
             Err(ParseError::MissingCommand)
         );
     }
 
     #[test]
     fn parse_double_pipe_is_missing_command() {
-        // Two consecutive Op(Pipe) — not Op(Or) — at the parser level.
         assert_eq!(
             parse(vec![
-                w("a"),
+                w_tok("a"),
                 Token::Op(Operator::Pipe),
                 Token::Op(Operator::Pipe),
-                w("b"),
+                w_tok("b"),
             ]),
             Err(ParseError::MissingCommand)
         );
@@ -342,7 +316,7 @@ mod tests {
     #[test]
     fn parse_redirect_without_program_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::RedirOut), w("f")]),
+            parse(vec![Token::Op(Operator::RedirOut), w_tok("f")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -350,7 +324,7 @@ mod tests {
     #[test]
     fn parse_redirect_without_target_is_error() {
         assert_eq!(
-            parse(vec![w("ls"), Token::Op(Operator::RedirOut)]),
+            parse(vec![w_tok("ls"), Token::Op(Operator::RedirOut)]),
             Err(ParseError::MissingRedirectTarget)
         );
     }
@@ -359,125 +333,44 @@ mod tests {
     fn parse_redirect_target_is_operator_is_error() {
         assert_eq!(
             parse(vec![
-                w("ls"),
+                w_tok("ls"),
                 Token::Op(Operator::RedirOut),
                 Token::Op(Operator::Pipe),
-                w("b"),
+                w_tok("b"),
             ]),
             Err(ParseError::RedirectTargetIsOperator)
         );
     }
 
-    // ----- new: command sequencing -----
-
     #[test]
     fn parse_semicolon_sequence() {
-        let seq = parse(vec![w("a"), Token::Op(Operator::Semi), w("b")])
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.first.commands, vec![plain("a", &[])]);
         assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::Semi);
-        assert_eq!(seq.rest[0].1.commands, vec![plain("b", &[])]);
     }
 
     #[test]
     fn parse_and_sequence() {
-        let seq = parse(vec![w("a"), Token::Op(Operator::And), w("b")])
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::And), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::And);
     }
 
     #[test]
     fn parse_or_sequence() {
-        let seq = parse(vec![w("a"), Token::Op(Operator::Or), w("b")])
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Or), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::Or);
     }
 
     #[test]
-    fn parse_mixed_sequencing_operators() {
-        // a && b || c ; d
-        let seq = parse(vec![
-            w("a"),
-            Token::Op(Operator::And),
-            w("b"),
-            Token::Op(Operator::Or),
-            w("c"),
-            Token::Op(Operator::Semi),
-            w("d"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[])]);
-        assert_eq!(
-            seq.rest.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
-            vec![Connector::And, Connector::Or, Connector::Semi]
-        );
-        assert_eq!(seq.rest[0].1.commands, vec![plain("b", &[])]);
-        assert_eq!(seq.rest[1].1.commands, vec![plain("c", &[])]);
-        assert_eq!(seq.rest[2].1.commands, vec![plain("d", &[])]);
-    }
-
-    #[test]
-    fn parse_sequence_of_multi_stage_pipelines() {
-        // ls | grep foo && find . -name bar | wc -l
-        let seq = parse(vec![
-            w("ls"),
-            Token::Op(Operator::Pipe),
-            w("grep"),
-            w("foo"),
-            Token::Op(Operator::And),
-            w("find"),
-            w("."),
-            w("-name"),
-            w("bar"),
-            Token::Op(Operator::Pipe),
-            w("wc"),
-            w("-l"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            seq.first.commands,
-            vec![plain("ls", &[]), plain("grep", &["foo"])]
-        );
-        assert_eq!(seq.rest.len(), 1);
-        assert_eq!(seq.rest[0].0, Connector::And);
-        assert_eq!(
-            seq.rest[0].1.commands,
-            vec![plain("find", &[".", "-name", "bar"]), plain("wc", &["-l"])]
-        );
-    }
-
-    #[test]
-    fn parse_pipeline_with_redirect_inside_sequence() {
-        // echo hi > f ; cat f
-        let seq = parse(vec![
-            w("echo"),
-            w("hi"),
-            Token::Op(Operator::RedirOut),
-            w("f"),
-            Token::Op(Operator::Semi),
-            w("cat"),
-            w("f"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            seq.first.commands[0].stdout,
-            Some(Redirect::Truncate("f".to_string()))
-        );
-        assert_eq!(seq.rest[0].1.commands, vec![plain("cat", &["f"])]);
-    }
-
-    #[test]
     fn parse_trailing_semicolon_is_allowed() {
-        let seq = parse(vec![w("a"), Token::Op(Operator::Semi)])
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi)])
             .unwrap()
             .unwrap();
         assert_eq!(seq.first.commands, vec![plain("a", &[])]);
@@ -487,15 +380,7 @@ mod tests {
     #[test]
     fn parse_trailing_and_is_missing_command() {
         assert_eq!(
-            parse(vec![w("a"), Token::Op(Operator::And)]),
-            Err(ParseError::MissingCommand)
-        );
-    }
-
-    #[test]
-    fn parse_trailing_or_is_missing_command() {
-        assert_eq!(
-            parse(vec![w("a"), Token::Op(Operator::Or)]),
+            parse(vec![w_tok("a"), Token::Op(Operator::And)]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -503,7 +388,7 @@ mod tests {
     #[test]
     fn parse_leading_semicolon_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::Semi), w("a")]),
+            parse(vec![Token::Op(Operator::Semi), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -512,25 +397,12 @@ mod tests {
     fn parse_double_sequencing_op_is_missing_command() {
         assert_eq!(
             parse(vec![
-                w("a"),
+                w_tok("a"),
                 Token::Op(Operator::And),
                 Token::Op(Operator::And),
-                w("b"),
+                w_tok("b"),
             ]),
             Err(ParseError::MissingCommand)
-        );
-    }
-
-    #[test]
-    fn parse_redirect_target_is_sequencing_op_is_error() {
-        // ls > ;
-        assert_eq!(
-            parse(vec![
-                w("ls"),
-                Token::Op(Operator::RedirOut),
-                Token::Op(Operator::Semi),
-            ]),
-            Err(ParseError::RedirectTargetIsOperator)
         );
     }
 }

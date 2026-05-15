@@ -4,7 +4,10 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 
 use crate::builtins::{self, ExecOutcome};
-use crate::command::{Command, Connector, Pipeline, Redirect, Sequence};
+use crate::command::{
+    Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
+};
+use crate::expand::expand;
 use crate::shell_state::Shell;
 
 pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
@@ -36,18 +39,82 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     }
 }
 
+// ----- resolved command (post-expansion) ------------------------------------
+
+/// A command with every `Word` already expanded against the live `Shell`.
+struct ResolvedCommand {
+    program: String,
+    args: Vec<String>,
+    stdin: Option<String>,
+    stdout: Option<ResolvedRedirect>,
+    stderr: Option<ResolvedRedirect>,
+}
+
+enum ResolvedRedirect {
+    Truncate(String),
+    Append(String),
+}
+
+/// Expands a `Word` to exactly one string, or prints an `ambiguous redirect`
+/// error and returns `Err(())`.
+fn expand_single(word: &crate::lexer::Word, shell: &Shell) -> Result<String, ()> {
+    let fields = expand(word, shell);
+    if fields.len() == 1 {
+        Ok(fields.into_iter().next().unwrap())
+    } else {
+        eprintln!("shuck: ambiguous redirect");
+        Err(())
+    }
+}
+
+/// Expands every Word in an ExecCommand. Returns `Err(status)` on failure
+/// (empty program → 127, ambiguous redirect → 1).
+fn resolve(cmd: &ExecCommand, shell: &Shell) -> Result<ResolvedCommand, i32> {
+    let prog_fields = expand(&cmd.program, shell);
+    if prog_fields.is_empty() {
+        eprintln!("shuck: command not found:");
+        return Err(127);
+    }
+    let mut iter = prog_fields.into_iter();
+    let program = iter.next().unwrap();
+    let mut args: Vec<String> = iter.collect();
+    for word in &cmd.args {
+        args.extend(expand(word, shell));
+    }
+    let stdin = match &cmd.stdin {
+        Some(word) => Some(expand_single(word, shell).map_err(|()| 1)?),
+        None => None,
+    };
+    let stdout = match &cmd.stdout {
+        Some(Redirect::Truncate(w)) => {
+            Some(ResolvedRedirect::Truncate(expand_single(w, shell).map_err(|()| 1)?))
+        }
+        Some(Redirect::Append(w)) => {
+            Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
+        }
+        None => None,
+    };
+    let stderr = match &cmd.stderr {
+        Some(Redirect::Truncate(w)) => {
+            Some(ResolvedRedirect::Truncate(expand_single(w, shell).map_err(|()| 1)?))
+        }
+        Some(Redirect::Append(w)) => {
+            Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
+        }
+        None => None,
+    };
+    Ok(ResolvedCommand { program, args, stdin, stdout, stderr })
+}
+
 // ----- redirect file handling -----------------------------------------------
 
-/// The redirect files a command needs, already opened.
 struct StageFiles {
     stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
 }
 
-/// Opens every redirect file a command needs. On the first failure, prints the
-/// error and returns `Err(())` — the caller must then run nothing.
-fn open_stage_files(cmd: &Command) -> Result<StageFiles, ()> {
+fn open_stage_files(cmd: &ResolvedCommand) -> Result<StageFiles, ()> {
     let stdin = match &cmd.stdin {
         Some(path) => match File::open(path) {
             Ok(file) => Some(file),
@@ -59,20 +126,20 @@ fn open_stage_files(cmd: &Command) -> Result<StageFiles, ()> {
         None => None,
     };
     let stdout = match &cmd.stdout {
-        Some(redirect) => match open_output(redirect) {
+        Some(redirect) => match open_resolved(redirect) {
             Ok(file) => Some(file),
             Err(e) => {
-                eprintln!("shuck: {}: {e}", redirect_path(redirect));
+                eprintln!("shuck: {}: {e}", resolved_path(redirect));
                 return Err(());
             }
         },
         None => None,
     };
     let stderr = match &cmd.stderr {
-        Some(redirect) => match open_output(redirect) {
+        Some(redirect) => match open_resolved(redirect) {
             Ok(file) => Some(file),
             Err(e) => {
-                eprintln!("shuck: {}: {e}", redirect_path(redirect));
+                eprintln!("shuck: {}: {e}", resolved_path(redirect));
                 return Err(());
             }
         },
@@ -81,14 +148,14 @@ fn open_stage_files(cmd: &Command) -> Result<StageFiles, ()> {
     Ok(StageFiles { stdin, stdout, stderr })
 }
 
-fn open_output(redirect: &Redirect) -> io::Result<File> {
+fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
     match redirect {
-        Redirect::Truncate(path) => OpenOptions::new()
+        ResolvedRedirect::Truncate(path) => OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(path),
-        Redirect::Append(path) => OpenOptions::new()
+        ResolvedRedirect::Append(path) => OpenOptions::new()
             .write(true)
             .create(true)
             .append(true)
@@ -96,14 +163,12 @@ fn open_output(redirect: &Redirect) -> io::Result<File> {
     }
 }
 
-fn redirect_path(redirect: &Redirect) -> &str {
+fn resolved_path(redirect: &ResolvedRedirect) -> &str {
     match redirect {
-        Redirect::Truncate(path) | Redirect::Append(path) => path,
+        ResolvedRedirect::Truncate(p) | ResolvedRedirect::Append(p) => p,
     }
 }
 
-/// Maps a finished child's status to an exit code, using the POSIX
-/// `128 + signal` convention for signal-killed children.
 fn status_code(status: &ExitStatus) -> i32 {
     status
         .code()
@@ -112,26 +177,41 @@ fn status_code(status: &ExitStatus) -> i32 {
 
 // ----- single command -------------------------------------------------------
 
-fn run_single(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
-    let files = match open_stage_files(cmd) {
-        Ok(files) => files,
-        Err(()) => return ExecOutcome::Continue(1),
-    };
-
-    if builtins::is_builtin(&cmd.program) {
-        match files.stdout {
-            Some(mut file) => builtins::run_builtin(&cmd.program, &cmd.args, &mut file, shell),
-            None => {
-                let mut out = io::stdout();
-                builtins::run_builtin(&cmd.program, &cmd.args, &mut out, shell)
-            }
+fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
+    match cmd {
+        SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
+        SimpleCommand::Assign { .. } => {
+            unreachable!("parser does not yet produce SimpleCommand::Assign")
         }
-    } else {
-        run_subprocess(cmd, files, shell)
     }
 }
 
-fn run_subprocess(cmd: &Command, files: StageFiles, shell: &Shell) -> ExecOutcome {
+fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell) -> ExecOutcome {
+    let resolved = match resolve(cmd, shell) {
+        Ok(r) => r,
+        Err(code) => return ExecOutcome::Continue(code),
+    };
+    let files = match open_stage_files(&resolved) {
+        Ok(f) => f,
+        Err(()) => return ExecOutcome::Continue(1),
+    };
+
+    if builtins::is_builtin(&resolved.program) {
+        match files.stdout {
+            Some(mut file) => {
+                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+            }
+            None => {
+                let mut out = io::stdout();
+                builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+            }
+        }
+    } else {
+        run_subprocess(&resolved, files, shell)
+    }
+}
+
+fn run_subprocess(cmd: &ResolvedCommand, files: StageFiles, shell: &Shell) -> ExecOutcome {
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
     process.env_clear();
@@ -161,34 +241,43 @@ fn run_subprocess(cmd: &Command, files: StageFiles, shell: &Shell) -> ExecOutcom
 
 // ----- multi-stage pipeline -------------------------------------------------
 
-/// What a stage hands to the next stage's stdin.
 enum Carry {
     None,
     ChildStdout(ChildStdout),
     Buffer(Vec<u8>),
 }
 
-/// A pipeline stage awaiting its final status.
 enum Stage {
     Done(i32),
     Process(Child),
 }
 
-fn run_multi_stage(commands: &[Command], shell: &mut Shell) -> ExecOutcome {
-    // Pre-flight: open every redirect file first. If any fails, run nothing.
-    let mut all_files: Vec<StageFiles> = Vec::with_capacity(commands.len());
+fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome {
+    let mut resolved_stages: Vec<ResolvedCommand> = Vec::with_capacity(commands.len());
     for cmd in commands {
-        match open_stage_files(cmd) {
-            Ok(files) => all_files.push(files),
+        match cmd {
+            SimpleCommand::Assign { .. } => {
+                unreachable!("parser does not yet produce SimpleCommand::Assign");
+            }
+            SimpleCommand::Exec(exec) => match resolve(exec, shell) {
+                Ok(r) => resolved_stages.push(r),
+                Err(code) => return ExecOutcome::Continue(code),
+            },
+        }
+    }
+    let mut all_files: Vec<StageFiles> = Vec::with_capacity(resolved_stages.len());
+    for r in &resolved_stages {
+        match open_stage_files(r) {
+            Ok(f) => all_files.push(f),
             Err(()) => return ExecOutcome::Continue(1),
         }
     }
 
-    let n = commands.len();
+    let n = resolved_stages.len();
     let mut stages: Vec<Stage> = Vec::with_capacity(n);
     let mut carry = Carry::None;
 
-    for (i, (cmd, files)) in commands.iter().zip(all_files).enumerate() {
+    for (i, (cmd, files)) in resolved_stages.iter().zip(all_files).enumerate() {
         let is_last = i == n - 1;
         let incoming = std::mem::replace(&mut carry, Carry::None);
 
