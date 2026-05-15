@@ -646,7 +646,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 64 tests pass (38 lexer + 19 command + 7 builtins).
+Expected: PASS — 63 tests pass (37 lexer + 19 command + 7 builtins).
 
 - [ ] **Step 5: Commit**
 
@@ -1537,7 +1537,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 76 tests pass (38 lexer + 31 command + 7 builtins). The interim Task-1 command test was replaced by the real sequencing tests in Step 1.
+Expected: PASS — 74 tests pass (37 lexer + 30 command + 7 builtins). The interim Task-1 command test was replaced by the real sequencing tests in Step 1.
 
 - [ ] **Step 5: Commit**
 
@@ -1616,7 +1616,7 @@ Run: `cargo build`
 Expected: PASS — no warnings.
 
 Run: `cargo test`
-Expected: PASS — 76 tests pass (no test count change; the executor has no unit tests).
+Expected: PASS — 74 tests pass (no test count change; the executor has no unit tests).
 
 - [ ] **Step 4: Manual smoke test of sequencing**
 
