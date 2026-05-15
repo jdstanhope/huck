@@ -49,6 +49,33 @@ pub fn expand(word: &Word, shell: &Shell) -> Vec<String> {
     result
 }
 
+/// Expands a `Word` for assignment context: word-splitting is suppressed and
+/// the result is one string. Each `Var`/`LastStatus` part contributes its
+/// value verbatim regardless of the `quoted` flag — matching bash, which
+/// disables splitting on the right-hand side of `NAME=...`.
+pub fn expand_assignment(word: &Word, shell: &Shell) -> String {
+    let mut result = String::new();
+    for part in &word.0 {
+        match part {
+            WordPart::Literal(s) => result.push_str(s),
+            WordPart::Tilde => {
+                if let Some(home) = shell.get("HOME") {
+                    result.push_str(home);
+                }
+            }
+            WordPart::Var { name, .. } => {
+                if let Some(value) = shell.get(name) {
+                    result.push_str(value);
+                }
+            }
+            WordPart::LastStatus { .. } => {
+                result.push_str(&shell.last_status().to_string());
+            }
+        }
+    }
+    result
+}
+
 /// Splits `value` on ASCII whitespace and integrates the fields into the
 /// caller's accumulator state, following the standard word-splitting rule.
 fn emit_split(
@@ -203,5 +230,41 @@ mod tests {
             name: "SHUCK_T_TWOFIELD".to_string(),
             quoted: false,
         }]), &shell).len(), 2);
+    }
+
+    #[test]
+    fn expand_assignment_preserves_interior_whitespace() {
+        // Assignment context: word-splitting is suppressed, so "a  b"
+        // (two spaces) must round-trip exactly.
+        let mut shell = Shell::new();
+        shell.set("SHUCK_T_PAD", "a  b".to_string());
+        let word = Word(vec![WordPart::Var {
+            name: "SHUCK_T_PAD".to_string(),
+            quoted: false,
+        }]);
+        assert_eq!(expand_assignment(&word, &shell), "a  b".to_string());
+    }
+
+    #[test]
+    fn expand_assignment_concatenates_parts() {
+        let mut shell = Shell::new();
+        shell.set("SHUCK_T_X", "x".to_string());
+        let word = Word(vec![
+            WordPart::Literal("pre-".to_string()),
+            WordPart::Var { name: "SHUCK_T_X".to_string(), quoted: false },
+            WordPart::Literal("-post".to_string()),
+        ]);
+        assert_eq!(expand_assignment(&word, &shell), "pre-x-post".to_string());
+    }
+
+    #[test]
+    fn expand_assignment_unset_var_yields_empty_segment() {
+        let shell = Shell::new();
+        let word = Word(vec![
+            WordPart::Literal("[".to_string()),
+            WordPart::Var { name: "DEFINITELY_NOT_SET_ASN".to_string(), quoted: false },
+            WordPart::Literal("]".to_string()),
+        ]);
+        assert_eq!(expand_assignment(&word, &shell), "[]".to_string());
     }
 }

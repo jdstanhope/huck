@@ -7,7 +7,7 @@ use crate::builtins::{self, ExecOutcome};
 use crate::command::{
     Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
 };
-use crate::expand::expand;
+use crate::expand::{expand, expand_assignment};
 use crate::shell_state::Shell;
 
 pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
@@ -181,9 +181,7 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
         SimpleCommand::Assign { name, value } => {
-            let fields = expand(value, shell);
-            let joined = fields.join(" ");
-            shell.set(name, joined);
+            shell.set(name, expand_assignment(value, shell));
             ExecOutcome::Continue(0)
         }
     }
