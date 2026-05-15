@@ -9,6 +9,7 @@ use crate::builtins::ExecOutcome;
 use crate::command::{self, ParseError};
 use crate::executor;
 use crate::lexer::{self, LexError};
+use crate::shell_state::Shell;
 
 const PROMPT: &str = "shuck> ";
 
@@ -24,10 +25,7 @@ pub fn run() -> i32 {
         }
     };
 
-    // Tracks the exit status of the last command, so Ctrl-D (EOF) exits with
-    // it — standard shell behavior, and the consumer of `ExecOutcome::Continue`'s
-    // status. Room to grow into `$?` later.
-    let mut last_status: i32 = 0;
+    let mut shell = Shell::new();
 
     loop {
         match editor.readline(PROMPT) {
@@ -35,13 +33,13 @@ pub fn run() -> i32 {
                 if !line.trim().is_empty() {
                     let _ = editor.add_history_entry(line.as_str());
                 }
-                match process_line(&line) {
+                match process_line(&line, &mut shell) {
                     ExecOutcome::Exit(code) => return code,
-                    ExecOutcome::Continue(status) => last_status = status,
+                    ExecOutcome::Continue(status) => shell.set_last_status(status),
                 }
             }
             Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return last_status,
+            Err(ReadlineError::Eof) => return shell.last_status(),
             Err(e) => {
                 eprintln!("shuck: input error: {e}");
                 return 1;
@@ -63,7 +61,7 @@ fn install_sigint_handler() {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-fn process_line(line: &str) -> ExecOutcome {
+fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
         Err(e) => {
@@ -73,7 +71,7 @@ fn process_line(line: &str) -> ExecOutcome {
     };
 
     match command::parse(tokens) {
-        Ok(Some(sequence)) => executor::execute(&sequence),
+        Ok(Some(sequence)) => executor::execute(&sequence, shell),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
             eprintln!("shuck: syntax error: {}", parse_error_message(e));

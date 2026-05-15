@@ -2,6 +2,8 @@ use std::env;
 use std::io::Write;
 use std::path::Path;
 
+use crate::shell_state::Shell;
+
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
 #[derive(Debug)]
@@ -17,9 +19,9 @@ pub fn is_builtin(name: &str) -> bool {
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
 /// destination for any stdout the builtin produces (`echo`, `pwd`); `cd` and
 /// `exit` produce no stdout and ignore it.
-pub fn run_builtin(name: &str, args: &[String], out: &mut dyn Write) -> ExecOutcome {
+pub fn run_builtin(name: &str, args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     match name {
-        "cd" => builtin_cd(args),
+        "cd" => builtin_cd(args, shell),
         "pwd" => builtin_pwd(out),
         "echo" => builtin_echo(args, out),
         "exit" => builtin_exit(args),
@@ -27,16 +29,16 @@ pub fn run_builtin(name: &str, args: &[String], out: &mut dyn Write) -> ExecOutc
     }
 }
 
-fn builtin_cd(args: &[String]) -> ExecOutcome {
+fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
         eprintln!("shuck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
     let target = match args.first() {
         Some(dir) => dir.clone(),
-        None => match env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => {
+        None => match shell.get("HOME") {
+            Some(home) => home.to_string(),
+            None => {
                 eprintln!("shuck: cd: HOME not set");
                 return ExecOutcome::Continue(1);
             }

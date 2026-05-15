@@ -5,9 +5,10 @@ use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, St
 
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{Command, Connector, Pipeline, Redirect, Sequence};
+use crate::shell_state::Shell;
 
-pub fn execute(seq: &Sequence) -> ExecOutcome {
-    let mut status = run_pipeline(&seq.first);
+pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
+    let mut status = run_pipeline(&seq.first, shell);
     if matches!(status, ExecOutcome::Exit(_)) {
         return status;
     }
@@ -18,7 +19,7 @@ pub fn execute(seq: &Sequence) -> ExecOutcome {
             Connector::Or => matches!(status, ExecOutcome::Continue(c) if c != 0),
         };
         if should_run {
-            status = run_pipeline(pipeline);
+            status = run_pipeline(pipeline, shell);
             if matches!(status, ExecOutcome::Exit(_)) {
                 return status;
             }
@@ -27,11 +28,11 @@ pub fn execute(seq: &Sequence) -> ExecOutcome {
     status
 }
 
-fn run_pipeline(pipeline: &Pipeline) -> ExecOutcome {
+fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
     if pipeline.commands.len() == 1 {
-        run_single(&pipeline.commands[0])
+        run_single(&pipeline.commands[0], shell)
     } else {
-        run_multi_stage(&pipeline.commands)
+        run_multi_stage(&pipeline.commands, shell)
     }
 }
 
@@ -111,7 +112,7 @@ fn status_code(status: &ExitStatus) -> i32 {
 
 // ----- single command -------------------------------------------------------
 
-fn run_single(cmd: &Command) -> ExecOutcome {
+fn run_single(cmd: &Command, shell: &mut Shell) -> ExecOutcome {
     let files = match open_stage_files(cmd) {
         Ok(files) => files,
         Err(()) => return ExecOutcome::Continue(1),
@@ -119,20 +120,22 @@ fn run_single(cmd: &Command) -> ExecOutcome {
 
     if builtins::is_builtin(&cmd.program) {
         match files.stdout {
-            Some(mut file) => builtins::run_builtin(&cmd.program, &cmd.args, &mut file),
+            Some(mut file) => builtins::run_builtin(&cmd.program, &cmd.args, &mut file, shell),
             None => {
                 let mut out = io::stdout();
-                builtins::run_builtin(&cmd.program, &cmd.args, &mut out)
+                builtins::run_builtin(&cmd.program, &cmd.args, &mut out, shell)
             }
         }
     } else {
-        run_subprocess(cmd, files)
+        run_subprocess(cmd, files, shell)
     }
 }
 
-fn run_subprocess(cmd: &Command, files: StageFiles) -> ExecOutcome {
+fn run_subprocess(cmd: &Command, files: StageFiles, shell: &Shell) -> ExecOutcome {
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
+    process.env_clear();
+    process.envs(shell.exported_env());
     if let Some(file) = files.stdin {
         process.stdin(Stdio::from(file));
     }
@@ -171,7 +174,7 @@ enum Stage {
     Process(Child),
 }
 
-fn run_multi_stage(commands: &[Command]) -> ExecOutcome {
+fn run_multi_stage(commands: &[Command], shell: &mut Shell) -> ExecOutcome {
     // Pre-flight: open every redirect file first. If any fails, run nothing.
     let mut all_files: Vec<StageFiles> = Vec::with_capacity(commands.len());
     for cmd in commands {
@@ -201,7 +204,7 @@ fn run_multi_stage(commands: &[Command]) -> ExecOutcome {
             }
 
             let mut buffer: Vec<u8> = Vec::new();
-            let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer);
+            let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer, shell);
             let mut status = match outcome {
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
@@ -233,6 +236,8 @@ fn run_multi_stage(commands: &[Command]) -> ExecOutcome {
 
         let mut process = ProcessCommand::new(&cmd.program);
         process.args(&cmd.args);
+        process.env_clear();
+        process.envs(shell.exported_env());
 
         let mut pending_input: Option<Vec<u8>> = None;
         if let Some(file) = files.stdin {
