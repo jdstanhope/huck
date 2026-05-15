@@ -721,4 +721,20 @@ mod tests {
             ]))]
         );
     }
+
+    #[test]
+    fn tokenize_escaped_dollar_in_double_quotes_is_literal() {
+        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), words(&["$FOO"]));
+    }
+
+    #[test]
+    fn tokenize_two_adjacent_vars() {
+        assert_eq!(
+            tokenize("$FOO$BAR").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Var { name: "FOO".to_string(), quoted: false },
+                WordPart::Var { name: "BAR".to_string(), quoted: false },
+            ]))]
+        );
+    }
 }
