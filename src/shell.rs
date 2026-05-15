@@ -66,14 +66,14 @@ fn install_sigint_handler() {
 fn process_line(line: &str) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
-        Err(LexError::UnterminatedQuote) => {
-            eprintln!("shuck: syntax error: unterminated quote");
+        Err(e) => {
+            eprintln!("shuck: syntax error: {}", lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
     };
 
     match command::parse(tokens) {
-        Ok(Some(pipeline)) => executor::execute(&pipeline),
+        Ok(Some(sequence)) => executor::execute(&sequence),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
             eprintln!("shuck: syntax error: {}", parse_error_message(e));
@@ -87,5 +87,12 @@ fn parse_error_message(error: ParseError) -> &'static str {
         ParseError::MissingCommand => "expected a command",
         ParseError::MissingRedirectTarget => "expected a filename after redirection",
         ParseError::RedirectTargetIsOperator => "expected a filename after redirection",
+    }
+}
+
+fn lex_error_message(error: LexError) -> &'static str {
+    match error {
+        LexError::UnterminatedQuote => "unterminated quote",
+        LexError::BareAmpersand => "unexpected '&'",
     }
 }

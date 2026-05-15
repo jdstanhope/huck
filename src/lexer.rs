@@ -1,6 +1,7 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum LexError {
     UnterminatedQuote,
+    BareAmpersand,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -11,6 +12,9 @@ pub enum Operator {
     RedirIn,        // <
     RedirErr,       // 2>
     RedirErrAppend, // 2>>
+    And,            // &&
+    Or,             // ||
+    Semi,           // ;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,7 +79,31 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     tokens.push(Token::Word(std::mem::take(&mut current)));
                     has_token = false;
                 }
-                tokens.push(Token::Op(Operator::Pipe));
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::Or));
+                } else {
+                    tokens.push(Token::Op(Operator::Pipe));
+                }
+            }
+            '&' => {
+                if has_token {
+                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    has_token = false;
+                }
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::And));
+                } else {
+                    return Err(LexError::BareAmpersand);
+                }
+            }
+            ';' => {
+                if has_token {
+                    tokens.push(Token::Word(std::mem::take(&mut current)));
+                    has_token = false;
+                }
+                tokens.push(Token::Op(Operator::Semi));
             }
             '<' => {
                 if has_token {
@@ -129,6 +157,8 @@ mod tests {
     fn words(parts: &[&str]) -> Vec<Token> {
         parts.iter().map(|w| Token::Word(w.to_string())).collect()
     }
+
+    // ----- existing v2 lexer tests (must keep passing) -----
 
     #[test]
     fn tokenize_simple_command() {
@@ -345,6 +375,123 @@ mod tests {
                 Token::Word("b".to_string()),
                 Token::Op(Operator::RedirOut),
                 Token::Word("out".to_string()),
+            ]
+        );
+    }
+
+    // ----- new: sequencing operators -----
+
+    #[test]
+    fn tokenize_or_with_spaces() {
+        assert_eq!(
+            tokenize("a || b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::Or),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_or_without_spaces() {
+        assert_eq!(
+            tokenize("a||b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::Or),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_and_with_spaces() {
+        assert_eq!(
+            tokenize("a && b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::And),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_and_without_spaces() {
+        assert_eq!(
+            tokenize("a&&b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::And),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_bare_ampersand_is_error() {
+        assert_eq!(tokenize("a & b").unwrap_err(), LexError::BareAmpersand);
+    }
+
+    #[test]
+    fn tokenize_bare_ampersand_at_end_is_error() {
+        assert_eq!(tokenize("a &").unwrap_err(), LexError::BareAmpersand);
+    }
+
+    #[test]
+    fn tokenize_semicolon_with_spaces() {
+        assert_eq!(
+            tokenize("a ; b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::Semi),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_semicolon_without_spaces() {
+        assert_eq!(
+            tokenize("a;b").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::Semi),
+                Token::Word("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_quoted_sequencing_operators_stay_words() {
+        assert_eq!(
+            tokenize(r#"echo "&&" "||" ";""#).unwrap(),
+            words(&["echo", "&&", "||", ";"])
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_sequencing_operators_stay_words() {
+        // `\&` is just `&` (literal); two `\&` make `&&` (the literal word, not the op).
+        assert_eq!(
+            tokenize(r"echo \&\& \|\| \;").unwrap(),
+            words(&["echo", "&&", "||", ";"])
+        );
+    }
+
+    #[test]
+    fn tokenize_combined_sequencing_operators() {
+        assert_eq!(
+            tokenize("a && b || c ; d").unwrap(),
+            vec![
+                Token::Word("a".to_string()),
+                Token::Op(Operator::And),
+                Token::Word("b".to_string()),
+                Token::Op(Operator::Or),
+                Token::Word("c".to_string()),
+                Token::Op(Operator::Semi),
+                Token::Word("d".to_string()),
             ]
         );
     }
