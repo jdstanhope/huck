@@ -62,6 +62,11 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Pipeline>, ParseError> {
                     stderr: stderr.take(),
                 });
             }
+            Token::Op(Operator::And | Operator::Or | Operator::Semi) => {
+                // INTERIM (made real in Task 2): sequencing operators are not
+                // yet parsed; report as a syntax error.
+                return Err(ParseError::MissingCommand);
+            }
             Token::Op(op) => {
                 // A redirect operator: the next token must be a filename word.
                 let target = match iter.next() {
@@ -75,7 +80,9 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Pipeline>, ParseError> {
                     Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
                     Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
                     Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
-                    Operator::Pipe => unreachable!("Pipe is handled in the arm above"),
+                    Operator::Pipe | Operator::And | Operator::Or | Operator::Semi => {
+                        unreachable!("handled in the outer arms");
+                    }
                 }
             }
         }
@@ -305,6 +312,15 @@ mod tests {
                 w("b"),
             ]),
             Err(ParseError::RedirectTargetIsOperator)
+        );
+    }
+
+    #[test]
+    fn parse_sequencing_op_is_interim_missing_command() {
+        // INTERIM (deleted in Task 2): the parser does not yet handle sequencing.
+        assert_eq!(
+            parse(vec![w("a"), Token::Op(Operator::Semi), w("b")]),
+            Err(ParseError::MissingCommand)
         );
     }
 }
