@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use signal_hook::consts::SIGINT;
+use signal_hook::consts::{SIGCHLD, SIGINT};
 
 use crate::builtins::ExecOutcome;
 use crate::command::{self, ParseError};
@@ -26,6 +26,7 @@ pub fn run() -> i32 {
     };
 
     let mut shell = Shell::new();
+    install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
 
     loop {
         match editor.readline(PROMPT) {
@@ -60,6 +61,14 @@ fn install_sigint_handler() {
     }
 }
 
+/// Installs a SIGCHLD handler that toggles the supplied flag. Called once
+/// at startup; the flag lives on the `Shell` so the reap path can poll it.
+fn install_sigchld_handler(flag: Arc<AtomicBool>) {
+    if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
+        eprintln!("shuck: warning: could not install SIGCHLD handler: {e}");
+    }
+}
+
 /// Tokenizes, parses, and executes a single input line.
 fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
@@ -71,7 +80,7 @@ fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     };
 
     match command::parse(tokens) {
-        Ok(Some(sequence)) => executor::execute(&sequence, shell),
+        Ok(Some(sequence)) => executor::execute(&sequence, shell, line),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
             eprintln!("shuck: syntax error: {}", parse_error_message(e));

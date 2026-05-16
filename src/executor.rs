@@ -17,20 +17,20 @@ pub enum StdoutSink<'a> {
     Capture(&'a mut Vec<u8>),
 }
 
-pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
+pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    execute_inner(seq, shell, &mut sink)
+    execute_inner(seq, shell, &mut sink, source)
 }
 
-/// Runs a sequence with stdout captured to a buffer. The returned status is
-/// the last command's exit code (`ExecOutcome::Exit` and `Continue` are both
-/// treated as a normal status here — `exit N` inside `$(...)` terminates the
-/// substitution with status N, not the parent shuck).
+/// Runs a sequence with stdout captured to a buffer. Used by command
+/// substitution; the substituted command's `background` flag is ignored
+/// (substitutions always wait), and we pass an empty `source` since job-
+/// table registration is irrelevant inside a substitution.
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
         let mut sink = StdoutSink::Capture(&mut buf);
-        execute_inner(seq, shell, &mut sink)
+        execute_inner(seq, shell, &mut sink, "")
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
@@ -38,7 +38,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
-fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink, _source: &str) -> ExecOutcome {
     let mut status = run_pipeline(&seq.first, shell, sink);
     if matches!(status, ExecOutcome::Exit(_)) {
         return status;
