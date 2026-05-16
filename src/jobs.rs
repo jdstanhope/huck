@@ -70,7 +70,9 @@ impl JobTable {
             pgid: 0,
             pids: Vec::new(),
             reaped: Vec::new(),
-            last_status: Some(0),
+            // Encode `exit` as a normal-exit raw waitpid status so any
+            // future reader of `last_status` can decode it consistently.
+            last_status: Some(exit << 8),
             command,
             state: JobState::Done(exit),
             notified: false,
