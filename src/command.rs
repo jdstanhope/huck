@@ -141,13 +141,14 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     while let Some(token) = iter.next() {
         match token {
             Token::Op(Operator::Background) => {
-                // Trailing `&` only: nothing must follow.
-                if iter.peek().is_some() {
-                    return Err(ParseError::UnexpectedBackground);
-                }
-                // And only on a single-pipeline sequence.
+                // The multi-pipeline restriction is the more specific
+                // diagnostic, so report it first. `UnexpectedBackground`
+                // covers the remaining "& is not at the end" case.
                 if !rest.is_empty() {
                     return Err(ParseError::BackgroundedMultiPipelineSequence);
+                }
+                if iter.peek().is_some() {
+                    return Err(ParseError::UnexpectedBackground);
                 }
                 background = true;
                 break;
@@ -703,6 +704,22 @@ mod tests {
                 Token::Op(Operator::Semi),
                 w_tok("cmd2"),
                 Token::Op(Operator::Background),
+            ]),
+            Err(ParseError::BackgroundedMultiPipelineSequence)
+        );
+    }
+
+    #[test]
+    fn parse_background_mid_sequence_after_andor_prefers_multipipeline_error() {
+        // cmd1 && cmd2 & cmd3 — both errors apply; the more specific
+        // BackgroundedMultiPipelineSequence wins.
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd1"),
+                Token::Op(Operator::And),
+                w_tok("cmd2"),
+                Token::Op(Operator::Background),
+                w_tok("cmd3"),
             ]),
             Err(ParseError::BackgroundedMultiPipelineSequence)
         );
