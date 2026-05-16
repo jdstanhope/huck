@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Job table for tracking background pipelines.
 //!
 //! A `Job` represents one background pipeline. Its `pids` are the PIDs of
@@ -18,6 +17,7 @@ pub enum JobState {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: u32,
+    #[allow(dead_code)]
     pub pgid: i32,
     pub pids: Vec<i32>,
     pub reaped: Vec<bool>,
@@ -84,10 +84,12 @@ impl JobTable {
         id
     }
 
+    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
 
+    #[allow(dead_code)]
     pub fn has_running(&self) -> bool {
         self.jobs.iter().any(|j| matches!(j.state, JobState::Running))
     }
@@ -156,6 +158,52 @@ impl JobTable {
             }
             id += 1;
         }
+    }
+}
+
+/// Drains all reapable children via non-blocking `waitpid(WNOHANG)`, feeding
+/// each into the shell's job table. Also resets the SIGCHLD flag.
+pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
+    shell
+        .sigchld_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let mut raw_status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WNOHANG) };
+        if pid <= 0 {
+            // 0 = no children changed state; -1 = no children at all (ECHILD)
+            break;
+        }
+        shell.jobs.reap(pid as i32, raw_status);
+    }
+}
+
+/// Reaps and then prints `[N]<flag> <state> <cmd> &` for any newly-completed
+/// jobs. Drops the printed jobs from the table.
+pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
+    reap_completed(shell);
+    let (current, previous) = shell.jobs.current_and_previous();
+    let notifs = shell.jobs.drain_notifications();
+    for job in notifs {
+        let flag = if Some(job.id) == current {
+            '+'
+        } else if Some(job.id) == previous {
+            '-'
+        } else {
+            ' '
+        };
+        let state = render_state(&job.state);
+        eprintln!("[{}]{} {:<20} {} &", job.id, flag, state, job.command);
+    }
+    shell.jobs.remove_notified();
+}
+
+pub fn render_state(state: &JobState) -> String {
+    match state {
+        JobState::Running => "Running".to_string(),
+        JobState::Done(0) => "Done".to_string(),
+        JobState::Done(n) => format!("Exit {n}"),
+        JobState::Signaled(s) => format!("Killed (signal {s})"),
     }
 }
 

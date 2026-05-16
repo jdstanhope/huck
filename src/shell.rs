@@ -29,6 +29,7 @@ pub fn run() -> i32 {
     install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
 
     loop {
+        crate::jobs::reap_and_notify(&mut shell);
         match editor.readline(PROMPT) {
             Ok(line) => {
                 if !line.trim().is_empty() {
