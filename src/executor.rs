@@ -10,8 +10,38 @@ use crate::command::{
 use crate::expand::{expand, expand_assignment};
 use crate::shell_state::Shell;
 
+/// Where the terminal stage of a top-level pipeline sends its stdout when
+/// there's no explicit `> file` redirect.
+pub enum StdoutSink<'a> {
+    Terminal,
+    #[allow(dead_code)]
+    Capture(&'a mut Vec<u8>),
+}
+
 pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
-    let mut status = run_pipeline(&seq.first, shell);
+    let mut sink = StdoutSink::Terminal;
+    execute_inner(seq, shell, &mut sink)
+}
+
+/// Runs a sequence with stdout captured to a buffer. The returned status is
+/// the last command's exit code (`ExecOutcome::Exit` and `Continue` are both
+/// treated as a normal status here — `exit N` inside `$(...)` terminates the
+/// substitution with status N, not the parent shuck).
+#[allow(dead_code)]
+pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    let mut buf: Vec<u8> = Vec::new();
+    let outcome = {
+        let mut sink = StdoutSink::Capture(&mut buf);
+        execute_inner(seq, shell, &mut sink)
+    };
+    let status = match outcome {
+        ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
+    };
+    (String::from_utf8_lossy(&buf).into_owned(), status)
+}
+
+fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    let mut status = run_pipeline(&seq.first, shell, sink);
     if matches!(status, ExecOutcome::Exit(_)) {
         return status;
     }
@@ -22,7 +52,7 @@ pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
             Connector::Or => matches!(status, ExecOutcome::Continue(c) if c != 0),
         };
         if should_run {
-            status = run_pipeline(pipeline, shell);
+            status = run_pipeline(pipeline, shell, sink);
             if matches!(status, ExecOutcome::Exit(_)) {
                 return status;
             }
@@ -31,17 +61,16 @@ pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
     status
 }
 
-fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell) -> ExecOutcome {
+fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     if pipeline.commands.len() == 1 {
-        run_single(&pipeline.commands[0], shell)
+        run_single(&pipeline.commands[0], shell, sink)
     } else {
-        run_multi_stage(&pipeline.commands, shell)
+        run_multi_stage(&pipeline.commands, shell, sink)
     }
 }
 
 // ----- resolved command (post-expansion) ------------------------------------
 
-/// A command with every `Word` already expanded against the live `Shell`.
 struct ResolvedCommand {
     program: String,
     args: Vec<String>,
@@ -55,9 +84,7 @@ enum ResolvedRedirect {
     Append(String),
 }
 
-/// Expands a `Word` to exactly one string, or prints an `ambiguous redirect`
-/// error and returns `Err(())`.
-fn expand_single(word: &crate::lexer::Word, shell: &Shell) -> Result<String, ()> {
+fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String, ()> {
     let fields = expand(word, shell);
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap())
@@ -67,9 +94,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &Shell) -> Result<String, ()>
     }
 }
 
-/// Expands every Word in an ExecCommand. Returns `Err(status)` on failure
-/// (empty program → 127, ambiguous redirect → 1).
-fn resolve(cmd: &ExecCommand, shell: &Shell) -> Result<ResolvedCommand, i32> {
+fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
     let prog_fields = expand(&cmd.program, shell);
     if prog_fields.is_empty() {
         eprintln!("shuck: command not found:");
@@ -177,9 +202,9 @@ fn status_code(status: &ExitStatus) -> i32 {
 
 // ----- single command -------------------------------------------------------
 
-fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
+fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     match cmd {
-        SimpleCommand::Exec(exec) => run_exec_single(exec, shell),
+        SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign { name, value } => {
             shell.set(name, expand_assignment(value, shell));
             ExecOutcome::Continue(0)
@@ -187,7 +212,7 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell) -> ExecOutcome {
     }
 }
 
-fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell) -> ExecOutcome {
+fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
@@ -202,17 +227,27 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell) -> ExecOutcome {
             Some(mut file) => {
                 builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
             }
-            None => {
-                let mut out = io::stdout();
-                builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
-            }
+            None => match sink {
+                StdoutSink::Terminal => {
+                    let mut out = io::stdout();
+                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                }
+                StdoutSink::Capture(buf) => {
+                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                }
+            },
         }
     } else {
-        run_subprocess(&resolved, files, shell)
+        run_subprocess(&resolved, files, shell, sink)
     }
 }
 
-fn run_subprocess(cmd: &ResolvedCommand, files: StageFiles, shell: &Shell) -> ExecOutcome {
+fn run_subprocess(
+    cmd: &ResolvedCommand,
+    files: StageFiles,
+    shell: &Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
     process.env_clear();
@@ -220,15 +255,31 @@ fn run_subprocess(cmd: &ResolvedCommand, files: StageFiles, shell: &Shell) -> Ex
     if let Some(file) = files.stdin {
         process.stdin(Stdio::from(file));
     }
+    let want_capture = matches!(sink, StdoutSink::Capture(_));
     if let Some(file) = files.stdout {
         process.stdout(Stdio::from(file));
+    } else if want_capture {
+        process.stdout(Stdio::piped());
     }
     if let Some(file) = files.stderr {
         process.stderr(Stdio::from(file));
     }
 
-    match process.status() {
-        Ok(status) => ExecOutcome::Continue(status_code(&status)),
+    match process.spawn() {
+        Ok(mut child) => {
+            if let StdoutSink::Capture(buf) = sink {
+                if let Some(mut child_stdout) = child.stdout.take() {
+                    let _ = io::copy(&mut child_stdout, *buf);
+                }
+            }
+            match child.wait() {
+                Ok(status) => ExecOutcome::Continue(status_code(&status)),
+                Err(e) => {
+                    eprintln!("shuck: {}: {e}", cmd.program);
+                    ExecOutcome::Continue(1)
+                }
+            }
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             eprintln!("shuck: command not found: {}", cmd.program);
             ExecOutcome::Continue(127)
@@ -253,16 +304,15 @@ enum Stage {
     Process(Child),
 }
 
-fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome {
+fn run_multi_stage(
+    commands: &[SimpleCommand],
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
     let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             SimpleCommand::Assign { .. } => {
-                // Inside a multi-stage pipeline, an assignment is a no-op
-                // (its shell-state effect would only apply to a subshell,
-                // which we don't fork). Record a placeholder None so the
-                // index alignment with `all_files` and the stage loop stays
-                // correct.
                 resolved_stages.push(None);
             }
             SimpleCommand::Exec(exec) => match resolve(exec, shell) {
@@ -293,14 +343,12 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
         let cmd = match resolved {
             Some(r) => r,
             None => {
-                // Assign stage in a pipeline: no-op. Hand the next stage an
-                // empty input so it doesn't see the terminal stdin.
                 drop(incoming);
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
                 }
                 stages.push(Stage::Done(0));
-                let _ = files; // Option<StageFiles>, always None here
+                let _ = files;
                 continue;
             }
         };
@@ -335,9 +383,16 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
                 }
                 None => {
                     if is_last {
-                        if let Err(e) = io::stdout().write_all(&buffer) {
-                            eprintln!("shuck: {}: {e}", cmd.program);
-                            status = 1;
+                        match sink {
+                            StdoutSink::Terminal => {
+                                if let Err(e) = io::stdout().write_all(&buffer) {
+                                    eprintln!("shuck: {}: {e}", cmd.program);
+                                    status = 1;
+                                }
+                            }
+                            StdoutSink::Capture(buf) => {
+                                buf.extend_from_slice(&buffer);
+                            }
                         }
                     } else {
                         carry = Carry::Buffer(buffer);
@@ -370,9 +425,11 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
         }
 
         let pipe_onward = !is_last && cmd.stdout.is_none();
+        let want_terminal_capture =
+            is_last && cmd.stdout.is_none() && matches!(sink, StdoutSink::Capture(_));
         if let Some(file) = files.stdout {
             process.stdout(Stdio::from(file));
-        } else if pipe_onward {
+        } else if pipe_onward || want_terminal_capture {
             process.stdout(Stdio::piped());
         }
 
@@ -410,6 +467,12 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
             carry = Carry::ChildStdout(child.stdout.take().expect("stdout was set to piped"));
         } else if !is_last {
             carry = Carry::Buffer(Vec::new());
+        } else if want_terminal_capture {
+            if let StdoutSink::Capture(buf) = sink {
+                if let Some(mut child_stdout) = child.stdout.take() {
+                    let _ = io::copy(&mut child_stdout, *buf);
+                }
+            }
         }
 
         stages.push(Stage::Process(child));
@@ -431,4 +494,62 @@ fn run_multi_stage(commands: &[SimpleCommand], shell: &mut Shell) -> ExecOutcome
         }
     }
     ExecOutcome::Continue(last_status)
+}
+
+// ----- tests ---------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+    use crate::lexer::{Word, WordPart};
+
+    fn lit_word(s: &str) -> Word {
+        Word(vec![WordPart::Literal(s.to_string())])
+    }
+
+    fn exec(program: &str, args: &[&str]) -> SimpleCommand {
+        SimpleCommand::Exec(ExecCommand {
+            program: lit_word(program),
+            args: args.iter().map(|a| lit_word(a)).collect(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        })
+    }
+
+    fn one_command_sequence(cmd: SimpleCommand) -> Sequence {
+        Sequence {
+            first: Pipeline { commands: vec![cmd] },
+            rest: vec![],
+        }
+    }
+
+    #[test]
+    fn execute_capturing_echo_returns_raw_output_with_newline() {
+        // execute_capturing does NOT strip; that happens in expand::run_substitution.
+        let seq = one_command_sequence(exec("echo", &["hi"]));
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(out, "hi\n");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn execute_capturing_exit_returns_status() {
+        let seq = one_command_sequence(exec("exit", &["7"]));
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(out, "");
+        assert_eq!(status, 7);
+    }
+
+    #[test]
+    fn execute_capturing_empty_echo() {
+        let seq = one_command_sequence(exec("echo", &[]));
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(out, "\n");
+        assert_eq!(status, 0);
+    }
 }
