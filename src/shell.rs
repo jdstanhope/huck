@@ -88,11 +88,18 @@ fn parse_error_message(error: ParseError) -> &'static str {
     }
 }
 
-fn lex_error_message(error: LexError) -> &'static str {
+fn lex_error_message(error: LexError) -> String {
     match error {
-        LexError::UnterminatedQuote => "unterminated quote",
-        LexError::BareAmpersand => "unexpected '&'",
-        LexError::InvalidVarName => "invalid variable name in '${...}'",
-        LexError::UnterminatedBrace => "unterminated '${...}'",
+        LexError::UnterminatedQuote => "unterminated quote".to_string(),
+        LexError::BareAmpersand => "unexpected '&'".to_string(),
+        LexError::InvalidVarName => "invalid variable name in '${...}'".to_string(),
+        LexError::UnterminatedBrace => "unterminated '${...}'".to_string(),
+        LexError::UnterminatedSubstitution => "unterminated command substitution".to_string(),
+        LexError::SubstitutionLexError(inner) => {
+            format!("in command substitution: {}", lex_error_message(*inner))
+        }
+        LexError::SubstitutionParseError(inner) => {
+            format!("in command substitution: {}", parse_error_message(inner))
+        }
     }
 }

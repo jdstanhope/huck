@@ -14,7 +14,6 @@ use crate::shell_state::Shell;
 /// there's no explicit `> file` redirect.
 pub enum StdoutSink<'a> {
     Terminal,
-    #[allow(dead_code)]
     Capture(&'a mut Vec<u8>),
 }
 
@@ -27,7 +26,6 @@ pub fn execute(seq: &Sequence, shell: &mut Shell) -> ExecOutcome {
 /// the last command's exit code (`ExecOutcome::Exit` and `Continue` are both
 /// treated as a normal status here — `exit N` inside `$(...)` terminates the
 /// substitution with status N, not the parent shuck).
-#[allow(dead_code)]
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
@@ -206,7 +204,8 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign { name, value } => {
-            shell.set(name, expand_assignment(value, shell));
+            let v = expand_assignment(value, shell);
+            shell.set(name, v);
             ExecOutcome::Continue(0)
         }
     }

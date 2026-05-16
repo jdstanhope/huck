@@ -1,45 +1,52 @@
 use crate::lexer::{Operator, Token, Word};
 
 /// If `word` looks like `NAME=value` (a leading `Literal` whose text begins
-/// with a valid identifier followed by `=`), returns `Some((name, value))`
+/// with a valid identifier followed by `=`), returns `Ok((name, value))`
 /// where `value` is a `Word` containing the rest of the prefix Literal
-/// followed by the remaining original parts. Otherwise `None`.
-fn try_split_assignment(word: &crate::lexer::Word) -> Option<(String, crate::lexer::Word)> {
+/// followed by the remaining original parts (moved, not cloned). Otherwise
+/// returns `Err(word)` handing the original back unchanged.
+fn try_split_assignment(
+    word: crate::lexer::Word,
+) -> Result<(String, crate::lexer::Word), crate::lexer::Word> {
     use crate::lexer::WordPart;
-    let first = word.0.first()?;
+    let first = match word.0.first() {
+        Some(p) => p,
+        None => return Err(word),
+    };
     let text = match first {
         WordPart::Literal(s) => s,
-        _ => return None,
+        _ => return Err(word),
     };
-    let eq = text.find('=')?;
-    let name = &text[..eq];
-    if name.is_empty() {
-        return None;
+    let Some(eq) = text.find('=') else {
+        return Err(word);
+    };
+    let name_slice = &text[..eq];
+    if name_slice.is_empty() {
+        return Err(word);
     }
-    let mut name_chars = name.chars();
-    let first_ch = name_chars.next()?;
+    let mut name_chars = name_slice.chars();
+    let Some(first_ch) = name_chars.next() else {
+        return Err(word);
+    };
     if !(first_ch == '_' || first_ch.is_ascii_alphabetic()) {
-        return None;
+        return Err(word);
     }
     if !name_chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        return None;
+        return Err(word);
     }
-    let rest_of_first = text[eq + 1..].to_string();
-    let mut value_parts: Vec<WordPart> = Vec::with_capacity(word.0.len());
+
+    // Validation passed — destructure the word, moving parts into the value.
+    let crate::lexer::Word(mut parts) = word;
+    let first_part = parts.remove(0);
+    let text = match first_part {
+        WordPart::Literal(s) => s,
+        _ => unreachable!("checked above"),
+    };
+    let (name, rest_of_first) = (text[..eq].to_string(), text[eq + 1..].to_string());
+    let mut value_parts: Vec<WordPart> = Vec::with_capacity(parts.len() + 1);
     value_parts.push(WordPart::Literal(rest_of_first));
-    for part in word.0.iter().skip(1) {
-        let cloned = match part {
-            WordPart::Literal(s) => WordPart::Literal(s.clone()),
-            WordPart::Var { name, quoted } => WordPart::Var {
-                name: name.clone(),
-                quoted: *quoted,
-            },
-            WordPart::LastStatus { quoted } => WordPart::LastStatus { quoted: *quoted },
-            WordPart::Tilde => WordPart::Tilde,
-        };
-        value_parts.push(cloned);
-    }
-    Some((name.to_string(), crate::lexer::Word(value_parts)))
+    value_parts.extend(parts);
+    Ok((name, crate::lexer::Word(value_parts)))
 }
 
 fn finalize_stage(
@@ -50,8 +57,17 @@ fn finalize_stage(
     stderr: Option<Redirect>,
 ) -> SimpleCommand {
     if args.is_empty() && stdin.is_none() && stdout.is_none() && stderr.is_none() {
-        if let Some((name, value)) = try_split_assignment(&program) {
-            return SimpleCommand::Assign { name, value };
+        match try_split_assignment(program) {
+            Ok((name, value)) => return SimpleCommand::Assign { name, value },
+            Err(restored) => {
+                return SimpleCommand::Exec(ExecCommand {
+                    program: restored,
+                    args,
+                    stdin,
+                    stdout,
+                    stderr,
+                });
+            }
         }
     }
     SimpleCommand::Exec(ExecCommand {

@@ -1,3 +1,5 @@
+use crate::command::Sequence;
+use crate::executor;
 use crate::lexer::{Word, WordPart};
 use crate::shell_state::Shell;
 
@@ -5,7 +7,7 @@ use crate::shell_state::Shell;
 /// argument strings. Quoted variable references append their value verbatim;
 /// unquoted references split on ASCII whitespace and can yield multiple
 /// fields (or zero, for an empty value).
-pub fn expand(word: &Word, shell: &Shell) -> Vec<String> {
+pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
     let mut current = String::new();
     let mut has_emitted = false;
     let mut result: Vec<String> = Vec::new();
@@ -33,12 +35,21 @@ pub fn expand(word: &Word, shell: &Shell) -> Vec<String> {
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
-                let value = shell.get(name).unwrap_or("");
-                emit_split(value, &mut current, &mut result, &mut has_emitted);
+                let value = shell.get(name).map(|s| s.to_string()).unwrap_or_default();
+                emit_split(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::LastStatus { quoted: false } => {
                 let value = shell.last_status().to_string();
                 emit_split(&value, &mut current, &mut result, &mut has_emitted);
+            }
+            WordPart::CommandSub { sequence, quoted: true } => {
+                let output = run_substitution(sequence, shell);
+                current.push_str(&output);
+                has_emitted = true;
+            }
+            WordPart::CommandSub { sequence, quoted: false } => {
+                let output = run_substitution(sequence, shell);
+                emit_split(&output, &mut current, &mut result, &mut has_emitted);
             }
         }
     }
@@ -50,10 +61,10 @@ pub fn expand(word: &Word, shell: &Shell) -> Vec<String> {
 }
 
 /// Expands a `Word` for assignment context: word-splitting is suppressed and
-/// the result is one string. Each `Var`/`LastStatus` part contributes its
-/// value verbatim regardless of the `quoted` flag — matching bash, which
-/// disables splitting on the right-hand side of `NAME=...`.
-pub fn expand_assignment(word: &Word, shell: &Shell) -> String {
+/// the result is one string. Each `Var`/`LastStatus`/`CommandSub` part
+/// contributes its value verbatim regardless of the `quoted` flag — matching
+/// bash, which disables splitting on the right-hand side of `NAME=...`.
+pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     let mut result = String::new();
     for part in &word.0 {
         match part {
@@ -71,13 +82,29 @@ pub fn expand_assignment(word: &Word, shell: &Shell) -> String {
             WordPart::LastStatus { .. } => {
                 result.push_str(&shell.last_status().to_string());
             }
+            WordPart::CommandSub { sequence, .. } => {
+                result.push_str(&run_substitution(sequence, shell));
+            }
         }
     }
     result
 }
 
-/// Splits `value` on ASCII whitespace and integrates the fields into the
-/// caller's accumulator state, following the standard word-splitting rule.
+/// Runs a sub-sequence as a substituted command: clones the parent `Shell`
+/// (so state mutations don't leak), captures stdout via the executor's
+/// `execute_capturing`, strips trailing newlines, and propagates the
+/// substituted command's exit status into the parent shell's `$?`.
+pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
+    let mut cloned = shell.clone();
+    let (output, status) = executor::execute_capturing(seq, &mut cloned);
+    shell.set_last_status(status);
+    strip_trailing_newlines(&output)
+}
+
+fn strip_trailing_newlines(s: &str) -> String {
+    s.trim_end_matches('\n').to_string()
+}
+
 fn emit_split(
     value: &str,
     current: &mut String,
@@ -86,9 +113,7 @@ fn emit_split(
 ) {
     let fields: Vec<&str> = value.split_ascii_whitespace().collect();
     match fields.len() {
-        0 => {
-            // No fields — the unquoted empty expansion contributes nothing.
-        }
+        0 => {}
         1 => {
             current.push_str(fields[0]);
             *has_emitted = true;
@@ -108,31 +133,10 @@ fn emit_split(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{ExecCommand, Pipeline, SimpleCommand};
 
     fn lit(s: &str) -> Word {
         Word(vec![WordPart::Literal(s.to_string())])
-    }
-
-    #[test]
-    fn expand_literal_word() {
-        let shell = Shell::new();
-        assert_eq!(expand(&lit("hello"), &shell), vec!["hello".to_string()]);
-    }
-
-    #[test]
-    fn expand_empty_literal_yields_one_empty_arg() {
-        let shell = Shell::new();
-        assert_eq!(expand(&lit(""), &shell), vec!["".to_string()]);
-    }
-
-    #[test]
-    fn expand_multiple_literals_concatenate() {
-        let shell = Shell::new();
-        let word = Word(vec![
-            WordPart::Literal("foo".to_string()),
-            WordPart::Literal("bar".to_string()),
-        ]);
-        assert_eq!(expand(&word, &shell), vec!["foobar".to_string()]);
     }
 
     fn var_unq(name: &str) -> Word {
@@ -142,17 +146,71 @@ mod tests {
         Word(vec![WordPart::Var { name: name.to_string(), quoted: true }])
     }
 
+    /// Builds a synthetic Sequence for `echo <args>` — used to drive
+    /// CommandSub expansion in unit tests without invoking the lexer.
+    fn echo_sequence(args: &[&str]) -> Sequence {
+        Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: lit("echo"),
+                    args: args.iter().map(|a| lit(a)).collect(),
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            },
+            rest: vec![],
+        }
+    }
+
+    fn exit_sequence(code: i32) -> Sequence {
+        Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: lit("exit"),
+                    args: vec![lit(&code.to_string())],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            },
+            rest: vec![],
+        }
+    }
+
+    #[test]
+    fn expand_literal_word() {
+        let mut shell = Shell::new();
+        assert_eq!(expand(&lit("hello"), &mut shell), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn expand_empty_literal_yields_one_empty_arg() {
+        let mut shell = Shell::new();
+        assert_eq!(expand(&lit(""), &mut shell), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn expand_multiple_literals_concatenate() {
+        let mut shell = Shell::new();
+        let word = Word(vec![
+            WordPart::Literal("foo".to_string()),
+            WordPart::Literal("bar".to_string()),
+        ]);
+        assert_eq!(expand(&word, &mut shell), vec!["foobar".to_string()]);
+    }
+
     #[test]
     fn expand_unset_unquoted_yields_no_args() {
-        let shell = Shell::new();
-        assert!(expand(&var_unq("DEFINITELY_NOT_SET_XYZ"), &shell).is_empty());
+        let mut shell = Shell::new();
+        assert!(expand(&var_unq("DEFINITELY_NOT_SET_XYZ"), &mut shell).is_empty());
     }
 
     #[test]
     fn expand_unset_quoted_yields_one_empty_arg() {
-        let shell = Shell::new();
+        let mut shell = Shell::new();
         assert_eq!(
-            expand(&var_q("DEFINITELY_NOT_SET_XYZ"), &shell),
+            expand(&var_q("DEFINITELY_NOT_SET_XYZ"), &mut shell),
             vec!["".to_string()]
         );
     }
@@ -161,7 +219,7 @@ mod tests {
     fn expand_set_var_quoted_preserves_whitespace() {
         let mut shell = Shell::new();
         shell.set("SHUCK_T", "a b".to_string());
-        assert_eq!(expand(&var_q("SHUCK_T"), &shell), vec!["a b".to_string()]);
+        assert_eq!(expand(&var_q("SHUCK_T"), &mut shell), vec!["a b".to_string()]);
     }
 
     #[test]
@@ -169,7 +227,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("SHUCK_T", "a b".to_string());
         assert_eq!(
-            expand(&var_unq("SHUCK_T"), &shell),
+            expand(&var_unq("SHUCK_T"), &mut shell),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -183,7 +241,7 @@ mod tests {
             WordPart::Var { name: "SHUCK_T".to_string(), quoted: false },
         ]);
         assert_eq!(
-            expand(&word, &shell),
+            expand(&word, &mut shell),
             vec!["ax".to_string(), "y".to_string()]
         );
     }
@@ -193,7 +251,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_last_status(42);
         let word = Word(vec![WordPart::LastStatus { quoted: true }]);
-        assert_eq!(expand(&word, &shell), vec!["42".to_string()]);
+        assert_eq!(expand(&word, &mut shell), vec!["42".to_string()]);
     }
 
     #[test]
@@ -205,44 +263,39 @@ mod tests {
             WordPart::Literal("/foo".to_string()),
         ]);
         assert_eq!(
-            expand(&word, &shell),
+            expand(&word, &mut shell),
             vec!["/tmp/shuck_test/foo".to_string()]
         );
     }
 
     #[test]
     fn expand_unset_unquoted_returns_no_fields_for_redirect_check() {
-        // executor.rs::expand_single uses fields.len() != 1 as the
-        // "ambiguous redirect" signal. Confirm 0 fields fires it.
-        let shell = Shell::new();
+        let mut shell = Shell::new();
         assert_eq!(expand(&Word(vec![WordPart::Var {
             name: "DEFINITELY_NOT_SET_REDIR".to_string(),
             quoted: false,
-        }]), &shell).len(), 0);
+        }]), &mut shell).len(), 0);
     }
 
     #[test]
     fn expand_unquoted_var_with_two_fields_returns_two_for_redirect_check() {
-        // Two-field result must also fire the ambiguous-redirect path.
         let mut shell = Shell::new();
         shell.set("SHUCK_T_TWOFIELD", "a b".to_string());
         assert_eq!(expand(&Word(vec![WordPart::Var {
             name: "SHUCK_T_TWOFIELD".to_string(),
             quoted: false,
-        }]), &shell).len(), 2);
+        }]), &mut shell).len(), 2);
     }
 
     #[test]
     fn expand_assignment_preserves_interior_whitespace() {
-        // Assignment context: word-splitting is suppressed, so "a  b"
-        // (two spaces) must round-trip exactly.
         let mut shell = Shell::new();
         shell.set("SHUCK_T_PAD", "a  b".to_string());
         let word = Word(vec![WordPart::Var {
             name: "SHUCK_T_PAD".to_string(),
             quoted: false,
         }]);
-        assert_eq!(expand_assignment(&word, &shell), "a  b".to_string());
+        assert_eq!(expand_assignment(&word, &mut shell), "a  b".to_string());
     }
 
     #[test]
@@ -254,17 +307,105 @@ mod tests {
             WordPart::Var { name: "SHUCK_T_X".to_string(), quoted: false },
             WordPart::Literal("-post".to_string()),
         ]);
-        assert_eq!(expand_assignment(&word, &shell), "pre-x-post".to_string());
+        assert_eq!(expand_assignment(&word, &mut shell), "pre-x-post".to_string());
     }
 
     #[test]
     fn expand_assignment_unset_var_yields_empty_segment() {
-        let shell = Shell::new();
+        let mut shell = Shell::new();
         let word = Word(vec![
             WordPart::Literal("[".to_string()),
             WordPart::Var { name: "DEFINITELY_NOT_SET_ASN".to_string(), quoted: false },
             WordPart::Literal("]".to_string()),
         ]);
-        assert_eq!(expand_assignment(&word, &shell), "[]".to_string());
+        assert_eq!(expand_assignment(&word, &mut shell), "[]".to_string());
+    }
+
+    // ---- CommandSub tests --------------------------------------------------
+
+    #[test]
+    fn expand_command_sub_invokes_inner_echo() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: echo_sequence(&["hello"]),
+            quoted: false,
+        }]);
+        assert_eq!(expand(&word, &mut shell), vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn expand_command_sub_unquoted_splits() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: echo_sequence(&["a", "b"]),
+            quoted: false,
+        }]);
+        assert_eq!(
+            expand(&word, &mut shell),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_command_sub_quoted_preserves_whitespace() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: echo_sequence(&["a", "b"]),
+            quoted: true,
+        }]);
+        assert_eq!(expand(&word, &mut shell), vec!["a b".to_string()]);
+    }
+
+    #[test]
+    fn expand_command_sub_with_literal_prefix_merges_first_field() {
+        let mut shell = Shell::new();
+        let word = Word(vec![
+            WordPart::Literal("pre".to_string()),
+            WordPart::CommandSub {
+                sequence: echo_sequence(&["x", "y"]),
+                quoted: false,
+            },
+        ]);
+        assert_eq!(
+            expand(&word, &mut shell),
+            vec!["prex".to_string(), "y".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_command_sub_strips_trailing_newlines() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: echo_sequence(&["hi"]),
+            quoted: true,
+        }]);
+        // echo emits "hi\n"; run_substitution strips -> "hi" exactly.
+        assert_eq!(expand(&word, &mut shell), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn expand_command_sub_updates_parent_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(0);
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: exit_sequence(7),
+            quoted: true,
+        }]);
+        let _ = expand(&word, &mut shell);
+        assert_eq!(shell.last_status(), 7);
+    }
+
+    #[test]
+    fn expand_assignment_command_sub_concatenates_verbatim() {
+        // expand_assignment suppresses splitting, so `FOO=$(echo a b)` stores
+        // "a b" (one space) as the value — same as bash's IFS=behavior in
+        // assignment context. (echo's argument joining already produces "a b"
+        // with one space.)
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::CommandSub {
+            sequence: echo_sequence(&["a", "b"]),
+            quoted: false,
+        }]);
+        assert_eq!(expand_assignment(&word, &mut shell), "a b".to_string());
     }
 }

@@ -4,6 +4,12 @@ pub enum LexError {
     BareAmpersand,
     InvalidVarName,
     UnterminatedBrace,
+    #[allow(dead_code)]
+    UnterminatedSubstitution,
+    #[allow(dead_code)]
+    SubstitutionLexError(Box<LexError>),
+    #[allow(dead_code)]
+    SubstitutionParseError(crate::command::ParseError),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -25,6 +31,8 @@ pub enum WordPart {
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     Tilde,
+    #[allow(dead_code)]
+    CommandSub { sequence: crate::command::Sequence, quoted: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]

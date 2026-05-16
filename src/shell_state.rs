@@ -10,7 +10,7 @@ struct Variable {
 /// last command's exit status. The initial set of variables is seeded from
 /// the process environment shuck inherited at startup, every one marked
 /// exported.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Shell {
     vars: HashMap<String, Variable>,
     last_status: i32,
