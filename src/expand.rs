@@ -8,6 +8,11 @@ use crate::shell_state::Shell;
 /// unquoted references split on ASCII whitespace and can yield multiple
 /// fields (or zero, for an empty value).
 pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
+    // Snapshot $? at the start so every `LastStatus` part in this word sees
+    // the same value — even if a `CommandSub` part earlier in the word
+    // updates the live $?. This matches bash: substitutions update $? for
+    // the next command, not for `$?` references in the same expansion.
+    let snapshot_status = shell.last_status();
     let mut current = String::new();
     let mut has_emitted = false;
     let mut result: Vec<String> = Vec::new();
@@ -31,7 +36,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
                 has_emitted = true;
             }
             WordPart::LastStatus { quoted: true } => {
-                current.push_str(&shell.last_status().to_string());
+                current.push_str(&snapshot_status.to_string());
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
@@ -39,7 +44,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
                 emit_split(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::LastStatus { quoted: false } => {
-                let value = shell.last_status().to_string();
+                let value = snapshot_status.to_string();
                 emit_split(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::CommandSub { sequence, quoted: true } => {
@@ -407,5 +412,25 @@ mod tests {
             quoted: false,
         }]);
         assert_eq!(expand_assignment(&word, &mut shell), "a b".to_string());
+    }
+
+    #[test]
+    fn expand_last_status_after_command_sub_in_same_word_reads_snapshot() {
+        // Bash semantics: within a single word, `$?` reads the value of $?
+        // at the start of expansion, NOT the status set by an earlier
+        // CommandSub in the same word. e.g. `"$(exit 7)$?"` with $?=3 before
+        // expands to "73" (the substitution's "" output then "3"), not "77".
+        let mut shell = Shell::new();
+        shell.set_last_status(3);
+        let word = Word(vec![
+            WordPart::CommandSub {
+                sequence: exit_sequence(7),
+                quoted: true,
+            },
+            WordPart::LastStatus { quoted: true },
+        ]);
+        assert_eq!(expand(&word, &mut shell), vec!["3".to_string()]);
+        // The substitution still updates $? for the NEXT word/command.
+        assert_eq!(shell.last_status(), 7);
     }
 }
