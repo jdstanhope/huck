@@ -138,7 +138,15 @@ fn run_background_sequence(
 
         let files = match open_stage_files(cmd) {
             Ok(f) => f,
-            Err(()) => return ExecOutcome::Continue(1),
+            Err(()) => {
+                // Already-spawned children are background processes the
+                // user didn't ask for. Kill them and drain via Drop so the
+                // shell isn't left holding zombies.
+                for mut c in children {
+                    let _ = c.kill();
+                }
+                return ExecOutcome::Continue(1);
+            }
         };
 
         let mut process = ProcessCommand::new(&cmd.program);
@@ -196,6 +204,14 @@ fn run_background_sequence(
         spawned_pids.push(pid);
         if first_pid.is_none() {
             first_pid = Some(pid);
+            // Close the setpgid race: Rust's `process_group` only sets the
+            // pg in the child (pre-exec), so subsequent stages may try to
+            // join `pid`'s group before the child has run setpgid. The
+            // standard fix is to also call setpgid in the parent — it's
+            // idempotent with the child's call.
+            unsafe {
+                libc::setpgid(pid, pid);
+            }
         }
 
         if !is_last {
