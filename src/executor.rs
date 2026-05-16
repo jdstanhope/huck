@@ -19,18 +19,23 @@ pub enum StdoutSink<'a> {
 
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    execute_inner(seq, shell, &mut sink, source)
+    if seq.background {
+        // Parser guarantees rest.is_empty() when background is set.
+        return run_background_sequence(&seq.first, shell, &mut sink, source);
+    }
+    execute_sequence_body(seq, shell, &mut sink)
 }
 
 /// Runs a sequence with stdout captured to a buffer. Used by command
-/// substitution; the substituted command's `background` flag is ignored
-/// (substitutions always wait), and we pass an empty `source` since job-
-/// table registration is irrelevant inside a substitution.
+/// substitution; the trailing `&` is ignored here because substitutions
+/// must complete before their output is interpolated. Spawning real
+/// background children whose pids the parent's JobTable doesn't track
+/// would let them escape `wait`/`jobs` and litter the terminal.
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
         let mut sink = StdoutSink::Capture(&mut buf);
-        execute_inner(seq, shell, &mut sink, "")
+        execute_sequence_body(seq, shell, &mut sink)
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
@@ -38,11 +43,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
-fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink, source: &str) -> ExecOutcome {
-    if seq.background {
-        // Parser guarantees rest.is_empty() when background is set.
-        return run_background_sequence(&seq.first, shell, sink, source);
-    }
+fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let mut status = run_pipeline(&seq.first, shell, sink);
     if matches!(status, ExecOutcome::Exit(_)) {
         return status;
@@ -139,12 +140,7 @@ fn run_background_sequence(
         let files = match open_stage_files(cmd) {
             Ok(f) => f,
             Err(()) => {
-                // Already-spawned children are background processes the
-                // user didn't ask for. Kill them and drain via Drop so the
-                // shell isn't left holding zombies.
-                for mut c in children {
-                    let _ = c.kill();
-                }
+                cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(1);
             }
         };
@@ -185,17 +181,12 @@ fn run_background_sequence(
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 eprintln!("shuck: command not found: {}", cmd.program);
-                // Bail out — partial pipeline cleanup is best-effort.
-                for mut c in children {
-                    let _ = c.kill();
-                }
+                cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(127);
             }
             Err(e) => {
                 eprintln!("shuck: {}: {e}", cmd.program);
-                for mut c in children {
-                    let _ = c.kill();
-                }
+                cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(1);
             }
         };
@@ -241,6 +232,20 @@ fn run_background_sequence(
     let id = shell.jobs.add(pgid, spawned_pids, display);
     eprintln!("[{id}] {last_pid}");
     ExecOutcome::Continue(0)
+}
+
+/// Cleans up children spawned during a background pipeline before it could be
+/// fully started. Signals the whole process group (catching any double-forked
+/// grandchildren), then reaps each child so we don't leave zombies.
+fn cleanup_partial_pipeline(pgid: Option<i32>, children: Vec<Child>) {
+    if let Some(pg) = pgid {
+        unsafe {
+            libc::killpg(pg, libc::SIGKILL);
+        }
+    }
+    for mut c in children {
+        let _ = c.wait();
+    }
 }
 
 /// True iff every stage in the pipeline is a builtin (or an Assign).
@@ -800,6 +805,24 @@ mod tests {
         assert_eq!(jobs[0].command, "echo hi");
         assert!(matches!(jobs[0].state, JobState::Done(0)));
         assert!(jobs[0].pids.is_empty()); // synthetic — no real pids
+    }
+
+    #[test]
+    fn execute_capturing_ignores_background_flag_runs_synchronously() {
+        // `$(cmd &)` must wait and capture, not spawn an escaped bg job.
+        let seq = Sequence {
+            first: Pipeline {
+                commands: vec![exec("echo", &["captured"])],
+            },
+            rest: vec![],
+            background: true,
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(out, "captured\n");
+        assert_eq!(status, 0);
+        // And nothing should have been registered in the job table.
+        assert_eq!(shell.jobs.iter().count(), 0);
     }
 
     #[test]
