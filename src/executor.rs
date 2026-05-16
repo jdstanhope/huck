@@ -267,13 +267,23 @@ fn run_subprocess(
 
     match process.spawn() {
         Ok(mut child) => {
+            let mut copy_err: Option<io::Error> = None;
             if let StdoutSink::Capture(buf) = sink {
                 if let Some(mut child_stdout) = child.stdout.take() {
-                    let _ = io::copy(&mut child_stdout, *buf);
+                    if let Err(e) = io::copy(&mut child_stdout, *buf) {
+                        copy_err = Some(e);
+                    }
                 }
             }
             match child.wait() {
-                Ok(status) => ExecOutcome::Continue(status_code(&status)),
+                Ok(status) => {
+                    if let Some(e) = copy_err {
+                        eprintln!("shuck: {}: {e}", cmd.program);
+                        ExecOutcome::Continue(1)
+                    } else {
+                        ExecOutcome::Continue(status_code(&status))
+                    }
+                }
                 Err(e) => {
                     eprintln!("shuck: {}: {e}", cmd.program);
                     ExecOutcome::Continue(1)
@@ -470,7 +480,9 @@ fn run_multi_stage(
         } else if want_terminal_capture {
             if let StdoutSink::Capture(buf) = sink {
                 if let Some(mut child_stdout) = child.stdout.take() {
-                    let _ = io::copy(&mut child_stdout, *buf);
+                    if let Err(e) = io::copy(&mut child_stdout, *buf) {
+                        eprintln!("shuck: {}: {e}", cmd.program);
+                    }
                 }
             }
         }
@@ -550,6 +562,24 @@ mod tests {
         let mut shell = Shell::new();
         let (out, status) = execute_capturing(&seq, &mut shell);
         assert_eq!(out, "\n");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn execute_capturing_builtin_pipeline_captures_terminal_stage() {
+        // Two-stage pipeline: `echo first | echo second`. The terminal stage
+        // is a builtin (echo) whose output should land in the capture buffer.
+        // The first stage's output is discarded by echo (which doesn't read
+        // stdin), so we just confirm the terminal echo's output is captured.
+        let seq = Sequence {
+            first: Pipeline {
+                commands: vec![exec("echo", &["first"]), exec("echo", &["second"])],
+            },
+            rest: vec![],
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(out, "second\n");
         assert_eq!(status, 0);
     }
 }
