@@ -165,6 +165,7 @@ mod tests {
                 })],
             },
             rest: vec![],
+            background: false,
         }
     }
 
@@ -180,6 +181,7 @@ mod tests {
                 })],
             },
             rest: vec![],
+            background: false,
         }
     }
 

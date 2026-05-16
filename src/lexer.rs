@@ -1,7 +1,6 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum LexError {
     UnterminatedQuote,
-    BareAmpersand,
     InvalidVarName,
     UnterminatedBrace,
     UnterminatedSubstitution,
@@ -20,6 +19,7 @@ pub enum Operator {
     And,            // &&
     Or,             // ||
     Semi,           // ;
+    Background,     // &
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,7 +152,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     chars.next();
                     tokens.push(Token::Op(Operator::And));
                 } else {
-                    return Err(LexError::BareAmpersand);
+                    tokens.push(Token::Op(Operator::Background));
                 }
             }
             ';' => {
@@ -379,6 +379,7 @@ fn empty_sequence() -> crate::command::Sequence {
     crate::command::Sequence {
         first: crate::command::Pipeline { commands: Vec::new() },
         rest: Vec::new(),
+        background: false,
     }
 }
 
@@ -684,13 +685,39 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_bare_ampersand_is_error() {
-        assert_eq!(tokenize("a & b").unwrap_err(), LexError::BareAmpersand);
+    fn tokenize_bare_ampersand_is_background_op() {
+        assert_eq!(
+            tokenize("a & b").unwrap(),
+            vec![w("a"), Token::Op(Operator::Background), w("b")]
+        );
     }
 
     #[test]
-    fn tokenize_bare_ampersand_at_end_is_error() {
-        assert_eq!(tokenize("a &").unwrap_err(), LexError::BareAmpersand);
+    fn tokenize_bare_ampersand_at_end_is_background_op() {
+        assert_eq!(
+            tokenize("a &").unwrap(),
+            vec![w("a"), Token::Op(Operator::Background)]
+        );
+    }
+
+    #[test]
+    fn tokenize_double_ampersand_still_and_op() {
+        assert_eq!(
+            tokenize("a && b").unwrap(),
+            vec![w("a"), Token::Op(Operator::And), w("b")]
+        );
+    }
+
+    #[test]
+    fn tokenize_two_separate_backgrounds() {
+        assert_eq!(
+            tokenize("a & &").unwrap(),
+            vec![
+                w("a"),
+                Token::Op(Operator::Background),
+                Token::Op(Operator::Background),
+            ]
+        );
     }
 
     #[test]
@@ -914,6 +941,7 @@ mod tests {
                 })],
             },
             rest: vec![],
+            background: false,
         }
     }
 
@@ -955,6 +983,7 @@ mod tests {
                 sequence: crate::command::Sequence {
                     first: crate::command::Pipeline { commands: vec![] },
                     rest: vec![],
+                    background: false,
                 },
                 quoted: false,
             }])]
@@ -994,6 +1023,7 @@ mod tests {
                     })],
                 },
                 rest: vec![],
+                background: false,
             }
         };
         assert_eq!(

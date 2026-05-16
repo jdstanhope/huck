@@ -533,6 +533,7 @@ mod tests {
         Sequence {
             first: Pipeline { commands: vec![cmd] },
             rest: vec![],
+            background: false,
         }
     }
 
@@ -575,6 +576,7 @@ mod tests {
                 commands: vec![exec("echo", &["first"]), exec("echo", &["second"])],
             },
             rest: vec![],
+            background: false,
         };
         let mut shell = Shell::new();
         let (out, status) = execute_capturing(&seq, &mut shell);

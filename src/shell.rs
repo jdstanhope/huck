@@ -85,6 +85,10 @@ fn parse_error_message(error: ParseError) -> &'static str {
         ParseError::MissingCommand => "expected a command",
         ParseError::MissingRedirectTarget => "expected a filename after redirection",
         ParseError::RedirectTargetIsOperator => "expected a filename after redirection",
+        ParseError::UnexpectedBackground => "'&' not allowed here",
+        ParseError::BackgroundedMultiPipelineSequence => {
+            "'&' on multi-command sequence not supported; use a single pipeline"
+        }
     }
 }
 
@@ -96,7 +100,6 @@ fn parse_error_message(error: ParseError) -> &'static str {
 fn lex_error_message(error: LexError) -> String {
     match error {
         LexError::UnterminatedQuote => ": unterminated quote".to_string(),
-        LexError::BareAmpersand => ": unexpected '&'".to_string(),
         LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
         LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
         LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
