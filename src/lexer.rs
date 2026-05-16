@@ -4,11 +4,8 @@ pub enum LexError {
     BareAmpersand,
     InvalidVarName,
     UnterminatedBrace,
-    #[allow(dead_code)]
     UnterminatedSubstitution,
-    #[allow(dead_code)]
     SubstitutionLexError(Box<LexError>),
-    #[allow(dead_code)]
     SubstitutionParseError(crate::command::ParseError),
 }
 
@@ -31,7 +28,6 @@ pub enum WordPart {
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     Tilde,
-    #[allow(dead_code)]
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
 }
 
@@ -214,6 +210,11 @@ fn read_dollar_expansion(
     quoted: bool,
 ) -> Result<(), LexError> {
     match chars.peek().copied() {
+        Some('(') => {
+            chars.next(); // consume '('
+            let sequence = scan_paren_substitution(chars)?;
+            parts.push(WordPart::CommandSub { sequence, quoted });
+        }
         Some('{') => {
             chars.next();
             let name = read_braced_var_name(chars)?;
@@ -232,6 +233,105 @@ fn read_dollar_expansion(
         }
     }
     Ok(())
+}
+
+/// Reads the body of a `$(...)` substitution. The opening `$(` is already
+/// consumed; this function consumes through the matching `)` at depth 0.
+/// Tracks quote and escape state so that `)` inside `'...'`, `"..."`, or
+/// after `\` does not close the substitution, and nested `$(...)` increments
+/// the depth.
+fn scan_paren_substitution(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<crate::command::Sequence, LexError> {
+    let mut body = String::new();
+    let mut depth: usize = 0;
+    while let Some(c) = chars.next() {
+        match c {
+            ')' if depth == 0 => {
+                return parse_substitution_body(&body);
+            }
+            ')' => {
+                depth -= 1;
+                body.push(c);
+            }
+            '(' => {
+                // Bare `(` is just a character. shuck has no subshell
+                // `(cmd)` syntax — only `$(` increments depth (handled in
+                // the `$` arm below).
+                body.push(c);
+            }
+            '\\' => {
+                body.push(c);
+                if let Some(next) = chars.next() {
+                    body.push(next);
+                } else {
+                    return Err(LexError::UnterminatedSubstitution);
+                }
+            }
+            '\'' => {
+                body.push(c);
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            body.push('\'');
+                            break;
+                        }
+                        Some(ch) => body.push(ch),
+                        None => return Err(LexError::UnterminatedSubstitution),
+                    }
+                }
+            }
+            '"' => {
+                body.push(c);
+                loop {
+                    match chars.next() {
+                        Some('"') => {
+                            body.push('"');
+                            break;
+                        }
+                        Some('\\') => {
+                            body.push('\\');
+                            if let Some(next) = chars.next() {
+                                body.push(next);
+                            } else {
+                                return Err(LexError::UnterminatedSubstitution);
+                            }
+                        }
+                        Some(ch) => body.push(ch),
+                        None => return Err(LexError::UnterminatedSubstitution),
+                    }
+                }
+            }
+            '$' => {
+                body.push(c);
+                if let Some(&next) = chars.peek() {
+                    if next == '(' {
+                        chars.next();
+                        body.push('(');
+                        depth += 1;
+                    }
+                }
+            }
+            _ => body.push(c),
+        }
+    }
+    Err(LexError::UnterminatedSubstitution)
+}
+
+/// Tokenizes and parses a substitution body, wrapping any errors with the
+/// substitution-context `LexError` variants. Empty bodies (whitespace only)
+/// produce an empty `Sequence`.
+fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexError> {
+    let tokens = tokenize(body).map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
+    let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
+    Ok(parsed.unwrap_or_else(empty_sequence))
+}
+
+fn empty_sequence() -> crate::command::Sequence {
+    crate::command::Sequence {
+        first: crate::command::Pipeline { commands: Vec::new() },
+        rest: Vec::new(),
+    }
 }
 
 fn read_var_name(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
@@ -744,5 +844,192 @@ mod tests {
                 WordPart::Var { name: "BAR".to_string(), quoted: false },
             ]))]
         );
+    }
+
+    fn sub_word(parts: Vec<WordPart>) -> Token {
+        Token::Word(Word(parts))
+    }
+
+    fn echo_seq(args: &[&str]) -> crate::command::Sequence {
+        use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+        Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal("echo".to_string())]),
+                    args: args
+                        .iter()
+                        .map(|a| Word(vec![WordPart::Literal(a.to_string())]))
+                        .collect(),
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            },
+            rest: vec![],
+        }
+    }
+
+    #[test]
+    fn tokenize_command_sub_basic() {
+        assert_eq!(
+            tokenize("$(echo hi)").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: echo_seq(&["hi"]),
+                quoted: false,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_quoted_in_double_quotes() {
+        assert_eq!(
+            tokenize("\"$(echo hi)\"").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: echo_seq(&["hi"]),
+                quoted: true,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_in_single_quotes_is_literal() {
+        assert_eq!(
+            tokenize("'$(echo hi)'").unwrap(),
+            words(&["$(echo hi)"])
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_empty() {
+        assert_eq!(
+            tokenize("$()").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: crate::command::Sequence {
+                    first: crate::command::Pipeline { commands: vec![] },
+                    rest: vec![],
+                },
+                quoted: false,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_with_paren_inside_double_quotes() {
+        // The `)` inside `"..."` does not close the substitution.
+        assert_eq!(
+            tokenize("$(echo \")\")").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: echo_seq(&[")"]),
+                quoted: false,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_nested() {
+        // Outer body is `echo $(echo hi)`; inner is `echo hi`.
+        let inner = echo_seq(&["hi"]);
+        let inner_word = Word(vec![WordPart::CommandSub {
+            sequence: inner,
+            quoted: false,
+        }]);
+        let outer = {
+            use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+            Sequence {
+                first: Pipeline {
+                    commands: vec![SimpleCommand::Exec(ExecCommand {
+                        program: Word(vec![WordPart::Literal("echo".to_string())]),
+                        args: vec![inner_word],
+                        stdin: None,
+                        stdout: None,
+                        stderr: None,
+                    })],
+                },
+                rest: vec![],
+            }
+        };
+        assert_eq!(
+            tokenize("$(echo $(echo hi))").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: outer,
+                quoted: false,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_unterminated() {
+        assert_eq!(
+            tokenize("$(echo").unwrap_err(),
+            LexError::UnterminatedSubstitution
+        );
+    }
+
+    #[test]
+    fn tokenize_command_sub_inner_lex_error() {
+        // `${1foo}` inside a substitution → InvalidVarName, wrapped.
+        let err = tokenize("$(echo ${1foo})").unwrap_err();
+        match err {
+            LexError::SubstitutionLexError(inner) => {
+                assert_eq!(*inner, LexError::InvalidVarName);
+            }
+            other => panic!("expected SubstitutionLexError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_command_sub_inner_parse_error() {
+        // `echo |` inside the body → MissingCommand from the parser, wrapped.
+        let err = tokenize("$(echo |)").unwrap_err();
+        match err {
+            LexError::SubstitutionParseError(inner) => {
+                assert_eq!(inner, crate::command::ParseError::MissingCommand);
+            }
+            other => panic!("expected SubstitutionParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_command_sub_as_program() {
+        // `$(echo ls) -la` — the program word is itself a CommandSub.
+        let tokens = tokenize("$(echo ls) -la").unwrap();
+        assert_eq!(tokens.len(), 2);
+        match &tokens[0] {
+            Token::Word(Word(parts)) => {
+                assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
+        assert_eq!(tokens[1], w("-la"));
+    }
+
+    #[test]
+    fn tokenize_command_sub_concatenates_with_literal() {
+        // `pre$(echo x)post` → one Word with three parts: Literal, CommandSub, Literal
+        let tokens = tokenize("pre$(echo x)post").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::Word(Word(parts)) => {
+                assert_eq!(parts.len(), 3);
+                assert!(matches!(parts[0], WordPart::Literal(ref s) if s == "pre"));
+                assert!(matches!(parts[1], WordPart::CommandSub { .. }));
+                assert!(matches!(parts[2], WordPart::Literal(ref s) if s == "post"));
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_command_sub_in_redirect_target() {
+        let tokens = tokenize("cat > $(echo /tmp/f)").unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], w("cat"));
+        assert_eq!(tokens[1], Token::Op(Operator::RedirOut));
+        match &tokens[2] {
+            Token::Word(Word(parts)) => {
+                assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
     }
 }
