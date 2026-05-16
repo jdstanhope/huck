@@ -38,7 +38,11 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
-fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink, _source: &str) -> ExecOutcome {
+fn execute_inner(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink, source: &str) -> ExecOutcome {
+    if seq.background {
+        // Parser guarantees rest.is_empty() when background is set.
+        return run_background_sequence(&seq.first, shell, sink, source);
+    }
     let mut status = run_pipeline(&seq.first, shell, sink);
     if matches!(status, ExecOutcome::Exit(_)) {
         return status;
@@ -65,6 +69,183 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -
     } else {
         run_multi_stage(&pipeline.commands, shell, sink)
     }
+}
+
+// ----- background pipeline --------------------------------------------------
+
+fn run_background_sequence(
+    pipeline: &Pipeline,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    source: &str,
+) -> ExecOutcome {
+    let display = display_command(source);
+
+    if pipeline_is_pure_builtin(pipeline) {
+        // Run synchronously in the parent shell. Side effects (cd, exports,
+        // exit) take effect on the parent — documented divergence from bash,
+        // which would fork a subshell.
+        let outcome = run_pipeline(pipeline, shell, sink);
+        if matches!(outcome, ExecOutcome::Exit(_)) {
+            return outcome;
+        }
+        let exit = match outcome {
+            ExecOutcome::Continue(c) => c,
+            ExecOutcome::Exit(_) => unreachable!(),
+        };
+        let id = shell.jobs.add_synthetic_done(display, exit);
+        eprintln!("[{id}] Done");
+        return ExecOutcome::Continue(0);
+    }
+
+    // Spawn each stage with process_group. The first stage gets
+    // process_group(0) to become its own pg leader; subsequent stages join
+    // that pg via process_group(first_pid). The first stage's stdin
+    // defaults to /dev/null (so background commands don't fight the shell
+    // for the terminal); explicit `< file` redirects override this.
+    let n = pipeline.commands.len();
+    let mut all_resolved: Vec<Option<ResolvedCommand>> = Vec::with_capacity(n);
+    for cmd in &pipeline.commands {
+        match cmd {
+            SimpleCommand::Assign { .. } => {
+                all_resolved.push(None);
+            }
+            SimpleCommand::Exec(exec) => match resolve(exec, shell) {
+                Ok(r) => all_resolved.push(Some(r)),
+                Err(code) => {
+                    // Failed to expand; print the [N] line for the failed
+                    // job so the user can see what happened, and bail.
+                    return ExecOutcome::Continue(code);
+                }
+            },
+        }
+    }
+
+    let mut spawned_pids: Vec<i32> = Vec::with_capacity(n);
+    let mut first_pid: Option<i32> = None;
+    let mut carry: Option<ChildStdout> = None;
+    let mut children: Vec<Child> = Vec::with_capacity(n);
+
+    for (i, resolved) in all_resolved.iter().enumerate() {
+        let is_last = i == n - 1;
+        let Some(cmd) = resolved else {
+            // Assign stage in a background pipeline: no-op stage. The carry
+            // input from the previous stage is dropped; the next stage will
+            // get an empty pipe (Stdio::null instead of stdin from prev).
+            carry = None;
+            continue;
+        };
+
+        let files = match open_stage_files(cmd) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
+
+        let mut process = ProcessCommand::new(&cmd.program);
+        process.args(&cmd.args);
+        process.env_clear();
+        process.envs(shell.exported_env());
+
+        // Process-group: first stage = own pg leader; rest join.
+        use std::os::unix::process::CommandExt;
+        let pgid_target = first_pid.unwrap_or(0);
+        process.process_group(pgid_target);
+
+        // Stdin: explicit redirect wins; otherwise carry from prev stage if
+        // any; otherwise /dev/null for the first stage.
+        if let Some(file) = files.stdin {
+            process.stdin(Stdio::from(file));
+        } else if let Some(child_stdout) = carry.take() {
+            process.stdin(Stdio::from(child_stdout));
+        } else {
+            process.stdin(Stdio::null());
+        }
+
+        // Stdout: explicit redirect wins; otherwise pipe onward if not last;
+        // otherwise inherit terminal.
+        if let Some(file) = files.stdout {
+            process.stdout(Stdio::from(file));
+        } else if !is_last {
+            process.stdout(Stdio::piped());
+        }
+
+        if let Some(file) = files.stderr {
+            process.stderr(Stdio::from(file));
+        }
+
+        let mut child = match process.spawn() {
+            Ok(c) => c,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                eprintln!("shuck: command not found: {}", cmd.program);
+                // Bail out — partial pipeline cleanup is best-effort.
+                for mut c in children {
+                    let _ = c.kill();
+                }
+                return ExecOutcome::Continue(127);
+            }
+            Err(e) => {
+                eprintln!("shuck: {}: {e}", cmd.program);
+                for mut c in children {
+                    let _ = c.kill();
+                }
+                return ExecOutcome::Continue(1);
+            }
+        };
+
+        let pid = child.id() as i32;
+        spawned_pids.push(pid);
+        if first_pid.is_none() {
+            first_pid = Some(pid);
+        }
+
+        if !is_last {
+            carry = child.stdout.take();
+        }
+
+        children.push(child);
+    }
+
+    let Some(pgid) = first_pid else {
+        // No actual children spawned (all-Assign pipeline). Treat as
+        // synthetic Done. This shouldn't happen in practice — the parser
+        // doesn't produce all-Assign backgrounded pipelines as a typical
+        // user input shape, but we handle it defensively.
+        let id = shell.jobs.add_synthetic_done(display, 0);
+        eprintln!("[{id}] Done");
+        return ExecOutcome::Continue(0);
+    };
+
+    // Forget the Child structs so the OS doesn't try to reap them as
+    // zombies via Drop — we own reaping via waitpid.
+    for child in children {
+        std::mem::forget(child);
+    }
+
+    let last_pid = *spawned_pids.last().unwrap();
+    let id = shell.jobs.add(pgid, spawned_pids, display);
+    eprintln!("[{id}] {last_pid}");
+    ExecOutcome::Continue(0)
+}
+
+/// True iff every stage in the pipeline is a builtin (or an Assign).
+fn pipeline_is_pure_builtin(pipeline: &Pipeline) -> bool {
+    pipeline.commands.iter().all(|cmd| match cmd {
+        SimpleCommand::Exec(e) => match e.program.0.first() {
+            Some(crate::lexer::WordPart::Literal(name)) => builtins::is_builtin(name),
+            _ => false,
+        },
+        SimpleCommand::Assign { .. } => true,
+    })
+}
+
+/// Strips a trailing `&` and surrounding whitespace from the source line for
+/// display in the job table.
+fn display_command(source: &str) -> String {
+    source
+        .trim_end()
+        .trim_end_matches('&')
+        .trim_end()
+        .to_string()
 }
 
 // ----- resolved command (post-expansion) ------------------------------------
@@ -582,5 +763,44 @@ mod tests {
         let (out, status) = execute_capturing(&seq, &mut shell);
         assert_eq!(out, "second\n");
         assert_eq!(status, 0);
+    }
+
+    use crate::jobs::JobState;
+
+    #[test]
+    fn background_pure_builtin_runs_synchronously_and_registers_done_job() {
+        let seq = Sequence {
+            first: Pipeline {
+                commands: vec![exec("echo", &["hi"])],
+            },
+            rest: vec![],
+            background: true,
+        };
+        let mut shell = Shell::new();
+        let outcome = execute(&seq, &mut shell, "echo hi &");
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let jobs: Vec<_> = shell.jobs.iter().collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].command, "echo hi");
+        assert!(matches!(jobs[0].state, JobState::Done(0)));
+        assert!(jobs[0].pids.is_empty()); // synthetic — no real pids
+    }
+
+    #[test]
+    fn background_pure_builtin_assignment_runs_in_parent() {
+        let seq = Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Assign {
+                    name: "SHUCK_TEST_BG_ASSIGN".to_string(),
+                    value: lit_word("v"),
+                }],
+            },
+            rest: vec![],
+            background: true,
+        };
+        let mut shell = Shell::new();
+        let _ = execute(&seq, &mut shell, "SHUCK_TEST_BG_ASSIGN=v &");
+        // The assignment ran in the parent (pure-builtin path).
+        assert_eq!(shell.get("SHUCK_TEST_BG_ASSIGN"), Some("v"));
     }
 }
