@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use crate::jobs::JobTable;
 
 #[derive(Debug, Clone)]
 struct Variable {
@@ -14,6 +18,9 @@ struct Variable {
 pub struct Shell {
     vars: HashMap<String, Variable>,
     last_status: i32,
+    #[allow(dead_code)]
+    pub jobs: JobTable,
+    pub sigchld_flag: Arc<AtomicBool>,
 }
 
 impl Shell {
@@ -22,7 +29,12 @@ impl Shell {
         for (key, value) in std::env::vars() {
             vars.insert(key, Variable { value, exported: true });
         }
-        Self { vars, last_status: 0 }
+        Self {
+            vars,
+            last_status: 0,
+            jobs: JobTable::new(),
+            sigchld_flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {

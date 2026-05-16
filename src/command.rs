@@ -116,6 +116,7 @@ pub enum Connector {
 pub struct Sequence {
     pub first: Pipeline,
     pub rest: Vec<(Connector, Pipeline)>,
+    pub background: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,6 +124,8 @@ pub enum ParseError {
     MissingCommand,
     MissingRedirectTarget,
     RedirectTargetIsOperator,
+    UnexpectedBackground,
+    BackgroundedMultiPipelineSequence,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -133,25 +136,46 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     let mut iter = tokens.into_iter().peekable();
     let first = parse_pipeline(&mut iter)?;
     let mut rest = Vec::new();
+    let mut background = false;
 
     while let Some(token) = iter.next() {
-        let connector = match token {
-            Token::Op(Operator::Semi) => Connector::Semi,
-            Token::Op(Operator::And) => Connector::And,
-            Token::Op(Operator::Or) => Connector::Or,
+        match token {
+            Token::Op(Operator::Background) => {
+                // The multi-pipeline restriction is the more specific
+                // diagnostic, so report it first. `UnexpectedBackground`
+                // covers the remaining "& is not at the end" case.
+                if !rest.is_empty() {
+                    return Err(ParseError::BackgroundedMultiPipelineSequence);
+                }
+                if iter.peek().is_some() {
+                    return Err(ParseError::UnexpectedBackground);
+                }
+                background = true;
+                break;
+            }
+            Token::Op(Operator::Semi) => {
+                if iter.peek().is_none() {
+                    break;
+                }
+                let pipeline = parse_pipeline(&mut iter)?;
+                rest.push((Connector::Semi, pipeline));
+            }
+            Token::Op(Operator::And) => {
+                let pipeline = parse_pipeline(&mut iter)?;
+                rest.push((Connector::And, pipeline));
+            }
+            Token::Op(Operator::Or) => {
+                let pipeline = parse_pipeline(&mut iter)?;
+                rest.push((Connector::Or, pipeline));
+            }
             _ => unreachable!(
                 "parse_pipeline leaves only sequencing ops in the iterator; \
                  anything else it consumes itself"
             ),
-        };
-        if matches!(connector, Connector::Semi) && iter.peek().is_none() {
-            break;
         }
-        let pipeline = parse_pipeline(&mut iter)?;
-        rest.push((connector, pipeline));
     }
 
-    Ok(Some(Sequence { first, rest }))
+    Ok(Some(Sequence { first, rest, background }))
 }
 
 fn parse_pipeline<I: Iterator<Item = Token>>(
@@ -168,7 +192,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     while let Some(token) = iter.peek() {
         if matches!(
             token,
-            Token::Op(Operator::Semi | Operator::And | Operator::Or)
+            Token::Op(Operator::Semi | Operator::And | Operator::Or | Operator::Background)
         ) {
             break;
         }
@@ -203,7 +227,11 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                     Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
                     Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
                     Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
-                    Operator::Pipe | Operator::And | Operator::Or | Operator::Semi => {
+                    Operator::Pipe
+                    | Operator::And
+                    | Operator::Or
+                    | Operator::Semi
+                    | Operator::Background => {
                         unreachable!("handled in the outer arms");
                     }
                 }
@@ -245,6 +273,7 @@ mod tests {
         Sequence {
             first: Pipeline { commands },
             rest: vec![],
+            background: false,
         }
     }
 
@@ -572,6 +601,7 @@ mod tests {
                 })],
             },
             rest: vec![],
+            background: false,
         };
         let program_word = Word(vec![
             WordPart::Literal("FOO=".to_string()),
@@ -591,5 +621,107 @@ mod tests {
             }
             other => panic!("expected Assign, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_command_with_background() {
+        let seq = parse(vec![w_tok("sleep"), w_tok("1"), Token::Op(Operator::Background)])
+            .unwrap()
+            .unwrap();
+        assert!(seq.background);
+        assert!(seq.rest.is_empty());
+        assert_eq!(seq.first.commands, vec![plain("sleep", &["1"])]);
+    }
+
+    #[test]
+    fn parse_pipeline_backgrounded() {
+        // cmd1 | cmd2 &
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::Pipe),
+            w_tok("cmd2"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(seq.background);
+        assert!(seq.rest.is_empty());
+        assert_eq!(seq.first.commands.len(), 2);
+    }
+
+    #[test]
+    fn parse_background_alone_is_missing_command() {
+        assert_eq!(
+            parse(vec![Token::Op(Operator::Background)]),
+            Err(ParseError::MissingCommand)
+        );
+    }
+
+    #[test]
+    fn parse_background_mid_sequence_is_error() {
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd1"),
+                Token::Op(Operator::Background),
+                w_tok("cmd2"),
+            ]),
+            Err(ParseError::UnexpectedBackground)
+        );
+    }
+
+    #[test]
+    fn parse_two_backgrounds_is_unexpected() {
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd"),
+                Token::Op(Operator::Background),
+                Token::Op(Operator::Background),
+            ]),
+            Err(ParseError::UnexpectedBackground)
+        );
+    }
+
+    #[test]
+    fn parse_background_after_andor_is_unsupported() {
+        // cmd1 && cmd2 &
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd1"),
+                Token::Op(Operator::And),
+                w_tok("cmd2"),
+                Token::Op(Operator::Background),
+            ]),
+            Err(ParseError::BackgroundedMultiPipelineSequence)
+        );
+    }
+
+    #[test]
+    fn parse_background_after_semi_is_unsupported() {
+        // cmd1 ; cmd2 &
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd1"),
+                Token::Op(Operator::Semi),
+                w_tok("cmd2"),
+                Token::Op(Operator::Background),
+            ]),
+            Err(ParseError::BackgroundedMultiPipelineSequence)
+        );
+    }
+
+    #[test]
+    fn parse_background_mid_sequence_after_andor_prefers_multipipeline_error() {
+        // cmd1 && cmd2 & cmd3 — both errors apply; the more specific
+        // BackgroundedMultiPipelineSequence wins.
+        assert_eq!(
+            parse(vec![
+                w_tok("cmd1"),
+                Token::Op(Operator::And),
+                w_tok("cmd2"),
+                Token::Op(Operator::Background),
+                w_tok("cmd3"),
+            ]),
+            Err(ParseError::BackgroundedMultiPipelineSequence)
+        );
     }
 }

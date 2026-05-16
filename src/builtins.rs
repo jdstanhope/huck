@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::shell_state::Shell;
+use libc;
 
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
@@ -13,7 +14,10 @@ pub enum ExecOutcome {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "cd" | "exit" | "pwd" | "echo" | "export" | "unset")
+    matches!(
+        name,
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait"
+    )
 }
 
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
@@ -32,6 +36,8 @@ pub fn run_builtin(
         "exit" => builtin_exit(args),
         "export" => builtin_export(args, out, shell),
         "unset" => builtin_unset(args, shell),
+        "jobs" => builtin_jobs(args, out, shell),
+        "wait" => builtin_wait(args, out, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -168,6 +174,49 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     }
 }
 
+fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if !args.is_empty() {
+        eprintln!("shuck: jobs: arguments not supported in this version");
+        return ExecOutcome::Continue(2);
+    }
+    let (current, previous) = shell.jobs.current_and_previous();
+    for job in shell.jobs.iter() {
+        let flag = if Some(job.id) == current {
+            '+'
+        } else if Some(job.id) == previous {
+            '-'
+        } else {
+            ' '
+        };
+        let state = crate::jobs::render_state(&job.state);
+        if let Err(e) = writeln!(out, "[{}]{} {:<20} {} &", job.id, flag, state, job.command) {
+            eprintln!("shuck: jobs: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if !args.is_empty() {
+        eprintln!("shuck: wait: arguments not supported in this version");
+        return ExecOutcome::Continue(2);
+    }
+    // Blocking wait loop until no Running jobs remain (or no children at all).
+    while shell.jobs.has_running() {
+        let mut raw_status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut raw_status, 0) };
+        if pid <= 0 {
+            // -1 with ECHILD or 0 (shouldn't happen without WNOHANG); bail.
+            break;
+        }
+        shell.jobs.reap(pid as i32, raw_status);
+    }
+    // Print Done lines for anything that just transitioned during the wait.
+    crate::jobs::reap_and_notify(shell);
+    ExecOutcome::Continue(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +345,57 @@ mod tests {
         let mut shell = Shell::new();
         let outcome = builtin_unset(&["NEVER_SET_SHUCK_XYZ".to_string()], &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn jobs_with_empty_table_prints_nothing_and_returns_zero() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = builtin_jobs(&[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn jobs_lists_synthetic_done_entry() {
+        let mut shell = Shell::new();
+        let _ = shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = builtin_jobs(&[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("[1]"));
+        assert!(s.contains("Done"));
+        assert!(s.contains("echo hi"));
+    }
+
+    #[test]
+    fn jobs_with_args_errors() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = builtin_jobs(&["-l".to_string()], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_no_jobs_returns_zero_immediately() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = builtin_wait(&[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn wait_with_args_errors() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = builtin_wait(&["%1".to_string()], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn is_builtin_recognizes_jobs_and_wait() {
+        assert!(is_builtin("jobs"));
+        assert!(is_builtin("wait"));
     }
 }
