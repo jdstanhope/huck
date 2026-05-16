@@ -65,7 +65,7 @@ fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
         Err(e) => {
-            eprintln!("shuck: syntax error: {}", lex_error_message(e));
+            eprintln!("shuck: syntax error{}", lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
     };
@@ -88,18 +88,23 @@ fn parse_error_message(error: ParseError) -> &'static str {
     }
 }
 
+/// Renders a `LexError` into a message that includes its own leading
+/// separator. Most variants start with `": "` so the caller's
+/// `"shuck: syntax error"` prefix reads naturally. Substitution-wrapper
+/// variants start with `" in command substitution"` (no colon) so the
+/// rendered line reads `"shuck: syntax error in command substitution: ..."`.
 fn lex_error_message(error: LexError) -> String {
     match error {
-        LexError::UnterminatedQuote => "unterminated quote".to_string(),
-        LexError::BareAmpersand => "unexpected '&'".to_string(),
-        LexError::InvalidVarName => "invalid variable name in '${...}'".to_string(),
-        LexError::UnterminatedBrace => "unterminated '${...}'".to_string(),
-        LexError::UnterminatedSubstitution => "unterminated command substitution".to_string(),
+        LexError::UnterminatedQuote => ": unterminated quote".to_string(),
+        LexError::BareAmpersand => ": unexpected '&'".to_string(),
+        LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
+        LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
+        LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
         LexError::SubstitutionLexError(inner) => {
-            format!("in command substitution: {}", lex_error_message(*inner))
+            format!(" in command substitution{}", lex_error_message(*inner))
         }
         LexError::SubstitutionParseError(inner) => {
-            format!("in command substitution: {}", parse_error_message(inner))
+            format!(" in command substitution: {}", parse_error_message(inner))
         }
     }
 }

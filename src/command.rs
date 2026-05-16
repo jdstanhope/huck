@@ -552,4 +552,44 @@ mod tests {
         assert_eq!(seq.first.commands[0], assignment("FOO", ww("bar")));
         assert_eq!(seq.first.commands[1], plain("cat", &[]));
     }
+
+    #[test]
+    fn parse_assignment_with_command_sub_value_moves_parts() {
+        // Simulates lexer output for `FOO=$(echo bar)`: one Word with two
+        // parts — Literal("FOO=") and CommandSub. The parser's
+        // try_split_assignment must MOVE the CommandSub into the value
+        // (it can't be cloned without Clone on Sequence). Asserts the
+        // resulting Assign carries a value Word [Literal(""), CommandSub].
+        use crate::lexer::WordPart;
+        let inner_seq = Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: ww("echo"),
+                    args: vec![ww("bar")],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            },
+            rest: vec![],
+        };
+        let program_word = Word(vec![
+            WordPart::Literal("FOO=".to_string()),
+            WordPart::CommandSub { sequence: inner_seq, quoted: false },
+        ]);
+        let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
+        assert_eq!(seq.first.commands.len(), 1);
+        match &seq.first.commands[0] {
+            SimpleCommand::Assign { name, value } => {
+                assert_eq!(name, "FOO");
+                assert_eq!(value.0.len(), 2);
+                match &value.0[0] {
+                    WordPart::Literal(s) => assert_eq!(s, ""),
+                    other => panic!("expected Literal(\"\"), got {other:?}"),
+                }
+                assert!(matches!(&value.0[1], WordPart::CommandSub { .. }));
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
 }
