@@ -84,12 +84,10 @@ impl JobTable {
         id
     }
 
-    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
 
-    #[allow(dead_code)]
     pub fn has_running(&self) -> bool {
         self.jobs.iter().any(|j| matches!(j.state, JobState::Running))
     }
