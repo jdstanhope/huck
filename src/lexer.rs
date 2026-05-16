@@ -89,6 +89,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                             }
                             read_dollar_expansion(&mut chars, &mut parts, true)?;
                         }
+                        Some('`') => {
+                            // Backtick substitution inside double quotes (quoted: true).
+                            if !current.is_empty() {
+                                parts.push(WordPart::Literal(std::mem::take(&mut current)));
+                            }
+                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            parts.push(WordPart::CommandSub { sequence, quoted: true });
+                        }
                         Some(ch) => current.push(ch),
                         None => return Err(LexError::UnterminatedQuote),
                     }
@@ -112,6 +120,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '~' if !has_token && tilde_at_word_start(&chars) => {
                 has_token = true;
                 parts.push(WordPart::Tilde);
+            }
+            '`' => {
+                has_token = true;
+                if !current.is_empty() {
+                    parts.push(WordPart::Literal(std::mem::take(&mut current)));
+                }
+                let sequence = scan_backtick_substitution(&mut chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '|' => {
                 if has_token {
@@ -325,6 +341,38 @@ fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexEr
     let tokens = tokenize(body).map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
     let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
+}
+
+/// Reads the body of a `` `...` `` substitution. The opening backtick is
+/// already consumed; this function consumes through the matching unescaped
+/// backtick. Applies bash's backtick escape rules:
+/// - `\` + `` ` `` -> literal `` ` `` in the body
+/// - `\` + `\` -> literal `\` in the body
+/// - `\` + `$` -> literal `$` in the body
+/// - `\` + any other char `c` -> both `\` and `c` are preserved verbatim
+fn scan_backtick_substitution(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<crate::command::Sequence, LexError> {
+    let mut body = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                return parse_substitution_body(&body);
+            }
+            '\\' => match chars.next() {
+                Some('`') => body.push('`'),
+                Some('\\') => body.push('\\'),
+                Some('$') => body.push('$'),
+                Some(other) => {
+                    body.push('\\');
+                    body.push(other);
+                }
+                None => return Err(LexError::UnterminatedSubstitution),
+            },
+            _ => body.push(c),
+        }
+    }
+    Err(LexError::UnterminatedSubstitution)
 }
 
 fn empty_sequence() -> crate::command::Sequence {
@@ -1031,5 +1079,129 @@ mod tests {
             }
             other => panic!("expected Word, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tokenize_backtick_basic() {
+        assert_eq!(
+            tokenize("`echo hi`").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: echo_seq(&["hi"]),
+                quoted: false,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_backtick_in_double_quotes_is_quoted() {
+        assert_eq!(
+            tokenize("\"`echo hi`\"").unwrap(),
+            vec![sub_word(vec![WordPart::CommandSub {
+                sequence: echo_seq(&["hi"]),
+                quoted: true,
+            }])]
+        );
+    }
+
+    #[test]
+    fn tokenize_backtick_escape_dollar() {
+        // `\$FOO` inside backticks → inner body is `$FOO` (the `\$` unescapes
+        // before the inner tokenizer sees it). So the inner Sequence has a
+        // single command whose first arg expands $FOO.
+        let tokens = tokenize("`echo \\$FOO`").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::Word(Word(parts)) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    WordPart::CommandSub { sequence, quoted: false } => {
+                        // Inner: echo $FOO → second word's first part is a Var
+                        let inner_cmd = &sequence.first.commands[0];
+                        match inner_cmd {
+                            crate::command::SimpleCommand::Exec(e) => {
+                                assert_eq!(e.args.len(), 1);
+                                match &e.args[0].0[0] {
+                                    WordPart::Var { name, quoted: false } => {
+                                        assert_eq!(name, "FOO");
+                                    }
+                                    other => panic!("expected Var(FOO), got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected Exec, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected CommandSub, got {other:?}"),
+                }
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_backtick_escape_backslash() {
+        // `\\` inside backticks → inner body is `\`. Inner tokenize sees
+        // a trailing backslash; treats it as a literal.
+        let tokens = tokenize("`echo \\\\`").unwrap();
+        match &tokens[0] {
+            Token::Word(Word(parts)) => match &parts[0] {
+                WordPart::CommandSub { sequence, .. } => {
+                    match &sequence.first.commands[0] {
+                        crate::command::SimpleCommand::Exec(e) => {
+                            // Inner body was `echo \` — backslash at end is literal.
+                            assert_eq!(e.args.len(), 1);
+                            match &e.args[0].0[0] {
+                                WordPart::Literal(s) => assert_eq!(s, "\\"),
+                                other => panic!("expected Literal(\\\\), got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Exec, got {other:?}"),
+                    }
+                }
+                other => panic!("expected CommandSub, got {other:?}"),
+            },
+            other => panic!("expected Word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_backtick_unescaped_other_backslash_preserved() {
+        // `\n` inside backticks → body has `\n` (backslash + n), which the
+        // inner tokenize treats as an escape (literal `n`).
+        let tokens = tokenize("`echo \\n`").unwrap();
+        match &tokens[0] {
+            Token::Word(Word(parts)) => match &parts[0] {
+                WordPart::CommandSub { sequence, .. } => {
+                    match &sequence.first.commands[0] {
+                        crate::command::SimpleCommand::Exec(e) => {
+                            // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
+                            assert_eq!(e.args.len(), 1);
+                            match &e.args[0].0[0] {
+                                WordPart::Literal(s) => assert_eq!(s, "n"),
+                                other => panic!("expected Literal(n), got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Exec, got {other:?}"),
+                    }
+                }
+                other => panic!("expected CommandSub, got {other:?}"),
+            },
+            other => panic!("expected Word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_backtick_unterminated() {
+        assert_eq!(
+            tokenize("`echo hi").unwrap_err(),
+            LexError::UnterminatedSubstitution
+        );
+    }
+
+    #[test]
+    fn tokenize_backtick_in_single_quotes_is_literal() {
+        assert_eq!(
+            tokenize("'`echo hi`'").unwrap(),
+            words(&["`echo hi`"])
+        );
     }
 }
