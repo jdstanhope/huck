@@ -16,13 +16,14 @@ spec, an implementation plan, and a test suite.
 | v6        | Background jobs (`&`, `jobs`, `wait`)                   |
 | v7        | Foreground job control (`fg`, `bg`, Ctrl-Z)             |
 | v8        | Job specifiers, `kill`, `disown`                        |
+| v9        | Tilde expansion (`~`, `~/path`, `~user`, `~+`, `~-`)    |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (258 tests)
+cargo test               # full test suite (283 tests)
 ```
 
 ## Features
@@ -30,7 +31,8 @@ cargo test               # full test suite (258 tests)
 **Syntax:**
 `cmd a b c`, `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`, `cmd1 | cmd2`,
 `cmd > out`, `cmd < in`, `cmd >> out`, `cmd 2> err`, `cmd &`,
-`echo "$VAR"`, `echo $(date)`, `NAME=value cmd`.
+`echo "$VAR"`, `echo $(date)`, `NAME=value cmd`, `cd ~`, `ls ~/dir`,
+`cd ~-`, `PATH=~/bin:~/lib`.
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
@@ -49,11 +51,22 @@ name or number, including `-0` for a check-alive probe). `disown`
 removes a job from the table without signaling it. `jobs` lists
 Running/Stopped/finished jobs with `+`/`-` markers.
 
+**Tilde expansion (v9):**
+`~` → `$HOME`, `~/path` → `$HOME/path`, `~+` → `$PWD`, `~-` → `$OLDPWD`,
+`~user` → user's home (via `getpwnam_r`). Also expands after unquoted `:`
+and `=` in assignment-context words like `PATH=~/bin:~/lib`. Unresolved
+forms (missing `HOME`/`PWD`/`OLDPWD`, unknown user) fall back to literal
+text. `cd` maintains `PWD` and `OLDPWD`.
+
 **Not yet implemented:**
-extended job specs (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`,
-`disown -a`/`-r`/`-h`, backgrounded multi-pipeline sequences
-(`cmd1 && cmd2 &`), control flow (`if`/`while`/`for`/`case`), functions,
-quoted globbing, history expansion, arithmetic, here-docs, aliases.
+pathname expansion (`*`/`?`/`[abc]` — coming in v10), arithmetic
+expansion (`$((expr))` — coming in v11), parameter-expansion modifiers
+(`${var:-x}`/`${var/pat/repl}`/etc.), brace expansion (`{a,b,c}`),
+special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
+(`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
+(`if`/`while`/`for`/`case`), functions, history expansion, here-docs,
+aliases.
 
 ## Project layout
 
