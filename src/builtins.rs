@@ -232,10 +232,14 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
         }
     };
     let (pgid, pids, command) = {
-        let job = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id).unwrap();
-        job.state = crate::jobs::JobState::Running;
-        job.notified = true;
-        (job.pgid, job.pids.clone(), job.command.clone())
+        if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
+            job.state = crate::jobs::JobState::Running;
+            job.notified = true;
+            (job.pgid, job.pids.clone(), job.command.clone())
+        } else {
+            eprintln!("shuck: fg: no current job");
+            return ExecOutcome::Continue(1);
+        }
     };
 
     eprintln!("{command}");
@@ -299,10 +303,14 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
         }
     };
     let (pgid, command) = {
-        let job = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id).unwrap();
-        job.state = crate::jobs::JobState::Running;
-        job.notified = true;
-        (job.pgid, job.command.clone())
+        if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
+            job.state = crate::jobs::JobState::Running;
+            job.notified = true;
+            (job.pgid, job.command.clone())
+        } else {
+            eprintln!("shuck: bg: no current job");
+            return ExecOutcome::Continue(1);
+        }
     };
 
     unsafe { libc::killpg(pgid, libc::SIGCONT); }

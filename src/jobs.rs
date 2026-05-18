@@ -97,8 +97,16 @@ impl JobTable {
         for job in self.jobs.iter_mut() {
             if let Some(idx) = job.pids.iter().position(|&p| p == pid) {
                 if libc::WIFSTOPPED(raw_status) {
-                    job.state = JobState::Stopped(libc::WSTOPSIG(raw_status));
-                    job.notified = false;
+                    let new_sig = libc::WSTOPSIG(raw_status);
+                    // Idempotent: the synchronous waiter in the executor / `fg` already
+                    // handled this stop event for one stage; later WUNTRACED reports for
+                    // sibling stages of the same pipeline must not re-fire the
+                    // notification. Only update + re-notify if the state actually changes.
+                    let already_in_this_state = matches!(job.state, JobState::Stopped(s) if s == new_sig);
+                    if !already_in_this_state {
+                        job.state = JobState::Stopped(new_sig);
+                        job.notified = false;
+                    }
                     return;
                 }
                 if job.reaped[idx] {
@@ -596,5 +604,19 @@ mod tests {
         t.reap(100, exit_a);
         assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)),
             "last stage status (b=7) must win, not a=0");
+    }
+
+    #[test]
+    fn reap_repeated_stopped_status_same_signal_is_idempotent_for_notification() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        // First stop: synchronous waiter would have set notified=true after this.
+        t.reap(100, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(s) if s == libc::SIGTSTP));
+        t.jobs_mut()[0].notified = true;  // simulate the synchronous waiter's bookkeeping
+        // Second stop for the same job (other pid, same signal).
+        t.reap(200, stopped);
+        assert!(t.jobs_mut()[0].notified, "must NOT reset notified for the second stop");
     }
 }
