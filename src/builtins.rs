@@ -332,15 +332,33 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
 }
 
 fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: bg: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
-    }
-    let id = match shell.jobs.current_stopped_id() {
-        Some(id) => id,
-        None => {
-            eprintln!("shuck: bg: no current job");
-            return ExecOutcome::Continue(1);
+    let id = match args.len() {
+        0 => match shell.jobs.current_stopped_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: bg: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+        1 if args[0].starts_with('%') => {
+            let id = match resolve_spec_or_error(&args[0], "bg", shell) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+            // Verify the resolved job is actually Stopped.
+            let is_stopped = shell.jobs.iter()
+                .find(|j| j.id == id)
+                .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
+                .unwrap_or(false);
+            if !is_stopped {
+                eprintln!("shuck: bg: job %{id} already running");
+                return ExecOutcome::Continue(1);
+            }
+            id
+        }
+        _ => {
+            eprintln!("shuck: bg: usage: bg [%job]");
+            return ExecOutcome::Continue(2);
         }
     };
     let (pgid, command) = {
@@ -586,11 +604,11 @@ mod fg_bg_tests {
     }
 
     #[test]
-    fn bg_with_args_rejected_with_status_2() {
+    fn bg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
@@ -638,6 +656,44 @@ mod fg_bg_tests {
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin(
             "fg",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn bg_with_bad_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_no_such_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_running_spec_errors_already_running() {
+        let mut shell = Shell::new();
+        shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "bg",
             &["%1".to_string(), "%2".to_string()],
             &mut buf,
             &mut shell,
