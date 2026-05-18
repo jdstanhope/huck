@@ -204,15 +204,19 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
         eprintln!("shuck: wait: arguments not supported in this version");
         return ExecOutcome::Continue(2);
     }
-    // Blocking wait loop until no Running jobs remain (or no children at all).
+    shell.sigint_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     while shell.jobs.has_pending() {
-        let mut raw_status: libc::c_int = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut raw_status, 0) };
-        if pid <= 0 {
-            // -1 with ECHILD or 0 (shouldn't happen without WNOHANG); bail.
-            break;
+        if shell.sigint_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!();  // newline so the ^C doesn't run into the prompt
+            return ExecOutcome::Continue(130);
         }
-        shell.jobs.reap(pid as i32, raw_status);
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     // Print Done lines for anything that just transitioned during the wait.
     crate::jobs::reap_and_notify(shell);
