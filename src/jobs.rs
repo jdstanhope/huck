@@ -10,6 +10,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     Running,
+    Stopped(i32),
     Done(i32),
     Signaled(i32),
 }
@@ -88,10 +89,6 @@ impl JobTable {
         self.jobs.iter()
     }
 
-    pub fn has_running(&self) -> bool {
-        self.jobs.iter().any(|j| matches!(j.state, JobState::Running))
-    }
-
     /// Marks `pid` as reaped with the given raw waitpid status. If the pid
     /// is the LAST stage of its job, records the status; when all pids of
     /// the job are reaped, transitions its overall state. No-op if `pid`
@@ -99,6 +96,19 @@ impl JobTable {
     pub fn reap(&mut self, pid: i32, raw_status: i32) {
         for job in self.jobs.iter_mut() {
             if let Some(idx) = job.pids.iter().position(|&p| p == pid) {
+                if libc::WIFSTOPPED(raw_status) {
+                    let new_sig = libc::WSTOPSIG(raw_status);
+                    // Idempotent: the synchronous waiter in the executor / `fg` already
+                    // handled this stop event for one stage; later WUNTRACED reports for
+                    // sibling stages of the same pipeline must not re-fire the
+                    // notification. Only update + re-notify if the state actually changes.
+                    let already_in_this_state = matches!(job.state, JobState::Stopped(s) if s == new_sig);
+                    if !already_in_this_state {
+                        job.state = JobState::Stopped(new_sig);
+                        job.notified = false;
+                    }
+                    return;
+                }
                 if job.reaped[idx] {
                     return;
                 }
@@ -123,7 +133,8 @@ impl JobTable {
     pub fn drain_notifications(&mut self) -> Vec<Job> {
         let mut out = Vec::new();
         for job in self.jobs.iter_mut() {
-            if !matches!(job.state, JobState::Running) && !job.notified {
+            let pending = !matches!(job.state, JobState::Running);
+            if pending && !job.notified {
                 job.notified = true;
                 out.push(job.clone());
             }
@@ -134,11 +145,15 @@ impl JobTable {
 
     /// Drops all jobs that are non-Running AND notified.
     pub fn remove_notified(&mut self) {
-        self.jobs
-            .retain(|j| matches!(j.state, JobState::Running) || !j.notified);
+        self.jobs.retain(|j| {
+            matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified
+        });
     }
 
     /// Returns the most-recent and previous job ids (for `+`/`-` markers).
+    /// Unlike [`current_id`], this includes Done/Signaled jobs that are
+    /// still in the table awaiting notification, so the `+`/`-` flags on
+    /// `jobs` output match what the user just saw.
     /// Most-recent is the highest `created_at`; previous is the next.
     pub fn current_and_previous(&self) -> (Option<u32>, Option<u32>) {
         let mut by_age: Vec<&Job> = self.jobs.iter().collect();
@@ -146,6 +161,35 @@ impl JobTable {
         let current = by_age.first().map(|j| j.id);
         let previous = by_age.get(1).map(|j| j.id);
         (current, previous)
+    }
+
+    /// Most-recent Running or Stopped job id (the `+` job for fg/bg/jobs).
+    pub fn current_id(&self) -> Option<u32> {
+        self.jobs
+            .iter()
+            .filter(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
+            .max_by_key(|j| j.created_at)
+            .map(|j| j.id)
+    }
+
+    /// Most-recent Stopped job id, ignoring Running jobs. Used by `bg`.
+    pub fn current_stopped_id(&self) -> Option<u32> {
+        self.jobs
+            .iter()
+            .filter(|j| matches!(j.state, JobState::Stopped(_)))
+            .max_by_key(|j| j.created_at)
+            .map(|j| j.id)
+    }
+
+    /// True if any job is Running or Stopped (i.e., `wait` should block).
+    pub fn has_pending(&self) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
+    }
+
+    pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
+        &mut self.jobs
     }
 
     fn next_id(&self) -> u32 {
@@ -167,7 +211,9 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
         .store(false, std::sync::atomic::Ordering::Relaxed);
     loop {
         let mut raw_status: libc::c_int = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WNOHANG) };
+        let pid = unsafe {
+            libc::waitpid(-1, &mut raw_status, libc::WNOHANG | libc::WUNTRACED)
+        };
         if pid <= 0 {
             // 0 = no children changed state; -1 = no children at all (ECHILD)
             break;
@@ -190,8 +236,7 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
-        let state = render_state(&job.state);
-        eprintln!("[{}]{} {:<20} {} &", job.id, flag, state, job.command);
+        eprintln!("{}", notification_line(&job, flag));
     }
     shell.jobs.remove_notified();
 }
@@ -199,10 +244,29 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
 pub fn render_state(state: &JobState) -> String {
     match state {
         JobState::Running => "Running".to_string(),
+        JobState::Stopped(s) => match *s {
+            libc::SIGTSTP => "Stopped".to_string(),
+            libc::SIGTTIN => "Stopped (tty input)".to_string(),
+            libc::SIGTTOU => "Stopped (tty output)".to_string(),
+            n => format!("Stopped (signal {n})"),
+        },
         JobState::Done(0) => "Done".to_string(),
         JobState::Done(n) => format!("Exit {n}"),
         JobState::Signaled(s) => format!("Killed (signal {s})"),
     }
+}
+
+/// Renders one notification/listing line for a job. The trailing `&` is
+/// included for Running and Done/Signaled jobs — Stopped jobs are not
+/// "running in the background" so the suffix would be misleading. Column
+/// width is 24 to fit `Stopped (tty output)`.
+pub fn notification_line(job: &Job, flag: char) -> String {
+    let state = render_state(&job.state);
+    let suffix = match job.state {
+        JobState::Stopped(_) => "",
+        _ => " &",
+    };
+    format!("[{}]{} {:<24} {}{}", job.id, flag, state, job.command, suffix)
 }
 
 /// Decodes a raw waitpid status into a JobState terminal variant.
@@ -211,10 +275,9 @@ fn decode_status(raw: libc::c_int) -> JobState {
         JobState::Done(libc::WEXITSTATUS(raw))
     } else if libc::WIFSIGNALED(raw) {
         JobState::Signaled(libc::WTERMSIG(raw))
+    } else if libc::WIFSTOPPED(raw) {
+        JobState::Stopped(libc::WSTOPSIG(raw))
     } else {
-        // Stopped or continued — sub-project A doesn't handle these; treat
-        // as still running. In practice we never call decode_status until
-        // all pids have been reaped, so this branch shouldn't fire here.
         JobState::Running
     }
 }
@@ -334,13 +397,65 @@ mod tests {
     }
 
     #[test]
-    fn has_running_tracks_state() {
+    fn has_pending_tracks_state() {
         let mut t = JobTable::new();
-        assert!(!t.has_running());
+        assert!(!t.has_pending());
         let _ = t.add(100, vec![100], "x".to_string());
-        assert!(t.has_running());
+        assert!(t.has_pending());
         t.reap(100, fake_done_raw(0));
-        assert!(!t.has_running());
+        assert!(!t.has_pending());
+    }
+
+    #[test]
+    fn current_id_returns_most_recent_running_or_stopped() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());      // id 1
+        let _ = t.add(200, vec![200], "b".to_string());      // id 2 — more recent
+        assert_eq!(t.current_id(), Some(2));
+    }
+
+    #[test]
+    fn current_id_includes_stopped_jobs() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        let _ = t.add(200, vec![200], "b".to_string());
+        t.jobs_mut()[1].state = JobState::Stopped(libc::SIGTSTP);
+        assert_eq!(t.current_id(), Some(2));
+    }
+
+    #[test]
+    fn current_id_returns_none_when_only_done_jobs() {
+        let mut t = JobTable::new();
+        let id = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
+        assert_eq!(t.current_id(), None);
+        let _ = id;
+    }
+
+    #[test]
+    fn current_stopped_id_skips_running_jobs() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());      // Running, id 1
+        let _ = t.add(200, vec![200], "b".to_string());      // Running, id 2 (more recent)
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        // Most-recent is id 2 (Running); current_stopped should skip it and return id 1.
+        assert_eq!(t.current_stopped_id(), Some(1));
+    }
+
+    #[test]
+    fn has_pending_true_when_any_stopped() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        assert!(t.has_pending());
+    }
+
+    #[test]
+    fn has_pending_false_when_all_done() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
+        assert!(!t.has_pending());
     }
 
     #[test]
@@ -362,5 +477,142 @@ mod tests {
         assert_eq!(cur, Some(id_c));
         assert_eq!(prev, Some(id_b));
         let _ = id_a;
+    }
+
+    #[test]
+    fn render_state_stopped_sigtstp_is_plain_stopped() {
+        assert_eq!(render_state(&JobState::Stopped(libc::SIGTSTP)), "Stopped");
+    }
+
+    #[test]
+    fn render_state_stopped_sigttin_includes_tty_input() {
+        assert_eq!(
+            render_state(&JobState::Stopped(libc::SIGTTIN)),
+            "Stopped (tty input)"
+        );
+    }
+
+    #[test]
+    fn render_state_stopped_sigttou_includes_tty_output() {
+        assert_eq!(
+            render_state(&JobState::Stopped(libc::SIGTTOU)),
+            "Stopped (tty output)"
+        );
+    }
+
+    #[test]
+    fn render_state_stopped_unknown_signal_falls_back_to_numeric() {
+        assert_eq!(
+            render_state(&JobState::Stopped(99)),
+            "Stopped (signal 99)"
+        );
+    }
+
+    #[test]
+    fn notification_line_for_stopped_omits_ampersand() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "sleep 100".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        let line = notification_line(&t.jobs_mut()[0], '+');
+        assert_eq!(line, "[1]+ Stopped                  sleep 100");
+    }
+
+    #[test]
+    fn notification_line_for_done_includes_ampersand() {
+        let mut t = JobTable::new();
+        t.add_synthetic_done("echo hi".to_string(), 0);
+        let line = notification_line(&t.jobs_mut()[0], ' ');
+        assert_eq!(line, "[1]  Done                     echo hi &");
+    }
+
+    #[test]
+    fn notification_line_for_stopped_tty_input_shows_reason() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "cat".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTTIN);
+        let line = notification_line(&t.jobs_mut()[0], '+');
+        assert_eq!(line, "[1]+ Stopped (tty input)      cat");
+    }
+
+    #[test]
+    fn reap_with_stopped_status_transitions_job_to_stopped_state() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        // POSIX: WIFSTOPPED true when low byte == 0x7f; stop signal in second byte.
+        let raw_status: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(4242, raw_status);
+        let j = &t.jobs_mut()[0];
+        assert!(
+            matches!(j.state, JobState::Stopped(s) if s == libc::SIGTSTP),
+            "got state {:?}", j.state
+        );
+        assert!(!j.reaped[0], "stopped is not reaped — child still exists");
+        assert!(!j.notified, "stopped jobs must be visible to the next notification pass");
+    }
+
+    #[test]
+    fn reap_with_exit_after_stop_finally_transitions_to_done() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        let exited: libc::c_int = 0;
+        t.reap(4242, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)));
+        t.reap(4242, exited);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(0)));
+    }
+
+    #[test]
+    fn pipeline_reap_stop_then_exit_in_order_finalizes_with_last_stage_status() {
+        // Pipeline `a | b`: SIGTSTP both, then a exits 0 then b exits 7.
+        // Final state must be Done(7) — last stage wins.
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(100, stopped);
+        t.reap(200, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)));
+        assert_eq!(t.jobs_mut()[0].reaped, vec![false, false]);
+
+        let exit_a: libc::c_int = 0; // WEXITSTATUS = 0
+        let exit_b: libc::c_int = 7 << 8; // WEXITSTATUS = 7
+        t.reap(100, exit_a);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while b is alive");
+        t.reap(200, exit_b);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)));
+    }
+
+    #[test]
+    fn pipeline_reap_stop_then_exit_reverse_order_still_uses_last_stage_status() {
+        // Same as above but b exits BEFORE a.
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(100, stopped);
+        t.reap(200, stopped);
+
+        let exit_b: libc::c_int = 7 << 8;
+        let exit_a: libc::c_int = 0;
+        t.reap(200, exit_b);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while a is alive");
+        t.reap(100, exit_a);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)),
+            "last stage status (b=7) must win, not a=0");
+    }
+
+    #[test]
+    fn reap_repeated_stopped_status_same_signal_is_idempotent_for_notification() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        // First stop: synchronous waiter would have set notified=true after this.
+        t.reap(100, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(s) if s == libc::SIGTSTP));
+        t.jobs_mut()[0].notified = true;  // simulate the synchronous waiter's bookkeeping
+        // Second stop for the same job (other pid, same signal).
+        t.reap(200, stopped);
+        assert!(t.jobs_mut()[0].notified, "must NOT reset notified for the second stop");
     }
 }

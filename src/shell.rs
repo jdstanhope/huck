@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use libc;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use signal_hook::consts::{SIGCHLD, SIGINT};
@@ -15,7 +16,7 @@ const PROMPT: &str = "shuck> ";
 
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run() -> i32 {
-    install_sigint_handler();
+    install_job_control_signals();
 
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -26,6 +27,7 @@ pub fn run() -> i32 {
     };
 
     let mut shell = Shell::new();
+    install_sigint_handler(Arc::clone(&shell.sigint_flag));
     install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
 
     loop {
@@ -50,13 +52,10 @@ pub fn run() -> i32 {
     }
 }
 
-/// Installs a SIGINT handler so the shell survives Ctrl-C while a child
-/// process runs. The handler is a real handler (not SIG_IGN), so a spawned
-/// child resets SIGINT to its default disposition on exec and is terminated
-/// normally. The flag itself is not read; registering the handler is the
-/// whole point.
-fn install_sigint_handler() {
-    let flag = Arc::new(AtomicBool::new(false));
+/// Installs a SIGINT handler that sets the supplied flag. Called once at
+/// startup after `Shell::new()`; the flag lives on the `Shell` so the wait
+/// builtin can poll it to break out of its loop when Ctrl-C is pressed.
+fn install_sigint_handler(flag: Arc<AtomicBool>) {
     if let Err(e) = signal_hook::flag::register(SIGINT, flag) {
         eprintln!("shuck: warning: could not install SIGINT handler: {e}");
     }
@@ -67,6 +66,25 @@ fn install_sigint_handler() {
 fn install_sigchld_handler(flag: Arc<AtomicBool>) {
     if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
         eprintln!("shuck: warning: could not install SIGCHLD handler: {e}");
+    }
+}
+
+/// Ignore SIGTSTP/SIGTTIN/SIGTTOU at the shell level so that:
+///   - Ctrl-Z at the prompt does not suspend shuck itself.
+///   - `tcsetpgrp` from a non-foreground pgrp does not trigger SIGTTOU on us.
+///   - Defensive: shuck never reads `/dev/tty` directly today, but match bash.
+///
+/// NOTE: `SIG_IGN` is inherited across `execve`. Foreground children
+/// spawned by the executor (Task 5) MUST reset these three signals to
+/// `SIG_DFL` via a `CommandExt::pre_exec` hook — otherwise Ctrl-Z would
+/// not stop `vim`/`less`/etc., and a backgrounded reader would never
+/// get SIGTTIN.
+fn install_job_control_signals() {
+    for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        let prev = unsafe { libc::signal(sig, libc::SIG_IGN) };
+        if prev == libc::SIG_ERR {
+            eprintln!("shuck: warning: could not ignore signal {sig}");
+        }
     }
 }
 

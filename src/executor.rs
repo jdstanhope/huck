@@ -150,8 +150,11 @@ fn run_background_sequence(
         process.env_clear();
         process.envs(shell.exported_env());
 
-        // Process-group: first stage = own pg leader; rest join.
+        // Reset job-control signals to SIG_DFL in the child before exec.
         use std::os::unix::process::CommandExt;
+        unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+
+        // Process-group: first stage = own pg leader; rest join.
         let pgid_target = first_pid.unwrap_or(0);
         process.process_group(pgid_target);
 
@@ -201,7 +204,11 @@ fn run_background_sequence(
             // standard fix is to also call setpgid in the parent — it's
             // idempotent with the child's call.
             unsafe {
-                libc::setpgid(pid, pid);
+                if libc::setpgid(pid, pid) != 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_assert!(errno == libc::ESRCH,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                }
             }
         }
 
@@ -446,13 +453,27 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
 fn run_subprocess(
     cmd: &ResolvedCommand,
     files: StageFiles,
-    shell: &Shell,
+    shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
+    let interactive = matches!(sink, StdoutSink::Terminal);
+
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
     process.env_clear();
     process.envs(shell.exported_env());
+
+    // Reset job-control signals to SIG_DFL in every child (foreground and
+    // background). The shell SIG_IGNs these, and SIG_IGN is inherited across
+    // exec — without this, Ctrl-Z would never stop foreground children like
+    // vim/less, and background readers could never receive SIGTTIN.
+    use std::os::unix::process::CommandExt;
+    unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+
+    if interactive {
+        process.process_group(0);
+    }
+
     if let Some(file) = files.stdin {
         process.stdin(Stdio::from(file));
     }
@@ -468,26 +489,83 @@ fn run_subprocess(
 
     match process.spawn() {
         Ok(mut child) => {
-            let mut copy_err: Option<io::Error> = None;
-            if let StdoutSink::Capture(buf) = sink {
-                if let Some(mut child_stdout) = child.stdout.take() {
-                    if let Err(e) = io::copy(&mut child_stdout, *buf) {
-                        copy_err = Some(e);
+            let pid = child.id() as i32;
+
+            if interactive {
+                // Race-close: also setpgid in the parent so the child's pgrp
+                // is guaranteed to exist before we call tcsetpgrp.
+                unsafe {
+                    if libc::setpgid(pid, pid) != 0 {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        debug_assert!(errno == libc::ESRCH,
+                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
                     }
                 }
-            }
-            match child.wait() {
-                Ok(status) => {
-                    if let Some(e) = copy_err {
+                give_terminal_to(pid);
+
+                match wait_with_untraced(pid) {
+                    Ok((raw_status, true)) => {
+                        // Child was stopped (e.g. Ctrl-Z / SIGTSTP).
+                        let sig = libc::WSTOPSIG(raw_status);
+                        let job_id = shell.jobs.add(pid, vec![pid], cmd.program.clone());
+                        for job in shell.jobs.jobs_mut() {
+                            if job.id == job_id {
+                                job.state = crate::jobs::JobState::Stopped(sig);
+                                job.notified = true;
+                                break;
+                            }
+                        }
+                        let line = shell.jobs.iter()
+                            .find(|j| j.id == job_id)
+                            .map(|j| crate::jobs::notification_line(j, '+'))
+                            .unwrap_or_default();
+                        eprintln!("\n{line}");
+                        std::mem::forget(child);
+                        give_terminal_to(shell.shell_pgid);
+                        ExecOutcome::Continue(128 + sig)
+                    }
+                    Ok((raw_status, false)) => {
+                        // Child exited or was killed by a signal.
+                        let code = if libc::WIFEXITED(raw_status) {
+                            libc::WEXITSTATUS(raw_status)
+                        } else if libc::WIFSIGNALED(raw_status) {
+                            128 + libc::WTERMSIG(raw_status)
+                        } else {
+                            1
+                        };
+                        std::mem::forget(child);
+                        give_terminal_to(shell.shell_pgid);
+                        ExecOutcome::Continue(code)
+                    }
+                    Err(()) => {
+                        std::mem::forget(child);
+                        give_terminal_to(shell.shell_pgid);
+                        ExecOutcome::Continue(1)
+                    }
+                }
+            } else {
+                // Capture path: use existing child.wait() semantics.
+                let mut copy_err: Option<io::Error> = None;
+                if let StdoutSink::Capture(buf) = sink {
+                    if let Some(mut child_stdout) = child.stdout.take() {
+                        if let Err(e) = io::copy(&mut child_stdout, *buf) {
+                            copy_err = Some(e);
+                        }
+                    }
+                }
+                match child.wait() {
+                    Ok(status) => {
+                        if let Some(e) = copy_err {
+                            eprintln!("shuck: {}: {e}", cmd.program);
+                            ExecOutcome::Continue(1)
+                        } else {
+                            ExecOutcome::Continue(status_code(&status))
+                        }
+                    }
+                    Err(e) => {
                         eprintln!("shuck: {}: {e}", cmd.program);
                         ExecOutcome::Continue(1)
-                    } else {
-                        ExecOutcome::Continue(status_code(&status))
                     }
-                }
-                Err(e) => {
-                    eprintln!("shuck: {}: {e}", cmd.program);
-                    ExecOutcome::Continue(1)
                 }
             }
         }
@@ -520,6 +598,9 @@ fn run_multi_stage(
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
+    let interactive = matches!(sink, StdoutSink::Terminal);
+    let mut first_pid: Option<i32> = None;
+
     let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
@@ -545,6 +626,7 @@ fn run_multi_stage(
 
     let n = resolved_stages.len();
     let mut stages: Vec<Stage> = Vec::with_capacity(n);
+    let mut stage_pids: Vec<i32> = Vec::with_capacity(n);
     let mut carry = Carry::None;
 
     for (i, (resolved, files)) in resolved_stages.iter().zip(all_files).enumerate() {
@@ -619,6 +701,14 @@ fn run_multi_stage(
         process.env_clear();
         process.envs(shell.exported_env());
 
+        // Reset job-control signals to SIG_DFL in every child.
+        use std::os::unix::process::CommandExt;
+        unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+        if interactive {
+            let pgid_target = first_pid.unwrap_or(0);
+            process.process_group(pgid_target);
+        }
+
         let mut pending_input: Option<Vec<u8>> = None;
         if let Some(file) = files.stdin {
             process.stdin(Stdio::from(file));
@@ -674,6 +764,21 @@ fn run_multi_stage(
             }
         }
 
+        // Track pid for interactive job-control; setpgid in parent to
+        // close the race with the child's setpgid (via process_group).
+        let pid = child.id() as i32;
+        stage_pids.push(pid);
+        if interactive && first_pid.is_none() {
+            first_pid = Some(pid);
+            unsafe {
+                if libc::setpgid(pid, pid) != 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_assert!(errno == libc::ESRCH,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                }
+            }
+        }
+
         if pipe_onward {
             carry = Carry::ChildStdout(child.stdout.take().expect("stdout was set to piped"));
         } else if !is_last {
@@ -691,22 +796,111 @@ fn run_multi_stage(
         stages.push(Stage::Process(child));
     }
 
+    // Give the terminal to the pipeline's process group if interactive.
+    if interactive {
+        if let Some(pgid) = first_pid {
+            give_terminal_to(pgid);
+        }
+    }
+
     let mut last_status = 0;
     for stage in stages {
         match stage {
             Stage::Done(code) => last_status = code,
             Stage::Process(mut child) => {
-                last_status = match child.wait() {
-                    Ok(status) => status_code(&status),
-                    Err(e) => {
-                        eprintln!("shuck: {e}");
-                        1
+                if interactive {
+                    let pid = child.id() as i32;
+                    match wait_with_untraced(pid) {
+                        Ok((raw_status, true)) => {
+                            // Pipeline was stopped (Ctrl-Z).
+                            let sig = libc::WSTOPSIG(raw_status);
+                            let pgid = first_pid.unwrap_or(pid);
+                            let display = format!("(pipeline pid {pgid})");
+                            let job_id = shell.jobs.add(pgid, stage_pids.clone(), display.clone());
+                            for job in shell.jobs.jobs_mut() {
+                                if job.id == job_id {
+                                    job.state = crate::jobs::JobState::Stopped(sig);
+                                    job.notified = true;
+                                    break;
+                                }
+                            }
+                            let line = shell.jobs.iter()
+                                .find(|j| j.id == job_id)
+                                .map(|j| crate::jobs::notification_line(j, '+'))
+                                .unwrap_or_default();
+                            eprintln!("\n{line}");
+                            std::mem::forget(child);
+                            give_terminal_to(shell.shell_pgid);
+                            return ExecOutcome::Continue(128 + sig);
+                        }
+                        Ok((raw_status, false)) => {
+                            last_status = if libc::WIFEXITED(raw_status) {
+                                libc::WEXITSTATUS(raw_status)
+                            } else if libc::WIFSIGNALED(raw_status) {
+                                128 + libc::WTERMSIG(raw_status)
+                            } else {
+                                1
+                            };
+                            std::mem::forget(child);
+                        }
+                        Err(()) => {
+                            last_status = 1;
+                            std::mem::forget(child);
+                        }
                     }
-                };
+                } else {
+                    last_status = match child.wait() {
+                        Ok(status) => status_code(&status),
+                        Err(e) => {
+                            eprintln!("shuck: {e}");
+                            1
+                        }
+                    };
+                }
             }
         }
     }
+
+    if interactive {
+        give_terminal_to(shell.shell_pgid);
+    }
     ExecOutcome::Continue(last_status)
+}
+
+// ----- job-control helpers -------------------------------------------------
+
+/// Best-effort: give the controlling terminal to `pgid`. Swallows ENOTTY
+/// (non-tty environments like cargo test) and EPERM (race: pgrp already
+/// exited). Other errors are silently ignored too.
+fn give_terminal_to(pgid: i32) {
+    unsafe {
+        let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+    }
+}
+
+/// Block-wait for a single child pid with WUNTRACED. Returns:
+///   `Ok((raw_status, stopped))` where `stopped` is true if WIFSTOPPED.
+///   `Err(())` on waitpid failure.
+fn wait_with_untraced(pid: i32) -> Result<(libc::c_int, bool), ()> {
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+    if r < 0 {
+        return Err(());
+    }
+    Ok((status, libc::WIFSTOPPED(status)))
+}
+
+/// pre_exec closure that resets SIGTSTP/SIGTTIN/SIGTTOU to SIG_DFL in the
+/// child. Required because shuck SIG_IGNs these at the shell level and
+/// SIG_IGN is inherited across exec — without this, Ctrl-Z would never
+/// stop a foreground job, and a background reader could never SIGTTIN.
+fn reset_job_control_signals_in_child() -> std::io::Result<()> {
+    unsafe {
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+    }
+    Ok(())
 }
 
 // ----- tests ---------------------------------------------------------------
@@ -841,5 +1035,12 @@ mod tests {
         let _ = execute(&seq, &mut shell, "SHUCK_TEST_BG_ASSIGN=v &");
         // The assignment ran in the parent (pure-builtin path).
         assert_eq!(shell.get("SHUCK_TEST_BG_ASSIGN"), Some("v"));
+    }
+
+    #[test]
+    fn give_terminal_to_silently_succeeds_on_non_tty() {
+        // cargo test runs without a controlling terminal; tcsetpgrp returns
+        // ENOTTY. The helper must swallow it.
+        give_terminal_to(1); // bogus pgid; we only care that we don't panic
     }
 }
