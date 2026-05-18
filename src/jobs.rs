@@ -557,4 +557,44 @@ mod tests {
         t.reap(4242, exited);
         assert!(matches!(t.jobs_mut()[0].state, JobState::Done(0)));
     }
+
+    #[test]
+    fn pipeline_reap_stop_then_exit_in_order_finalizes_with_last_stage_status() {
+        // Pipeline `a | b`: SIGTSTP both, then a exits 0 then b exits 7.
+        // Final state must be Done(7) — last stage wins.
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(100, stopped);
+        t.reap(200, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)));
+        assert_eq!(t.jobs_mut()[0].reaped, vec![false, false]);
+
+        let exit_a: libc::c_int = 0; // WEXITSTATUS = 0
+        let exit_b: libc::c_int = 7 << 8; // WEXITSTATUS = 7
+        t.reap(100, exit_a);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while b is alive");
+        t.reap(200, exit_b);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)));
+    }
+
+    #[test]
+    fn pipeline_reap_stop_then_exit_reverse_order_still_uses_last_stage_status() {
+        // Same as above but b exits BEFORE a.
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100, 200], "a | b".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(100, stopped);
+        t.reap(200, stopped);
+
+        let exit_b: libc::c_int = 7 << 8;
+        let exit_a: libc::c_int = 0;
+        t.reap(200, exit_b);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)),
+            "still stopped while a is alive");
+        t.reap(100, exit_a);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)),
+            "last stage status (b=7) must win, not a=0");
+    }
 }
