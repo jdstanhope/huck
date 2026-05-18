@@ -937,4 +937,57 @@ mod tests {
 
         assert_eq!(out, vec!["fooA".to_string(), "fooB".to_string()]);
     }
+
+    #[test]
+    fn glob_negation_bracket_excludes_listed() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.txt");
+        touch(tmp.path(), "b.txt");
+        touch(tmp.path(), "c.txt");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("[!a]");
+        f.push_str(".txt", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["b.txt".to_string(), "c.txt".to_string()]);
+    }
+
+    #[test]
+    fn glob_unterminated_bracket_falls_back_to_literal() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let f = Field::from_unquoted("[abc"); // no closing ]
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["[abc".to_string()]);
+    }
+
+    #[test]
+    fn glob_star_does_not_cross_path_separator() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        touch(&tmp.path().join("sub"), "deep.txt");
+        touch(tmp.path(), "top.txt");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("*");
+        f.push_str(".txt", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["top.txt".to_string()]);
+    }
 }
