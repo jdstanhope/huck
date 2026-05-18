@@ -16,7 +16,7 @@ pub enum ExecOutcome {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait"
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg"
     )
 }
 
@@ -38,6 +38,8 @@ pub fn run_builtin(
         "unset" => builtin_unset(args, shell),
         "jobs" => builtin_jobs(args, out, shell),
         "wait" => builtin_wait(args, out, shell),
+        "fg" => builtin_fg(args, shell),
+        "bg" => builtin_bg(args, out, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -214,6 +216,98 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
     }
     // Print Done lines for anything that just transitioned during the wait.
     crate::jobs::reap_and_notify(shell);
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if !args.is_empty() {
+        eprintln!("shuck: fg: arguments not supported in this version");
+        return ExecOutcome::Continue(2);
+    }
+    let id = match shell.jobs.current_id() {
+        Some(id) => id,
+        None => {
+            eprintln!("shuck: fg: no current job");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let (pgid, pids, command) = {
+        let job = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id).unwrap();
+        job.state = crate::jobs::JobState::Running;
+        job.notified = true;
+        (job.pgid, job.pids.clone(), job.command.clone())
+    };
+
+    eprintln!("{command}");
+
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        libc::killpg(pgid, libc::SIGCONT);
+    }
+
+    let mut last_status = 0;
+    let mut stopped_sig: Option<i32> = None;
+    for &pid in &pids {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if r < 0 {
+            last_status = 1;
+            continue;
+        }
+        if libc::WIFSTOPPED(status) {
+            stopped_sig = Some(libc::WSTOPSIG(status));
+            break;
+        }
+        last_status = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        };
+    }
+
+    unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid); }
+
+    if let Some(sig) = stopped_sig {
+        if let Some(job) = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id) {
+            job.state = crate::jobs::JobState::Stopped(sig);
+            job.notified = true;
+        }
+        let line = shell.jobs.iter()
+            .find(|j| j.id == id)
+            .map(|j| crate::jobs::notification_line(j, '+'))
+            .unwrap_or_default();
+        eprintln!("\n{line}");
+        return ExecOutcome::Continue(128 + sig);
+    }
+
+    shell.jobs.jobs_mut().retain(|j| j.id != id);
+    ExecOutcome::Continue(last_status)
+}
+
+fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
+    if !args.is_empty() {
+        eprintln!("shuck: bg: arguments not supported in this version");
+        return ExecOutcome::Continue(2);
+    }
+    let id = match shell.jobs.current_stopped_id() {
+        Some(id) => id,
+        None => {
+            eprintln!("shuck: bg: no current job");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let (pgid, command) = {
+        let job = shell.jobs.jobs_mut().iter_mut().find(|j| j.id == id).unwrap();
+        job.state = crate::jobs::JobState::Running;
+        job.notified = true;
+        (job.pgid, job.command.clone())
+    };
+
+    unsafe { libc::killpg(pgid, libc::SIGCONT); }
+
+    eprintln!("[{id}]+ {command} &");
     ExecOutcome::Continue(0)
 }
 
@@ -397,5 +491,58 @@ mod tests {
     fn is_builtin_recognizes_jobs_and_wait() {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("wait"));
+    }
+}
+
+#[cfg(test)]
+mod fg_bg_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn fg_with_no_jobs_errors() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_no_jobs_errors() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn fg_with_args_rejected_with_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn bg_with_args_rejected_with_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn bg_on_running_job_returns_no_current_job() {
+        let mut shell = Shell::new();
+        shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn is_builtin_recognizes_fg_and_bg() {
+        assert!(is_builtin("fg"));
+        assert!(is_builtin("bg"));
     }
 }
