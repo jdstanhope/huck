@@ -14,13 +14,14 @@ spec, an implementation plan, and a test suite.
 | v4        | Variables and expansion (`$VAR`, `${VAR}`, assignments) |
 | v5        | Command substitution (`$(cmd)`)                         |
 | v6        | Background jobs (`&`, `jobs`, `wait`)                   |
+| v7        | Foreground job control (`fg`, `bg`, Ctrl-Z)             |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (186 tests)
+cargo test               # full test suite (214 tests)
 ```
 
 ## Features
@@ -31,17 +32,23 @@ cargo test               # full test suite (186 tests)
 `echo "$VAR"`, `echo $(date)`, `NAME=value cmd`.
 
 **Builtins:**
-`cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`.
+`cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`.
 
-**Job control (v6, sub-project A):**
-Trailing `&` runs a single pipeline in its own process group, prints
+**Job control (v6 + v7):**
+Trailing `&` runs a pipeline in its own process group, prints
 `[N] PID`, and the prompt-time reaper prints `[N] Done <cmd> &`
-notifications. `jobs` lists running/finished jobs with `+`/`-` markers;
-`wait` blocks until all background jobs finish.
+notifications. Foreground pipelines also get their own process group;
+`tcsetpgrp` hands them the controlling terminal so interactive programs
+(`vim`, `less`) work and Ctrl-Z stops the job into `Stopped` state. `fg`
+resumes the current job in foreground; `bg` resumes the current stopped
+job in background. `jobs` lists Running/Stopped/finished jobs with
+`+`/`-` markers; `wait` blocks until no jobs are Running or Stopped, and
+can be interrupted with Ctrl-C.
 
 **Not yet implemented:**
-`fg`/`bg`/`Ctrl-Z`, control flow (`if`/`while`/`for`/`case`), functions,
-quoted globbing, history expansion, arithmetic, here-docs, aliases.
+job specifiers (`%1`, `%+`, `%-`, `%cmd`), `disown`, `kill` builtin,
+control flow (`if`/`while`/`for`/`case`), functions, quoted globbing,
+history expansion, arithmetic, here-docs, aliases.
 
 ## Project layout
 
@@ -76,7 +83,7 @@ Tests live alongside each module in `#[cfg(test)] mod tests` blocks.
 
 - `rustyline` — line editing
 - `signal-hook` — SIGINT, SIGCHLD
-- `libc` — `waitpid`, `setpgid`, `killpg`
+- `libc` — `waitpid`, `setpgid`, `killpg`, `tcsetpgrp`, `signal`
 
 ## License
 
