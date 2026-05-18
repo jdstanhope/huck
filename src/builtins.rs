@@ -16,7 +16,7 @@ pub enum ExecOutcome {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg"
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill"
     )
 }
 
@@ -40,6 +40,7 @@ pub fn run_builtin(
         "wait" => builtin_wait(args, out, shell),
         "fg" => builtin_fg(args, shell),
         "bg" => builtin_bg(args, out, shell),
+        "kill" => builtin_kill(args, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -317,6 +318,23 @@ fn check_sigint(shell: &Shell) -> bool {
     }
 }
 
+fn signal_by_name(s: &str) -> Option<i32> {
+    let upper = s.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    Some(match name {
+        "HUP"  => libc::SIGHUP,
+        "INT"  => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "KILL" => libc::SIGKILL,
+        "TERM" => libc::SIGTERM,
+        "STOP" => libc::SIGSTOP,
+        "CONT" => libc::SIGCONT,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        _ => return None,
+    })
+}
+
 /// Parses `arg` as a job spec and resolves it to a job id. On parse or
 /// resolution failure, prints a `shuck: <builtin>: ...` error to stderr
 /// and returns `Err(ExecOutcome::Continue(1))` so the caller can `?` it.
@@ -333,6 +351,82 @@ fn resolve_spec_or_error(
         eprintln!("shuck: {builtin}: {arg}: no such job");
         ExecOutcome::Continue(1)
     })
+}
+
+fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let (sig, targets) = if let Some(first) = args.first() {
+        if let Some(rest) = first.strip_prefix('-') {
+            // -<sig> form
+            let sig = match rest.parse::<i32>() {
+                Ok(n) if (1..=64).contains(&n) => n,
+                Ok(_) => {
+                    eprintln!("shuck: kill: {rest}: invalid signal number");
+                    return ExecOutcome::Continue(1);
+                }
+                Err(_) => match signal_by_name(rest) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("shuck: kill: {rest}: invalid signal");
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+            if args.len() < 2 {
+                eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+                return ExecOutcome::Continue(2);
+            }
+            (sig, &args[1..])
+        } else {
+            (libc::SIGTERM, &args[..])
+        }
+    } else {
+        eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+        return ExecOutcome::Continue(2);
+    };
+
+    let mut any_failed = false;
+    for target in targets {
+        if let Some(_rest) = target.strip_prefix('%') {
+            let id = match resolve_spec_or_error(target, "kill", shell) {
+                Ok(id) => id,
+                Err(_) => {
+                    any_failed = true;
+                    continue;
+                }
+            };
+            let pgid = match shell.jobs.iter().find(|j| j.id == id) {
+                Some(j) => j.pgid,
+                None => {
+                    eprintln!("shuck: kill: {target}: no such job");
+                    any_failed = true;
+                    continue;
+                }
+            };
+            let rc = unsafe { libc::killpg(pgid, sig) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                eprintln!("shuck: kill: ({target}) - {errno}");
+                any_failed = true;
+            }
+        } else {
+            match target.parse::<i32>() {
+                Ok(pid) if pid > 0 => {
+                    let rc = unsafe { libc::kill(pid, sig) };
+                    if rc != 0 {
+                        let errno = std::io::Error::last_os_error();
+                        eprintln!("shuck: kill: ({pid}) - {errno}");
+                        any_failed = true;
+                    }
+                }
+                _ => {
+                    eprintln!("shuck: kill: {target}: arguments must be process or job IDs");
+                    any_failed = true;
+                }
+            }
+        }
+    }
+
+    if any_failed { ExecOutcome::Continue(1) } else { ExecOutcome::Continue(0) }
 }
 
 fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -841,5 +935,91 @@ mod fg_bg_tests {
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn is_builtin_recognizes_kill() {
+        assert!(is_builtin("kill"));
+    }
+
+    #[test]
+    fn kill_no_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_sig_flag_with_no_targets_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["-TERM".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_invalid_signal_name_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-ABC".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_invalid_signal_number_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-9999".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_unparseable_target_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_no_such_job_spec_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn signal_by_name_table_recognizes_common_signals() {
+        assert_eq!(signal_by_name("HUP"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("SIGHUP"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("hup"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("sighup"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("INT"), Some(libc::SIGINT));
+        assert_eq!(signal_by_name("KILL"), Some(libc::SIGKILL));
+        assert_eq!(signal_by_name("TERM"), Some(libc::SIGTERM));
+        assert_eq!(signal_by_name("STOP"), Some(libc::SIGSTOP));
+        assert_eq!(signal_by_name("CONT"), Some(libc::SIGCONT));
+        assert_eq!(signal_by_name("USR1"), Some(libc::SIGUSR1));
+        assert_eq!(signal_by_name("USR2"), Some(libc::SIGUSR2));
+        assert_eq!(signal_by_name("ABC"), None);
+        assert_eq!(signal_by_name(""), None);
     }
 }
