@@ -32,7 +32,7 @@ pub enum TildeSpec {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WordPart {
-    Literal(String),
+    Literal { text: String, quoted: bool },
     Tilde(TildeSpec),
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
@@ -52,6 +52,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
+    let mut quoted_current = String::new();
     let mut has_token = false;
     let mut in_assignment_value = false;
     let mut chars = input.chars().peekable();
@@ -59,7 +60,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     while let Some(c) = chars.next() {
         if c.is_whitespace() {
             if has_token {
-                flush_literal(&mut parts, &mut current);
+                flush_literal(&mut parts, &mut current, false);
+                if parts.is_empty() {
+                    // Defensive: a token exists but produced no parts. This
+                    // shouldn't happen for whitespace-terminated tokens (the
+                    // quote arms handle the empty `""`/`''` case themselves),
+                    // but emit an empty unquoted Literal to preserve the
+                    // "has_emitted" contract just in case.
+                    parts.push(WordPart::Literal { text: String::new(), quoted: false });
+                }
                 tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                 has_token = false;
                 in_assignment_value = false;
@@ -70,46 +79,58 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         match c {
             '\'' => {
                 has_token = true;
+                flush_literal(&mut parts, &mut current, false);
+                let parts_len_before = parts.len();
                 loop {
                     match chars.next() {
                         Some('\'') => break,
-                        Some(ch) => current.push(ch),
+                        Some(ch) => quoted_current.push(ch),
                         None => return Err(LexError::UnterminatedQuote),
                     }
+                }
+                flush_literal(&mut parts, &mut quoted_current, true);
+                if parts.len() == parts_len_before {
+                    // Empty `''` — preserve the empty-token contract by
+                    // emitting an empty quoted Literal.
+                    parts.push(WordPart::Literal { text: String::new(), quoted: true });
                 }
             }
             '"' => {
                 has_token = true;
+                flush_literal(&mut parts, &mut current, false);
+                let parts_len_before = parts.len();
                 loop {
                     match chars.next() {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
-                            Some(esc @ ('"' | '\\')) => current.push(esc),
-                            Some('$') => current.push('$'), // `\$` -> literal $
+                            Some(esc @ ('"' | '\\')) => quoted_current.push(esc),
+                            Some('$') => quoted_current.push('$'), // `\$` -> literal $
                             Some(other) => {
-                                current.push('\\');
-                                current.push(other);
+                                quoted_current.push('\\');
+                                quoted_current.push(other);
                             }
                             None => return Err(LexError::UnterminatedQuote),
                         },
                         Some('$') => {
                             // Expansion inside double quotes (quoted: true).
-                            if !current.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut current)));
-                            }
+                            flush_literal(&mut parts, &mut quoted_current, true);
                             read_dollar_expansion(&mut chars, &mut parts, true)?;
                         }
                         Some('`') => {
                             // Backtick substitution inside double quotes (quoted: true).
-                            if !current.is_empty() {
-                                parts.push(WordPart::Literal(std::mem::take(&mut current)));
-                            }
+                            flush_literal(&mut parts, &mut quoted_current, true);
                             let sequence = scan_backtick_substitution(&mut chars)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
-                        Some(ch) => current.push(ch),
+                        Some(ch) => quoted_current.push(ch),
                         None => return Err(LexError::UnterminatedQuote),
                     }
+                }
+                flush_literal(&mut parts, &mut quoted_current, true);
+                if parts.len() == parts_len_before {
+                    // Empty `""` — preserve the empty-token contract by
+                    // emitting an empty quoted Literal.
+                    parts.push(WordPart::Literal { text: String::new(), quoted: true });
                 }
             }
             '\\' => {
@@ -122,16 +143,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '$' => {
                 // Expansion outside any quotes (quoted: false).
                 has_token = true;
-                if !current.is_empty() {
-                    parts.push(WordPart::Literal(std::mem::take(&mut current)));
-                }
+                flush_literal(&mut parts, &mut current, false);
                 read_dollar_expansion(&mut chars, &mut parts, false)?;
             }
             '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
                 if let Some(spec) = try_parse_tilde(&mut chars, in_assignment_value) {
-                    if !current.is_empty() {
-                        parts.push(WordPart::Literal(std::mem::take(&mut current)));
-                    }
+                    flush_literal(&mut parts, &mut current, false);
                     has_token = true;
                     parts.push(WordPart::Tilde(spec));
                 } else {
@@ -142,15 +159,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '`' => {
                 has_token = true;
-                if !current.is_empty() {
-                    parts.push(WordPart::Literal(std::mem::take(&mut current)));
-                }
+                flush_literal(&mut parts, &mut current, false);
                 let sequence = scan_backtick_substitution(&mut chars)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '|' => {
                 if has_token {
-                    flush_literal(&mut parts, &mut current);
+                    flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                     in_assignment_value = false;
@@ -165,7 +180,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '&' => {
                 if has_token {
-                    flush_literal(&mut parts, &mut current);
+                    flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                     in_assignment_value = false;
@@ -180,7 +195,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             ';' => {
                 if has_token {
-                    flush_literal(&mut parts, &mut current);
+                    flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                     in_assignment_value = false;
@@ -190,7 +205,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '<' => {
                 if has_token {
-                    flush_literal(&mut parts, &mut current);
+                    flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                     in_assignment_value = false;
@@ -200,7 +215,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '>' => {
                 if has_token {
-                    flush_literal(&mut parts, &mut current);
+                    flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                     in_assignment_value = false;
@@ -236,19 +251,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     }
 
     if has_token {
-        flush_literal(&mut parts, &mut current);
+        flush_literal(&mut parts, &mut current, false);
         tokens.push(Token::Word(Word(parts)));
     }
     Ok(tokens)
 }
 
-fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String) {
+fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
     if !current.is_empty() {
-        parts.push(WordPart::Literal(std::mem::take(current)));
-    } else if parts.is_empty() {
-        // The token exists (e.g. from `""`) but no literal text has accumulated.
-        // Push an empty Literal so expansion's `has_emitted` fires.
-        parts.push(WordPart::Literal(String::new()));
+        parts.push(WordPart::Literal {
+            text: std::mem::take(current),
+            quoted,
+        });
     }
 }
 
@@ -280,7 +294,7 @@ fn read_dollar_expansion(
             parts.push(WordPart::Var { name, quoted });
         }
         _ => {
-            parts.push(WordPart::Literal("$".to_string()));
+            parts.push(WordPart::Literal { text: "$".to_string(), quoted });
         }
     }
     Ok(())
@@ -562,8 +576,8 @@ fn word_is_identifier_so_far(current: &str, parts: &[WordPart]) -> bool {
     // concatenation is a non-empty identifier.
     let mut joined = String::new();
     for p in parts {
-        if let WordPart::Literal(s) = p {
-            joined.push_str(s);
+        if let WordPart::Literal { text, .. } = p {
+            joined.push_str(text);
         } else {
             return false;
         }
@@ -594,7 +608,12 @@ mod tests {
 
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Literal(s.to_string())]))
+        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+    }
+
+    /// Builds a Token that holds a single quoted-Literal Word.
+    fn wq(s: &str) -> Token {
+        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: true }]))
     }
 
     /// Builds a Vec<Token> of all-Literal words.
@@ -621,7 +640,7 @@ mod tests {
     fn tokenize_single_quotes() {
         assert_eq!(
             tokenize("echo 'hello world'").unwrap(),
-            words(&["echo", "hello world"])
+            vec![w("echo"), wq("hello world")]
         );
     }
 
@@ -629,13 +648,13 @@ mod tests {
     fn tokenize_double_quotes() {
         assert_eq!(
             tokenize("echo \"hello world\"").unwrap(),
-            words(&["echo", "hello world"])
+            vec![w("echo"), wq("hello world")]
         );
     }
 
     #[test]
     fn tokenize_double_quote_escape() {
-        assert_eq!(tokenize(r#"echo "a\"b""#).unwrap(), words(&["echo", "a\"b"]));
+        assert_eq!(tokenize(r#"echo "a\"b""#).unwrap(), vec![w("echo"), wq("a\"b")]);
     }
 
     #[test]
@@ -650,17 +669,25 @@ mod tests {
 
     #[test]
     fn tokenize_adjacent_runs_concatenate() {
-        assert_eq!(tokenize(r#"foo"bar baz""#).unwrap(), words(&["foobar baz"]));
+        // `foo"bar baz"` flushes at the quote boundary: one Word with two
+        // parts, the unquoted `foo` and the quoted `bar baz`.
+        assert_eq!(
+            tokenize(r#"foo"bar baz""#).unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Literal { text: "foo".to_string(), quoted: false },
+                WordPart::Literal { text: "bar baz".to_string(), quoted: true },
+            ]))]
+        );
     }
 
     #[test]
     fn tokenize_single_quotes_preserve_backslash() {
-        assert_eq!(tokenize(r"echo 'a\b'").unwrap(), words(&["echo", r"a\b"]));
+        assert_eq!(tokenize(r"echo 'a\b'").unwrap(), vec![w("echo"), wq(r"a\b")]);
     }
 
     #[test]
     fn tokenize_empty_quotes_produce_empty_token() {
-        assert_eq!(tokenize("''").unwrap(), words(&[""]));
+        assert_eq!(tokenize("''").unwrap(), vec![wq("")]);
     }
 
     #[test]
@@ -760,7 +787,7 @@ mod tests {
     fn tokenize_quoted_operators_stay_words() {
         assert_eq!(
             tokenize(r#"echo "|" ">""#).unwrap(),
-            words(&["echo", "|", ">"])
+            vec![w("echo"), wq("|"), wq(">")]
         );
     }
 
@@ -873,7 +900,7 @@ mod tests {
     fn tokenize_quoted_sequencing_operators_stay_words() {
         assert_eq!(
             tokenize(r#"echo "&&" "||" ";""#).unwrap(),
-            words(&["echo", "&&", "||", ";"])
+            vec![w("echo"), wq("&&"), wq("||"), wq(";")]
         );
     }
 
@@ -932,7 +959,7 @@ mod tests {
 
     #[test]
     fn tokenize_dollar_var_in_single_quotes_is_literal() {
-        assert_eq!(tokenize("'$FOO'").unwrap(), words(&["$FOO"]));
+        assert_eq!(tokenize("'$FOO'").unwrap(), vec![wq("$FOO")]);
     }
 
     #[test]
@@ -950,8 +977,8 @@ mod tests {
         assert_eq!(
             tokenize("$5").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("$".to_string()),
-                WordPart::Literal("5".to_string()),
+                WordPart::Literal { text: "$".to_string(), quoted: false },
+                WordPart::Literal { text: "5".to_string(), quoted: false },
             ]))]
         );
     }
@@ -961,8 +988,8 @@ mod tests {
         assert_eq!(
             tokenize("$$").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("$".to_string()),
-                WordPart::Literal("$".to_string()),
+                WordPart::Literal { text: "$".to_string(), quoted: false },
+                WordPart::Literal { text: "$".to_string(), quoted: false },
             ]))]
         );
     }
@@ -981,7 +1008,7 @@ mod tests {
             tokenize("~/foo").unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal("/foo".to_string()),
+                WordPart::Literal { text: "/foo".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1017,7 +1044,7 @@ mod tests {
             tokenize("~alice/bin").unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::User("alice".to_string())),
-                WordPart::Literal("/bin".to_string()),
+                WordPart::Literal { text: "/bin".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1034,7 +1061,7 @@ mod tests {
 
     #[test]
     fn tokenize_tilde_in_quotes_is_literal() {
-        assert_eq!(tokenize("\"~\"").unwrap(), words(&["~"]));
+        assert_eq!(tokenize("\"~\"").unwrap(), vec![wq("~")]);
     }
 
     #[test]
@@ -1057,7 +1084,7 @@ mod tests {
         assert_eq!(
             tokenize("a$FOOb").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("a".to_string()),
+                WordPart::Literal { text: "a".to_string(), quoted: false },
                 WordPart::Var { name: "FOOb".to_string(), quoted: false },
             ]))]
         );
@@ -1069,14 +1096,14 @@ mod tests {
             tokenize("${FOO}bar").unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Var { name: "FOO".to_string(), quoted: false },
-                WordPart::Literal("bar".to_string()),
+                WordPart::Literal { text: "bar".to_string(), quoted: false },
             ]))]
         );
     }
 
     #[test]
     fn tokenize_escaped_dollar_in_double_quotes_is_literal() {
-        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), words(&["$FOO"]));
+        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), vec![wq("$FOO")]);
     }
 
     #[test]
@@ -1099,10 +1126,10 @@ mod tests {
         Sequence {
             first: Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
-                    program: Word(vec![WordPart::Literal("echo".to_string())]),
+                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: args
                         .iter()
-                        .map(|a| Word(vec![WordPart::Literal(a.to_string())]))
+                        .map(|a| Word(vec![WordPart::Literal { text: a.to_string(), quoted: false }]))
                         .collect(),
                     stdin: None,
                     stdout: None,
@@ -1140,7 +1167,7 @@ mod tests {
     fn tokenize_command_sub_in_single_quotes_is_literal() {
         assert_eq!(
             tokenize("'$(echo hi)'").unwrap(),
-            words(&["$(echo hi)"])
+            vec![wq("$(echo hi)")]
         );
     }
 
@@ -1161,11 +1188,26 @@ mod tests {
 
     #[test]
     fn tokenize_command_sub_with_paren_inside_double_quotes() {
-        // The `)` inside `"..."` does not close the substitution.
+        // The `)` inside `"..."` does not close the substitution. The inner
+        // `")"` arg is quoted, so the inner Literal carries quoted: true.
+        use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+        let inner = Sequence {
+            first: Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
+                    args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            },
+            rest: vec![],
+            background: false,
+        };
         assert_eq!(
             tokenize("$(echo \")\")").unwrap(),
             vec![sub_word(vec![WordPart::CommandSub {
-                sequence: echo_seq(&[")"]),
+                sequence: inner,
                 quoted: false,
             }])]
         );
@@ -1184,7 +1226,7 @@ mod tests {
             Sequence {
                 first: Pipeline {
                     commands: vec![SimpleCommand::Exec(ExecCommand {
-                        program: Word(vec![WordPart::Literal("echo".to_string())]),
+                        program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                         args: vec![inner_word],
                         stdin: None,
                         stdout: None,
@@ -1258,9 +1300,9 @@ mod tests {
         match &tokens[0] {
             Token::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 3);
-                assert!(matches!(parts[0], WordPart::Literal(ref s) if s == "pre"));
+                assert!(matches!(parts[0], WordPart::Literal { ref text, .. } if text == "pre"));
                 assert!(matches!(parts[1], WordPart::CommandSub { .. }));
-                assert!(matches!(parts[2], WordPart::Literal(ref s) if s == "post"));
+                assert!(matches!(parts[2], WordPart::Literal { ref text, .. } if text == "post"));
             }
             other => panic!("expected Word, got {other:?}"),
         }
@@ -1349,7 +1391,7 @@ mod tests {
                             // Inner body was `echo \` — backslash at end is literal.
                             assert_eq!(e.args.len(), 1);
                             match &e.args[0].0[0] {
-                                WordPart::Literal(s) => assert_eq!(s, "\\"),
+                                WordPart::Literal { text, .. } => assert_eq!(text, "\\"),
                                 other => panic!("expected Literal(\\\\), got {other:?}"),
                             }
                         }
@@ -1375,7 +1417,7 @@ mod tests {
                             // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
                             assert_eq!(e.args.len(), 1);
                             match &e.args[0].0[0] {
-                                WordPart::Literal(s) => assert_eq!(s, "n"),
+                                WordPart::Literal { text, .. } => assert_eq!(text, "n"),
                                 other => panic!("expected Literal(n), got {other:?}"),
                             }
                         }
@@ -1400,7 +1442,7 @@ mod tests {
     fn tokenize_backtick_in_single_quotes_is_literal() {
         assert_eq!(
             tokenize("'`echo hi`'").unwrap(),
-            words(&["`echo hi`"])
+            vec![wq("`echo hi`")]
         );
     }
 
@@ -1426,7 +1468,7 @@ mod tests {
             tokenize("~+/x").unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::Pwd),
-                WordPart::Literal("/x".to_string()),
+                WordPart::Literal { text: "/x".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1437,7 +1479,7 @@ mod tests {
             tokenize("~-/x").unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::OldPwd),
-                WordPart::Literal("/x".to_string()),
+                WordPart::Literal { text: "/x".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1455,7 +1497,7 @@ mod tests {
         assert_eq!(
             tokenize("X=~").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("X=".to_string()),
+                WordPart::Literal { text: "X=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
             ]))]
         );
@@ -1466,9 +1508,9 @@ mod tests {
         assert_eq!(
             tokenize("PATH=~/bin").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("PATH=".to_string()),
+                WordPart::Literal { text: "PATH=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal("/bin".to_string()),
+                WordPart::Literal { text: "/bin".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1478,11 +1520,11 @@ mod tests {
         assert_eq!(
             tokenize("PATH=~/bin:~/lib").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("PATH=".to_string()),
+                WordPart::Literal { text: "PATH=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal("/bin:".to_string()),
+                WordPart::Literal { text: "/bin:".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
-                WordPart::Literal("/lib".to_string()),
+                WordPart::Literal { text: "/lib".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1510,9 +1552,9 @@ mod tests {
         assert_eq!(
             tokenize("HOMES=~alice:~bob").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal("HOMES=".to_string()),
+                WordPart::Literal { text: "HOMES=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::User("alice".to_string())),
-                WordPart::Literal(":".to_string()),
+                WordPart::Literal { text: ":".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::User("bob".to_string())),
             ]))]
         );
@@ -1533,5 +1575,16 @@ mod tests {
             tokenize("echo ~+:foo").unwrap(),
             words(&["echo", "~+:foo"])
         );
+    }
+
+    #[test]
+    fn tokenize_mixed_quoted_unquoted_flushes_at_boundaries() {
+        let tokens = tokenize("foo\"bar\"baz").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
+        assert_eq!(parts[1], WordPart::Literal { text: "bar".to_string(), quoted: true });
+        assert_eq!(parts[2], WordPart::Literal { text: "baz".to_string(), quoted: false });
     }
 }

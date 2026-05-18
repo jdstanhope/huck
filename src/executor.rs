@@ -261,7 +261,7 @@ fn cleanup_partial_pipeline(pgid: Option<i32>, children: Vec<Child>) {
 fn pipeline_is_pure_builtin(pipeline: &Pipeline) -> bool {
     pipeline.commands.iter().all(|cmd| match cmd {
         SimpleCommand::Exec(e) => match e.program.0.first() {
-            Some(crate::lexer::WordPart::Literal(name)) => builtins::is_builtin(name),
+            Some(crate::lexer::WordPart::Literal { text: name, .. }) => builtins::is_builtin(name),
             _ => false,
         },
         SimpleCommand::Assign { .. } => true,
@@ -918,7 +918,7 @@ mod tests {
     use crate::lexer::{Word, WordPart};
 
     fn lit_word(s: &str) -> Word {
-        Word(vec![WordPart::Literal(s.to_string())])
+        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
     fn exec(program: &str, args: &[&str]) -> SimpleCommand {

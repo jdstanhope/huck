@@ -72,8 +72,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
 
     for part in &word.0 {
         match part {
-            WordPart::Literal(s) => {
-                current.push_str(s);
+            WordPart::Literal { text, .. } => {
+                current.push_str(text);
                 has_emitted = true;
             }
             WordPart::Tilde(spec) => {
@@ -126,7 +126,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     let mut result = String::new();
     for part in &word.0 {
         match part {
-            WordPart::Literal(s) => result.push_str(s),
+            WordPart::Literal { text, .. } => result.push_str(text),
             WordPart::Tilde(spec) => {
                 let text = resolve_tilde(spec, shell)
                     .unwrap_or_else(|| render_tilde_literal(spec));
@@ -194,7 +194,7 @@ mod tests {
     use crate::command::{ExecCommand, Pipeline, SimpleCommand};
 
     fn lit(s: &str) -> Word {
-        Word(vec![WordPart::Literal(s.to_string())])
+        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
     fn var_unq(name: &str) -> Word {
@@ -254,8 +254,8 @@ mod tests {
     fn expand_multiple_literals_concatenate() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal("foo".to_string()),
-            WordPart::Literal("bar".to_string()),
+            WordPart::Literal { text: "foo".to_string(), quoted: false },
+            WordPart::Literal { text: "bar".to_string(), quoted: false },
         ]);
         assert_eq!(expand(&word, &mut shell), vec!["foobar".to_string()]);
     }
@@ -297,7 +297,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HUCK_T", "x y".to_string());
         let word = Word(vec![
-            WordPart::Literal("a".to_string()),
+            WordPart::Literal { text: "a".to_string(), quoted: false },
             WordPart::Var { name: "HUCK_T".to_string(), quoted: false },
         ]);
         assert_eq!(
@@ -320,7 +320,7 @@ mod tests {
         shell.export_set("HOME", "/tmp/huck_test".to_string());
         let word = Word(vec![
             WordPart::Tilde(TildeSpec::Home),
-            WordPart::Literal("/foo".to_string()),
+            WordPart::Literal { text: "/foo".to_string(), quoted: false },
         ]);
         assert_eq!(
             expand(&word, &mut shell),
@@ -363,9 +363,9 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HUCK_T_X", "x".to_string());
         let word = Word(vec![
-            WordPart::Literal("pre-".to_string()),
+            WordPart::Literal { text: "pre-".to_string(), quoted: false },
             WordPart::Var { name: "HUCK_T_X".to_string(), quoted: false },
-            WordPart::Literal("-post".to_string()),
+            WordPart::Literal { text: "-post".to_string(), quoted: false },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "pre-x-post".to_string());
     }
@@ -374,9 +374,9 @@ mod tests {
     fn expand_assignment_unset_var_yields_empty_segment() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal("[".to_string()),
+            WordPart::Literal { text: "[".to_string(), quoted: false },
             WordPart::Var { name: "DEFINITELY_NOT_SET_ASN".to_string(), quoted: false },
-            WordPart::Literal("]".to_string()),
+            WordPart::Literal { text: "]".to_string(), quoted: false },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "[]".to_string());
     }
@@ -420,7 +420,7 @@ mod tests {
     fn expand_command_sub_with_literal_prefix_merges_first_field() {
         let mut shell = Shell::new();
         let word = Word(vec![
-            WordPart::Literal("pre".to_string()),
+            WordPart::Literal { text: "pre".to_string(), quoted: false },
             WordPart::CommandSub {
                 sequence: echo_sequence(&["x", "y"]),
                 quoted: false,
@@ -526,7 +526,7 @@ mod tests {
         let mut shell = Shell::new();
         let word = Word(vec![
             WordPart::Tilde(TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string())),
-            WordPart::Literal("/x".to_string()),
+            WordPart::Literal { text: "/x".to_string(), quoted: false },
         ]);
         assert_eq!(
             expand(&word, &mut shell),
@@ -539,9 +539,9 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/h".to_string());
         let word = Word(vec![
-            WordPart::Literal("PATH=".to_string()),
+            WordPart::Literal { text: "PATH=".to_string(), quoted: false },
             WordPart::Tilde(TildeSpec::Home),
-            WordPart::Literal("/bin".to_string()),
+            WordPart::Literal { text: "/bin".to_string(), quoted: false },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "PATH=/h/bin");
     }

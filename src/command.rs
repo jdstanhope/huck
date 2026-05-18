@@ -14,7 +14,7 @@ fn try_split_assignment(
         None => return Err(word),
     };
     let text = match first {
-        WordPart::Literal(s) => s,
+        WordPart::Literal { text, .. } => text,
         _ => return Err(word),
     };
     let Some(eq) = text.find('=') else {
@@ -38,13 +38,13 @@ fn try_split_assignment(
     // Validation passed — destructure the word, moving parts into the value.
     let crate::lexer::Word(mut parts) = word;
     let first_part = parts.remove(0);
-    let text = match first_part {
-        WordPart::Literal(s) => s,
+    let (text, quoted) = match first_part {
+        WordPart::Literal { text, quoted } => (text, quoted),
         _ => unreachable!("checked above"),
     };
     let (name, rest_of_first) = (text[..eq].to_string(), text[eq + 1..].to_string());
     let mut value_parts: Vec<WordPart> = Vec::with_capacity(parts.len() + 1);
-    value_parts.push(WordPart::Literal(rest_of_first));
+    value_parts.push(WordPart::Literal { text: rest_of_first, quoted });
     value_parts.extend(parts);
     Ok((name, crate::lexer::Word(value_parts)))
 }
@@ -251,11 +251,11 @@ mod tests {
     use crate::lexer::WordPart;
 
     fn w_tok(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Literal(s.to_string())]))
+        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
     }
 
     fn ww(s: &str) -> Word {
-        Word(vec![WordPart::Literal(s.to_string())])
+        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
     /// Builds a SimpleCommand::Exec with no redirections, all-Literal Words.
@@ -527,12 +527,12 @@ mod tests {
     fn parse_assignment_with_expansion_in_value() {
         let var_part = WordPart::Var { name: "BAR".to_string(), quoted: false };
         let prog = Token::Word(Word(vec![
-            WordPart::Literal("FOO=".to_string()),
+            WordPart::Literal { text: "FOO=".to_string(), quoted: false },
             var_part,
         ]));
         let seq = parse(vec![prog]).unwrap().unwrap();
         let expected_value = Word(vec![
-            WordPart::Literal("".to_string()),
+            WordPart::Literal { text: "".to_string(), quoted: false },
             WordPart::Var { name: "BAR".to_string(), quoted: false },
         ]);
         assert_eq!(seq.first.commands, vec![assignment("FOO", expected_value)]);
@@ -604,7 +604,7 @@ mod tests {
             background: false,
         };
         let program_word = Word(vec![
-            WordPart::Literal("FOO=".to_string()),
+            WordPart::Literal { text: "FOO=".to_string(), quoted: false },
             WordPart::CommandSub { sequence: inner_seq, quoted: false },
         ]);
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
@@ -614,7 +614,7 @@ mod tests {
                 assert_eq!(name, "FOO");
                 assert_eq!(value.0.len(), 2);
                 match &value.0[0] {
-                    WordPart::Literal(s) => assert_eq!(s, ""),
+                    WordPart::Literal { text, .. } => assert_eq!(text, ""),
                     other => panic!("expected Literal(\"\"), got {other:?}"),
                 }
                 assert!(matches!(&value.0[1], WordPart::CommandSub { .. }));
