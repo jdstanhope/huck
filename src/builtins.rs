@@ -16,7 +16,7 @@ pub enum ExecOutcome {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg"
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill" | "disown"
     )
 }
 
@@ -40,6 +40,8 @@ pub fn run_builtin(
         "wait" => builtin_wait(args, out, shell),
         "fg" => builtin_fg(args, shell),
         "bg" => builtin_bg(args, out, shell),
+        "kill" => builtin_kill(args, shell),
+        "disown" => builtin_disown(args, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -198,19 +200,33 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     ExecOutcome::Continue(0)
 }
 
-fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: wait: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
-    }
-    while shell.jobs.has_pending() {
-        if shell.sigint_flag
-            .compare_exchange(true, false, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-            .is_ok()
-        {
-            eprintln!();  // newline so the ^C doesn't run into the prompt
-            return ExecOutcome::Continue(130);
+fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
+    match args.len() {
+        0 => wait_all(shell),
+        1 if args[0].starts_with('%') => {
+            let id = match resolve_spec_or_error(&args[0], "wait", shell) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+            wait_for_job(id, shell)
         }
+        1 => match args[0].parse::<i32>() {
+            Ok(pid) if pid > 0 => wait_for_pid(pid, shell),
+            _ => {
+                eprintln!("shuck: wait: usage: wait [%job | pid]");
+                ExecOutcome::Continue(2)
+            }
+        },
+        _ => {
+            eprintln!("shuck: wait: usage: wait [%job | pid]");
+            ExecOutcome::Continue(2)
+        }
+    }
+}
+
+fn wait_all(shell: &mut Shell) -> ExecOutcome {
+    while shell.jobs.has_pending() {
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
@@ -224,16 +240,244 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
     ExecOutcome::Continue(0)
 }
 
-fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: fg: arguments not supported in this version");
+fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
+    loop {
+        // Check terminal state first — handles already-Done jobs.
+        let terminal = shell.jobs.iter()
+            .find(|j| j.id == id)
+            .and_then(|j| match j.state {
+                crate::jobs::JobState::Done(c) => Some(c),
+                crate::jobs::JobState::Signaled(s) => Some(128 + s),
+                _ => None,
+            });
+        if let Some(code) = terminal {
+            return ExecOutcome::Continue(code);
+        }
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
+    let mut first = true;
+    loop {
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+            if libc::WIFSTOPPED(status) {
+                // Still alive; keep polling.
+                first = false;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                1
+            };
+            return ExecOutcome::Continue(code);
+        }
+        if r < 0 {
+            // ECHILD: not a child (or already reaped). On the first call,
+            // surface as "not a child." On a subsequent call, treat as a
+            // race we can't recover from.
+            if first {
+                eprintln!("shuck: wait: pid {pid} is not a child of this shell");
+                return ExecOutcome::Continue(127);
+            }
+            return ExecOutcome::Continue(1);
+        }
+        first = false;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn check_sigint(shell: &Shell) -> bool {
+    if shell.sigint_flag
+        .compare_exchange(
+            true,
+            false,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        eprintln!();
+        true
+    } else {
+        false
+    }
+}
+
+fn signal_by_name(s: &str) -> Option<i32> {
+    let upper = s.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    Some(match name {
+        "HUP"  => libc::SIGHUP,
+        "INT"  => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "KILL" => libc::SIGKILL,
+        "TERM" => libc::SIGTERM,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "CONT" => libc::SIGCONT,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "CHLD" => libc::SIGCHLD,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        _ => return None,
+    })
+}
+
+/// Parses `arg` as a job spec and resolves it to a job id. On parse or
+/// resolution failure, prints a `shuck: <builtin>: ...` error to stderr
+/// and returns `Err(ExecOutcome::Continue(1))` so the caller can `?` it.
+fn resolve_spec_or_error(
+    arg: &str,
+    builtin: &str,
+    shell: &Shell,
+) -> Result<u32, ExecOutcome> {
+    let spec = crate::job_spec::parse_job_spec(arg).map_err(|_| {
+        eprintln!("shuck: {builtin}: {arg}: bad job spec");
+        ExecOutcome::Continue(1)
+    })?;
+    shell.jobs.resolve(&spec).ok_or_else(|| {
+        eprintln!("shuck: {builtin}: {arg}: no such job");
+        ExecOutcome::Continue(1)
+    })
+}
+
+fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let (sig, targets) = if let Some(first) = args.first() {
+        if let Some(rest) = first.strip_prefix('-') {
+            // -<sig> form
+            let sig = match rest.parse::<i32>() {
+                Ok(n) if (0..=64).contains(&n) => n,
+                Ok(_) => {
+                    eprintln!("shuck: kill: {rest}: invalid signal number");
+                    return ExecOutcome::Continue(1);
+                }
+                Err(_) => match signal_by_name(rest) {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("shuck: kill: {rest}: invalid signal");
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+            if args.len() < 2 {
+                eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+                return ExecOutcome::Continue(2);
+            }
+            (sig, &args[1..])
+        } else {
+            (libc::SIGTERM, &args[..])
+        }
+    } else {
+        eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+        return ExecOutcome::Continue(2);
+    };
+
+    let mut any_failed = false;
+    for target in targets {
+        if let Some(_rest) = target.strip_prefix('%') {
+            let id = match resolve_spec_or_error(target, "kill", shell) {
+                Ok(id) => id,
+                Err(_) => {
+                    any_failed = true;
+                    continue;
+                }
+            };
+            let pgid = match shell.jobs.iter().find(|j| j.id == id) {
+                Some(j) => j.pgid,
+                None => {
+                    eprintln!("shuck: kill: {target}: no such job");
+                    any_failed = true;
+                    continue;
+                }
+            };
+            let rc = unsafe { libc::killpg(pgid, sig) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                eprintln!("shuck: kill: ({target}) - {errno}");
+                any_failed = true;
+            }
+        } else {
+            match target.parse::<i32>() {
+                Ok(pid) if pid > 0 => {
+                    let rc = unsafe { libc::kill(pid, sig) };
+                    if rc != 0 {
+                        let errno = std::io::Error::last_os_error();
+                        eprintln!("shuck: kill: ({pid}) - {errno}");
+                        any_failed = true;
+                    }
+                }
+                _ => {
+                    eprintln!("shuck: kill: {target}: arguments must be process or job IDs");
+                    any_failed = true;
+                }
+            }
+        }
+    }
+
+    if any_failed { ExecOutcome::Continue(1) } else { ExecOutcome::Continue(0) }
+}
+
+fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.len() > 1 {
+        eprintln!("shuck: disown: usage: disown [%job]");
         return ExecOutcome::Continue(2);
     }
-    let id = match shell.jobs.current_id() {
-        Some(id) => id,
-        None => {
-            eprintln!("shuck: fg: no current job");
-            return ExecOutcome::Continue(1);
+    let id = match args.first() {
+        Some(arg) if arg.starts_with('%') => match resolve_spec_or_error(arg, "disown", shell) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
+        },
+        Some(_) => {
+            eprintln!("shuck: disown: usage: disown [%job]");
+            return ExecOutcome::Continue(2);
+        }
+        None => match shell.jobs.current_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: disown: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+    };
+    shell.jobs.jobs_mut().retain(|j| j.id != id);
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let id = match args.len() {
+        0 => match shell.jobs.current_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: fg: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "fg", shell) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
+        },
+        _ => {
+            eprintln!("shuck: fg: usage: fg [%job]");
+            return ExecOutcome::Continue(2);
         }
     };
     let (pgid, pids, command) = {
@@ -308,15 +552,33 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
 }
 
 fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: bg: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
-    }
-    let id = match shell.jobs.current_stopped_id() {
-        Some(id) => id,
-        None => {
-            eprintln!("shuck: bg: no current job");
-            return ExecOutcome::Continue(1);
+    let id = match args.len() {
+        0 => match shell.jobs.current_stopped_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: bg: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+        1 if args[0].starts_with('%') => {
+            let id = match resolve_spec_or_error(&args[0], "bg", shell) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+            // Verify the resolved job is actually Stopped.
+            let is_stopped = shell.jobs.iter()
+                .find(|j| j.id == id)
+                .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
+                .unwrap_or(false);
+            if !is_stopped {
+                eprintln!("shuck: bg: job %{id} already running");
+                return ExecOutcome::Continue(1);
+            }
+            id
+        }
+        _ => {
+            eprintln!("shuck: bg: usage: bg [%job]");
+            return ExecOutcome::Continue(2);
         }
     };
     let (pgid, command) = {
@@ -518,14 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_with_args_errors() {
-        let mut shell = Shell::new();
-        let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_wait(&["%1".to_string()], &mut out, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
-    }
-
-    #[test]
     fn is_builtin_recognizes_jobs_and_wait() {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("wait"));
@@ -554,19 +808,19 @@ mod fg_bg_tests {
     }
 
     #[test]
-    fn fg_with_args_rejected_with_status_2() {
+    fn fg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("fg", &["%1".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
-    fn bg_with_args_rejected_with_status_2() {
+    fn bg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
@@ -582,5 +836,323 @@ mod fg_bg_tests {
     fn is_builtin_recognizes_fg_and_bg() {
         assert!(is_builtin("fg"));
         assert!(is_builtin("bg"));
+    }
+
+    #[test]
+    fn fg_with_bad_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn fg_with_no_such_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn fg_with_non_percent_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn fg_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "fg",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn bg_with_bad_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_no_such_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_running_spec_errors_already_running() {
+        let mut shell = Shell::new();
+        shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn bg_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "bg",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_bad_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn wait_with_no_such_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn wait_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_unparseable_pid_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_done_spec_returns_decoded_status_immediately() {
+        let mut shell = Shell::new();
+        // Synthetic Done job — wait should see it's already terminal and
+        // return decode(0) → 0 without blocking.
+        shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn wait_with_done_spec_returns_nonzero_for_exit_n() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("false".to_string(), 1);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn is_builtin_recognizes_kill() {
+        assert!(is_builtin("kill"));
+    }
+
+    #[test]
+    fn kill_no_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_sig_flag_with_no_targets_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["-TERM".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_invalid_signal_name_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-ABC".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_invalid_signal_number_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-9999".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_unparseable_target_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_no_such_job_spec_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn signal_by_name_table_recognizes_common_signals() {
+        assert_eq!(signal_by_name("HUP"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("SIGHUP"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("hup"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("sighup"), Some(libc::SIGHUP));
+        assert_eq!(signal_by_name("INT"), Some(libc::SIGINT));
+        assert_eq!(signal_by_name("KILL"), Some(libc::SIGKILL));
+        assert_eq!(signal_by_name("TERM"), Some(libc::SIGTERM));
+        assert_eq!(signal_by_name("STOP"), Some(libc::SIGSTOP));
+        assert_eq!(signal_by_name("CONT"), Some(libc::SIGCONT));
+        assert_eq!(signal_by_name("USR1"), Some(libc::SIGUSR1));
+        assert_eq!(signal_by_name("USR2"), Some(libc::SIGUSR2));
+        assert_eq!(signal_by_name("TSTP"), Some(libc::SIGTSTP));
+        assert_eq!(signal_by_name("PIPE"), Some(libc::SIGPIPE));
+        assert_eq!(signal_by_name("ALRM"), Some(libc::SIGALRM));
+        assert_eq!(signal_by_name("CHLD"), Some(libc::SIGCHLD));
+        assert_eq!(signal_by_name("TTIN"), Some(libc::SIGTTIN));
+        assert_eq!(signal_by_name("TTOU"), Some(libc::SIGTTOU));
+        assert_eq!(signal_by_name("ABC"), None);
+        assert_eq!(signal_by_name(""), None);
+    }
+
+    #[test]
+    fn kill_signal_zero_is_accepted_as_valid_numeric() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        // No targets after the signal → usage(2) — but the signal itself
+        // must parse without "invalid signal number" status 1.
+        let outcome = run_builtin("kill", &["-0".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)),
+            "kill -0 (no targets) should reach usage check, not signal check");
+    }
+}
+
+#[cfg(test)]
+mod disown_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn is_builtin_recognizes_disown() {
+        assert!(is_builtin("disown"));
+    }
+
+    #[test]
+    fn disown_no_args_with_no_current_job_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn disown_no_args_removes_current_job() {
+        let mut shell = Shell::new();
+        shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_with_spec_removes_specified_job() {
+        let mut shell = Shell::new();
+        shell.jobs.add(100, vec![100], "a".to_string());
+        shell.jobs.add(200, vec![200], "b".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let remaining: Vec<u32> = shell.jobs.iter().map(|j| j.id).collect();
+        assert_eq!(remaining, vec![2]);
+    }
+
+    #[test]
+    fn disown_with_bad_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn disown_with_non_percent_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn disown_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn disown_drops_pending_done_notification() {
+        let mut shell = Shell::new();
+        // Synthetic Done job with notified=false would trigger a "[1] Done"
+        // line at the next prompt. Disown should remove the job and
+        // suppress that notification.
+        shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
     }
 }

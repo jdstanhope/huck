@@ -188,6 +188,20 @@ impl JobTable {
             .any(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
     }
 
+    /// Resolves a JobSpec to a job id, if any matching job exists.
+    pub fn resolve(&self, spec: &crate::job_spec::JobSpec) -> Option<u32> {
+        match spec {
+            crate::job_spec::JobSpec::Id(id) => {
+                self.jobs.iter().find(|j| j.id == *id).map(|j| j.id)
+            }
+            crate::job_spec::JobSpec::Current => self.current_id(),
+            crate::job_spec::JobSpec::Previous => {
+                let (_, prev) = self.current_and_previous();
+                prev
+            }
+        }
+    }
+
     pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
         &mut self.jobs
     }
@@ -600,6 +614,45 @@ mod tests {
         t.reap(100, exit_a);
         assert!(matches!(t.jobs_mut()[0].state, JobState::Done(7)),
             "last stage status (b=7) must win, not a=0");
+    }
+
+    #[test]
+    fn resolve_id_returns_matching_id() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        let _ = t.add(200, vec![200], "b".to_string());
+        let spec = crate::job_spec::JobSpec::Id(2);
+        assert_eq!(t.resolve(&spec), Some(2));
+    }
+
+    #[test]
+    fn resolve_id_missing_returns_none() {
+        let t = JobTable::new();
+        let spec = crate::job_spec::JobSpec::Id(99);
+        assert_eq!(t.resolve(&spec), None);
+    }
+
+    #[test]
+    fn resolve_current_uses_current_id() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        let _ = t.add(200, vec![200], "b".to_string());
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Current), Some(2));
+    }
+
+    #[test]
+    fn resolve_previous_returns_second_most_recent() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        let _ = t.add(200, vec![200], "b".to_string());
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), Some(1));
+    }
+
+    #[test]
+    fn resolve_previous_returns_none_when_only_one_job() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), None);
     }
 
     #[test]
