@@ -271,7 +271,7 @@ fn scan_paren_substitution(
                 body.push(c);
             }
             '(' => {
-                // Bare `(` is just a character. shuck has no subshell
+                // Bare `(` is just a character. huck has no subshell
                 // `(cmd)` syntax — only `$(` increments depth (handled in
                 // the `$` arm below).
                 body.push(c);

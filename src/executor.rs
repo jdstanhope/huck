@@ -183,12 +183,12 @@ fn run_background_sequence(
         let mut child = match process.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                eprintln!("shuck: command not found: {}", cmd.program);
+                eprintln!("huck: command not found: {}", cmd.program);
                 cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(127);
             }
             Err(e) => {
-                eprintln!("shuck: {}: {e}", cmd.program);
+                eprintln!("huck: {}: {e}", cmd.program);
                 cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(1);
             }
@@ -298,7 +298,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap())
     } else {
-        eprintln!("shuck: ambiguous redirect");
+        eprintln!("huck: ambiguous redirect");
         Err(())
     }
 }
@@ -306,7 +306,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
     let prog_fields = expand(&cmd.program, shell);
     if prog_fields.is_empty() {
-        eprintln!("shuck: command not found:");
+        eprintln!("huck: command not found:");
         return Err(127);
     }
     let mut iter = prog_fields.into_iter();
@@ -353,7 +353,7 @@ fn open_stage_files(cmd: &ResolvedCommand) -> Result<StageFiles, ()> {
         Some(path) => match File::open(path) {
             Ok(file) => Some(file),
             Err(e) => {
-                eprintln!("shuck: {path}: {e}");
+                eprintln!("huck: {path}: {e}");
                 return Err(());
             }
         },
@@ -363,7 +363,7 @@ fn open_stage_files(cmd: &ResolvedCommand) -> Result<StageFiles, ()> {
         Some(redirect) => match open_resolved(redirect) {
             Ok(file) => Some(file),
             Err(e) => {
-                eprintln!("shuck: {}: {e}", resolved_path(redirect));
+                eprintln!("huck: {}: {e}", resolved_path(redirect));
                 return Err(());
             }
         },
@@ -373,7 +373,7 @@ fn open_stage_files(cmd: &ResolvedCommand) -> Result<StageFiles, ()> {
         Some(redirect) => match open_resolved(redirect) {
             Ok(file) => Some(file),
             Err(e) => {
-                eprintln!("shuck: {}: {e}", resolved_path(redirect));
+                eprintln!("huck: {}: {e}", resolved_path(redirect));
                 return Err(());
             }
         },
@@ -560,25 +560,25 @@ fn run_subprocess(
                 match child.wait() {
                     Ok(status) => {
                         if let Some(e) = copy_err {
-                            eprintln!("shuck: {}: {e}", cmd.program);
+                            eprintln!("huck: {}: {e}", cmd.program);
                             ExecOutcome::Continue(1)
                         } else {
                             ExecOutcome::Continue(status_code(&status))
                         }
                     }
                     Err(e) => {
-                        eprintln!("shuck: {}: {e}", cmd.program);
+                        eprintln!("huck: {}: {e}", cmd.program);
                         ExecOutcome::Continue(1)
                     }
                 }
             }
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            eprintln!("shuck: command not found: {}", cmd.program);
+            eprintln!("huck: command not found: {}", cmd.program);
             ExecOutcome::Continue(127)
         }
         Err(e) => {
-            eprintln!("shuck: {}: {e}", cmd.program);
+            eprintln!("huck: {}: {e}", cmd.program);
             ExecOutcome::Continue(1)
         }
     }
@@ -671,7 +671,7 @@ fn run_multi_stage(
             match files.stdout {
                 Some(mut file) => {
                     if let Err(e) = file.write_all(&buffer) {
-                        eprintln!("shuck: {}: {e}", cmd.program);
+                        eprintln!("huck: {}: {e}", cmd.program);
                         status = 1;
                     }
                     if !is_last {
@@ -683,7 +683,7 @@ fn run_multi_stage(
                         match sink {
                             StdoutSink::Terminal => {
                                 if let Err(e) = io::stdout().write_all(&buffer) {
-                                    eprintln!("shuck: {}: {e}", cmd.program);
+                                    eprintln!("huck: {}: {e}", cmd.program);
                                     status = 1;
                                 }
                             }
@@ -745,7 +745,7 @@ fn run_multi_stage(
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                eprintln!("shuck: command not found: {}", cmd.program);
+                eprintln!("huck: command not found: {}", cmd.program);
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
                 }
@@ -753,7 +753,7 @@ fn run_multi_stage(
                 continue;
             }
             Err(e) => {
-                eprintln!("shuck: {}: {e}", cmd.program);
+                eprintln!("huck: {}: {e}", cmd.program);
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
                 }
@@ -793,7 +793,7 @@ fn run_multi_stage(
             if let StdoutSink::Capture(buf) = sink {
                 if let Some(mut child_stdout) = child.stdout.take() {
                     if let Err(e) = io::copy(&mut child_stdout, *buf) {
-                        eprintln!("shuck: {}: {e}", cmd.program);
+                        eprintln!("huck: {}: {e}", cmd.program);
                     }
                 }
             }
@@ -858,7 +858,7 @@ fn run_multi_stage(
                     last_status = match child.wait() {
                         Ok(status) => status_code(&status),
                         Err(e) => {
-                            eprintln!("shuck: {e}");
+                            eprintln!("huck: {e}");
                             1
                         }
                     };
@@ -897,7 +897,7 @@ fn wait_with_untraced(pid: i32) -> Result<(libc::c_int, bool), ()> {
 }
 
 /// pre_exec closure that resets SIGTSTP/SIGTTIN/SIGTTOU to SIG_DFL in the
-/// child. Required because shuck SIG_IGNs these at the shell level and
+/// child. Required because huck SIG_IGNs these at the shell level and
 /// SIG_IGN is inherited across exec — without this, Ctrl-Z would never
 /// stop a foreground job, and a background reader could never SIGTTIN.
 fn reset_job_control_signals_in_child() -> std::io::Result<()> {
@@ -1030,7 +1030,7 @@ mod tests {
         let seq = Sequence {
             first: Pipeline {
                 commands: vec![SimpleCommand::Assign {
-                    name: "SHUCK_TEST_BG_ASSIGN".to_string(),
+                    name: "HUCK_TEST_BG_ASSIGN".to_string(),
                     value: lit_word("v"),
                 }],
             },
@@ -1038,9 +1038,9 @@ mod tests {
             background: true,
         };
         let mut shell = Shell::new();
-        let _ = execute(&seq, &mut shell, "SHUCK_TEST_BG_ASSIGN=v &");
+        let _ = execute(&seq, &mut shell, "HUCK_TEST_BG_ASSIGN=v &");
         // The assignment ran in the parent (pure-builtin path).
-        assert_eq!(shell.get("SHUCK_TEST_BG_ASSIGN"), Some("v"));
+        assert_eq!(shell.get("HUCK_TEST_BG_ASSIGN"), Some("v"));
     }
 
     #[test]

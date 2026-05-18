@@ -48,7 +48,7 @@ pub fn run_builtin(
 
 fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
-        eprintln!("shuck: cd: too many arguments");
+        eprintln!("huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
     let target = match args.first() {
@@ -56,7 +56,7 @@ fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
             None => {
-                eprintln!("shuck: cd: HOME not set");
+                eprintln!("huck: cd: HOME not set");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -64,7 +64,7 @@ fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
     match env::set_current_dir(Path::new(&target)) {
         Ok(()) => ExecOutcome::Continue(0),
         Err(e) => {
-            eprintln!("shuck: cd: {target}: {e}");
+            eprintln!("huck: cd: {target}: {e}");
             ExecOutcome::Continue(1)
         }
     }
@@ -74,13 +74,13 @@ fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
     match env::current_dir() {
         Ok(path) => {
             if let Err(e) = writeln!(out, "{}", path.display()) {
-                eprintln!("shuck: pwd: {e}");
+                eprintln!("huck: pwd: {e}");
                 return ExecOutcome::Continue(1);
             }
             ExecOutcome::Continue(0)
         }
         Err(e) => {
-            eprintln!("shuck: pwd: {e}");
+            eprintln!("huck: pwd: {e}");
             ExecOutcome::Continue(1)
         }
     }
@@ -88,7 +88,7 @@ fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
 
 fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
     if let Err(e) = writeln!(out, "{}", args.join(" ")) {
-        eprintln!("shuck: echo: {e}");
+        eprintln!("huck: echo: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -100,7 +100,7 @@ fn builtin_exit(args: &[String]) -> ExecOutcome {
         Some(code_str) => match code_str.parse::<i32>() {
             Ok(code) => ExecOutcome::Exit(code),
             Err(_) => {
-                eprintln!("shuck: exit: {code_str}: numeric argument required");
+                eprintln!("huck: exit: {code_str}: numeric argument required");
                 ExecOutcome::Continue(2)
             }
         },
@@ -125,7 +125,7 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
         entries.sort();
         for (name, value) in entries {
             if let Err(e) = writeln!(out, "export {name}={value}") {
-                eprintln!("shuck: export: {e}");
+                eprintln!("huck: export: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -138,7 +138,7 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
                 let name = &arg[..idx];
                 let value = &arg[idx + 1..];
                 if !is_valid_name(name) {
-                    eprintln!("shuck: export: '{arg}': not a valid identifier");
+                    eprintln!("huck: export: '{arg}': not a valid identifier");
                     any_error = true;
                     continue;
                 }
@@ -146,7 +146,7 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
             }
             None => {
                 if !is_valid_name(arg) {
-                    eprintln!("shuck: export: '{arg}': not a valid identifier");
+                    eprintln!("huck: export: '{arg}': not a valid identifier");
                     any_error = true;
                     continue;
                 }
@@ -165,7 +165,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut any_error = false;
     for arg in args {
         if !is_valid_name(arg) {
-            eprintln!("shuck: unset: '{arg}': not a valid identifier");
+            eprintln!("huck: unset: '{arg}': not a valid identifier");
             any_error = true;
             continue;
         }
@@ -180,7 +180,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
 fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if !args.is_empty() {
-        eprintln!("shuck: jobs: arguments not supported in this version");
+        eprintln!("huck: jobs: arguments not supported in this version");
         return ExecOutcome::Continue(2);
     }
     let (current, previous) = shell.jobs.current_and_previous();
@@ -193,7 +193,7 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             ' '
         };
         if let Err(e) = writeln!(out, "{}", crate::jobs::notification_line(job, flag)) {
-            eprintln!("shuck: jobs: {e}");
+            eprintln!("huck: jobs: {e}");
             return ExecOutcome::Continue(1);
         }
     }
@@ -213,12 +213,12 @@ fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shel
         1 => match args[0].parse::<i32>() {
             Ok(pid) if pid > 0 => wait_for_pid(pid, shell),
             _ => {
-                eprintln!("shuck: wait: usage: wait [%job | pid]");
+                eprintln!("huck: wait: usage: wait [%job | pid]");
                 ExecOutcome::Continue(2)
             }
         },
         _ => {
-            eprintln!("shuck: wait: usage: wait [%job | pid]");
+            eprintln!("huck: wait: usage: wait [%job | pid]");
             ExecOutcome::Continue(2)
         }
     }
@@ -292,7 +292,7 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
             // surface as "not a child." On a subsequent call, treat as a
             // race we can't recover from.
             if first {
-                eprintln!("shuck: wait: pid {pid} is not a child of this shell");
+                eprintln!("huck: wait: pid {pid} is not a child of this shell");
                 return ExecOutcome::Continue(127);
             }
             return ExecOutcome::Continue(1);
@@ -343,7 +343,7 @@ fn signal_by_name(s: &str) -> Option<i32> {
 }
 
 /// Parses `arg` as a job spec and resolves it to a job id. On parse or
-/// resolution failure, prints a `shuck: <builtin>: ...` error to stderr
+/// resolution failure, prints a `huck: <builtin>: ...` error to stderr
 /// and returns `Err(ExecOutcome::Continue(1))` so the caller can `?` it.
 fn resolve_spec_or_error(
     arg: &str,
@@ -351,11 +351,11 @@ fn resolve_spec_or_error(
     shell: &Shell,
 ) -> Result<u32, ExecOutcome> {
     let spec = crate::job_spec::parse_job_spec(arg).map_err(|_| {
-        eprintln!("shuck: {builtin}: {arg}: bad job spec");
+        eprintln!("huck: {builtin}: {arg}: bad job spec");
         ExecOutcome::Continue(1)
     })?;
     shell.jobs.resolve(&spec).ok_or_else(|| {
-        eprintln!("shuck: {builtin}: {arg}: no such job");
+        eprintln!("huck: {builtin}: {arg}: no such job");
         ExecOutcome::Continue(1)
     })
 }
@@ -367,19 +367,19 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
             let sig = match rest.parse::<i32>() {
                 Ok(n) if (0..=64).contains(&n) => n,
                 Ok(_) => {
-                    eprintln!("shuck: kill: {rest}: invalid signal number");
+                    eprintln!("huck: kill: {rest}: invalid signal number");
                     return ExecOutcome::Continue(1);
                 }
                 Err(_) => match signal_by_name(rest) {
                     Some(n) => n,
                     None => {
-                        eprintln!("shuck: kill: {rest}: invalid signal");
+                        eprintln!("huck: kill: {rest}: invalid signal");
                         return ExecOutcome::Continue(1);
                     }
                 },
             };
             if args.len() < 2 {
-                eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+                eprintln!("huck: kill: usage: kill [-sig] pid | %job ...");
                 return ExecOutcome::Continue(2);
             }
             (sig, &args[1..])
@@ -387,7 +387,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
             (libc::SIGTERM, &args[..])
         }
     } else {
-        eprintln!("shuck: kill: usage: kill [-sig] pid | %job ...");
+        eprintln!("huck: kill: usage: kill [-sig] pid | %job ...");
         return ExecOutcome::Continue(2);
     };
 
@@ -404,7 +404,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
             let pgid = match shell.jobs.iter().find(|j| j.id == id) {
                 Some(j) => j.pgid,
                 None => {
-                    eprintln!("shuck: kill: {target}: no such job");
+                    eprintln!("huck: kill: {target}: no such job");
                     any_failed = true;
                     continue;
                 }
@@ -412,7 +412,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
             let rc = unsafe { libc::killpg(pgid, sig) };
             if rc != 0 {
                 let errno = std::io::Error::last_os_error();
-                eprintln!("shuck: kill: ({target}) - {errno}");
+                eprintln!("huck: kill: ({target}) - {errno}");
                 any_failed = true;
             }
         } else {
@@ -421,12 +421,12 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
                     let rc = unsafe { libc::kill(pid, sig) };
                     if rc != 0 {
                         let errno = std::io::Error::last_os_error();
-                        eprintln!("shuck: kill: ({pid}) - {errno}");
+                        eprintln!("huck: kill: ({pid}) - {errno}");
                         any_failed = true;
                     }
                 }
                 _ => {
-                    eprintln!("shuck: kill: {target}: arguments must be process or job IDs");
+                    eprintln!("huck: kill: {target}: arguments must be process or job IDs");
                     any_failed = true;
                 }
             }
@@ -438,7 +438,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
 fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
-        eprintln!("shuck: disown: usage: disown [%job]");
+        eprintln!("huck: disown: usage: disown [%job]");
         return ExecOutcome::Continue(2);
     }
     let id = match args.first() {
@@ -447,13 +447,13 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
             Err(outcome) => return outcome,
         },
         Some(_) => {
-            eprintln!("shuck: disown: usage: disown [%job]");
+            eprintln!("huck: disown: usage: disown [%job]");
             return ExecOutcome::Continue(2);
         }
         None => match shell.jobs.current_id() {
             Some(id) => id,
             None => {
-                eprintln!("shuck: disown: no current job");
+                eprintln!("huck: disown: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -467,7 +467,7 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
         0 => match shell.jobs.current_id() {
             Some(id) => id,
             None => {
-                eprintln!("shuck: fg: no current job");
+                eprintln!("huck: fg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -476,7 +476,7 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
             Err(outcome) => return outcome,
         },
         _ => {
-            eprintln!("shuck: fg: usage: fg [%job]");
+            eprintln!("huck: fg: usage: fg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -486,7 +486,7 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
             job.notified = true;
             (job.pgid, job.pids.clone(), job.command.clone())
         } else {
-            eprintln!("shuck: fg: no current job");
+            eprintln!("huck: fg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
@@ -556,7 +556,7 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
         0 => match shell.jobs.current_stopped_id() {
             Some(id) => id,
             None => {
-                eprintln!("shuck: bg: no current job");
+                eprintln!("huck: bg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -571,13 +571,13 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
                 .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
                 .unwrap_or(false);
             if !is_stopped {
-                eprintln!("shuck: bg: job %{id} already running");
+                eprintln!("huck: bg: job %{id} already running");
                 return ExecOutcome::Continue(1);
             }
             id
         }
         _ => {
-            eprintln!("shuck: bg: usage: bg [%job]");
+            eprintln!("huck: bg: usage: bg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -587,7 +587,7 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
             job.notified = true;
             (job.pgid, job.command.clone())
         } else {
-            eprintln!("shuck: bg: no current job");
+            eprintln!("huck: bg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
@@ -662,11 +662,11 @@ mod tests {
     #[test]
     fn export_marks_existing() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_EXP", "v".to_string());
+        shell.set("HUCK_EXP", "v".to_string());
         let mut out = Vec::new();
-        let outcome = builtin_export(&["SHUCK_EXP".to_string()], &mut out, &mut shell);
+        let outcome = builtin_export(&["HUCK_EXP".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_EXP");
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_EXP");
         assert!(in_exported);
     }
 
@@ -674,20 +674,20 @@ mod tests {
     fn export_name_only_creates_empty_exported() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        let outcome = builtin_export(&["SHUCK_NEW_VAR".to_string()], &mut out, &mut shell);
+        let outcome = builtin_export(&["HUCK_NEW_VAR".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.get("SHUCK_NEW_VAR"), Some(""));
-        assert!(shell.exported_env().any(|(k, _)| k == "SHUCK_NEW_VAR"));
+        assert_eq!(shell.get("HUCK_NEW_VAR"), Some(""));
+        assert!(shell.exported_env().any(|(k, _)| k == "HUCK_NEW_VAR"));
     }
 
     #[test]
     fn export_sets_and_exports() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        let outcome = builtin_export(&["SHUCK_EXP2=hello".to_string()], &mut out, &mut shell);
+        let outcome = builtin_export(&["HUCK_EXP2=hello".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.get("SHUCK_EXP2"), Some("hello"));
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_EXP2");
+        assert_eq!(shell.get("HUCK_EXP2"), Some("hello"));
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_EXP2");
         assert!(in_exported);
     }
 
@@ -708,10 +708,10 @@ mod tests {
     #[test]
     fn unset_removes_variable() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_RM", "v".to_string());
-        let outcome = builtin_unset(&["SHUCK_RM".to_string()], &mut shell);
+        shell.set("HUCK_RM", "v".to_string());
+        let outcome = builtin_unset(&["HUCK_RM".to_string()], &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.get("SHUCK_RM"), None);
+        assert_eq!(shell.get("HUCK_RM"), None);
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn unset_unknown_name_is_silent_ok() {
         let mut shell = Shell::new();
-        let outcome = builtin_unset(&["NEVER_SET_SHUCK_XYZ".to_string()], &mut shell);
+        let outcome = builtin_unset(&["NEVER_SET_HUCK_XYZ".to_string()], &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 

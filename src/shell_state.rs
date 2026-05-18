@@ -13,7 +13,7 @@ struct Variable {
 
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
-/// the process environment shuck inherited at startup, every one marked
+/// the process environment huck inherited at startup, every one marked
 /// exported.
 #[derive(Debug, Clone)]
 pub struct Shell {
@@ -121,47 +121,47 @@ mod tests {
     #[test]
     fn set_creates_unexported_var() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_TEST_SET", "value".to_string());
-        assert_eq!(shell.get("SHUCK_TEST_SET"), Some("value"));
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_SET");
+        shell.set("HUCK_TEST_SET", "value".to_string());
+        assert_eq!(shell.get("HUCK_TEST_SET"), Some("value"));
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_SET");
         assert!(!in_exported);
     }
 
     #[test]
     fn set_preserves_existing_exported_flag() {
         let mut shell = Shell::new();
-        shell.export_set("SHUCK_TEST_KEEP", "v1".to_string());
-        shell.set("SHUCK_TEST_KEEP", "v2".to_string());
-        assert_eq!(shell.get("SHUCK_TEST_KEEP"), Some("v2"));
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_KEEP");
+        shell.export_set("HUCK_TEST_KEEP", "v1".to_string());
+        shell.set("HUCK_TEST_KEEP", "v2".to_string());
+        assert_eq!(shell.get("HUCK_TEST_KEEP"), Some("v2"));
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_KEEP");
         assert!(in_exported);
     }
 
     #[test]
     fn export_marks_existing_exported() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_TEST_EX", "value".to_string());
-        shell.export("SHUCK_TEST_EX");
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_EX");
+        shell.set("HUCK_TEST_EX", "value".to_string());
+        shell.export("HUCK_TEST_EX");
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_EX");
         assert!(in_exported);
     }
 
     #[test]
     fn export_creates_empty_when_missing() {
         let mut shell = Shell::new();
-        shell.export("SHUCK_TEST_EMPTY");
-        assert_eq!(shell.get("SHUCK_TEST_EMPTY"), Some(""));
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_EMPTY");
+        shell.export("HUCK_TEST_EMPTY");
+        assert_eq!(shell.get("HUCK_TEST_EMPTY"), Some(""));
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_EMPTY");
         assert!(in_exported);
     }
 
     #[test]
     fn unset_removes_variable() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_TEST_REMOVE", "v".to_string());
-        shell.unset("SHUCK_TEST_REMOVE");
-        assert_eq!(shell.get("SHUCK_TEST_REMOVE"), None);
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_REMOVE");
+        shell.set("HUCK_TEST_REMOVE", "v".to_string());
+        shell.unset("HUCK_TEST_REMOVE");
+        assert_eq!(shell.get("HUCK_TEST_REMOVE"), None);
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_REMOVE");
         assert!(!in_exported);
     }
 
@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn exported_env_excludes_unexported() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_TEST_HIDDEN", "v".to_string());
-        let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_HIDDEN");
+        shell.set("HUCK_TEST_HIDDEN", "v".to_string());
+        let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_HIDDEN");
         assert!(!in_exported);
     }
 

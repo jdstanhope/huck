@@ -225,16 +225,16 @@ mod tests {
     #[test]
     fn expand_set_var_quoted_preserves_whitespace() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T", "a b".to_string());
-        assert_eq!(expand(&var_q("SHUCK_T"), &mut shell), vec!["a b".to_string()]);
+        shell.set("HUCK_T", "a b".to_string());
+        assert_eq!(expand(&var_q("HUCK_T"), &mut shell), vec!["a b".to_string()]);
     }
 
     #[test]
     fn expand_set_var_unquoted_splits_whitespace() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T", "a b".to_string());
+        shell.set("HUCK_T", "a b".to_string());
         assert_eq!(
-            expand(&var_unq("SHUCK_T"), &mut shell),
+            expand(&var_unq("HUCK_T"), &mut shell),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -242,10 +242,10 @@ mod tests {
     #[test]
     fn expand_unquoted_var_with_literal_prefix_merges_first_field() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T", "x y".to_string());
+        shell.set("HUCK_T", "x y".to_string());
         let word = Word(vec![
             WordPart::Literal("a".to_string()),
-            WordPart::Var { name: "SHUCK_T".to_string(), quoted: false },
+            WordPart::Var { name: "HUCK_T".to_string(), quoted: false },
         ]);
         assert_eq!(
             expand(&word, &mut shell),
@@ -264,14 +264,14 @@ mod tests {
     #[test]
     fn expand_tilde_uses_home() {
         let mut shell = Shell::new();
-        shell.export_set("HOME", "/tmp/shuck_test".to_string());
+        shell.export_set("HOME", "/tmp/huck_test".to_string());
         let word = Word(vec![
             WordPart::Tilde,
             WordPart::Literal("/foo".to_string()),
         ]);
         assert_eq!(
             expand(&word, &mut shell),
-            vec!["/tmp/shuck_test/foo".to_string()]
+            vec!["/tmp/huck_test/foo".to_string()]
         );
     }
 
@@ -287,9 +287,9 @@ mod tests {
     #[test]
     fn expand_unquoted_var_with_two_fields_returns_two_for_redirect_check() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T_TWOFIELD", "a b".to_string());
+        shell.set("HUCK_T_TWOFIELD", "a b".to_string());
         assert_eq!(expand(&Word(vec![WordPart::Var {
-            name: "SHUCK_T_TWOFIELD".to_string(),
+            name: "HUCK_T_TWOFIELD".to_string(),
             quoted: false,
         }]), &mut shell).len(), 2);
     }
@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn expand_assignment_preserves_interior_whitespace() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T_PAD", "a  b".to_string());
+        shell.set("HUCK_T_PAD", "a  b".to_string());
         let word = Word(vec![WordPart::Var {
-            name: "SHUCK_T_PAD".to_string(),
+            name: "HUCK_T_PAD".to_string(),
             quoted: false,
         }]);
         assert_eq!(expand_assignment(&word, &mut shell), "a  b".to_string());
@@ -308,10 +308,10 @@ mod tests {
     #[test]
     fn expand_assignment_concatenates_parts() {
         let mut shell = Shell::new();
-        shell.set("SHUCK_T_X", "x".to_string());
+        shell.set("HUCK_T_X", "x".to_string());
         let word = Word(vec![
             WordPart::Literal("pre-".to_string()),
-            WordPart::Var { name: "SHUCK_T_X".to_string(), quoted: false },
+            WordPart::Var { name: "HUCK_T_X".to_string(), quoted: false },
             WordPart::Literal("-post".to_string()),
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "pre-x-post".to_string());

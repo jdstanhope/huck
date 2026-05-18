@@ -1,4 +1,4 @@
-# shuck
+# huck
 
 A small POSIX-ish shell written in Rust, built incrementally as a learning
 project. Each iteration ships a single coherent feature with a written design

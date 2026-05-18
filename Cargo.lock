@@ -61,6 +61,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "huck"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustyline",
+ "signal-hook",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -128,15 +137,6 @@ dependencies = [
  "unicode-width",
  "utf8parse",
  "windows-sys",
-]
-
-[[package]]
-name = "shuck"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rustyline",
- "signal-hook",
 ]
 
 [[package]]
