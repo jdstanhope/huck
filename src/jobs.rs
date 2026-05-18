@@ -222,6 +222,10 @@ pub fn render_state(state: &JobState) -> String {
 /// so the suffix would be misleading. Column width is 24 to fit
 /// `Stopped (tty output)`.
 pub fn notification_line(job: &Job, flag: char) -> String {
+    debug_assert!(
+        !matches!(job.state, JobState::Running),
+        "notification_line called on a Running job — this is a bug"
+    );
     let state = render_state(&job.state);
     let suffix = match job.state {
         JobState::Stopped(_) => "",
@@ -236,6 +240,8 @@ fn decode_status(raw: libc::c_int) -> JobState {
         JobState::Done(libc::WEXITSTATUS(raw))
     } else if libc::WIFSIGNALED(raw) {
         JobState::Signaled(libc::WTERMSIG(raw))
+    // WIFSTOPPED is dead code today (reap_completed uses WNOHANG only).
+    // It becomes reachable once Task 4 adds WUNTRACED to reap_completed.
     } else if libc::WIFSTOPPED(raw) {
         JobState::Stopped(libc::WSTOPSIG(raw))
     } else {
