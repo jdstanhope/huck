@@ -17,13 +17,14 @@ spec, an implementation plan, and a test suite.
 | v7        | Foreground job control (`fg`, `bg`, Ctrl-Z)             |
 | v8        | Job specifiers, `kill`, `disown`                        |
 | v9        | Tilde expansion (`~`, `~/path`, `~user`, `~+`, `~-`)    |
+| v10       | Pathname expansion (`*`, `?`, `[abc]`)                  |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (283 tests)
+cargo test               # full test suite (318 tests)
 ```
 
 ## Features
@@ -32,7 +33,7 @@ cargo test               # full test suite (283 tests)
 `cmd a b c`, `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`, `cmd1 | cmd2`,
 `cmd > out`, `cmd < in`, `cmd >> out`, `cmd 2> err`, `cmd &`,
 `echo "$VAR"`, `echo $(date)`, `NAME=value cmd`, `cd ~`, `ls ~/dir`,
-`cd ~-`, `PATH=~/bin:~/lib`.
+`cd ~-`, `PATH=~/bin:~/lib`, `ls *.txt`, `echo [ab].rs`.
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
@@ -58,9 +59,16 @@ and `=` in assignment-context words like `PATH=~/bin:~/lib`. Unresolved
 forms (missing `HOME`/`PWD`/`OLDPWD`, unknown user) fall back to literal
 text. `cd` maintains `PWD` and `OLDPWD`.
 
+**Pathname expansion (v10):**
+`*` matches any run of characters, `?` matches one character, `[abc]`
+and `[a-z]` match a single character from a class (`[!abc]` negates).
+Metacharacters do not cross `/` and do not match a leading `.` (use
+`.*` for dotfiles). Quoted metacharacters (`"*"`, `'*'`) stay literal.
+A pattern with no matches is passed through unchanged (bash default).
+Redirect targets do not yet glob-expand.
+
 **Not yet implemented:**
-pathname expansion (`*`/`?`/`[abc]` — coming in v10), arithmetic
-expansion (`$((expr))` — coming in v11), parameter-expansion modifiers
+arithmetic expansion (`$((expr))` — coming in v11), parameter-expansion modifiers
 (`${var:-x}`/`${var/pat/repl}`/etc.), brace expansion (`{a,b,c}`),
 special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
