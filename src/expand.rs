@@ -99,8 +99,11 @@ impl Default for Field {
 /// unquoted references split on ASCII whitespace and can yield multiple
 /// fields (or zero, for an empty value).
 ///
-/// NOTE (v10 Task 4): All chars are appended with `quoted: false` for now.
-/// Per-WordPart-kind quoting propagation lands in Task 5.
+/// Per-WordPart quoting propagation (v10 Task 5): each char appended to a
+/// `Field` carries the `quoted` flag of its source `WordPart`. Tilde
+/// expansions and IFS-split fragments are always marked unquoted. This
+/// preserves the information that pathname expansion (glob) needs to skip
+/// quoted metacharacters.
 pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
     // Snapshot $? at the start so every `LastStatus` part in this word sees
     // the same value — even if a `CommandSub` part earlier in the word
@@ -113,11 +116,13 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
 
     for part in &word.0 {
         match part {
-            WordPart::Literal { text, .. } => {
-                current.push_str(text, false);
+            WordPart::Literal { text, quoted } => {
+                current.push_str(text, *quoted);
                 has_emitted = true;
             }
             WordPart::Tilde(spec) => {
+                // Tilde expansion result is always unquoted — pathname
+                // expansion treats the expanded path as if the user typed it.
                 let text = resolve_tilde(spec, shell)
                     .unwrap_or_else(|| render_tilde_literal(spec));
                 current.push_str(&text, false);
@@ -126,12 +131,14 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             WordPart::Var { name, quoted: true } => {
                 if let Some(value) = shell.get(name) {
                     let v = value.to_string();
-                    current.push_str(&v, false);
+                    current.push_str(&v, true);
                 }
+                // Unset quoted var: relies on `has_emitted` so end-of-word
+                // still produces a (possibly empty) Field.
                 has_emitted = true;
             }
             WordPart::LastStatus { quoted: true } => {
-                current.push_str(&snapshot_status.to_string(), false);
+                current.push_str(&snapshot_status.to_string(), true);
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
@@ -144,7 +151,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             }
             WordPart::CommandSub { sequence, quoted: true } => {
                 let output = run_substitution(sequence, shell);
-                current.push_str(&output, false);
+                current.push_str(&output, true);
                 has_emitted = true;
             }
             WordPart::CommandSub { sequence, quoted: false } => {
@@ -622,5 +629,69 @@ mod tests {
         let f = Field::from_unquoted("é");
         assert_eq!(f.chars.chars().count(), 1);
         assert_eq!(f.quoted.len(), 1);
+    }
+
+    // ---- Quoting propagation (v10 Task 5) ----------------------------------
+
+    #[test]
+    fn expand_literal_unquoted_marks_chars_unquoted() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Literal { text: "abc".to_string(), quoted: false }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].quoted, vec![false, false, false]);
+    }
+
+    #[test]
+    fn expand_literal_quoted_marks_chars_quoted() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Literal { text: "abc".to_string(), quoted: true }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].quoted, vec![true, true, true]);
+    }
+
+    #[test]
+    fn expand_mixed_quoted_unquoted_literal_parts() {
+        let mut shell = Shell::new();
+        let word = Word(vec![
+            WordPart::Literal { text: "foo".to_string(), quoted: false },
+            WordPart::Literal { text: "*".to_string(), quoted: true },
+            WordPart::Literal { text: "bar".to_string(), quoted: false },
+        ]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "foo*bar");
+        assert_eq!(fields[0].quoted, vec![false, false, false, true, false, false, false]);
+    }
+
+    #[test]
+    fn expand_quoted_var_marks_chars_quoted() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_Q", "val".to_string());
+        let word = Word(vec![WordPart::Var { name: "HUCK_Q".to_string(), quoted: true }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].quoted, vec![true, true, true]);
+    }
+
+    #[test]
+    fn expand_unquoted_var_marks_chars_unquoted() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_Q", "val".to_string());
+        let word = Word(vec![WordPart::Var { name: "HUCK_Q".to_string(), quoted: false }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].quoted, vec![false, false, false]);
+    }
+
+    #[test]
+    fn expand_tilde_marks_chars_unquoted() {
+        let mut shell = Shell::new();
+        shell.export_set("HOME", "/h".to_string());
+        let word = Word(vec![WordPart::Tilde(TildeSpec::Home)]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields[0].chars, "/h");
+        assert_eq!(fields[0].quoted, vec![false, false]);
     }
 }
