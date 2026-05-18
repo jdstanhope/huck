@@ -294,7 +294,9 @@ enum ResolvedRedirect {
 }
 
 fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String, ()> {
-    let fields = expand(word, shell);
+    // v10 Task 4: project Vec<Field> back to Vec<String> at the call site.
+    // Task 9 replaces this projection with `glob_expand_fields`.
+    let fields: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap())
     } else {
@@ -304,7 +306,9 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
 }
 
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
-    let prog_fields = expand(&cmd.program, shell);
+    // v10 Task 4: project Vec<Field> back to Vec<String> at the call site.
+    // Task 9 replaces this projection with `glob_expand_fields`.
+    let prog_fields: Vec<String> = expand(&cmd.program, shell).into_iter().map(|f| f.chars).collect();
     if prog_fields.is_empty() {
         eprintln!("huck: command not found:");
         return Err(127);
@@ -313,7 +317,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let program = iter.next().unwrap();
     let mut args: Vec<String> = iter.collect();
     for word in &cmd.args {
-        args.extend(expand(word, shell));
+        let expanded: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
+        args.extend(expanded);
     }
     let stdin = match &cmd.stdin {
         Some(word) => Some(expand_single(word, shell).map_err(|()| 1)?),

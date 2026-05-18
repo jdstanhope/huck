@@ -95,62 +95,69 @@ impl Default for Field {
 }
 
 /// Expands a `Word` against the current `Shell` state into 0 or more
-/// argument strings. Quoted variable references append their value verbatim;
+/// `Field`s. Quoted variable references append their value verbatim;
 /// unquoted references split on ASCII whitespace and can yield multiple
 /// fields (or zero, for an empty value).
-pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
+///
+/// NOTE (v10 Task 4): All chars are appended with `quoted: false` for now.
+/// Per-WordPart-kind quoting propagation lands in Task 5.
+pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
     // Snapshot $? at the start so every `LastStatus` part in this word sees
     // the same value — even if a `CommandSub` part earlier in the word
     // updates the live $?. This matches bash: substitutions update $? for
     // the next command, not for `$?` references in the same expansion.
     let snapshot_status = shell.last_status();
-    let mut current = String::new();
+    let mut current = Field::new();
     let mut has_emitted = false;
-    let mut result: Vec<String> = Vec::new();
+    let mut result: Vec<Field> = Vec::new();
 
     for part in &word.0 {
         match part {
             WordPart::Literal { text, .. } => {
-                current.push_str(text);
+                current.push_str(text, false);
                 has_emitted = true;
             }
             WordPart::Tilde(spec) => {
                 let text = resolve_tilde(spec, shell)
                     .unwrap_or_else(|| render_tilde_literal(spec));
-                current.push_str(&text);
+                current.push_str(&text, false);
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: true } => {
                 if let Some(value) = shell.get(name) {
-                    current.push_str(value);
+                    let v = value.to_string();
+                    current.push_str(&v, false);
                 }
                 has_emitted = true;
             }
             WordPart::LastStatus { quoted: true } => {
-                current.push_str(&snapshot_status.to_string());
+                current.push_str(&snapshot_status.to_string(), false);
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
                 let value = shell.get(name).map(|s| s.to_string()).unwrap_or_default();
-                emit_split(&value, &mut current, &mut result, &mut has_emitted);
+                emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::LastStatus { quoted: false } => {
                 let value = snapshot_status.to_string();
-                emit_split(&value, &mut current, &mut result, &mut has_emitted);
+                emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::CommandSub { sequence, quoted: true } => {
                 let output = run_substitution(sequence, shell);
-                current.push_str(&output);
+                current.push_str(&output, false);
                 has_emitted = true;
             }
             WordPart::CommandSub { sequence, quoted: false } => {
                 let output = run_substitution(sequence, shell);
-                emit_split(&output, &mut current, &mut result, &mut has_emitted);
+                emit_split_fields(&output, &mut current, &mut result, &mut has_emitted);
             }
         }
     }
 
-    if has_emitted {
+    // End-of-word: push the in-progress field if it's non-empty, OR if
+    // `has_emitted` is true (preserves the "this word produced something —
+    // possibly an empty arg from `""` or a `"$UNSET"`" semantic).
+    if !current.is_empty() || has_emitted {
         result.push(current);
     }
     result
@@ -201,28 +208,24 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches('\n').to_string()
 }
 
-fn emit_split(
+fn emit_split_fields(
     value: &str,
-    current: &mut String,
-    result: &mut Vec<String>,
+    current: &mut Field,
+    result: &mut Vec<Field>,
     has_emitted: &mut bool,
 ) {
-    let fields: Vec<&str> = value.split_ascii_whitespace().collect();
-    match fields.len() {
-        0 => {}
-        1 => {
-            current.push_str(fields[0]);
-            *has_emitted = true;
-        }
-        _ => {
-            current.push_str(fields[0]);
-            result.push(std::mem::take(current));
-            for f in &fields[1..fields.len() - 1] {
-                result.push((*f).to_string());
-            }
-            *current = fields[fields.len() - 1].to_string();
-            *has_emitted = true;
-        }
+    let fragments: Vec<&str> = value.split_ascii_whitespace().collect();
+    if fragments.is_empty() {
+        return;
+    }
+    // First fragment continues the in-progress field.
+    current.push_str(fragments[0], false);
+    *has_emitted = true;
+    // Each subsequent fragment closes the field and starts a new one.
+    for frag in &fragments[1..] {
+        let finished = std::mem::take(current);
+        result.push(finished);
+        current.push_str(frag, false);
     }
 }
 
@@ -233,6 +236,13 @@ mod tests {
 
     fn lit(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    }
+
+    /// Test helper: project `Vec<Field>` back to `Vec<String>` so the existing
+    /// assertions don't have to construct `Field` literals. (Task 4 only
+    /// changes the signature; quoting propagation lands in Task 5.)
+    fn expand_strings(word: &Word, shell: &mut Shell) -> Vec<String> {
+        expand(word, shell).into_iter().map(|f| f.chars).collect()
     }
 
     fn var_unq(name: &str) -> Word {
@@ -279,13 +289,13 @@ mod tests {
     #[test]
     fn expand_literal_word() {
         let mut shell = Shell::new();
-        assert_eq!(expand(&lit("hello"), &mut shell), vec!["hello".to_string()]);
+        assert_eq!(expand_strings(&lit("hello"), &mut shell), vec!["hello".to_string()]);
     }
 
     #[test]
     fn expand_empty_literal_yields_one_empty_arg() {
         let mut shell = Shell::new();
-        assert_eq!(expand(&lit(""), &mut shell), vec!["".to_string()]);
+        assert_eq!(expand_strings(&lit(""), &mut shell), vec!["".to_string()]);
     }
 
     #[test]
@@ -295,20 +305,20 @@ mod tests {
             WordPart::Literal { text: "foo".to_string(), quoted: false },
             WordPart::Literal { text: "bar".to_string(), quoted: false },
         ]);
-        assert_eq!(expand(&word, &mut shell), vec!["foobar".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["foobar".to_string()]);
     }
 
     #[test]
     fn expand_unset_unquoted_yields_no_args() {
         let mut shell = Shell::new();
-        assert!(expand(&var_unq("DEFINITELY_NOT_SET_XYZ"), &mut shell).is_empty());
+        assert!(expand_strings(&var_unq("DEFINITELY_NOT_SET_XYZ"), &mut shell).is_empty());
     }
 
     #[test]
     fn expand_unset_quoted_yields_one_empty_arg() {
         let mut shell = Shell::new();
         assert_eq!(
-            expand(&var_q("DEFINITELY_NOT_SET_XYZ"), &mut shell),
+            expand_strings(&var_q("DEFINITELY_NOT_SET_XYZ"), &mut shell),
             vec!["".to_string()]
         );
     }
@@ -317,7 +327,7 @@ mod tests {
     fn expand_set_var_quoted_preserves_whitespace() {
         let mut shell = Shell::new();
         shell.set("HUCK_T", "a b".to_string());
-        assert_eq!(expand(&var_q("HUCK_T"), &mut shell), vec!["a b".to_string()]);
+        assert_eq!(expand_strings(&var_q("HUCK_T"), &mut shell), vec!["a b".to_string()]);
     }
 
     #[test]
@@ -325,7 +335,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HUCK_T", "a b".to_string());
         assert_eq!(
-            expand(&var_unq("HUCK_T"), &mut shell),
+            expand_strings(&var_unq("HUCK_T"), &mut shell),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -339,7 +349,7 @@ mod tests {
             WordPart::Var { name: "HUCK_T".to_string(), quoted: false },
         ]);
         assert_eq!(
-            expand(&word, &mut shell),
+            expand_strings(&word, &mut shell),
             vec!["ax".to_string(), "y".to_string()]
         );
     }
@@ -349,7 +359,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_last_status(42);
         let word = Word(vec![WordPart::LastStatus { quoted: true }]);
-        assert_eq!(expand(&word, &mut shell), vec!["42".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["42".to_string()]);
     }
 
     #[test]
@@ -361,7 +371,7 @@ mod tests {
             WordPart::Literal { text: "/foo".to_string(), quoted: false },
         ]);
         assert_eq!(
-            expand(&word, &mut shell),
+            expand_strings(&word, &mut shell),
             vec!["/tmp/huck_test/foo".to_string()]
         );
     }
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn expand_unset_unquoted_returns_no_fields_for_redirect_check() {
         let mut shell = Shell::new();
-        assert_eq!(expand(&Word(vec![WordPart::Var {
+        assert_eq!(expand_strings(&Word(vec![WordPart::Var {
             name: "DEFINITELY_NOT_SET_REDIR".to_string(),
             quoted: false,
         }]), &mut shell).len(), 0);
@@ -379,7 +389,7 @@ mod tests {
     fn expand_unquoted_var_with_two_fields_returns_two_for_redirect_check() {
         let mut shell = Shell::new();
         shell.set("HUCK_T_TWOFIELD", "a b".to_string());
-        assert_eq!(expand(&Word(vec![WordPart::Var {
+        assert_eq!(expand_strings(&Word(vec![WordPart::Var {
             name: "HUCK_T_TWOFIELD".to_string(),
             quoted: false,
         }]), &mut shell).len(), 2);
@@ -428,7 +438,7 @@ mod tests {
             sequence: echo_sequence(&["hello"]),
             quoted: false,
         }]);
-        assert_eq!(expand(&word, &mut shell), vec!["hello".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["hello".to_string()]);
     }
 
     #[test]
@@ -439,7 +449,7 @@ mod tests {
             quoted: false,
         }]);
         assert_eq!(
-            expand(&word, &mut shell),
+            expand_strings(&word, &mut shell),
             vec!["a".to_string(), "b".to_string()]
         );
     }
@@ -451,7 +461,7 @@ mod tests {
             sequence: echo_sequence(&["a", "b"]),
             quoted: true,
         }]);
-        assert_eq!(expand(&word, &mut shell), vec!["a b".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["a b".to_string()]);
     }
 
     #[test]
@@ -465,7 +475,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            expand(&word, &mut shell),
+            expand_strings(&word, &mut shell),
             vec!["prex".to_string(), "y".to_string()]
         );
     }
@@ -478,7 +488,7 @@ mod tests {
             quoted: true,
         }]);
         // echo emits "hi\n"; run_substitution strips -> "hi" exactly.
-        assert_eq!(expand(&word, &mut shell), vec!["hi".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["hi".to_string()]);
     }
 
     #[test]
@@ -522,7 +532,7 @@ mod tests {
             },
             WordPart::LastStatus { quoted: true },
         ]);
-        assert_eq!(expand(&word, &mut shell), vec!["3".to_string()]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["3".to_string()]);
         // The substitution still updates $? for the NEXT word/command.
         assert_eq!(shell.last_status(), 7);
     }
@@ -532,7 +542,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.unset("HOME");
         let word = Word(vec![WordPart::Tilde(TildeSpec::Home)]);
-        assert_eq!(expand(&word, &mut shell), vec!["~"]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["~"]);
     }
 
     #[test]
@@ -540,7 +550,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("PWD", "/var/tmp".to_string());
         let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
-        assert_eq!(expand(&word, &mut shell), vec!["/var/tmp"]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["/var/tmp"]);
     }
 
     #[test]
@@ -548,7 +558,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.unset("PWD");
         let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
-        assert_eq!(expand(&word, &mut shell), vec!["~+"]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["~+"]);
     }
 
     #[test]
@@ -556,7 +566,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.unset("OLDPWD");
         let word = Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]);
-        assert_eq!(expand(&word, &mut shell), vec!["~-"]);
+        assert_eq!(expand_strings(&word, &mut shell), vec!["~-"]);
     }
 
     #[test]
@@ -567,7 +577,7 @@ mod tests {
             WordPart::Literal { text: "/x".to_string(), quoted: false },
         ]);
         assert_eq!(
-            expand(&word, &mut shell),
+            expand_strings(&word, &mut shell),
             vec!["~definitely_not_a_real_user_xyz_42/x"]
         );
     }
