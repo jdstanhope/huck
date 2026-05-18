@@ -224,6 +224,24 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
     ExecOutcome::Continue(0)
 }
 
+/// Parses `arg` as a job spec and resolves it to a job id. On parse or
+/// resolution failure, prints a `shuck: <builtin>: ...` error to stderr
+/// and returns `Err(ExecOutcome::Continue(1))` so the caller can `?` it.
+fn resolve_spec_or_error(
+    arg: &str,
+    builtin: &str,
+    shell: &Shell,
+) -> Result<u32, ExecOutcome> {
+    let spec = crate::job_spec::parse_job_spec(arg).map_err(|_| {
+        eprintln!("shuck: {builtin}: {arg}: bad job spec");
+        ExecOutcome::Continue(1)
+    })?;
+    shell.jobs.resolve(&spec).ok_or_else(|| {
+        eprintln!("shuck: {builtin}: {arg}: no such job");
+        ExecOutcome::Continue(1)
+    })
+}
+
 fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if !args.is_empty() {
         eprintln!("shuck: fg: arguments not supported in this version");
