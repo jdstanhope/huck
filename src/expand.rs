@@ -973,6 +973,14 @@ mod tests {
     }
 
     #[test]
+    fn expand_then_glob_end_to_end_for_literal() {
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]);
+        let argv = glob_expand_fields(expand(&word, &mut shell));
+        assert_eq!(argv, vec!["hello".to_string()]);
+    }
+
+    #[test]
     fn glob_star_does_not_cross_path_separator() {
         let _g = CWD_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();

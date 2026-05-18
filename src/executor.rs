@@ -7,7 +7,7 @@ use crate::builtins::{self, ExecOutcome};
 use crate::command::{
     Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
 };
-use crate::expand::{expand, expand_assignment};
+use crate::expand::{expand, expand_assignment, glob_expand_fields};
 use crate::shell_state::Shell;
 
 /// Where the terminal stage of a top-level pipeline sends its stdout when
@@ -294,9 +294,7 @@ enum ResolvedRedirect {
 }
 
 fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String, ()> {
-    // v10 Task 4: project Vec<Field> back to Vec<String> at the call site.
-    // Task 9 replaces this projection with `glob_expand_fields`.
-    let fields: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
+    let fields = glob_expand_fields(expand(word, shell));
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap())
     } else {
@@ -306,9 +304,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
 }
 
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
-    // v10 Task 4: project Vec<Field> back to Vec<String> at the call site.
-    // Task 9 replaces this projection with `glob_expand_fields`.
-    let prog_fields: Vec<String> = expand(&cmd.program, shell).into_iter().map(|f| f.chars).collect();
+    let prog_fields = glob_expand_fields(expand(&cmd.program, shell));
     if prog_fields.is_empty() {
         eprintln!("huck: command not found:");
         return Err(127);
@@ -317,8 +313,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let program = iter.next().unwrap();
     let mut args: Vec<String> = iter.collect();
     for word in &cmd.args {
-        let expanded: Vec<String> = expand(word, shell).into_iter().map(|f| f.chars).collect();
-        args.extend(expanded);
+        args.extend(glob_expand_fields(expand(word, shell)));
     }
     let stdin = match &cmd.stdin {
         Some(word) => Some(expand_single(word, shell).map_err(|()| 1)?),
