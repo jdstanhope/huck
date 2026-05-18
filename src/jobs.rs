@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn has_running_tracks_state() {
+    fn has_pending_tracks_state() {
         let mut t = JobTable::new();
         assert!(!t.has_pending());
         let _ = t.add(100, vec![100], "x".to_string());
