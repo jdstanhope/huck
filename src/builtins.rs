@@ -16,7 +16,7 @@ pub enum ExecOutcome {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill"
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill" | "disown"
     )
 }
 
@@ -41,6 +41,7 @@ pub fn run_builtin(
         "fg" => builtin_fg(args, shell),
         "bg" => builtin_bg(args, out, shell),
         "kill" => builtin_kill(args, shell),
+        "disown" => builtin_disown(args, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -427,6 +428,32 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
     }
 
     if any_failed { ExecOutcome::Continue(1) } else { ExecOutcome::Continue(0) }
+}
+
+fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.len() > 1 {
+        eprintln!("shuck: disown: usage: disown [%job]");
+        return ExecOutcome::Continue(2);
+    }
+    let id = match args.first() {
+        Some(arg) if arg.starts_with('%') => match resolve_spec_or_error(arg, "disown", shell) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
+        },
+        Some(_) => {
+            eprintln!("shuck: disown: usage: disown [%job]");
+            return ExecOutcome::Continue(2);
+        }
+        None => match shell.jobs.current_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: disown: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+    };
+    shell.jobs.jobs_mut().retain(|j| j.id != id);
+    ExecOutcome::Continue(0)
 }
 
 fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -1021,5 +1048,88 @@ mod kill_tests {
         assert_eq!(signal_by_name("USR2"), Some(libc::SIGUSR2));
         assert_eq!(signal_by_name("ABC"), None);
         assert_eq!(signal_by_name(""), None);
+    }
+}
+
+#[cfg(test)]
+mod disown_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn is_builtin_recognizes_disown() {
+        assert!(is_builtin("disown"));
+    }
+
+    #[test]
+    fn disown_no_args_with_no_current_job_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn disown_no_args_removes_current_job() {
+        let mut shell = Shell::new();
+        shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_with_spec_removes_specified_job() {
+        let mut shell = Shell::new();
+        shell.jobs.add(100, vec![100], "a".to_string());
+        shell.jobs.add(200, vec![200], "b".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let remaining: Vec<u32> = shell.jobs.iter().map(|j| j.id).collect();
+        assert_eq!(remaining, vec![2]);
+    }
+
+    #[test]
+    fn disown_with_bad_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn disown_with_non_percent_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn disown_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn disown_drops_pending_done_notification() {
+        let mut shell = Shell::new();
+        // Synthetic Done job with notified=false would trigger a "[1] Done"
+        // line at the next prompt. Disown should remove the job and
+        // suppress that notification.
+        shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
     }
 }
