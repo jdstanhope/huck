@@ -198,19 +198,33 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     ExecOutcome::Continue(0)
 }
 
-fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: wait: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
-    }
-    while shell.jobs.has_pending() {
-        if shell.sigint_flag
-            .compare_exchange(true, false, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-            .is_ok()
-        {
-            eprintln!();  // newline so the ^C doesn't run into the prompt
-            return ExecOutcome::Continue(130);
+fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
+    match args.len() {
+        0 => wait_all(shell),
+        1 if args[0].starts_with('%') => {
+            let id = match resolve_spec_or_error(&args[0], "wait", shell) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+            wait_for_job(id, shell)
         }
+        1 => match args[0].parse::<i32>() {
+            Ok(pid) if pid > 0 => wait_for_pid(pid, shell),
+            _ => {
+                eprintln!("shuck: wait: usage: wait [%job | pid]");
+                ExecOutcome::Continue(2)
+            }
+        },
+        _ => {
+            eprintln!("shuck: wait: usage: wait [%job | pid]");
+            ExecOutcome::Continue(2)
+        }
+    }
+}
+
+fn wait_all(shell: &mut Shell) -> ExecOutcome {
+    while shell.jobs.has_pending() {
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
@@ -222,6 +236,85 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
     // Print Done lines for anything that just transitioned during the wait.
     crate::jobs::reap_and_notify(shell);
     ExecOutcome::Continue(0)
+}
+
+fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
+    loop {
+        // Check terminal state first — handles already-Done jobs.
+        let terminal = shell.jobs.iter()
+            .find(|j| j.id == id)
+            .and_then(|j| match j.state {
+                crate::jobs::JobState::Done(c) => Some(c),
+                crate::jobs::JobState::Signaled(s) => Some(128 + s),
+                _ => None,
+            });
+        if let Some(code) = terminal {
+            return ExecOutcome::Continue(code);
+        }
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
+    let mut first = true;
+    loop {
+        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+            if libc::WIFSTOPPED(status) {
+                // Still alive; keep polling.
+                first = false;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                1
+            };
+            return ExecOutcome::Continue(code);
+        }
+        if r < 0 {
+            // ECHILD: not a child (or already reaped). On the first call,
+            // surface as "not a child." On a subsequent call, treat as a
+            // race we can't recover from.
+            if first {
+                eprintln!("shuck: wait: pid {pid} is not a child of this shell");
+                return ExecOutcome::Continue(127);
+            }
+            return ExecOutcome::Continue(1);
+        }
+        first = false;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn check_sigint(shell: &Shell) -> bool {
+    if shell.sigint_flag
+        .compare_exchange(
+            true,
+            false,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        eprintln!();
+        true
+    } else {
+        false
+    }
 }
 
 /// Parses `arg` as a job spec and resolves it to a job id. On parse or
@@ -560,14 +653,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_with_args_errors() {
-        let mut shell = Shell::new();
-        let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_wait(&["%1".to_string()], &mut out, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
-    }
-
-    #[test]
     fn is_builtin_recognizes_jobs_and_wait() {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("wait"));
@@ -699,5 +784,62 @@ mod fg_bg_tests {
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_bad_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn wait_with_no_such_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn wait_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_unparseable_pid_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_with_done_spec_returns_decoded_status_immediately() {
+        let mut shell = Shell::new();
+        // Synthetic Done job — wait should see it's already terminal and
+        // return decode(0) → 0 without blocking.
+        shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn wait_with_done_spec_returns_nonzero_for_exit_n() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("false".to_string(), 1);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 }
