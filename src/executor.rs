@@ -505,7 +505,11 @@ fn run_subprocess(
                                 break;
                             }
                         }
-                        eprintln!("\n[{job_id}]+ Stopped              {}", cmd.program);
+                        let line = shell.jobs.iter()
+                            .find(|j| j.id == job_id)
+                            .map(|j| crate::jobs::notification_line(j, '+'))
+                            .unwrap_or_default();
+                        eprintln!("\n{line}");
                         std::mem::forget(child);
                         give_terminal_to(shell.shell_pgid);
                         ExecOutcome::Continue(128 + sig)
@@ -804,7 +808,11 @@ fn run_multi_stage(
                                     break;
                                 }
                             }
-                            eprintln!("\n[{job_id}]+ Stopped              {display}");
+                            let line = shell.jobs.iter()
+                                .find(|j| j.id == job_id)
+                                .map(|j| crate::jobs::notification_line(j, '+'))
+                                .unwrap_or_default();
+                            eprintln!("\n{line}");
                             std::mem::forget(child);
                             give_terminal_to(shell.shell_pgid);
                             return ExecOutcome::Continue(128 + sig);
@@ -857,7 +865,6 @@ fn give_terminal_to(pgid: i32) {
 /// Block-wait for a single child pid with WUNTRACED. Returns:
 ///   `Ok((raw_status, stopped))` where `stopped` is true if WIFSTOPPED.
 ///   `Err(())` on waitpid failure.
-#[allow(dead_code)]
 fn wait_with_untraced(pid: i32) -> Result<(libc::c_int, bool), ()> {
     let mut status: libc::c_int = 0;
     let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
