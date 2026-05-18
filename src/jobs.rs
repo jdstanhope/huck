@@ -138,6 +138,9 @@ impl JobTable {
     }
 
     /// Returns the most-recent and previous job ids (for `+`/`-` markers).
+    /// Unlike [`current_id`], this includes Done/Signaled jobs that are
+    /// still in the table awaiting notification, so the `+`/`-` flags on
+    /// `jobs` output match what the user just saw.
     /// Most-recent is the highest `created_at`; previous is the next.
     pub fn current_and_previous(&self) -> (Option<u32>, Option<u32>) {
         let mut by_age: Vec<&Job> = self.jobs.iter().collect();
@@ -149,24 +152,20 @@ impl JobTable {
 
     /// Most-recent Running or Stopped job id (the `+` job for fg/bg/jobs).
     pub fn current_id(&self) -> Option<u32> {
-        let mut by_age: Vec<&Job> = self
-            .jobs
+        self.jobs
             .iter()
             .filter(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
-            .collect();
-        by_age.sort_by_key(|j| std::cmp::Reverse(j.created_at));
-        by_age.first().map(|j| j.id)
+            .max_by_key(|j| j.created_at)
+            .map(|j| j.id)
     }
 
     /// Most-recent Stopped job id, ignoring Running jobs. Used by `bg`.
     pub fn current_stopped_id(&self) -> Option<u32> {
-        let mut by_age: Vec<&Job> = self
-            .jobs
+        self.jobs
             .iter()
             .filter(|j| matches!(j.state, JobState::Stopped(_)))
-            .collect();
-        by_age.sort_by_key(|j| std::cmp::Reverse(j.created_at));
-        by_age.first().map(|j| j.id)
+            .max_by_key(|j| j.created_at)
+            .map(|j| j.id)
     }
 
     /// True if any job is Running or Stopped (i.e., `wait` should block).
