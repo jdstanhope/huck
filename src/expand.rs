@@ -1,7 +1,60 @@
 use crate::command::Sequence;
 use crate::executor;
-use crate::lexer::{Word, WordPart};
+use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
+
+fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
+    match spec {
+        TildeSpec::Home   => shell.get("HOME").map(str::to_string),
+        TildeSpec::Pwd    => shell.get("PWD").map(str::to_string),
+        TildeSpec::OldPwd => shell.get("OLDPWD").map(str::to_string),
+        TildeSpec::User(name) => lookup_home_for_user(name),
+    }
+}
+
+fn render_tilde_literal(spec: &TildeSpec) -> String {
+    match spec {
+        TildeSpec::Home       => "~".to_string(),
+        TildeSpec::Pwd        => "~+".to_string(),
+        TildeSpec::OldPwd     => "~-".to_string(),
+        TildeSpec::User(name) => format!("~{name}"),
+    }
+}
+
+fn lookup_home_for_user(name: &str) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    let cname = CString::new(name).ok()?;
+    let mut buf: Vec<u8> = vec![0; 1024];
+    loop {
+        let mut pwd: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                cname.as_ptr(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 && !result.is_null() {
+            let pwd = unsafe { pwd.assume_init() };
+            if pwd.pw_dir.is_null() {
+                return None;
+            }
+            let home = unsafe { CStr::from_ptr(pwd.pw_dir) };
+            return home.to_str().ok().map(str::to_string);
+        }
+        if rc == libc::ERANGE && buf.len() < 16384 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return None;
+    }
+}
 
 /// Expands a `Word` against the current `Shell` state into 0 or more
 /// argument strings. Quoted variable references append their value verbatim;
@@ -23,10 +76,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<String> {
                 current.push_str(s);
                 has_emitted = true;
             }
-            WordPart::Tilde => {
-                if let Some(home) = shell.get("HOME") {
-                    current.push_str(home);
-                }
+            WordPart::Tilde(spec) => {
+                let text = resolve_tilde(spec, shell)
+                    .unwrap_or_else(|| render_tilde_literal(spec));
+                current.push_str(&text);
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: true } => {
@@ -74,10 +127,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     for part in &word.0 {
         match part {
             WordPart::Literal(s) => result.push_str(s),
-            WordPart::Tilde => {
-                if let Some(home) = shell.get("HOME") {
-                    result.push_str(home);
-                }
+            WordPart::Tilde(spec) => {
+                let text = resolve_tilde(spec, shell)
+                    .unwrap_or_else(|| render_tilde_literal(spec));
+                result.push_str(&text);
             }
             WordPart::Var { name, .. } => {
                 if let Some(value) = shell.get(name) {
@@ -266,7 +319,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/tmp/huck_test".to_string());
         let word = Word(vec![
-            WordPart::Tilde,
+            WordPart::Tilde(TildeSpec::Home),
             WordPart::Literal("/foo".to_string()),
         ]);
         assert_eq!(
@@ -434,5 +487,62 @@ mod tests {
         assert_eq!(expand(&word, &mut shell), vec!["3".to_string()]);
         // The substitution still updates $? for the NEXT word/command.
         assert_eq!(shell.last_status(), 7);
+    }
+
+    #[test]
+    fn expand_tilde_home_unset_falls_back_to_literal() {
+        let mut shell = Shell::new();
+        shell.unset("HOME");
+        let word = Word(vec![WordPart::Tilde(TildeSpec::Home)]);
+        assert_eq!(expand(&word, &mut shell), vec!["~"]);
+    }
+
+    #[test]
+    fn expand_tilde_pwd_resolves_when_pwd_set() {
+        let mut shell = Shell::new();
+        shell.export_set("PWD", "/var/tmp".to_string());
+        let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
+        assert_eq!(expand(&word, &mut shell), vec!["/var/tmp"]);
+    }
+
+    #[test]
+    fn expand_tilde_pwd_unset_falls_back_to_literal_plus() {
+        let mut shell = Shell::new();
+        shell.unset("PWD");
+        let word = Word(vec![WordPart::Tilde(TildeSpec::Pwd)]);
+        assert_eq!(expand(&word, &mut shell), vec!["~+"]);
+    }
+
+    #[test]
+    fn expand_tilde_oldpwd_unset_falls_back_to_literal_minus() {
+        let mut shell = Shell::new();
+        shell.unset("OLDPWD");
+        let word = Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]);
+        assert_eq!(expand(&word, &mut shell), vec!["~-"]);
+    }
+
+    #[test]
+    fn expand_tilde_unknown_user_falls_back_to_literal() {
+        let mut shell = Shell::new();
+        let word = Word(vec![
+            WordPart::Tilde(TildeSpec::User("definitely_not_a_real_user_xyz_42".to_string())),
+            WordPart::Literal("/x".to_string()),
+        ]);
+        assert_eq!(
+            expand(&word, &mut shell),
+            vec!["~definitely_not_a_real_user_xyz_42/x"]
+        );
+    }
+
+    #[test]
+    fn expand_assignment_tilde_home_resolves() {
+        let mut shell = Shell::new();
+        shell.export_set("HOME", "/h".to_string());
+        let word = Word(vec![
+            WordPart::Literal("PATH=".to_string()),
+            WordPart::Tilde(TildeSpec::Home),
+            WordPart::Literal("/bin".to_string()),
+        ]);
+        assert_eq!(expand_assignment(&word, &mut shell), "PATH=/h/bin");
     }
 }

@@ -61,13 +61,26 @@ fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
         },
     };
-    match env::set_current_dir(Path::new(&target)) {
-        Ok(()) => ExecOutcome::Continue(0),
+    if let Err(e) = env::set_current_dir(Path::new(&target)) {
+        eprintln!("huck: cd: {target}: {e}");
+        return ExecOutcome::Continue(1);
+    }
+    // chdir succeeded — maintain PWD/OLDPWD.
+    let prev_pwd = shell.get("PWD").map(str::to_string);
+    match env::current_dir() {
+        Ok(new_pwd) => {
+            if let Some(prev) = prev_pwd {
+                shell.export_set("OLDPWD", prev);
+            }
+            shell.export_set("PWD", new_pwd.to_string_lossy().to_string());
+        }
         Err(e) => {
-            eprintln!("huck: cd: {target}: {e}");
-            ExecOutcome::Continue(1)
+            // chdir succeeded but we can't read it back — warn but
+            // don't fail the command.
+            eprintln!("huck: cd: warning: could not read current dir: {e}");
         }
     }
+    ExecOutcome::Continue(0)
 }
 
 fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
@@ -1071,6 +1084,49 @@ mod kill_tests {
         let outcome = run_builtin("kill", &["-0".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)),
             "kill -0 (no targets) should reach usage check, not signal check");
+    }
+}
+
+#[cfg(test)]
+mod cd_pwd_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn cd_sets_pwd_to_target_directory() {
+        let mut shell = Shell::new();
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        // Restore for any other tests.
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
+        assert!(shell.exported_env().any(|(k, _)| k == "PWD"));
+    }
+
+    #[test]
+    fn cd_sets_oldpwd_to_previous_pwd() {
+        let mut shell = Shell::new();
+        shell.export_set("PWD", "/var".to_string());
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.get("OLDPWD"), Some("/var"));
+        assert!(shell.exported_env().any(|(k, _)| k == "OLDPWD"));
+    }
+
+    #[test]
+    fn cd_with_pwd_initially_unset_does_not_set_oldpwd() {
+        let mut shell = Shell::new();
+        shell.unset("PWD");
+        shell.unset("OLDPWD");
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.get("OLDPWD"), None);
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
     }
 }
 
