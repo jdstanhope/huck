@@ -125,9 +125,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 read_dollar_expansion(&mut chars, &mut parts, false)?;
             }
-            '~' if !has_token && tilde_at_word_start(&chars) => {
-                has_token = true;
-                parts.push(WordPart::Tilde(TildeSpec::Home));
+            '~' if !has_token => {
+                if let Some(spec) = try_parse_tilde(&mut chars) {
+                    has_token = true;
+                    parts.push(WordPart::Tilde(spec));
+                } else {
+                    // Fall through: treat '~' as literal.
+                    current.push('~');
+                    has_token = true;
+                }
             }
             '`' => {
                 has_token = true;
@@ -450,17 +456,45 @@ fn is_name_cont(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
 }
 
-/// True iff a `~` would expand here: next char is `/`, whitespace, an
-/// operator metachar (`|`, `<`, `>`, `&`, `;`), or end of input.
-fn tilde_at_word_start(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
-    match chars.clone().peek() {
-        None => true,
-        Some(&c) => {
-            c == '/'
-                || c.is_whitespace()
-                || matches!(c, '|' | '<' | '>' | '&' | ';')
+/// Tries to consume a tilde construct starting just after the `~`.
+/// On success, returns the `TildeSpec` (consuming any extra chars, e.g.
+/// the `+` in `~+`). On failure, leaves the iterator untouched and
+/// returns `None` (the caller treats `~` as a literal).
+fn try_parse_tilde(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<TildeSpec> {
+    match chars.peek().copied() {
+        // Bare ~ at end of word.
+        None => Some(TildeSpec::Home),
+        Some(c) if is_tilde_terminator(c) => Some(TildeSpec::Home),
+        // ~+, ~- — must be followed by terminator (or nothing).
+        Some('+') => {
+            let mut lookahead = chars.clone();
+            lookahead.next(); // consume the +
+            match lookahead.peek().copied() {
+                None => { chars.next(); Some(TildeSpec::Pwd) }
+                Some(c) if is_tilde_terminator(c) => { chars.next(); Some(TildeSpec::Pwd) }
+                _ => None,
+            }
         }
+        Some('-') => {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            match lookahead.peek().copied() {
+                None => { chars.next(); Some(TildeSpec::OldPwd) }
+                Some(c) if is_tilde_terminator(c) => { chars.next(); Some(TildeSpec::OldPwd) }
+                _ => None,
+            }
+        }
+        // ~user — Task 3 will handle this; for now fall through.
+        _ => None,
     }
+}
+
+fn is_tilde_terminator(c: char) -> bool {
+    c == '/'
+        || c.is_whitespace()
+        || matches!(c, '|' | '<' | '>' | '&' | ';')
 }
 
 #[cfg(test)]
@@ -1241,5 +1275,49 @@ mod tests {
             tokenize("'`echo hi`'").unwrap(),
             words(&["`echo hi`"])
         );
+    }
+
+    #[test]
+    fn tokenize_tilde_plus_alone() {
+        assert_eq!(
+            tokenize("~+").unwrap(),
+            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::Pwd)]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_minus_alone() {
+        assert_eq!(
+            tokenize("~-").unwrap(),
+            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_plus_slash_path() {
+        assert_eq!(
+            tokenize("~+/x").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::Pwd),
+                WordPart::Literal("/x".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_minus_slash_path() {
+        assert_eq!(
+            tokenize("~-/x").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::OldPwd),
+                WordPart::Literal("/x".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_plus_followed_by_letter_is_literal() {
+        // ~+abc is not a valid form; falls back to literal.
+        assert_eq!(tokenize("~+abc").unwrap(), words(&["~+abc"]));
     }
 }
