@@ -1449,6 +1449,19 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_assignment_bare_tilde_after_equals() {
+        // X=~  (just `=~` with no path after) — covers the end-of-input branch
+        // of try_parse_tilde inside assignment context.
+        assert_eq!(
+            tokenize("X=~").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Literal("X=".to_string()),
+                WordPart::Tilde(TildeSpec::Home),
+            ]))]
+        );
+    }
+
+    #[test]
     fn tokenize_assignment_value_expands_first_tilde_after_equals() {
         assert_eq!(
             tokenize("PATH=~/bin").unwrap(),
