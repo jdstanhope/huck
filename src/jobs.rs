@@ -10,6 +10,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     Running,
+    Stopped(i32),
     Done(i32),
     Signaled(i32),
 }
@@ -123,7 +124,8 @@ impl JobTable {
     pub fn drain_notifications(&mut self) -> Vec<Job> {
         let mut out = Vec::new();
         for job in self.jobs.iter_mut() {
-            if !matches!(job.state, JobState::Running) && !job.notified {
+            let pending = !matches!(job.state, JobState::Running);
+            if pending && !job.notified {
                 job.notified = true;
                 out.push(job.clone());
             }
@@ -134,8 +136,9 @@ impl JobTable {
 
     /// Drops all jobs that are non-Running AND notified.
     pub fn remove_notified(&mut self) {
-        self.jobs
-            .retain(|j| matches!(j.state, JobState::Running) || !j.notified);
+        self.jobs.retain(|j| {
+            matches!(j.state, JobState::Running | JobState::Stopped(_)) || !j.notified
+        });
     }
 
     /// Returns the most-recent and previous job ids (for `+`/`-` markers).
@@ -146,6 +149,10 @@ impl JobTable {
         let current = by_age.first().map(|j| j.id);
         let previous = by_age.get(1).map(|j| j.id);
         (current, previous)
+    }
+
+    pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
+        &mut self.jobs
     }
 
     fn next_id(&self) -> u32 {
@@ -190,8 +197,7 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
-        let state = render_state(&job.state);
-        eprintln!("[{}]{} {:<20} {} &", job.id, flag, state, job.command);
+        eprintln!("{}", notification_line(&job, flag));
     }
     shell.jobs.remove_notified();
 }
@@ -199,10 +205,29 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
 pub fn render_state(state: &JobState) -> String {
     match state {
         JobState::Running => "Running".to_string(),
+        JobState::Stopped(s) => match *s {
+            libc::SIGTSTP => "Stopped".to_string(),
+            libc::SIGTTIN => "Stopped (tty input)".to_string(),
+            libc::SIGTTOU => "Stopped (tty output)".to_string(),
+            n => format!("Stopped (signal {n})"),
+        },
         JobState::Done(0) => "Done".to_string(),
         JobState::Done(n) => format!("Exit {n}"),
         JobState::Signaled(s) => format!("Killed (signal {s})"),
     }
+}
+
+/// Renders one notification line. The trailing `&` is included only for
+/// Done/Signaled jobs — Stopped jobs are not "running in the background"
+/// so the suffix would be misleading. Column width is 24 to fit
+/// `Stopped (tty output)`.
+pub fn notification_line(job: &Job, flag: char) -> String {
+    let state = render_state(&job.state);
+    let suffix = match job.state {
+        JobState::Stopped(_) => "",
+        _ => " &",
+    };
+    format!("[{}]{} {:<24} {}{}", job.id, flag, state, job.command, suffix)
 }
 
 /// Decodes a raw waitpid status into a JobState terminal variant.
@@ -211,10 +236,9 @@ fn decode_status(raw: libc::c_int) -> JobState {
         JobState::Done(libc::WEXITSTATUS(raw))
     } else if libc::WIFSIGNALED(raw) {
         JobState::Signaled(libc::WTERMSIG(raw))
+    } else if libc::WIFSTOPPED(raw) {
+        JobState::Stopped(libc::WSTOPSIG(raw))
     } else {
-        // Stopped or continued — sub-project A doesn't handle these; treat
-        // as still running. In practice we never call decode_status until
-        // all pids have been reaped, so this branch shouldn't fire here.
         JobState::Running
     }
 }
@@ -362,5 +386,60 @@ mod tests {
         assert_eq!(cur, Some(id_c));
         assert_eq!(prev, Some(id_b));
         let _ = id_a;
+    }
+
+    #[test]
+    fn render_state_stopped_sigtstp_is_plain_stopped() {
+        assert_eq!(render_state(&JobState::Stopped(libc::SIGTSTP)), "Stopped");
+    }
+
+    #[test]
+    fn render_state_stopped_sigttin_includes_tty_input() {
+        assert_eq!(
+            render_state(&JobState::Stopped(libc::SIGTTIN)),
+            "Stopped (tty input)"
+        );
+    }
+
+    #[test]
+    fn render_state_stopped_sigttou_includes_tty_output() {
+        assert_eq!(
+            render_state(&JobState::Stopped(libc::SIGTTOU)),
+            "Stopped (tty output)"
+        );
+    }
+
+    #[test]
+    fn render_state_stopped_unknown_signal_falls_back_to_numeric() {
+        assert_eq!(
+            render_state(&JobState::Stopped(99)),
+            "Stopped (signal 99)"
+        );
+    }
+
+    #[test]
+    fn notification_line_for_stopped_omits_ampersand() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "sleep 100".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        let line = notification_line(&t.jobs_mut()[0], '+');
+        assert_eq!(line, "[1]+ Stopped                  sleep 100");
+    }
+
+    #[test]
+    fn notification_line_for_done_includes_ampersand() {
+        let mut t = JobTable::new();
+        t.add_synthetic_done("echo hi".to_string(), 0);
+        let line = notification_line(&t.jobs_mut()[0], ' ');
+        assert_eq!(line, "[1]  Done                     echo hi &");
+    }
+
+    #[test]
+    fn notification_line_for_stopped_tty_input_shows_reason() {
+        let mut t = JobTable::new();
+        t.add(4242, vec![4242], "cat".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTTIN);
+        let line = notification_line(&t.jobs_mut()[0], '+');
+        assert_eq!(line, "[1]+ Stopped (tty input)      cat");
     }
 }
