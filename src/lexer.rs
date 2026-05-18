@@ -504,6 +504,8 @@ fn try_parse_tilde(
             };
             if tail_ok && !name.is_empty() {
                 // Consume the scanned chars from the real iterator.
+                // Safe: is_user_name_start/continue only accept ASCII, so
+                // name.len() (bytes) equals the char count.
                 for _ in 0..name.len() {
                     chars.next();
                 }
