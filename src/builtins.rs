@@ -243,15 +243,21 @@ fn resolve_spec_or_error(
 }
 
 fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("shuck: fg: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
-    }
-    let id = match shell.jobs.current_id() {
-        Some(id) => id,
-        None => {
-            eprintln!("shuck: fg: no current job");
-            return ExecOutcome::Continue(1);
+    let id = match args.len() {
+        0 => match shell.jobs.current_id() {
+            Some(id) => id,
+            None => {
+                eprintln!("shuck: fg: no current job");
+                return ExecOutcome::Continue(1);
+            }
+        },
+        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "fg", shell) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
+        },
+        _ => {
+            eprintln!("shuck: fg: usage: fg [%job]");
+            return ExecOutcome::Continue(2);
         }
     };
     let (pgid, pids, command) = {
@@ -572,11 +578,11 @@ mod fg_bg_tests {
     }
 
     #[test]
-    fn fg_with_args_rejected_with_status_2() {
+    fn fg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("fg", &["%1".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
@@ -600,5 +606,42 @@ mod fg_bg_tests {
     fn is_builtin_recognizes_fg_and_bg() {
         assert!(is_builtin("fg"));
         assert!(is_builtin("bg"));
+    }
+
+    #[test]
+    fn fg_with_bad_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["%abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn fg_with_no_such_job_spec_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["%99".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn fg_with_non_percent_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("fg", &["1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn fg_with_multiple_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "fg",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
