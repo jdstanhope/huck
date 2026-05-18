@@ -190,8 +190,7 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
         } else {
             ' '
         };
-        let state = crate::jobs::render_state(&job.state);
-        if let Err(e) = writeln!(out, "[{}]{} {:<20} {} &", job.id, flag, state, job.command) {
+        if let Err(e) = writeln!(out, "{}", crate::jobs::notification_line(job, flag)) {
             eprintln!("shuck: jobs: {e}");
             return ExecOutcome::Continue(1);
         }
@@ -204,9 +203,11 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
         eprintln!("shuck: wait: arguments not supported in this version");
         return ExecOutcome::Continue(2);
     }
-    shell.sigint_flag.store(false, std::sync::atomic::Ordering::Relaxed);
     while shell.jobs.has_pending() {
-        if shell.sigint_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        if shell.sigint_flag
+            .compare_exchange(true, false, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+            .is_ok()
+        {
             eprintln!();  // newline so the ^C doesn't run into the prompt
             return ExecOutcome::Continue(130);
         }
@@ -255,24 +256,31 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
     let mut last_status = 0;
     let mut stopped_sig: Option<i32> = None;
-    for &pid in &pids {
+    let mut completed = 0;
+    let total = pids.len();
+    loop {
+        if completed == total { break; }
         let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        // Wait for any child in this pgrp. -pgid means "any pid whose pgid == pgid".
+        let r = unsafe { libc::waitpid(-pgid, &mut status, libc::WUNTRACED) };
         if r < 0 {
+            // ECHILD — SIGCHLD reaper got ahead of us. Stop the loop; the
+            // job will be cleaned up by the next prompt's notify cycle.
             last_status = 1;
-            continue;
+            break;
         }
         if libc::WIFSTOPPED(status) {
             stopped_sig = Some(libc::WSTOPSIG(status));
             break;
         }
-        last_status = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
+        if libc::WIFEXITED(status) {
+            last_status = libc::WEXITSTATUS(status);
         } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
+            last_status = 128 + libc::WTERMSIG(status);
         } else {
-            1
-        };
+            last_status = 1;
+        }
+        completed += 1;
     }
 
     unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, shell.shell_pgid); }
@@ -290,7 +298,12 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
         return ExecOutcome::Continue(128 + sig);
     }
 
-    shell.jobs.jobs_mut().retain(|j| j.id != id);
+    // Only remove from the job table if all pids completed successfully.
+    // If the wait loop exited early (ECHILD race), leave the job for the
+    // prompt-time reaper to handle.
+    if completed == total {
+        shell.jobs.jobs_mut().retain(|j| j.id != id);
+    }
     ExecOutcome::Continue(last_status)
 }
 
@@ -481,6 +494,19 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = builtin_jobs(&["-l".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn jobs_lists_stopped_without_ampersand_suffix() {
+        let mut shell = Shell::new();
+        shell.jobs.add(100, vec![100], "sleep 100".to_string());
+        shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Stopped"), "got: {out:?}");
+        assert!(!out.trim_end().ends_with('&'), "Stopped line must NOT end with &; got: {out:?}");
     }
 
     #[test]

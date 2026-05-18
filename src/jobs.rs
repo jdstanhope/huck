@@ -256,15 +256,11 @@ pub fn render_state(state: &JobState) -> String {
     }
 }
 
-/// Renders one notification line. The trailing `&` is included only for
-/// Done/Signaled jobs — Stopped jobs are not "running in the background"
-/// so the suffix would be misleading. Column width is 24 to fit
-/// `Stopped (tty output)`.
+/// Renders one notification/listing line for a job. The trailing `&` is
+/// included for Running and Done/Signaled jobs — Stopped jobs are not
+/// "running in the background" so the suffix would be misleading. Column
+/// width is 24 to fit `Stopped (tty output)`.
 pub fn notification_line(job: &Job, flag: char) -> String {
-    debug_assert!(
-        !matches!(job.state, JobState::Running),
-        "notification_line called on a Running job — this is a bug"
-    );
     let state = render_state(&job.state);
     let suffix = match job.state {
         JobState::Stopped(_) => "",

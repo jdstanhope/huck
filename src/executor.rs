@@ -204,7 +204,11 @@ fn run_background_sequence(
             // standard fix is to also call setpgid in the parent — it's
             // idempotent with the child's call.
             unsafe {
-                libc::setpgid(pid, pid);
+                if libc::setpgid(pid, pid) != 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_assert!(errno == libc::ESRCH,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                }
             }
         }
 
@@ -490,7 +494,13 @@ fn run_subprocess(
             if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
-                unsafe { libc::setpgid(pid, pid); }
+                unsafe {
+                    if libc::setpgid(pid, pid) != 0 {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        debug_assert!(errno == libc::ESRCH,
+                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                    }
+                }
                 give_terminal_to(pid);
 
                 match wait_with_untraced(pid) {
@@ -760,7 +770,13 @@ fn run_multi_stage(
         stage_pids.push(pid);
         if interactive && first_pid.is_none() {
             first_pid = Some(pid);
-            unsafe { libc::setpgid(pid, pid); }
+            unsafe {
+                if libc::setpgid(pid, pid) != 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    debug_assert!(errno == libc::ESRCH,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                }
+            }
         }
 
         if pipe_onward {
