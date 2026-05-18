@@ -206,8 +206,10 @@ fn run_background_sequence(
             unsafe {
                 if libc::setpgid(pid, pid) != 0 {
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    debug_assert!(errno == libc::ESRCH,
-                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                    debug_assert!(
+                        errno == libc::ESRCH || errno == libc::EACCES,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+                    );
                 }
             }
         }
@@ -497,8 +499,10 @@ fn run_subprocess(
                 unsafe {
                     if libc::setpgid(pid, pid) != 0 {
                         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        debug_assert!(errno == libc::ESRCH,
-                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                        debug_assert!(
+                            errno == libc::ESRCH || errno == libc::EACCES,
+                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+                        );
                     }
                 }
                 give_terminal_to(pid);
@@ -773,8 +777,10 @@ fn run_multi_stage(
             unsafe {
                 if libc::setpgid(pid, pid) != 0 {
                     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    debug_assert!(errno == libc::ESRCH,
-                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}");
+                    debug_assert!(
+                        errno == libc::ESRCH || errno == libc::EACCES,
+                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+                    );
                 }
             }
         }
