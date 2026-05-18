@@ -61,14 +61,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         if c.is_whitespace() {
             if has_token {
                 flush_literal(&mut parts, &mut current, false);
-                if parts.is_empty() {
-                    // Defensive: a token exists but produced no parts. This
-                    // shouldn't happen for whitespace-terminated tokens (the
-                    // quote arms handle the empty `""`/`''` case themselves),
-                    // but emit an empty unquoted Literal to preserve the
-                    // "has_emitted" contract just in case.
-                    parts.push(WordPart::Literal { text: String::new(), quoted: false });
-                }
+                debug_assert!(
+                    !parts.is_empty(),
+                    "lexer invariant: has_token was true but no parts were emitted"
+                );
                 tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                 has_token = false;
                 in_assignment_value = false;
@@ -576,7 +572,7 @@ fn word_is_identifier_so_far(current: &str, parts: &[WordPart]) -> bool {
     // concatenation is a non-empty identifier.
     let mut joined = String::new();
     for p in parts {
-        if let WordPart::Literal { text, .. } = p {
+        if let WordPart::Literal { text, quoted: false } = p {
             joined.push_str(text);
         } else {
             return false;
@@ -1187,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_command_sub_with_paren_inside_double_quotes() {
+    fn tokenize_command_sub_with_quoted_paren_in_body() {
         // The `)` inside `"..."` does not close the substitution. The inner
         // `")"` arg is quoted, so the inner Literal carries quoted: true.
         use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
@@ -1545,6 +1541,19 @@ mod tests {
             tokenize("1ABC=~/x").unwrap(),
             words(&["1ABC=~/x"])
         );
+    }
+
+    #[test]
+    fn quoted_prefix_disqualifies_assignment() {
+        // `"F"OO=bar` is a command argument, not an assignment, because the
+        // identifier prefix contains quoted text.
+        let tokens = tokenize("\"F\"OO=bar").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        // Expect quoted "F", unquoted "OO=bar" — no assignment split.
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], WordPart::Literal { text: "F".to_string(), quoted: true });
+        assert_eq!(parts[1], WordPart::Literal { text: "OO=bar".to_string(), quoted: false });
     }
 
     #[test]

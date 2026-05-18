@@ -38,13 +38,19 @@ fn try_split_assignment(
     // Validation passed — destructure the word, moving parts into the value.
     let crate::lexer::Word(mut parts) = word;
     let first_part = parts.remove(0);
-    let (text, quoted) = match first_part {
-        WordPart::Literal { text, quoted } => (text, quoted),
+    let text = match first_part {
+        WordPart::Literal { text, quoted } => {
+            debug_assert!(
+                !quoted,
+                "assignment-eligible first Literal must be unquoted; lexer's `=` arm only fires while accumulating unquoted text"
+            );
+            text
+        }
         _ => unreachable!("checked above"),
     };
     let (name, rest_of_first) = (text[..eq].to_string(), text[eq + 1..].to_string());
     let mut value_parts: Vec<WordPart> = Vec::with_capacity(parts.len() + 1);
-    value_parts.push(WordPart::Literal { text: rest_of_first, quoted });
+    value_parts.push(WordPart::Literal { text: rest_of_first, quoted: false });
     value_parts.extend(parts);
     Ok((name, crate::lexer::Word(value_parts)))
 }
