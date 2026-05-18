@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::jobs::JobTable;
+use libc;
 
 #[derive(Debug, Clone)]
 struct Variable {
@@ -21,6 +22,7 @@ pub struct Shell {
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
+    pub shell_pgid: i32,
 }
 
 impl Shell {
@@ -34,6 +36,7 @@ impl Shell {
             last_status: 0,
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
+            shell_pgid: unsafe { libc::getpgrp() },
         }
     }
 
@@ -174,5 +177,13 @@ mod tests {
         shell.set("SHUCK_TEST_HIDDEN", "v".to_string());
         let in_exported = shell.exported_env().any(|(k, _)| k == "SHUCK_TEST_HIDDEN");
         assert!(!in_exported);
+    }
+
+    #[test]
+    fn new_captures_shell_pgid_from_getpgrp() {
+        let s = Shell::new();
+        let expected = unsafe { libc::getpgrp() };
+        assert_eq!(s.shell_pgid, expected);
+        assert!(s.shell_pgid > 0, "pgrp should be positive");
     }
 }

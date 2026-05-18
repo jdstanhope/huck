@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use libc;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use signal_hook::consts::{SIGCHLD, SIGINT};
@@ -16,6 +17,7 @@ const PROMPT: &str = "shuck> ";
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run() -> i32 {
     install_sigint_handler();
+    install_job_control_signals();
 
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -67,6 +69,18 @@ fn install_sigint_handler() {
 fn install_sigchld_handler(flag: Arc<AtomicBool>) {
     if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
         eprintln!("shuck: warning: could not install SIGCHLD handler: {e}");
+    }
+}
+
+/// Ignore SIGTSTP/SIGTTIN/SIGTTOU at the shell level so that:
+///   - Ctrl-Z at the prompt does not suspend shuck itself.
+///   - `tcsetpgrp` from a non-foreground pgrp does not trigger SIGTTOU on us.
+///   - Defensive: shuck never reads `/dev/tty` directly today, but match bash.
+fn install_job_control_signals() {
+    unsafe {
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
 }
 
