@@ -486,7 +486,32 @@ fn try_parse_tilde(
                 _ => None,
             }
         }
-        // ~user — Task 3 will handle this; for now fall through.
+        Some(c) if is_user_name_start(c) => {
+            // Scan a maximal identifier; the tail after must be a terminator.
+            let mut lookahead = chars.clone();
+            let mut name = String::new();
+            while let Some(&nc) = lookahead.peek() {
+                if is_user_name_continue(nc) {
+                    name.push(nc);
+                    lookahead.next();
+                } else {
+                    break;
+                }
+            }
+            let tail_ok = match lookahead.peek().copied() {
+                None => true,
+                Some(c) => is_tilde_terminator(c),
+            };
+            if tail_ok && !name.is_empty() {
+                // Consume the scanned chars from the real iterator.
+                for _ in 0..name.len() {
+                    chars.next();
+                }
+                Some(TildeSpec::User(name))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -495,6 +520,14 @@ fn is_tilde_terminator(c: char) -> bool {
     c == '/'
         || c.is_whitespace()
         || matches!(c, '|' | '<' | '>' | '&' | ';')
+}
+
+fn is_user_name_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic()
+}
+
+fn is_user_name_continue(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
 }
 
 #[cfg(test)]
@@ -901,8 +934,44 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_tilde_followed_by_name_is_literal() {
-        assert_eq!(tokenize("~foo").unwrap(), words(&["~foo"]));
+    fn tokenize_tilde_followed_by_name_is_user_form() {
+        assert_eq!(
+            tokenize("~foo").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::User("foo".to_string())),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_user_alone() {
+        assert_eq!(
+            tokenize("~alice").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::User("alice".to_string())),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_user_slash_path() {
+        assert_eq!(
+            tokenize("~alice/bin").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::User("alice".to_string())),
+                WordPart::Literal("/bin".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_user_with_underscore_and_digits() {
+        assert_eq!(
+            tokenize("~alice_123").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Tilde(TildeSpec::User("alice_123".to_string())),
+            ]))]
+        );
     }
 
     #[test]
