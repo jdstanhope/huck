@@ -2,6 +2,7 @@ use crate::command::Sequence;
 use crate::executor;
 use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
+use glob::{glob_with, MatchOptions};
 
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
     match spec {
@@ -238,8 +239,9 @@ fn emit_split_fields(
 
 /// Expands fields by pathname expansion (globbing). For fields with no
 /// unquoted glob metacharacters, returns the field as-is. For fields with
-/// unquoted metacharacters, attempts glob matching (Task 7); if no matches,
-/// returns the field as-is (literal fallback).
+/// unquoted metacharacters, builds a glob pattern (escaping quoted metachars
+/// via bracket expressions) and invokes the `glob` crate. If no matches,
+/// returns the field as-is (literal fallback — bash default behavior).
 pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
     let mut out = Vec::new();
     for field in fields {
@@ -247,10 +249,68 @@ pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
             out.push(field.chars);
             continue;
         }
-        // Glob path lands in Task 7. For now, literal fallback.
-        out.push(field.chars);
+        let pattern = build_glob_pattern(&field);
+        // Bash semantics: a literal leading `.` in the pattern matches a
+        // leading `.` in filenames; otherwise `*` and `?` never match one.
+        // The `glob` crate's `require_literal_leading_dot=true` enforces the
+        // "never" rule but also blocks an explicit `.` pattern from matching
+        // dotfiles, so we toggle it based on whether the pattern starts with
+        // a literal `.` character.
+        let literal_leading_dot = pattern.starts_with('.');
+        let opts = MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: !literal_leading_dot,
+        };
+        match glob_with(&pattern, opts) {
+            Ok(paths) => {
+                let mut matched = Vec::new();
+                for entry in paths {
+                    let Ok(path) = entry else { continue };
+                    match path.into_os_string().into_string() {
+                        Ok(s) => matched.push(s),
+                        Err(_) => eprintln!("huck: skipping non-UTF8 path"),
+                    }
+                }
+                // Defensive: filter `.` and `..` if the glob crate ever emits
+                // them for patterns like `.*`. (Current versions exclude them
+                // under require_literal_leading_dot, but explicit filtering
+                // makes the contract loud.)
+                matched.retain(|p| {
+                    let last = std::path::Path::new(p).file_name().and_then(|s| s.to_str());
+                    !matches!(last, Some(".") | Some(".."))
+                });
+                if matched.is_empty() {
+                    out.push(field.chars);
+                } else {
+                    out.extend(matched);
+                }
+            }
+            Err(_) => {
+                // Invalid pattern → literal fallback.
+                out.push(field.chars);
+            }
+        }
     }
     out
+}
+
+/// Builds the glob pattern string for a `Field`: quoted metacharacters
+/// (`*`, `?`, `[`, `]`) are escaped via one-char bracket expressions
+/// (`[*]`, `[?]`, `[[]`, `[]]`), so the `glob` crate treats them as literal.
+/// Unquoted chars pass through verbatim.
+fn build_glob_pattern(field: &Field) -> String {
+    let mut p = String::new();
+    for (c, &q) in field.chars.chars().zip(field.quoted.iter()) {
+        if q && matches!(c, '*' | '?' | '[' | ']') {
+            p.push('[');
+            p.push(c);
+            p.push(']');
+        } else {
+            p.push(c);
+        }
+    }
+    p
 }
 
 /// Checks whether a field contains any unquoted glob metacharacters: `*`, `?`, `[`.
@@ -755,5 +815,126 @@ mod tests {
         let f2 = Field::from_unquoted("second");
         let out = glob_expand_fields(vec![f1, f2]);
         assert_eq!(out, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    // ---- glob_expand_fields filesystem tests (v10 Task 7) ----------------------
+
+    use std::sync::Mutex;
+
+    // CWD is process-global; serialize tests that mutate it.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+
+    #[test]
+    fn glob_star_matches_files_in_cwd() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.txt");
+        touch(tmp.path(), "b.txt");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("*");
+        f.push_str(".txt", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn glob_star_excludes_dotfiles_by_default() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "visible");
+        touch(tmp.path(), ".hidden");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let f = Field::from_unquoted("*");
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["visible".to_string()]);
+    }
+
+    #[test]
+    fn glob_dot_star_matches_dotfiles_but_excludes_dot_and_dotdot() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), ".hidden");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted(".");
+        f.push_str("*", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert!(out.contains(&".hidden".to_string()));
+        assert!(!out.contains(&".".to_string()));
+        assert!(!out.contains(&"..".to_string()));
+    }
+
+    #[test]
+    fn glob_bracket_class_matches_listed_chars() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.txt");
+        touch(tmp.path(), "b.txt");
+        touch(tmp.path(), "c.txt");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("[ab]");
+        f.push_str(".txt", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn glob_no_match_returns_literal_pattern() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("nonex");
+        f.push_str("*", false);
+        f.push_str(".xyz", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["nonex*.xyz".to_string()]);
+    }
+
+    #[test]
+    fn glob_partial_quoting_keeps_literal_prefix() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "fooA");
+        touch(tmp.path(), "fooB");
+        touch(tmp.path(), "barA");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        // `"foo"*` — first three chars quoted, then unquoted `*`.
+        let mut f = Field::from_quoted("foo");
+        f.push_str("*", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec!["fooA".to_string(), "fooB".to_string()]);
     }
 }
