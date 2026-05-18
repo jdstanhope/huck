@@ -328,8 +328,14 @@ fn signal_by_name(s: &str) -> Option<i32> {
         "QUIT" => libc::SIGQUIT,
         "KILL" => libc::SIGKILL,
         "TERM" => libc::SIGTERM,
+        "PIPE" => libc::SIGPIPE,
+        "ALRM" => libc::SIGALRM,
         "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
         "CONT" => libc::SIGCONT,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "CHLD" => libc::SIGCHLD,
         "USR1" => libc::SIGUSR1,
         "USR2" => libc::SIGUSR2,
         _ => return None,
@@ -359,7 +365,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
         if let Some(rest) = first.strip_prefix('-') {
             // -<sig> form
             let sig = match rest.parse::<i32>() {
-                Ok(n) if (1..=64).contains(&n) => n,
+                Ok(n) if (0..=64).contains(&n) => n,
                 Ok(_) => {
                     eprintln!("shuck: kill: {rest}: invalid signal number");
                     return ExecOutcome::Continue(1);
@@ -1046,8 +1052,25 @@ mod kill_tests {
         assert_eq!(signal_by_name("CONT"), Some(libc::SIGCONT));
         assert_eq!(signal_by_name("USR1"), Some(libc::SIGUSR1));
         assert_eq!(signal_by_name("USR2"), Some(libc::SIGUSR2));
+        assert_eq!(signal_by_name("TSTP"), Some(libc::SIGTSTP));
+        assert_eq!(signal_by_name("PIPE"), Some(libc::SIGPIPE));
+        assert_eq!(signal_by_name("ALRM"), Some(libc::SIGALRM));
+        assert_eq!(signal_by_name("CHLD"), Some(libc::SIGCHLD));
+        assert_eq!(signal_by_name("TTIN"), Some(libc::SIGTTIN));
+        assert_eq!(signal_by_name("TTOU"), Some(libc::SIGTTOU));
         assert_eq!(signal_by_name("ABC"), None);
         assert_eq!(signal_by_name(""), None);
+    }
+
+    #[test]
+    fn kill_signal_zero_is_accepted_as_valid_numeric() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        // No targets after the signal → usage(2) — but the signal itself
+        // must parse without "invalid signal number" status 1.
+        let outcome = run_builtin("kill", &["-0".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)),
+            "kill -0 (no targets) should reach usage check, not signal check");
     }
 }
 
