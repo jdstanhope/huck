@@ -294,9 +294,12 @@ enum ResolvedRedirect {
 }
 
 fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String, ()> {
-    let fields = glob_expand_fields(expand(word, shell));
+    // Redirect targets do NOT undergo pathname expansion in v10 (per spec).
+    // We call `expand` directly and require exactly one field, preserving the
+    // ambiguous-redirect contract for word-splitting that produces 0 or >1.
+    let fields = expand(word, shell);
     if fields.len() == 1 {
-        Ok(fields.into_iter().next().unwrap())
+        Ok(fields.into_iter().next().unwrap().chars)
     } else {
         eprintln!("huck: ambiguous redirect");
         Err(())
@@ -1048,5 +1051,27 @@ mod tests {
         // cargo test runs without a controlling terminal; tcsetpgrp returns
         // ENOTTY. The helper must swallow it.
         give_terminal_to(1); // bogus pgid; we only care that we don't panic
+    }
+
+    #[test]
+    fn redirect_target_does_not_glob() {
+        // Create a temp dir with a real file matching the literal pattern name.
+        let tmp = tempfile::tempdir().unwrap();
+        // The file is named literally "starfile" — `*` should not glob to it.
+        std::fs::write(tmp.path().join("starfile"), b"hello\n").unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        // Build a redirect target word containing unquoted `*` and verify expand_single
+        // returns the literal "*" (not a glob match) — proving redirects bypass globbing.
+        let word = crate::lexer::Word(vec![
+            crate::lexer::WordPart::Literal { text: "*".to_string(), quoted: false }
+        ]);
+        let mut shell = crate::shell_state::Shell::new();
+        let result = expand_single(&word, &mut shell);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(result, Ok("*".to_string()));
     }
 }

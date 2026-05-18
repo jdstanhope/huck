@@ -132,7 +132,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '\\' => {
                 has_token = true;
                 match chars.next() {
-                    Some(ch) => current.push(ch),
+                    Some(ch) => {
+                        // Flush any accumulated unquoted text, then push the
+                        // escaped char as a one-char quoted Literal. This is
+                        // what makes `\*` survive pathname expansion as a
+                        // literal `*` (the `quoted` flag inhibits globbing).
+                        flush_literal(&mut parts, &mut current, false);
+                        parts.push(WordPart::Literal { text: ch.to_string(), quoted: true });
+                    }
                     None => current.push('\\'),
                 }
             }
@@ -655,12 +662,46 @@ mod tests {
 
     #[test]
     fn tokenize_backslash_escape_outside_quotes() {
-        assert_eq!(tokenize(r"echo a\ b").unwrap(), words(&["echo", "a b"]));
+        // Backslash flushes the unquoted run and pushes the escaped char as a
+        // quoted single-char Literal. So `a\ b` is one Word made of three parts:
+        // unquoted "a", quoted " ", unquoted "b". This preserves the quoting
+        // information that pathname expansion needs (the escaped char must not
+        // be treated as a glob metachar).
+        assert_eq!(
+            tokenize(r"echo a\ b").unwrap(),
+            vec![
+                w("echo"),
+                Token::Word(Word(vec![
+                    WordPart::Literal { text: "a".to_string(), quoted: false },
+                    WordPart::Literal { text: " ".to_string(), quoted: true },
+                    WordPart::Literal { text: "b".to_string(), quoted: false },
+                ])),
+            ]
+        );
     }
 
     #[test]
     fn tokenize_trailing_backslash_is_literal() {
         assert_eq!(tokenize(r"echo a\").unwrap(), words(&["echo", r"a\"]));
+    }
+
+    #[test]
+    fn backslash_escaped_metachar_is_quoted_literal() {
+        let tokens = tokenize("\\*").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts, &[WordPart::Literal { text: "*".to_string(), quoted: true }]);
+    }
+
+    #[test]
+    fn backslash_in_middle_of_word_flushes_and_quotes() {
+        // `foo\*bar` → unquoted "foo", quoted "*", unquoted "bar"
+        let tokens = tokenize("foo\\*bar").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts, &[
+            WordPart::Literal { text: "foo".to_string(), quoted: false },
+            WordPart::Literal { text: "*".to_string(), quoted: true },
+            WordPart::Literal { text: "bar".to_string(), quoted: false },
+        ]);
     }
 
     #[test]
@@ -789,7 +830,11 @@ mod tests {
 
     #[test]
     fn tokenize_escaped_operators_stay_words() {
-        assert_eq!(tokenize(r"echo \| \>").unwrap(), words(&["echo", "|", ">"]));
+        // Escaped operators become quoted single-char Literals (one Word each).
+        assert_eq!(
+            tokenize(r"echo \| \>").unwrap(),
+            vec![w("echo"), wq("|"), wq(">")]
+        );
     }
 
     #[test]
@@ -902,9 +947,17 @@ mod tests {
 
     #[test]
     fn tokenize_escaped_sequencing_operators_stay_words() {
+        // Each `\X` becomes its own quoted single-char Literal part. Adjacent
+        // escapes within the same token concatenate into one Word with N parts.
+        let two_quoted = |a: &str, b: &str| {
+            Token::Word(Word(vec![
+                WordPart::Literal { text: a.to_string(), quoted: true },
+                WordPart::Literal { text: b.to_string(), quoted: true },
+            ]))
+        };
         assert_eq!(
             tokenize(r"echo \&\& \|\| \;").unwrap(),
-            words(&["echo", "&&", "||", ";"])
+            vec![w("echo"), two_quoted("&", "&"), two_quoted("|", "|"), wq(";")]
         );
     }
 

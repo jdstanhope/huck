@@ -250,13 +250,16 @@ pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
             continue;
         }
         let pattern = build_glob_pattern(&field);
-        // Bash semantics: a literal leading `.` in the pattern matches a
+        // Bash semantics: a leading literal `.` in the pattern matches a
         // leading `.` in filenames; otherwise `*` and `?` never match one.
         // The `glob` crate's `require_literal_leading_dot=true` enforces the
-        // "never" rule but also blocks an explicit `.` pattern from matching
-        // dotfiles, so we toggle it based on whether the pattern starts with
-        // a literal `.` character.
-        let literal_leading_dot = pattern.starts_with('.');
+        // "never" rule but also blocks an explicit dot-prefix pattern (`.*`,
+        // `.foo`, or a bracket class like `[.]*`) from matching dotfiles, so
+        // we toggle it off when the pattern's effective first char is a
+        // literal `.`. We accept both bare `.` and the `[.]` single-element
+        // bracket form (verified empirically against `glob` 0.3).
+        let literal_leading_dot =
+            pattern.starts_with('.') || pattern.starts_with("[.]");
         let opts = MatchOptions {
             case_sensitive: true,
             require_literal_separator: true,
@@ -800,12 +803,20 @@ mod tests {
 
     #[test]
     fn glob_expand_question_mark_metachar_detected() {
+        // CWD is process-global; run inside an empty temp dir under the lock
+        // so concurrent tests can't contaminate the glob result.
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
         let mut f = Field::from_unquoted("a");
         f.push_str("?", false);
-        // Detection only — actual matching arrives in task 7. For now we
-        // assert the no-match literal-fallback path returns the chars.
         let out = glob_expand_fields(vec![f]);
-        // With no real files matching `a?` in CWD, expect literal fallback.
+
+        std::env::set_current_dir(saved).unwrap();
+
+        // No matches in empty temp dir → literal fallback.
         assert_eq!(out, vec!["a?".to_string()]);
     }
 
@@ -880,6 +891,23 @@ mod tests {
         assert!(out.contains(&".hidden".to_string()));
         assert!(!out.contains(&".".to_string()));
         assert!(!out.contains(&"..".to_string()));
+    }
+
+    #[test]
+    fn glob_bracket_dot_class_matches_dotfile() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), ".hidden");
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut f = Field::from_unquoted("[.]");
+        f.push_str("hidden", false);
+        let out = glob_expand_fields(vec![f]);
+
+        std::env::set_current_dir(saved).unwrap();
+
+        assert_eq!(out, vec![".hidden".to_string()]);
     }
 
     #[test]
