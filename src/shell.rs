@@ -76,11 +76,18 @@ fn install_sigchld_handler(flag: Arc<AtomicBool>) {
 ///   - Ctrl-Z at the prompt does not suspend shuck itself.
 ///   - `tcsetpgrp` from a non-foreground pgrp does not trigger SIGTTOU on us.
 ///   - Defensive: shuck never reads `/dev/tty` directly today, but match bash.
+///
+/// NOTE: `SIG_IGN` is inherited across `execve`. Foreground children
+/// spawned by the executor (Task 5) MUST reset these three signals to
+/// `SIG_DFL` via a `CommandExt::pre_exec` hook — otherwise Ctrl-Z would
+/// not stop `vim`/`less`/etc., and a backgrounded reader would never
+/// get SIGTTIN.
 fn install_job_control_signals() {
-    unsafe {
-        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
-        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
-        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+        let prev = unsafe { libc::signal(sig, libc::SIG_IGN) };
+        if prev == libc::SIG_ERR {
+            eprintln!("shuck: warning: could not ignore signal {sig}");
+        }
     }
 }
 
