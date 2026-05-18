@@ -56,6 +56,44 @@ fn lookup_home_for_user(name: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub chars: String,
+    pub quoted: Vec<bool>,
+}
+
+impl Field {
+    pub fn new() -> Self {
+        Self { chars: String::new(), quoted: Vec::new() }
+    }
+
+    pub fn from_unquoted(s: &str) -> Self {
+        let count = s.chars().count();
+        Self { chars: s.to_string(), quoted: vec![false; count] }
+    }
+
+    pub fn from_quoted(s: &str) -> Self {
+        let count = s.chars().count();
+        Self { chars: s.to_string(), quoted: vec![true; count] }
+    }
+
+    pub fn push_str(&mut self, s: &str, quoted: bool) {
+        let count = s.chars().count();
+        self.chars.push_str(s);
+        self.quoted.extend(std::iter::repeat(quoted).take(count));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+}
+
+impl Default for Field {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Expands a `Word` against the current `Shell` state into 0 or more
 /// argument strings. Quoted variable references append their value verbatim;
 /// unquoted references split on ASCII whitespace and can yield multiple
@@ -544,5 +582,35 @@ mod tests {
             WordPart::Literal { text: "/bin".to_string(), quoted: false },
         ]);
         assert_eq!(expand_assignment(&word, &mut shell), "PATH=/h/bin");
+    }
+
+    #[test]
+    fn field_from_unquoted_str_marks_all_chars_unquoted() {
+        let f = Field::from_unquoted("abc");
+        assert_eq!(f.chars, "abc");
+        assert_eq!(f.quoted, vec![false, false, false]);
+    }
+
+    #[test]
+    fn field_from_quoted_str_marks_all_chars_quoted() {
+        let f = Field::from_quoted("xy");
+        assert_eq!(f.chars, "xy");
+        assert_eq!(f.quoted, vec![true, true]);
+    }
+
+    #[test]
+    fn field_push_str_appends_chars_with_quoted_flag() {
+        let mut f = Field::from_unquoted("a");
+        f.push_str("bc", true);
+        assert_eq!(f.chars, "abc");
+        assert_eq!(f.quoted, vec![false, true, true]);
+    }
+
+    #[test]
+    fn field_quoted_vec_uses_char_count_not_byte_count() {
+        // Multi-byte char: should produce 1 quoted entry, not the UTF-8 byte count.
+        let f = Field::from_unquoted("é");
+        assert_eq!(f.chars.chars().count(), 1);
+        assert_eq!(f.quoted.len(), 1);
     }
 }
