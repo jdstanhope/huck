@@ -96,6 +96,11 @@ impl JobTable {
     pub fn reap(&mut self, pid: i32, raw_status: i32) {
         for job in self.jobs.iter_mut() {
             if let Some(idx) = job.pids.iter().position(|&p| p == pid) {
+                if libc::WIFSTOPPED(raw_status) {
+                    job.state = JobState::Stopped(libc::WSTOPSIG(raw_status));
+                    job.notified = false;
+                    return;
+                }
                 if job.reaped[idx] {
                     return;
                 }
@@ -198,7 +203,9 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
         .store(false, std::sync::atomic::Ordering::Relaxed);
     loop {
         let mut raw_status: libc::c_int = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WNOHANG) };
+        let pid = unsafe {
+            libc::waitpid(-1, &mut raw_status, libc::WNOHANG | libc::WUNTRACED)
+        };
         if pid <= 0 {
             // 0 = no children changed state; -1 = no children at all (ECHILD)
             break;
@@ -264,8 +271,6 @@ fn decode_status(raw: libc::c_int) -> JobState {
         JobState::Done(libc::WEXITSTATUS(raw))
     } else if libc::WIFSIGNALED(raw) {
         JobState::Signaled(libc::WTERMSIG(raw))
-    // WIFSTOPPED is dead code today (reap_completed uses WNOHANG only).
-    // It becomes reachable once Task 4 adds WUNTRACED to reap_completed.
     } else if libc::WIFSTOPPED(raw) {
         JobState::Stopped(libc::WSTOPSIG(raw))
     } else {
@@ -523,5 +528,33 @@ mod tests {
         t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTTIN);
         let line = notification_line(&t.jobs_mut()[0], '+');
         assert_eq!(line, "[1]+ Stopped (tty input)      cat");
+    }
+
+    #[test]
+    fn reap_with_stopped_status_transitions_job_to_stopped_state() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        // POSIX: WIFSTOPPED true when low byte == 0x7f; stop signal in second byte.
+        let raw_status: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        t.reap(4242, raw_status);
+        let j = &t.jobs_mut()[0];
+        assert!(
+            matches!(j.state, JobState::Stopped(s) if s == libc::SIGTSTP),
+            "got state {:?}", j.state
+        );
+        assert!(!j.reaped[0], "stopped is not reaped — child still exists");
+        assert!(!j.notified, "stopped jobs must be visible to the next notification pass");
+    }
+
+    #[test]
+    fn reap_with_exit_after_stop_finally_transitions_to_done() {
+        let mut t = JobTable::new();
+        let _ = t.add(4242, vec![4242], "sleep 100".to_string());
+        let stopped: libc::c_int = (libc::SIGTSTP << 8) | 0x7f;
+        let exited: libc::c_int = 0;
+        t.reap(4242, stopped);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Stopped(_)));
+        t.reap(4242, exited);
+        assert!(matches!(t.jobs_mut()[0].state, JobState::Done(0)));
     }
 }
