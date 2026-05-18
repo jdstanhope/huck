@@ -236,6 +236,32 @@ fn emit_split_fields(
     }
 }
 
+/// Expands fields by pathname expansion (globbing). For fields with no
+/// unquoted glob metacharacters, returns the field as-is. For fields with
+/// unquoted metacharacters, attempts glob matching (Task 7); if no matches,
+/// returns the field as-is (literal fallback).
+pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
+    let mut out = Vec::new();
+    for field in fields {
+        if !has_unquoted_metachar(&field) {
+            out.push(field.chars);
+            continue;
+        }
+        // Glob path lands in Task 7. For now, literal fallback.
+        out.push(field.chars);
+    }
+    out
+}
+
+/// Checks whether a field contains any unquoted glob metacharacters: `*`, `?`, `[`.
+fn has_unquoted_metachar(field: &Field) -> bool {
+    field
+        .chars
+        .chars()
+        .zip(field.quoted.iter())
+        .any(|(c, &q)| !q && matches!(c, '*' | '?' | '['))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +719,41 @@ mod tests {
         let fields = expand(&word, &mut shell);
         assert_eq!(fields[0].chars, "/h");
         assert_eq!(fields[0].quoted, vec![false, false]);
+    }
+
+    // ---- glob_expand_fields tests (v10 Task 6) ----------------------------------
+
+    #[test]
+    fn glob_expand_no_metachar_returns_chars_as_string() {
+        let f = Field::from_unquoted("plain.txt");
+        let out = glob_expand_fields(vec![f]);
+        assert_eq!(out, vec!["plain.txt".to_string()]);
+    }
+
+    #[test]
+    fn glob_expand_quoted_metachar_treated_as_literal() {
+        // All chars quoted including the `*` → no globbing.
+        let f = Field::from_quoted("*.txt");
+        let out = glob_expand_fields(vec![f]);
+        assert_eq!(out, vec!["*.txt".to_string()]);
+    }
+
+    #[test]
+    fn glob_expand_question_mark_metachar_detected() {
+        let mut f = Field::from_unquoted("a");
+        f.push_str("?", false);
+        // Detection only — actual matching arrives in task 7. For now we
+        // assert the no-match literal-fallback path returns the chars.
+        let out = glob_expand_fields(vec![f]);
+        // With no real files matching `a?` in CWD, expect literal fallback.
+        assert_eq!(out, vec!["a?".to_string()]);
+    }
+
+    #[test]
+    fn glob_expand_preserves_field_order() {
+        let f1 = Field::from_unquoted("first");
+        let f2 = Field::from_unquoted("second");
+        let out = glob_expand_fields(vec![f1, f2]);
+        assert_eq!(out, vec!["first".to_string(), "second".to_string()]);
     }
 }
