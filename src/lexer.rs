@@ -23,11 +23,19 @@ pub enum Operator {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum TildeSpec {
+    Home,
+    User(String),
+    Pwd,
+    OldPwd,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum WordPart {
     Literal(String),
+    Tilde(TildeSpec),
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
-    Tilde,
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
 }
 
@@ -119,7 +127,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '~' if !has_token && tilde_at_word_start(&chars) => {
                 has_token = true;
-                parts.push(WordPart::Tilde);
+                parts.push(WordPart::Tilde(TildeSpec::Home));
             }
             '`' => {
                 has_token = true;
@@ -838,7 +846,7 @@ mod tests {
     fn tokenize_tilde_alone() {
         assert_eq!(
             tokenize("~").unwrap(),
-            vec![Token::Word(Word(vec![WordPart::Tilde]))]
+            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::Home)]))]
         );
     }
 
@@ -847,7 +855,7 @@ mod tests {
         assert_eq!(
             tokenize("~/foo").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Tilde,
+                WordPart::Tilde(TildeSpec::Home),
                 WordPart::Literal("/foo".to_string()),
             ]))]
         );
