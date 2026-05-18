@@ -89,10 +89,6 @@ impl JobTable {
         self.jobs.iter()
     }
 
-    pub fn has_running(&self) -> bool {
-        self.jobs.iter().any(|j| matches!(j.state, JobState::Running))
-    }
-
     /// Marks `pid` as reaped with the given raw waitpid status. If the pid
     /// is the LAST stage of its job, records the status; when all pids of
     /// the job are reaped, transitions its overall state. No-op if `pid`
@@ -149,6 +145,35 @@ impl JobTable {
         let current = by_age.first().map(|j| j.id);
         let previous = by_age.get(1).map(|j| j.id);
         (current, previous)
+    }
+
+    /// Most-recent Running or Stopped job id (the `+` job for fg/bg/jobs).
+    pub fn current_id(&self) -> Option<u32> {
+        let mut by_age: Vec<&Job> = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
+            .collect();
+        by_age.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+        by_age.first().map(|j| j.id)
+    }
+
+    /// Most-recent Stopped job id, ignoring Running jobs. Used by `bg`.
+    pub fn current_stopped_id(&self) -> Option<u32> {
+        let mut by_age: Vec<&Job> = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.state, JobState::Stopped(_)))
+            .collect();
+        by_age.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+        by_age.first().map(|j| j.id)
+    }
+
+    /// True if any job is Running or Stopped (i.e., `wait` should block).
+    pub fn has_pending(&self) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| matches!(j.state, JobState::Running | JobState::Stopped(_)))
     }
 
     pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
@@ -366,11 +391,63 @@ mod tests {
     #[test]
     fn has_running_tracks_state() {
         let mut t = JobTable::new();
-        assert!(!t.has_running());
+        assert!(!t.has_pending());
         let _ = t.add(100, vec![100], "x".to_string());
-        assert!(t.has_running());
+        assert!(t.has_pending());
         t.reap(100, fake_done_raw(0));
-        assert!(!t.has_running());
+        assert!(!t.has_pending());
+    }
+
+    #[test]
+    fn current_id_returns_most_recent_running_or_stopped() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());      // id 1
+        let _ = t.add(200, vec![200], "b".to_string());      // id 2 — more recent
+        assert_eq!(t.current_id(), Some(2));
+    }
+
+    #[test]
+    fn current_id_includes_stopped_jobs() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        let _ = t.add(200, vec![200], "b".to_string());
+        t.jobs_mut()[1].state = JobState::Stopped(libc::SIGTSTP);
+        assert_eq!(t.current_id(), Some(2));
+    }
+
+    #[test]
+    fn current_id_returns_none_when_only_done_jobs() {
+        let mut t = JobTable::new();
+        let id = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
+        assert_eq!(t.current_id(), None);
+        let _ = id;
+    }
+
+    #[test]
+    fn current_stopped_id_skips_running_jobs() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());      // Running, id 1
+        let _ = t.add(200, vec![200], "b".to_string());      // Running, id 2 (more recent)
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        // Most-recent is id 2 (Running); current_stopped should skip it and return id 1.
+        assert_eq!(t.current_stopped_id(), Some(1));
+    }
+
+    #[test]
+    fn has_pending_true_when_any_stopped() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Stopped(libc::SIGTSTP);
+        assert!(t.has_pending());
+    }
+
+    #[test]
+    fn has_pending_false_when_all_done() {
+        let mut t = JobTable::new();
+        let _ = t.add(100, vec![100], "a".to_string());
+        t.jobs_mut()[0].state = JobState::Done(0);
+        assert!(!t.has_pending());
     }
 
     #[test]

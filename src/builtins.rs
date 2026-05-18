@@ -203,7 +203,7 @@ fn builtin_wait(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> Exe
         return ExecOutcome::Continue(2);
     }
     // Blocking wait loop until no Running jobs remain (or no children at all).
-    while shell.jobs.has_running() {
+    while shell.jobs.has_pending() {
         let mut raw_status: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut raw_status, 0) };
         if pid <= 0 {
