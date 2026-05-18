@@ -15,13 +15,14 @@ spec, an implementation plan, and a test suite.
 | v5        | Command substitution (`$(cmd)`)                         |
 | v6        | Background jobs (`&`, `jobs`, `wait`)                   |
 | v7        | Foreground job control (`fg`, `bg`, Ctrl-Z)             |
+| v8        | Job specifiers, `kill`, `disown`                        |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (214 tests)
+cargo test               # full test suite (258 tests)
 ```
 
 ## Features
@@ -32,23 +33,27 @@ cargo test               # full test suite (214 tests)
 `echo "$VAR"`, `echo $(date)`, `NAME=value cmd`.
 
 **Builtins:**
-`cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`.
+`cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
+`kill`, `disown`.
 
-**Job control (v6 + v7):**
-Trailing `&` runs a pipeline in its own process group, prints
-`[N] PID`, and the prompt-time reaper prints `[N] Done <cmd> &`
-notifications. Foreground pipelines also get their own process group;
-`tcsetpgrp` hands them the controlling terminal so interactive programs
-(`vim`, `less`) work and Ctrl-Z stops the job into `Stopped` state. `fg`
-resumes the current job in foreground; `bg` resumes the current stopped
-job in background. `jobs` lists Running/Stopped/finished jobs with
-`+`/`-` markers; `wait` blocks until no jobs are Running or Stopped, and
-can be interrupted with Ctrl-C.
+**Job control (v6 + v7 + v8):**
+Trailing `&` runs a pipeline in its own process group, prints `[N] PID`,
+and the prompt-time reaper prints `[N] Done <cmd> &` notifications.
+Foreground pipelines also get their own process group; `tcsetpgrp` hands
+them the controlling terminal so interactive programs (`vim`, `less`)
+work and Ctrl-Z stops the job into `Stopped` state. `fg`/`bg`/`wait`
+accept job specifiers (`%1`, `%+`, `%%`, `%-`); `wait` also accepts a
+bare PID and returns the waited-on job's decoded exit status. `kill`
+sends signals to PIDs or to a job's process group (`-<sig>` accepts a
+name or number, including `-0` for a check-alive probe). `disown`
+removes a job from the table without signaling it. `jobs` lists
+Running/Stopped/finished jobs with `+`/`-` markers.
 
 **Not yet implemented:**
-job specifiers (`%1`, `%+`, `%-`, `%cmd`), `disown`, `kill` builtin,
-control flow (`if`/`while`/`for`/`case`), functions, quoted globbing,
-history expansion, arithmetic, here-docs, aliases.
+extended job specs (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`,
+`disown -a`/`-r`/`-h`, backgrounded multi-pipeline sequences
+(`cmd1 && cmd2 &`), control flow (`if`/`while`/`for`/`case`), functions,
+quoted globbing, history expansion, arithmetic, here-docs, aliases.
 
 ## Project layout
 
@@ -63,6 +68,7 @@ src/
   executor.rs    fork/exec, pipes, redirects, background spawn
   builtins.rs    builtin dispatch table
   jobs.rs        JobTable + SIGCHLD reaping
+  job_spec.rs    parser for %N / %+ / %% / %- job specifiers
 docs/superpowers/
   specs/         design spec per iteration
   plans/         implementation plan per iteration
@@ -83,7 +89,7 @@ Tests live alongside each module in `#[cfg(test)] mod tests` blocks.
 
 - `rustyline` — line editing
 - `signal-hook` — SIGINT, SIGCHLD
-- `libc` — `waitpid`, `setpgid`, `killpg`, `tcsetpgrp`, `signal`
+- `libc` — `waitpid`, `setpgid`, `killpg`, `kill`, `tcsetpgrp`, `signal`
 
 ## License
 
