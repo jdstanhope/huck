@@ -53,6 +53,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
     let mut has_token = false;
+    let mut in_assignment_value = false;
     let mut chars = input.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -61,6 +62,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 flush_literal(&mut parts, &mut current);
                 tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                 has_token = false;
+                in_assignment_value = false;
             }
             continue;
         }
@@ -125,8 +127,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 read_dollar_expansion(&mut chars, &mut parts, false)?;
             }
-            '~' if !has_token => {
+            '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
                 if let Some(spec) = try_parse_tilde(&mut chars) {
+                    if !current.is_empty() {
+                        parts.push(WordPart::Literal(std::mem::take(&mut current)));
+                    }
                     has_token = true;
                     parts.push(WordPart::Tilde(spec));
                 } else {
@@ -148,6 +153,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
+                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'|') {
                     chars.next();
@@ -155,12 +161,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else {
                     tokens.push(Token::Op(Operator::Pipe));
                 }
+                in_assignment_value = false;
             }
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
+                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'&') {
                     chars.next();
@@ -168,28 +176,34 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else {
                     tokens.push(Token::Op(Operator::Background));
                 }
+                in_assignment_value = false;
             }
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
+                    in_assignment_value = false;
                 }
                 tokens.push(Token::Op(Operator::Semi));
+                in_assignment_value = false;
             }
             '<' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
+                    in_assignment_value = false;
                 }
                 tokens.push(Token::Op(Operator::RedirIn));
+                in_assignment_value = false;
             }
             '>' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
+                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();
@@ -197,6 +211,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
+                in_assignment_value = false;
             }
             '2' if !has_token && chars.peek() == Some(&'>') => {
                 chars.next();
@@ -206,6 +221,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 } else {
                     tokens.push(Token::Op(Operator::RedirErr));
                 }
+                in_assignment_value = false;
+            }
+            '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
+                in_assignment_value = true;
+                has_token = true;
+                current.push('=');
             }
             other => {
                 has_token = true;
@@ -521,7 +542,40 @@ fn try_parse_tilde(
 fn is_tilde_terminator(c: char) -> bool {
     c == '/'
         || c.is_whitespace()
-        || matches!(c, '|' | '<' | '>' | '&' | ';')
+        || matches!(c, '|' | '<' | '>' | '&' | ';' | ':')
+}
+
+fn tilde_eligible_in_assignment(in_assignment_value: bool, current: &str) -> bool {
+    if !in_assignment_value {
+        return false;
+    }
+    matches!(current.chars().last(), Some(':') | Some('='))
+}
+
+/// True iff the unquoted text accumulated so far for the current word
+/// forms a valid shell identifier (matches [A-Za-z_]\w*).
+fn word_is_identifier_so_far(current: &str, parts: &[WordPart]) -> bool {
+    // The word so far must be exactly `parts ++ current` where every
+    // WordPart is a Literal (no Var/Tilde/CommandSub etc), AND the
+    // concatenation is a non-empty identifier.
+    let mut joined = String::new();
+    for p in parts {
+        if let WordPart::Literal(s) = p {
+            joined.push_str(s);
+        } else {
+            return false;
+        }
+    }
+    joined.push_str(current);
+    if joined.is_empty() {
+        return false;
+    }
+    let mut iter = joined.chars();
+    let first = iter.next().unwrap();
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    iter.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn is_user_name_start(c: char) -> bool {
@@ -1390,5 +1444,62 @@ mod tests {
     fn tokenize_tilde_plus_followed_by_letter_is_literal() {
         // ~+abc is not a valid form; falls back to literal.
         assert_eq!(tokenize("~+abc").unwrap(), words(&["~+abc"]));
+    }
+
+    #[test]
+    fn tokenize_assignment_value_expands_first_tilde_after_equals() {
+        assert_eq!(
+            tokenize("PATH=~/bin").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Literal("PATH=".to_string()),
+                WordPart::Tilde(TildeSpec::Home),
+                WordPart::Literal("/bin".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_assignment_value_expands_each_tilde_after_colon() {
+        assert_eq!(
+            tokenize("PATH=~/bin:~/lib").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Literal("PATH=".to_string()),
+                WordPart::Tilde(TildeSpec::Home),
+                WordPart::Literal("/bin:".to_string()),
+                WordPart::Tilde(TildeSpec::Home),
+                WordPart::Literal("/lib".to_string()),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_non_assignment_colon_tilde_stays_literal() {
+        // `echo` is not an assignment, so `a:~/b` does NOT expand the tilde.
+        assert_eq!(
+            tokenize("echo a:~/b").unwrap(),
+            words(&["echo", "a:~/b"])
+        );
+    }
+
+    #[test]
+    fn tokenize_assignment_with_digit_first_is_not_assignment_context() {
+        // `1ABC=~/x` doesn't match identifier-start; treated as literal.
+        assert_eq!(
+            tokenize("1ABC=~/x").unwrap(),
+            words(&["1ABC=~/x"])
+        );
+    }
+
+    #[test]
+    fn tokenize_assignment_value_tilde_user() {
+        assert_eq!(
+            tokenize("HOMES=~alice:~bob").unwrap(),
+            vec![Token::Word(Word(vec![
+                WordPart::Literal("HOMES=".to_string()),
+                WordPart::Tilde(TildeSpec::User("alice".to_string())),
+                WordPart::Literal(":".to_string()),
+                WordPart::Tilde(TildeSpec::User("bob".to_string())),
+            ]))]
+        );
     }
 }
