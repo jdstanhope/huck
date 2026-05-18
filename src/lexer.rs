@@ -128,7 +128,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 read_dollar_expansion(&mut chars, &mut parts, false)?;
             }
             '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
-                if let Some(spec) = try_parse_tilde(&mut chars) {
+                if let Some(spec) = try_parse_tilde(&mut chars, in_assignment_value) {
                     if !current.is_empty() {
                         parts.push(WordPart::Literal(std::mem::take(&mut current)));
                     }
@@ -483,18 +483,20 @@ fn is_name_cont(c: char) -> bool {
 /// returns `None` (the caller treats `~` as a literal).
 fn try_parse_tilde(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    in_assignment_value: bool,
 ) -> Option<TildeSpec> {
+    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
     match chars.peek().copied() {
         // Bare ~ at end of word.
         None => Some(TildeSpec::Home),
-        Some(c) if is_tilde_terminator(c) => Some(TildeSpec::Home),
+        Some(c) if term(c) => Some(TildeSpec::Home),
         // ~+, ~- — must be followed by terminator (or nothing).
         Some('+') => {
             let mut lookahead = chars.clone();
             lookahead.next(); // consume the +
             match lookahead.peek().copied() {
                 None => { chars.next(); Some(TildeSpec::Pwd) }
-                Some(c) if is_tilde_terminator(c) => { chars.next(); Some(TildeSpec::Pwd) }
+                Some(c) if term(c) => { chars.next(); Some(TildeSpec::Pwd) }
                 _ => None,
             }
         }
@@ -503,7 +505,7 @@ fn try_parse_tilde(
             lookahead.next();
             match lookahead.peek().copied() {
                 None => { chars.next(); Some(TildeSpec::OldPwd) }
-                Some(c) if is_tilde_terminator(c) => { chars.next(); Some(TildeSpec::OldPwd) }
+                Some(c) if term(c) => { chars.next(); Some(TildeSpec::OldPwd) }
                 _ => None,
             }
         }
@@ -521,7 +523,7 @@ fn try_parse_tilde(
             }
             let tail_ok = match lookahead.peek().copied() {
                 None => true,
-                Some(c) => is_tilde_terminator(c),
+                Some(c) => term(c),
             };
             if tail_ok && !name.is_empty() {
                 // Consume the scanned chars from the real iterator.
@@ -542,7 +544,7 @@ fn try_parse_tilde(
 fn is_tilde_terminator(c: char) -> bool {
     c == '/'
         || c.is_whitespace()
-        || matches!(c, '|' | '<' | '>' | '&' | ';' | ':')
+        || matches!(c, '|' | '<' | '>' | '&' | ';')
 }
 
 fn tilde_eligible_in_assignment(in_assignment_value: bool, current: &str) -> bool {
@@ -1500,6 +1502,23 @@ mod tests {
                 WordPart::Literal(":".to_string()),
                 WordPart::Tilde(TildeSpec::User("bob".to_string())),
             ]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_user_colon_outside_assignment_is_literal() {
+        // Bash: ~alice:bob outside assignment is literal (no : terminator).
+        assert_eq!(
+            tokenize("echo ~alice:bob").unwrap(),
+            words(&["echo", "~alice:bob"])
+        );
+    }
+
+    #[test]
+    fn tokenize_tilde_pwd_colon_outside_assignment_is_literal() {
+        assert_eq!(
+            tokenize("echo ~+:foo").unwrap(),
+            words(&["echo", "~+:foo"])
         );
     }
 }
