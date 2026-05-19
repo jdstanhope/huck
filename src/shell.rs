@@ -131,6 +131,8 @@ fn lex_error_message(error: LexError) -> String {
         LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
         LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
         LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
+        LexError::UnterminatedArith => ": unterminated arithmetic expansion".to_string(),
+        LexError::ArithParse(msg) => format!(": arithmetic expansion: {msg}"),
         LexError::SubstitutionLexError(inner) => {
             format!(" in command substitution{}", lex_error_message(*inner))
         }

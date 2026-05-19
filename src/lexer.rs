@@ -4,6 +4,8 @@ pub enum LexError {
     InvalidVarName,
     UnterminatedBrace,
     UnterminatedSubstitution,
+    UnterminatedArith,
+    ArithParse(String),
     SubstitutionLexError(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
 }
@@ -37,6 +39,7 @@ pub enum WordPart {
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
+    Arith { expr: crate::arith::ArithExpr, quoted: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]
