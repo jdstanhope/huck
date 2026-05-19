@@ -275,6 +275,73 @@ impl Parser {
     }
 }
 
+use crate::shell_state::Shell;
+
+pub fn eval(expr: &ArithExpr, shell: &Shell) -> Result<i64, ArithError> {
+    match expr {
+        ArithExpr::Num(n) => Ok(*n),
+        ArithExpr::Var(name) => {
+            let raw = shell.get(name).unwrap_or("");
+            if raw.is_empty() {
+                Ok(0)
+            } else {
+                raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+                    var: name.clone(),
+                    value: raw.to_string(),
+                })
+            }
+        }
+        ArithExpr::Neg(e) => Ok(eval(e, shell)?.wrapping_neg()),
+        ArithExpr::Not(e) => Ok(if eval(e, shell)? == 0 { 1 } else { 0 }),
+        ArithExpr::Add(a, b) => Ok(eval(a, shell)?.wrapping_add(eval(b, shell)?)),
+        ArithExpr::Sub(a, b) => Ok(eval(a, shell)?.wrapping_sub(eval(b, shell)?)),
+        ArithExpr::Mul(a, b) => Ok(eval(a, shell)?.wrapping_mul(eval(b, shell)?)),
+        ArithExpr::Div(a, b) => {
+            let lhs = eval(a, shell)?;
+            let rhs = eval(b, shell)?;
+            if rhs == 0 { return Err(ArithError::DivisionByZero); }
+            Ok(lhs.wrapping_div(rhs))
+        }
+        ArithExpr::Mod(a, b) => {
+            let lhs = eval(a, shell)?;
+            let rhs = eval(b, shell)?;
+            if rhs == 0 { return Err(ArithError::ModuloByZero); }
+            Ok(lhs.wrapping_rem(rhs))
+        }
+        ArithExpr::Eq(a, b) => Ok(bool_to_i64(eval(a, shell)? == eval(b, shell)?)),
+        ArithExpr::Ne(a, b) => Ok(bool_to_i64(eval(a, shell)? != eval(b, shell)?)),
+        ArithExpr::Lt(a, b) => Ok(bool_to_i64(eval(a, shell)? <  eval(b, shell)?)),
+        ArithExpr::Le(a, b) => Ok(bool_to_i64(eval(a, shell)? <= eval(b, shell)?)),
+        ArithExpr::Gt(a, b) => Ok(bool_to_i64(eval(a, shell)? >  eval(b, shell)?)),
+        ArithExpr::Ge(a, b) => Ok(bool_to_i64(eval(a, shell)? >= eval(b, shell)?)),
+        ArithExpr::And(a, b) => {
+            if eval(a, shell)? == 0 {
+                Ok(0)
+            } else {
+                Ok(bool_to_i64(eval(b, shell)? != 0))
+            }
+        }
+        ArithExpr::Or(a, b) => {
+            if eval(a, shell)? != 0 {
+                Ok(1)
+            } else {
+                Ok(bool_to_i64(eval(b, shell)? != 0))
+            }
+        }
+        ArithExpr::Ternary(c, t, e) => {
+            if eval(c, shell)? != 0 {
+                eval(t, shell)
+            } else {
+                eval(e, shell)
+            }
+        }
+    }
+}
+
+fn bool_to_i64(b: bool) -> i64 {
+    if b { 1 } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +570,167 @@ mod tests {
     fn parse_strips_dollar_on_var() {
         assert_eq!(parse("$x + 1").unwrap(),
             ArithExpr::Add(v("x"), n(1)));
+    }
+
+    use crate::shell_state::Shell;
+
+    fn eval_str(s: &str, shell: &Shell) -> Result<i64, ArithError> {
+        eval(&parse(s).unwrap(), shell)
+    }
+
+    #[test]
+    fn eval_number_literal() {
+        let s = Shell::new();
+        assert_eq!(eval_str("42", &s).unwrap(), 42);
+    }
+
+    #[test]
+    fn eval_addition() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1+2", &s).unwrap(), 3);
+    }
+
+    #[test]
+    fn eval_precedence() {
+        let s = Shell::new();
+        assert_eq!(eval_str("2+3*4", &s).unwrap(), 14);
+        assert_eq!(eval_str("(2+3)*4", &s).unwrap(), 20);
+    }
+
+    #[test]
+    fn eval_subtraction_left_assoc() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1-2-3", &s).unwrap(), -4);
+    }
+
+    #[test]
+    fn eval_unary_minus() {
+        let s = Shell::new();
+        assert_eq!(eval_str("-5", &s).unwrap(), -5);
+        assert_eq!(eval_str("--5", &s).unwrap(), 5);
+    }
+
+    #[test]
+    fn eval_division_truncates_toward_zero() {
+        let s = Shell::new();
+        assert_eq!(eval_str("7/2", &s).unwrap(), 3);
+        assert_eq!(eval_str("-7/2", &s).unwrap(), -3);
+    }
+
+    #[test]
+    fn eval_modulo() {
+        let s = Shell::new();
+        assert_eq!(eval_str("7%3", &s).unwrap(), 1);
+        assert_eq!(eval_str("-7%3", &s).unwrap(), -1);
+    }
+
+    #[test]
+    fn eval_division_by_zero() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1/0", &s).unwrap_err(), ArithError::DivisionByZero);
+    }
+
+    #[test]
+    fn eval_modulo_by_zero() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1%0", &s).unwrap_err(), ArithError::ModuloByZero);
+    }
+
+    #[test]
+    fn eval_comparison_returns_one_or_zero() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1<2", &s).unwrap(), 1);
+        assert_eq!(eval_str("2<1", &s).unwrap(), 0);
+        assert_eq!(eval_str("1==1", &s).unwrap(), 1);
+        assert_eq!(eval_str("1!=1", &s).unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_logical_not() {
+        let s = Shell::new();
+        assert_eq!(eval_str("!0", &s).unwrap(), 1);
+        assert_eq!(eval_str("!5", &s).unwrap(), 0);
+        assert_eq!(eval_str("!!5", &s).unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_logical_and_short_circuits() {
+        let s = Shell::new();
+        assert_eq!(eval_str("0 && 1/0", &s).unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_logical_or_short_circuits() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1 || 1/0", &s).unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_logical_and_returns_one_when_both_truthy() {
+        let s = Shell::new();
+        assert_eq!(eval_str("5 && 3", &s).unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_logical_or_returns_one_when_either_truthy() {
+        let s = Shell::new();
+        assert_eq!(eval_str("0 || 3", &s).unwrap(), 1);
+        assert_eq!(eval_str("0 || 0", &s).unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_ternary() {
+        let s = Shell::new();
+        assert_eq!(eval_str("1 ? 42 : 99", &s).unwrap(), 42);
+        assert_eq!(eval_str("0 ? 42 : 99", &s).unwrap(), 99);
+    }
+
+    #[test]
+    fn eval_overflow_wraps() {
+        let s = Shell::new();
+        let max = i64::MAX.to_string();
+        let expr = format!("{max} + 1");
+        assert_eq!(eval_str(&expr, &s).unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn eval_unset_var_is_zero() {
+        let s = Shell::new();
+        assert_eq!(eval_str("HUCK_TEST_UNSET_ARITH + 5", &s).unwrap(), 5);
+    }
+
+    #[test]
+    fn eval_set_var_lookup() {
+        let mut s = Shell::new();
+        s.export_set("HUCK_TEST_ARITH_X", "10".to_string());
+        assert_eq!(eval_str("HUCK_TEST_ARITH_X * 2", &s).unwrap(), 20);
+    }
+
+    #[test]
+    fn eval_var_with_dollar_prefix_same_as_bare() {
+        let mut s = Shell::new();
+        s.export_set("HUCK_TEST_ARITH_Y", "7".to_string());
+        assert_eq!(eval_str("$HUCK_TEST_ARITH_Y + 1", &s).unwrap(), 8);
+    }
+
+    #[test]
+    fn eval_empty_var_is_zero() {
+        let mut s = Shell::new();
+        s.export_set("HUCK_TEST_ARITH_EMPTY", "".to_string());
+        assert_eq!(eval_str("HUCK_TEST_ARITH_EMPTY + 3", &s).unwrap(), 3);
+    }
+
+    #[test]
+    fn eval_non_integer_var_is_error() {
+        let mut s = Shell::new();
+        s.export_set("HUCK_TEST_ARITH_BAD", "abc".to_string());
+        let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &s).unwrap_err();
+        assert_eq!(
+            err,
+            ArithError::NotAnInteger {
+                var: "HUCK_TEST_ARITH_BAD".to_string(),
+                value: "abc".to_string()
+            }
+        );
     }
 }
