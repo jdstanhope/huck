@@ -1,3 +1,4 @@
+mod arith;
 mod builtins;
 mod command;
 mod executor;

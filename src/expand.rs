@@ -159,6 +159,20 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 let output = run_substitution(sequence, shell);
                 emit_split_fields(&output, &mut current, &mut result, &mut has_emitted);
             }
+            WordPart::Arith { expr, quoted: _ } => {
+                match crate::arith::eval(expr, shell) {
+                    Ok(n) => {
+                        current.push_str(&n.to_string(), true);
+                        has_emitted = true;
+                    }
+                    Err(e) => {
+                        eprintln!("huck: arithmetic: {}", e);
+                        shell.set_last_status(1);
+                        has_emitted = true;
+                        // Append nothing; the field stays empty if no other parts.
+                    }
+                }
+            }
         }
     }
 
@@ -195,6 +209,16 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
             }
             WordPart::CommandSub { sequence, .. } => {
                 result.push_str(&run_substitution(sequence, shell));
+            }
+            WordPart::Arith { expr, quoted: _ } => {
+                match crate::arith::eval(expr, shell) {
+                    Ok(n) => result.push_str(&n.to_string()),
+                    Err(e) => {
+                        eprintln!("huck: arithmetic: {}", e);
+                        shell.set_last_status(1);
+                        // Append nothing.
+                    }
+                }
             }
         }
     }
@@ -1006,6 +1030,55 @@ mod tests {
         let word = Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]);
         let argv = glob_expand_fields(expand(&word, &mut shell));
         assert_eq!(argv, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn expand_arith_part_renders_decimal_result() {
+        use crate::arith::ArithExpr;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Arith {
+            expr: ArithExpr::Add(
+                Box::new(ArithExpr::Num(2)),
+                Box::new(ArithExpr::Num(3)),
+            ),
+            quoted: false,
+        }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "5");
+        assert_eq!(fields[0].quoted, vec![true]);
+    }
+
+    #[test]
+    fn expand_arith_part_division_by_zero_yields_empty_field_and_sets_status() {
+        use crate::arith::ArithExpr;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Arith {
+            expr: ArithExpr::Div(
+                Box::new(ArithExpr::Num(1)),
+                Box::new(ArithExpr::Num(0)),
+            ),
+            quoted: false,
+        }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "");
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_assignment_arith_part_renders_decimal() {
+        use crate::arith::ArithExpr;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Arith {
+            expr: ArithExpr::Mul(
+                Box::new(ArithExpr::Num(6)),
+                Box::new(ArithExpr::Num(7)),
+            ),
+            quoted: false,
+        }]);
+        let value = expand_assignment(&word, &mut shell);
+        assert_eq!(value, "42");
     }
 
     #[test]
