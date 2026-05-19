@@ -1764,4 +1764,25 @@ mod tests {
         let WordPart::Arith { expr, .. } = &parts[0] else { panic!() };
         assert_eq!(*expr, ArithExpr::Var("x".to_string()));
     }
+
+    #[test]
+    fn tokenize_arith_back_to_back_in_same_word() {
+        use crate::arith::ArithExpr;
+        let tokens = tokenize("$((1+2))$((3+4))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 2);
+        let WordPart::Arith { expr: e1, .. } = &parts[0] else { panic!() };
+        let WordPart::Arith { expr: e2, .. } = &parts[1] else { panic!() };
+        assert_eq!(*e1, ArithExpr::Add(Box::new(ArithExpr::Num(1)), Box::new(ArithExpr::Num(2))));
+        assert_eq!(*e2, ArithExpr::Add(Box::new(ArithExpr::Num(3)), Box::new(ArithExpr::Num(4))));
+    }
+
+    #[test]
+    fn tokenize_arith_close_paren_not_followed_by_close_paren_is_unterminated() {
+        // After the inner `)` at depth 1, the next char must be `)` to close `))`.
+        // If it's anything else, that's an unterminated arithmetic expansion.
+        let err = tokenize("$((1)x)").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedArith);
+    }
 }

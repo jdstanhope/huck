@@ -158,7 +158,7 @@ pub enum ArithError {
 impl std::fmt::Display for ArithError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Parse(m) => write!(f, "parse error: {m}"),
+            Self::Parse(m) => write!(f, "{m}"),
             Self::DivisionByZero => write!(f, "division by zero"),
             Self::ModuloByZero => write!(f, "modulo by zero"),
             Self::NotAnInteger { var, value } =>
@@ -357,9 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn display_parse_error_includes_message() {
+    fn display_parse_error_is_bare_message() {
         let e = ArithError::Parse("unexpected end of input".to_string());
-        assert_eq!(e.to_string(), "parse error: unexpected end of input");
+        assert_eq!(e.to_string(), "unexpected end of input");
     }
 
     #[test]
