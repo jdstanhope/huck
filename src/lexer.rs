@@ -282,9 +282,17 @@ fn read_dollar_expansion(
 ) -> Result<(), LexError> {
     match chars.peek().copied() {
         Some('(') => {
-            chars.next(); // consume '('
-            let sequence = scan_paren_substitution(chars)?;
-            parts.push(WordPart::CommandSub { sequence, quoted });
+            chars.next(); // consume first '('
+            if chars.peek() == Some(&'(') {
+                chars.next(); // consume second '(' — this is `$((`
+                let inner = scan_arith_body(chars)?;
+                let expr = crate::arith::parse(&inner)
+                    .map_err(|e| LexError::ArithParse(e.to_string()))?;
+                parts.push(WordPart::Arith { expr, quoted });
+            } else {
+                let sequence = scan_paren_substitution(chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted });
+            }
         }
         Some('{') => {
             chars.next();
@@ -304,6 +312,40 @@ fn read_dollar_expansion(
         }
     }
     Ok(())
+}
+
+/// Reads the inner text of a `$((...))` arithmetic expansion. The opening
+/// `$((` has already been consumed; this function scans forward until the
+/// matching `))` at depth 0. Returns the inner text (without the closing
+/// `))`). Tracks paren depth so that nested `(` / `)` inside the
+/// expression do not prematurely close the expansion.
+fn scan_arith_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut body = String::new();
+    let mut depth: u32 = 1; // we are inside the outer `((`
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedArith),
+            Some('(') => {
+                depth += 1;
+                body.push('(');
+            }
+            Some(')') => {
+                if depth == 1 {
+                    // The next char must be `)` to close `))`.
+                    match chars.next() {
+                        Some(')') => return Ok(body),
+                        Some(_) | None => return Err(LexError::UnterminatedArith),
+                    }
+                } else {
+                    depth -= 1;
+                    body.push(')');
+                }
+            }
+            Some(c) => body.push(c),
+        }
+    }
 }
 
 /// Reads the body of a `$(...)` substitution. The opening `$(` is already
@@ -1651,5 +1693,75 @@ mod tests {
         assert_eq!(parts[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
         assert_eq!(parts[1], WordPart::Literal { text: "bar".to_string(), quoted: true });
         assert_eq!(parts[2], WordPart::Literal { text: "baz".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn tokenize_arith_simple() {
+        use crate::arith::ArithExpr;
+        let tokens = tokenize("$((1+2))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Arith { expr, quoted } = &parts[0] else {
+            panic!("expected Arith part, got {:?}", parts[0])
+        };
+        assert_eq!(*quoted, false);
+        assert_eq!(*expr, ArithExpr::Add(
+            Box::new(ArithExpr::Num(1)),
+            Box::new(ArithExpr::Num(2)),
+        ));
+    }
+
+    #[test]
+    fn tokenize_arith_with_nested_parens() {
+        use crate::arith::ArithExpr;
+        let tokens = tokenize("$(( (1+2) * 3 ))").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Arith { expr, .. } = &parts[0] else { panic!() };
+        assert_eq!(*expr, ArithExpr::Mul(
+            Box::new(ArithExpr::Add(
+                Box::new(ArithExpr::Num(1)),
+                Box::new(ArithExpr::Num(2)),
+            )),
+            Box::new(ArithExpr::Num(3)),
+        ));
+    }
+
+    #[test]
+    fn tokenize_arith_inside_double_quotes_is_quoted() {
+        let tokens = tokenize("\"$((1+2))\"").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Arith { quoted, .. } = &parts[0] else { panic!() };
+        assert_eq!(*quoted, true);
+    }
+
+    #[test]
+    fn tokenize_arith_unterminated_returns_error() {
+        let err = tokenize("$((1+2").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedArith);
+    }
+
+    #[test]
+    fn tokenize_arith_parse_error_returns_arith_parse_err() {
+        let err = tokenize("$((1+))").unwrap_err();
+        assert!(matches!(err, LexError::ArithParse(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn tokenize_arith_and_command_sub_both_recognized() {
+        let tokens = tokenize("$((1)) $(echo x)").unwrap();
+        let Token::Word(Word(parts1)) = &tokens[0] else { panic!() };
+        assert!(matches!(parts1[0], WordPart::Arith { .. }));
+        let Token::Word(Word(parts2)) = &tokens[1] else { panic!() };
+        assert!(matches!(parts2[0], WordPart::CommandSub { .. }));
+    }
+
+    #[test]
+    fn tokenize_arith_var_with_dollar_prefix_inside() {
+        use crate::arith::ArithExpr;
+        let tokens = tokenize("$(($x))").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Arith { expr, .. } = &parts[0] else { panic!() };
+        assert_eq!(*expr, ArithExpr::Var("x".to_string()));
     }
 }
