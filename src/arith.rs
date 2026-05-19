@@ -167,6 +167,114 @@ impl std::fmt::Display for ArithError {
     }
 }
 
+pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
+    let tokens = tokenize(input)?;
+    let mut p = Parser { tokens, pos: 0 };
+    let expr = p.parse_expr(0)?;
+    if p.pos < p.tokens.len() {
+        return Err(ArithError::Parse(format!(
+            "unexpected token after expression: {:?}", p.tokens[p.pos]
+        )));
+    }
+    Ok(expr)
+}
+
+struct Parser {
+    tokens: Vec<ArithToken>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&ArithToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn bump(&mut self) -> Option<ArithToken> {
+        let t = self.tokens.get(self.pos).cloned();
+        self.pos += 1;
+        t
+    }
+
+    fn parse_expr(&mut self, min_bp: u8) -> Result<ArithExpr, ArithError> {
+        let mut lhs = self.parse_prefix()?;
+        loop {
+            let op = match self.peek() {
+                Some(t) => t.clone(),
+                None => break,
+            };
+            // Ternary: `cond ? then : else`. Right-associative, lowest binding power.
+            if op == ArithToken::Question && min_bp <= 1 {
+                self.bump();
+                let then_branch = self.parse_expr(0)?;
+                match self.bump() {
+                    Some(ArithToken::Colon) => {}
+                    other => return Err(ArithError::Parse(format!(
+                        "expected ':' in ternary, got {:?}", other
+                    ))),
+                }
+                let else_branch = self.parse_expr(1)?;
+                lhs = ArithExpr::Ternary(Box::new(lhs), Box::new(then_branch), Box::new(else_branch));
+                continue;
+            }
+            let (lbp, rbp, make): (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr) =
+                match op {
+                    ArithToken::OrOr   => (2, 3, ArithExpr::Or),
+                    ArithToken::AndAnd => (4, 5, ArithExpr::And),
+                    ArithToken::Eq     => (6, 7, ArithExpr::Eq),
+                    ArithToken::Ne     => (6, 7, ArithExpr::Ne),
+                    ArithToken::Lt     => (8, 9, ArithExpr::Lt),
+                    ArithToken::Le     => (8, 9, ArithExpr::Le),
+                    ArithToken::Gt     => (8, 9, ArithExpr::Gt),
+                    ArithToken::Ge     => (8, 9, ArithExpr::Ge),
+                    ArithToken::Plus   => (10, 11, ArithExpr::Add),
+                    ArithToken::Minus  => (10, 11, ArithExpr::Sub),
+                    ArithToken::Star   => (12, 13, ArithExpr::Mul),
+                    ArithToken::Slash  => (12, 13, ArithExpr::Div),
+                    ArithToken::Percent => (12, 13, ArithExpr::Mod),
+                    _ => break,
+                };
+            if lbp < min_bp {
+                break;
+            }
+            self.bump();
+            let rhs = self.parse_expr(rbp)?;
+            lhs = make(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_prefix(&mut self) -> Result<ArithExpr, ArithError> {
+        match self.bump() {
+            Some(ArithToken::Number(n)) => Ok(ArithExpr::Num(n)),
+            Some(ArithToken::Ident(s)) => Ok(ArithExpr::Var(s)),
+            Some(ArithToken::Minus) => {
+                let inner = self.parse_expr(14)?;
+                Ok(ArithExpr::Neg(Box::new(inner)))
+            }
+            Some(ArithToken::Plus) => {
+                self.parse_expr(14)
+            }
+            Some(ArithToken::Bang) => {
+                let inner = self.parse_expr(14)?;
+                Ok(ArithExpr::Not(Box::new(inner)))
+            }
+            Some(ArithToken::LParen) => {
+                let inner = self.parse_expr(0)?;
+                match self.bump() {
+                    Some(ArithToken::RParen) => Ok(inner),
+                    other => Err(ArithError::Parse(format!(
+                        "expected ')', got {:?}", other
+                    ))),
+                }
+            }
+            Some(t) => Err(ArithError::Parse(format!(
+                "expected expression, got {:?}", t
+            ))),
+            None => Err(ArithError::Parse("unexpected end of input".to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +391,117 @@ mod tests {
     fn tokenize_single_pipe_is_parse_error() {
         let err = tokenize("1 | 2").unwrap_err();
         assert!(matches!(err, ArithError::Parse(_)));
+    }
+
+    fn n(x: i64) -> Box<ArithExpr> { Box::new(ArithExpr::Num(x)) }
+    fn v(name: &str) -> Box<ArithExpr> { Box::new(ArithExpr::Var(name.to_string())) }
+
+    #[test]
+    fn parse_number_literal() {
+        assert_eq!(parse("42").unwrap(), ArithExpr::Num(42));
+    }
+
+    #[test]
+    fn parse_identifier() {
+        assert_eq!(parse("foo").unwrap(), ArithExpr::Var("foo".to_string()));
+    }
+
+    #[test]
+    fn parse_addition() {
+        assert_eq!(parse("1+2").unwrap(), ArithExpr::Add(n(1), n(2)));
+    }
+
+    #[test]
+    fn parse_subtraction_left_associative() {
+        assert_eq!(
+            parse("1-2-3").unwrap(),
+            ArithExpr::Sub(Box::new(ArithExpr::Sub(n(1), n(2))), n(3))
+        );
+    }
+
+    #[test]
+    fn parse_multiplication_binds_tighter_than_addition() {
+        assert_eq!(
+            parse("1+2*3").unwrap(),
+            ArithExpr::Add(n(1), Box::new(ArithExpr::Mul(n(2), n(3))))
+        );
+    }
+
+    #[test]
+    fn parse_parenthesized_overrides_precedence() {
+        assert_eq!(
+            parse("(1+2)*3").unwrap(),
+            ArithExpr::Mul(Box::new(ArithExpr::Add(n(1), n(2))), n(3))
+        );
+    }
+
+    #[test]
+    fn parse_unary_minus() {
+        assert_eq!(parse("-5").unwrap(), ArithExpr::Neg(n(5)));
+    }
+
+    #[test]
+    fn parse_double_unary_minus() {
+        assert_eq!(parse("--5").unwrap(), ArithExpr::Neg(Box::new(ArithExpr::Neg(n(5)))));
+    }
+
+    #[test]
+    fn parse_unary_not() {
+        assert_eq!(parse("!0").unwrap(), ArithExpr::Not(n(0)));
+    }
+
+    #[test]
+    fn parse_comparison() {
+        assert_eq!(parse("1<2").unwrap(), ArithExpr::Lt(n(1), n(2)));
+    }
+
+    #[test]
+    fn parse_equality_lower_than_comparison() {
+        assert_eq!(
+            parse("1<2 == 1").unwrap(),
+            ArithExpr::Eq(Box::new(ArithExpr::Lt(n(1), n(2))), n(1))
+        );
+    }
+
+    #[test]
+    fn parse_logical_and_binds_tighter_than_or() {
+        assert_eq!(
+            parse("a||b&&c").unwrap(),
+            ArithExpr::Or(v("a"), Box::new(ArithExpr::And(v("b"), v("c"))))
+        );
+    }
+
+    #[test]
+    fn parse_ternary_right_associative() {
+        assert_eq!(parse("a?b:c?d:e").unwrap(),
+            ArithExpr::Ternary(v("a"), v("b"),
+                Box::new(ArithExpr::Ternary(v("c"), v("d"), v("e"))))
+        );
+    }
+
+    #[test]
+    fn parse_empty_is_error() {
+        assert!(matches!(parse("").unwrap_err(), ArithError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_trailing_junk_is_error() {
+        assert!(matches!(parse("1+2 3").unwrap_err(), ArithError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_unbalanced_paren_is_error() {
+        assert!(matches!(parse("(1+2").unwrap_err(), ArithError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_missing_rhs_is_error() {
+        assert!(matches!(parse("1+").unwrap_err(), ArithError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_strips_dollar_on_var() {
+        assert_eq!(parse("$x + 1").unwrap(),
+            ArithExpr::Add(v("x"), n(1)));
     }
 }
