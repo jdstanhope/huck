@@ -18,13 +18,14 @@ spec, an implementation plan, and a test suite.
 | v8        | Job specifiers, `kill`, `disown`                        |
 | v9        | Tilde expansion (`~`, `~/path`, `~user`, `~+`, `~-`)    |
 | v10       | Pathname expansion (`*`, `?`, `[abc]`)                  |
+| v11       | Arithmetic expansion (`$((expr))`)                      |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (318 tests)
+cargo test               # full test suite (392 tests)
 ```
 
 ## Features
@@ -33,7 +34,7 @@ cargo test               # full test suite (318 tests)
 `cmd a b c`, `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`, `cmd1 | cmd2`,
 `cmd > out`, `cmd < in`, `cmd >> out`, `cmd 2> err`, `cmd &`,
 `echo "$VAR"`, `echo $(date)`, `NAME=value cmd`, `cd ~`, `ls ~/dir`,
-`cd ~-`, `PATH=~/bin:~/lib`, `ls *.txt`, `echo [ab].rs`.
+`cd ~-`, `PATH=~/bin:~/lib`, `ls *.txt`, `echo [ab].rs`, `echo $((2+3))`.
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
@@ -67,8 +68,20 @@ Metacharacters do not cross `/` and do not match a leading `.` (use
 A pattern with no matches is passed through unchanged (bash default).
 Redirect targets do not yet glob-expand.
 
+**Arithmetic expansion (v11):**
+`$((expr))` evaluates a C-style integer expression and substitutes
+the decimal result into the surrounding word. Operators: `+`, `-`,
+`*`, `/`, `%`, comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`),
+logical (`&&`, `||`, `!`) with short-circuit, ternary (`?:`),
+parentheses, unary `+`/`-`/`!`. Integers are 64-bit signed and
+wrap on overflow (matches bash). Variables are referenced by bare
+name (`x`) or with `$` (`$x`); unset/empty values are treated as 0;
+non-integer values produce a stderr error and an empty result.
+Bitwise operators, assignment operators, increment/decrement, and
+non-decimal bases are not implemented.
+
 **Not yet implemented:**
-arithmetic expansion (`$((expr))` — coming in v11), parameter-expansion modifiers
+parameter-expansion modifiers
 (`${var:-x}`/`${var/pat/repl}`/etc.), brace expansion (`{a,b,c}`),
 special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
