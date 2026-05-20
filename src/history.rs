@@ -164,10 +164,44 @@ fn resolve_histfile() -> Option<PathBuf> {
 /// changed, `Ok(Some(expanded))` if at least one reference expanded, or
 /// `Err` if a referenced event could not be resolved.
 pub fn expand(line: &str, history: &History) -> Result<Option<String>, HistError> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('^') {
+        return quick_substitution(line, history);
+    }
     if !line.contains('!') {
         return Ok(None);
     }
     scan(line, history)
+}
+
+/// Handles `^old^new^` (or `^old^new`) quick substitution on the previous
+/// command. `line`, after leading blanks, begins with `^`.
+fn quick_substitution(
+    line: &str,
+    history: &History,
+) -> Result<Option<String>, HistError> {
+    let leading = line.len() - line.trim_start().len();
+    // Skip the leading blanks and the first `^`.
+    let body = &line[leading + 1..];
+    let mut parts = body.splitn(3, '^');
+    let old = parts.next().unwrap_or("");
+    let new = match parts.next() {
+        Some(n) => n,
+        None => return Err(HistError::Substitution(old.to_string())),
+    };
+    let rest = parts.next().unwrap_or("");
+
+    if old.is_empty() {
+        return Err(HistError::Substitution(old.to_string()));
+    }
+    let prev = history
+        .last()
+        .ok_or_else(|| HistError::Substitution(old.to_string()))?;
+    if !prev.contains(old) {
+        return Err(HistError::Substitution(old.to_string()));
+    }
+    let replaced = prev.replacen(old, new, 1);
+    Ok(Some(format!("{replaced}{rest}")))
 }
 
 /// Walks the line, tracking quote state, and replaces `!`-references.
@@ -630,5 +664,62 @@ mod tests {
     fn expand_bang_string_stops_at_whitespace() {
         let h = hist_with(&["make build"]);
         assert_eq!(expand("!make again", &h).unwrap(), Some("make build again".to_string()));
+    }
+
+    #[test]
+    fn expand_quick_substitution_basic() {
+        let h = hist_with(&["echo hello"]);
+        assert_eq!(expand("^hello^world^", &h).unwrap(), Some("echo world".to_string()));
+    }
+
+    #[test]
+    fn expand_quick_substitution_trailing_caret_optional() {
+        let h = hist_with(&["echo hello"]);
+        assert_eq!(expand("^hello^world", &h).unwrap(), Some("echo world".to_string()));
+    }
+
+    #[test]
+    fn expand_quick_substitution_first_occurrence_only() {
+        let h = hist_with(&["a a a"]);
+        assert_eq!(expand("^a^X^", &h).unwrap(), Some("X a a".to_string()));
+    }
+
+    #[test]
+    fn expand_quick_substitution_leading_blanks_allowed() {
+        let h = hist_with(&["echo hello"]);
+        assert_eq!(expand("  ^hello^world^", &h).unwrap(), Some("echo world".to_string()));
+    }
+
+    #[test]
+    fn expand_quick_substitution_old_not_found_errors() {
+        let h = hist_with(&["echo hello"]);
+        assert!(matches!(
+            expand("^missing^world^", &h).unwrap_err(),
+            HistError::Substitution(_)
+        ));
+    }
+
+    #[test]
+    fn expand_quick_substitution_no_history_errors() {
+        let h = hist_with(&[]);
+        assert!(matches!(
+            expand("^a^b^", &h).unwrap_err(),
+            HistError::Substitution(_)
+        ));
+    }
+
+    #[test]
+    fn expand_caret_not_at_line_start_is_not_substitution() {
+        let h = hist_with(&["echo hello"]);
+        assert_eq!(expand("echo a^b^c", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_quick_substitution_trailing_text_appended() {
+        let h = hist_with(&["echo hello"]);
+        assert_eq!(
+            expand("^hello^world^ extra", &h).unwrap(),
+            Some("echo world extra".to_string())
+        );
     }
 }
