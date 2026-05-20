@@ -290,6 +290,77 @@ fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
+use crate::shell_state::Shell;
+
+/// rustyline completion helper. Holds a snapshot of shell state
+/// (variable names, `$PATH`, `$HOME`) refreshed before each readline.
+pub struct HuckHelper {
+    var_names: Vec<String>,
+    path: String,
+    home: String,
+}
+
+impl HuckHelper {
+    pub fn new() -> Self {
+        Self { var_names: Vec::new(), path: String::new(), home: String::new() }
+    }
+
+    /// Refreshes the cached snapshot from live shell state.
+    pub fn refresh(&mut self, shell: &Shell) {
+        self.var_names = shell.var_names().map(|s| s.to_string()).collect();
+        self.path = shell.get("PATH").unwrap_or("").to_string();
+        self.home = shell.get("HOME").unwrap_or("").to_string();
+    }
+}
+
+impl Default for HuckHelper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl rustyline::completion::Completer for HuckHelper {
+    type Candidate = rustyline::completion::Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let (start, context) = analyze(line, pos);
+        let candidates = match context {
+            CompletionContext::Command { prefix } => {
+                complete_command(&prefix, &self.path)
+            }
+            CompletionContext::Variable { prefix } => {
+                complete_variable(&prefix, &self.var_names)
+            }
+            CompletionContext::File { dir, prefix } => {
+                complete_file(&dir, &prefix, &self.home)
+            }
+        };
+        let pairs = candidates
+            .into_iter()
+            .map(|c| rustyline::completion::Pair {
+                display: c.display,
+                replacement: c.replacement,
+            })
+            .collect();
+        Ok((start, pairs))
+    }
+}
+
+impl rustyline::hint::Hinter for HuckHelper {
+    type Hint = String;
+}
+
+impl rustyline::highlight::Highlighter for HuckHelper {}
+
+impl rustyline::validate::Validator for HuckHelper {}
+
+impl rustyline::Helper for HuckHelper {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +597,61 @@ mod tests {
     #[test]
     fn complete_file_unreadable_dir_is_empty() {
         assert!(complete_file("/nonexistent/huck/path", "x", "").is_empty());
+    }
+
+    #[test]
+    fn helper_complete_command_context() {
+        let helper = HuckHelper {
+            var_names: Vec::new(),
+            path: String::new(),
+            home: String::new(),
+        };
+        let history = rustyline::history::FileHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (start, pairs) = rustyline::completion::Completer::complete(
+            &helper, "ec", 2, &ctx,
+        ).unwrap();
+        assert_eq!(start, 0);
+        assert!(pairs.iter().any(|p| p.replacement == "echo"));
+    }
+
+    #[test]
+    fn helper_complete_variable_context() {
+        let helper = HuckHelper {
+            var_names: vec!["HOME".to_string(), "PATH".to_string()],
+            path: String::new(),
+            home: String::new(),
+        };
+        let history = rustyline::history::FileHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (start, pairs) = rustyline::completion::Completer::complete(
+            &helper, "echo $HO", 8, &ctx,
+        ).unwrap();
+        assert_eq!(start, 6);
+        assert!(pairs.iter().any(|p| p.replacement == "HOME"));
+    }
+
+    #[test]
+    fn helper_complete_file_context() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "targetfile");
+        let helper = HuckHelper {
+            var_names: Vec::new(),
+            path: String::new(),
+            home: String::new(),
+        };
+        let history = rustyline::history::FileHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let line = format!("echo {}/targ", dir.path().to_str().unwrap());
+        let pos = line.len();
+        let (_, pairs) = rustyline::completion::Completer::complete(
+            &helper, &line, pos, &ctx,
+        ).unwrap();
+        let replacements: Vec<&str> =
+            pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert!(
+            pairs.iter().any(|p| p.replacement == "targetfile"),
+            "{replacements:?}",
+        );
     }
 }
