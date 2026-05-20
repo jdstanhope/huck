@@ -199,6 +199,21 @@ pub fn complete_command(prefix: &str, path: &str) -> Vec<Candidate> {
         .collect()
 }
 
+/// Completes a variable name from `var_names`.
+pub fn complete_variable(prefix: &str, var_names: &[String]) -> Vec<Candidate> {
+    let mut matches: Vec<String> = var_names
+        .iter()
+        .filter(|n| n.starts_with(prefix))
+        .cloned()
+        .collect();
+    matches.sort();
+    matches.dedup();
+    matches
+        .into_iter()
+        .map(|n| Candidate { display: n.clone(), replacement: n })
+        .collect()
+}
+
 /// True if the directory entry is a regular file with an executable bit.
 fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -353,5 +368,31 @@ mod tests {
         let mut sorted = cands.clone();
         sorted.sort_by(|a, b| a.replacement.cmp(&b.replacement));
         assert_eq!(cands, sorted);
+    }
+
+    #[test]
+    fn complete_variable_matches_prefix() {
+        let names = vec![
+            "HOME".to_string(),
+            "HOST".to_string(),
+            "PATH".to_string(),
+        ];
+        let cands = complete_variable("HO", &names);
+        let got: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(got, vec!["HOME", "HOST"]);
+    }
+
+    #[test]
+    fn complete_variable_empty_prefix_returns_all_sorted() {
+        let names = vec!["ZED".to_string(), "ABC".to_string()];
+        let cands = complete_variable("", &names);
+        let got: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(got, vec!["ABC", "ZED"]);
+    }
+
+    #[test]
+    fn complete_variable_no_match_is_empty() {
+        let names = vec!["HOME".to_string()];
+        assert!(complete_variable("XYZ", &names).is_empty());
     }
 }
