@@ -6,6 +6,7 @@ mod expand;
 mod job_spec;
 mod jobs;
 mod lexer;
+mod param_expansion;
 mod shell;
 mod shell_state;
 
