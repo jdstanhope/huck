@@ -40,6 +40,13 @@ fn assign_default_mutates_shell() {
 }
 
 #[test]
+fn assign_default_no_colon_mutates_when_unset() {
+    let (out, _) = run("echo ${X=assigned}\necho $X\nexit\n");
+    let lines: Vec<&str> = out.lines().filter(|l| *l == "assigned").collect();
+    assert!(lines.len() >= 2, "expected 'assigned' twice, stdout: {out}");
+}
+
+#[test]
 fn error_if_unset_writes_to_stderr() {
     let (_, err) = run("echo ${UNSET:?missing}\nexit\n");
     assert!(err.contains("UNSET: missing"), "stderr: {err}");

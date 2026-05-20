@@ -370,6 +370,11 @@ fn scan_arith_body(
 fn scan_braced_operand(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<String, LexError> {
+    // Known limitation: a `${...}` nested *inside* a double-quoted span of
+    // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner
+    // `}` chars are consumed literally by the quote loop. Real scripts very
+    // rarely nest this way, and bash's own handling here is murky. Plain
+    // nesting like `${X:-${Y}}` IS handled (depth tracking outside quotes).
     let mut body = String::new();
     let mut depth: u32 = 1;
     loop {
@@ -2037,6 +2042,14 @@ mod tests {
         assert_eq!(name, "foo");
         assert_eq!(*quoted, false);
         assert!(matches!(modifier, ParamModifier::Length));
+    }
+
+    #[test]
+    fn tokenize_length_modifier_digit_leading_name_errors() {
+        // `${#1foo}` — the name part starts with a digit, which is not a
+        // valid identifier (special parameters are out of scope for v12).
+        let err = tokenize("${#1foo}").unwrap_err();
+        assert_eq!(err, LexError::InvalidVarName);
     }
 
     #[test]

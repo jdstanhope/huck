@@ -273,6 +273,16 @@ mod tests {
     }
 
     #[test]
+    fn error_if_unset_empty_operand_uses_default_message() {
+        // ${X:?} with no operand word — should still error and set status.
+        let mut shell = Shell::new();
+        let m = ParamModifier::ErrorIfUnset { word: Word(vec![]), colon: true };
+        let r = expand_modifier("HUCK_TEST_PE_EU_EMPTY", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
     fn use_alternate_set_returns_alternate() {
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_UA1", "anything".to_string());
@@ -323,7 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn remove_prefix_empty_pattern_returns_value_unchanged() {
+    fn remove_prefix_empty_pattern_removes_nothing() {
+        // The empty glob pattern matches the empty prefix; removing an
+        // empty prefix leaves the value intact (matches bash `${var#}`).
         assert_eq!(remove_prefix("hello", "", false), "hello");
     }
 
