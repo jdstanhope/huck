@@ -30,20 +30,44 @@ pub fn run() -> i32 {
     install_sigint_handler(Arc::clone(&shell.sigint_flag));
     install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
 
+    shell.history.load();
+    for (_, command) in shell.history.entries() {
+        let _ = editor.add_history_entry(command);
+    }
+
     loop {
         crate::jobs::reap_and_notify(&mut shell);
         match editor.readline(PROMPT) {
             Ok(line) => {
-                if !line.trim().is_empty() {
-                    let _ = editor.add_history_entry(line.as_str());
+                let to_run = match crate::history::expand(&line, &shell.history) {
+                    Ok(None) => line.clone(),
+                    Ok(Some(expanded)) => {
+                        println!("{expanded}");
+                        expanded
+                    }
+                    Err(e) => {
+                        eprintln!("huck: {e}");
+                        shell.set_last_status(1);
+                        continue;
+                    }
+                };
+                if !to_run.trim().is_empty() {
+                    shell.history.add(to_run.clone());
+                    let _ = editor.add_history_entry(to_run.as_str());
                 }
-                match process_line(&line, &mut shell) {
-                    ExecOutcome::Exit(code) => return code,
+                match process_line(&to_run, &mut shell) {
+                    ExecOutcome::Exit(code) => {
+                        shell.history.save();
+                        return code;
+                    }
                     ExecOutcome::Continue(status) => shell.set_last_status(status),
                 }
             }
             Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return shell.last_status(),
+            Err(ReadlineError::Eof) => {
+                shell.history.save();
+                return shell.last_status();
+            }
             Err(e) => {
                 eprintln!("huck: input error: {e}");
                 return 1;
