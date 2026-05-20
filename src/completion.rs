@@ -214,6 +214,73 @@ pub fn complete_variable(prefix: &str, var_names: &[String]) -> Vec<Candidate> {
         .collect()
 }
 
+use std::path::PathBuf;
+
+/// Completes a filename. `dir` is the directory portion of the word
+/// (empty = current directory; a leading `~/` is expanded against
+/// `home`). `prefix` is the filename fragment. Directory results get a
+/// trailing `/`; `replacement` is metacharacter-escaped.
+pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
+    let Some(scan_dir) = resolve_dir(dir, home) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&scan_dir) else {
+        return Vec::new();
+    };
+    let show_hidden = prefix.starts_with('.');
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if name.starts_with('.') && !show_hidden {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let mut display = name.to_string();
+        let mut replacement = escape_filename(name);
+        if is_dir {
+            display.push('/');
+            replacement.push('/');
+        }
+        candidates.push(Candidate { display, replacement });
+    }
+    candidates.sort_by(|a, b| a.display.cmp(&b.display));
+    candidates
+}
+
+/// Resolves the directory to scan. `~/` is expanded against `home`.
+fn resolve_dir(dir: &str, home: &str) -> Option<PathBuf> {
+    if dir.is_empty() {
+        return Some(PathBuf::from("."));
+    }
+    if let Some(rest) = dir.strip_prefix("~/") {
+        if home.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(home).join(rest));
+    }
+    Some(PathBuf::from(dir))
+}
+
+/// Backslash-escapes shell metacharacters in a filename.
+fn escape_filename(name: &str) -> String {
+    const SPECIAL: &[char] = &[
+        ' ', '\t', '\'', '"', '\\', '$', ';', '&', '|', '<', '>',
+        '(', ')', '*', '?', '[', ']', '~', '#', '`',
+    ];
+    let mut out = String::new();
+    for c in name.chars() {
+        if SPECIAL.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// True if the directory entry is a regular file with an executable bit.
 fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -394,5 +461,70 @@ mod tests {
     fn complete_variable_no_match_is_empty() {
         let names = vec!["HOME".to_string()];
         assert!(complete_variable("XYZ", &names).is_empty());
+    }
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+
+    #[test]
+    fn complete_file_matches_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "alpha.txt");
+        touch(dir.path(), "alpine.txt");
+        touch(dir.path(), "beta.txt");
+        let cands = complete_file(dir.path().to_str().unwrap(), "alp", "");
+        let got: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(got, vec!["alpha.txt", "alpine.txt"]);
+    }
+
+    #[test]
+    fn complete_file_directory_gets_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("mysub")).unwrap();
+        let cands = complete_file(dir.path().to_str().unwrap(), "mys", "");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].display, "mysub/");
+        assert_eq!(cands[0].replacement, "mysub/");
+    }
+
+    #[test]
+    fn complete_file_hidden_excluded_unless_prefix_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), ".secret");
+        touch(dir.path(), "visible");
+        let no_dot = complete_file(dir.path().to_str().unwrap(), "", "");
+        assert!(no_dot.iter().all(|c| c.replacement != ".secret"));
+        let with_dot = complete_file(dir.path().to_str().unwrap(), ".", "");
+        assert!(with_dot.iter().any(|c| c.replacement == ".secret"));
+    }
+
+    #[test]
+    fn complete_file_escapes_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "my file.txt");
+        let cands = complete_file(dir.path().to_str().unwrap(), "my", "");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].display, "my file.txt");
+        assert_eq!(cands[0].replacement, "my\\ file.txt");
+    }
+
+    #[test]
+    fn complete_file_tilde_expands_with_home() {
+        let home = tempfile::tempdir().unwrap();
+        touch(home.path(), "homefile");
+        let home_str = home.path().to_str().unwrap();
+        let cands = complete_file("~/", "homef", home_str);
+        assert!(cands.iter().any(|c| c.replacement == "homefile"), "{cands:?}");
+    }
+
+    #[test]
+    fn complete_file_empty_dir_scans_relative() {
+        let _ = complete_file("", "", "");
+    }
+
+    #[test]
+    fn complete_file_unreadable_dir_is_empty() {
+        assert!(complete_file("/nonexistent/huck/path", "x", "").is_empty());
     }
 }
