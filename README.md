@@ -19,13 +19,14 @@ spec, an implementation plan, and a test suite.
 | v9        | Tilde expansion (`~`, `~/path`, `~user`, `~+`, `~-`)    |
 | v10       | Pathname expansion (`*`, `?`, `[abc]`)                  |
 | v11       | Arithmetic expansion (`$((expr))`)                      |
+| v12       | Parameter-expansion modifiers (`${var:-w}`, `${var#pat}`, etc.) |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (394 tests)
+cargo test               # full test suite (472 tests)
 ```
 
 ## Features
@@ -34,7 +35,7 @@ cargo test               # full test suite (394 tests)
 `cmd a b c`, `cmd1 ; cmd2`, `cmd1 && cmd2`, `cmd1 || cmd2`, `cmd1 | cmd2`,
 `cmd > out`, `cmd < in`, `cmd >> out`, `cmd 2> err`, `cmd &`,
 `echo "$VAR"`, `echo $(date)`, `NAME=value cmd`, `cd ~`, `ls ~/dir`,
-`cd ~-`, `PATH=~/bin:~/lib`, `ls *.txt`, `echo [ab].rs`, `echo $((2+3))`.
+`cd ~-`, `PATH=~/bin:~/lib`, `ls *.txt`, `echo [ab].rs`, `echo $((2+3))`, `echo ${X:-default}`, `echo ${f##*/}`.
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
@@ -80,10 +81,22 @@ non-integer values produce a stderr error and an empty result.
 Bitwise operators, assignment operators, increment/decrement, and
 non-decimal bases are not implemented.
 
+**Parameter-expansion modifiers (v12):**
+Default-value family: `${var:-w}` (use `w` if null), `${var:=w}`
+(also assign), `${var:?w}` (stderr error if null), `${var:+w}` (use
+`w` if set). The non-`:` variants (`-`/`=`/`?`/`+`) treat only unset
+as null. Length: `${#var}` returns the Unicode character count.
+Prefix/suffix removal: `${var#pat}`/`${var##pat}` strip the shortest
+or longest matching prefix; `${var%pat}`/`${var%%pat}` strip the
+suffix. Patterns use glob syntax (`*`, `?`, `[abc]`) and `*` can
+cross `/`. The operand `w` (or `pat`) is recursively expanded —
+variables, arithmetic, command sub, and tilde all work inside.
+Pattern substitution `${var/pat/repl}`, substring `${var:off:len}`,
+and case modification are not yet implemented.
+
 **Not yet implemented:**
-parameter-expansion modifiers
-(`${var:-x}`/`${var/pat/repl}`/etc.), brace expansion (`{a,b,c}`),
-special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
+pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
+brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
 (`if`/`while`/`for`/`case`), functions, history expansion, here-docs,

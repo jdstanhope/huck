@@ -133,6 +133,9 @@ fn lex_error_message(error: LexError) -> String {
         LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
         LexError::UnterminatedArith => ": unterminated arithmetic expansion".to_string(),
         LexError::ArithParse(msg) => format!(": arithmetic expansion: {msg}"),
+        LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
+        LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
+        LexError::InvalidBraceOperand => ": invalid operator in parameter-expansion operand".to_string(),
         LexError::SubstitutionLexError(inner) => {
             format!(" in command substitution{}", lex_error_message(*inner))
         }

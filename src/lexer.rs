@@ -6,6 +6,9 @@ pub enum LexError {
     UnterminatedSubstitution,
     UnterminatedArith,
     ArithParse(String),
+    InvalidBraceModifier(String),
+    EmptyParamName,
+    InvalidBraceOperand,
     SubstitutionLexError(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
 }
@@ -24,7 +27,7 @@ pub enum Operator {
     Background,     // &
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TildeSpec {
     Home,
     User(String),
@@ -32,7 +35,18 @@ pub enum TildeSpec {
     OldPwd,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamModifier {
+    Length,
+    UseDefault    { word: Word, colon: bool },
+    AssignDefault { word: Word, colon: bool },
+    ErrorIfUnset  { word: Word, colon: bool },
+    UseAlternate  { word: Word, colon: bool },
+    RemovePrefix  { pattern: Word, longest: bool },
+    RemoveSuffix  { pattern: Word, longest: bool },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
     Tilde(TildeSpec),
@@ -40,9 +54,10 @@ pub enum WordPart {
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
     Arith { expr: crate::arith::ArithExpr, quoted: bool },
+    ParamExpansion { name: String, modifier: ParamModifier, quoted: bool },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -296,8 +311,7 @@ fn read_dollar_expansion(
         }
         Some('{') => {
             chars.next();
-            let name = read_braced_var_name(chars)?;
-            parts.push(WordPart::Var { name, quoted });
+            read_braced_param_expansion(chars, parts, quoted)?;
         }
         Some('?') => {
             chars.next();
@@ -346,6 +360,89 @@ fn scan_arith_body(
             Some(c) => body.push(c),
         }
     }
+}
+
+/// Reads the inner text of a `${...}` operand. The opening `{` has already
+/// been consumed; this function consumes through the matching `}` at depth 0.
+/// Tracks brace-depth, plus `'...'` and `"..."` so a stray `}` inside a
+/// quoted span doesn't close the expansion. Returns the inner text (without
+/// the closing `}`).
+fn scan_braced_operand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    // Known limitation: a `${...}` nested *inside* a double-quoted span of
+    // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner
+    // `}` chars are consumed literally by the quote loop. Real scripts very
+    // rarely nest this way, and bash's own handling here is murky. Plain
+    // nesting like `${X:-${Y}}` IS handled (depth tracking outside quotes).
+    let mut body = String::new();
+    let mut depth: u32 = 1;
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedBrace),
+            Some('\\') => {
+                body.push('\\');
+                if let Some(c) = chars.next() { body.push(c); }
+            }
+            Some('"') => {
+                body.push('"');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('"') => { body.push('"'); break; }
+                        Some('\\') => {
+                            body.push('\\');
+                            if let Some(c) = chars.next() { body.push(c); }
+                        }
+                        Some(c) => body.push(c),
+                    }
+                }
+            }
+            Some('\'') => {
+                body.push('\'');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('\'') => { body.push('\''); break; }
+                        Some(c) => body.push(c),
+                    }
+                }
+            }
+            Some('{') => { depth += 1; body.push('{'); }
+            Some('}') => {
+                if depth == 1 { return Ok(body); }
+                depth -= 1;
+                body.push('}');
+            }
+            Some(c) => body.push(c),
+        }
+    }
+}
+
+/// Tokenizes the operand body and merges the resulting words into a single
+/// `Word`, inserting a literal space between adjacent words to preserve
+/// IFS-split-relevant whitespace.
+fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
+    let tokens = tokenize(body)
+        .map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut first = true;
+    for tok in tokens {
+        match tok {
+            Token::Word(Word(ps)) => {
+                if !first {
+                    parts.push(WordPart::Literal {
+                        text: " ".to_string(),
+                        quoted: false,
+                    });
+                }
+                parts.extend(ps);
+                first = false;
+            }
+            Token::Op(_) => return Err(LexError::InvalidBraceOperand),
+        }
+    }
+    Ok(Word(parts))
 }
 
 /// Reads the body of a `$(...)` substitution. The opening `$(` is already
@@ -493,42 +590,125 @@ fn read_var_name(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String
     name
 }
 
-fn read_braced_var_name(
+/// Reads a `${...}` parameter expansion. The opening `$` and `{` have
+/// already been consumed. Pushes either a `WordPart::Var` (plain `${name}`)
+/// or a `WordPart::ParamExpansion` (any modifier).
+fn read_braced_param_expansion(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    parts: &mut Vec<WordPart>,
+    quoted: bool,
+) -> Result<(), LexError> {
+    // Length form: ${#name}
+    if chars.peek() == Some(&'#') {
+        chars.next();
+        let name = read_braced_name(chars)?;
+        if name.is_empty() {
+            return Err(LexError::EmptyParamName);
+        }
+        if chars.next() != Some('}') {
+            return Err(LexError::UnterminatedBrace);
+        }
+        parts.push(WordPart::ParamExpansion {
+            name,
+            modifier: ParamModifier::Length,
+            quoted,
+        });
+        return Ok(());
+    }
+
+    let name = read_braced_name(chars)?;
+    if name.is_empty() {
+        return Err(LexError::EmptyParamName);
+    }
+
+    match chars.next() {
+        Some('}') => {
+            parts.push(WordPart::Var { name, quoted });
+            Ok(())
+        }
+        Some(':') => {
+            let modifier = match chars.next() {
+                Some('-') => modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?,
+                Some('=') => modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?,
+                Some('?') => modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?,
+                Some('+') => modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?,
+                Some(c) => return Err(LexError::InvalidBraceModifier(format!(":{c}"))),
+                None => return Err(LexError::UnterminatedBrace),
+            };
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('-') => {
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: false })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('=') => {
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('?') => {
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('+') => {
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('#') => {
+            let longest = chars.peek() == Some(&'#');
+            if longest { chars.next(); }
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some('%') => {
+            let longest = chars.peek() == Some(&'%');
+            if longest { chars.next(); }
+            let modifier = modifier_with_operand(chars, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            Ok(())
+        }
+        Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
+        None => Err(LexError::UnterminatedBrace),
+    }
+}
+
+/// Reads identifier chars (the parameter name) inside a `${...}` until it
+/// hits a non-identifier char. Does NOT consume the terminator.
+fn read_braced_name(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<String, LexError> {
     let mut name = String::new();
-    let first = chars.next().ok_or(LexError::UnterminatedBrace)?;
-    if !is_name_start(first) {
-        // Drain until '}' so the error is recoverable on the REPL.
-        if first != '}' {
-            loop {
-                match chars.next() {
-                    Some('}') => break,
-                    Some(_) => continue,
-                    None => return Err(LexError::UnterminatedBrace),
-                }
-            }
-        }
-        return Err(LexError::InvalidVarName);
-    }
-    name.push(first);
-    loop {
-        match chars.next() {
-            Some('}') => return Ok(name),
-            Some(c) if is_name_cont(c) => name.push(c),
-            Some(_) => {
-                loop {
-                    match chars.next() {
-                        Some('}') => break,
-                        Some(_) => continue,
-                        None => return Err(LexError::UnterminatedBrace),
-                    }
-                }
+    while let Some(&c) = chars.peek() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            if name.is_empty() && c.is_ascii_digit() {
                 return Err(LexError::InvalidVarName);
             }
-            None => return Err(LexError::UnterminatedBrace),
+            name.push(c);
+            chars.next();
+        } else {
+            break;
         }
     }
+    Ok(name)
+}
+
+/// Scans the operand text until the matching `}` and parses it as a single
+/// `Word`. Builds the `ParamModifier` via the caller's closure.
+fn modifier_with_operand<F>(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    build: F,
+) -> Result<ParamModifier, LexError>
+where
+    F: FnOnce(Word) -> ParamModifier,
+{
+    let body = scan_braced_operand(chars)?;
+    let word = parse_braced_operand(&body)?;
+    Ok(build(word))
 }
 
 fn is_name_start(c: char) -> bool {
@@ -1165,7 +1345,7 @@ mod tests {
 
     #[test]
     fn tokenize_braced_var_empty_name() {
-        assert_eq!(tokenize("${}").unwrap_err(), LexError::InvalidVarName);
+        assert_eq!(tokenize("${}").unwrap_err(), LexError::EmptyParamName);
     }
 
     #[test]
@@ -1784,5 +1964,228 @@ mod tests {
         // If it's anything else, that's an unterminated arithmetic expansion.
         let err = tokenize("$((1)x)").unwrap_err();
         assert_eq!(err, LexError::UnterminatedArith);
+    }
+
+    #[test]
+    fn scan_braced_operand_simple() {
+        let mut chars = "foo}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "foo");
+    }
+
+    #[test]
+    fn scan_braced_operand_nested_braces() {
+        let mut chars = "${Y}}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "${Y}");
+    }
+
+    #[test]
+    fn scan_braced_operand_double_quote_protects_brace() {
+        let mut chars = "\"a}b\"c}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "\"a}b\"c");
+    }
+
+    #[test]
+    fn scan_braced_operand_single_quote_protects_brace() {
+        let mut chars = "'a}b'c}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "'a}b'c");
+    }
+
+    #[test]
+    fn scan_braced_operand_unterminated_is_error() {
+        let mut chars = "foo".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap_err(), LexError::UnterminatedBrace);
+    }
+
+    #[test]
+    fn parse_braced_operand_single_word() {
+        let w = parse_braced_operand("foo").unwrap();
+        assert_eq!(w.0.len(), 1);
+        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn parse_braced_operand_two_words_join_with_space() {
+        let w = parse_braced_operand("foo bar").unwrap();
+        assert_eq!(w.0.len(), 3);
+        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
+        assert_eq!(w.0[1], WordPart::Literal { text: " ".to_string(), quoted: false });
+        assert_eq!(w.0[2], WordPart::Literal { text: "bar".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn parse_braced_operand_top_level_pipe_is_error() {
+        assert_eq!(parse_braced_operand("foo | bar").unwrap_err(), LexError::InvalidBraceOperand);
+    }
+
+    #[test]
+    fn parse_braced_operand_empty_returns_empty_word() {
+        let w = parse_braced_operand("").unwrap();
+        assert_eq!(w.0.len(), 0);
+    }
+
+    #[test]
+    fn tokenize_brace_var_no_modifier_still_emits_var() {
+        let tokens = tokenize("${foo}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], WordPart::Var { name: "foo".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn tokenize_length_modifier() {
+        let tokens = tokenize("${#foo}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        let WordPart::ParamExpansion { name, modifier, quoted } = &parts[0] else {
+            panic!("expected ParamExpansion, got {:?}", parts[0]);
+        };
+        assert_eq!(name, "foo");
+        assert_eq!(*quoted, false);
+        assert!(matches!(modifier, ParamModifier::Length));
+    }
+
+    #[test]
+    fn tokenize_length_modifier_digit_leading_name_errors() {
+        // `${#1foo}` — the name part starts with a digit, which is not a
+        // valid identifier (special parameters are out of scope for v12).
+        let err = tokenize("${#1foo}").unwrap_err();
+        assert_eq!(err, LexError::InvalidVarName);
+    }
+
+    #[test]
+    fn tokenize_use_default_colon_dash() {
+        let tokens = tokenize("${X:-w}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, .. } = &parts[0] else { panic!() };
+        assert_eq!(name, "X");
+        match modifier {
+            ParamModifier::UseDefault { word, colon } => {
+                assert_eq!(*colon, true);
+                assert_eq!(word.0, vec![WordPart::Literal { text: "w".to_string(), quoted: false }]);
+            }
+            other => panic!("expected UseDefault, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tokenize_use_default_no_colon() {
+        let tokens = tokenize("${X-w}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_assign_default_colon_equals() {
+        let tokens = tokenize("${X:=w}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::AssignDefault { colon: true, .. }));
+    }
+
+    #[test]
+    fn tokenize_error_if_unset_colon_question() {
+        let tokens = tokenize("${X:?msg}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::ErrorIfUnset { colon: true, .. }));
+    }
+
+    #[test]
+    fn tokenize_use_alternate_colon_plus() {
+        let tokens = tokenize("${X:+w}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::UseAlternate { colon: true, .. }));
+    }
+
+    #[test]
+    fn tokenize_remove_prefix_short() {
+        let tokens = tokenize("${X#pat}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_remove_prefix_long() {
+        let tokens = tokenize("${X##pat}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: true, .. }));
+    }
+
+    #[test]
+    fn tokenize_remove_suffix_short() {
+        let tokens = tokenize("${X%pat}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_remove_suffix_long() {
+        let tokens = tokenize("${X%%pat}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: true, .. }));
+    }
+
+    #[test]
+    fn tokenize_nested_param_expansion_in_operand() {
+        let tokens = tokenize("${X:-${Y}}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        if let ParamModifier::UseDefault { word, .. } = modifier {
+            assert_eq!(word.0.len(), 1);
+            assert!(matches!(word.0[0], WordPart::Var { .. }));
+        } else {
+            panic!("expected UseDefault");
+        }
+    }
+
+    #[test]
+    fn tokenize_quoted_operand_preserves_spaces() {
+        let tokens = tokenize("${X:-\"a b\"}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        if let ParamModifier::UseDefault { word, .. } = modifier {
+            assert_eq!(word.0.len(), 1);
+            assert_eq!(word.0[0], WordPart::Literal { text: "a b".to_string(), quoted: true });
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn tokenize_quoted_outer_param_expansion() {
+        let tokens = tokenize("\"${X:-w}\"").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { quoted, .. } = &parts[0] else { panic!() };
+        assert_eq!(*quoted, true);
+    }
+
+    #[test]
+    fn tokenize_invalid_modifier_errors() {
+        let err = tokenize("${X:&Y}").unwrap_err();
+        assert!(matches!(err, LexError::InvalidBraceModifier(_)));
+    }
+
+    #[test]
+    fn tokenize_empty_param_name_errors() {
+        let err = tokenize("${:-foo}").unwrap_err();
+        assert_eq!(err, LexError::EmptyParamName);
+    }
+
+    #[test]
+    fn tokenize_unterminated_brace_modifier_errors() {
+        let err = tokenize("${X:-foo").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedBrace);
+    }
+
+    #[test]
+    fn tokenize_pipe_in_operand_errors() {
+        let err = tokenize("${X:-foo | bar}").unwrap_err();
+        assert_eq!(err, LexError::InvalidBraceOperand);
     }
 }

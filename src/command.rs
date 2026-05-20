@@ -85,13 +85,13 @@ fn finalize_stage(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Redirect {
     Truncate(Word),
     Append(Word),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExecCommand {
     pub program: Word,
     pub args: Vec<Word>,
@@ -100,13 +100,13 @@ pub struct ExecCommand {
     pub stderr: Option<Redirect>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SimpleCommand {
     Assign { name: String, value: Word },
     Exec(ExecCommand),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
 }
@@ -118,7 +118,7 @@ pub enum Connector {
     Or,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Sequence {
     pub first: Pipeline,
     pub rest: Vec<(Connector, Pipeline)>,
