@@ -1,6 +1,7 @@
 mod arith;
 mod builtins;
 mod command;
+mod completion;
 mod executor;
 mod expand;
 mod history;

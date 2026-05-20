@@ -1,0 +1,274 @@
+//! Tab completion: cursor-context analysis and completion sources.
+
+/// One completion candidate. `display` is shown in the Tab-Tab list;
+/// `replacement` is the (possibly escaped) text inserted into the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub display: String,
+    pub replacement: String,
+}
+
+/// What the cursor is positioned to complete.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompletionContext {
+    Command { prefix: String },
+    Variable { prefix: String },
+    File { dir: String, prefix: String },
+}
+
+/// Classifies the completion context at byte offset `pos` in `line`.
+/// Returns the byte offset where replacement begins and the context
+/// (whose prefix has backslash-escapes resolved).
+pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
+    let head = &line[..pos];
+
+    let mut word_start = 0usize;
+    let mut current_has_content = false;
+    let mut is_command_pos = true;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    let indexed: Vec<(usize, char)> = head.char_indices().collect();
+    let mut i = 0;
+    while i < indexed.len() {
+        let (off, c) = indexed[i];
+
+        if !in_single && c == '\\' {
+            current_has_content = true;
+            i += 2;
+            continue;
+        }
+        if in_single {
+            current_has_content = true;
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            current_has_content = true;
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_single = true;
+                current_has_content = true;
+                i += 1;
+            }
+            '"' => {
+                in_double = true;
+                current_has_content = true;
+                i += 1;
+            }
+            ' ' | '\t' => {
+                if current_has_content {
+                    let word = &head[word_start..off];
+                    if !is_assignment(word) {
+                        is_command_pos = false;
+                    }
+                }
+                current_has_content = false;
+                word_start = off + c.len_utf8();
+                i += 1;
+            }
+            ';' | '|' | '&' | '<' | '>' => {
+                current_has_content = false;
+                is_command_pos = true;
+                word_start = off + c.len_utf8();
+                i += 1;
+            }
+            _ => {
+                current_has_content = true;
+                i += 1;
+            }
+        }
+    }
+
+    let word = &head[word_start..];
+
+    if let Some(dollar) = last_unescaped_dollar(word) {
+        let after = &word[dollar + 1..];
+        let (brace, name) = match after.strip_prefix('{') {
+            Some(rest) => (true, rest),
+            None => (false, after),
+        };
+        if name.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+            let name_off = dollar + 1 + if brace { 1 } else { 0 };
+            return (
+                word_start + name_off,
+                CompletionContext::Variable { prefix: name.to_string() },
+            );
+        }
+    }
+
+    if let Some(slash) = word.rfind('/') {
+        let dir = unescape(&word[..=slash]);
+        let prefix = unescape(&word[slash + 1..]);
+        return (word_start + slash + 1, CompletionContext::File { dir, prefix });
+    }
+
+    if !is_command_pos {
+        return (
+            word_start,
+            CompletionContext::File { dir: String::new(), prefix: unescape(word) },
+        );
+    }
+
+    (word_start, CompletionContext::Command { prefix: unescape(word) })
+}
+
+/// True if `word` looks like a `NAME=value` assignment prefix.
+fn is_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else { return false };
+    let name = &word[..eq];
+    !name.is_empty()
+        && name.chars().next().map(|c| c == '_' || c.is_ascii_alphabetic()).unwrap_or(false)
+        && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Byte offset of the last `$` in `word` that is not backslash-escaped.
+fn last_unescaped_dollar(word: &str) -> Option<usize> {
+    let mut result = None;
+    let mut escaped = false;
+    for (i, c) in word.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+        } else if c == '$' {
+            result = Some(i);
+        }
+    }
+    result
+}
+
+/// Resolves backslash escapes: `\x` -> `x`.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_empty_line_is_command() {
+        let (start, ctx) = analyze("", 0);
+        assert_eq!(start, 0);
+        assert_eq!(ctx, CompletionContext::Command { prefix: String::new() });
+    }
+
+    #[test]
+    fn analyze_first_word_is_command() {
+        let (start, ctx) = analyze("ec", 2);
+        assert_eq!(start, 0);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_command_is_file() {
+        let (start, ctx) = analyze("echo fo", 7);
+        assert_eq!(start, 5);
+        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "fo".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_semicolon_is_command() {
+        let (start, ctx) = analyze("echo hi; ec", 11);
+        assert_eq!(start, 9);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_pipe_is_command() {
+        let (_, ctx) = analyze("ls | gr", 7);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "gr".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_assignment_word_is_command() {
+        let (start, ctx) = analyze("FOO=bar ec", 10);
+        assert_eq!(start, 8);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_variable_dollar() {
+        let (start, ctx) = analyze("echo $HO", 8);
+        assert_eq!(start, 6);
+        assert_eq!(ctx, CompletionContext::Variable { prefix: "HO".to_string() });
+    }
+
+    #[test]
+    fn analyze_variable_braced() {
+        let (start, ctx) = analyze("echo ${HO", 9);
+        assert_eq!(start, 7);
+        assert_eq!(ctx, CompletionContext::Variable { prefix: "HO".to_string() });
+    }
+
+    #[test]
+    fn analyze_variable_mid_word() {
+        let (start, ctx) = analyze("echo foo$BA", 11);
+        assert_eq!(start, 9);
+        assert_eq!(ctx, CompletionContext::Variable { prefix: "BA".to_string() });
+    }
+
+    #[test]
+    fn analyze_variable_empty_prefix() {
+        let (start, ctx) = analyze("echo $", 6);
+        assert_eq!(start, 6);
+        assert_eq!(ctx, CompletionContext::Variable { prefix: String::new() });
+    }
+
+    #[test]
+    fn analyze_path_splits_at_slash() {
+        let (start, ctx) = analyze("cat src/le", 10);
+        assert_eq!(start, 8);
+        assert_eq!(ctx, CompletionContext::File { dir: "src/".to_string(), prefix: "le".to_string() });
+    }
+
+    #[test]
+    fn analyze_command_with_slash_is_file() {
+        let (start, ctx) = analyze("./scr", 5);
+        assert_eq!(start, 2);
+        assert_eq!(ctx, CompletionContext::File { dir: "./".to_string(), prefix: "scr".to_string() });
+    }
+
+    #[test]
+    fn analyze_escaped_space_stays_in_word() {
+        let (start, ctx) = analyze("cat my\\ fi", 10);
+        assert_eq!(start, 4);
+        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "my fi".to_string() });
+    }
+
+    #[test]
+    fn analyze_ignores_text_after_cursor() {
+        let (_, ctx) = analyze("echo fo bar", 7);
+        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "fo".to_string() });
+    }
+
+    #[test]
+    fn analyze_escaped_dollar_is_not_variable() {
+        let (_, ctx) = analyze("echo \\$HOM", 10);
+        assert!(matches!(ctx, CompletionContext::File { .. }));
+    }
+}
