@@ -20,13 +20,14 @@ spec, an implementation plan, and a test suite.
 | v10       | Pathname expansion (`*`, `?`, `[abc]`)                  |
 | v11       | Arithmetic expansion (`$((expr))`)                      |
 | v12       | Parameter-expansion modifiers (`${var:-w}`, `${var#pat}`, etc.) |
+| v13       | Command history + history expansion (`!!`, `!$`, `^a^b^`) |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (472 tests)
+cargo test               # full test suite (528 tests)
 ```
 
 ## Features
@@ -39,7 +40,7 @@ cargo test               # full test suite (472 tests)
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
-`kill`, `disown`.
+`kill`, `disown`, `history`.
 
 **Job control (v6 + v7 + v8):**
 Trailing `&` runs a pipeline in its own process group, prints `[N] PID`,
@@ -94,12 +95,26 @@ variables, arithmetic, command sub, and tilde all work inside.
 Pattern substitution `${var/pat/repl}`, substring `${var:off:len}`,
 and case modification are not yet implemented.
 
+**Command history (v13):**
+Commands are recorded in memory and persisted to `$HISTFILE` (default
+`~/.huck_history`), loaded at startup and saved on exit, capped at
+1000 entries. The `history` builtin lists numbered entries; `history
+-c` clears them. History expansion runs on each input line before
+parsing: `!!` (previous command), `!n` (entry n), `!-n` (n entries
+back), `!string` (most recent starting with `string`), `!$` (last
+argument), `!^` (first argument), `!*` (all arguments), and
+`^old^new^` quick substitution. A `!` is literal inside single
+quotes, before whitespace/`=`, or when escaped (`\!`); it still
+expands inside double quotes (matching bash). An expanded line is
+echoed before it runs. Word designators (`!!:2`) and modifiers
+(`:h`/`:t`/`:s`) are not yet implemented.
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
-(`if`/`while`/`for`/`case`), functions, history expansion, here-docs,
+(`if`/`while`/`for`/`case`), functions, here-docs,
 aliases.
 
 ## Project layout

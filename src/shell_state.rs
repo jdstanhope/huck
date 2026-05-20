@@ -24,6 +24,7 @@ pub struct Shell {
     pub sigchld_flag: Arc<AtomicBool>,
     pub sigint_flag: Arc<AtomicBool>,
     pub shell_pgid: i32,
+    pub history: crate::history::History,
 }
 
 impl Shell {
@@ -39,6 +40,7 @@ impl Shell {
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
             shell_pgid: unsafe { libc::getpgrp() },
+            history: crate::history::History::new(),
         }
     }
 

@@ -3,6 +3,7 @@ mod builtins;
 mod command;
 mod executor;
 mod expand;
+mod history;
 mod job_spec;
 mod jobs;
 mod lexer;
