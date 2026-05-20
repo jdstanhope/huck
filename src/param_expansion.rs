@@ -65,8 +65,15 @@ pub fn expand_modifier(
                 ExpansionResult::Value(expand_word_to_string(word, shell))
             }
         }
-        ParamModifier::RemovePrefix { .. } | ParamModifier::RemoveSuffix { .. } => {
-            unreachable!("prefix/suffix removal lands in Task 4");
+        ParamModifier::RemovePrefix { pattern, longest } => {
+            let v = shell.get(name).unwrap_or("").to_string();
+            let p = expand_word_to_string(pattern, shell);
+            ExpansionResult::Value(remove_prefix(&v, &p, *longest))
+        }
+        ParamModifier::RemoveSuffix { pattern, longest } => {
+            let v = shell.get(name).unwrap_or("").to_string();
+            let p = expand_word_to_string(pattern, shell);
+            ExpansionResult::Value(remove_suffix(&v, &p, *longest))
         }
     }
 }
@@ -81,6 +88,64 @@ pub(crate) fn condition_is_null(raw: Option<&str>, colon: bool) -> bool {
 
 pub(crate) fn expand_word_to_string(word: &Word, shell: &mut Shell) -> String {
     crate::expand::expand_assignment(word, shell)
+}
+
+fn remove_prefix(value: &str, pattern: &str, longest: bool) -> String {
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    let pat = match glob::Pattern::new(pattern) {
+        Ok(p) => p,
+        Err(_) => return value.to_string(),
+    };
+    let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(value.len());
+
+    if longest {
+        for &end in boundaries.iter().rev() {
+            if pat.matches_with(&value[..end], opts) {
+                return value[end..].to_string();
+            }
+        }
+    } else {
+        for &end in &boundaries {
+            if pat.matches_with(&value[..end], opts) {
+                return value[end..].to_string();
+            }
+        }
+    }
+    value.to_string()
+}
+
+fn remove_suffix(value: &str, pattern: &str, longest: bool) -> String {
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    let pat = match glob::Pattern::new(pattern) {
+        Ok(p) => p,
+        Err(_) => return value.to_string(),
+    };
+    let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(value.len());
+
+    if longest {
+        for &start in &boundaries {
+            if pat.matches_with(&value[start..], opts) {
+                return value[..start].to_string();
+            }
+        }
+    } else {
+        for &start in boundaries.iter().rev() {
+            if pat.matches_with(&value[start..], opts) {
+                return value[..start].to_string();
+            }
+        }
+    }
+    value.to_string()
 }
 
 #[cfg(test)]
@@ -240,5 +305,96 @@ mod tests {
         let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
         let r = expand_modifier("HUCK_TEST_PE_UA4", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("alt".to_string()));
+    }
+
+    #[test]
+    fn remove_prefix_shortest_match() {
+        assert_eq!(remove_prefix("/path/to/file.txt", "*/", false), "path/to/file.txt");
+    }
+
+    #[test]
+    fn remove_prefix_longest_match() {
+        assert_eq!(remove_prefix("/path/to/file.txt", "*/", true), "file.txt");
+    }
+
+    #[test]
+    fn remove_prefix_no_match_returns_value_unchanged() {
+        assert_eq!(remove_prefix("hello", "world", false), "hello");
+    }
+
+    #[test]
+    fn remove_prefix_empty_pattern_returns_value_unchanged() {
+        assert_eq!(remove_prefix("hello", "", false), "hello");
+    }
+
+    #[test]
+    fn remove_prefix_invalid_glob_returns_value_unchanged() {
+        assert_eq!(remove_prefix("hello", "[abc", false), "hello");
+    }
+
+    #[test]
+    fn remove_prefix_literal_match() {
+        assert_eq!(remove_prefix("hello world", "hello ", false), "world");
+    }
+
+    #[test]
+    fn remove_prefix_glob_crosses_slash() {
+        assert_eq!(remove_prefix("a/b/c", "*", true), "");
+        assert_eq!(remove_prefix("a/b/c", "*/", true), "c");
+    }
+
+    #[test]
+    fn remove_suffix_shortest_match() {
+        assert_eq!(remove_suffix("file.tar.gz", ".*", false), "file.tar");
+    }
+
+    #[test]
+    fn remove_suffix_longest_match() {
+        assert_eq!(remove_suffix("file.tar.gz", ".*", true), "file");
+    }
+
+    #[test]
+    fn remove_suffix_no_match() {
+        assert_eq!(remove_suffix("hello", "world", false), "hello");
+    }
+
+    #[test]
+    fn remove_suffix_handles_utf8_boundaries() {
+        assert_eq!(remove_suffix("café.txt", ".txt", false), "café");
+    }
+
+    #[test]
+    fn expand_modifier_remove_prefix_shortest() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_RP1", "/path/to/file.txt".to_string());
+        let m = ParamModifier::RemovePrefix { pattern: lit("*/"), longest: false };
+        let r = expand_modifier("HUCK_TEST_PE_RP1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("path/to/file.txt".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_remove_prefix_longest() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_RP2", "/path/to/file.txt".to_string());
+        let m = ParamModifier::RemovePrefix { pattern: lit("*/"), longest: true };
+        let r = expand_modifier("HUCK_TEST_PE_RP2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("file.txt".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_remove_suffix_longest() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_RS1", "file.tar.gz".to_string());
+        let m = ParamModifier::RemoveSuffix { pattern: lit(".*"), longest: true };
+        let r = expand_modifier("HUCK_TEST_PE_RS1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("file".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_remove_prefix_unset_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::RemovePrefix { pattern: lit("*"), longest: true };
+        let r = expand_modifier("HUCK_TEST_PE_UNSET_RP", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
     }
 }
