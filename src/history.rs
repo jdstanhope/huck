@@ -242,7 +242,7 @@ fn scan(line: &str, history: &History) -> Result<Option<String>, HistError> {
                         out.push('!');
                         i += 1;
                     }
-                    Some(n) if n.is_whitespace() || n == '=' || n == '(' => {
+                    Some(n) if n.is_whitespace() || n == '=' || n == '(' || n == '\'' || n == '"' => {
                         out.push('!');
                         i += 1;
                     }
@@ -295,7 +295,7 @@ fn read_event(
                 // `!-` not followed by digits — not a trigger.
                 return Ok(None);
             }
-            let n: usize = chars[after + 1..j].iter().collect::<String>().parse().unwrap();
+            let n: usize = chars[after + 1..j].iter().collect::<String>().parse().unwrap_or(usize::MAX);
             let token: String = chars[start..j].iter().collect();
             let last_num = history
                 .last_number()
@@ -311,7 +311,7 @@ fn read_event(
             while j < chars.len() && chars[j].is_ascii_digit() {
                 j += 1;
             }
-            let n: usize = chars[after..j].iter().collect::<String>().parse().unwrap();
+            let n: usize = chars[after..j].iter().collect::<String>().parse().unwrap_or(usize::MAX);
             let token: String = chars[start..j].iter().collect();
             match history.get(n) {
                 Some(s) => Ok(Some((s.to_string(), j - start))),
@@ -721,5 +721,32 @@ mod tests {
             expand("^hello^world^ extra", &h).unwrap(),
             Some("echo world extra".to_string())
         );
+    }
+
+    #[test]
+    fn expand_oversized_bang_n_errors_not_panics() {
+        let h = hist_with(&["only one"]);
+        // 21-digit number overflows usize — must error, not panic.
+        assert!(matches!(
+            expand("!999999999999999999999", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn expand_oversized_bang_minus_n_errors_not_panics() {
+        let h = hist_with(&["only one"]);
+        assert!(matches!(
+            expand("!-999999999999999999999", &h).unwrap_err(),
+            HistError::EventNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn expand_bang_before_quote_is_literal() {
+        let h = hist_with(&["previous command"]);
+        // `!` immediately before a quote must NOT expand to the last entry.
+        assert_eq!(expand("echo !'hi'", &h).unwrap(), None);
+        assert_eq!(expand("echo !\"hi\"", &h).unwrap(), None);
     }
 }
