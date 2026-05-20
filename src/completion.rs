@@ -1,5 +1,7 @@
 //! Tab completion: cursor-context analysis and completion sources.
 
+use std::collections::BTreeSet;
+
 /// One completion candidate. `display` is shown in the Tab-Tab list;
 /// `replacement` is the (possibly escaped) text inserted into the line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +168,46 @@ fn unescape(s: &str) -> String {
     out
 }
 
+/// Completes a command name: builtins plus executables found in the
+/// `:`-separated `path`.
+pub fn complete_command(prefix: &str, path: &str) -> Vec<Candidate> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+
+    for &builtin in crate::builtins::BUILTIN_NAMES {
+        if builtin.starts_with(prefix) {
+            names.insert(builtin.to_string());
+        }
+    }
+
+    for dir in path.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue };
+            if name.starts_with(prefix) && is_executable_file(&entry) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    names
+        .into_iter()
+        .map(|n| Candidate { display: n.clone(), replacement: n })
+        .collect()
+}
+
+/// True if the directory entry is a regular file with an executable bit.
+fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match entry.metadata() {
+        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +312,46 @@ mod tests {
     fn analyze_escaped_dollar_is_not_variable() {
         let (_, ctx) = analyze("echo \\$HOM", 10);
         assert!(matches!(ctx, CompletionContext::File { .. }));
+    }
+
+    #[test]
+    fn complete_command_matches_builtin_prefix() {
+        let cands = complete_command("ec", "");
+        assert!(cands.iter().any(|c| c.replacement == "echo"));
+    }
+
+    #[test]
+    fn complete_command_empty_prefix_includes_builtins() {
+        let cands = complete_command("", "");
+        assert!(cands.iter().any(|c| c.replacement == "cd"));
+        assert!(cands.iter().any(|c| c.replacement == "history"));
+    }
+
+    #[test]
+    fn complete_command_scans_path_for_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("huckcmd_exe");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("huckcmd_plain");
+        std::fs::write(&plain, b"data").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir(dir.path().join("huckcmd_subdir")).unwrap();
+
+        let path = dir.path().to_str().unwrap();
+        let cands = complete_command("huckcmd_", path);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"huckcmd_exe"), "exe should match: {names:?}");
+        assert!(!names.contains(&"huckcmd_plain"), "non-exe should not match");
+        assert!(!names.contains(&"huckcmd_subdir"), "subdir should not match");
+    }
+
+    #[test]
+    fn complete_command_results_are_sorted_and_unique() {
+        let cands = complete_command("", "");
+        let mut sorted = cands.clone();
+        sorted.sort_by(|a, b| a.replacement.cmp(&b.replacement));
+        assert_eq!(cands, sorted);
     }
 }
