@@ -284,8 +284,52 @@ fn read_event(
                 None => Err(HistError::EventNotFound(token)),
             }
         }
-        // `!$`, `!^`, `!*`, `!string` are added in Task 5.
-        _ => Ok(None),
+        Some('$') => {
+            let prev = history
+                .last()
+                .ok_or_else(|| HistError::EventNotFound("!$".to_string()))?;
+            let words: Vec<&str> = prev.split_whitespace().collect();
+            let word = words.last().copied().unwrap_or("");
+            Ok(Some((word.to_string(), 2)))
+        }
+        Some('^') => {
+            let prev = history
+                .last()
+                .ok_or_else(|| HistError::EventNotFound("!^".to_string()))?;
+            let words: Vec<&str> = prev.split_whitespace().collect();
+            let word = words.get(1).copied().unwrap_or("");
+            Ok(Some((word.to_string(), 2)))
+        }
+        Some('*') => {
+            let prev = history
+                .last()
+                .ok_or_else(|| HistError::EventNotFound("!*".to_string()))?;
+            let words: Vec<&str> = prev.split_whitespace().collect();
+            let joined = if words.len() > 1 {
+                words[1..].join(" ")
+            } else {
+                String::new()
+            };
+            Ok(Some((joined, 2)))
+        }
+        Some(_) => {
+            // !string — prefix search.
+            let mut j = after;
+            while j < chars.len() {
+                let c = chars[j];
+                if c.is_whitespace() || c == '\'' || c == '"' || c == '!' {
+                    break;
+                }
+                j += 1;
+            }
+            let needle: String = chars[after..j].iter().collect();
+            let token: String = chars[start..j].iter().collect();
+            match history.search_prefix(&needle) {
+                Some(s) => Ok(Some((s.to_string(), j - start))),
+                None => Err(HistError::EventNotFound(token)),
+            }
+        }
+        None => Ok(None),
     }
 }
 
@@ -526,5 +570,65 @@ mod tests {
     fn expand_escaped_bang_is_literal() {
         let h = hist_with(&["prev"]);
         assert_eq!(expand("echo \\!!", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_dollar_is_last_word() {
+        let h = hist_with(&["ls -l /tmp"]);
+        assert_eq!(expand("echo !$", &h).unwrap(), Some("echo /tmp".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_caret_is_first_argument() {
+        let h = hist_with(&["ls -l /tmp"]);
+        assert_eq!(expand("echo !^", &h).unwrap(), Some("echo -l".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_star_is_all_arguments() {
+        let h = hist_with(&["ls -l /tmp /var"]);
+        assert_eq!(expand("echo !*", &h).unwrap(), Some("echo -l /tmp /var".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_dollar_single_word_command() {
+        let h = hist_with(&["pwd"]);
+        assert_eq!(expand("echo !$", &h).unwrap(), Some("echo pwd".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_caret_no_arguments_is_empty() {
+        let h = hist_with(&["pwd"]);
+        assert_eq!(expand("echo !^", &h).unwrap(), Some("echo ".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_star_no_arguments_is_empty() {
+        let h = hist_with(&["pwd"]);
+        assert_eq!(expand("echo !*", &h).unwrap(), Some("echo ".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_dollar_no_history_errors() {
+        let h = hist_with(&[]);
+        assert!(matches!(expand("echo !$", &h).unwrap_err(), HistError::EventNotFound(_)));
+    }
+
+    #[test]
+    fn expand_bang_string_prefix_search() {
+        let h = hist_with(&["echo one", "ls -l", "echo two"]);
+        assert_eq!(expand("!echo", &h).unwrap(), Some("echo two".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_string_no_match_errors() {
+        let h = hist_with(&["ls -l"]);
+        assert!(matches!(expand("!nope", &h).unwrap_err(), HistError::EventNotFound(_)));
+    }
+
+    #[test]
+    fn expand_bang_string_stops_at_whitespace() {
+        let h = hist_with(&["make build"]);
+        assert_eq!(expand("!make again", &h).unwrap(), Some("make build again".to_string()));
     }
 }
