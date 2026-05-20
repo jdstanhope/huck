@@ -13,11 +13,13 @@ pub enum ExecOutcome {
     Exit(i32),
 }
 
+pub const BUILTIN_NAMES: &[&str] = &[
+    "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
+    "wait", "fg", "bg", "kill", "disown", "history",
+];
+
 pub fn is_builtin(name: &str) -> bool {
-    matches!(
-        name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill" | "disown" | "history"
-    )
+    BUILTIN_NAMES.contains(&name)
 }
 
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
@@ -822,6 +824,19 @@ mod tests {
     fn is_builtin_recognizes_jobs_and_wait() {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("wait"));
+    }
+
+    #[test]
+    fn builtin_names_const_matches_is_builtin() {
+        for name in BUILTIN_NAMES {
+            assert!(is_builtin(name), "{name} should be a builtin");
+        }
+        assert!(!is_builtin("definitely_not_a_builtin"));
+    }
+
+    #[test]
+    fn builtin_names_includes_history() {
+        assert!(BUILTIN_NAMES.contains(&"history"));
     }
 }
 
