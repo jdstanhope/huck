@@ -173,6 +173,9 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
+            WordPart::ParamExpansion { .. } => {
+                unreachable!("ParamExpansion: lexer wiring lands in a later task");
+            }
         }
     }
 
@@ -219,6 +222,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // Append nothing.
                     }
                 }
+            }
+            WordPart::ParamExpansion { .. } => {
+                unreachable!("ParamExpansion in assignment context: lexer wiring lands in a later task");
             }
         }
     }

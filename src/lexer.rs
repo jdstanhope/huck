@@ -6,6 +6,9 @@ pub enum LexError {
     UnterminatedSubstitution,
     UnterminatedArith,
     ArithParse(String),
+    InvalidBraceModifier(String),
+    EmptyParamName,
+    InvalidBraceOperand,
     SubstitutionLexError(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
 }
@@ -24,7 +27,7 @@ pub enum Operator {
     Background,     // &
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TildeSpec {
     Home,
     User(String),
@@ -32,7 +35,18 @@ pub enum TildeSpec {
     OldPwd,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamModifier {
+    Length,
+    UseDefault    { word: Word, colon: bool },
+    AssignDefault { word: Word, colon: bool },
+    ErrorIfUnset  { word: Word, colon: bool },
+    UseAlternate  { word: Word, colon: bool },
+    RemovePrefix  { pattern: Word, longest: bool },
+    RemoveSuffix  { pattern: Word, longest: bool },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
     Tilde(TildeSpec),
@@ -40,9 +54,10 @@ pub enum WordPart {
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
     Arith { expr: crate::arith::ArithExpr, quoted: bool },
+    ParamExpansion { name: String, modifier: ParamModifier, quoted: bool },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -346,6 +361,84 @@ fn scan_arith_body(
             Some(c) => body.push(c),
         }
     }
+}
+
+/// Reads the inner text of a `${...}` operand. The opening `{` has already
+/// been consumed; this function consumes through the matching `}` at depth 0.
+/// Tracks brace-depth, plus `'...'` and `"..."` so a stray `}` inside a
+/// quoted span doesn't close the expansion. Returns the inner text (without
+/// the closing `}`).
+fn scan_braced_operand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut body = String::new();
+    let mut depth: u32 = 1;
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedBrace),
+            Some('\\') => {
+                body.push('\\');
+                if let Some(c) = chars.next() { body.push(c); }
+            }
+            Some('"') => {
+                body.push('"');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('"') => { body.push('"'); break; }
+                        Some('\\') => {
+                            body.push('\\');
+                            if let Some(c) = chars.next() { body.push(c); }
+                        }
+                        Some(c) => body.push(c),
+                    }
+                }
+            }
+            Some('\'') => {
+                body.push('\'');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('\'') => { body.push('\''); break; }
+                        Some(c) => body.push(c),
+                    }
+                }
+            }
+            Some('{') => { depth += 1; body.push('{'); }
+            Some('}') => {
+                if depth == 1 { return Ok(body); }
+                depth -= 1;
+                body.push('}');
+            }
+            Some(c) => body.push(c),
+        }
+    }
+}
+
+/// Tokenizes the operand body and merges the resulting words into a single
+/// `Word`, inserting a literal space between adjacent words to preserve
+/// IFS-split-relevant whitespace.
+fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
+    let tokens = tokenize(body)
+        .map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut first = true;
+    for tok in tokens {
+        match tok {
+            Token::Word(Word(ps)) => {
+                if !first {
+                    parts.push(WordPart::Literal {
+                        text: " ".to_string(),
+                        quoted: false,
+                    });
+                }
+                parts.extend(ps);
+                first = false;
+            }
+            Token::Op(_) => return Err(LexError::InvalidBraceOperand),
+        }
+    }
+    Ok(Word(parts))
 }
 
 /// Reads the body of a `$(...)` substitution. The opening `$(` is already
@@ -1784,5 +1877,62 @@ mod tests {
         // If it's anything else, that's an unterminated arithmetic expansion.
         let err = tokenize("$((1)x)").unwrap_err();
         assert_eq!(err, LexError::UnterminatedArith);
+    }
+
+    #[test]
+    fn scan_braced_operand_simple() {
+        let mut chars = "foo}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "foo");
+    }
+
+    #[test]
+    fn scan_braced_operand_nested_braces() {
+        let mut chars = "${Y}}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "${Y}");
+    }
+
+    #[test]
+    fn scan_braced_operand_double_quote_protects_brace() {
+        let mut chars = "\"a}b\"c}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "\"a}b\"c");
+    }
+
+    #[test]
+    fn scan_braced_operand_single_quote_protects_brace() {
+        let mut chars = "'a}b'c}".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "'a}b'c");
+    }
+
+    #[test]
+    fn scan_braced_operand_unterminated_is_error() {
+        let mut chars = "foo".chars().peekable();
+        assert_eq!(scan_braced_operand(&mut chars).unwrap_err(), LexError::UnterminatedBrace);
+    }
+
+    #[test]
+    fn parse_braced_operand_single_word() {
+        let w = parse_braced_operand("foo").unwrap();
+        assert_eq!(w.0.len(), 1);
+        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn parse_braced_operand_two_words_join_with_space() {
+        let w = parse_braced_operand("foo bar").unwrap();
+        assert_eq!(w.0.len(), 3);
+        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
+        assert_eq!(w.0[1], WordPart::Literal { text: " ".to_string(), quoted: false });
+        assert_eq!(w.0[2], WordPart::Literal { text: "bar".to_string(), quoted: false });
+    }
+
+    #[test]
+    fn parse_braced_operand_top_level_pipe_is_error() {
+        assert_eq!(parse_braced_operand("foo | bar").unwrap_err(), LexError::InvalidBraceOperand);
+    }
+
+    #[test]
+    fn parse_braced_operand_empty_returns_empty_word() {
+        let w = parse_braced_operand("").unwrap();
+        assert_eq!(w.0.len(), 0);
     }
 }
