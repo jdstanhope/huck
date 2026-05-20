@@ -173,8 +173,20 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::ParamExpansion { .. } => {
-                unreachable!("ParamExpansion: lexer wiring lands in a later task");
+            WordPart::ParamExpansion { name, modifier, quoted } => {
+                match crate::param_expansion::expand_modifier(name, modifier, shell) {
+                    crate::param_expansion::ExpansionResult::Value(v) => {
+                        if *quoted {
+                            current.push_str(&v, true);
+                            has_emitted = true;
+                        } else {
+                            emit_split_fields(&v, &mut current, &mut result, &mut has_emitted);
+                        }
+                    }
+                    crate::param_expansion::ExpansionResult::Empty => {
+                        has_emitted = true;
+                    }
+                }
             }
         }
     }
@@ -223,8 +235,11 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     }
                 }
             }
-            WordPart::ParamExpansion { .. } => {
-                unreachable!("ParamExpansion in assignment context: lexer wiring lands in a later task");
+            WordPart::ParamExpansion { name, modifier, .. } => {
+                match crate::param_expansion::expand_modifier(name, modifier, shell) {
+                    crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
+                    crate::param_expansion::ExpansionResult::Empty => {}
+                }
             }
         }
     }
@@ -1085,6 +1100,92 @@ mod tests {
         }]);
         let value = expand_assignment(&word, &mut shell);
         assert_eq!(value, "42");
+    }
+
+    #[test]
+    fn expand_param_expansion_use_default_unquoted_unset() {
+        use crate::lexer::ParamModifier;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::ParamExpansion {
+            name: "HUCK_TEST_PE_E1".to_string(),
+            modifier: ParamModifier::UseDefault {
+                word: Word(vec![WordPart::Literal { text: "fallback".to_string(), quoted: false }]),
+                colon: true,
+            },
+            quoted: false,
+        }]);
+        let fields = expand(&word, &mut shell);
+        let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        assert_eq!(strings, vec!["fallback".to_string()]);
+    }
+
+    #[test]
+    fn expand_param_expansion_quoted_value_with_space_stays_one_field() {
+        use crate::lexer::ParamModifier;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::ParamExpansion {
+            name: "HUCK_TEST_PE_E2".to_string(),
+            modifier: ParamModifier::UseDefault {
+                word: Word(vec![WordPart::Literal { text: "a b c".to_string(), quoted: false }]),
+                colon: true,
+            },
+            quoted: true,
+        }]);
+        let fields = expand(&word, &mut shell);
+        let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        assert_eq!(strings, vec!["a b c".to_string()]);
+    }
+
+    #[test]
+    fn expand_param_expansion_unquoted_value_with_space_splits() {
+        use crate::lexer::ParamModifier;
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_E3", "a b c".to_string());
+        let word = Word(vec![WordPart::ParamExpansion {
+            name: "HUCK_TEST_PE_E3".to_string(),
+            modifier: ParamModifier::UseDefault {
+                word: Word(vec![]),
+                colon: true,
+            },
+            quoted: false,
+        }]);
+        let fields = expand(&word, &mut shell);
+        let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        assert_eq!(strings, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn expand_assignment_param_expansion_no_split() {
+        use crate::lexer::ParamModifier;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::ParamExpansion {
+            name: "HUCK_TEST_PE_E4".to_string(),
+            modifier: ParamModifier::UseDefault {
+                word: Word(vec![WordPart::Literal { text: "a b c".to_string(), quoted: false }]),
+                colon: true,
+            },
+            quoted: false,
+        }]);
+        let value = expand_assignment(&word, &mut shell);
+        assert_eq!(value, "a b c");
+    }
+
+    #[test]
+    fn expand_param_expansion_error_yields_empty_field_sets_status() {
+        use crate::lexer::ParamModifier;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::ParamExpansion {
+            name: "HUCK_TEST_PE_E5".to_string(),
+            modifier: ParamModifier::ErrorIfUnset {
+                word: Word(vec![WordPart::Literal { text: "missing".to_string(), quoted: false }]),
+                colon: true,
+            },
+            quoted: false,
+        }]);
+        let fields = expand(&word, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "");
+        assert_eq!(shell.last_status(), 1);
     }
 
     #[test]
