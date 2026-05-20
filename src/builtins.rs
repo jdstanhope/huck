@@ -16,7 +16,7 @@ pub enum ExecOutcome {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill" | "disown"
+        "cd" | "exit" | "pwd" | "echo" | "export" | "unset" | "jobs" | "wait" | "fg" | "bg" | "kill" | "disown" | "history"
     )
 }
 
@@ -42,6 +42,7 @@ pub fn run_builtin(
         "bg" => builtin_bg(args, out, shell),
         "kill" => builtin_kill(args, shell),
         "disown" => builtin_disown(args, shell),
+        "history" => builtin_history(args, out, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -609,6 +610,31 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
 
     eprintln!("[{id}]+ {command} &");
     ExecOutcome::Continue(0)
+}
+
+fn builtin_history(
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    match args.first().map(|s| s.as_str()) {
+        None => {
+            for (number, command) in shell.history.entries() {
+                if writeln!(out, "{number:>5}\t{command}").is_err() {
+                    return ExecOutcome::Continue(1);
+                }
+            }
+            ExecOutcome::Continue(0)
+        }
+        Some("-c") => {
+            shell.history.clear();
+            ExecOutcome::Continue(0)
+        }
+        Some(other) => {
+            eprintln!("huck: history: {other}: invalid option");
+            ExecOutcome::Continue(1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1210,5 +1236,43 @@ mod disown_tests {
         let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn history_lists_numbered_entries() {
+        let mut shell = Shell::new();
+        shell.history.add("first cmd".to_string());
+        shell.history.add("second cmd".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("history", &[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("first cmd"), "output: {text}");
+        assert!(text.contains("second cmd"), "output: {text}");
+        assert!(text.contains("1"), "output should have numbers: {text}");
+    }
+
+    #[test]
+    fn history_dash_c_clears() {
+        let mut shell = Shell::new();
+        shell.history.add("doomed".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("history", &["-c".to_string()], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.history.last(), None);
+    }
+
+    #[test]
+    fn history_invalid_option_errors() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("history", &["--bogus".to_string()], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 }
