@@ -80,6 +80,42 @@ impl History {
         self.entries.clear();
         self.base_number = 1;
     }
+
+    /// Reads the histfile into `entries`, keeping the most recent `max`
+    /// lines. A missing file loads as empty history. Other I/O errors
+    /// print a warning and leave history empty.
+    pub fn load(&mut self) {
+        let Some(path) = &self.file else { return };
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let mut lines: Vec<String> =
+                    contents.lines().map(|l| l.to_string()).collect();
+                if lines.len() > self.max {
+                    lines.drain(0..lines.len() - self.max);
+                }
+                self.entries = lines;
+                self.base_number = 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("huck: warning: could not read history file: {e}");
+            }
+        }
+    }
+
+    /// Writes `entries` to the histfile, one command per line, overwriting.
+    /// A write error prints a warning; it never aborts the shell.
+    pub fn save(&self) {
+        let Some(path) = &self.file else { return };
+        let mut out = String::new();
+        for entry in &self.entries {
+            out.push_str(entry);
+            out.push('\n');
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            eprintln!("huck: warning: could not write history file: {e}");
+        }
+    }
 }
 
 impl Default for History {
@@ -176,5 +212,68 @@ mod tests {
         assert_eq!(h.last(), None);
         h.add("fresh".to_string());
         assert_eq!(h.get(1), Some("fresh"));
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+
+        let writer = History {
+            entries: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            base_number: 1,
+            max: 1000,
+            file: Some(path.clone()),
+        };
+        writer.save();
+
+        let mut reader = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 1000,
+            file: Some(path.clone()),
+        };
+        reader.load();
+        let collected: Vec<(usize, &str)> = reader.entries().collect();
+        assert_eq!(collected, vec![(1, "one"), (2, "two"), (3, "three")]);
+    }
+
+    #[test]
+    fn load_missing_file_is_empty_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist");
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 1000,
+            file: Some(path),
+        };
+        h.load();
+        assert_eq!(h.last(), None);
+    }
+
+    #[test]
+    fn load_truncates_to_max_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        std::fs::write(&path, "c1\nc2\nc3\nc4\nc5\n").unwrap();
+
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 3,
+            file: Some(path),
+        };
+        h.load();
+        let collected: Vec<(usize, &str)> = h.entries().collect();
+        assert_eq!(collected, vec![(1, "c3"), (2, "c4"), (3, "c5")]);
+    }
+
+    #[test]
+    fn load_and_save_no_op_when_file_is_none() {
+        let mut h = History { entries: Vec::new(), base_number: 1, max: 1000, file: None };
+        h.load();
+        h.save();
+        assert_eq!(h.last(), None);
     }
 }
