@@ -4,6 +4,26 @@ use std::path::PathBuf;
 
 const HISTORY_MAX: usize = 1000;
 
+/// A history-expansion failure. The shell prints these and refuses to
+/// run the offending line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistError {
+    /// A referenced event (`!foo`, `!99`, `!-99`, `!!`) does not exist.
+    EventNotFound(String),
+    /// A `^old^new^` substitution failed (no previous command, or `old`
+    /// not found in it).
+    Substitution(String),
+}
+
+impl std::fmt::Display for HistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EventNotFound(t) => write!(f, "{t}: event not found"),
+            Self::Substitution(o) => write!(f, "{o}: substitution failed"),
+        }
+    }
+}
+
 /// In-memory command history with absolute entry numbering. The entry at
 /// index `i` has display number `base_number + i`. When the cap is hit,
 /// the oldest entry is dropped and `base_number` increments, so live
@@ -138,6 +158,135 @@ fn resolve_histfile() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Expands history references in `line`. Returns `Ok(None)` if nothing
+/// changed, `Ok(Some(expanded))` if at least one reference expanded, or
+/// `Err` if a referenced event could not be resolved.
+pub fn expand(line: &str, history: &History) -> Result<Option<String>, HistError> {
+    if !line.contains('!') {
+        return Ok(None);
+    }
+    scan(line, history)
+}
+
+/// Walks the line, tracking quote state, and replaces `!`-references.
+fn scan(line: &str, history: &History) -> Result<Option<String>, HistError> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut expanded = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                out.push('\\');
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push('\'');
+                i += 1;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push('"');
+                i += 1;
+            }
+            '!' if !in_single => {
+                let next = chars.get(i + 1).copied();
+                match next {
+                    None => {
+                        out.push('!');
+                        i += 1;
+                    }
+                    Some(n) if n.is_whitespace() || n == '=' || n == '(' => {
+                        out.push('!');
+                        i += 1;
+                    }
+                    Some(_) => match read_event(&chars, i, history)? {
+                        Some((text, consumed)) => {
+                            out.push_str(&text);
+                            i += consumed;
+                            expanded = true;
+                        }
+                        None => {
+                            out.push('!');
+                            i += 1;
+                        }
+                    },
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    if expanded { Ok(Some(out)) } else { Ok(None) }
+}
+
+/// Reads one `!`-event starting at `chars[start]` (which is `!`). Returns
+/// `Some((replacement, chars_consumed))` on a recognized reference,
+/// `None` if the form is not a recognized trigger (caller emits a literal
+/// `!`), or `Err` if a recognized reference failed to resolve.
+fn read_event(
+    chars: &[char],
+    start: usize,
+    history: &History,
+) -> Result<Option<(String, usize)>, HistError> {
+    let after = start + 1;
+    match chars.get(after).copied() {
+        Some('!') => {
+            let text = history
+                .last()
+                .ok_or_else(|| HistError::EventNotFound("!!".to_string()))?;
+            Ok(Some((text.to_string(), 2)))
+        }
+        Some('-') => {
+            let mut j = after + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j == after + 1 {
+                // `!-` not followed by digits — not a trigger.
+                return Ok(None);
+            }
+            let n: usize = chars[after + 1..j].iter().collect::<String>().parse().unwrap();
+            let token: String = chars[start..j].iter().collect();
+            let last_num = history
+                .last_number()
+                .ok_or_else(|| HistError::EventNotFound(token.clone()))?;
+            let target = (last_num + 1).checked_sub(n);
+            match target.and_then(|t| history.get(t)) {
+                Some(s) => Ok(Some((s.to_string(), j - start))),
+                None => Err(HistError::EventNotFound(token)),
+            }
+        }
+        Some(d) if d.is_ascii_digit() => {
+            let mut j = after;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = chars[after..j].iter().collect::<String>().parse().unwrap();
+            let token: String = chars[start..j].iter().collect();
+            match history.get(n) {
+                Some(s) => Ok(Some((s.to_string(), j - start))),
+                None => Err(HistError::EventNotFound(token)),
+            }
+        }
+        // `!$`, `!^`, `!*`, `!string` are added in Task 5.
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +424,107 @@ mod tests {
         h.load();
         h.save();
         assert_eq!(h.last(), None);
+    }
+
+    fn hist_with(cmds: &[&str]) -> History {
+        let mut h = History { entries: Vec::new(), base_number: 1, max: 1000, file: None };
+        for c in cmds {
+            h.add(c.to_string());
+        }
+        h
+    }
+
+    #[test]
+    fn expand_no_bang_is_noop() {
+        let h = hist_with(&["echo hi"]);
+        assert_eq!(expand("ls -l", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_bang_is_previous_command() {
+        let h = hist_with(&["echo one", "ls -l"]);
+        assert_eq!(expand("!!", &h).unwrap(), Some("ls -l".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_bang_embedded_in_line() {
+        let h = hist_with(&["ls -l"]);
+        assert_eq!(expand("sudo !!", &h).unwrap(), Some("sudo ls -l".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_n_absolute() {
+        let h = hist_with(&["first", "second", "third"]);
+        assert_eq!(expand("!2", &h).unwrap(), Some("second".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_n_out_of_range_errors() {
+        let h = hist_with(&["only"]);
+        assert!(matches!(expand("!9", &h).unwrap_err(), HistError::EventNotFound(_)));
+    }
+
+    #[test]
+    fn expand_bang_minus_n() {
+        let h = hist_with(&["first", "second", "third"]);
+        assert_eq!(expand("!-1", &h).unwrap(), Some("third".to_string()));
+        assert_eq!(expand("!-2", &h).unwrap(), Some("second".to_string()));
+    }
+
+    #[test]
+    fn expand_bang_minus_n_out_of_range_errors() {
+        let h = hist_with(&["one"]);
+        assert!(matches!(expand("!-5", &h).unwrap_err(), HistError::EventNotFound(_)));
+    }
+
+    #[test]
+    fn expand_bang_bang_no_history_errors() {
+        let h = hist_with(&[]);
+        assert!(matches!(expand("!!", &h).unwrap_err(), HistError::EventNotFound(_)));
+    }
+
+    #[test]
+    fn expand_bang_before_whitespace_is_literal() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("echo ! hi", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_before_equals_is_literal() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("x != y", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_at_end_of_line_is_literal() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("echo hi!", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_inside_single_quotes_is_literal() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("echo '!!'", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_bang_inside_double_quotes_still_expands() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("echo \"!!\"", &h).unwrap(), Some("echo \"prev\"".to_string()));
+    }
+
+    #[test]
+    fn expand_single_quote_inside_double_quote_not_a_quote_region() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(
+            expand("echo \"it's !!\"", &h).unwrap(),
+            Some("echo \"it's prev\"".to_string())
+        );
+    }
+
+    #[test]
+    fn expand_escaped_bang_is_literal() {
+        let h = hist_with(&["prev"]);
+        assert_eq!(expand("echo \\!!", &h).unwrap(), None);
     }
 }
