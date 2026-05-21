@@ -59,9 +59,39 @@ fn is_binary_op(s: &str) -> bool {
     )
 }
 
-/// Applies a unary operator. Implemented in Task 2.
-fn apply_unary(op: &str, _operand: &str) -> Result<bool, String> {
-    Err(format!("{op}: operator not yet implemented"))
+/// Applies a unary operator to its operand.
+fn apply_unary(op: &str, operand: &str) -> Result<bool, String> {
+    match op {
+        "-z" => Ok(operand.is_empty()),
+        "-n" => Ok(!operand.is_empty()),
+        "-e" => Ok(std::fs::metadata(operand).is_ok()),
+        "-f" => Ok(std::fs::metadata(operand)
+            .map(|m| m.is_file())
+            .unwrap_or(false)),
+        "-d" => Ok(std::fs::metadata(operand)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)),
+        "-s" => Ok(std::fs::metadata(operand)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)),
+        "-L" => Ok(std::fs::symlink_metadata(operand)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)),
+        "-r" => Ok(access(operand, libc::R_OK)),
+        "-w" => Ok(access(operand, libc::W_OK)),
+        "-x" => Ok(access(operand, libc::X_OK)),
+        _ => Err(format!("{op}: unknown operator")),
+    }
+}
+
+/// True if the calling process can access `path` with `mode`
+/// (`libc::R_OK` / `W_OK` / `X_OK`), per `access(2)`.
+fn access(path: &str, mode: i32) -> bool {
+    use std::ffi::CString;
+    let Ok(c_path) = CString::new(path) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
 }
 
 /// Applies a binary operator. Implemented in Task 3.
@@ -122,5 +152,80 @@ mod tests {
     #[test]
     fn four_args_without_leading_bang_is_usage_error() {
         assert!(evaluate(&args(&["a", "b", "c", "d"])).is_err());
+    }
+
+    #[test]
+    fn unary_string_z_and_n() {
+        assert_eq!(evaluate(&args(&["-z", ""])), Ok(true));
+        assert_eq!(evaluate(&args(&["-z", "x"])), Ok(false));
+        assert_eq!(evaluate(&args(&["-n", "x"])), Ok(true));
+        assert_eq!(evaluate(&args(&["-n", ""])), Ok(false));
+    }
+
+    #[test]
+    fn unary_file_exists_and_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular");
+        std::fs::write(&file, b"data").unwrap();
+        let subdir = dir.path().join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        let file_s = file.to_str().unwrap();
+        let dir_s = subdir.to_str().unwrap();
+
+        assert_eq!(evaluate(&args(&["-e", file_s])), Ok(true));
+        assert_eq!(evaluate(&args(&["-e", dir_s])), Ok(true));
+        assert_eq!(evaluate(&args(&["-f", file_s])), Ok(true));
+        assert_eq!(evaluate(&args(&["-f", dir_s])), Ok(false));
+        assert_eq!(evaluate(&args(&["-d", dir_s])), Ok(true));
+        assert_eq!(evaluate(&args(&["-d", file_s])), Ok(false));
+    }
+
+    #[test]
+    fn unary_file_nonexistent_is_false_not_error() {
+        let r = evaluate(&args(&["-f", "/no/such/huck/path"]));
+        assert_eq!(r, Ok(false));
+    }
+
+    #[test]
+    fn unary_size_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let full = dir.path().join("full");
+        std::fs::write(&full, b"content").unwrap();
+        assert_eq!(evaluate(&args(&["-s", empty.to_str().unwrap()])), Ok(false));
+        assert_eq!(evaluate(&args(&["-s", full.to_str().unwrap()])), Ok(true));
+    }
+
+    #[test]
+    fn unary_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(evaluate(&args(&["-L", link.to_str().unwrap()])), Ok(true));
+        assert_eq!(evaluate(&args(&["-L", target.to_str().unwrap()])), Ok(false));
+        assert_eq!(evaluate(&args(&["-f", link.to_str().unwrap()])), Ok(true));
+    }
+
+    #[test]
+    fn unary_readable_true_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("readable");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(evaluate(&args(&["-r", file.to_str().unwrap()])), Ok(true));
+        assert_eq!(evaluate(&args(&["-w", file.to_str().unwrap()])), Ok(true));
+    }
+
+    #[test]
+    fn unary_negation_over_file_test() {
+        let r = evaluate(&args(&["!", "-f", "/no/such/huck/path"]));
+        assert_eq!(r, Ok(true));
+    }
+
+    #[test]
+    fn unary_unknown_operator_in_one_arg_position_is_truthiness() {
+        assert_eq!(evaluate(&args(&["-q"])), Ok(true));
     }
 }
