@@ -5,7 +5,7 @@ use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, St
 
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
-    Command, Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
+    Command, Connector, ExecCommand, IfClause, Pipeline, Redirect, Sequence, SimpleCommand,
 };
 use crate::expand::{expand, expand_assignment, glob_expand_fields};
 use crate::shell_state::Shell;
@@ -72,8 +72,34 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
 fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     match cmd {
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
-        Command::If(_) => unreachable!("if execution lands in v17 task 3"),
+        Command::If(clause) => run_if(clause, shell, sink),
     }
+}
+
+/// Runs an `if` clause: evaluate the condition, then run the first
+/// branch whose condition succeeds (exit 0), or the `else` body, or
+/// nothing (status 0). An `exit` anywhere inside propagates.
+fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    let cond = execute_sequence_body(&clause.condition, shell, sink);
+    if matches!(cond, ExecOutcome::Exit(_)) {
+        return cond;
+    }
+    if matches!(cond, ExecOutcome::Continue(0)) {
+        return execute_sequence_body(&clause.then_body, shell, sink);
+    }
+    for elif in &clause.elif_branches {
+        let elif_cond = execute_sequence_body(&elif.condition, shell, sink);
+        if matches!(elif_cond, ExecOutcome::Exit(_)) {
+            return elif_cond;
+        }
+        if matches!(elif_cond, ExecOutcome::Continue(0)) {
+            return execute_sequence_body(&elif.body, shell, sink);
+        }
+    }
+    if let Some(else_body) = &clause.else_body {
+        return execute_sequence_body(else_body, shell, sink);
+    }
+    ExecOutcome::Continue(0)
 }
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
@@ -929,8 +955,53 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
+    use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
+
+    /// A top-level sequence wrapping a single Command.
+    fn seq_of(cmd: Command) -> Sequence {
+        Sequence { first: cmd, rest: vec![], background: false }
+    }
+
+    /// A one-pipeline Sequence running `echo <word>`.
+    fn echo_seq(word: &str) -> Sequence {
+        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: ww("echo"),
+                    args: vec![ww(word)],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        }
+    }
+
+    /// A one-pipeline condition Sequence with a known exit status: true
+    /// (exit 0) when `succeed`, false (exit 1) otherwise. Built from the
+    /// side-effect-free `test` builtin — `test 0 -eq 0` succeeds,
+    /// `test 1 -eq 0` fails.
+    fn cond_seq(succeed: bool) -> Sequence {
+        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let lhs = if succeed { "0" } else { "1" };
+        Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: ww("test"),
+                    args: vec![ww(lhs), ww("-eq"), ww("0")],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        }
+    }
 
     fn lit_word(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
@@ -952,6 +1023,64 @@ mod tests {
             rest: vec![],
             background: false,
         }
+    }
+
+    #[test]
+    fn if_true_condition_runs_then_body() {
+        let clause = IfClause {
+            condition: cond_seq(true),
+            then_body: echo_seq("yes"),
+            elif_branches: vec![],
+            else_body: None,
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq_of(Command::If(Box::new(clause))), &mut shell);
+        assert_eq!(out.trim(), "yes");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn if_false_condition_runs_else_body() {
+        let clause = IfClause {
+            condition: cond_seq(false),
+            then_body: echo_seq("yes"),
+            elif_branches: vec![],
+            else_body: Some(echo_seq("no")),
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&seq_of(Command::If(Box::new(clause))), &mut shell);
+        assert_eq!(out.trim(), "no");
+    }
+
+    #[test]
+    fn if_false_no_else_runs_nothing_status_zero() {
+        let clause = IfClause {
+            condition: cond_seq(false),
+            then_body: echo_seq("yes"),
+            elif_branches: vec![],
+            else_body: None,
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&seq_of(Command::If(Box::new(clause))), &mut shell);
+        assert_eq!(out.trim(), "");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn if_elif_selects_matching_branch() {
+        use crate::command::ElifBranch;
+        let clause = IfClause {
+            condition: cond_seq(false),
+            then_body: echo_seq("a"),
+            elif_branches: vec![ElifBranch {
+                condition: cond_seq(true),
+                body: echo_seq("b"),
+            }],
+            else_body: Some(echo_seq("c")),
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&seq_of(Command::If(Box::new(clause))), &mut shell);
+        assert_eq!(out.trim(), "b");
     }
 
     #[test]
