@@ -195,3 +195,77 @@ fn tab_completes_variable() {
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
+
+#[test]
+fn up_arrow_recalls_previous() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo recallmarker");
+    send(&mut session, ENTER);
+    expect(&mut session, "recallmarker"); // sync past the command
+    expect(&mut session, "huck> ");       // sync to the next prompt
+    send(&mut session, UP);
+    // If up-arrow recalled the entry, the line is redrawn as the full
+    // previous command.
+    expect(&mut session, "echo recallmarker");
+    send(&mut session, ENTER);
+    expect(&mut session, "recallmarker"); // it ran again
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn up_arrow_twice_recalls_older() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo olderone");
+    send(&mut session, ENTER);
+    expect(&mut session, "olderone");
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo newertwo");
+    send(&mut session, ENTER);
+    expect(&mut session, "newertwo");
+    expect(&mut session, "huck> ");
+    send(&mut session, UP);
+    send(&mut session, UP);
+    expect(&mut session, "echo olderone");
+    send(&mut session, ENTER);
+    expect(&mut session, "olderone");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn down_arrow_navigates_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo firstcmd");
+    send(&mut session, ENTER);
+    expect(&mut session, "firstcmd");
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo secondcmd");
+    send(&mut session, ENTER);
+    expect(&mut session, "secondcmd");
+    expect(&mut session, "huck> ");
+    send(&mut session, UP);
+    send(&mut session, UP);
+    expect(&mut session, "echo firstcmd");
+    send(&mut session, DOWN);
+    expect(&mut session, "echo secondcmd");
+    send(&mut session, ENTER);
+    expect(&mut session, "secondcmd");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
