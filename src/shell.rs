@@ -150,6 +150,8 @@ fn parse_error_message(error: ParseError) -> &'static str {
         ParseError::BackgroundedMultiPipelineSequence => {
             "'&' on multi-command sequence not supported; use a single pipeline"
         }
+        ParseError::UnterminatedIf => "unterminated 'if' (expected 'fi')",
+        ParseError::UnexpectedKeyword(_) => "unexpected keyword",
     }
 }
 
