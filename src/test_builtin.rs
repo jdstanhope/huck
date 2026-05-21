@@ -94,9 +94,32 @@ fn access(path: &str, mode: i32) -> bool {
     unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
 }
 
-/// Applies a binary operator. Implemented in Task 3.
-fn apply_binary(op: &str, _lhs: &str, _rhs: &str) -> Result<bool, String> {
-    Err(format!("{op}: operator not yet implemented"))
+/// Applies a binary operator to its two operands.
+fn apply_binary(op: &str, lhs: &str, rhs: &str) -> Result<bool, String> {
+    match op {
+        "=" | "==" => Ok(lhs == rhs),
+        "!=" => Ok(lhs != rhs),
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            let l = parse_int(lhs)?;
+            let r = parse_int(rhs)?;
+            Ok(match op {
+                "-eq" => l == r,
+                "-ne" => l != r,
+                "-lt" => l < r,
+                "-le" => l <= r,
+                "-gt" => l > r,
+                "-ge" => l >= r,
+                _ => unreachable!("checked by the outer match"),
+            })
+        }
+        _ => Err(format!("{op}: unknown operator")),
+    }
+}
+
+/// Parses a `test` integer operand (decimal `i64`).
+fn parse_int(s: &str) -> Result<i64, String> {
+    s.parse::<i64>()
+        .map_err(|_| "integer expression expected".to_string())
 }
 
 #[cfg(test)]
@@ -227,5 +250,54 @@ mod tests {
     #[test]
     fn unary_unknown_operator_in_one_arg_position_is_truthiness() {
         assert_eq!(evaluate(&args(&["-q"])), Ok(true));
+    }
+
+    #[test]
+    fn binary_string_equality() {
+        assert_eq!(evaluate(&args(&["abc", "=", "abc"])), Ok(true));
+        assert_eq!(evaluate(&args(&["abc", "=", "xyz"])), Ok(false));
+        assert_eq!(evaluate(&args(&["abc", "==", "abc"])), Ok(true));
+        assert_eq!(evaluate(&args(&["abc", "!=", "xyz"])), Ok(true));
+        assert_eq!(evaluate(&args(&["abc", "!=", "abc"])), Ok(false));
+    }
+
+    #[test]
+    fn binary_string_empty_operands() {
+        assert_eq!(evaluate(&args(&["", "=", ""])), Ok(true));
+        assert_eq!(evaluate(&args(&["", "=", "x"])), Ok(false));
+    }
+
+    #[test]
+    fn binary_integer_comparisons() {
+        assert_eq!(evaluate(&args(&["3", "-eq", "3"])), Ok(true));
+        assert_eq!(evaluate(&args(&["3", "-ne", "4"])), Ok(true));
+        assert_eq!(evaluate(&args(&["3", "-lt", "10"])), Ok(true));
+        assert_eq!(evaluate(&args(&["10", "-lt", "3"])), Ok(false));
+        assert_eq!(evaluate(&args(&["3", "-le", "3"])), Ok(true));
+        assert_eq!(evaluate(&args(&["10", "-gt", "3"])), Ok(true));
+        assert_eq!(evaluate(&args(&["3", "-ge", "3"])), Ok(true));
+    }
+
+    #[test]
+    fn binary_integer_negative_operands() {
+        assert_eq!(evaluate(&args(&["-5", "-lt", "0"])), Ok(true));
+        assert_eq!(evaluate(&args(&["-5", "-eq", "-5"])), Ok(true));
+    }
+
+    #[test]
+    fn binary_integer_non_integer_operand_is_error() {
+        assert!(evaluate(&args(&["abc", "-eq", "3"])).is_err());
+        assert!(evaluate(&args(&["3", "-eq", "abc"])).is_err());
+    }
+
+    #[test]
+    fn binary_negation_over_comparison() {
+        assert_eq!(evaluate(&args(&["!", "a", "=", "b"])), Ok(true));
+        assert_eq!(evaluate(&args(&["!", "a", "=", "a"])), Ok(false));
+    }
+
+    #[test]
+    fn binary_negation_over_failing_comparison_stays_error() {
+        assert!(evaluate(&args(&["!", "abc", "-eq", "3"])).is_err());
     }
 }
