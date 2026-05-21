@@ -217,13 +217,15 @@ pub enum ParseError {
     UnterminatedIf,
     UnexpectedKeyword(String),
     UnterminatedLoop,
+    UnexpectedToken,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    if tokens.is_empty() {
+    let mut iter = tokens.into_iter().peekable();
+    skip_newlines(&mut iter);
+    if iter.peek().is_none() {
         return Ok(None);
     }
-    let mut iter = tokens.into_iter().peekable();
     let seq = parse_sequence(&mut iter, &[])?;
     Ok(Some(seq))
 }
@@ -267,7 +269,8 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 background = true;
                 break;
             }
-            Token::Op(Operator::Semi) => {
+            Token::Op(Operator::Semi) | Token::Newline => {
+                skip_newlines(iter);
                 match iter.peek() {
                     None => break,
                     Some(tok) => {
@@ -279,16 +282,20 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 rest.push((Connector::Semi, parse_command(iter)?));
             }
             Token::Op(Operator::And) => {
+                skip_newlines(iter);
                 rest.push((Connector::And, parse_command(iter)?));
             }
             Token::Op(Operator::Or) => {
+                skip_newlines(iter);
                 rest.push((Connector::Or, parse_command(iter)?));
             }
             other => {
                 if let Some(kw) = keyword_of(&other) {
                     return Err(ParseError::UnexpectedKeyword(kw.name().to_string()));
                 }
-                unreachable!("unexpected non-operator, non-keyword token after a command: {other:?}")
+                // A non-keyword, non-connector token after a command —
+                // e.g. a stray word or `|` after a closed `if`/`while`.
+                return Err(ParseError::UnexpectedToken);
             }
         }
     }
@@ -300,6 +307,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
 fn parse_command<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Command, ParseError> {
+    skip_newlines(iter);
     match iter.peek().and_then(keyword_of) {
         Some(Keyword::If) => Ok(Command::If(Box::new(parse_if(iter)?))),
         Some(Keyword::While) | Some(Keyword::Until) => {
@@ -307,6 +315,14 @@ fn parse_command<I: Iterator<Item = Token>>(
         }
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
+    }
+}
+
+/// Consumes a run of `Newline` tokens. Newlines are soft separators —
+/// they are skipped wherever a command is expected but not yet present.
+fn skip_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) {
+    while matches!(iter.peek(), Some(Token::Newline)) {
+        iter.next();
     }
 }
 
@@ -322,27 +338,52 @@ fn expect_keyword<I: Iterator<Item = Token>>(
     }
 }
 
+/// Runs `parse_sequence` for a compound command's condition or body.
+/// If it fails with `MissingCommand` because input simply ran out
+/// (the iterator is exhausted), the failure is the compound command
+/// being unterminated — report `unterminated` instead. A
+/// `MissingCommand` with tokens still pending is a genuine error and
+/// passes through unchanged.
+fn parse_compound_section<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+    stop_at: &[Keyword],
+    unterminated: ParseError,
+) -> Result<Sequence, ParseError> {
+    match parse_sequence(iter, stop_at) {
+        Err(ParseError::MissingCommand) if iter.peek().is_none() => Err(unterminated),
+        other => other,
+    }
+}
+
 /// Parses `if LIST; then LIST; [elif LIST; then LIST;]... [else LIST;] fi`.
 fn parse_if<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<IfClause, ParseError> {
     expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
-    let condition = parse_sequence(iter, &[Keyword::Then])?;
+    let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
     expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
-    let then_body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
+    let then_body = parse_compound_section(
+        iter,
+        &[Keyword::Elif, Keyword::Else, Keyword::Fi],
+        ParseError::UnterminatedIf,
+    )?;
 
     let mut elif_branches = Vec::new();
     while iter.peek().and_then(keyword_of) == Some(Keyword::Elif) {
         iter.next(); // consume `elif`
-        let condition = parse_sequence(iter, &[Keyword::Then])?;
+        let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
         expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
-        let body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
+        let body = parse_compound_section(
+            iter,
+            &[Keyword::Elif, Keyword::Else, Keyword::Fi],
+            ParseError::UnterminatedIf,
+        )?;
         elif_branches.push(ElifBranch { condition, body });
     }
 
     let else_body = if iter.peek().and_then(keyword_of) == Some(Keyword::Else) {
         iter.next(); // consume `else`
-        Some(parse_sequence(iter, &[Keyword::Fi])?)
+        Some(parse_compound_section(iter, &[Keyword::Fi], ParseError::UnterminatedIf)?)
     } else {
         None
     };
@@ -361,9 +402,9 @@ fn parse_while<I: Iterator<Item = Token>>(
         Some(Keyword::Until) => true,
         _ => unreachable!("parse_command guarantees a while/until keyword here"),
     };
-    let condition = parse_sequence(iter, &[Keyword::Do])?;
+    let condition = parse_compound_section(iter, &[Keyword::Do], ParseError::UnterminatedLoop)?;
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
-    let body = parse_sequence(iter, &[Keyword::Done])?;
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
     expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
     Ok(WhileClause { condition, body, until })
 }
@@ -412,6 +453,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                     stdout.take(),
                     stderr.take(),
                 ));
+                skip_newlines(iter);
             }
             Token::Op(op) => {
                 let target = match iter.next() {
@@ -1270,5 +1312,122 @@ mod tests {
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
             commands: vec![plain("echo", &["while"])],
         }));
+    }
+
+    #[test]
+    fn multiline_if_parses_same_as_singleline() {
+        let multiline = parse(vec![
+            kw("if"), w_tok("a"), Token::Newline,
+            kw("then"), w_tok("b"), Token::Newline,
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let singleline = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        assert_eq!(multiline, singleline);
+    }
+
+    #[test]
+    fn newline_after_then_is_skipped() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Newline,
+            kw("then"), Token::Newline,
+            w_tok("b"), Token::Newline,
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let clause = first_if(&seq);
+        assert_eq!(
+            clause.then_body.first,
+            Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] })
+        );
+    }
+
+    #[test]
+    fn multiline_while_parses() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Newline,
+            kw("do"), w_tok("b"), Token::Newline,
+            kw("done"),
+        ]).unwrap().unwrap();
+        let clause = first_while(&seq);
+        assert!(!clause.until);
+        assert_eq!(
+            clause.body.first,
+            Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] })
+        );
+    }
+
+    #[test]
+    fn newline_separates_top_level_commands() {
+        let seq = parse(vec![w_tok("a"), Token::Newline, w_tok("b")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq.rest.len(), 1);
+        assert_eq!(seq.rest[0].0, Connector::Semi);
+    }
+
+    #[test]
+    fn leading_newlines_are_skipped() {
+        let seq = parse(vec![Token::Newline, Token::Newline, w_tok("a")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
+    }
+
+    #[test]
+    fn all_newline_buffer_is_none() {
+        assert_eq!(parse(vec![Token::Newline, Token::Newline]), Ok(None));
+    }
+
+    #[test]
+    fn newline_after_pipe_continues_pipeline() {
+        let seq = parse(vec![
+            w_tok("a"), Token::Op(Operator::Pipe), Token::Newline, w_tok("b"),
+        ]).unwrap().unwrap();
+        let p = first_pipeline(&seq);
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn trailing_semicolon_then_newline_is_not_an_error() {
+        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), Token::Newline])
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq.rest.len(), 0);
+    }
+
+    #[test]
+    fn then_followed_by_semicolon_still_errors() {
+        let result = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), Token::Op(Operator::Semi),
+            w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stray_word_after_compound_errors_without_panic() {
+        let result = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"), w_tok("extra"),
+        ]);
+        assert_eq!(result, Err(ParseError::UnexpectedToken));
+    }
+
+    #[test]
+    fn if_with_no_body_at_end_of_input_is_unterminated() {
+        let result = parse(vec![kw("if"), w_tok("a"), Token::Newline, kw("then")]);
+        assert_eq!(result, Err(ParseError::UnterminatedIf));
+    }
+
+    #[test]
+    fn while_with_no_body_at_end_of_input_is_unterminated() {
+        let result = parse(vec![kw("while"), w_tok("a"), Token::Newline, kw("do")]);
+        assert_eq!(result, Err(ParseError::UnterminatedLoop));
     }
 }
