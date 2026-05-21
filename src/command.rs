@@ -7,6 +7,10 @@ enum Keyword {
     Elif,
     Else,
     Fi,
+    While,
+    Until,
+    Do,
+    Done,
 }
 
 impl Keyword {
@@ -17,6 +21,10 @@ impl Keyword {
             Keyword::Elif => "elif",
             Keyword::Else => "else",
             Keyword::Fi => "fi",
+            Keyword::While => "while",
+            Keyword::Until => "until",
+            Keyword::Do => "do",
+            Keyword::Done => "done",
         }
     }
 }
@@ -38,6 +46,10 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "elif" => Some(Keyword::Elif),
         "else" => Some(Keyword::Else),
         "fi" => Some(Keyword::Fi),
+        "while" => Some(Keyword::While),
+        "until" => Some(Keyword::Until),
+        "do" => Some(Keyword::Do),
+        "done" => Some(Keyword::Done),
         _ => None,
     }
 }
@@ -164,6 +176,7 @@ pub enum Connector {
 pub enum Command {
     Pipeline(Pipeline),
     If(Box<IfClause>),
+    While(Box<WhileClause>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -172,6 +185,13 @@ pub struct IfClause {
     pub then_body: Sequence,
     pub elif_branches: Vec<ElifBranch>,
     pub else_body: Option<Sequence>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct WhileClause {
+    pub condition: Sequence,
+    pub body: Sequence,
+    pub until: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -196,6 +216,7 @@ pub enum ParseError {
     BackgroundedMultiPipelineSequence,
     UnterminatedIf,
     UnexpectedKeyword(String),
+    UnterminatedLoop,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -281,6 +302,9 @@ fn parse_command<I: Iterator<Item = Token>>(
 ) -> Result<Command, ParseError> {
     match iter.peek().and_then(keyword_of) {
         Some(Keyword::If) => Ok(Command::If(Box::new(parse_if(iter)?))),
+        Some(Keyword::While) | Some(Keyword::Until) => {
+            Ok(Command::While(Box::new(parse_while(iter)?)))
+        }
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
     }
@@ -290,10 +314,11 @@ fn parse_command<I: Iterator<Item = Token>>(
 fn expect_keyword<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
     expected: Keyword,
+    on_missing: ParseError,
 ) -> Result<(), ParseError> {
     match iter.next() {
         Some(ref t) if keyword_of(t) == Some(expected) => Ok(()),
-        _ => Err(ParseError::UnterminatedIf),
+        _ => Err(on_missing),
     }
 }
 
@@ -301,16 +326,16 @@ fn expect_keyword<I: Iterator<Item = Token>>(
 fn parse_if<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<IfClause, ParseError> {
-    expect_keyword(iter, Keyword::If)?;
+    expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
     let condition = parse_sequence(iter, &[Keyword::Then])?;
-    expect_keyword(iter, Keyword::Then)?;
+    expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
     let then_body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
 
     let mut elif_branches = Vec::new();
     while iter.peek().and_then(keyword_of) == Some(Keyword::Elif) {
         iter.next(); // consume `elif`
         let condition = parse_sequence(iter, &[Keyword::Then])?;
-        expect_keyword(iter, Keyword::Then)?;
+        expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
         let body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
         elif_branches.push(ElifBranch { condition, body });
     }
@@ -322,8 +347,25 @@ fn parse_if<I: Iterator<Item = Token>>(
         None
     };
 
-    expect_keyword(iter, Keyword::Fi)?;
+    expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     Ok(IfClause { condition, then_body, elif_branches, else_body })
+}
+
+/// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
+/// The caller has already peeked the leading `while`/`until`.
+fn parse_while<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<WhileClause, ParseError> {
+    let until = match iter.next().as_ref().and_then(keyword_of) {
+        Some(Keyword::While) => false,
+        Some(Keyword::Until) => true,
+        _ => unreachable!("parse_command guarantees a while/until keyword here"),
+    };
+    let condition = parse_sequence(iter, &[Keyword::Do])?;
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+    let body = parse_sequence(iter, &[Keyword::Done])?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    Ok(WhileClause { condition, body, until })
 }
 
 fn parse_pipeline<I: Iterator<Item = Token>>(
@@ -431,6 +473,7 @@ mod tests {
         match &seq.first {
             Command::Pipeline(p) => p,
             Command::If(_) => panic!("expected a pipeline, got an if"),
+            Command::While(_) => panic!("expected a pipeline, got a while"),
         }
     }
 
@@ -892,6 +935,15 @@ mod tests {
         match &seq.first {
             Command::If(c) => c,
             Command::Pipeline(_) => panic!("expected an if, got a pipeline"),
+            Command::While(_) => panic!("expected an if, got a while"),
+        }
+    }
+
+    /// Extracts the WhileClause from a sequence whose first command is a While.
+    fn first_while(seq: &Sequence) -> &WhileClause {
+        match &seq.first {
+            Command::While(c) => c,
+            other => panic!("expected a while, got {other:?}"),
         }
     }
 
@@ -1065,5 +1117,150 @@ mod tests {
             kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
         ]);
         assert_eq!(r, Err(ParseError::UnexpectedBackground));
+    }
+
+    #[test]
+    fn parse_simple_while() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        let c = first_while(&seq);
+        assert_eq!(c.until, false);
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
+        assert_eq!(c.body.first, Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] }));
+    }
+
+    #[test]
+    fn parse_until_sets_flag() {
+        let seq = parse(vec![
+            kw("until"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_while(&seq).until, true);
+    }
+
+    #[test]
+    fn parse_while_andor_condition() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::And), w_tok("b"),
+            Token::Op(Operator::Semi),
+            kw("do"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        let c = first_while(&seq);
+        assert_eq!(c.condition.rest.len(), 1);
+        assert_eq!(c.condition.rest[0].0, Connector::And);
+    }
+
+    #[test]
+    fn parse_while_multi_command_body() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Semi), w_tok("c"),
+            Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_while(&seq).body.rest.len(), 1);
+    }
+
+    #[test]
+    fn parse_while_followed_by_command() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("done"), Token::Op(Operator::Semi), w_tok("echo"),
+        ]).unwrap().unwrap();
+        assert!(matches!(seq.first, Command::While(_)));
+        assert_eq!(seq.rest.len(), 1);
+        assert!(matches!(seq.rest[0].1, Command::Pipeline(_)));
+    }
+
+    #[test]
+    fn parse_nested_while() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"),
+            kw("while"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("done"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert!(matches!(first_while(&seq).body.first, Command::While(_)));
+    }
+
+    #[test]
+    fn parse_while_with_if_body() {
+        let seq = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"),
+            kw("if"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("fi"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert!(matches!(first_while(&seq).body.first, Command::If(_)));
+    }
+
+    #[test]
+    fn parse_while_unterminated_is_error() {
+        let r = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"),
+        ]);
+        assert_eq!(r, Err(ParseError::UnterminatedLoop));
+    }
+
+    #[test]
+    fn parse_while_missing_do_is_error() {
+        let r = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi), kw("done"),
+        ]);
+        assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))));
+    }
+
+    #[test]
+    fn parse_bare_do_is_unexpected_keyword() {
+        assert!(matches!(
+            parse(vec![kw("do"), w_tok("x")]),
+            Err(ParseError::UnexpectedKeyword(_))
+        ));
+    }
+
+    #[test]
+    fn parse_bare_done_is_unexpected_keyword() {
+        assert!(matches!(
+            parse(vec![kw("done")]),
+            Err(ParseError::UnexpectedKeyword(_))
+        ));
+    }
+
+    #[test]
+    fn parse_while_empty_condition_is_missing_command() {
+        let r = parse(vec![
+            kw("while"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Semi), kw("done"),
+        ]);
+        assert_eq!(r, Err(ParseError::MissingCommand));
+    }
+
+    #[test]
+    fn parse_while_background_in_body_is_error() {
+        let r = parse(vec![
+            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("b"), Token::Op(Operator::Background),
+            kw("done"),
+        ]);
+        assert_eq!(r, Err(ParseError::UnexpectedBackground));
+    }
+
+    #[test]
+    fn parse_keyword_while_as_argument_is_literal() {
+        let seq = parse(vec![w_tok("echo"), w_tok("while")]).unwrap().unwrap();
+        assert_eq!(seq.first, Command::Pipeline(Pipeline {
+            commands: vec![plain("echo", &["while"])],
+        }));
     }
 }

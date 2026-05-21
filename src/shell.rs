@@ -152,6 +152,7 @@ fn parse_error_message(error: ParseError) -> String {
         }
         ParseError::UnterminatedIf => "unterminated 'if' (expected 'then'/'fi')".to_string(),
         ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
+        ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
     }
 }
 
