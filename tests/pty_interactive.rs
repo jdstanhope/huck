@@ -69,6 +69,17 @@ fn expect_eof(session: &mut OsSession) {
         .unwrap_or_else(|e| panic!("expected session EOF but: {e}"));
 }
 
+/// Brief pause to let huck cross a terminal-mode boundary that produces
+/// no output to sync on. Used before sending Ctrl-C into a blocking
+/// builtin: rustyline echoes the submitted line *before* huck leaves
+/// raw mode and enters the builtin, so a Ctrl-C sent the instant the
+/// echo is seen can land in raw mode (where `\x03` is a line-edit key,
+/// not a signal). Pausing guarantees huck has reached the cooked-mode
+/// poll loop, so the keystroke becomes a real SIGINT.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(400));
+}
+
 /// Builds a `(HISTFILE=...)` env pointing into `dir`, isolating
 /// history per test.
 #[allow(dead_code)]
@@ -268,4 +279,102 @@ fn down_arrow_navigates_forward() {
     expect(&mut session, "secondcmd");
     send(&mut session, "exit");
     send(&mut session, ENTER);
+}
+
+#[test]
+fn ctrl_c_empty_prompt_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, CTRL_C);
+    // After Ctrl-C rustyline aborts the line and the loop redraws a
+    // fresh prompt. Sync to it before typing so the keystrokes are not
+    // sent into the editor mid-redraw.
+    expect(&mut session, "huck> ");
+    // The shell must still be alive: a command sent afterwards runs.
+    send(&mut session, "echo aftersigint");
+    send(&mut session, ENTER);
+    expect(&mut session, "aftersigint");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn ctrl_c_clears_partial_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    // Type a partial line with NO Enter, then Ctrl-C.
+    send(&mut session, "echo partialXYZ");
+    send(&mut session, CTRL_C);
+    // After Ctrl-C rustyline discards the partial line and the loop
+    // redraws a fresh prompt. Sync to it before typing `pwd` so the
+    // keystrokes are not sent into the editor mid-redraw.
+    expect(&mut session, "huck> ");
+    // Run `pwd`. If Ctrl-C cleared the partial line, `pwd` runs alone
+    // and prints the cwd. If it did NOT clear, the line would be
+    // `echo partialXYZpwd` and the cwd path would never be printed.
+    send(&mut session, "pwd");
+    send(&mut session, ENTER);
+    // The temp dir's unique random component appears only if `pwd`
+    // ran clean — it is never part of the typed input.
+    let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    expect(&mut session, marker);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn ctrl_c_breaks_out_of_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    // Background a long sleep so `wait` blocks.
+    send(&mut session, "sleep 30 &");
+    send(&mut session, ENTER);
+    expect(&mut session, "[1]"); // background job notification
+    expect(&mut session, "huck> ");
+    send(&mut session, "wait");
+    send(&mut session, ENTER);
+    // Sync past the echoed `wait` line, then settle: rustyline echoes
+    // the line *before* huck enters `wait`'s cooked-mode poll loop, so
+    // Ctrl-C sent the instant the echo is seen could be eaten by the
+    // editor in raw mode. The pause guarantees `wait` is blocking.
+    expect(&mut session, "wait");
+    settle();
+    // Ctrl-C must break the blocking `wait` and return to the prompt.
+    send(&mut session, CTRL_C);
+    // Sync to the fresh prompt the loop redraws after `wait` returns,
+    // so `echo afterwait` is not typed during the cooked->raw mode
+    // transition.
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo afterwait");
+    send(&mut session, ENTER);
+    expect(&mut session, "afterwait");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+    // The orphaned `sleep 30` is reparented to init and exits on its
+    // own — harmless.
+}
+
+#[test]
+fn ctrl_d_empty_prompt_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    // Ctrl-D (EOF) at an empty prompt exits the shell.
+    send(&mut session, CTRL_D);
+    expect_eof(&mut session);
 }
