@@ -25,13 +25,14 @@ spec, an implementation plan, and a test suite.
 | v15       | PTY-based interactive test harness                      |
 | v16       | `test` / `[` builtin (file, string, integer tests)      |
 | v17       | `if` control flow (`if`/`elif`/`else`/`fi`)             |
+| v18       | `while`/`until` loops (`break`, `continue`)             |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (650 tests)
+cargo test               # full test suite (679 tests)
 ```
 
 ## Features
@@ -44,7 +45,7 @@ cargo test               # full test suite (650 tests)
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
-`kill`, `disown`, `history`, `test`, `[`.
+`kill`, `disown`, `history`, `test`, `[`, `break`, `continue`.
 
 **Job control (v6 + v7 + v8):**
 Trailing `&` runs a pipeline in its own process group, prints `[N] PID`,
@@ -142,13 +143,21 @@ commands. Single-line form only (parts separated by `;`); multi-line
 `if`, `if` inside a `|` pipeline, and backgrounding a whole `if` are
 not yet implemented.
 
+**`while` / `until` loops (v18):**
+`while LIST; do LIST; done` runs the body while the condition's exit
+status is 0; `until` runs it while the condition is non-zero. `break`
+exits the innermost loop and `continue` skips to its next iteration.
+An infinite `while true; do …; done` is interruptible with Ctrl-C.
+Loops are sequence-level compound commands — they compose with `;`,
+`&&`, `||` and nest. Single-line form only (multi-line `if`/loops are
+a later iteration); `break N` / `continue N` are not implemented.
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
-(`while`/`until`/`for`/`case`), functions, here-docs,
-aliases.
+(`for`/`case`), functions, here-docs, aliases.
 
 ## Project layout
 
