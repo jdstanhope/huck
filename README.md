@@ -23,13 +23,14 @@ spec, an implementation plan, and a test suite.
 | v13       | Command history + history expansion (`!!`, `!$`, `^a^b^`) |
 | v14       | Tab completion (commands, filenames, variables)         |
 | v15       | PTY-based interactive test harness                      |
+| v16       | `test` / `[` builtin (file, string, integer tests)      |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (579 tests)
+cargo test               # full test suite (620 tests)
 ```
 
 ## Features
@@ -42,7 +43,7 @@ cargo test               # full test suite (579 tests)
 
 **Builtins:**
 `cd`, `pwd`, `echo`, `exit`, `export`, `unset`, `jobs`, `wait`, `fg`, `bg`,
-`kill`, `disown`, `history`.
+`kill`, `disown`, `history`, `test`, `[`.
 
 **Job control (v6 + v7 + v8):**
 Trailing `&` runs a pipeline in its own process group, prints `[N] PID`,
@@ -121,6 +122,14 @@ backslash-escaped when inserted; a leading `~/` is expanded before
 the directory is scanned; hidden files appear only when the typed
 prefix begins with `.`. Per-command argument completion and `~user`
 completion are not implemented.
+
+**Conditionals (v16):**
+`test EXPR` and `[ EXPR ]` evaluate file tests (`-e`/`-f`/`-d`/
+`-r`/`-w`/`-x`/`-s`/`-L`), string tests (`-z`/`-n`/`=`/`!=`),
+and integer comparisons (`-eq`/`-ne`/`-lt`/`-le`/`-gt`/`-ge`),
+with `!` negation. Exit status is 0 (true), 1 (false), or 2
+(usage error). The `-a`/`-o`/`( )` combinators and `[[ ]]` are
+not implemented; `if` is a separate iteration.
 
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
