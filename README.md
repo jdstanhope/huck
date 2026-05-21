@@ -22,13 +22,14 @@ spec, an implementation plan, and a test suite.
 | v12       | Parameter-expansion modifiers (`${var:-w}`, `${var#pat}`, etc.) |
 | v13       | Command history + history expansion (`!!`, `!$`, `^a^b^`) |
 | v14       | Tab completion (commands, filenames, variables)         |
+| v15       | PTY-based interactive test harness                      |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (566 tests)
+cargo test               # full test suite (579 tests)
 ```
 
 ## Features
@@ -158,12 +159,17 @@ Each iteration follows the same loop:
 4. **Final review** across the whole branch before merging to `main`
 
 Tests live alongside each module in `#[cfg(test)] mod tests` blocks.
+Interactive features (tab completion, history recall, Ctrl-C) are
+covered by a PTY-driven golden-path suite in `tests/pty_interactive.rs`
+using the `expectrl` crate; it skips gracefully where no PTY is
+available.
 
 ## Dependencies
 
 - `rustyline` — line editing
 - `signal-hook` — SIGINT, SIGCHLD
 - `libc` — `waitpid`, `setpgid`, `killpg`, `kill`, `tcsetpgrp`, `signal`
+- `expectrl` — PTY-driven interactive tests (dev-dependency)
 
 ## License
 
