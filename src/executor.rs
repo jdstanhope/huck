@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, St
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
     Command, Connector, ExecCommand, IfClause, Pipeline, Redirect, Sequence, SimpleCommand,
+    WhileClause,
 };
 use crate::expand::{expand, expand_assignment, glob_expand_fields};
 use crate::shell_state::Shell;
@@ -80,8 +81,50 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
     match cmd {
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
         Command::If(clause) => run_if(clause, shell, sink),
-        Command::While(_) => unreachable!("run_while lands in v18 task 3"),
+        Command::While(clause) => run_while(clause, shell, sink),
     }
+}
+
+/// Runs a `while`/`until` loop. The body runs while the condition's
+/// exit status satisfies the loop's polarity. `break` ends the loop;
+/// `continue` jumps to the next condition test; `exit` propagates; a
+/// pending SIGINT (Ctrl-C) ends the loop with status 130.
+fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    use std::sync::atomic::Ordering;
+    let mut last = ExecOutcome::Continue(0);
+    loop {
+        if shell.sigint_flag.load(Ordering::Relaxed) {
+            shell.sigint_flag.store(false, Ordering::Relaxed);
+            return ExecOutcome::Continue(130);
+        }
+        let cond = execute_sequence_body(&clause.condition, shell, sink);
+        let keep_going = match cond {
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                return cond;
+            }
+            ExecOutcome::Continue(c) => {
+                if clause.until { c != 0 } else { c == 0 }
+            }
+        };
+        if !keep_going {
+            break;
+        }
+        match execute_sequence_body(&clause.body, shell, sink) {
+            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
+            ExecOutcome::LoopBreak => {
+                last = ExecOutcome::Continue(0);
+                break;
+            }
+            ExecOutcome::LoopContinue => {
+                last = ExecOutcome::Continue(0);
+                // fall through — the loop re-tests the condition
+            }
+            ExecOutcome::Continue(c) => {
+                last = ExecOutcome::Continue(c);
+            }
+        }
+    }
+    last
 }
 
 /// Runs an `if` clause: evaluate the condition, then run the first
@@ -1254,5 +1297,73 @@ mod tests {
         std::env::set_current_dir(saved).unwrap();
 
         assert_eq!(result, Ok("*".to_string()));
+    }
+
+    use crate::command::WhileClause;
+
+    /// A Sequence wrapping a single `while`/`until` clause.
+    fn while_seq(clause: WhileClause) -> Sequence {
+        Sequence { first: Command::While(Box::new(clause)), rest: vec![], background: false }
+    }
+
+    /// A one-pipeline Sequence running the `break` builtin.
+    fn break_seq() -> Sequence {
+        use crate::command::{ExecCommand, Pipeline};
+        use crate::lexer::{Word, WordPart};
+        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: ww("break"),
+                    args: vec![],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        }
+    }
+
+    #[test]
+    fn while_false_condition_runs_body_zero_times() {
+        let clause = WhileClause {
+            condition: cond_seq(false),
+            body: echo_seq("x"),
+            until: false,
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&while_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn while_true_body_breaks_runs_once() {
+        // while (true); do break; done — `break` ends the loop after one
+        // iteration. Reaching the assertion at all proves termination.
+        let clause = WhileClause {
+            condition: cond_seq(true),
+            body: break_seq(),
+            until: false,
+        };
+        let mut shell = Shell::new();
+        let (_out, status) = execute_capturing(&while_seq(clause), &mut shell);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn until_true_condition_runs_body_zero_times() {
+        // until (test 0 -eq 0 -> true); do echo x; done — `until` stops
+        // immediately when the condition is true.
+        let clause = WhileClause {
+            condition: cond_seq(true),
+            body: echo_seq("x"),
+            until: true,
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&while_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "");
     }
 }
