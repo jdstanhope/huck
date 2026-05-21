@@ -15,7 +15,7 @@ pub enum ExecOutcome {
 
 pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
-    "wait", "fg", "bg", "kill", "disown", "history",
+    "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -45,6 +45,7 @@ pub fn run_builtin(
         "kill" => builtin_kill(args, shell),
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
+        "test" | "[" => builtin_test(name, args),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -639,6 +640,28 @@ fn builtin_history(
     }
 }
 
+fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
+    let eval_args: &[String] = if name == "[" {
+        match args.last() {
+            Some(last) if last == "]" => &args[..args.len() - 1],
+            _ => {
+                eprintln!("huck: [: missing ']'");
+                return ExecOutcome::Continue(2);
+            }
+        }
+    } else {
+        args
+    };
+    match crate::test_builtin::evaluate(eval_args) {
+        Ok(true) => ExecOutcome::Continue(0),
+        Ok(false) => ExecOutcome::Continue(1),
+        Err(msg) => {
+            eprintln!("huck: {name}: {msg}");
+            ExecOutcome::Continue(2)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +860,63 @@ mod tests {
     #[test]
     fn builtin_names_includes_history() {
         assert!(BUILTIN_NAMES.contains(&"history"));
+    }
+
+    #[test]
+    fn builtin_test_true_expression() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let args = vec!["-n".to_string(), "x".to_string()];
+        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn builtin_test_false_expression() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let args = vec!["-z".to_string(), "x".to_string()];
+        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn builtin_test_usage_error() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let args = vec!["3".to_string(), "-eq".to_string(), "abc".to_string()];
+        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn builtin_bracket_strips_trailing_bracket() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let args = vec![
+            "-n".to_string(),
+            "x".to_string(),
+            "]".to_string(),
+        ];
+        let outcome = run_builtin("[", &args, &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn builtin_bracket_missing_close_is_error() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let args = vec!["-n".to_string(), "x".to_string()];
+        let outcome = run_builtin("[", &args, &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn builtin_bracket_empty_is_error() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("[", &[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
 
