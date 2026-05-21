@@ -2235,6 +2235,18 @@ mod tests {
     }
 
     #[test]
+    fn newline_inside_single_quotes_stays_literal() {
+        let tokens = tokenize("'a\nb'").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::Literal {
+                text: "a\nb".to_string(),
+                quoted: true,
+            }]))]
+        );
+    }
+
+    #[test]
     fn consecutive_newlines_emit_consecutive_tokens() {
         let tokens = tokenize("a\n\nb").unwrap();
         assert_eq!(
