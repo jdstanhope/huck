@@ -141,17 +141,17 @@ fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     }
 }
 
-fn parse_error_message(error: ParseError) -> &'static str {
+fn parse_error_message(error: ParseError) -> String {
     match error {
-        ParseError::MissingCommand => "expected a command",
-        ParseError::MissingRedirectTarget => "expected a filename after redirection",
-        ParseError::RedirectTargetIsOperator => "expected a filename after redirection",
-        ParseError::UnexpectedBackground => "'&' not allowed here",
+        ParseError::MissingCommand => "expected a command".to_string(),
+        ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
+        ParseError::RedirectTargetIsOperator => "expected a filename after redirection".to_string(),
+        ParseError::UnexpectedBackground => "'&' not allowed here".to_string(),
         ParseError::BackgroundedMultiPipelineSequence => {
-            "'&' on multi-command sequence not supported; use a single pipeline"
+            "'&' on multi-command sequence not supported; use a single pipeline".to_string()
         }
-        ParseError::UnterminatedIf => "unterminated 'if' (expected 'fi')",
-        ParseError::UnexpectedKeyword(_) => "unexpected keyword",
+        ParseError::UnterminatedIf => "unterminated 'if' (expected 'then'/'fi')".to_string(),
+        ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
     }
 }
 
