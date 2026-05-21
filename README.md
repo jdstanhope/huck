@@ -31,7 +31,7 @@ spec, an implementation plan, and a test suite.
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (648 tests)
+cargo test               # full test suite (650 tests)
 ```
 
 ## Features
