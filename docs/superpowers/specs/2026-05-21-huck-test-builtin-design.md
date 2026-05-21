@@ -24,8 +24,10 @@ a real condition command to branch on.
 **Out of scope (deferred):**
 - The `-a` / `-o` / `( )` combinators — POSIX-deprecated and
   ambiguous; modern scripts use `[ ... ] && [ ... ]`
-- `[[ ... ]]` — a separate shell-keyword compound command, not a
-  builtin; a candidate for a later iteration
+- The double-bracket `[[ ... ]]` form — a distinct shell-keyword
+  compound command parsed by the shell grammar, *not* a builtin and
+  unrelated to the single-bracket `[` alias (which IS in scope
+  above). A candidate for a later iteration.
 - Less-common file tests: `-p`, `-S`, `-b`, `-c`, `-O`, `-G`, `-N`,
   `-k`, `-u`, `-g`, `-t`
 - String `<` / `>` ordering (a `[[ ]]` feature; POSIX `test` does
