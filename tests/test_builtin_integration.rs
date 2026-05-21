@@ -27,7 +27,7 @@ fn test_f_on_existing_file_is_true() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("afile");
     std::fs::write(&file, b"x").unwrap();
-    let script = format!("test -f {}\necho $?\nexit\n", file.to_str().unwrap());
+    let script = format!("test -f '{}'\necho $?\nexit\n", file.to_str().unwrap());
     let out = run(&script);
     assert!(out.lines().any(|l| l == "0"), "stdout: {out}");
 }
@@ -41,7 +41,7 @@ fn test_f_on_missing_file_is_false() {
 #[test]
 fn bracket_d_on_directory_is_true() {
     let dir = tempfile::tempdir().unwrap();
-    let script = format!("[ -d {} ]\necho $?\nexit\n", dir.path().to_str().unwrap());
+    let script = format!("[ -d '{}' ]\necho $?\nexit\n", dir.path().to_str().unwrap());
     let out = run(&script);
     assert!(out.lines().any(|l| l == "0"), "stdout: {out}");
 }

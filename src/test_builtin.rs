@@ -300,4 +300,18 @@ mod tests {
     fn binary_negation_over_failing_comparison_stays_error() {
         assert!(evaluate(&args(&["!", "abc", "-eq", "3"])).is_err());
     }
+
+    #[test]
+    fn three_args_binary_op_wins_over_leading_bang() {
+        // `! = x` — args[1] is the binary `=`, so this is a string
+        // comparison of "!" against "x", not a negation.
+        assert_eq!(evaluate(&args(&["!", "=", "x"])), Ok(false));
+        assert_eq!(evaluate(&args(&["!", "=", "!"])), Ok(true));
+    }
+
+    #[test]
+    fn binary_integer_plus_signed_operand() {
+        // A leading `+` is accepted on integer operands.
+        assert_eq!(evaluate(&args(&["+5", "-eq", "5"])), Ok(true));
+    }
 }
