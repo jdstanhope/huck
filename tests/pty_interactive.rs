@@ -77,7 +77,7 @@ fn expect_eof(session: &mut OsSession) {
 /// not a signal). Pausing guarantees huck has reached the cooked-mode
 /// poll loop, so the keystroke becomes a real SIGINT.
 fn settle() {
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(600));
 }
 
 /// Builds a `(HISTFILE=...)` env pointing into `dir`, isolating
@@ -149,6 +149,7 @@ fn tab_double_tab_lists() {
     expect(&mut session, "echo");
     expect(&mut session, "history");
     send(&mut session, CTRL_C);
+    expect(&mut session, "huck> ");
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
