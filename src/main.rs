@@ -11,6 +11,7 @@ mod lexer;
 mod param_expansion;
 mod shell;
 mod shell_state;
+mod test_builtin;
 
 fn main() {
     std::process::exit(shell::run());
