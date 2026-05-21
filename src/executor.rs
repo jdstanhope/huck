@@ -25,7 +25,7 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
             // Parser guarantees rest.is_empty() when background is set.
             return run_background_sequence(p, shell, &mut sink, source);
         }
-        // Backgrounding a compound command (if) is not supported in v17;
+        // Backgrounding a compound command (if/while) is not supported;
         // fall through and run it synchronously.
     }
     execute_sequence_body(seq, shell, &mut sink)
@@ -93,8 +93,11 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
     use std::sync::atomic::Ordering;
     let mut last = ExecOutcome::Continue(0);
     loop {
-        if shell.sigint_flag.load(Ordering::Relaxed) {
-            shell.sigint_flag.store(false, Ordering::Relaxed);
+        if shell
+            .sigint_flag
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
             return ExecOutcome::Continue(130);
         }
         let cond = execute_sequence_body(&clause.condition, shell, sink);
