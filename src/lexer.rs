@@ -571,7 +571,9 @@ fn scan_backtick_substitution(
 
 fn empty_sequence() -> crate::command::Sequence {
     crate::command::Sequence {
-        first: crate::command::Pipeline { commands: Vec::new() },
+        first: crate::command::Command::Pipeline(crate::command::Pipeline {
+            commands: Vec::new(),
+        }),
         rest: Vec::new(),
         background: false,
     }
@@ -1396,9 +1398,9 @@ mod tests {
     }
 
     fn echo_seq(args: &[&str]) -> crate::command::Sequence {
-        use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+        use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: args
@@ -1409,7 +1411,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         }
@@ -1451,7 +1453,9 @@ mod tests {
             tokenize("$()").unwrap(),
             vec![sub_word(vec![WordPart::CommandSub {
                 sequence: crate::command::Sequence {
-                    first: crate::command::Pipeline { commands: vec![] },
+                    first: crate::command::Command::Pipeline(
+                        crate::command::Pipeline { commands: vec![] },
+                    ),
                     rest: vec![],
                     background: false,
                 },
@@ -1464,9 +1468,9 @@ mod tests {
     fn tokenize_command_sub_with_quoted_paren_in_body() {
         // The `)` inside `"..."` does not close the substitution. The inner
         // `")"` arg is quoted, so the inner Literal carries quoted: true.
-        use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+        use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         let inner = Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
@@ -1474,7 +1478,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         };
@@ -1496,9 +1500,9 @@ mod tests {
             quoted: false,
         }]);
         let outer = {
-            use crate::command::{ExecCommand, Pipeline, Sequence, SimpleCommand};
+            use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
             Sequence {
-                first: Pipeline {
+                first: Command::Pipeline(Pipeline {
                     commands: vec![SimpleCommand::Exec(ExecCommand {
                         program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                         args: vec![inner_word],
@@ -1506,7 +1510,7 @@ mod tests {
                         stdout: None,
                         stderr: None,
                     })],
-                },
+                }),
                 rest: vec![],
                 background: false,
             }
@@ -1631,7 +1635,11 @@ mod tests {
                 match &parts[0] {
                     WordPart::CommandSub { sequence, quoted: false } => {
                         // Inner: echo $FOO → second word's first part is a Var
-                        let inner_cmd = &sequence.first.commands[0];
+                        let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
+                        else {
+                            panic!("expected a pipeline");
+                        };
+                        let inner_cmd = &inner_pipeline.commands[0];
                         match inner_cmd {
                             crate::command::SimpleCommand::Exec(e) => {
                                 assert_eq!(e.args.len(), 1);
@@ -1660,7 +1668,11 @@ mod tests {
         match &tokens[0] {
             Token::Word(Word(parts)) => match &parts[0] {
                 WordPart::CommandSub { sequence, .. } => {
-                    match &sequence.first.commands[0] {
+                    let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
+                    else {
+                        panic!("expected a pipeline");
+                    };
+                    match &inner_pipeline.commands[0] {
                         crate::command::SimpleCommand::Exec(e) => {
                             // Inner body was `echo \` — backslash at end is literal.
                             assert_eq!(e.args.len(), 1);
@@ -1686,7 +1698,11 @@ mod tests {
         match &tokens[0] {
             Token::Word(Word(parts)) => match &parts[0] {
                 WordPart::CommandSub { sequence, .. } => {
-                    match &sequence.first.commands[0] {
+                    let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
+                    else {
+                        panic!("expected a pipeline");
+                    };
+                    match &inner_pipeline.commands[0] {
                         crate::command::SimpleCommand::Exec(e) => {
                             // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
                             assert_eq!(e.args.len(), 1);

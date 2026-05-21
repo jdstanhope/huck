@@ -373,7 +373,7 @@ fn has_unquoted_metachar(field: &Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{ExecCommand, Pipeline, SimpleCommand};
+    use crate::command::{Command, ExecCommand, Pipeline, SimpleCommand};
 
     fn lit(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
@@ -397,7 +397,7 @@ mod tests {
     /// CommandSub expansion in unit tests without invoking the lexer.
     fn echo_sequence(args: &[&str]) -> Sequence {
         Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: lit("echo"),
                     args: args.iter().map(|a| lit(a)).collect(),
@@ -405,7 +405,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         }
@@ -413,7 +413,7 @@ mod tests {
 
     fn exit_sequence(code: i32) -> Sequence {
         Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: lit("exit"),
                     args: vec![lit(&code.to_string())],
@@ -421,7 +421,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         }

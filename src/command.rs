@@ -119,9 +119,29 @@ pub enum Connector {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Command {
+    Pipeline(Pipeline),
+    If(Box<IfClause>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct IfClause {
+    pub condition: Sequence,
+    pub then_body: Sequence,
+    pub elif_branches: Vec<ElifBranch>,
+    pub else_body: Option<Sequence>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ElifBranch {
+    pub condition: Sequence,
+    pub body: Sequence,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Sequence {
-    pub first: Pipeline,
-    pub rest: Vec<(Connector, Pipeline)>,
+    pub first: Command,
+    pub rest: Vec<(Connector, Command)>,
     pub background: bool,
 }
 
@@ -140,7 +160,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     }
 
     let mut iter = tokens.into_iter().peekable();
-    let first = parse_pipeline(&mut iter)?;
+    let first = Command::Pipeline(parse_pipeline(&mut iter)?);
     let mut rest = Vec::new();
     let mut background = false;
 
@@ -164,15 +184,15 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
                     break;
                 }
                 let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::Semi, pipeline));
+                rest.push((Connector::Semi, Command::Pipeline(pipeline)));
             }
             Token::Op(Operator::And) => {
                 let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::And, pipeline));
+                rest.push((Connector::And, Command::Pipeline(pipeline)));
             }
             Token::Op(Operator::Or) => {
                 let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::Or, pipeline));
+                rest.push((Connector::Or, Command::Pipeline(pipeline)));
             }
             _ => unreachable!(
                 "parse_pipeline leaves only sequencing ops in the iterator; \
@@ -277,28 +297,37 @@ mod tests {
 
     fn one_pipeline(commands: Vec<SimpleCommand>) -> Sequence {
         Sequence {
-            first: Pipeline { commands },
+            first: Command::Pipeline(Pipeline { commands }),
             rest: vec![],
             background: false,
         }
     }
 
+    /// Reaches through `Command::Pipeline` for tests that inspect the first
+    /// element as a pipeline.
+    fn first_pipeline(seq: &Sequence) -> &Pipeline {
+        match &seq.first {
+            Command::Pipeline(p) => p,
+            Command::If(_) => panic!("expected a pipeline, got an if"),
+        }
+    }
+
     fn exec_stdout(seq: &Sequence) -> &Option<Redirect> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stdout,
             _ => panic!("expected Exec"),
         }
     }
 
     fn exec_stdin(seq: &Sequence) -> &Option<Word> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stdin,
             _ => panic!("expected Exec"),
         }
     }
 
     fn exec_stderr(seq: &Sequence) -> &Option<Redirect> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stderr,
             _ => panic!("expected Exec"),
         }
@@ -374,7 +403,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Pipe), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[]), plain("b", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[]), plain("b", &[])]);
     }
 
     #[test]
@@ -388,7 +417,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(seq.first.commands.len(), 3);
+        assert_eq!(first_pipeline(&seq).commands.len(), 3);
     }
 
     #[test]
@@ -454,7 +483,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
         assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::Semi);
     }
@@ -480,7 +509,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi)])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
         assert!(seq.rest.is_empty());
     }
 
@@ -520,13 +549,13 @@ mod tests {
     #[test]
     fn parse_simple_assignment() {
         let seq = parse(vec![w_tok("FOO=bar")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![assignment("FOO", ww("bar"))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww("bar"))]);
     }
 
     #[test]
     fn parse_empty_value_assignment() {
         let seq = parse(vec![w_tok("FOO=")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![assignment("FOO", ww(""))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww(""))]);
     }
 
     #[test]
@@ -541,19 +570,19 @@ mod tests {
             WordPart::Literal { text: "".to_string(), quoted: false },
             WordPart::Var { name: "BAR".to_string(), quoted: false },
         ]);
-        assert_eq!(seq.first.commands, vec![assignment("FOO", expected_value)]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", expected_value)]);
     }
 
     #[test]
     fn parse_assignment_invalid_name_is_exec() {
         let seq = parse(vec![w_tok("1FOO=bar")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![plain("1FOO=bar", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("1FOO=bar", &[])]);
     }
 
     #[test]
     fn parse_assignment_with_arg_is_exec() {
         let seq = parse(vec![w_tok("FOO=bar"), w_tok("baz")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![plain("FOO=bar", &["baz"])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("FOO=bar", &["baz"])]);
     }
 
     #[test]
@@ -565,7 +594,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        match &seq.first.commands[0] {
+        match &first_pipeline(&seq).commands[0] {
             SimpleCommand::Exec(e) => {
                 assert_eq!(e.program, ww("FOO=bar"));
                 assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
@@ -583,9 +612,9 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(seq.first.commands.len(), 2);
-        assert_eq!(seq.first.commands[0], assignment("FOO", ww("bar")));
-        assert_eq!(seq.first.commands[1], plain("cat", &[]));
+        assert_eq!(first_pipeline(&seq).commands.len(), 2);
+        assert_eq!(first_pipeline(&seq).commands[0], assignment("FOO", ww("bar")));
+        assert_eq!(first_pipeline(&seq).commands[1], plain("cat", &[]));
     }
 
     #[test]
@@ -597,7 +626,7 @@ mod tests {
         // resulting Assign carries a value Word [Literal(""), CommandSub].
         use crate::lexer::WordPart;
         let inner_seq = Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: ww("echo"),
                     args: vec![ww("bar")],
@@ -605,7 +634,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         };
@@ -614,8 +643,8 @@ mod tests {
             WordPart::CommandSub { sequence: inner_seq, quoted: false },
         ]);
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
-        assert_eq!(seq.first.commands.len(), 1);
-        match &seq.first.commands[0] {
+        assert_eq!(first_pipeline(&seq).commands.len(), 1);
+        match &first_pipeline(&seq).commands[0] {
             SimpleCommand::Assign { name, value } => {
                 assert_eq!(name, "FOO");
                 assert_eq!(value.0.len(), 2);
@@ -636,7 +665,7 @@ mod tests {
             .unwrap();
         assert!(seq.background);
         assert!(seq.rest.is_empty());
-        assert_eq!(seq.first.commands, vec![plain("sleep", &["1"])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("sleep", &["1"])]);
     }
 
     #[test]
@@ -652,7 +681,7 @@ mod tests {
         .unwrap();
         assert!(seq.background);
         assert!(seq.rest.is_empty());
-        assert_eq!(seq.first.commands.len(), 2);
+        assert_eq!(first_pipeline(&seq).commands.len(), 2);
     }
 
     #[test]
