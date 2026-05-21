@@ -78,9 +78,16 @@ pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
                 word_start = off + c.len_utf8();
                 i += 1;
             }
-            ';' | '|' | '&' | '<' | '>' => {
+            ';' | '|' | '&' => {
                 current_has_content = false;
                 is_command_pos = true;
+                word_start = off + c.len_utf8();
+                i += 1;
+            }
+            '<' | '>' => {
+                current_has_content = false;
+                // A redirect operator does not introduce a command; what follows
+                // is a file argument. Leave is_command_pos unchanged.
                 word_start = off + c.len_utf8();
                 i += 1;
             }
@@ -195,7 +202,7 @@ pub fn complete_command(prefix: &str, path: &str) -> Vec<Candidate> {
 
     names
         .into_iter()
-        .map(|n| Candidate { display: n.clone(), replacement: n })
+        .map(|n| Candidate { display: n.clone(), replacement: escape_filename(&n) })
         .collect()
 }
 
@@ -238,7 +245,11 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
         if name.starts_with('.') && !show_hidden {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // std::fs::metadata follows symlinks, so a symlink to a directory is
+        // correctly given a trailing slash.
+        let is_dir = std::fs::metadata(entry.path())
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         let mut display = name.to_string();
         let mut replacement = escape_filename(name);
         if is_dir {
@@ -281,10 +292,12 @@ fn escape_filename(name: &str) -> String {
     out
 }
 
-/// True if the directory entry is a regular file with an executable bit.
+/// True if the directory entry resolves to a regular file with an
+/// executable bit. Uses `std::fs::metadata` (follows symlinks) so that
+/// symlinked executables — common in /usr/bin — are found.
 fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    match entry.metadata() {
+    match std::fs::metadata(entry.path()) {
         Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
         Err(_) => false,
     }
@@ -653,5 +666,45 @@ mod tests {
             pairs.iter().any(|p| p.replacement == "targetfile"),
             "{replacements:?}",
         );
+    }
+
+    #[test]
+    fn complete_command_finds_symlinked_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A real executable.
+        let real = dir.path().join("huckcmd_real");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A symlink to it.
+        let link = dir.path().join("huckcmd_link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let path = dir.path().to_str().unwrap();
+        let cands = complete_command("huckcmd_", path);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"huckcmd_real"), "{names:?}");
+        assert!(names.contains(&"huckcmd_link"), "symlinked exe should complete: {names:?}");
+    }
+
+    #[test]
+    fn complete_file_symlinked_directory_gets_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("realdir");
+        std::fs::create_dir(&real_dir).unwrap();
+        let link = dir.path().join("linkdir");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        let cands = complete_file(dir.path().to_str().unwrap(), "linkd", "");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].replacement, "linkdir/", "symlinked dir should get a trailing slash");
+    }
+
+    #[test]
+    fn analyze_redirect_target_is_file_not_command() {
+        // `echo > lo` — the word after `>` is a redirect target (a file),
+        // not a command.
+        let (_, ctx) = analyze("echo > lo", 9);
+        assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "lo".to_string() });
     }
 }
