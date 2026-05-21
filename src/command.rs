@@ -383,6 +383,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
         if matches!(
             token,
             Token::Op(Operator::Semi | Operator::And | Operator::Or | Operator::Background)
+                | Token::Newline
         ) {
             break;
         }
@@ -394,6 +395,13 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                 } else {
                     args.push(word);
                 }
+            }
+            Token::Newline => {
+                // Unreachable: the peek-break above stops the loop on a
+                // Newline before it is ever consumed here. Task 2 adds a
+                // skip_newlines call after the `|` arm; this arm exists
+                // only to keep the match exhaustive.
+                unreachable!("Newline terminates the pipeline via the peek-break above");
             }
             Token::Op(Operator::Pipe) => {
                 let prog = program.take().ok_or(ParseError::MissingCommand)?;
@@ -409,7 +417,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                 let target = match iter.next() {
                     Some(Token::Word(word)) => word,
                     Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                    None => return Err(ParseError::MissingRedirectTarget),
+                    Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                 };
                 match op {
                     Operator::RedirIn => stdin = Some(target),

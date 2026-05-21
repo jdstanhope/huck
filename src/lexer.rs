@@ -64,6 +64,7 @@ pub struct Word(pub Vec<WordPart>);
 pub enum Token {
     Word(Word),
     Op(Operator),
+    Newline,
 }
 
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
@@ -86,6 +87,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                 has_token = false;
                 in_assignment_value = false;
+            }
+            if c == '\n' {
+                tokens.push(Token::Newline);
             }
             continue;
         }
@@ -439,7 +443,7 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
                 parts.extend(ps);
                 first = false;
             }
-            Token::Op(_) => return Err(LexError::InvalidBraceOperand),
+            Token::Op(_) | Token::Newline => return Err(LexError::InvalidBraceOperand),
         }
     }
     Ok(Word(parts))
@@ -2203,5 +2207,57 @@ mod tests {
     fn tokenize_pipe_in_operand_errors() {
         let err = tokenize("${X:-foo | bar}").unwrap_err();
         assert_eq!(err, LexError::InvalidBraceOperand);
+    }
+
+    #[test]
+    fn newline_outside_quotes_emits_newline_token() {
+        let tokens = tokenize("a\nb").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                Token::Newline,
+                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_inside_double_quotes_stays_literal() {
+        let tokens = tokenize("\"a\nb\"").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::Literal {
+                text: "a\nb".to_string(),
+                quoted: true,
+            }]))]
+        );
+    }
+
+    #[test]
+    fn consecutive_newlines_emit_consecutive_tokens() {
+        let tokens = tokenize("a\n\nb").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                Token::Newline,
+                Token::Newline,
+                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+            ]
+        );
+    }
+
+    #[test]
+    fn carriage_return_is_still_plain_whitespace() {
+        // `\r` separates words but does not emit a Newline token.
+        let tokens = tokenize("a\rb").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+            ]
+        );
     }
 }
