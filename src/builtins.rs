@@ -11,11 +11,14 @@ use libc;
 pub enum ExecOutcome {
     Continue(i32),
     Exit(i32),
+    LoopBreak,
+    LoopContinue,
 }
 
 pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
+    "break", "continue",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -46,6 +49,8 @@ pub fn run_builtin(
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
         "test" | "[" => builtin_test(name, args),
+        "break" => ExecOutcome::LoopBreak,
+        "continue" => ExecOutcome::LoopContinue,
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -917,6 +922,22 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("[", &[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn builtin_break_returns_loop_break() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("break", &[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::LoopBreak));
+    }
+
+    #[test]
+    fn builtin_continue_returns_loop_continue() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_builtin("continue", &[], &mut out, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::LoopContinue));
     }
 }
 

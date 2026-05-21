@@ -70,6 +70,12 @@ pub fn run() -> i32 {
                         return code;
                     }
                     ExecOutcome::Continue(status) => shell.set_last_status(status),
+                    // A `break`/`continue` with no enclosing loop propagated
+                    // to the top level: neutralize it to status 0 — do not
+                    // exit the shell.
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                        shell.set_last_status(0)
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => continue,
@@ -152,6 +158,7 @@ fn parse_error_message(error: ParseError) -> String {
         }
         ParseError::UnterminatedIf => "unterminated 'if' (expected 'then'/'fi')".to_string(),
         ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
+        ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
     }
 }
 
