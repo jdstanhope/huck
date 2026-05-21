@@ -21,13 +21,14 @@ spec, an implementation plan, and a test suite.
 | v11       | Arithmetic expansion (`$((expr))`)                      |
 | v12       | Parameter-expansion modifiers (`${var:-w}`, `${var#pat}`, etc.) |
 | v13       | Command history + history expansion (`!!`, `!$`, `^a^b^`) |
+| v14       | Tab completion (commands, filenames, variables)         |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (528 tests)
+cargo test               # full test suite (566 tests)
 ```
 
 ## Features
@@ -108,6 +109,17 @@ quotes, before whitespace/`=`, or when escaped (`\!`); it still
 expands inside double quotes (matching bash). An expanded line is
 echoed before it runs. Word designators (`!!:2`) and modifiers
 (`:h`/`:t`/`:s`) are not yet implemented.
+
+**Tab completion (v14):**
+Tab completes command names (builtins and `$PATH` executables) in
+command position, filenames and paths in argument position
+(directories shown with a trailing `/`), and variable names after
+`$`/`${`. The first Tab fills in the longest common prefix; a second
+Tab lists all candidates. Filenames with shell-special characters are
+backslash-escaped when inserted; a leading `~/` is expanded before
+the directory is scanned; hidden files appear only when the typed
+prefix begins with `.`. Per-command argument completion and `~user`
+completion are not implemented.
 
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),

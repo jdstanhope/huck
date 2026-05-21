@@ -99,6 +99,11 @@ impl Shell {
             .filter(|(_, v)| v.exported)
             .map(|(k, v)| (k.as_str(), v.value.as_str()))
     }
+
+    /// Iterates the names of all variables (exported or not).
+    pub fn var_names(&self) -> impl Iterator<Item = &str> {
+        self.vars.keys().map(|s| s.as_str())
+    }
 }
 
 impl Default for Shell {
@@ -195,5 +200,13 @@ mod tests {
     fn new_initializes_sigint_flag_to_false() {
         let s = Shell::new();
         assert!(!s.sigint_flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn var_names_lists_all_variables() {
+        let mut shell = Shell::new();
+        shell.set("HUCK_TEST_VN", "value".to_string());
+        let names: Vec<&str> = shell.var_names().collect();
+        assert!(names.contains(&"HUCK_TEST_VN"));
     }
 }

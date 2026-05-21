@@ -2,12 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use libc;
-use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use rustyline::history::FileHistory;
+use rustyline::{CompletionType, Config, Editor};
 use signal_hook::consts::{SIGCHLD, SIGINT};
 
 use crate::builtins::ExecOutcome;
 use crate::command::{self, ParseError};
+use crate::completion::HuckHelper;
 use crate::executor;
 use crate::lexer::{self, LexError};
 use crate::shell_state::Shell;
@@ -18,13 +20,17 @@ const PROMPT: &str = "huck> ";
 pub fn run() -> i32 {
     install_job_control_signals();
 
-    let mut editor = match DefaultEditor::new() {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor: Editor<HuckHelper, FileHistory> = match Editor::with_config(config) {
         Ok(editor) => editor,
         Err(e) => {
             eprintln!("huck: failed to initialize line editor: {e}");
             return 1;
         }
     };
+    editor.set_helper(Some(HuckHelper::new()));
 
     let mut shell = Shell::new();
     install_sigint_handler(Arc::clone(&shell.sigint_flag));
@@ -37,6 +43,9 @@ pub fn run() -> i32 {
 
     loop {
         crate::jobs::reap_and_notify(&mut shell);
+        if let Some(helper) = editor.helper_mut() {
+            helper.refresh(&shell);
+        }
         match editor.readline(PROMPT) {
             Ok(line) => {
                 let to_run = match crate::history::expand(&line, &shell.history) {
