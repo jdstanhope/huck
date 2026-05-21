@@ -1,4 +1,46 @@
-use crate::lexer::{Operator, Token, Word};
+use crate::lexer::{Operator, Token, Word, WordPart};
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Keyword {
+    If,
+    Then,
+    Elif,
+    Else,
+    Fi,
+}
+
+impl Keyword {
+    fn name(self) -> &'static str {
+        match self {
+            Keyword::If => "if",
+            Keyword::Then => "then",
+            Keyword::Elif => "elif",
+            Keyword::Else => "else",
+            Keyword::Fi => "fi",
+        }
+    }
+}
+
+/// Returns the keyword a token represents, or `None`. A token is a
+/// keyword only when it is a `Word` of exactly one part — an *unquoted*
+/// `Literal` whose text equals the keyword.
+fn keyword_of(token: &Token) -> Option<Keyword> {
+    let Token::Word(Word(parts)) = token else { return None };
+    if parts.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal { text, quoted: false } = &parts[0] else {
+        return None;
+    };
+    match text.as_str() {
+        "if" => Some(Keyword::If),
+        "then" => Some(Keyword::Then),
+        "elif" => Some(Keyword::Elif),
+        "else" => Some(Keyword::Else),
+        "fi" => Some(Keyword::Fi),
+        _ => None,
+    }
+}
 
 /// If `word` looks like `NAME=value` (a leading `Literal` whose text begins
 /// with a valid identifier followed by `=`), returns `Ok((name, value))`
@@ -119,9 +161,29 @@ pub enum Connector {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Command {
+    Pipeline(Pipeline),
+    If(Box<IfClause>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct IfClause {
+    pub condition: Sequence,
+    pub then_body: Sequence,
+    pub elif_branches: Vec<ElifBranch>,
+    pub else_body: Option<Sequence>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ElifBranch {
+    pub condition: Sequence,
+    pub body: Sequence,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Sequence {
-    pub first: Pipeline,
-    pub rest: Vec<(Connector, Pipeline)>,
+    pub first: Command,
+    pub rest: Vec<(Connector, Command)>,
     pub background: bool,
 }
 
@@ -132,24 +194,49 @@ pub enum ParseError {
     RedirectTargetIsOperator,
     UnexpectedBackground,
     BackgroundedMultiPipelineSequence,
+    UnterminatedIf,
+    UnexpectedKeyword(String),
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     if tokens.is_empty() {
         return Ok(None);
     }
-
     let mut iter = tokens.into_iter().peekable();
-    let first = parse_pipeline(&mut iter)?;
+    let seq = parse_sequence(&mut iter, &[])?;
+    Ok(Some(seq))
+}
+
+/// Parses commands joined by `;` / `&&` / `||` (and an optional trailing
+/// `&` at top level only). Stops — without consuming — when the next
+/// token is a keyword in `stop_at`. `stop_at` is empty only at the top
+/// level; a non-empty `stop_at` means we are inside a compound command.
+fn parse_sequence<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+    stop_at: &[Keyword],
+) -> Result<Sequence, ParseError> {
+    let at_top_level = stop_at.is_empty();
+    let first = parse_command(iter)?;
     let mut rest = Vec::new();
     let mut background = false;
 
-    while let Some(token) = iter.next() {
+    loop {
+        match iter.peek() {
+            None => break,
+            Some(tok) => {
+                if let Some(kw) = keyword_of(tok) {
+                    if stop_at.contains(&kw) {
+                        break;
+                    }
+                }
+            }
+        }
+        let token = iter.next().unwrap();
         match token {
             Token::Op(Operator::Background) => {
-                // The multi-pipeline restriction is the more specific
-                // diagnostic, so report it first. `UnexpectedBackground`
-                // covers the remaining "& is not at the end" case.
+                if !at_top_level {
+                    return Err(ParseError::UnexpectedBackground);
+                }
                 if !rest.is_empty() {
                     return Err(ParseError::BackgroundedMultiPipelineSequence);
                 }
@@ -160,28 +247,83 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
                 break;
             }
             Token::Op(Operator::Semi) => {
-                if iter.peek().is_none() {
-                    break;
+                match iter.peek() {
+                    None => break,
+                    Some(tok) => {
+                        if keyword_of(tok).map(|k| stop_at.contains(&k)).unwrap_or(false) {
+                            break;
+                        }
+                    }
                 }
-                let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::Semi, pipeline));
+                rest.push((Connector::Semi, parse_command(iter)?));
             }
             Token::Op(Operator::And) => {
-                let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::And, pipeline));
+                rest.push((Connector::And, parse_command(iter)?));
             }
             Token::Op(Operator::Or) => {
-                let pipeline = parse_pipeline(&mut iter)?;
-                rest.push((Connector::Or, pipeline));
+                rest.push((Connector::Or, parse_command(iter)?));
             }
-            _ => unreachable!(
-                "parse_pipeline leaves only sequencing ops in the iterator; \
-                 anything else it consumes itself"
-            ),
+            other => {
+                if let Some(kw) = keyword_of(&other) {
+                    return Err(ParseError::UnexpectedKeyword(kw.name().to_string()));
+                }
+                unreachable!("unexpected non-operator, non-keyword token after a command: {other:?}")
+            }
         }
     }
 
-    Ok(Some(Sequence { first, rest, background }))
+    Ok(Sequence { first, rest, background })
+}
+
+/// Parses a single sequence element: an `if` clause or a pipeline.
+fn parse_command<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    match iter.peek().and_then(keyword_of) {
+        Some(Keyword::If) => Ok(Command::If(Box::new(parse_if(iter)?))),
+        Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
+        None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
+    }
+}
+
+/// Consumes one token and checks it is the expected keyword.
+fn expect_keyword<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+    expected: Keyword,
+) -> Result<(), ParseError> {
+    match iter.next() {
+        Some(ref t) if keyword_of(t) == Some(expected) => Ok(()),
+        _ => Err(ParseError::UnterminatedIf),
+    }
+}
+
+/// Parses `if LIST; then LIST; [elif LIST; then LIST;]... [else LIST;] fi`.
+fn parse_if<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<IfClause, ParseError> {
+    expect_keyword(iter, Keyword::If)?;
+    let condition = parse_sequence(iter, &[Keyword::Then])?;
+    expect_keyword(iter, Keyword::Then)?;
+    let then_body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
+
+    let mut elif_branches = Vec::new();
+    while iter.peek().and_then(keyword_of) == Some(Keyword::Elif) {
+        iter.next(); // consume `elif`
+        let condition = parse_sequence(iter, &[Keyword::Then])?;
+        expect_keyword(iter, Keyword::Then)?;
+        let body = parse_sequence(iter, &[Keyword::Elif, Keyword::Else, Keyword::Fi])?;
+        elif_branches.push(ElifBranch { condition, body });
+    }
+
+    let else_body = if iter.peek().and_then(keyword_of) == Some(Keyword::Else) {
+        iter.next(); // consume `else`
+        Some(parse_sequence(iter, &[Keyword::Fi])?)
+    } else {
+        None
+    };
+
+    expect_keyword(iter, Keyword::Fi)?;
+    Ok(IfClause { condition, then_body, elif_branches, else_body })
 }
 
 fn parse_pipeline<I: Iterator<Item = Token>>(
@@ -277,28 +419,37 @@ mod tests {
 
     fn one_pipeline(commands: Vec<SimpleCommand>) -> Sequence {
         Sequence {
-            first: Pipeline { commands },
+            first: Command::Pipeline(Pipeline { commands }),
             rest: vec![],
             background: false,
         }
     }
 
+    /// Reaches through `Command::Pipeline` for tests that inspect the first
+    /// element as a pipeline.
+    fn first_pipeline(seq: &Sequence) -> &Pipeline {
+        match &seq.first {
+            Command::Pipeline(p) => p,
+            Command::If(_) => panic!("expected a pipeline, got an if"),
+        }
+    }
+
     fn exec_stdout(seq: &Sequence) -> &Option<Redirect> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stdout,
             _ => panic!("expected Exec"),
         }
     }
 
     fn exec_stdin(seq: &Sequence) -> &Option<Word> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stdin,
             _ => panic!("expected Exec"),
         }
     }
 
     fn exec_stderr(seq: &Sequence) -> &Option<Redirect> {
-        match &seq.first.commands[0] {
+        match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stderr,
             _ => panic!("expected Exec"),
         }
@@ -374,7 +525,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Pipe), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[]), plain("b", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[]), plain("b", &[])]);
     }
 
     #[test]
@@ -388,7 +539,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(seq.first.commands.len(), 3);
+        assert_eq!(first_pipeline(&seq).commands.len(), 3);
     }
 
     #[test]
@@ -454,7 +605,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
         assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::Semi);
     }
@@ -480,7 +631,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi)])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first.commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
         assert!(seq.rest.is_empty());
     }
 
@@ -520,13 +671,13 @@ mod tests {
     #[test]
     fn parse_simple_assignment() {
         let seq = parse(vec![w_tok("FOO=bar")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![assignment("FOO", ww("bar"))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww("bar"))]);
     }
 
     #[test]
     fn parse_empty_value_assignment() {
         let seq = parse(vec![w_tok("FOO=")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![assignment("FOO", ww(""))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww(""))]);
     }
 
     #[test]
@@ -541,19 +692,19 @@ mod tests {
             WordPart::Literal { text: "".to_string(), quoted: false },
             WordPart::Var { name: "BAR".to_string(), quoted: false },
         ]);
-        assert_eq!(seq.first.commands, vec![assignment("FOO", expected_value)]);
+        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", expected_value)]);
     }
 
     #[test]
     fn parse_assignment_invalid_name_is_exec() {
         let seq = parse(vec![w_tok("1FOO=bar")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![plain("1FOO=bar", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("1FOO=bar", &[])]);
     }
 
     #[test]
     fn parse_assignment_with_arg_is_exec() {
         let seq = parse(vec![w_tok("FOO=bar"), w_tok("baz")]).unwrap().unwrap();
-        assert_eq!(seq.first.commands, vec![plain("FOO=bar", &["baz"])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("FOO=bar", &["baz"])]);
     }
 
     #[test]
@@ -565,7 +716,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        match &seq.first.commands[0] {
+        match &first_pipeline(&seq).commands[0] {
             SimpleCommand::Exec(e) => {
                 assert_eq!(e.program, ww("FOO=bar"));
                 assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
@@ -583,9 +734,9 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(seq.first.commands.len(), 2);
-        assert_eq!(seq.first.commands[0], assignment("FOO", ww("bar")));
-        assert_eq!(seq.first.commands[1], plain("cat", &[]));
+        assert_eq!(first_pipeline(&seq).commands.len(), 2);
+        assert_eq!(first_pipeline(&seq).commands[0], assignment("FOO", ww("bar")));
+        assert_eq!(first_pipeline(&seq).commands[1], plain("cat", &[]));
     }
 
     #[test]
@@ -597,7 +748,7 @@ mod tests {
         // resulting Assign carries a value Word [Literal(""), CommandSub].
         use crate::lexer::WordPart;
         let inner_seq = Sequence {
-            first: Pipeline {
+            first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
                     program: ww("echo"),
                     args: vec![ww("bar")],
@@ -605,7 +756,7 @@ mod tests {
                     stdout: None,
                     stderr: None,
                 })],
-            },
+            }),
             rest: vec![],
             background: false,
         };
@@ -614,8 +765,8 @@ mod tests {
             WordPart::CommandSub { sequence: inner_seq, quoted: false },
         ]);
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
-        assert_eq!(seq.first.commands.len(), 1);
-        match &seq.first.commands[0] {
+        assert_eq!(first_pipeline(&seq).commands.len(), 1);
+        match &first_pipeline(&seq).commands[0] {
             SimpleCommand::Assign { name, value } => {
                 assert_eq!(name, "FOO");
                 assert_eq!(value.0.len(), 2);
@@ -636,7 +787,7 @@ mod tests {
             .unwrap();
         assert!(seq.background);
         assert!(seq.rest.is_empty());
-        assert_eq!(seq.first.commands, vec![plain("sleep", &["1"])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![plain("sleep", &["1"])]);
     }
 
     #[test]
@@ -652,7 +803,7 @@ mod tests {
         .unwrap();
         assert!(seq.background);
         assert!(seq.rest.is_empty());
-        assert_eq!(seq.first.commands.len(), 2);
+        assert_eq!(first_pipeline(&seq).commands.len(), 2);
     }
 
     #[test]
@@ -729,5 +880,190 @@ mod tests {
             ]),
             Err(ParseError::BackgroundedMultiPipelineSequence)
         );
+    }
+
+    /// A bare unquoted keyword token (same shape as an ordinary word).
+    fn kw(s: &str) -> Token {
+        w_tok(s)
+    }
+
+    /// Extracts the IfClause from a sequence whose first command is an If.
+    fn first_if(seq: &Sequence) -> &IfClause {
+        match &seq.first {
+            Command::If(c) => c,
+            Command::Pipeline(_) => panic!("expected an if, got a pipeline"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_if() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let c = first_if(&seq);
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
+        assert_eq!(c.then_body.first, Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] }));
+        assert!(c.elif_branches.is_empty());
+        assert!(c.else_body.is_none());
+    }
+
+    #[test]
+    fn parse_if_else() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("else"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        assert!(first_if(&seq).else_body.is_some());
+    }
+
+    #[test]
+    fn parse_if_elif_else() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("elif"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("d"), Token::Op(Operator::Semi),
+            kw("else"), w_tok("e"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let c = first_if(&seq);
+        assert_eq!(c.elif_branches.len(), 1);
+        assert!(c.else_body.is_some());
+    }
+
+    #[test]
+    fn parse_if_with_andor_condition() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::And), w_tok("b"),
+            Token::Op(Operator::Semi),
+            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let c = first_if(&seq);
+        assert_eq!(c.condition.rest.len(), 1);
+        assert_eq!(c.condition.rest[0].0, Connector::And);
+    }
+
+    #[test]
+    fn parse_if_multi_command_body() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi), w_tok("c"),
+            Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_if(&seq).then_body.rest.len(), 1);
+    }
+
+    #[test]
+    fn parse_if_followed_by_command() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"), Token::Op(Operator::Semi), w_tok("echo"),
+        ]).unwrap().unwrap();
+        assert!(matches!(seq.first, Command::If(_)));
+        assert_eq!(seq.rest.len(), 1);
+        assert_eq!(seq.rest[0].0, Connector::Semi);
+        assert!(matches!(seq.rest[0].1, Command::Pipeline(_)));
+    }
+
+    #[test]
+    fn parse_if_joined_with_and() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"), Token::Op(Operator::And), w_tok("echo"),
+        ]).unwrap().unwrap();
+        assert_eq!(seq.rest[0].0, Connector::And);
+    }
+
+    #[test]
+    fn parse_nested_if() {
+        let seq = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"),
+            kw("if"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("fi"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        assert!(matches!(first_if(&seq).then_body.first, Command::If(_)));
+    }
+
+    #[test]
+    fn parse_if_unterminated_is_error() {
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"),
+        ]);
+        assert_eq!(r, Err(ParseError::UnterminatedIf));
+    }
+
+    #[test]
+    fn parse_if_missing_then_is_error() {
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi), kw("fi"),
+        ]);
+        assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))));
+    }
+
+    #[test]
+    fn parse_bare_then_is_unexpected_keyword() {
+        assert!(matches!(
+            parse(vec![kw("then"), w_tok("x")]),
+            Err(ParseError::UnexpectedKeyword(_))
+        ));
+    }
+
+    #[test]
+    fn parse_bare_fi_is_unexpected_keyword() {
+        assert!(matches!(
+            parse(vec![kw("fi")]),
+            Err(ParseError::UnexpectedKeyword(_))
+        ));
+    }
+
+    #[test]
+    fn parse_if_empty_condition_is_missing_command() {
+        let r = parse(vec![
+            kw("if"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
+        ]);
+        assert_eq!(r, Err(ParseError::MissingCommand));
+    }
+
+    #[test]
+    fn parse_keyword_as_argument_is_literal() {
+        let seq = parse(vec![w_tok("echo"), w_tok("if")]).unwrap().unwrap();
+        assert_eq!(seq.first, Command::Pipeline(Pipeline {
+            commands: vec![plain("echo", &["if"])],
+        }));
+    }
+
+    #[test]
+    fn parse_trailing_keyword_after_if_is_unexpected_keyword() {
+        // `if a; then b; fi fi` — a stray `fi` after a complete `if`.
+        // Must be a clean parse error, never a panic.
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"), kw("fi"),
+        ]);
+        assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn parse_if_condition_with_background_is_error() {
+        // `&` is not allowed inside an `if` condition/body (v17 limitation).
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Background),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
+        ]);
+        assert_eq!(r, Err(ParseError::UnexpectedBackground));
     }
 }

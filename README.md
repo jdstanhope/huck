@@ -24,13 +24,14 @@ spec, an implementation plan, and a test suite.
 | v14       | Tab completion (commands, filenames, variables)         |
 | v15       | PTY-based interactive test harness                      |
 | v16       | `test` / `[` builtin (file, string, integer tests)      |
+| v17       | `if` control flow (`if`/`elif`/`else`/`fi`)             |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (620 tests)
+cargo test               # full test suite (650 tests)
 ```
 
 ## Features
@@ -131,12 +132,22 @@ with `!` negation. Exit status is 0 (true), 1 (false), or 2
 (usage error). The `-a`/`-o`/`( )` combinators and `[[ ]]` are
 not implemented; `if` is a separate iteration.
 
+**`if` control flow (v17):**
+`if LIST; then LIST; [elif LIST; then LIST;]... [else LIST;] fi`
+runs the `then` body when the condition's exit status is 0, an
+`elif` body when its condition succeeds, or the `else` body. An `if`
+is a compound command at the sequence level: it composes with `;`,
+`&&`, `||`, nests inside branch bodies, and can be followed by more
+commands. Single-line form only (parts separated by `;`); multi-line
+`if`, `if` inside a `|` pipeline, and backgrounding a whole `if` are
+not yet implemented.
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
-(`if`/`while`/`for`/`case`), functions, here-docs,
+(`while`/`until`/`for`/`case`), functions, here-docs,
 aliases.
 
 ## Project layout
