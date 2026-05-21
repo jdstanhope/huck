@@ -30,6 +30,9 @@ AST/parser/executor change that later control flow (`while`, `for`,
 - `if` as a stage *inside* a `|` pipeline (`if ...; fi | grep`) —
   would require `Pipeline` to hold compound commands and the pipeline
   executor to run an `if` as a forked stage
+- Backgrounding a whole `if` (`if ...; fi &`) — the background
+  executor path is pipeline-specific; a trailing `&` after an `if`
+  runs the `if` synchronously instead
 - `while` / `until` / `for` / `case` / functions — later iterations
 - Any lexer change
 
@@ -200,11 +203,16 @@ returns that.
 **Same-process execution.** A plain `if` is not forked — the
 condition and the chosen branch run in the shell's own process, like
 a top-level sequence. Builtins in the condition (notably `test` from
-v16) run in-process; external commands fork as usual. The only
-forking is the pre-existing background path: a `Sequence` with
-`background: true` whose `first` is `Command::If` is forked as a job,
-and the child's sequence-runner handles the `If` — so `if ...; fi &`
-works with no extra code.
+v16) run in-process; external commands fork as usual.
+
+**Backgrounding an `if` is out of scope for v17.** The background
+executor path (`run_background_sequence`) is pipeline-specific. The
+`execute` entry point keeps calling it only when the sequence's
+`first` is a `Command::Pipeline`; when `background` is set but
+`first` is a `Command::If`, the executor falls through to synchronous
+execution — the `&` has no effect. This is a documented limitation
+for the rare `if ...; fi &` case; `run_background_sequence` itself is
+unchanged.
 
 **`$?` semantics.** When a branch body runs, its first command sees
 `$?` set to the condition's exit status (bash behavior); nothing
