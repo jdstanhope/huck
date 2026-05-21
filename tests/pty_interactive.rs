@@ -96,3 +96,102 @@ fn pty_huck_starts_and_exits() {
     send(&mut session, ENTER);
     expect_eof(&mut session);
 }
+
+/// Builds an env with an isolated HISTFILE plus an empty PATH
+/// directory, so command completion sees only builtins (deterministic).
+fn isolated_env(dir: &Path) -> Vec<(&'static str, String)> {
+    let hist = dir.join("huck_history");
+    let empty_path = dir.join("emptybin");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    vec![
+        ("HISTFILE", hist.to_string_lossy().into_owned()),
+        ("PATH", empty_path.to_string_lossy().into_owned()),
+    ]
+}
+
+#[test]
+fn tab_completes_builtin() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = isolated_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "ec");
+    send(&mut session, TAB);
+    expect(&mut session, "echo");
+    send(&mut session, ENTER);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn tab_double_tab_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = isolated_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, TAB);
+    send(&mut session, TAB);
+    expect(&mut session, "echo");
+    expect(&mut session, "history");
+    send(&mut session, CTRL_C);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn tab_completes_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ptyfile_unique.txt"), b"").unwrap();
+    let env = isolated_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo ptyfile_un");
+    send(&mut session, TAB);
+    expect(&mut session, "ptyfile_unique.txt");
+    send(&mut session, ENTER);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn tab_completes_directory_slash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("ptydir_unique")).unwrap();
+    let env = isolated_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo ptydir_un");
+    send(&mut session, TAB);
+    expect(&mut session, "ptydir_unique/");
+    send(&mut session, ENTER);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn tab_completes_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let hist = dir.path().join("huck_history");
+    let env: Vec<(&str, &str)> = vec![
+        ("HISTFILE", hist.to_str().unwrap()),
+        ("HUCKPTYVAR", "ptyvarvalue"),
+    ];
+    let Some(mut session) = try_spawn(dir.path(), &env) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo $HUCKPTY");
+    send(&mut session, TAB);
+    send(&mut session, ENTER);
+    expect(&mut session, "ptyvarvalue");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
