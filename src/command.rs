@@ -1127,7 +1127,7 @@ mod tests {
             kw("done"),
         ]).unwrap().unwrap();
         let c = first_while(&seq);
-        assert_eq!(c.until, false);
+        assert!(!c.until);
         assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
         assert_eq!(c.body.first, Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] }));
     }
@@ -1139,7 +1139,7 @@ mod tests {
             kw("do"), w_tok("b"), Token::Op(Operator::Semi),
             kw("done"),
         ]).unwrap().unwrap();
-        assert_eq!(first_while(&seq).until, true);
+        assert!(first_while(&seq).until);
     }
 
     #[test]
