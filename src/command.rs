@@ -210,7 +210,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
 /// Parses commands joined by `;` / `&&` / `||` (and an optional trailing
 /// `&` at top level only). Stops — without consuming — when the next
 /// token is a keyword in `stop_at`. `stop_at` is empty only at the top
-/// level; a non-empty `stop_at` means we are inside an `if`.
+/// level; a non-empty `stop_at` means we are inside a compound command.
 fn parse_sequence<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
     stop_at: &[Keyword],
@@ -263,7 +263,12 @@ fn parse_sequence<I: Iterator<Item = Token>>(
             Token::Op(Operator::Or) => {
                 rest.push((Connector::Or, parse_command(iter)?));
             }
-            other => unreachable!("unexpected token after a command: {other:?}"),
+            other => {
+                if let Some(kw) = keyword_of(&other) {
+                    return Err(ParseError::UnexpectedKeyword(kw.name().to_string()));
+                }
+                unreachable!("unexpected non-operator, non-keyword token after a command: {other:?}")
+            }
         }
     }
 
@@ -1038,5 +1043,27 @@ mod tests {
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
             commands: vec![plain("echo", &["if"])],
         }));
+    }
+
+    #[test]
+    fn parse_trailing_keyword_after_if_is_unexpected_keyword() {
+        // `if a; then b; fi fi` — a stray `fi` after a complete `if`.
+        // Must be a clean parse error, never a panic.
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("fi"), kw("fi"),
+        ]);
+        assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn parse_if_condition_with_background_is_error() {
+        // `&` is not allowed inside an `if` condition/body (v17 limitation).
+        let r = parse(vec![
+            kw("if"), w_tok("a"), Token::Op(Operator::Background),
+            kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
+        ]);
+        assert_eq!(r, Err(ParseError::UnexpectedBackground));
     }
 }
