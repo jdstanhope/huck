@@ -43,13 +43,17 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
+        ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
 fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let mut status = run_command(&seq.first, shell, sink);
-    if matches!(status, ExecOutcome::Exit(_)) {
+    if matches!(
+        status,
+        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+    ) {
         return status;
     }
     for (connector, command) in &seq.rest {
@@ -60,7 +64,10 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         };
         if should_run {
             status = run_command(command, shell, sink);
-            if matches!(status, ExecOutcome::Exit(_)) {
+            if matches!(
+                status,
+                ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+            ) {
                 return status;
             }
         }
@@ -82,7 +89,10 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
 /// nothing (status 0). An `exit` anywhere inside propagates.
 fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let cond = execute_sequence_body(&clause.condition, shell, sink);
-    if matches!(cond, ExecOutcome::Exit(_)) {
+    if matches!(
+        cond,
+        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+    ) {
         return cond;
     }
     if matches!(cond, ExecOutcome::Continue(0)) {
@@ -90,7 +100,10 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
     }
     for elif in &clause.elif_branches {
         let elif_cond = execute_sequence_body(&elif.condition, shell, sink);
-        if matches!(elif_cond, ExecOutcome::Exit(_)) {
+        if matches!(
+            elif_cond,
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+        ) {
             return elif_cond;
         }
         if matches!(elif_cond, ExecOutcome::Continue(0)) {
@@ -131,6 +144,7 @@ fn run_background_sequence(
         }
         let exit = match outcome {
             ExecOutcome::Continue(c) => c,
+            ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
             ExecOutcome::Exit(_) => unreachable!(),
         };
         let id = shell.jobs.add_synthetic_done(display, exit);
@@ -709,6 +723,7 @@ fn run_multi_stage(
             let mut status = match outcome {
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
+                ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
             };
             match files.stdout {
                 Some(mut file) => {
@@ -1193,6 +1208,30 @@ mod tests {
         // cargo test runs without a controlling terminal; tcsetpgrp returns
         // ENOTTY. The helper must swallow it.
         give_terminal_to(1); // bogus pgid; we only care that we don't panic
+    }
+
+    #[test]
+    fn stray_break_at_top_level_is_harmless() {
+        // `break` with no enclosing loop: the sequence stops, status 0.
+        use crate::command::{ExecCommand, Pipeline};
+        use crate::lexer::{Word, WordPart};
+        let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
+        let seq = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: ww("break"),
+                    args: vec![],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let mut shell = Shell::new();
+        let (_out, status) = execute_capturing(&seq, &mut shell);
+        assert_eq!(status, 0);
     }
 
     #[test]

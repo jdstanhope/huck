@@ -70,6 +70,12 @@ pub fn run() -> i32 {
                         return code;
                     }
                     ExecOutcome::Continue(status) => shell.set_last_status(status),
+                    // A `break`/`continue` with no enclosing loop propagated
+                    // to the top level: neutralize it to status 0 — do not
+                    // exit the shell.
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                        shell.set_last_status(0)
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => continue,
