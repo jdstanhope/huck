@@ -1360,7 +1360,8 @@ mod tests {
 
     #[test]
     fn parse_case_omitted_final_terminator() {
-        // `case x in a) echo ; esac` — a `;` ends the body, the `;;` is omitted.
+        // case x in a) echo ; esac — last clause with the `;;` omitted; a
+        // separator (here `;`) is required before `esac`, as for `fi`/`done`.
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
             w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),

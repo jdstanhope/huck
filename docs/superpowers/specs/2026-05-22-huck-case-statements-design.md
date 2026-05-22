@@ -130,9 +130,12 @@ Key points:
   clause body can be legitimately empty (`a) ;;`), and `Sequence` cannot
   represent emptiness (it requires a `first` command). `None` means "run
   nothing, exit status 0".
-- **An omitted final terminator** (`*) echo hi esac`) is recorded as
-  `CaseTerminator::Break`. The AST does not distinguish "wrote `;;`" from
-  "wrote nothing"; both mean the same thing.
+- **An omitted final terminator** (`*) echo hi; esac` — the `;;` dropped
+  from the last clause) is recorded as `CaseTerminator::Break`. As with
+  `fi`/`done`, a separator (`;`, a newline, or a `;;`-family terminator)
+  must precede `esac`; an `esac` written directly after a body word is an
+  ordinary argument, not the keyword. The AST does not distinguish "wrote
+  `;;`" from "wrote nothing"; both mean the same thing.
 - `subject` and the pattern `Word`s are stored unexpanded; expansion happens
   at run time in `run_case`.
 - `items` may be empty — `case x in esac` is valid.
