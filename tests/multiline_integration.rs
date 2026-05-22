@@ -7,23 +7,8 @@ fn huck_binary() -> String {
 
 /// Runs huck with `script` piped to stdin; returns (stdout, stderr).
 fn run(script: &str) -> (String, String) {
-    let mut child = Command::new(huck_binary())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn huck");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("wait");
-    (
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    let (stdout, stderr, _) = run_with_status(script);
+    (stdout, stderr)
 }
 
 /// Runs huck and also returns the decoded exit status code.
