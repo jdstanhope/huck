@@ -5,8 +5,8 @@ use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, St
 
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
-    Command, Connector, ExecCommand, IfClause, Pipeline, Redirect, Sequence, SimpleCommand,
-    WhileClause,
+    Command, Connector, ExecCommand, ForClause, IfClause, Pipeline, Redirect, Sequence,
+    SimpleCommand, WhileClause,
 };
 use crate::expand::{expand, expand_assignment, glob_expand_fields};
 use crate::shell_state::Shell;
@@ -82,7 +82,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
         Command::If(clause) => run_if(clause, shell, sink),
         Command::While(clause) => run_while(clause, shell, sink),
-        Command::For(_) => unreachable!("run_for lands in v20 task 2"),
+        Command::For(clause) => run_for(clause, shell, sink),
     }
 }
 
@@ -122,6 +122,48 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
             ExecOutcome::LoopContinue => {
                 last = ExecOutcome::Continue(0);
                 // fall through — the loop re-tests the condition
+            }
+            ExecOutcome::Continue(c) => {
+                last = ExecOutcome::Continue(c);
+            }
+        }
+    }
+    last
+}
+
+/// Runs a `for` loop. The word list is expanded once, up front; the
+/// body then runs with the loop variable set to each value in turn.
+/// `break` ends the loop, `continue` advances to the next value,
+/// `exit` propagates, and a pending SIGINT (Ctrl-C) ends the loop
+/// with status 130.
+fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    use std::sync::atomic::Ordering;
+
+    // Expand the word list once — the same path command arguments take.
+    let mut values: Vec<String> = Vec::new();
+    for word in &clause.words {
+        values.extend(glob_expand_fields(expand(word, shell)));
+    }
+
+    let mut last = ExecOutcome::Continue(0);
+    for value in values {
+        if shell
+            .sigint_flag
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return ExecOutcome::Continue(130);
+        }
+        shell.set(&clause.var, value);
+        match execute_sequence_body(&clause.body, shell, sink) {
+            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
+            ExecOutcome::LoopBreak => {
+                last = ExecOutcome::Continue(0);
+                break;
+            }
+            ExecOutcome::LoopContinue => {
+                last = ExecOutcome::Continue(0);
+                // fall through — advance to the next value
             }
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
@@ -1308,6 +1350,110 @@ mod tests {
     /// A Sequence wrapping a single `while`/`until` clause.
     fn while_seq(clause: WhileClause) -> Sequence {
         Sequence { first: Command::While(Box::new(clause)), rest: vec![], background: false }
+    }
+
+    use crate::command::ForClause;
+
+    /// A Sequence wrapping a single `for` clause.
+    fn for_seq(clause: ForClause) -> Sequence {
+        Sequence { first: Command::For(Box::new(clause)), rest: vec![], background: false }
+    }
+
+    /// A one-pipeline Sequence running `echo $<var>` (the variable expanded).
+    fn echo_var_seq(var: &str) -> Sequence {
+        Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
+                    args: vec![Word(vec![WordPart::Var { name: var.to_string(), quoted: false }])],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        }
+    }
+
+    /// A one-pipeline Sequence running the `continue` builtin.
+    fn continue_seq() -> Sequence {
+        Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
+                    args: vec![],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        }
+    }
+
+    #[test]
+    fn for_iterates_each_value_in_order() {
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            body: echo_var_seq("x"),
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn for_empty_list_runs_body_zero_times() {
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![],
+            body: echo_seq("hi"),
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn for_variable_holds_last_value_after_loop() {
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            body: echo_var_seq("x"),
+        };
+        let mut shell = Shell::new();
+        execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(shell.get("x"), Some("c"));
+    }
+
+    #[test]
+    fn for_break_stops_iteration() {
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            body: break_seq(),
+        };
+        let mut shell = Shell::new();
+        let (_out, status) = execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(shell.get("x"), Some("a"));
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn for_continue_advances_through_all_values() {
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            body: continue_seq(),
+        };
+        let mut shell = Shell::new();
+        execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(shell.get("x"), Some("c"));
     }
 
     /// A one-pipeline Sequence running the `break` builtin.
