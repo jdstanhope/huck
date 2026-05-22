@@ -26,13 +26,14 @@ spec, an implementation plan, and a test suite.
 | v16       | `test` / `[` builtin (file, string, integer tests)      |
 | v17       | `if` control flow (`if`/`elif`/`else`/`fi`)             |
 | v18       | `while`/`until` loops (`break`, `continue`)             |
+| v19       | Multi-line input (continuation lines, `> ` prompt)      |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (679 tests)
+cargo test               # full test suite (733 tests)
 ```
 
 ## Features
@@ -139,9 +140,7 @@ runs the `then` body when the condition's exit status is 0, an
 `elif` body when its condition succeeds, or the `else` body. An `if`
 is a compound command at the sequence level: it composes with `;`,
 `&&`, `||`, nests inside branch bodies, and can be followed by more
-commands. Single-line form only (parts separated by `;`); multi-line
-`if`, `if` inside a `|` pipeline, and backgrounding a whole `if` are
-not yet implemented.
+commands. `if` inside a `|` pipeline and backgrounding a whole `if` are not yet implemented.
 
 **`while` / `until` loops (v18):**
 `while LIST; do LIST; done` runs the body while the condition's exit
@@ -149,8 +148,19 @@ status is 0; `until` runs it while the condition is non-zero. `break`
 exits the innermost loop and `continue` skips to its next iteration.
 An infinite `while true; do …; done` is interruptible with Ctrl-C.
 Loops are sequence-level compound commands — they compose with `;`,
-`&&`, `||` and nest. Single-line form only (multi-line `if`/loops are
-a later iteration); `break N` / `continue N` are not implemented.
+`&&`, `||` and nest. `break N` / `continue N` are not implemented.
+
+**Multi-line input (v19):**
+A command can span several input lines. The REPL reads continuation
+lines — showing a `> ` prompt — until the typed text forms a complete
+command: an unterminated `if`/`while`/`until`, an open quote or
+expansion (`'`, `"`, `` ` ``, `$(`, `${`, `$((`), a pending operator
+(`|`, `&&`, `||`), or a line ending in a backslash all carry over onto
+the next line. `if`/`while`/`until` can therefore be written across
+multiple lines, the way they appear in scripts. Ctrl-C at the `> `
+prompt discards the partial command; an EOF mid-command is a syntax
+error. A multi-line command is stored in history collapsed onto one
+line.
 
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
