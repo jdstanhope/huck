@@ -379,3 +379,67 @@ fn ctrl_d_empty_prompt_exits() {
     send(&mut session, CTRL_D);
     expect_eof(&mut session);
 }
+
+#[test]
+fn pty_continuation_prompt_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    // An unterminated `if` must draw the `> ` continuation prompt.
+    send(&mut session, "if true");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn pty_multiline_if_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "if true");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "then echo MARKER42");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "fi");
+    send(&mut session, ENTER);
+    // The body runs only if the three lines were assembled into one
+    // complete `if` command.
+    expect(&mut session, "MARKER42");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn pty_ctrl_c_aborts_multiline_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    // Start a multi-line `if`, then abort it with Ctrl-C.
+    send(&mut session, "if true");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    settle();
+    send(&mut session, CTRL_C);
+    // After the abort the main prompt returns and the partial command
+    // is gone — a fresh `pwd` runs alone and prints the temp dir name.
+    expect(&mut session, "huck> ");
+    send(&mut session, "pwd");
+    send(&mut session, ENTER);
+    let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    expect(&mut session, marker);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
