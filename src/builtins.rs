@@ -7,18 +7,19 @@ use libc;
 
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ExecOutcome {
     Continue(i32),
     Exit(i32),
     LoopBreak,
     LoopContinue,
+    FunctionReturn(i32),
 }
 
 pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
-    "break", "continue",
+    "break", "continue", "return",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -51,6 +52,13 @@ pub fn run_builtin(
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
+        "return" => {
+            let code = match args.first() {
+                Some(s) => s.parse::<i32>().unwrap_or_else(|_| shell.last_status()),
+                None => shell.last_status(),
+            };
+            ExecOutcome::FunctionReturn(code)
+        }
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -938,6 +946,38 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("continue", &[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::LoopContinue));
+    }
+
+    #[test]
+    fn builtin_return_with_arg_returns_function_return() {
+        let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            run_builtin("return", &["7".to_string()], &mut out, &mut shell),
+            ExecOutcome::FunctionReturn(7)
+        );
+    }
+
+    #[test]
+    fn builtin_return_no_arg_returns_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(42);
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            run_builtin("return", &[], &mut out, &mut shell),
+            ExecOutcome::FunctionReturn(42)
+        );
+    }
+
+    #[test]
+    fn builtin_return_invalid_arg_falls_back_to_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(13);
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(
+            run_builtin("return", &["not-a-num".to_string()], &mut out, &mut shell),
+            ExecOutcome::FunctionReturn(13)
+        );
     }
 }
 

@@ -45,6 +45,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+        ExecOutcome::FunctionReturn(n) => n,
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
@@ -54,6 +55,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+            | ExecOutcome::FunctionReturn(_)
     ) {
         return status;
     }
@@ -68,6 +70,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             if matches!(
                 status,
                 ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                    | ExecOutcome::FunctionReturn(_)
             ) {
                 return status;
             }
@@ -105,7 +108,8 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
         }
         let cond = execute_sequence_body(&clause.condition, shell, sink);
         let keep_going = match cond {
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                | ExecOutcome::FunctionReturn(_) => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
@@ -125,6 +129,7 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
                 last = ExecOutcome::Continue(0);
                 // fall through — the loop re-tests the condition
             }
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -167,6 +172,7 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
                 last = ExecOutcome::Continue(0);
                 // fall through — advance to the next value
             }
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -217,6 +223,7 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
                 ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
                 ExecOutcome::LoopBreak => return ExecOutcome::LoopBreak,
                 ExecOutcome::LoopContinue => return ExecOutcome::LoopContinue,
+                ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
             },
         }
@@ -243,6 +250,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+            | ExecOutcome::FunctionReturn(_)
     ) {
         return cond;
     }
@@ -254,6 +262,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                | ExecOutcome::FunctionReturn(_)
         ) {
             return elif_cond;
         }
@@ -296,6 +305,7 @@ fn run_background_sequence(
         let exit = match outcome {
             ExecOutcome::Continue(c) => c,
             ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+            ExecOutcome::FunctionReturn(n) => n,
             ExecOutcome::Exit(_) => unreachable!(),
         };
         let id = shell.jobs.add_synthetic_done(display, exit);
@@ -875,6 +885,7 @@ fn run_multi_stage(
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
                 ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+                ExecOutcome::FunctionReturn(n) => n,
             };
             match files.stdout {
                 Some(mut file) => {

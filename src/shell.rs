@@ -74,7 +74,8 @@ pub fn run() -> i32 {
                         return code;
                     }
                     ExecOutcome::Continue(status) => shell.set_last_status(status),
-                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                    | ExecOutcome::FunctionReturn(_) => {
                         shell.set_last_status(0)
                     }
                 }
