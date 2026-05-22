@@ -28,13 +28,14 @@ spec, an implementation plan, and a test suite.
 | v18       | `while`/`until` loops (`break`, `continue`)             |
 | v19       | Multi-line input (continuation lines, `> ` prompt)      |
 | v20       | `for` loops (`for NAME in WORDS; do … done`)            |
+| v21       | `case` statements (`case W in PAT) … ;; esac`)          |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (764 tests)
+cargo test               # full test suite (814 tests)
 ```
 
 ## Features
@@ -174,12 +175,26 @@ body zero times — huck has no positional parameters for it to iterate.
 After the loop `NAME` keeps its last value. C-style `for ((;;))` is not
 implemented.
 
+**`case` statements (v21):**
+`case WORD in PATTERN) LIST ;; … esac` matches the expanded subject
+against each clause's glob patterns (`*`, `?`, `[…]`), runs the first
+matching clause's body, and stops. Patterns may be `|`-alternated and
+may carry an optional leading `(`. A quoted metacharacter matches
+literally (`"*"` matches a literal `*`). All three terminators are
+supported: `;;` (done), `;&` (fall through into the next clause's
+body), `;;&` (keep testing later patterns). Clause bodies may be empty
+and the final `;;` may be omitted (a separator before `esac` is still
+required, as for `fi`/`done`). `break`/`continue` inside a body target
+the enclosing loop — `case` is not a loop. Multi-line form works as for
+the other compound commands. Adding `case` made `(`, `)`, `;;`, `;&`,
+`;;&` lexer tokens; an unquoted `(` or `)` is now a shell metacharacter
+(quote it to keep it literal: `"("`/`')'`).
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
-(`case`), functions, here-docs, aliases.
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), functions, here-docs, aliases.
 
 ## Project layout
 
