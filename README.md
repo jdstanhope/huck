@@ -27,13 +27,14 @@ spec, an implementation plan, and a test suite.
 | v17       | `if` control flow (`if`/`elif`/`else`/`fi`)             |
 | v18       | `while`/`until` loops (`break`, `continue`)             |
 | v19       | Multi-line input (continuation lines, `> ` prompt)      |
+| v20       | `for` loops (`for NAME in WORDS; do … done`)            |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (733 tests)
+cargo test               # full test suite (764 tests)
 ```
 
 ## Features
@@ -162,12 +163,23 @@ prompt discards the partial command; an EOF mid-command is a syntax
 error. A multi-line command is stored in history collapsed onto one
 line.
 
+**`for` loops (v20):**
+`for NAME in WORD...; do LIST; done` runs the body once per word, with
+`NAME` set to each word in turn. The word list is expanded once before
+the loop — variables, command substitution, globs, and word-splitting
+all apply, exactly as for command arguments (`for f in *.txt`, `for x
+in $list`, `for n in $(seq 3)`). `break`/`continue` and multi-line form
+work as for `while`. The no-`in` form (`for NAME; do … done`) runs the
+body zero times — huck has no positional parameters for it to iterate.
+After the loop `NAME` keeps its last value. C-style `for ((;;))` is not
+implemented.
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), control flow
-(`for`/`case`), functions, here-docs, aliases.
+(`case`), functions, here-docs, aliases.
 
 ## Project layout
 
