@@ -446,9 +446,9 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
             }
             Token::Newline => {
                 // Unreachable: the peek-break above stops the loop on a
-                // Newline before it is ever consumed here. Task 2 adds a
-                // skip_newlines call after the `|` arm; this arm exists
-                // only to keep the match exhaustive.
+                // Newline before it is ever consumed here, and a Newline
+                // directly after `|` is consumed by skip_newlines in the
+                // `Pipe` arm. This arm only keeps the match exhaustive.
                 unreachable!("Newline terminates the pipeline via the peek-break above");
             }
             Token::Op(Operator::Pipe) => {
