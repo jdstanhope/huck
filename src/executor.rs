@@ -1446,14 +1446,29 @@ mod tests {
 
     #[test]
     fn for_continue_advances_through_all_values() {
+        // body: `continue ; echo NOPE` — `continue` must skip the echo on
+        // every iteration, so nothing prints, yet all values are visited.
+        let echo_nope = Command::Pipeline(Pipeline {
+            commands: vec![SimpleCommand::Exec(ExecCommand {
+                program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
+                args: vec![Word(vec![WordPart::Literal { text: "NOPE".to_string(), quoted: false }])],
+                stdin: None,
+                stdout: None,
+                stderr: None,
+            })],
+        });
+        let mut body = continue_seq();
+        body.rest.push((crate::command::Connector::Semi, echo_nope));
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
-            body: continue_seq(),
+            body,
         };
         let mut shell = Shell::new();
-        execute_capturing(&for_seq(clause), &mut shell);
+        let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "", "continue should skip the echo: {out:?}");
         assert_eq!(shell.get("x"), Some("c"));
+        assert_eq!(status, 0);
     }
 
     /// A one-pipeline Sequence running the `break` builtin.
