@@ -83,6 +83,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::If(clause) => run_if(clause, shell, sink),
         Command::While(clause) => run_while(clause, shell, sink),
         Command::For(clause) => run_for(clause, shell, sink),
+        Command::Case(_) => unreachable!("run_case lands in v21 task 3"),
     }
 }
 
