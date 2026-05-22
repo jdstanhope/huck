@@ -198,7 +198,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'|') {
                     chars.next();
@@ -213,7 +212,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'&') {
                     chars.next();
@@ -228,7 +226,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 let op = if chars.peek() == Some(&';') {
                     chars.next();
@@ -252,7 +249,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 tokens.push(Token::Op(Operator::LParen));
                 in_assignment_value = false;
@@ -262,7 +258,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 tokens.push(Token::Op(Operator::RParen));
                 in_assignment_value = false;
@@ -272,7 +267,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 tokens.push(Token::Op(Operator::RedirIn));
                 in_assignment_value = false;
@@ -282,7 +276,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     flush_literal(&mut parts, &mut current, false);
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
-                    in_assignment_value = false;
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();

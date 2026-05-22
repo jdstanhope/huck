@@ -68,16 +68,6 @@ impl Field {
         Self { chars: String::new(), quoted: Vec::new() }
     }
 
-    pub fn from_unquoted(s: &str) -> Self {
-        let count = s.chars().count();
-        Self { chars: s.to_string(), quoted: vec![false; count] }
-    }
-
-    pub fn from_quoted(s: &str) -> Self {
-        let count = s.chars().count();
-        Self { chars: s.to_string(), quoted: vec![true; count] }
-    }
-
     pub fn push_str(&mut self, s: &str, quoted: bool) {
         let count = s.chars().count();
         self.chars.push_str(s);
@@ -407,6 +397,19 @@ fn has_unquoted_metachar(field: &Field) -> bool {
         .chars()
         .zip(field.quoted.iter())
         .any(|(c, &q)| !q && matches!(c, '*' | '?' | '['))
+}
+
+#[cfg(test)]
+impl Field {
+    pub fn from_unquoted(s: &str) -> Self {
+        let count = s.chars().count();
+        Self { chars: s.to_string(), quoted: vec![false; count] }
+    }
+
+    pub fn from_quoted(s: &str) -> Self {
+        let count = s.chars().count();
+        Self { chars: s.to_string(), quoted: vec![true; count] }
+    }
 }
 
 #[cfg(test)]
