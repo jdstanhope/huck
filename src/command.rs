@@ -15,6 +15,8 @@ enum Keyword {
     In,
     Case,
     Esac,
+    LBrace,
+    RBrace,
 }
 
 impl Keyword {
@@ -33,6 +35,8 @@ impl Keyword {
             Keyword::In => "in",
             Keyword::Case => "case",
             Keyword::Esac => "esac",
+            Keyword::LBrace => "{",
+            Keyword::RBrace => "}",
         }
     }
 }
@@ -62,6 +66,8 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "in" => Some(Keyword::In),
         "case" => Some(Keyword::Case),
         "esac" => Some(Keyword::Esac),
+        "{" => Some(Keyword::LBrace),
+        "}" => Some(Keyword::RBrace),
         _ => None,
     }
 }
@@ -191,6 +197,7 @@ pub enum Command {
     While(Box<WhileClause>),
     For(Box<ForClause>),
     Case(Box<CaseClause>),
+    BraceGroup(Box<Sequence>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -268,6 +275,7 @@ pub enum ParseError {
     UnexpectedToken,
     ForVariable,
     UnterminatedCase,
+    UnterminatedBrace,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -376,6 +384,7 @@ fn parse_command<I: Iterator<Item = Token>>(
         }
         Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
+        Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
     }
@@ -633,6 +642,16 @@ fn parse_case_item<I: Iterator<Item = Token>>(
     Ok(CaseItem { patterns, body, terminator })
 }
 
+/// Parses `{ LIST }`. The caller has peeked the leading `{`.
+fn parse_brace_group<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Sequence, ParseError> {
+    expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
+    let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
+    expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+    Ok(body)
+}
+
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
 /// The caller has already peeked the leading `while`/`until`.
 fn parse_while<I: Iterator<Item = Token>>(
@@ -783,6 +802,7 @@ mod tests {
             Command::While(_) => panic!("expected a pipeline, got a while"),
             Command::For(_) => panic!("expected a pipeline, got a for"),
             Command::Case(_) => panic!("expected a pipeline, got a case"),
+            Command::BraceGroup(_) => panic!("expected a pipeline, got a brace group"),
         }
     }
 
@@ -1247,6 +1267,7 @@ mod tests {
             Command::While(_) => panic!("expected an if, got a while"),
             Command::For(_) => panic!("expected an if, got a for"),
             Command::Case(_) => panic!("expected an if, got a case"),
+            Command::BraceGroup(_) => panic!("expected an if, got a brace group"),
         }
     }
 
@@ -2015,5 +2036,38 @@ mod tests {
     fn while_with_no_body_at_end_of_input_is_unterminated() {
         let result = parse(vec![kw("while"), w_tok("a"), Token::Newline, kw("do")]);
         assert_eq!(result, Err(ParseError::UnterminatedLoop));
+    }
+
+    #[test]
+    fn parse_brace_group_simple() {
+        // { echo hi ; }
+        let seq = parse(vec![
+            kw("{"), w_tok("echo"), w_tok("hi"), Token::Op(Operator::Semi), kw("}"),
+        ]).unwrap().unwrap();
+        let body = match &seq.first {
+            Command::BraceGroup(b) => b.as_ref(),
+            other => panic!("expected a brace group, got {other:?}"),
+        };
+        assert_eq!(body.first, Command::Pipeline(Pipeline { commands: vec![plain("echo", &["hi"])] }));
+    }
+
+    #[test]
+    fn parse_brace_group_multiline_matches_singleline() {
+        let multi = parse(vec![
+            kw("{"), Token::Newline, w_tok("echo"), Token::Newline, kw("}"),
+        ]).unwrap().unwrap();
+        let single = parse(vec![
+            kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+        ]).unwrap().unwrap();
+        assert_eq!(multi, single);
+    }
+
+    #[test]
+    fn parse_brace_group_unterminated() {
+        // missing `}`
+        assert_eq!(
+            parse(vec![kw("{"), w_tok("echo"), Token::Op(Operator::Semi)]),
+            Err(ParseError::UnterminatedBrace)
+        );
     }
 }

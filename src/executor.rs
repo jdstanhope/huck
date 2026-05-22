@@ -84,6 +84,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::While(clause) => run_while(clause, shell, sink),
         Command::For(clause) => run_for(clause, shell, sink),
         Command::Case(clause) => run_case(clause, shell, sink),
+        Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
     }
 }
 
@@ -1382,6 +1383,31 @@ mod tests {
         let mut shell = Shell::new();
         let (_out, status) = execute_capturing(&seq, &mut shell);
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn brace_group_assignments_affect_current_shell() {
+        // A brace group has NO subshell isolation — `x=value` inside it
+        // is visible after.
+        let assign = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Assign {
+                    name: "BG_X".to_string(),
+                    value: Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]),
+                }],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let group = Sequence {
+            first: Command::BraceGroup(Box::new(assign)),
+            rest: vec![],
+            background: false,
+        };
+        let mut shell = Shell::new();
+        let (_, status) = execute_capturing(&group, &mut shell);
+        assert_eq!(status, 0);
+        assert_eq!(shell.get("BG_X"), Some("hello"));
     }
 
     #[test]

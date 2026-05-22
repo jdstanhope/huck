@@ -62,7 +62,10 @@ pub fn classify(buffer: &str) -> Completeness {
     }
     match command::parse(tokens) {
         Ok(_) => Completeness::Complete,
-        Err(ParseError::UnterminatedIf | ParseError::UnterminatedLoop | ParseError::UnterminatedCase) => {
+        Err(ParseError::UnterminatedIf
+            | ParseError::UnterminatedLoop
+            | ParseError::UnterminatedCase
+            | ParseError::UnterminatedBrace) => {
             Completeness::Incomplete(ContinuationReason::Compound)
         }
         Err(_) => Completeness::Error,
@@ -74,7 +77,7 @@ pub fn classify(buffer: &str) -> Completeness {
 fn ends_with_control_keyword(line: &str) -> bool {
     matches!(
         line.split_whitespace().next_back(),
-        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "in" | "case")
+        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "in" | "case" | "{")
     )
 }
 
@@ -279,5 +282,18 @@ mod tests {
     #[test]
     fn joiner_compound_is_space_after_case_keyword() {
         assert_eq!(joiner_for(ContinuationReason::Compound, "case"), " ");
+    }
+
+    #[test]
+    fn unterminated_brace_is_incomplete() {
+        assert_eq!(
+            classify("{ echo hi"),
+            Completeness::Incomplete(ContinuationReason::Compound)
+        );
+    }
+
+    #[test]
+    fn joiner_compound_is_space_after_open_brace() {
+        assert_eq!(joiner_for(ContinuationReason::Compound, "{"), " ");
     }
 }
