@@ -245,6 +245,11 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
         return Ok(None);
     }
     let seq = parse_sequence(&mut iter, &[])?;
+    if iter.peek().is_some() {
+        // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
+        // sequence — `parse_sequence` peek-breaks on those (see below).
+        return Err(ParseError::UnexpectedToken);
+    }
     Ok(Some(seq))
 }
 
@@ -264,6 +269,9 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     loop {
         match iter.peek() {
             None => break,
+            Some(Token::Op(
+                Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+            )) => break,
             Some(tok) => {
                 if let Some(kw) = keyword_of(tok) {
                     if stop_at.contains(&kw) {
@@ -529,8 +537,15 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     while let Some(token) = iter.peek() {
         if matches!(
             token,
-            Token::Op(Operator::Semi | Operator::And | Operator::Or | Operator::Background)
-                | Token::Newline
+            Token::Op(
+                Operator::Semi
+                    | Operator::And
+                    | Operator::Or
+                    | Operator::Background
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp
+            ) | Token::Newline
         ) {
             break;
         }
@@ -561,6 +576,10 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                 ));
                 skip_newlines(iter);
             }
+            Token::Op(Operator::LParen | Operator::RParen) => {
+                // A `(` or `)` outside a `case` pattern list is a syntax error.
+                return Err(ParseError::UnexpectedToken);
+            }
             Token::Op(op) => {
                 let target = match iter.next() {
                     Some(Token::Word(word)) => word,
@@ -577,8 +596,13 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                     | Operator::And
                     | Operator::Or
                     | Operator::Semi
-                    | Operator::Background => {
-                        unreachable!("handled in the outer arms");
+                    | Operator::Background
+                    | Operator::LParen
+                    | Operator::RParen
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp => {
+                        unreachable!("handled in the outer arms or peek-break");
                     }
                 }
             }
@@ -1663,6 +1687,30 @@ mod tests {
             kw("fi"), w_tok("extra"),
         ]);
         assert_eq!(result, Err(ParseError::UnexpectedToken));
+    }
+
+    #[test]
+    fn stray_close_paren_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::RParen)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_open_paren_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::LParen)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_double_semi_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemi)]),
+            Err(ParseError::UnexpectedToken)
+        );
     }
 
     #[test]

@@ -25,6 +25,11 @@ pub enum Operator {
     Or,             // ||
     Semi,           // ;
     Background,     // &
+    LParen,         // (
+    RParen,         // )
+    DoubleSemi,     // ;;
+    SemiAmp,        // ;&
+    DoubleSemiAmp,  // ;;&
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -225,7 +230,41 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     has_token = false;
                     in_assignment_value = false;
                 }
-                tokens.push(Token::Op(Operator::Semi));
+                let op = if chars.peek() == Some(&';') {
+                    chars.next();
+                    if chars.peek() == Some(&'&') {
+                        chars.next();
+                        Operator::DoubleSemiAmp
+                    } else {
+                        Operator::DoubleSemi
+                    }
+                } else if chars.peek() == Some(&'&') {
+                    chars.next();
+                    Operator::SemiAmp
+                } else {
+                    Operator::Semi
+                };
+                tokens.push(Token::Op(op));
+                in_assignment_value = false;
+            }
+            '(' => {
+                if has_token {
+                    flush_literal(&mut parts, &mut current, false);
+                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    has_token = false;
+                    in_assignment_value = false;
+                }
+                tokens.push(Token::Op(Operator::LParen));
+                in_assignment_value = false;
+            }
+            ')' => {
+                if has_token {
+                    flush_literal(&mut parts, &mut current, false);
+                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    has_token = false;
+                    in_assignment_value = false;
+                }
+                tokens.push(Token::Op(Operator::RParen));
                 in_assignment_value = false;
             }
             '<' => {
@@ -2271,5 +2310,52 @@ mod tests {
                 Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
             ]
         );
+    }
+
+    #[test]
+    fn tokenize_open_paren() {
+        assert_eq!(tokenize("(").unwrap(), vec![Token::Op(Operator::LParen)]);
+    }
+
+    #[test]
+    fn tokenize_close_paren() {
+        assert_eq!(tokenize(")").unwrap(), vec![Token::Op(Operator::RParen)]);
+    }
+
+    #[test]
+    fn tokenize_double_semi() {
+        assert_eq!(tokenize(";;").unwrap(), vec![Token::Op(Operator::DoubleSemi)]);
+    }
+
+    #[test]
+    fn tokenize_semi_amp() {
+        assert_eq!(tokenize(";&").unwrap(), vec![Token::Op(Operator::SemiAmp)]);
+    }
+
+    #[test]
+    fn tokenize_double_semi_amp() {
+        assert_eq!(tokenize(";;&").unwrap(), vec![Token::Op(Operator::DoubleSemiAmp)]);
+    }
+
+    #[test]
+    fn tokenize_lone_semi_still_semi() {
+        assert_eq!(
+            tokenize("a;b").unwrap(),
+            vec![w("a"), Token::Op(Operator::Semi), w("b")]
+        );
+    }
+
+    #[test]
+    fn tokenize_paren_splits_adjacent_word() {
+        assert_eq!(
+            tokenize("a)").unwrap(),
+            vec![w("a"), Token::Op(Operator::RParen)]
+        );
+    }
+
+    #[test]
+    fn tokenize_quoted_paren_stays_literal() {
+        // A quoted `)` is ordinary word content, not an operator.
+        assert_eq!(tokenize("')'").unwrap(), vec![wq(")")]);
     }
 }
