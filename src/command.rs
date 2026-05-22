@@ -13,6 +13,8 @@ enum Keyword {
     Done,
     For,
     In,
+    Case,
+    Esac,
 }
 
 impl Keyword {
@@ -29,6 +31,8 @@ impl Keyword {
             Keyword::Done => "done",
             Keyword::For => "for",
             Keyword::In => "in",
+            Keyword::Case => "case",
+            Keyword::Esac => "esac",
         }
     }
 }
@@ -56,6 +60,8 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "done" => Some(Keyword::Done),
         "for" => Some(Keyword::For),
         "in" => Some(Keyword::In),
+        "case" => Some(Keyword::Case),
+        "esac" => Some(Keyword::Esac),
         _ => None,
     }
 }
@@ -184,6 +190,7 @@ pub enum Command {
     If(Box<IfClause>),
     While(Box<WhileClause>),
     For(Box<ForClause>),
+    Case(Box<CaseClause>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -212,6 +219,30 @@ pub struct ForClause {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub struct CaseClause {
+    /// The word being matched — unexpanded.
+    pub subject: Word,
+    /// The clauses, in source order. May be empty.
+    pub items: Vec<CaseItem>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct CaseItem {
+    /// The `|`-separated patterns, unexpanded. Always non-empty.
+    pub patterns: Vec<Word>,
+    /// The clause body. `None` means an empty body.
+    pub body: Option<Sequence>,
+    pub terminator: CaseTerminator,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CaseTerminator {
+    Break,         // ;;
+    FallThrough,   // ;&
+    ContinueMatch, // ;;&
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ElifBranch {
     pub condition: Sequence,
     pub body: Sequence,
@@ -236,6 +267,7 @@ pub enum ParseError {
     UnterminatedLoop,
     UnexpectedToken,
     ForVariable,
+    UnterminatedCase,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -245,6 +277,11 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
         return Ok(None);
     }
     let seq = parse_sequence(&mut iter, &[])?;
+    if iter.peek().is_some() {
+        // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
+        // sequence — `parse_sequence` peek-breaks on those (see below).
+        return Err(ParseError::UnexpectedToken);
+    }
     Ok(Some(seq))
 }
 
@@ -264,6 +301,9 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     loop {
         match iter.peek() {
             None => break,
+            Some(Token::Op(
+                Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+            )) => break,
             Some(tok) => {
                 if let Some(kw) = keyword_of(tok) {
                     if stop_at.contains(&kw) {
@@ -291,6 +331,9 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 skip_newlines(iter);
                 match iter.peek() {
                     None => break,
+                    Some(Token::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => break,
                     Some(tok) => {
                         if keyword_of(tok).map(|k| stop_at.contains(&k)).unwrap_or(false) {
                             break;
@@ -332,6 +375,7 @@ fn parse_command<I: Iterator<Item = Token>>(
             Ok(Command::While(Box::new(parse_while(iter)?)))
         }
         Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
+        Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
     }
@@ -498,6 +542,97 @@ fn parse_for<I: Iterator<Item = Token>>(
     Ok(ForClause { var, words, body })
 }
 
+/// Parses `case WORD in [clause]... esac`. The caller has peeked `case`.
+fn parse_case<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<CaseClause, ParseError> {
+    expect_keyword(iter, Keyword::Case, ParseError::UnterminatedCase)?;
+    skip_newlines(iter);
+
+    let subject = match iter.next() {
+        None => return Err(ParseError::UnterminatedCase),
+        Some(Token::Word(w)) => w,
+        Some(_) => return Err(ParseError::UnexpectedToken),
+    };
+
+    skip_newlines(iter);
+    expect_keyword(iter, Keyword::In, ParseError::UnterminatedCase)?;
+    skip_newlines(iter);
+
+    let mut items: Vec<CaseItem> = Vec::new();
+    while iter.peek().and_then(keyword_of) != Some(Keyword::Esac) {
+        if iter.peek().is_none() {
+            return Err(ParseError::UnterminatedCase);
+        }
+        items.push(parse_case_item(iter)?);
+        skip_newlines(iter);
+    }
+    expect_keyword(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
+    Ok(CaseClause { subject, items })
+}
+
+/// Parses one `[(] pattern [| pattern]... ) [body] [terminator]` clause.
+fn parse_case_item<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<CaseItem, ParseError> {
+    // Optional leading `(`.
+    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+        iter.next();
+    }
+
+    // Pattern list — Word (`|` Word)* `)`, non-empty.
+    let mut patterns: Vec<Word> = Vec::new();
+    loop {
+        skip_newlines(iter);
+        match iter.next() {
+            None => return Err(ParseError::UnterminatedCase),
+            Some(Token::Word(w)) => patterns.push(w),
+            Some(_) => return Err(ParseError::UnexpectedToken),
+        }
+        match iter.peek() {
+            None => return Err(ParseError::UnterminatedCase),
+            Some(Token::Op(Operator::Pipe)) => {
+                iter.next();
+            }
+            Some(Token::Op(Operator::RParen)) => {
+                iter.next();
+                break;
+            }
+            Some(_) => return Err(ParseError::UnexpectedToken),
+        }
+    }
+
+    // Body — empty if the next token is a terminator or `esac`.
+    skip_newlines(iter);
+    let body = match iter.peek() {
+        None => return Err(ParseError::UnterminatedCase),
+        Some(Token::Op(
+            Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+        )) => None,
+        Some(tok) if keyword_of(tok) == Some(Keyword::Esac) => None,
+        Some(_) => Some(parse_sequence(iter, &[Keyword::Esac])?),
+    };
+
+    // Terminator — an absent one (next token is `esac` or end) is `Break`.
+    let terminator = match iter.peek() {
+        Some(Token::Op(Operator::DoubleSemi)) => {
+            iter.next();
+            CaseTerminator::Break
+        }
+        Some(Token::Op(Operator::SemiAmp)) => {
+            iter.next();
+            CaseTerminator::FallThrough
+        }
+        Some(Token::Op(Operator::DoubleSemiAmp)) => {
+            iter.next();
+            CaseTerminator::ContinueMatch
+        }
+        _ => CaseTerminator::Break,
+    };
+
+    Ok(CaseItem { patterns, body, terminator })
+}
+
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
 /// The caller has already peeked the leading `while`/`until`.
 fn parse_while<I: Iterator<Item = Token>>(
@@ -529,8 +664,15 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     while let Some(token) = iter.peek() {
         if matches!(
             token,
-            Token::Op(Operator::Semi | Operator::And | Operator::Or | Operator::Background)
-                | Token::Newline
+            Token::Op(
+                Operator::Semi
+                    | Operator::And
+                    | Operator::Or
+                    | Operator::Background
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp
+            ) | Token::Newline
         ) {
             break;
         }
@@ -561,6 +703,10 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                 ));
                 skip_newlines(iter);
             }
+            Token::Op(Operator::LParen | Operator::RParen) => {
+                // A `(` or `)` outside a `case` pattern list is a syntax error.
+                return Err(ParseError::UnexpectedToken);
+            }
             Token::Op(op) => {
                 let target = match iter.next() {
                     Some(Token::Word(word)) => word,
@@ -577,8 +723,13 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
                     | Operator::And
                     | Operator::Or
                     | Operator::Semi
-                    | Operator::Background => {
-                        unreachable!("handled in the outer arms");
+                    | Operator::Background
+                    | Operator::LParen
+                    | Operator::RParen
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp => {
+                        unreachable!("handled in the outer arms or peek-break");
                     }
                 }
             }
@@ -631,6 +782,7 @@ mod tests {
             Command::If(_) => panic!("expected a pipeline, got an if"),
             Command::While(_) => panic!("expected a pipeline, got a while"),
             Command::For(_) => panic!("expected a pipeline, got a for"),
+            Command::Case(_) => panic!("expected a pipeline, got a case"),
         }
     }
 
@@ -1094,6 +1246,7 @@ mod tests {
             Command::Pipeline(_) => panic!("expected an if, got a pipeline"),
             Command::While(_) => panic!("expected an if, got a while"),
             Command::For(_) => panic!("expected an if, got a for"),
+            Command::Case(_) => panic!("expected an if, got a case"),
         }
     }
 
@@ -1111,6 +1264,153 @@ mod tests {
             Command::For(c) => c,
             other => panic!("expected a for, got {other:?}"),
         }
+    }
+
+    /// Extracts the CaseClause from a sequence whose first command is a Case.
+    fn first_case(seq: &Sequence) -> &CaseClause {
+        match &seq.first {
+            Command::Case(c) => c,
+            other => panic!("expected a case, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_case() {
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"), w_tok("hi"),
+            Token::Op(Operator::DoubleSemi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        let clause = first_case(&seq);
+        assert_eq!(clause.items.len(), 1);
+        assert_eq!(clause.items[0].patterns.len(), 1);
+        assert_eq!(clause.items[0].terminator, CaseTerminator::Break);
+        assert!(clause.items[0].body.is_some());
+    }
+
+    #[test]
+    fn parse_case_multiline_matches_singleline() {
+        let multiline = parse(vec![
+            kw("case"), w_tok("x"), kw("in"), Token::Newline,
+            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"), Token::Newline,
+            Token::Op(Operator::DoubleSemi), Token::Newline,
+            kw("esac"),
+        ]).unwrap().unwrap();
+        let singleline = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::DoubleSemi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        assert_eq!(multiline, singleline);
+    }
+
+    #[test]
+    fn parse_case_alternation() {
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::Pipe), w_tok("b"),
+            Token::Op(Operator::Pipe), w_tok("c"), Token::Op(Operator::RParen),
+            w_tok("echo"), Token::Op(Operator::DoubleSemi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_case(&seq).items[0].patterns.len(), 3);
+    }
+
+    #[test]
+    fn parse_case_leading_paren() {
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            Token::Op(Operator::LParen), w_tok("a"), Token::Op(Operator::RParen),
+            w_tok("echo"), Token::Op(Operator::DoubleSemi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_case(&seq).items[0].patterns.len(), 1);
+    }
+
+    #[test]
+    fn parse_case_empty_body() {
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::RParen),
+            Token::Op(Operator::DoubleSemi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        assert!(first_case(&seq).items[0].body.is_none());
+    }
+
+    #[test]
+    fn parse_case_terminators() {
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::DoubleSemi),
+            w_tok("b"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::SemiAmp),
+            w_tok("c"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::DoubleSemiAmp),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        let items = &first_case(&seq).items;
+        assert_eq!(items[0].terminator, CaseTerminator::Break);
+        assert_eq!(items[1].terminator, CaseTerminator::FallThrough);
+        assert_eq!(items[2].terminator, CaseTerminator::ContinueMatch);
+    }
+
+    #[test]
+    fn parse_case_omitted_final_terminator() {
+        // case x in a) echo ; esac — last clause with the `;;` omitted; a
+        // separator (here `;`) is required before `esac`, as for `fi`/`done`.
+        let seq = parse(vec![
+            kw("case"), w_tok("x"), kw("in"),
+            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::Semi),
+            kw("esac"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_case(&seq).items[0].terminator, CaseTerminator::Break);
+    }
+
+    #[test]
+    fn parse_case_empty() {
+        let seq = parse(vec![kw("case"), w_tok("x"), kw("in"), kw("esac")])
+            .unwrap()
+            .unwrap();
+        assert!(first_case(&seq).items.is_empty());
+    }
+
+    #[test]
+    fn parse_case_unterminated_is_unterminated_case() {
+        assert_eq!(parse(vec![kw("case")]), Err(ParseError::UnterminatedCase));
+        assert_eq!(
+            parse(vec![kw("case"), w_tok("x")]),
+            Err(ParseError::UnterminatedCase)
+        );
+        assert_eq!(
+            parse(vec![kw("case"), w_tok("x"), kw("in")]),
+            Err(ParseError::UnterminatedCase)
+        );
+        assert_eq!(
+            parse(vec![
+                kw("case"), w_tok("x"), kw("in"),
+                w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
+                Token::Op(Operator::DoubleSemi),
+            ]),
+            Err(ParseError::UnterminatedCase)
+        );
+    }
+
+    #[test]
+    fn parse_case_malformed_pattern_list_errors() {
+        assert_eq!(
+            parse(vec![
+                kw("case"), w_tok("x"), kw("in"),
+                w_tok("a"), w_tok("b"), Token::Op(Operator::RParen),
+                w_tok("echo"), Token::Op(Operator::DoubleSemi),
+                kw("esac"),
+            ]),
+            Err(ParseError::UnexpectedToken)
+        );
     }
 
     #[test]
@@ -1663,6 +1963,46 @@ mod tests {
             kw("fi"), w_tok("extra"),
         ]);
         assert_eq!(result, Err(ParseError::UnexpectedToken));
+    }
+
+    #[test]
+    fn stray_close_paren_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::RParen)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_open_paren_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::LParen)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_double_semi_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemi)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_semi_amp_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::SemiAmp)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_double_semi_amp_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemiAmp)]),
+            Err(ParseError::UnexpectedToken)
+        );
     }
 
     #[test]

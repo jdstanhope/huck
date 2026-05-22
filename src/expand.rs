@@ -246,6 +246,45 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
     result
 }
 
+/// True when `part` carried a `quoted` flag set to true. Tilde parts
+/// have no quoted flag and count as unquoted.
+fn word_part_is_quoted(part: &WordPart) -> bool {
+    match part {
+        WordPart::Literal { quoted, .. } => *quoted,
+        WordPart::Var { quoted, .. } => *quoted,
+        WordPart::LastStatus { quoted } => *quoted,
+        WordPart::CommandSub { quoted, .. } => *quoted,
+        WordPart::Arith { quoted, .. } => *quoted,
+        WordPart::ParamExpansion { quoted, .. } => *quoted,
+        WordPart::Tilde(_) => false,
+    }
+}
+
+/// Expands `word` into a glob-pattern string for `case` matching.
+/// Like `expand_assignment` (no field splitting), but text contributed
+/// by a quoted part is escaped via `glob::Pattern::escape`, so a quoted
+/// `*`/`?`/`[` matches literally while an unquoted one is a wildcard.
+pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
+    // Snapshot `$?` so `LastStatus` parts read the value at the start of
+    // the expansion, not whatever a preceding `$(cmd)` mutated it to.
+    // Matches the contract in `expand()` (used for command arguments).
+    let snapshot_status = shell.last_status();
+    let mut result = String::new();
+    for part in &word.0 {
+        let text = if matches!(part, WordPart::LastStatus { .. }) {
+            snapshot_status.to_string()
+        } else {
+            expand_assignment(&Word(vec![part.clone()]), shell)
+        };
+        if word_part_is_quoted(part) {
+            result.push_str(&glob::Pattern::escape(&text));
+        } else {
+            result.push_str(&text);
+        }
+    }
+    result
+}
+
 /// Runs a sub-sequence as a substituted command: clones the parent `Shell`
 /// (so state mutations don't leak), captures stdout via the executor's
 /// `execute_capturing`, strips trailing newlines, and propagates the
@@ -1186,6 +1225,41 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "");
         assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_pattern_last_status_snapshots_before_command_sub() {
+        use crate::command::Sequence;
+
+        let mut shell = Shell::new();
+        shell.set_last_status(7);
+
+        // A pattern word of two parts: a CommandSub that runs `false` (which
+        // mutates $? to 1), followed by $?. With the snapshot fix, $? reads
+        // the pre-expansion value (7) — not the post-`false` value (1).
+        let false_cmd = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: lit("false"),
+                    args: vec![],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let word = Word(vec![
+            WordPart::CommandSub { sequence: false_cmd, quoted: false },
+            WordPart::LastStatus { quoted: false },
+        ]);
+
+        let pattern = expand_pattern(&word, &mut shell);
+        assert!(
+            pattern.ends_with("7"),
+            "expected pattern to end with the pre-expansion $? value 7, got: {pattern:?}"
+        );
     }
 
     #[test]

@@ -245,6 +245,7 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
         ParseError::UnexpectedToken => "unexpected token after command".to_string(),
         ParseError::ForVariable => "invalid variable name in 'for' loop".to_string(),
+        ParseError::UnterminatedCase => "unterminated 'case' (expected 'esac')".to_string(),
     }
 }
 
