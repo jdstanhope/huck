@@ -82,6 +82,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
         Command::If(clause) => run_if(clause, shell, sink),
         Command::While(clause) => run_while(clause, shell, sink),
+        Command::For(_) => unreachable!("run_for lands in v20 task 2"),
     }
 }
 

@@ -244,6 +244,7 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
         ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
         ParseError::UnexpectedToken => "unexpected token after command".to_string(),
+        ParseError::ForVariable => "invalid variable name in 'for' loop".to_string(),
     }
 }
 
