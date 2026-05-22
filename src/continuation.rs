@@ -132,6 +132,22 @@ mod tests {
     }
 
     #[test]
+    fn open_brace_expansion_is_incomplete() {
+        assert_eq!(
+            classify("echo ${FOO"),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        );
+    }
+
+    #[test]
+    fn open_arithmetic_expansion_is_incomplete() {
+        assert_eq!(
+            classify("echo $((1 + 2"),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        );
+    }
+
+    #[test]
     fn trailing_pipe_is_incomplete() {
         assert_eq!(
             classify("echo hi |"),
@@ -148,6 +164,14 @@ mod tests {
     }
 
     #[test]
+    fn trailing_oror_is_incomplete() {
+        assert_eq!(
+            classify("echo hi ||"),
+            Completeness::Incomplete(ContinuationReason::Operator)
+        );
+    }
+
+    #[test]
     fn unterminated_if_is_incomplete() {
         assert_eq!(
             classify("if true"),
@@ -159,6 +183,14 @@ mod tests {
     fn unterminated_while_is_incomplete() {
         assert_eq!(
             classify("while true\ndo echo hi"),
+            Completeness::Incomplete(ContinuationReason::Compound)
+        );
+    }
+
+    #[test]
+    fn unterminated_until_is_incomplete() {
+        assert_eq!(
+            classify("until false\ndo echo hi"),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
