@@ -1714,6 +1714,22 @@ mod tests {
     }
 
     #[test]
+    fn stray_semi_amp_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::SemiAmp)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
+    fn stray_double_semi_amp_is_error() {
+        assert_eq!(
+            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemiAmp)]),
+            Err(ParseError::UnexpectedToken)
+        );
+    }
+
+    #[test]
     fn if_with_no_body_at_end_of_input_is_unterminated() {
         let result = parse(vec![kw("if"), w_tok("a"), Token::Newline, kw("then")]);
         assert_eq!(result, Err(ParseError::UnterminatedIf));

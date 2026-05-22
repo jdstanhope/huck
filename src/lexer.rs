@@ -2338,6 +2338,14 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_double_semi_space_amp_is_two_tokens() {
+        assert_eq!(
+            tokenize(";; &").unwrap(),
+            vec![Token::Op(Operator::DoubleSemi), Token::Op(Operator::Background)]
+        );
+    }
+
+    #[test]
     fn tokenize_lone_semi_still_semi() {
         assert_eq!(
             tokenize("a;b").unwrap(),
