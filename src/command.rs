@@ -294,7 +294,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
     let at_top_level = stop_at.is_empty();
-    let first = parse_command(iter, stop_at)?;
+    let first = parse_command(iter)?;
     let mut rest = Vec::new();
     let mut background = false;
 
@@ -340,15 +340,15 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                         }
                     }
                 }
-                rest.push((Connector::Semi, parse_command(iter, stop_at)?));
+                rest.push((Connector::Semi, parse_command(iter)?));
             }
             Token::Op(Operator::And) => {
                 skip_newlines(iter);
-                rest.push((Connector::And, parse_command(iter, stop_at)?));
+                rest.push((Connector::And, parse_command(iter)?));
             }
             Token::Op(Operator::Or) => {
                 skip_newlines(iter);
-                rest.push((Connector::Or, parse_command(iter, stop_at)?));
+                rest.push((Connector::Or, parse_command(iter)?));
             }
             other => {
                 if let Some(kw) = keyword_of(&other) {
@@ -365,11 +365,8 @@ fn parse_sequence<I: Iterator<Item = Token>>(
 }
 
 /// Parses a single sequence element: an `if` clause or a pipeline.
-/// `stop_at` is forwarded to `parse_pipeline` so it can stop before
-/// consuming a stop keyword as a plain word argument.
 fn parse_command<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
-    stop_at: &[Keyword],
 ) -> Result<Command, ParseError> {
     skip_newlines(iter);
     match iter.peek().and_then(keyword_of) {
@@ -380,7 +377,7 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
-        None => Ok(Command::Pipeline(parse_pipeline(iter, stop_at)?)),
+        None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
     }
 }
 
@@ -655,7 +652,6 @@ fn parse_while<I: Iterator<Item = Token>>(
 
 fn parse_pipeline<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
-    stop_at: &[Keyword],
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
 
@@ -679,14 +675,6 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
             ) | Token::Newline
         ) {
             break;
-        }
-        // Stop before a stop-at keyword so it is not consumed as a word
-        // argument. This matters for case items whose body ends immediately
-        // before `esac` with no preceding `;`/newline.
-        if let Some(kw) = keyword_of(token) {
-            if stop_at.contains(&kw) {
-                break;
-            }
         }
         let token = iter.next().unwrap();
         match token {
@@ -1372,9 +1360,11 @@ mod tests {
 
     #[test]
     fn parse_case_omitted_final_terminator() {
+        // `case x in a) echo ; esac` — a `;` ends the body, the `;;` is omitted.
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
             w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
+            Token::Op(Operator::Semi),
             kw("esac"),
         ]).unwrap().unwrap();
         assert_eq!(first_case(&seq).items[0].terminator, CaseTerminator::Break);
