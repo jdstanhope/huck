@@ -293,6 +293,11 @@ mod tests {
     }
 
     #[test]
+    fn complete_brace_group_is_complete() {
+        assert_eq!(classify("{ echo hi; }"), Completeness::Complete);
+    }
+
+    #[test]
     fn joiner_compound_is_space_after_open_brace() {
         assert_eq!(joiner_for(ContinuationReason::Compound, "{"), " ");
     }
