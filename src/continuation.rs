@@ -74,7 +74,7 @@ pub fn classify(buffer: &str) -> Completeness {
 fn ends_with_control_keyword(line: &str) -> bool {
     matches!(
         line.split_whitespace().next_back(),
-        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif")
+        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "in")
     )
 }
 
@@ -188,6 +188,14 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_for_is_incomplete() {
+        assert_eq!(
+            classify("for x in a b c"),
+            Completeness::Incomplete(ContinuationReason::Compound)
+        );
+    }
+
+    #[test]
     fn unterminated_until_is_incomplete() {
         assert_eq!(
             classify("until false\ndo echo hi"),
@@ -252,5 +260,11 @@ mod tests {
     fn joiner_compound_is_space_after_a_bare_keyword() {
         assert_eq!(joiner_for(ContinuationReason::Compound, "then"), " ");
         assert_eq!(joiner_for(ContinuationReason::Compound, "  do  "), " ");
+    }
+
+    #[test]
+    fn joiner_compound_is_space_after_for_keyword() {
+        assert_eq!(joiner_for(ContinuationReason::Compound, "for"), " ");
+        assert_eq!(joiner_for(ContinuationReason::Compound, "for x in"), " ");
     }
 }

@@ -11,6 +11,8 @@ enum Keyword {
     Until,
     Do,
     Done,
+    For,
+    In,
 }
 
 impl Keyword {
@@ -25,6 +27,8 @@ impl Keyword {
             Keyword::Until => "until",
             Keyword::Do => "do",
             Keyword::Done => "done",
+            Keyword::For => "for",
+            Keyword::In => "in",
         }
     }
 }
@@ -50,6 +54,8 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "until" => Some(Keyword::Until),
         "do" => Some(Keyword::Do),
         "done" => Some(Keyword::Done),
+        "for" => Some(Keyword::For),
+        "in" => Some(Keyword::In),
         _ => None,
     }
 }
@@ -177,6 +183,7 @@ pub enum Command {
     Pipeline(Pipeline),
     If(Box<IfClause>),
     While(Box<WhileClause>),
+    For(Box<ForClause>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -192,6 +199,16 @@ pub struct WhileClause {
     pub condition: Sequence,
     pub body: Sequence,
     pub until: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ForClause {
+    /// The loop variable name — a validated identifier.
+    pub var: String,
+    /// The unexpanded `in` word list. Empty for the no-`in` form.
+    pub words: Vec<Word>,
+    /// The do…done body.
+    pub body: Sequence,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -218,6 +235,7 @@ pub enum ParseError {
     UnexpectedKeyword(String),
     UnterminatedLoop,
     UnexpectedToken,
+    ForVariable,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -313,6 +331,7 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::While) | Some(Keyword::Until) => {
             Ok(Command::While(Box::new(parse_while(iter)?)))
         }
+        Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
     }
@@ -397,6 +416,86 @@ fn parse_if<I: Iterator<Item = Token>>(
 
     expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     Ok(IfClause { condition, then_body, elif_branches, else_body })
+}
+
+/// Returns the loop-variable name if `token` is a single, unquoted
+/// `Literal` `Word` whose text is a valid identifier and not a reserved
+/// keyword. Otherwise `None`.
+fn for_variable_name(token: &Token) -> Option<String> {
+    if keyword_of(token).is_some() {
+        return None;
+    }
+    let Token::Word(Word(parts)) = token else {
+        return None;
+    };
+    if parts.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal { text, quoted: false } = &parts[0] else {
+        return None;
+    };
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(text.clone())
+}
+
+/// Parses `for NAME [in WORD...] sep do LIST done`. The caller has
+/// peeked the leading `for`.
+fn parse_for<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<ForClause, ParseError> {
+    expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
+
+    // Loop variable. End-of-input means the command is incomplete (the
+    // v19 classifier maps UnterminatedLoop to "read more"); a present
+    // but invalid token is a genuine error.
+    let var = match iter.next() {
+        None => return Err(ParseError::UnterminatedLoop),
+        Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
+    };
+
+    // POSIX allows a linebreak between the variable and `in`.
+    skip_newlines(iter);
+
+    // Optional `in` plus the word list.
+    let mut words: Vec<Word> = Vec::new();
+    if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
+        iter.next(); // consume `in`
+        loop {
+            match iter.peek() {
+                None | Some(Token::Newline) | Some(Token::Op(Operator::Semi)) => break,
+                Some(tok) => {
+                    if keyword_of(tok) == Some(Keyword::Do) {
+                        break;
+                    }
+                    match iter.next() {
+                        Some(Token::Word(w)) => words.push(w),
+                        Some(Token::Op(_)) => return Err(ParseError::UnexpectedToken),
+                        _ => unreachable!("peek already ruled out Newline/Semi/None here"),
+                    }
+                }
+            }
+        }
+    }
+
+    // Skip `;`/newline separators, then `do`.
+    while matches!(
+        iter.peek(),
+        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+    ) {
+        iter.next();
+    }
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    Ok(ForClause { var, words, body })
 }
 
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
@@ -531,6 +630,7 @@ mod tests {
             Command::Pipeline(p) => p,
             Command::If(_) => panic!("expected a pipeline, got an if"),
             Command::While(_) => panic!("expected a pipeline, got a while"),
+            Command::For(_) => panic!("expected a pipeline, got a for"),
         }
     }
 
@@ -993,6 +1093,7 @@ mod tests {
             Command::If(c) => c,
             Command::Pipeline(_) => panic!("expected an if, got a pipeline"),
             Command::While(_) => panic!("expected an if, got a while"),
+            Command::For(_) => panic!("expected an if, got a for"),
         }
     }
 
@@ -1002,6 +1103,144 @@ mod tests {
             Command::While(c) => c,
             other => panic!("expected a while, got {other:?}"),
         }
+    }
+
+    /// Extracts the ForClause from a sequence whose first command is a For.
+    fn first_for(seq: &Sequence) -> &ForClause {
+        match &seq.first {
+            Command::For(c) => c,
+            other => panic!("expected a for, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_for() {
+        // for x in a b c ; do echo ; done
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), kw("in"),
+            w_tok("a"), w_tok("b"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        let clause = first_for(&seq);
+        assert_eq!(clause.var, "x");
+        assert_eq!(clause.words.len(), 3);
+        assert_eq!(
+            clause.body.first,
+            Command::Pipeline(Pipeline { commands: vec![plain("echo", &[])] })
+        );
+    }
+
+    #[test]
+    fn parse_for_multiline_matches_singleline() {
+        let multiline = parse(vec![
+            kw("for"), w_tok("x"), kw("in"), w_tok("a"), Token::Newline,
+            kw("do"), w_tok("echo"), Token::Newline,
+            kw("done"),
+        ]).unwrap().unwrap();
+        let singleline = parse(vec![
+            kw("for"), w_tok("x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert_eq!(multiline, singleline);
+    }
+
+    #[test]
+    fn parse_for_no_in_has_empty_words() {
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert!(first_for(&seq).words.is_empty());
+    }
+
+    #[test]
+    fn parse_for_empty_in_list() {
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), kw("in"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert!(first_for(&seq).words.is_empty());
+    }
+
+    #[test]
+    fn parse_for_do_terminates_word_list() {
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), kw("in"), w_tok("a"), w_tok("b"),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_for(&seq).words.len(), 2);
+    }
+
+    #[test]
+    fn parse_for_keyword_words_in_list() {
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), kw("in"), w_tok("then"), w_tok("else"),
+            Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("done"),
+        ]).unwrap().unwrap();
+        assert_eq!(first_for(&seq).words.len(), 2);
+    }
+
+    #[test]
+    fn parse_for_in_on_next_line() {
+        let seq = parse(vec![
+            kw("for"), w_tok("x"), Token::Newline,
+            kw("in"), w_tok("a"), Token::Newline,
+            kw("do"), w_tok("echo"), Token::Newline,
+            kw("done"),
+        ]).unwrap().unwrap();
+        let clause = first_for(&seq);
+        assert_eq!(clause.var, "x");
+        assert_eq!(clause.words.len(), 1);
+    }
+
+    #[test]
+    fn parse_for_invalid_variable_name_errors() {
+        assert_eq!(
+            parse(vec![
+                kw("for"), w_tok("2x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
+                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+            ]),
+            Err(ParseError::ForVariable)
+        );
+    }
+
+    #[test]
+    fn parse_for_keyword_as_variable_errors() {
+        assert_eq!(
+            parse(vec![
+                kw("for"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
+                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+            ]),
+            Err(ParseError::ForVariable)
+        );
+    }
+
+    #[test]
+    fn parse_for_unterminated_is_unterminated_loop() {
+        assert_eq!(
+            parse(vec![kw("for"), w_tok("x"), kw("in"), w_tok("a")]),
+            Err(ParseError::UnterminatedLoop)
+        );
+        assert_eq!(parse(vec![kw("for")]), Err(ParseError::UnterminatedLoop));
+    }
+
+    #[test]
+    fn parse_for_operator_in_word_list_errors() {
+        assert_eq!(
+            parse(vec![
+                kw("for"), w_tok("x"), kw("in"), w_tok("a"),
+                Token::Op(Operator::Pipe), w_tok("b"), Token::Op(Operator::Semi),
+                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+            ]),
+            Err(ParseError::UnexpectedToken)
+        );
     }
 
     #[test]
