@@ -5,10 +5,10 @@ use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, St
 
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
-    Command, Connector, ExecCommand, ForClause, IfClause, Pipeline, Redirect, Sequence,
-    SimpleCommand, WhileClause,
+    CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, ForClause, IfClause,
+    Pipeline, Redirect, Sequence, SimpleCommand, WhileClause,
 };
-use crate::expand::{expand, expand_assignment, glob_expand_fields};
+use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields};
 use crate::shell_state::Shell;
 
 /// Where the terminal stage of a top-level pipeline sends its stdout when
@@ -83,7 +83,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::If(clause) => run_if(clause, shell, sink),
         Command::While(clause) => run_while(clause, shell, sink),
         Command::For(clause) => run_for(clause, shell, sink),
-        Command::Case(_) => unreachable!("run_case lands in v21 task 3"),
+        Command::Case(clause) => run_case(clause, shell, sink),
     }
 }
 
@@ -168,6 +168,66 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
             }
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
+            }
+        }
+    }
+    last
+}
+
+/// Matches `subject` against a `case` clause's `|`-patterns. A clause
+/// matches if any pattern matches; an unparseable glob matches nothing.
+fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool {
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    for pattern_word in &item.patterns {
+        let pattern = expand_pattern(pattern_word, shell);
+        if let Ok(p) = glob::Pattern::new(&pattern) {
+            if p.matches_with(subject, opts) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Runs a `case` statement. The subject is expanded once; clauses are
+/// walked in order. The first matching clause's body runs, then the
+/// terminator decides what happens: `;;` stops, `;&` runs the next
+/// clause's body unconditionally, `;;&` resumes pattern-testing.
+/// `case` is not a loop — `break`/`continue` propagate out unchanged.
+fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    let subject = expand_assignment(&clause.subject, shell);
+    let mut last = ExecOutcome::Continue(0);
+    let mut i = 0;
+    let mut fall_through = false;
+    while i < clause.items.len() {
+        let item = &clause.items[i];
+        let run_this = fall_through || case_item_matches(item, &subject, shell);
+        if !run_this {
+            i += 1;
+            continue;
+        }
+        match &item.body {
+            None => last = ExecOutcome::Continue(0),
+            Some(body) => match execute_sequence_body(body, shell, sink) {
+                ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
+                ExecOutcome::LoopBreak => return ExecOutcome::LoopBreak,
+                ExecOutcome::LoopContinue => return ExecOutcome::LoopContinue,
+                ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
+            },
+        }
+        match item.terminator {
+            CaseTerminator::Break => return last,
+            CaseTerminator::FallThrough => {
+                fall_through = true;
+                i += 1;
+            }
+            CaseTerminator::ContinueMatch => {
+                fall_through = false;
+                i += 1;
             }
         }
     }
@@ -1531,5 +1591,141 @@ mod tests {
         let mut shell = Shell::new();
         let (out, _) = execute_capturing(&while_seq(clause), &mut shell);
         assert_eq!(out.trim(), "");
+    }
+
+    // ----- case statement tests -----------------------------------------------
+
+    use crate::command::{CaseClause, CaseItem, CaseTerminator};
+
+    /// A Sequence wrapping a single `case` clause.
+    fn case_seq(clause: CaseClause) -> Sequence {
+        Sequence { first: Command::Case(Box::new(clause)), rest: vec![], background: false }
+    }
+
+    /// A CaseItem with a `;;` (Break) terminator.
+    fn item(patterns: &[&str], body: Option<Sequence>) -> CaseItem {
+        CaseItem {
+            patterns: patterns.iter().map(|p| lit_word(p)).collect(),
+            body,
+            terminator: CaseTerminator::Break,
+        }
+    }
+
+    #[test]
+    fn case_runs_first_matching_clause() {
+        let clause = CaseClause {
+            subject: lit_word("foo"),
+            items: vec![
+                item(&["foo"], Some(echo_seq("matched"))),
+                item(&["bar"], Some(echo_seq("other"))),
+            ],
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "matched");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn case_glob_pattern_matches() {
+        let clause = CaseClause {
+            subject: lit_word("report.txt"),
+            items: vec![item(&["*.txt"], Some(echo_seq("text")))],
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "text");
+    }
+
+    #[test]
+    fn case_alternation_matches_any() {
+        let clause = CaseClause {
+            subject: lit_word("b"),
+            items: vec![item(&["a", "b", "c"], Some(echo_seq("hit")))],
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "hit");
+    }
+
+    #[test]
+    fn case_no_match_is_status_zero_no_output() {
+        let clause = CaseClause {
+            subject: lit_word("x"),
+            items: vec![item(&["y"], Some(echo_seq("nope")))],
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn case_empty_body_is_status_zero() {
+        let clause = CaseClause {
+            subject: lit_word("x"),
+            items: vec![item(&["x"], None)],
+        };
+        let mut shell = Shell::new();
+        let (out, status) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.trim(), "");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn case_fall_through_runs_next_body() {
+        // a) echo one ;&  *) echo two ;;
+        let clause = CaseClause {
+            subject: lit_word("a"),
+            items: vec![
+                CaseItem {
+                    patterns: vec![lit_word("a")],
+                    body: Some(echo_seq("one")),
+                    terminator: CaseTerminator::FallThrough,
+                },
+                item(&["*"], Some(echo_seq("two"))),
+            ],
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn case_continue_match_keeps_testing() {
+        // a) echo one ;;&  a) echo two ;;
+        let clause = CaseClause {
+            subject: lit_word("a"),
+            items: vec![
+                CaseItem {
+                    patterns: vec![lit_word("a")],
+                    body: Some(echo_seq("one")),
+                    terminator: CaseTerminator::ContinueMatch,
+                },
+                item(&["a"], Some(echo_seq("two"))),
+            ],
+        };
+        let mut shell = Shell::new();
+        let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn case_quoted_metacharacter_matches_literally() {
+        // pattern is a quoted `*` — matches the literal string "*", not "abc"
+        let star_pattern = Word(vec![WordPart::Literal { text: "*".to_string(), quoted: true }]);
+        let make = |subj: &str| CaseClause {
+            subject: lit_word(subj),
+            items: vec![CaseItem {
+                patterns: vec![star_pattern.clone()],
+                body: Some(echo_seq("hit")),
+                terminator: CaseTerminator::Break,
+            }],
+        };
+        let mut shell = Shell::new();
+        let (out_star, _) = execute_capturing(&case_seq(make("*")), &mut shell);
+        assert_eq!(out_star.trim(), "hit", "literal * should match the string \"*\"");
+        let (out_abc, _) = execute_capturing(&case_seq(make("abc")), &mut shell);
+        assert_eq!(out_abc.trim(), "", "quoted * must not act as a wildcard");
     }
 }
