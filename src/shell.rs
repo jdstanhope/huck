@@ -15,6 +15,22 @@ use crate::lexer::{self, LexError};
 use crate::shell_state::Shell;
 
 const PROMPT: &str = "huck> ";
+const CONT_PROMPT: &str = "> ";
+
+/// The outcome of reading one logical (possibly multi-line) command.
+enum ReadResult {
+    /// A finished command: `buffer` is fed to the executor, `history`
+    /// is its single-line form for the history list.
+    Ready { buffer: String, history: String },
+    /// Ctrl-C — any partial command is discarded; the REPL loops.
+    Interrupted,
+    /// Ctrl-D at an empty first-line prompt — exit the shell cleanly.
+    Eof,
+    /// EOF while a partial command was pending — a truncated command.
+    EofMidCommand,
+    /// A rustyline read error — exit the shell.
+    ReadError(String),
+}
 
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run() -> i32 {
@@ -46,10 +62,62 @@ pub fn run() -> i32 {
         if let Some(helper) = editor.helper_mut() {
             helper.refresh(&shell);
         }
-        match editor.readline(PROMPT) {
-            Ok(line) => {
-                let to_run = match crate::history::expand(&line, &shell.history) {
-                    Ok(None) => line.clone(),
+        match read_logical_command(&mut editor, &mut shell) {
+            ReadResult::Ready { buffer, history } => {
+                if !history.trim().is_empty() {
+                    shell.history.add(history.clone());
+                    let _ = editor.add_history_entry(history.as_str());
+                }
+                match process_line(&buffer, &mut shell) {
+                    ExecOutcome::Exit(code) => {
+                        shell.history.save();
+                        return code;
+                    }
+                    ExecOutcome::Continue(status) => shell.set_last_status(status),
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                        shell.set_last_status(0)
+                    }
+                }
+            }
+            ReadResult::Interrupted => continue,
+            ReadResult::Eof => {
+                shell.history.save();
+                return shell.last_status();
+            }
+            ReadResult::EofMidCommand => {
+                eprintln!("huck: syntax error: unexpected end of input");
+                shell.history.save();
+                return 2;
+            }
+            ReadResult::ReadError(msg) => {
+                eprintln!("huck: input error: {msg}");
+                return 1;
+            }
+        }
+    }
+}
+
+/// Reads one logical command, gathering continuation lines until the
+/// accumulated buffer classifies as `Complete` or a genuine `Error`.
+fn read_logical_command(
+    editor: &mut Editor<HuckHelper, FileHistory>,
+    shell: &mut Shell,
+) -> ReadResult {
+    use crate::continuation::{classify, joiner_for, Completeness};
+
+    let mut buffer = String::new();
+    let mut history = String::new();
+    // The reason the buffer-so-far is incomplete, and the line that
+    // caused it — together they pick the joiner for the next line.
+    let mut pending: Option<(crate::continuation::ContinuationReason, String)> = None;
+
+    loop {
+        let prompt = if pending.is_none() { PROMPT } else { CONT_PROMPT };
+        match editor.readline(prompt) {
+            Ok(raw) => {
+                // History expansion runs per physical line, as before.
+                let line = match crate::history::expand(&raw, &shell.history) {
+                    Ok(None) => raw,
                     Ok(Some(expanded)) => {
                         println!("{expanded}");
                         expanded
@@ -57,36 +125,52 @@ pub fn run() -> i32 {
                     Err(e) => {
                         eprintln!("huck: {e}");
                         shell.set_last_status(1);
-                        continue;
+                        return ReadResult::Interrupted;
                     }
                 };
-                if !to_run.trim().is_empty() {
-                    shell.history.add(to_run.clone());
-                    let _ = editor.add_history_entry(to_run.as_str());
-                }
-                match process_line(&to_run, &mut shell) {
-                    ExecOutcome::Exit(code) => {
-                        shell.history.save();
-                        return code;
+
+                match pending.take() {
+                    None => {
+                        // First physical line.
+                        buffer.push_str(&line);
+                        history.push_str(&line);
                     }
-                    ExecOutcome::Continue(status) => shell.set_last_status(status),
-                    // A `break`/`continue` with no enclosing loop propagated
-                    // to the top level: neutralize it to status 0 — do not
-                    // exit the shell.
-                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
-                        shell.set_last_status(0)
+                    Some((reason, prev_line)) => {
+                        // `buffer` joins with a real newline, except a
+                        // backslash continuation which joins with nothing.
+                        if reason != crate::continuation::ContinuationReason::Backslash {
+                            buffer.push('\n');
+                        }
+                        buffer.push_str(&line);
+                        history.push_str(joiner_for(reason, &prev_line));
+                        history.push_str(&line);
+                    }
+                }
+
+                match classify(&buffer) {
+                    Completeness::Complete | Completeness::Error => {
+                        return ReadResult::Ready { buffer, history };
+                    }
+                    Completeness::Incomplete(reason) => {
+                        if reason == crate::continuation::ContinuationReason::Backslash {
+                            // Drop the unescaped trailing backslash from
+                            // both accumulators before the next line.
+                            buffer.pop();
+                            history.pop();
+                        }
+                        pending = Some((reason, line));
                     }
                 }
             }
-            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Interrupted) => return ReadResult::Interrupted,
             Err(ReadlineError::Eof) => {
-                shell.history.save();
-                return shell.last_status();
+                return if buffer.is_empty() {
+                    ReadResult::Eof
+                } else {
+                    ReadResult::EofMidCommand
+                };
             }
-            Err(e) => {
-                eprintln!("huck: input error: {e}");
-                return 1;
-            }
+            Err(e) => return ReadResult::ReadError(e.to_string()),
         }
     }
 }
