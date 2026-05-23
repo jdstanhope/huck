@@ -128,7 +128,7 @@ fn builtin_exit(args: &[String]) -> ExecOutcome {
     match args.first() {
         None => ExecOutcome::Exit(0),
         Some(code_str) => match code_str.parse::<i32>() {
-            Ok(code) => ExecOutcome::Exit(code),
+            Ok(code) => ExecOutcome::Exit(code.rem_euclid(256)),
             Err(_) => {
                 eprintln!("huck: exit: {code_str}: numeric argument required");
                 ExecOutcome::Continue(2)
@@ -708,6 +708,30 @@ mod tests {
         assert!(matches!(
             builtin_exit(&["abc".to_string()]),
             ExecOutcome::Continue(_)
+        ));
+    }
+
+    #[test]
+    fn exit_masks_value_greater_than_255() {
+        assert!(matches!(
+            builtin_exit(&["300".to_string()]),
+            ExecOutcome::Exit(44)
+        ));
+    }
+
+    #[test]
+    fn exit_masks_negative_value() {
+        assert!(matches!(
+            builtin_exit(&["-1".to_string()]),
+            ExecOutcome::Exit(255)
+        ));
+    }
+
+    #[test]
+    fn exit_masks_exact_256_to_zero() {
+        assert!(matches!(
+            builtin_exit(&["256".to_string()]),
+            ExecOutcome::Exit(0)
         ));
     }
 
