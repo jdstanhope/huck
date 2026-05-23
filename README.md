@@ -29,13 +29,14 @@ spec, an implementation plan, and a test suite.
 | v19       | Multi-line input (continuation lines, `> ` prompt)      |
 | v20       | `for` loops (`for NAME in WORDS; do … done`)            |
 | v21       | `case` statements (`case W in PAT) … ;; esac`)          |
+| v22       | Functions (`name() { … }`) + positional parameters      |
 
 ## Build and run
 
 ```sh
 cargo build --release
 cargo run                # interactive REPL
-cargo test               # full test suite (814 tests)
+cargo test               # full test suite (866 tests)
 ```
 
 ## Features
@@ -190,11 +191,29 @@ the other compound commands. Adding `case` made `(`, `)`, `;;`, `;&`,
 `;;&` lexer tokens; an unquoted `(` or `)` is now a shell metacharacter
 (quote it to keep it literal: `"("`/`')'`).
 
+**Functions (v22):**
+`name() compound-command` defines a function (the canonical body is a
+brace group `{ … }`, but any compound — `if`/`while`/`for`/`case`/
+`{ … }` — works). Calling `name arg1 arg2 …` runs the body with the
+positional parameters `$1`, `$2`, … set to the call's arguments and
+restored afterward. `$@` and `$*` give all args (`"$@"` preserves each
+as its own field — the only construct that produces multiple fields
+when quoted; `"$*"` joins them with a space). `$#` is the argument
+count. `${10}` and higher use the braced form. `return [N]` exits a
+function early with status `N` (defaulting to `$?`). A function
+shadows any builtin except the flow-control set (`return`/`exit`/
+`break`/`continue`), so `cd() { … }` works but `return() { … }` is
+unreachable. `break`/`continue` inside a function target the caller's
+enclosing loop (matching bash). `local` variable scoping, `set --` /
+`shift`, and `$0` are not implemented. v22 also adds the standalone
+brace group `{ list; }` (runs in the current shell — no subshell
+isolation).
+
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), functions, here-docs, aliases.
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), here-docs, aliases.
 
 ## Project layout
 
