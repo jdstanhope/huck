@@ -68,11 +68,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/builtins.rs` `builtin_exit` applies `code.rem_euclid(256)`.
 
 ### B-06: `echo -n` / `-e` / `-E` not supported
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: high
-- **huck**: `echo -n hello` prints `-n hello\n` literally; `-e` and `-E` similarly passed as args.
-- **bash**: `-n` suppresses trailing newline; `-e` enables escape interpretation; `-E` disables it (default).
-- **Fix location**: `src/builtins.rs` `builtin_echo` — parse leading flags before joining args.
+- **huck (was)**: `echo -n hello` printed `-n hello\n` literally; `-e` and `-E` similarly passed as args.
+- **bash**: `-n` suppresses trailing newline; `-e` enables escape interpretation; `-E` disables it (default). Combined like `-ne`.
+- **Fix**: `src/builtins.rs` — `parse_echo_flags` consumes leading flag groups; `process_echo_escapes` handles `\a \b \c \e \f \n \r \t \v \\ \0NNN \xHH`; unknown escapes keep the backslash (bash echo behaviour).
 
 ### B-07: `expand_assignment` reads `$?` live (latent v21 issue)
 - **Status**: open

@@ -117,11 +117,111 @@ fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
 }
 
 fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
-    if let Err(e) = writeln!(out, "{}", args.join(" ")) {
+    let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
+    let joined = args[consumed..].join(" ");
+    let bytes = if process_escapes {
+        let (b, hit_c) = process_echo_escapes(&joined);
+        if hit_c {
+            suppress_newline = true;
+        }
+        b
+    } else {
+        joined.into_bytes()
+    };
+
+    if let Err(e) = out.write_all(&bytes) {
         eprintln!("huck: echo: {e}");
         return ExecOutcome::Continue(1);
     }
+    if !suppress_newline {
+        if let Err(e) = out.write_all(b"\n") {
+            eprintln!("huck: echo: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    }
     ExecOutcome::Continue(0)
+}
+
+fn parse_echo_flags(args: &[String]) -> (bool, bool, usize) {
+    let mut suppress_newline = false;
+    let mut process_escapes = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg.len() < 2 || !arg.starts_with('-') {
+            break;
+        }
+        let rest = &arg[1..];
+        if !rest.chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+            break;
+        }
+        for c in rest.chars() {
+            match c {
+                'n' => suppress_newline = true,
+                'e' => process_escapes = true,
+                'E' => process_escapes = false,
+                _ => unreachable!(),
+            }
+        }
+        idx += 1;
+    }
+    (suppress_newline, process_escapes, idx)
+}
+
+fn process_echo_escapes(s: &str) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut buf = [0u8; 4];
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            None => out.push(b'\\'),
+            Some('a') => out.push(0x07),
+            Some('b') => out.push(0x08),
+            Some('c') => return (out, true),
+            Some('e') => out.push(0x1B),
+            Some('f') => out.push(0x0C),
+            Some('n') => out.push(0x0A),
+            Some('r') => out.push(0x0D),
+            Some('t') => out.push(0x09),
+            Some('v') => out.push(0x0B),
+            Some('\\') => out.push(b'\\'),
+            Some('0') => {
+                let mut value: u32 = 0;
+                for _ in 0..3 {
+                    let Some(&d) = chars.peek() else { break };
+                    let Some(n) = d.to_digit(8) else { break };
+                    value = value * 8 + n;
+                    chars.next();
+                }
+                out.push((value & 0xFF) as u8);
+            }
+            Some('x') => {
+                let mut value: u32 = 0;
+                let mut consumed = 0;
+                for _ in 0..2 {
+                    let Some(&d) = chars.peek() else { break };
+                    let Some(n) = d.to_digit(16) else { break };
+                    value = value * 16 + n;
+                    chars.next();
+                    consumed += 1;
+                }
+                if consumed == 0 {
+                    out.extend_from_slice(b"\\x");
+                } else {
+                    out.push(value as u8);
+                }
+            }
+            Some(other) => {
+                out.push(b'\\');
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    (out, false)
 }
 
 fn builtin_exit(args: &[String]) -> ExecOutcome {
@@ -748,6 +848,114 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         builtin_echo(&[], &mut out);
         assert_eq!(out, b"\n");
+    }
+
+    #[test]
+    fn echo_n_suppresses_trailing_newline() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-n".to_string(), "hello".to_string()], &mut out);
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn echo_n_alone_writes_nothing() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-n".to_string()], &mut out);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn echo_e_processes_basic_escapes() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-e".to_string(), r"a\tb\nc".to_string()], &mut out);
+        assert_eq!(out, b"a\tb\nc\n");
+    }
+
+    #[test]
+    fn echo_capital_e_keeps_backslashes_literal() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-E".to_string(), r"a\tb".to_string()], &mut out);
+        assert_eq!(out, b"a\\tb\n");
+    }
+
+    #[test]
+    fn echo_default_keeps_backslashes_literal() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&[r"a\tb".to_string()], &mut out);
+        assert_eq!(out, b"a\\tb\n");
+    }
+
+    #[test]
+    fn echo_combined_ne_flag() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-ne".to_string(), r"a\tb".to_string()], &mut out);
+        assert_eq!(out, b"a\tb");
+    }
+
+    #[test]
+    fn echo_e_then_capital_e_disables_escapes() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-eE".to_string(), r"a\tb".to_string()], &mut out);
+        assert_eq!(out, b"a\\tb\n");
+    }
+
+    #[test]
+    fn echo_non_flag_arg_stops_flag_parsing() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(
+            &["-n".to_string(), "foo".to_string(), "-n".to_string(), "bar".to_string()],
+            &mut out,
+        );
+        assert_eq!(out, b"foo -n bar");
+    }
+
+    #[test]
+    fn echo_unknown_flag_is_literal() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-x".to_string(), "foo".to_string()], &mut out);
+        assert_eq!(out, b"-x foo\n");
+    }
+
+    #[test]
+    fn echo_single_dash_is_literal() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-".to_string()], &mut out);
+        assert_eq!(out, b"-\n");
+    }
+
+    #[test]
+    fn echo_double_dash_is_literal() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["--".to_string(), "foo".to_string()], &mut out);
+        assert_eq!(out, b"-- foo\n");
+    }
+
+    #[test]
+    fn echo_e_c_escape_terminates_output() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-e".to_string(), r"abc\cdef".to_string()], &mut out);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn echo_e_octal_escape() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-e".to_string(), r"\0101".to_string()], &mut out);
+        assert_eq!(out, b"A\n");
+    }
+
+    #[test]
+    fn echo_e_hex_escape() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-e".to_string(), r"\x41".to_string()], &mut out);
+        assert_eq!(out, b"A\n");
+    }
+
+    #[test]
+    fn echo_e_unknown_escape_keeps_backslash() {
+        let mut out: Vec<u8> = Vec::new();
+        builtin_echo(&["-e".to_string(), r"\z".to_string()], &mut out);
+        assert_eq!(out, b"\\z\n");
     }
 
     #[test]
