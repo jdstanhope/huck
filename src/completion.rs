@@ -70,13 +70,10 @@ pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
             ' ' | '\t' => {
                 if current_has_content {
                     let word = &head[word_start..off];
-                    if is_assignment(word) {
-                        // Leave is_command_pos = true; next word is the command.
-                    } else if is_compound_keyword(word) {
-                        is_command_pos = true;
-                    } else {
-                        is_command_pos = false;
-                    }
+                    // Assignment prefix and compound-command keywords both keep
+                    // the next word in command position; everything else moves
+                    // into argument position.
+                    is_command_pos = is_assignment(word) || is_compound_keyword(word);
                 }
                 current_has_content = false;
                 word_start = off + c.len_utf8();

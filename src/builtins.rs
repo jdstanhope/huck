@@ -133,11 +133,11 @@ fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
         eprintln!("huck: echo: {e}");
         return ExecOutcome::Continue(1);
     }
-    if !suppress_newline {
-        if let Err(e) = out.write_all(b"\n") {
-            eprintln!("huck: echo: {e}");
-            return ExecOutcome::Continue(1);
-        }
+    if !suppress_newline
+        && let Err(e) = out.write_all(b"\n")
+    {
+        eprintln!("huck: echo: {e}");
+        return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
