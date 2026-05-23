@@ -75,11 +75,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/builtins.rs` — `parse_echo_flags` consumes leading flag groups; `process_echo_escapes` handles `\a \b \c \e \f \n \r \t \v \\ \0NNN \xHH`; unknown escapes keep the backslash (bash echo behaviour).
 
 ### B-07: `expand_assignment` reads `$?` live (latent v21 issue)
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: medium
-- **huck**: `NAME=$(false)$?` reads the post-substitution `$?` value (`1`) instead of the pre-assignment value. v21 fixed this for `expand_pattern` (case patterns) by snapshotting; `expand_assignment` (assignments) still has the bug.
+- **huck (was)**: `NAME=$(false)$?` read the post-substitution `$?` (`1`) instead of the pre-assignment value. v21 fixed this for `expand_pattern` only.
 - **bash**: `$?` inside an assignment RHS reflects the status from before the assignment.
-- **Fix location**: `src/expand.rs` `expand_assignment` — snapshot `shell.last_status()` at function entry, use the snapshot for `LastStatus` parts (mirror what `expand_pattern` does from v21).
+- **Fix**: `src/expand.rs` `expand_assignment` snapshots `shell.last_status()` at entry. All three expansion entry points (`expand`, `expand_assignment`, `expand_pattern`) now agree.
 
 ### B-08: `[N] Done` notification omits status for non-zero exits
 - **Status**: open

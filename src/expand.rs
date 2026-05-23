@@ -230,6 +230,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
 /// contributes its value verbatim regardless of the `quoted` flag — matching
 /// bash, which disables splitting on the right-hand side of `NAME=...`.
 pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
+    // Snapshot $? so `LastStatus` parts read the value at the start of
+    // expansion, not whatever a preceding `$(cmd)` mutated it to. Same
+    // contract as `expand()` and `expand_pattern()`.
+    let snapshot_status = shell.last_status();
     let mut result = String::new();
     for part in &word.0 {
         match part {
@@ -245,7 +249,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 }
             }
             WordPart::LastStatus { .. } => {
-                result.push_str(&shell.last_status().to_string());
+                result.push_str(&snapshot_status.to_string());
             }
             WordPart::CommandSub { sequence, .. } => {
                 result.push_str(&run_substitution(sequence, shell));
@@ -724,6 +728,25 @@ mod tests {
             quoted: true,
         }]);
         let _ = expand(&word, &mut shell);
+        assert_eq!(shell.last_status(), 7);
+    }
+
+    #[test]
+    fn expand_assignment_last_status_after_command_sub_reads_snapshot() {
+        // Parallel to expand_last_status_after_command_sub_in_same_word_reads_snapshot
+        // but for assignment context. `NAME=$(exit 7)$?` with $?=3 before should
+        // store "3", not "7" — `$?` reads the pre-assignment snapshot.
+        let mut shell = Shell::new();
+        shell.set_last_status(3);
+        let word = Word(vec![
+            WordPart::CommandSub {
+                sequence: exit_sequence(7),
+                quoted: false,
+            },
+            WordPart::LastStatus { quoted: false },
+        ]);
+        assert_eq!(expand_assignment(&word, &mut shell), "3".to_string());
+        // The substitution still updates $? for the next command.
         assert_eq!(shell.last_status(), 7);
     }
 
