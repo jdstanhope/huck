@@ -120,9 +120,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: true } => {
-                if let Some(value) = shell.get(name) {
-                    let v = value.to_string();
-                    current.push_str(&v, true);
+                if let Some(value) = shell.lookup_var(name) {
+                    current.push_str(&value, true);
                 }
                 // Unset quoted var: relies on `has_emitted` so end-of-word
                 // still produces a (possibly empty) Field.
@@ -133,8 +132,44 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
-                let value = shell.get(name).map(|s| s.to_string()).unwrap_or_default();
+                let value = shell.lookup_var(name).unwrap_or_default();
                 emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
+            }
+            WordPart::AllArgs { quoted: false, joined: _ } => {
+                // Unquoted $@ and $* are identical: each arg becomes its
+                // own field(s), IFS-split. Args are independent — the
+                // last IFS-fragment of arg N must NOT merge with the
+                // first of arg N+1, so we flush current between args.
+                let args = shell.positional_args.clone();
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 && !current.is_empty() {
+                        result.push(std::mem::take(&mut current));
+                    }
+                    emit_split_fields(arg, &mut current, &mut result, &mut has_emitted);
+                }
+            }
+            WordPart::AllArgs { quoted: true, joined: false } => {
+                // "$@" — each arg its own quoted field, no splitting.
+                // First arg merges into current; subsequent start new
+                // fields; last becomes the new current.
+                let args = shell.positional_args.clone();
+                if !args.is_empty() {
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            // Start a new field for the next arg.
+                            result.push(std::mem::take(&mut current));
+                        }
+                        current.push_str(arg, true);
+                        has_emitted = true;
+                    }
+                }
+                // Empty args: zero fields — do nothing.
+            }
+            WordPart::AllArgs { quoted: true, joined: true } => {
+                // "$*" — single field, args joined by " " (first IFS char).
+                let joined = shell.positional_args.join(" ");
+                current.push_str(&joined, true);
+                has_emitted = true;
             }
             WordPart::LastStatus { quoted: false } => {
                 let value = snapshot_status.to_string();
@@ -205,8 +240,8 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 result.push_str(&text);
             }
             WordPart::Var { name, .. } => {
-                if let Some(value) = shell.get(name) {
-                    result.push_str(value);
+                if let Some(value) = shell.lookup_var(name) {
+                    result.push_str(&value);
                 }
             }
             WordPart::LastStatus { .. } => {
@@ -231,6 +266,11 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     crate::param_expansion::ExpansionResult::Empty => {}
                 }
             }
+            WordPart::AllArgs { .. } => {
+                // No field splitting in assignment context; join with space.
+                let joined = shell.positional_args.join(" ");
+                result.push_str(&joined);
+            }
         }
     }
     result
@@ -246,6 +286,7 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::CommandSub { quoted, .. } => *quoted,
         WordPart::Arith { quoted, .. } => *quoted,
         WordPart::ParamExpansion { quoted, .. } => *quoted,
+        WordPart::AllArgs { quoted, .. } => *quoted,
         WordPart::Tilde(_) => false,
     }
 }
@@ -1282,5 +1323,82 @@ mod tests {
         std::env::set_current_dir(saved).unwrap();
 
         assert_eq!(out, vec!["top.txt".to_string()]);
+    }
+
+    // ---- Positional parameter expander tests (v22 Task 4) -------------------
+
+    #[test]
+    fn expand_dollar_digit_reads_positional() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["alpha".to_string(), "beta".to_string()];
+        let w = Word(vec![WordPart::Var { name: "1".to_string(), quoted: false }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "alpha");
+    }
+
+    #[test]
+    fn expand_dollar_digit_unset_is_empty() {
+        let mut shell = Shell::new();
+        let w = Word(vec![WordPart::Var { name: "1".to_string(), quoted: false }]);
+        let fields = expand(&w, &mut shell);
+        // Unset positional → no field (consistent with unset var behaviour)
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn expand_dollar_hash_is_arg_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let w = Word(vec![WordPart::Var { name: "#".to_string(), quoted: false }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "3");
+    }
+
+    #[test]
+    fn expand_dollar_at_quoted_produces_field_per_arg() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a a".to_string(), "b".to_string()];
+        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: true }]);
+        let fields = expand(&w, &mut shell);
+        // Each arg its own field; the space inside "a a" is preserved (no splitting).
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].chars, "a a");
+        assert_eq!(fields[1].chars, "b");
+    }
+
+    #[test]
+    fn expand_dollar_star_quoted_joins_with_space() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let w = Word(vec![WordPart::AllArgs { joined: true, quoted: true }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "a b c");
+    }
+
+    #[test]
+    fn expand_dollar_at_empty_produces_no_fields() {
+        let mut shell = Shell::new();
+        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: true }]);
+        let fields = expand(&w, &mut shell);
+        // Either zero fields or all-empty fields are acceptable per the spec.
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn expand_dollar_at_unquoted_splits_each_arg_independently() {
+        // $@ unquoted with two args, one containing whitespace.
+        // POSIX: each arg becomes its own field(s) after IFS-splitting;
+        // args do NOT merge across boundaries.
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello world".to_string(), "x".to_string()];
+        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: false }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 3, "fields: {fields:?}");
+        assert_eq!(fields[0].chars, "hello");
+        assert_eq!(fields[1].chars, "world");
+        assert_eq!(fields[2].chars, "x");
     }
 }

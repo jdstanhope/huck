@@ -74,7 +74,8 @@ pub fn run() -> i32 {
                         return code;
                     }
                     ExecOutcome::Continue(status) => shell.set_last_status(status),
-                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                    | ExecOutcome::FunctionReturn(_) => {
                         shell.set_last_status(0)
                     }
                 }
@@ -246,6 +247,15 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnexpectedToken => "unexpected token after command".to_string(),
         ParseError::ForVariable => "invalid variable name in 'for' loop".to_string(),
         ParseError::UnterminatedCase => "unterminated 'case' (expected 'esac')".to_string(),
+        ParseError::UnterminatedBrace => "unterminated '{' (expected '}')".to_string(),
+        ParseError::FunctionName => "invalid function name".to_string(),
+        ParseError::FunctionBody => {
+            "function definition: expected '()' and a compound-command body \
+             (`if`/`while`/`for`/`case`/`{ … }`)".to_string()
+        }
+        ParseError::UnterminatedFunction => {
+            "unterminated function definition (expected a compound-command body)".to_string()
+        }
     }
 }
 

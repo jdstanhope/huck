@@ -31,7 +31,6 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                 let mut s = String::new();
                 while let Some(&d) = chars.peek() {
                     if d == '_' || d.is_ascii_alphanumeric() {
-                        if s.is_empty() && d.is_ascii_digit() { break; }
                         s.push(d); chars.next();
                     } else { break; }
                 }
@@ -281,7 +280,7 @@ pub fn eval(expr: &ArithExpr, shell: &Shell) -> Result<i64, ArithError> {
     match expr {
         ArithExpr::Num(n) => Ok(*n),
         ArithExpr::Var(name) => {
-            let raw = shell.get(name).unwrap_or("");
+            let raw = shell.lookup_var(name).unwrap_or_default();
             if raw.is_empty() {
                 Ok(0)
             } else {

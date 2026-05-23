@@ -60,6 +60,9 @@ pub enum WordPart {
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
     Arith { expr: crate::arith::ArithExpr, quoted: bool },
     ParamExpansion { name: String, modifier: ParamModifier, quoted: bool },
+    /// `$@` (joined=false) or `$*` (joined=true). `quoted` reflects whether
+    /// this was inside double quotes.
+    AllArgs { quoted: bool, joined: bool },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -353,6 +356,22 @@ fn read_dollar_expansion(
             chars.next();
             parts.push(WordPart::LastStatus { quoted });
         }
+        Some('@') => {
+            chars.next();
+            parts.push(WordPart::AllArgs { joined: false, quoted });
+        }
+        Some('*') => {
+            chars.next();
+            parts.push(WordPart::AllArgs { joined: true, quoted });
+        }
+        Some('#') => {
+            chars.next();
+            parts.push(WordPart::Var { name: "#".to_string(), quoted });
+        }
+        Some(c) if c.is_ascii_digit() => {
+            let d = chars.next().unwrap();
+            parts.push(WordPart::Var { name: d.to_string(), quoted });
+        }
         Some(c) if is_name_start(c) => {
             let name = read_var_name(chars);
             parts.push(WordPart::Var { name, quoted });
@@ -636,9 +655,40 @@ fn read_braced_param_expansion(
     parts: &mut Vec<WordPart>,
     quoted: bool,
 ) -> Result<(), LexError> {
-    // Length form: ${#name}
+    // Special single-char forms: ${@}, ${*}, ${#} (arg count).
+    // These must be checked before the Length form (${#name}) disambiguation.
+    match chars.peek().copied() {
+        Some('@') => {
+            chars.next();
+            if chars.next() != Some('}') {
+                return Err(LexError::UnterminatedBrace);
+            }
+            parts.push(WordPart::AllArgs { joined: false, quoted });
+            return Ok(());
+        }
+        Some('*') => {
+            chars.next();
+            if chars.next() != Some('}') {
+                return Err(LexError::UnterminatedBrace);
+            }
+            parts.push(WordPart::AllArgs { joined: true, quoted });
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Length form (${#name}) vs bare arg-count (${#}).
+    // Peek ahead: if the char after `#` is `}`, emit Var { name: "#" }.
+    // Otherwise read the identifier name and emit a Length ParamExpansion.
     if chars.peek() == Some(&'#') {
-        chars.next();
+        chars.next(); // consume '#'
+        if chars.peek() == Some(&'}') {
+            // ${#} — count of positional args.
+            chars.next(); // consume '}'
+            parts.push(WordPart::Var { name: "#".to_string(), quoted });
+            return Ok(());
+        }
+        // ${#name} — length of $name.
         let name = read_braced_name(chars)?;
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
@@ -651,6 +701,24 @@ fn read_braced_param_expansion(
             modifier: ParamModifier::Length,
             quoted,
         });
+        return Ok(());
+    }
+
+    // Digit-only positional parameter names: ${1}, ${10}, ${42}, etc.
+    if matches!(chars.peek().copied(), Some(c) if c.is_ascii_digit()) {
+        let mut name = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                name.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if chars.next() != Some('}') {
+            return Err(LexError::UnterminatedBrace);
+        }
+        parts.push(WordPart::Var { name, quoted });
         return Ok(());
     }
 
@@ -1285,12 +1353,12 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_dollar_then_digit_is_literal_dollar() {
+    fn tokenize_dollar_then_digit_is_positional_param() {
+        // Since v22 Task 4: $<digit> is a positional parameter, not a literal $.
         assert_eq!(
             tokenize("$5").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal { text: "$".to_string(), quoted: false },
-                WordPart::Literal { text: "5".to_string(), quoted: false },
+                WordPart::Var { name: "5".to_string(), quoted: false },
             ]))]
         );
     }
@@ -1378,7 +1446,9 @@ mod tests {
 
     #[test]
     fn tokenize_braced_var_invalid_name() {
-        assert_eq!(tokenize("${1foo}").unwrap_err(), LexError::InvalidVarName);
+        // ${1foo}: digits are consumed as a positional name, then `f` is
+        // found where `}` is expected → UnterminatedBrace (v22 Task 4).
+        assert_eq!(tokenize("${1foo}").unwrap_err(), LexError::UnterminatedBrace);
     }
 
     #[test]
@@ -1570,11 +1640,13 @@ mod tests {
 
     #[test]
     fn tokenize_command_sub_inner_lex_error() {
-        // `${1foo}` inside a substitution → InvalidVarName, wrapped.
+        // `${1foo}` inside a substitution → UnterminatedBrace (v22 Task 4:
+        // digits are consumed as positional name; `f` found where `}` expected),
+        // wrapped in SubstitutionLexError.
         let err = tokenize("$(echo ${1foo})").unwrap_err();
         match err {
             LexError::SubstitutionLexError(inner) => {
-                assert_eq!(*inner, LexError::InvalidVarName);
+                assert_eq!(*inner, LexError::UnterminatedBrace);
             }
             other => panic!("expected SubstitutionLexError, got {other:?}"),
         }
@@ -2358,5 +2430,84 @@ mod tests {
     fn tokenize_quoted_paren_stays_literal() {
         // A quoted `)` is ordinary word content, not an operator.
         assert_eq!(tokenize("')'").unwrap(), vec![wq(")")]);
+    }
+
+    // ---- Positional parameter lexer tests (v22 Task 4) ----------------------
+
+    #[test]
+    fn tokenize_dollar_digit() {
+        let tokens = tokenize("$1").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::Var {
+                name: "1".to_string(), quoted: false
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_dollar_hash() {
+        let tokens = tokenize("$#").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::Var {
+                name: "#".to_string(), quoted: false
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_dollar_at() {
+        let tokens = tokenize("$@").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::AllArgs {
+                joined: false, quoted: false
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_dollar_star() {
+        let tokens = tokenize("$*").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::AllArgs {
+                joined: true, quoted: false
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_quoted_dollar_at() {
+        let tokens = tokenize("\"$@\"").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::AllArgs {
+                joined: false, quoted: true
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_braced_positional() {
+        let tokens = tokenize("${10}").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::Var {
+                name: "10".to_string(), quoted: false
+            }]))]
+        );
+    }
+
+    #[test]
+    fn tokenize_braced_special_at() {
+        let tokens = tokenize("${@}").unwrap();
+        assert_eq!(
+            tokens,
+            vec![Token::Word(Word(vec![WordPart::AllArgs {
+                joined: false, quoted: false
+            }]))]
+        );
     }
 }

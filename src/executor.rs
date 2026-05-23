@@ -45,6 +45,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+        ExecOutcome::FunctionReturn(n) => n,
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
@@ -54,6 +55,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+            | ExecOutcome::FunctionReturn(_)
     ) {
         return status;
     }
@@ -68,6 +70,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             if matches!(
                 status,
                 ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                    | ExecOutcome::FunctionReturn(_)
             ) {
                 return status;
             }
@@ -84,6 +87,11 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::While(clause) => run_while(clause, shell, sink),
         Command::For(clause) => run_for(clause, shell, sink),
         Command::Case(clause) => run_case(clause, shell, sink),
+        Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
+        Command::FunctionDef { name, body } => {
+            shell.functions.insert(name.clone(), body.clone());
+            ExecOutcome::Continue(0)
+        }
     }
 }
 
@@ -104,7 +112,8 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
         }
         let cond = execute_sequence_body(&clause.condition, shell, sink);
         let keep_going = match cond {
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                | ExecOutcome::FunctionReturn(_) => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
@@ -124,6 +133,7 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
                 last = ExecOutcome::Continue(0);
                 // fall through — the loop re-tests the condition
             }
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -166,6 +176,7 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
                 last = ExecOutcome::Continue(0);
                 // fall through — advance to the next value
             }
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -216,6 +227,7 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
                 ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
                 ExecOutcome::LoopBreak => return ExecOutcome::LoopBreak,
                 ExecOutcome::LoopContinue => return ExecOutcome::LoopContinue,
+                ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
             },
         }
@@ -242,6 +254,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+            | ExecOutcome::FunctionReturn(_)
     ) {
         return cond;
     }
@@ -253,6 +266,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
+                | ExecOutcome::FunctionReturn(_)
         ) {
             return elif_cond;
         }
@@ -295,6 +309,7 @@ fn run_background_sequence(
         let exit = match outcome {
             ExecOutcome::Continue(c) => c,
             ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+            ExecOutcome::FunctionReturn(n) => n,
             ExecOutcome::Exit(_) => unreachable!(),
         };
         let id = shell.jobs.add_synthetic_done(display, exit);
@@ -628,17 +643,71 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
     }
 }
 
+/// True for the un-shadowable control builtins. Functions named the
+/// same way are stored in `shell.functions` but unreachable — these
+/// builtins always win.
+fn is_control_builtin(name: &str) -> bool {
+    matches!(name, "return" | "exit" | "break" | "continue")
+}
+
+/// Runs a function body in a new positional-arg frame. `args` is the
+/// call's arguments *excluding* the function name — POSIX `$1` is the
+/// first user arg, not the function name. Catches `FunctionReturn` and
+/// converts to a normal `Continue(n)`; `Exit`/`LoopBreak`/`LoopContinue`
+/// propagate unchanged so `break` inside a function targets the
+/// caller's enclosing loop (matching bash).
+fn call_function(
+    body: Box<crate::command::Command>,
+    args: Vec<String>,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    let saved = std::mem::take(&mut shell.positional_args);
+    shell.positional_args = args;
+    let result = run_command(&body, shell, sink);
+    shell.positional_args = saved;
+    match result {
+        ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
+        other => other,
+    }
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
     };
-    let files = match open_stage_files(&resolved) {
-        Ok(f) => f,
-        Err(()) => return ExecOutcome::Continue(1),
-    };
 
-    if builtins::is_builtin(&resolved.program) {
+    // 1. Control builtins always win — they cannot be shadowed by functions.
+    // 2. User-defined function lookup.
+    // 3. Regular builtin.
+    // 4. PATH-exec.
+    if is_control_builtin(&resolved.program) {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
+        match files.stdout {
+            Some(mut file) => {
+                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+            }
+            None => match sink {
+                StdoutSink::Terminal => {
+                    let mut out = io::stdout();
+                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                }
+                StdoutSink::Capture(buf) => {
+                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                }
+            },
+        }
+    } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
+        call_function(body, resolved.args, shell, sink)
+    } else if builtins::is_builtin(&resolved.program) {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
         match files.stdout {
             Some(mut file) => {
                 builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
@@ -654,6 +723,10 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             },
         }
     } else {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
         run_subprocess(&resolved, files, shell, sink)
     }
 }
@@ -874,6 +947,7 @@ fn run_multi_stage(
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
                 ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+                ExecOutcome::FunctionReturn(n) => n,
             };
             match files.stdout {
                 Some(mut file) => {
@@ -1385,6 +1459,31 @@ mod tests {
     }
 
     #[test]
+    fn brace_group_assignments_affect_current_shell() {
+        // A brace group has NO subshell isolation — `x=value` inside it
+        // is visible after.
+        let assign = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Assign {
+                    name: "BG_X".to_string(),
+                    value: Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]),
+                }],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let group = Sequence {
+            first: Command::BraceGroup(Box::new(assign)),
+            rest: vec![],
+            background: false,
+        };
+        let mut shell = Shell::new();
+        let (_, status) = execute_capturing(&group, &mut shell);
+        assert_eq!(status, 0);
+        assert_eq!(shell.get("BG_X"), Some("hello"));
+    }
+
+    #[test]
     fn redirect_target_does_not_glob() {
         // Create a temp dir with a real file matching the literal pattern name.
         let tmp = tempfile::tempdir().unwrap();
@@ -1708,6 +1807,35 @@ mod tests {
         let mut shell = Shell::new();
         let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
         assert_eq!(out.lines().collect::<Vec<_>>(), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn function_def_registers_and_returns_zero() {
+        let body = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
+                    args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let def = Sequence {
+            first: Command::FunctionDef {
+                name: "f".to_string(),
+                body: Box::new(Command::BraceGroup(Box::new(body))),
+            },
+            rest: vec![],
+            background: false,
+        };
+        let mut shell = Shell::new();
+        let (_, status) = execute_capturing(&def, &mut shell);
+        assert_eq!(status, 0);
+        assert!(shell.functions.contains_key("f"));
     }
 
     #[test]
