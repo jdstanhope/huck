@@ -129,8 +129,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     match chars.next() {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
-                            Some(esc @ ('"' | '\\')) => quoted_current.push(esc),
-                            Some('$') => quoted_current.push('$'), // `\$` -> literal $
+                            // POSIX: inside `"..."`, backslash is special only
+                            // before `$`, ``, `"`, `\`, and newline. For other
+                            // characters, the backslash is retained literally.
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => quoted_current.push(esc),
                             Some(other) => {
                                 quoted_current.push('\\');
                                 quoted_current.push(other);
@@ -1039,6 +1041,16 @@ mod tests {
         assert_eq!(
             tokenize("echo \"# inside\"").unwrap(),
             vec![w("echo"), wq("# inside")]
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_backtick_in_double_quotes_is_literal() {
+        // POSIX: inside double quotes, `\\\`` is a literal backtick.
+        // Was a bug: huck only recognized `\"`, `\\`, `\$` as escapes.
+        assert_eq!(
+            tokenize(r#""\`""#).unwrap(),
+            vec![wq("`")]
         );
     }
 

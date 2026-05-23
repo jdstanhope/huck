@@ -40,11 +40,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/lexer.rs` `tokenize` — `'#' if !has_token` arm consumes through to (but not including) the next newline. `#` mid-word, inside quotes, or after a backslash stays literal because those paths never reach this arm.
 
 ### B-02: `` \` `` inside `"…"` not honored
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: medium
-- **huck**: `"\`"` does NOT produce a literal backtick — backslash inside double quotes only recognizes `\"`, `\\`, `\$`; the `` ` `` is taken as the start of a backtick substitution.
+- **huck (was)**: `"\`"` produced two characters (`\` then `` ` ``); the escape set was `"`, `\`, `$` only.
 - **bash**: `\`` inside `"…"` is a literal backtick.
-- **Fix location**: `src/lexer.rs`'s double-quote scanner — add `` ` `` to the escape set.
+- **Fix**: `src/lexer.rs` — added `` ` `` to the double-quote escape set so the escape set now matches POSIX (`"`, `\`, `$`, `` ` ``; newline already handled at continuation time).
 
 ### B-03: backslash-newline only detected at end-of-buffer
 - **Status**: open
