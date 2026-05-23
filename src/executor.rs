@@ -88,7 +88,10 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::For(clause) => run_for(clause, shell, sink),
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
-        Command::FunctionDef { .. } => unreachable!("function execution lands in v22 task 5"),
+        Command::FunctionDef { name, body } => {
+            shell.functions.insert(name.clone(), body.clone());
+            ExecOutcome::Continue(0)
+        }
     }
 }
 
@@ -640,17 +643,71 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
     }
 }
 
+/// True for the un-shadowable control builtins. Functions named the
+/// same way are stored in `shell.functions` but unreachable — these
+/// builtins always win.
+fn is_control_builtin(name: &str) -> bool {
+    matches!(name, "return" | "exit" | "break" | "continue")
+}
+
+/// Runs a function body in a new positional-arg frame. `args` is the
+/// call's arguments *excluding* the function name — POSIX `$1` is the
+/// first user arg, not the function name. Catches `FunctionReturn` and
+/// converts to a normal `Continue(n)`; `Exit`/`LoopBreak`/`LoopContinue`
+/// propagate unchanged so `break` inside a function targets the
+/// caller's enclosing loop (matching bash).
+fn call_function(
+    body: Box<crate::command::Command>,
+    args: Vec<String>,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    let saved = std::mem::take(&mut shell.positional_args);
+    shell.positional_args = args;
+    let result = run_command(&body, shell, sink);
+    shell.positional_args = saved;
+    match result {
+        ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
+        other => other,
+    }
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
     };
-    let files = match open_stage_files(&resolved) {
-        Ok(f) => f,
-        Err(()) => return ExecOutcome::Continue(1),
-    };
 
-    if builtins::is_builtin(&resolved.program) {
+    // 1. Control builtins always win — they cannot be shadowed by functions.
+    // 2. User-defined function lookup.
+    // 3. Regular builtin.
+    // 4. PATH-exec.
+    if is_control_builtin(&resolved.program) {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
+        match files.stdout {
+            Some(mut file) => {
+                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+            }
+            None => match sink {
+                StdoutSink::Terminal => {
+                    let mut out = io::stdout();
+                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                }
+                StdoutSink::Capture(buf) => {
+                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                }
+            },
+        }
+    } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
+        call_function(body, resolved.args.clone(), shell, sink)
+    } else if builtins::is_builtin(&resolved.program) {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
         match files.stdout {
             Some(mut file) => {
                 builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
@@ -666,6 +723,10 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             },
         }
     } else {
+        let files = match open_stage_files(&resolved) {
+            Ok(f) => f,
+            Err(()) => return ExecOutcome::Continue(1),
+        };
         run_subprocess(&resolved, files, shell, sink)
     }
 }
@@ -1746,6 +1807,35 @@ mod tests {
         let mut shell = Shell::new();
         let (out, _) = execute_capturing(&case_seq(clause), &mut shell);
         assert_eq!(out.lines().collect::<Vec<_>>(), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn function_def_registers_and_returns_zero() {
+        let body = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![SimpleCommand::Exec(ExecCommand {
+                    program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
+                    args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                })],
+            }),
+            rest: vec![],
+            background: false,
+        };
+        let def = Sequence {
+            first: Command::FunctionDef {
+                name: "f".to_string(),
+                body: Box::new(Command::BraceGroup(Box::new(body))),
+            },
+            rest: vec![],
+            background: false,
+        };
+        let mut shell = Shell::new();
+        let (_, status) = execute_capturing(&def, &mut shell);
+        assert_eq!(status, 0);
+        assert!(shell.functions.contains_key("f"));
     }
 
     #[test]

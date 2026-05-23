@@ -22,6 +22,10 @@ pub struct Shell {
     /// Current frame of positional parameters. Populated only by
     /// function calls (Task 5); empty at the top level.
     pub positional_args: Vec<String>,
+    /// User-defined functions. Populated by `Command::FunctionDef`
+    /// execution; looked up by `run_exec_single` when dispatching a
+    /// simple command.
+    pub functions: HashMap<String, Box<crate::command::Command>>,
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
@@ -40,6 +44,7 @@ impl Shell {
             vars,
             last_status: 0,
             positional_args: Vec::new(),
+            functions: HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
