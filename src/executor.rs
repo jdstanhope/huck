@@ -88,6 +88,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::For(clause) => run_for(clause, shell, sink),
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
+        Command::FunctionDef { .. } => unreachable!("function execution lands in v22 task 5"),
     }
 }
 

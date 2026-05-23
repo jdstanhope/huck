@@ -248,6 +248,10 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::ForVariable => "invalid variable name in 'for' loop".to_string(),
         ParseError::UnterminatedCase => "unterminated 'case' (expected 'esac')".to_string(),
         ParseError::UnterminatedBrace => "unterminated '{' (expected '}')".to_string(),
+        ParseError::FunctionName => "invalid function name".to_string(),
+        ParseError::FunctionBody => {
+            "'(' must be followed by ')' and a compound-command body".to_string()
+        }
     }
 }
 

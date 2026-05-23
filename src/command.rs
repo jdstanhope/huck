@@ -198,6 +198,7 @@ pub enum Command {
     For(Box<ForClause>),
     Case(Box<CaseClause>),
     BraceGroup(Box<Sequence>),
+    FunctionDef { name: String, body: Box<Command> },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -276,6 +277,8 @@ pub enum ParseError {
     ForVariable,
     UnterminatedCase,
     UnterminatedBrace,
+    FunctionName,
+    FunctionBody,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -386,8 +389,44 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
-        None => Ok(Command::Pipeline(parse_pipeline(iter)?)),
+        None => {
+            // Non-keyword: may be a function definition `name() compound`, or
+            // a plain pipeline. Need two-token lookahead.
+            if matches!(iter.peek(), Some(Token::Word(_))) {
+                // Consume the word; peek for `(`.
+                let Some(Token::Word(w)) = iter.next() else { unreachable!() };
+                if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+                    return parse_function_def(w, iter);
+                }
+                // Not a function def — pipeline with `w` as the first word.
+                Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), iter)?))
+            } else {
+                Ok(Command::Pipeline(parse_pipeline(iter)?))
+            }
+        }
     }
+}
+
+/// Parses `name() compound-command`. The caller has consumed the name
+/// (`name_word`) and verified the next token is `(`.
+fn parse_function_def<I: Iterator<Item = Token>>(
+    name_word: Word,
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    let name = valid_identifier_text(&name_word).ok_or(ParseError::FunctionName)?;
+    // Consume `(`.
+    iter.next();
+    // Expect `)`.
+    match iter.next() {
+        Some(Token::Op(Operator::RParen)) => {}
+        _ => return Err(ParseError::FunctionBody),
+    }
+    skip_newlines(iter);
+    let body = parse_command(iter)?;
+    if matches!(body, Command::Pipeline(_)) {
+        return Err(ParseError::FunctionBody);
+    }
+    Ok(Command::FunctionDef { name, body: Box::new(body) })
 }
 
 /// Consumes a run of `Newline` tokens. Newlines are soft separators —
@@ -471,22 +510,24 @@ fn parse_if<I: Iterator<Item = Token>>(
     Ok(IfClause { condition, then_body, elif_branches, else_body })
 }
 
-/// Returns the loop-variable name if `token` is a single, unquoted
-/// `Literal` `Word` whose text is a valid identifier and not a reserved
-/// keyword. Otherwise `None`.
-fn for_variable_name(token: &Token) -> Option<String> {
-    if keyword_of(token).is_some() {
+/// Returns the text of `word` if it is a single, unquoted `Literal` whose
+/// text is a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) and is not a
+/// reserved keyword. Used by `for`-loop variable names and function names.
+fn valid_identifier_text(word: &Word) -> Option<String> {
+    if word.0.len() != 1 {
         return None;
     }
-    let Token::Word(Word(parts)) = token else {
+    let WordPart::Literal { text, quoted: false } = &word.0[0] else {
         return None;
     };
-    if parts.len() != 1 {
+    // Reject reserved keywords. Build a single-Word token to reuse keyword_of.
+    let tok = Token::Word(Word(vec![WordPart::Literal {
+        text: text.clone(),
+        quoted: false,
+    }]));
+    if keyword_of(&tok).is_some() {
         return None;
     }
-    let WordPart::Literal { text, quoted: false } = &parts[0] else {
-        return None;
-    };
     let mut chars = text.chars();
     let first = chars.next()?;
     if !(first == '_' || first.is_ascii_alphabetic()) {
@@ -496,6 +537,14 @@ fn for_variable_name(token: &Token) -> Option<String> {
         return None;
     }
     Some(text.clone())
+}
+
+/// Returns the loop-variable name if `token` is a single, unquoted
+/// `Literal` `Word` whose text is a valid identifier and not a reserved
+/// keyword. Otherwise `None`.
+fn for_variable_name(token: &Token) -> Option<String> {
+    let Token::Word(w) = token else { return None };
+    valid_identifier_text(w)
 }
 
 /// Parses `for NAME [in WORD...] sep do LIST done`. The caller has
@@ -669,12 +718,13 @@ fn parse_while<I: Iterator<Item = Token>>(
     Ok(WhileClause { condition, body, until })
 }
 
-fn parse_pipeline<I: Iterator<Item = Token>>(
+fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
+    first: Option<Word>,
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<SimpleCommand> = Vec::new();
 
-    let mut program: Option<Word> = None;
+    let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
     let mut stdin: Option<Word> = None;
     let mut stdout: Option<Redirect> = None;
@@ -761,6 +811,12 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     Ok(Pipeline { commands })
 }
 
+fn parse_pipeline<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Pipeline, ParseError> {
+    parse_pipeline_with_first(None, iter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +859,7 @@ mod tests {
             Command::For(_) => panic!("expected a pipeline, got a for"),
             Command::Case(_) => panic!("expected a pipeline, got a case"),
             Command::BraceGroup(_) => panic!("expected a pipeline, got a brace group"),
+            Command::FunctionDef { .. } => panic!("expected a pipeline, got a function def"),
         }
     }
 
@@ -1268,6 +1325,7 @@ mod tests {
             Command::For(_) => panic!("expected an if, got a for"),
             Command::Case(_) => panic!("expected an if, got a case"),
             Command::BraceGroup(_) => panic!("expected an if, got a brace group"),
+            Command::FunctionDef { .. } => panic!("expected an if, got a function def"),
         }
     }
 
@@ -1996,9 +2054,11 @@ mod tests {
 
     #[test]
     fn stray_open_paren_is_error() {
+        // `echo(` with no matching `)` — looks like an incomplete function
+        // definition, so FunctionBody is the right error (missing `)`).
         assert_eq!(
             parse(vec![w_tok("echo"), Token::Op(Operator::LParen)]),
-            Err(ParseError::UnexpectedToken)
+            Err(ParseError::FunctionBody)
         );
     }
 
@@ -2069,5 +2129,88 @@ mod tests {
             parse(vec![kw("{"), w_tok("echo"), Token::Op(Operator::Semi)]),
             Err(ParseError::UnterminatedBrace)
         );
+    }
+
+    fn first_function(seq: &Sequence) -> (&str, &Command) {
+        match &seq.first {
+            Command::FunctionDef { name, body } => (name.as_str(), body.as_ref()),
+            other => panic!("expected a function def, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_simple_function_def() {
+        // foo() { echo hi; }
+        let seq = parse(vec![
+            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+            kw("{"), w_tok("echo"), w_tok("hi"), Token::Op(Operator::Semi), kw("}"),
+        ]).unwrap().unwrap();
+        let (name, body) = first_function(&seq);
+        assert_eq!(name, "foo");
+        assert!(matches!(body, Command::BraceGroup(_)));
+    }
+
+    #[test]
+    fn parse_function_with_if_body() {
+        // foo() if true; then echo; fi
+        let seq = parse(vec![
+            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+            kw("if"), w_tok("true"), Token::Op(Operator::Semi),
+            kw("then"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("fi"),
+        ]).unwrap().unwrap();
+        let (name, body) = first_function(&seq);
+        assert_eq!(name, "foo");
+        assert!(matches!(body, Command::If(_)));
+    }
+
+    #[test]
+    fn parse_function_invalid_name() {
+        // 1foo() { echo; }
+        assert_eq!(
+            parse(vec![
+                w_tok("1foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+            ]),
+            Err(ParseError::FunctionName)
+        );
+    }
+
+    #[test]
+    fn parse_function_missing_close_paren() {
+        // foo( { echo; }
+        assert_eq!(
+            parse(vec![
+                w_tok("foo"), Token::Op(Operator::LParen),
+                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+            ]),
+            Err(ParseError::FunctionBody)
+        );
+    }
+
+    #[test]
+    fn parse_function_pipeline_body_errors() {
+        // foo() echo hi  — body is a Pipeline, not a compound
+        assert_eq!(
+            parse(vec![
+                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                w_tok("echo"), w_tok("hi"),
+            ]),
+            Err(ParseError::FunctionBody)
+        );
+    }
+
+    #[test]
+    fn parse_function_def_followed_by_call() {
+        // foo() { echo; } ; foo
+        let seq = parse(vec![
+            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+            kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+            Token::Op(Operator::Semi),
+            w_tok("foo"),
+        ]).unwrap().unwrap();
+        assert!(matches!(seq.first, Command::FunctionDef { .. }));
+        assert_eq!(seq.rest.len(), 1);
+        assert!(matches!(seq.rest[0].1, Command::Pipeline(_)));
     }
 }
