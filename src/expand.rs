@@ -137,9 +137,14 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             }
             WordPart::AllArgs { quoted: false, joined: _ } => {
                 // Unquoted $@ and $* are identical: each arg becomes its
-                // own field, IFS-split.
+                // own field(s), IFS-split. Args are independent — the
+                // last IFS-fragment of arg N must NOT merge with the
+                // first of arg N+1, so we flush current between args.
                 let args = shell.positional_args.clone();
-                for arg in &args {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 && !current.is_empty() {
+                        result.push(std::mem::take(&mut current));
+                    }
                     emit_split_fields(arg, &mut current, &mut result, &mut has_emitted);
                 }
             }
@@ -1338,7 +1343,7 @@ mod tests {
         let w = Word(vec![WordPart::Var { name: "1".to_string(), quoted: false }]);
         let fields = expand(&w, &mut shell);
         // Unset positional → no field (consistent with unset var behaviour)
-        assert!(fields.iter().all(|f| f.chars.is_empty()));
+        assert!(fields.is_empty());
     }
 
     #[test]
@@ -1379,6 +1384,21 @@ mod tests {
         let w = Word(vec![WordPart::AllArgs { joined: false, quoted: true }]);
         let fields = expand(&w, &mut shell);
         // Either zero fields or all-empty fields are acceptable per the spec.
-        assert!(fields.is_empty() || fields.iter().all(|f| f.chars.is_empty()));
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn expand_dollar_at_unquoted_splits_each_arg_independently() {
+        // $@ unquoted with two args, one containing whitespace.
+        // POSIX: each arg becomes its own field(s) after IFS-splitting;
+        // args do NOT merge across boundaries.
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello world".to_string(), "x".to_string()];
+        let w = Word(vec![WordPart::AllArgs { joined: false, quoted: false }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 3, "fields: {fields:?}");
+        assert_eq!(fields[0].chars, "hello");
+        assert_eq!(fields[1].chars, "world");
+        assert_eq!(fields[2].chars, "x");
     }
 }
