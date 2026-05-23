@@ -19,6 +19,9 @@ struct Variable {
 pub struct Shell {
     vars: HashMap<String, Variable>,
     last_status: i32,
+    /// Current frame of positional parameters. Populated only by
+    /// function calls (Task 5); empty at the top level.
+    pub positional_args: Vec<String>,
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
@@ -36,6 +39,7 @@ impl Shell {
         Self {
             vars,
             last_status: 0,
+            positional_args: Vec::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
@@ -46,6 +50,24 @@ impl Shell {
 
     pub fn get(&self, name: &str) -> Option<&str> {
         self.vars.get(name).map(|v| v.value.as_str())
+    }
+
+    /// Variable lookup for expansion. Recognises positional names
+    /// (`"1"`-`"9"`/`"10"`/..., and `"#"`) before falling back to the
+    /// regular variable HashMap. Returns an owned `String` because
+    /// positional/computed values are not stored as references.
+    pub fn lookup_var(&self, name: &str) -> Option<String> {
+        if name == "#" {
+            return Some(self.positional_args.len().to_string());
+        }
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+            let n: usize = name.parse().ok()?;
+            if n == 0 {
+                return None; // $0 deferred
+            }
+            return self.positional_args.get(n - 1).cloned();
+        }
+        self.vars.get(name).map(|v| v.value.clone())
     }
 
     /// Sets a variable's value, preserving its existing `exported` flag (or
