@@ -70,7 +70,11 @@ pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
             ' ' | '\t' => {
                 if current_has_content {
                     let word = &head[word_start..off];
-                    if !is_assignment(word) {
+                    if is_assignment(word) {
+                        // Leave is_command_pos = true; next word is the command.
+                    } else if is_compound_keyword(word) {
+                        is_command_pos = true;
+                    } else {
                         is_command_pos = false;
                     }
                 }
@@ -138,6 +142,12 @@ fn is_assignment(word: &str) -> bool {
     !name.is_empty()
         && name.chars().next().map(|c| c == '_' || c.is_ascii_alphabetic()).unwrap_or(false)
         && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// True if `word` is a compound-command keyword after which the next word
+/// is in command position (i.e., the start of a new simple command).
+fn is_compound_keyword(word: &str) -> bool {
+    matches!(word, "then" | "do" | "else" | "elif" | "fi" | "done" | "esac" | "{" | "}")
 }
 
 /// Byte offset of the last `$` in `word` that is not backslash-escaped.
@@ -416,6 +426,46 @@ mod tests {
     fn analyze_after_assignment_word_is_command() {
         let (start, ctx) = analyze("FOO=bar ec", 10);
         assert_eq!(start, 8);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_then_keyword_is_command() {
+        let (start, ctx) = analyze("if true; then ec", 16);
+        assert_eq!(start, 14);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_do_keyword_is_command() {
+        let (_, ctx) = analyze("for x in 1; do ec", 17);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_else_keyword_is_command() {
+        let (_, ctx) = analyze("if x; then y; else ec", 21);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_elif_keyword_is_command() {
+        let (_, ctx) = analyze("if x; then y; elif ec", 21);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_open_brace_keyword_is_command() {
+        let (_, ctx) = analyze("{ ec", 4);
+        assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
+    }
+
+    #[test]
+    fn analyze_after_fi_keyword_is_command() {
+        // After `fi`, a separator is conventionally required, but treating the
+        // next word as a command position is the more useful completion default
+        // — it lets the user tab-complete `if x; then y; fi <TAB>` to a command.
+        let (_, ctx) = analyze("if x; then y; fi ec", 19);
         assert_eq!(ctx, CompletionContext::Command { prefix: "ec".to_string() });
     }
 

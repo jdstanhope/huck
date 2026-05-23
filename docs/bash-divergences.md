@@ -54,11 +54,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix location**: `src/lexer.rs` — handle `\<NL>` as deletion at lex time, not at continuation-classifier time.
 
 ### B-04: completion context doesn't reset after compound-command keywords
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: medium
-- **huck**: `analyze()` in `src/completion.rs` resets `is_command_pos` on `;`, `|`, `&` but not on keywords like `then`/`do`/`else`/`elif`/`fi`/`done`/`esac`/`{`/`}`. So `if true; then <TAB>` offers filenames instead of commands.
-- **bash**: completion is keyword-aware; `then <TAB>` offers commands.
-- **Fix location**: `src/completion.rs` `analyze()`.
+- **huck (was)**: `analyze()` reset `is_command_pos` only on `;`/`|`/`&`. After `then`/`do`/`else`/etc., tab offered filenames.
+- **bash**: completion is keyword-aware.
+- **Fix**: `src/completion.rs` — new `is_compound_keyword` helper recognises `then`/`do`/`else`/`elif`/`fi`/`done`/`esac`/`{`/`}`; the whitespace branch keeps `is_command_pos` true after one of these.
 
 ### B-05: `exit N` doesn't mask to 8 bits
 - **Status**: fixed (2026-05-23)
