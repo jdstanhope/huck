@@ -702,7 +702,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             },
         }
     } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
-        call_function(body, resolved.args.clone(), shell, sink)
+        call_function(body, resolved.args, shell, sink)
     } else if builtins::is_builtin(&resolved.program) {
         let files = match open_stage_files(&resolved) {
             Ok(f) => f,
