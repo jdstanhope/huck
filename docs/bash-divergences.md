@@ -33,11 +33,11 @@ messages so the doc stays in sync.
 huck behaves wrong without a design reason; should be fixed.
 
 ### B-01: `#` comments not supported
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: high
-- **huck**: `echo foo # comment` runs with `#` and `comment` as literal arguments.
+- **huck (was)**: `echo foo # comment` ran with `#` and `comment` as literal args.
 - **bash**: an unquoted `#` that begins a word starts a comment to end-of-line.
-- **Fix location**: `src/lexer.rs` `tokenize` — add a `#` arm that skips to newline (only when starting a word; inside an existing word or quotes, `#` stays literal).
+- **Fix**: `src/lexer.rs` `tokenize` — `'#' if !has_token` arm consumes through to (but not including) the next newline. `#` mid-word, inside quotes, or after a backslash stays literal because those paths never reach this arm.
 
 ### B-02: `` \` `` inside `"…"` not honored
 - **Status**: open

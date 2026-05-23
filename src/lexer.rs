@@ -179,6 +179,16 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 flush_literal(&mut parts, &mut current, false);
                 read_dollar_expansion(&mut chars, &mut parts, false)?;
             }
+            '#' if !has_token => {
+                // POSIX: an unquoted `#` that begins a word starts a comment
+                // to end-of-line. `#` mid-word (has_token=true) falls through
+                // to the catch-all as a literal char.
+                while let Some(&ch) = chars.peek() {
+                    if ch == '\n' { break; }
+                    chars.next();
+                }
+                // The trailing newline (if any) is handled by the outer loop.
+            }
             '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
                 if let Some(spec) = try_parse_tilde(&mut chars, in_assignment_value) {
                     flush_literal(&mut parts, &mut current, false);
@@ -968,6 +978,80 @@ mod tests {
     #[test]
     fn tokenize_only_whitespace() {
         assert_eq!(tokenize("   \t  ").unwrap(), Vec::<Token>::new());
+    }
+
+    #[test]
+    fn tokenize_full_line_comment() {
+        assert_eq!(tokenize("# just a comment").unwrap(), Vec::<Token>::new());
+    }
+
+    #[test]
+    fn tokenize_comment_to_newline() {
+        assert_eq!(
+            tokenize("# comment\necho hi").unwrap(),
+            vec![Token::Newline, w("echo"), w("hi")]
+        );
+    }
+
+    #[test]
+    fn tokenize_trailing_comment() {
+        assert_eq!(
+            tokenize("echo hi # trailing").unwrap(),
+            vec![w("echo"), w("hi")]
+        );
+    }
+
+    #[test]
+    fn tokenize_trailing_comment_then_next_line() {
+        assert_eq!(
+            tokenize("echo a # comment\necho b").unwrap(),
+            vec![w("echo"), w("a"), Token::Newline, w("echo"), w("b")]
+        );
+    }
+
+    #[test]
+    fn tokenize_hash_inside_word_is_literal() {
+        // bash: `echo foo#bar` outputs `foo#bar` (# mid-word is not a comment).
+        assert_eq!(
+            tokenize("echo foo#bar").unwrap(),
+            vec![w("echo"), w("foo#bar")]
+        );
+    }
+
+    #[test]
+    fn tokenize_hash_after_semicolon_is_comment() {
+        assert_eq!(
+            tokenize("echo a; # comment").unwrap(),
+            vec![w("echo"), w("a"), Token::Op(Operator::Semi)]
+        );
+    }
+
+    #[test]
+    fn tokenize_hash_inside_single_quotes_is_literal() {
+        assert_eq!(
+            tokenize("echo '# inside'").unwrap(),
+            vec![w("echo"), wq("# inside")]
+        );
+    }
+
+    #[test]
+    fn tokenize_hash_inside_double_quotes_is_literal() {
+        assert_eq!(
+            tokenize("echo \"# inside\"").unwrap(),
+            vec![w("echo"), wq("# inside")]
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_hash_is_literal() {
+        // `\#` at word start: backslash escape, # is literal
+        assert_eq!(
+            tokenize(r"echo \#hash").unwrap(),
+            vec![w("echo"), Token::Word(Word(vec![
+                WordPart::Literal { text: "#".to_string(), quoted: true },
+                WordPart::Literal { text: "hash".to_string(), quoted: false },
+            ]))]
+        );
     }
 
     #[test]
