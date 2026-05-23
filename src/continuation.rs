@@ -65,7 +65,8 @@ pub fn classify(buffer: &str) -> Completeness {
         Err(ParseError::UnterminatedIf
             | ParseError::UnterminatedLoop
             | ParseError::UnterminatedCase
-            | ParseError::UnterminatedBrace) => {
+            | ParseError::UnterminatedBrace
+            | ParseError::UnterminatedFunction) => {
             Completeness::Incomplete(ContinuationReason::Compound)
         }
         Err(_) => Completeness::Error,
@@ -300,5 +301,13 @@ mod tests {
     #[test]
     fn joiner_compound_is_space_after_open_brace() {
         assert_eq!(joiner_for(ContinuationReason::Compound, "{"), " ");
+    }
+
+    #[test]
+    fn unterminated_function_def_is_incomplete() {
+        assert_eq!(
+            classify("foo()"),
+            Completeness::Incomplete(ContinuationReason::Compound)
+        );
     }
 }

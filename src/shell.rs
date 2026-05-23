@@ -250,7 +250,11 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnterminatedBrace => "unterminated '{' (expected '}')".to_string(),
         ParseError::FunctionName => "invalid function name".to_string(),
         ParseError::FunctionBody => {
-            "'(' must be followed by ')' and a compound-command body".to_string()
+            "function definition: expected '()' and a compound-command body \
+             (`if`/`while`/`for`/`case`/`{ … }`)".to_string()
+        }
+        ParseError::UnterminatedFunction => {
+            "unterminated function definition (expected a compound-command body)".to_string()
         }
     }
 }

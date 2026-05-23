@@ -279,6 +279,7 @@ pub enum ParseError {
     UnterminatedBrace,
     FunctionName,
     FunctionBody,
+    UnterminatedFunction,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -422,8 +423,15 @@ fn parse_function_def<I: Iterator<Item = Token>>(
         _ => return Err(ParseError::FunctionBody),
     }
     skip_newlines(iter);
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedFunction);
+    }
     let body = parse_command(iter)?;
-    if matches!(body, Command::Pipeline(_)) {
+    if !matches!(
+        body,
+        Command::If(_) | Command::While(_) | Command::For(_)
+            | Command::Case(_) | Command::BraceGroup(_)
+    ) {
         return Err(ParseError::FunctionBody);
     }
     Ok(Command::FunctionDef { name, body: Box::new(body) })
@@ -2197,6 +2205,40 @@ mod tests {
                 w_tok("echo"), w_tok("hi"),
             ]),
             Err(ParseError::FunctionBody)
+        );
+    }
+
+    #[test]
+    fn parse_function_def_without_body_is_unterminated() {
+        // `foo()` then EOF — body not yet typed; classifier should treat as incomplete.
+        assert_eq!(
+            parse(vec![
+                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+            ]),
+            Err(ParseError::UnterminatedFunction)
+        );
+    }
+
+    #[test]
+    fn parse_function_nested_def_body_errors() {
+        // foo() bar() { echo; }  — body must be a compound, not another function def
+        assert_eq!(
+            parse(vec![
+                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                w_tok("bar"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+            ]),
+            Err(ParseError::FunctionBody)
+        );
+    }
+
+    #[test]
+    fn stray_open_paren_after_pipeline_args_is_error() {
+        // `echo hi (` — `(` after a pipeline arg goes via parse_pipeline,
+        // not function-def detection (which only fires on the FIRST token).
+        assert_eq!(
+            parse(vec![w_tok("echo"), w_tok("hi"), Token::Op(Operator::LParen)]),
+            Err(ParseError::UnexpectedToken)
         );
     }
 
