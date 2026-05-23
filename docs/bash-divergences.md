@@ -82,11 +82,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/expand.rs` `expand_assignment` snapshots `shell.last_status()` at entry. All three expansion entry points (`expand`, `expand_assignment`, `expand_pattern`) now agree.
 
 ### B-08: `[N] Done` notification omits status for non-zero exits
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: medium
-- **huck**: a synchronous synthetic builtin-background "done" notification always prints `[N] Done` regardless of exit status.
-- **bash**: prints `[N] Exit N cmd &` when the background command exited non-zero.
-- **Fix location**: `src/executor.rs` `run_background_sequence` pure-builtin path — when forming the notification, include the exit code (use the existing `render_state` logic).
+- **huck (was)**: a synchronous synthetic builtin-background "done" notification always printed bare `[N] Done`, regardless of exit status; a second (correctly-formatted) notification then fired at the next `reap_and_notify` pass — duplicate output.
+- **bash**: prints `[N]+ Exit N cmd &` when the background command exited non-zero.
+- **Fix**: `src/executor.rs` `run_background_sequence` — the pure-builtin path now calls `crate::jobs::reap_and_notify(shell)` after `add_synthetic_done`. The job is formatted via `notification_line` (which uses `render_state` → "Done" vs "Exit N") AND marked notified, so `remove_notified` drops it on the same sweep. The defensive all-Assign fallback path was migrated the same way.
 
 ### B-09: `run_multi_stage` foreground wait loop iterates per-pid
 - **Status**: open

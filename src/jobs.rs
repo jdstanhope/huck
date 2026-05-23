@@ -540,6 +540,14 @@ mod tests {
     }
 
     #[test]
+    fn notification_line_for_nonzero_exit_shows_exit_n() {
+        let mut t = JobTable::new();
+        t.add_synthetic_done("test -z hi".to_string(), 1);
+        let line = notification_line(&t.jobs_mut()[0], ' ');
+        assert_eq!(line, "[1]  Exit 1                   test -z hi &");
+    }
+
+    #[test]
     fn notification_line_for_stopped_tty_input_shows_reason() {
         let mut t = JobTable::new();
         t.add(4242, vec![4242], "cat".to_string());

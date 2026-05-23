@@ -312,8 +312,13 @@ fn run_background_sequence(
             ExecOutcome::FunctionReturn(n) => n,
             ExecOutcome::Exit(_) => unreachable!(),
         };
-        let id = shell.jobs.add_synthetic_done(display, exit);
-        eprintln!("[{id}] Done");
+        shell.jobs.add_synthetic_done(display, exit);
+        // Route through the normal notification path so the line is formatted
+        // with notification_line (includes `Exit N` for non-zero exits, the
+        // command text, and the trailing `&`) and marked notified — preventing
+        // the duplicate "[N] Done" line that would otherwise fire at the next
+        // reap_and_notify pass.
+        crate::jobs::reap_and_notify(shell);
         return ExecOutcome::Continue(0);
     }
 
@@ -444,8 +449,8 @@ fn run_background_sequence(
         // synthetic Done. This shouldn't happen in practice — the parser
         // doesn't produce all-Assign backgrounded pipelines as a typical
         // user input shape, but we handle it defensively.
-        let id = shell.jobs.add_synthetic_done(display, 0);
-        eprintln!("[{id}] Done");
+        shell.jobs.add_synthetic_done(display, 0);
+        crate::jobs::reap_and_notify(shell);
         return ExecOutcome::Continue(0);
     };
 
@@ -1373,7 +1378,12 @@ mod tests {
     use crate::jobs::JobState;
 
     #[test]
-    fn background_pure_builtin_runs_synchronously_and_registers_done_job() {
+    fn background_pure_builtin_runs_synchronously_and_notifies_done() {
+        // The synthetic Done job is added then immediately notified via the
+        // normal reap_and_notify path (which formats via notification_line and
+        // marks notified), so remove_notified drops it on the same sweep —
+        // leaving the table empty. This prevents the duplicate `[N] Done` line
+        // that would otherwise fire when the next prompt calls reap_and_notify.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![exec("echo", &["hi"])],
@@ -1384,11 +1394,25 @@ mod tests {
         let mut shell = Shell::new();
         let outcome = execute(&seq, &mut shell, "echo hi &");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let jobs: Vec<_> = shell.jobs.iter().collect();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].command, "echo hi");
-        assert!(matches!(jobs[0].state, JobState::Done(0)));
-        assert!(jobs[0].pids.is_empty()); // synthetic — no real pids
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn background_pure_builtin_nonzero_exit_runs_and_notifies() {
+        // `test -z hi` returns 1 (non-empty). The notification path must surface
+        // `Exit 1` (via render_state) rather than `Done`.
+        let seq = Sequence {
+            first: Command::Pipeline(Pipeline {
+                commands: vec![exec("test", &["-z", "hi"])],
+            }),
+            rest: vec![],
+            background: true,
+        };
+        let mut shell = Shell::new();
+        let outcome = execute(&seq, &mut shell, "test -z hi &");
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+        // Format coverage is in jobs::tests::notification_line_for_nonzero_exit.
     }
 
     #[test]
