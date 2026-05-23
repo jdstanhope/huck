@@ -61,11 +61,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix location**: `src/completion.rs` `analyze()`.
 
 ### B-05: `exit N` doesn't mask to 8 bits
-- **Status**: open
+- **Status**: fixed (2026-05-23)
 - **Severity**: medium
-- **huck**: `exit 300` reports 300 to the parent process.
+- **huck**: `exit 300` returned `ExecOutcome::Exit(300)` internally; the OS still masked at process-exit time, but the unmasked value would have surfaced in any future code path that observed the exit status before the process died (e.g. command substitution).
 - **bash**: POSIX requires exit status modulo 256; `exit 300` reports 44.
-- **Fix location**: `src/builtins.rs` `builtin_exit` — apply `code & 0xFF` (or `code.rem_euclid(256)`).
+- **Fix**: `src/builtins.rs` `builtin_exit` applies `code.rem_euclid(256)`.
 
 ### B-06: `echo -n` / `-e` / `-E` not supported
 - **Status**: open
