@@ -205,13 +205,13 @@ shadows any builtin except the flow-control set (`return`/`exit`/
 `break`/`continue`), so `cd() { … }` works but `return() { … }` is
 unreachable. `break`/`continue` inside a function target the caller's
 enclosing loop (matching bash). `local` variable scoping, `set --` /
-`shift`, and `$0` are not implemented. v22 also adds the standalone
+`shift`, `$0`, and redirections on a function call (`func > file`) are not implemented. v22 also adds the standalone
 brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
 **Not yet implemented:**
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
-brace expansion (`{a,b,c}`), special parameters (`$0`/`$1`/`$#`/`$@`/`$$`/`$!`), extended job specs
+brace expansion (`{a,b,c}`), special parameters (`$0`/`$$`/`$!`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), here-docs, aliases.
 
