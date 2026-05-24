@@ -109,6 +109,12 @@ impl Shell {
         self.vars.remove(name);
     }
 
+    /// True if `name` is set and marked exported.
+    #[allow(dead_code)] // used by Task 4 executor apply/restore path
+    pub fn is_exported(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| v.exported)
+    }
+
     pub fn last_status(&self) -> i32 {
         self.last_status
     }
@@ -234,5 +240,25 @@ mod tests {
         shell.set("HUCK_TEST_VN", "value".to_string());
         let names: Vec<&str> = shell.var_names().collect();
         assert!(names.contains(&"HUCK_TEST_VN"));
+    }
+
+    #[test]
+    fn is_exported_unset_var_is_false() {
+        let shell = Shell::new();
+        assert!(!shell.is_exported("DEFINITELY_NOT_SET"));
+    }
+
+    #[test]
+    fn is_exported_after_set_is_false() {
+        let mut shell = Shell::new();
+        shell.set("FOO", "bar".to_string());
+        assert!(!shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn is_exported_after_export_set_is_true() {
+        let mut shell = Shell::new();
+        shell.export_set("FOO", "bar".to_string());
+        assert!(shell.is_exported("FOO"));
     }
 }

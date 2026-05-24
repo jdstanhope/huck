@@ -25,6 +25,16 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+/// True for POSIX "special builtins" (2.14). Inline assignments preceding a
+/// special builtin persist in the shell; assignments preceding a regular
+/// builtin or external command are scoped to the command. The set is huck's
+/// existing builtins intersected with the POSIX special list; expand here as
+/// huck adds `set`/`shift`/`trap`/`eval`/`exec`/`:`/`readonly`/`.`.
+#[allow(dead_code)] // used by Task 4 executor apply/restore path
+pub fn is_special_builtin(name: &str) -> bool {
+    matches!(name, "break" | "continue" | "exit" | "export" | "return" | "unset")
+}
+
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
 /// destination for any stdout the builtin produces (`echo`, `pwd`); `cd` and
 /// `exit` produce no stdout and ignore it.
@@ -1661,5 +1671,30 @@ mod history_tests {
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("history", &["--bogus".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod special_builtin_tests {
+    use super::*;
+
+    #[test]
+    fn is_special_builtin_recognises_posix_specials() {
+        for name in ["break", "continue", "exit", "export", "return", "unset"] {
+            assert!(is_special_builtin(name), "expected {name} to be special");
+        }
+    }
+
+    #[test]
+    fn is_special_builtin_rejects_regular_builtins() {
+        for name in ["cd", "pwd", "echo", "jobs", "wait", "fg", "bg", "kill", "disown", "history", "test", "["] {
+            assert!(!is_special_builtin(name), "expected {name} to be regular");
+        }
+    }
+
+    #[test]
+    fn is_special_builtin_rejects_unknowns() {
+        assert!(!is_special_builtin("not_a_builtin"));
+        assert!(!is_special_builtin(""));
     }
 }
