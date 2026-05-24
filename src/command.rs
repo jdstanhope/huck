@@ -135,23 +135,43 @@ fn finalize_stage(
     stderr: Option<Redirect>,
 ) -> SimpleCommand {
     let no_redirs = stdin.is_none() && stdout.is_none() && stderr.is_none();
-    if args.is_empty() && no_redirs {
-        match try_split_assignment(program) {
-            Ok((name, value)) => return SimpleCommand::Assign(vec![(name, value)]),
-            Err(restored) => {
-                return SimpleCommand::Exec(ExecCommand {
-                    inline_assignments: Vec::new(),
-                    program: restored,
-                    args,
-                    stdin,
-                    stdout,
-                    stderr,
-                });
+
+    // Walk [program, args…] peeling leading assignments. Stops at the first
+    // word that isn't a valid `NAME=value` (per try_split_assignment).
+    let mut inline: Vec<(String, Word)> = Vec::new();
+    let mut iter = std::iter::once(program).chain(args).peekable();
+    while let Some(w) = iter.peek().cloned() {
+        match try_split_assignment(w) {
+            Ok((name, value)) => {
+                inline.push((name, value));
+                iter.next();
             }
+            Err(_) => break,
         }
     }
+    let remaining: Vec<Word> = iter.collect();
+
+    if remaining.is_empty() && no_redirs && !inline.is_empty() {
+        return SimpleCommand::Assign(inline);
+    }
+    // If remaining is empty (all words were assignments or there were none)
+    // AND there are redirects, we have a redirect-only command (possibly with
+    // inline assignment prefixes). Produce an Exec with an empty program word.
+    if remaining.is_empty() {
+        return SimpleCommand::Exec(ExecCommand {
+            inline_assignments: inline,
+            program: Word(Vec::new()),
+            args: Vec::new(),
+            stdin,
+            stdout,
+            stderr,
+        });
+    }
+    let mut remaining = remaining.into_iter();
+    let program = remaining.next().expect("non-empty after peel");
+    let args: Vec<Word> = remaining.collect();
     SimpleCommand::Exec(ExecCommand {
-        inline_assignments: Vec::new(),
+        inline_assignments: inline,
         program,
         args,
         stdin,
@@ -1150,12 +1170,22 @@ mod tests {
 
     #[test]
     fn parse_assignment_with_arg_is_exec() {
+        // `FOO=bar baz` — FOO=bar is an inline assignment; `baz` becomes the program.
         let seq = parse(vec![w_tok("FOO=bar"), w_tok("baz")]).unwrap().unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("FOO=bar", &["baz"])]);
+        match &first_pipeline(&seq).commands[0] {
+            SimpleCommand::Exec(e) => {
+                assert_eq!(e.inline_assignments.len(), 1);
+                assert_eq!(e.inline_assignments[0].0, "FOO");
+                assert_eq!(e.program, ww("baz"));
+                assert!(e.args.is_empty());
+            }
+            _ => panic!("expected Exec"),
+        }
     }
 
     #[test]
     fn parse_assignment_with_redirect_is_exec() {
+        // `FOO=bar > f` — assignment prefix with redirect, no program word.
         let seq = parse(vec![
             w_tok("FOO=bar"),
             Token::Op(Operator::RedirOut),
@@ -1165,7 +1195,9 @@ mod tests {
         .unwrap();
         match &first_pipeline(&seq).commands[0] {
             SimpleCommand::Exec(e) => {
-                assert_eq!(e.program, ww("FOO=bar"));
+                assert_eq!(e.inline_assignments.len(), 1);
+                assert_eq!(e.inline_assignments[0].0, "FOO");
+                assert_eq!(e.program, Word(Vec::new()));
                 assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
             }
             _ => panic!("expected Exec"),
@@ -2267,5 +2299,78 @@ mod tests {
         assert!(matches!(seq.first, Command::FunctionDef { .. }));
         assert_eq!(seq.rest.len(), 1);
         assert!(matches!(seq.rest[0].1, Command::Pipeline(_)));
+    }
+
+    #[test]
+    fn parse_inline_assignments_collect_into_exec() {
+        let tokens = crate::lexer::tokenize("A=1 B=2 cmd arg").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!("expected Pipeline") };
+        assert_eq!(p.commands.len(), 1);
+        let SimpleCommand::Exec(e) = &p.commands[0] else {
+            panic!("expected Exec, got {:?}", p.commands[0])
+        };
+        assert_eq!(e.inline_assignments.len(), 2);
+        assert_eq!(e.inline_assignments[0].0, "A");
+        assert_eq!(e.inline_assignments[1].0, "B");
+        assert_eq!(e.program, ww("cmd"));
+        assert_eq!(e.args, vec![ww("arg")]);
+    }
+
+    #[test]
+    fn parse_assign_only_multiple_vars() {
+        let tokens = crate::lexer::tokenize("A=1 B=2").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        assert_eq!(p.commands.len(), 1);
+        let SimpleCommand::Assign(items) = &p.commands[0] else {
+            panic!("expected Assign(Vec), got {:?}", p.commands[0])
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "A");
+        assert_eq!(items[1].0, "B");
+    }
+
+    #[test]
+    fn parse_assign_only_single_var_still_works() {
+        let tokens = crate::lexer::tokenize("FOO=bar").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let SimpleCommand::Assign(items) = &p.commands[0] else { panic!() };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "FOO");
+    }
+
+    #[test]
+    fn parse_mid_command_assignment_word_stays_literal() {
+        let tokens = crate::lexer::tokenize("cmd A=1").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!() };
+        assert!(e.inline_assignments.is_empty());
+        assert_eq!(e.program, ww("cmd"));
+        assert_eq!(e.args, vec![ww("A=1")]);
+    }
+
+    #[test]
+    fn parse_invalid_identifier_lhs_is_not_assignment() {
+        let tokens = crate::lexer::tokenize("1FOO=bar cmd").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!() };
+        assert!(e.inline_assignments.is_empty());
+        assert_eq!(e.program, ww("1FOO=bar"));
+        assert_eq!(e.args, vec![ww("cmd")]);
+    }
+
+    #[test]
+    fn parse_assignment_before_compound_command_errors() {
+        let tokens = crate::lexer::tokenize("A=1 if true; then echo hi; fi").unwrap();
+        let err = parse(tokens).expect_err("expected parse error");
+        // Either AssignmentBeforeCompound (if the implementer adds the variant)
+        // or whatever the existing error path produces for `A=1 if` — the test
+        // just confirms parsing fails rather than silently dropping the prefix.
+        let msg = format!("{err:?}");
+        assert!(!msg.is_empty(), "got: {err:?}");
     }
 }
