@@ -127,6 +127,27 @@ fn try_split_assignment(
     Ok((name, crate::lexer::Word(value_parts)))
 }
 
+/// Returns `true` if `w` looks like a `NAME=value` assignment word without
+/// consuming or cloning it. Mirrors the shape check in `try_split_assignment`
+/// so the caller can decide whether to take ownership before calling the
+/// real splitter.
+fn is_assignment_word(w: &crate::lexer::Word) -> bool {
+    use crate::lexer::WordPart;
+    let text = match w.0.first() {
+        Some(WordPart::Literal { text, quoted: false }) => text,
+        _ => return false,
+    };
+    let Some(eq) = text.find('=') else { return false };
+    let name_slice = &text[..eq];
+    if name_slice.is_empty() {
+        return false;
+    }
+    let mut chars = name_slice.chars();
+    let first_ch = chars.next().expect("non-empty");
+    (first_ch == '_' || first_ch.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
 fn finalize_stage(
     program: crate::lexer::Word,
     args: Vec<crate::lexer::Word>,
@@ -138,15 +159,19 @@ fn finalize_stage(
 
     // Walk [program, args…] peeling leading assignments. Stops at the first
     // word that isn't a valid `NAME=value` (per try_split_assignment).
+    // We peek by reference first (cheap) and only take ownership when the
+    // word is confirmed to be assignment-shaped, avoiding a deep clone on
+    // every non-assignment first word.
     let mut inline: Vec<(String, Word)> = Vec::new();
     let mut iter = std::iter::once(program).chain(args).peekable();
-    while let Some(w) = iter.peek().cloned() {
-        match try_split_assignment(w) {
-            Ok((name, value)) => {
-                inline.push((name, value));
-                iter.next();
-            }
-            Err(_) => break,
+    while let Some(w) = iter.peek() {
+        if !is_assignment_word(w) {
+            break;
+        }
+        let owned = iter.next().expect("just peeked Some");
+        match try_split_assignment(owned) {
+            Ok((name, value)) => inline.push((name, value)),
+            Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
         }
     }
     let remaining: Vec<Word> = iter.collect();
@@ -154,9 +179,10 @@ fn finalize_stage(
     if remaining.is_empty() && no_redirs && !inline.is_empty() {
         return SimpleCommand::Assign(inline);
     }
-    // If remaining is empty (all words were assignments or there were none)
-    // AND there are redirects, we have a redirect-only command (possibly with
-    // inline assignment prefixes). Produce an Exec with an empty program word.
+    // No trailing program word, but redirects (or zero words at all). Produce
+    // an Exec with an empty program word; the executor treats this as a
+    // "redirects only" command (POSIX 2.10.2 permits this — opens the files
+    // for side effects, then exits 0).
     if remaining.is_empty() {
         return SimpleCommand::Exec(ExecCommand {
             inline_assignments: inline,
@@ -2367,10 +2393,13 @@ mod tests {
     fn parse_assignment_before_compound_command_errors() {
         let tokens = crate::lexer::tokenize("A=1 if true; then echo hi; fi").unwrap();
         let err = parse(tokens).expect_err("expected parse error");
-        // Either AssignmentBeforeCompound (if the implementer adds the variant)
-        // or whatever the existing error path produces for `A=1 if` — the test
-        // just confirms parsing fails rather than silently dropping the prefix.
-        let msg = format!("{err:?}");
-        assert!(!msg.is_empty(), "got: {err:?}");
+        // The keyword token (`if`, `then`, etc.) that follows the assignment
+        // prefix is not a valid command position for a keyword, so the parser
+        // returns UnexpectedKeyword rather than silently treating the compound
+        // keyword as a literal argument.
+        assert!(
+            matches!(err, ParseError::UnexpectedKeyword(_)),
+            "expected UnexpectedKeyword, got: {err:?}"
+        );
     }
 }
