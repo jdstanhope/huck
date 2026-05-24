@@ -350,7 +350,7 @@ fn run_background_sequence(
     let mut carry: Option<ChildStdout> = None;
     let mut children: Vec<Child> = Vec::with_capacity(n);
 
-    for (i, resolved) in all_resolved.iter().enumerate() {
+    for (i, (resolved, orig_cmd)) in all_resolved.iter().zip(pipeline.commands.iter()).enumerate() {
         let is_last = i == n - 1;
         let Some(cmd) = resolved else {
             // Assign stage in a background pipeline: no-op stage. The carry
@@ -360,6 +360,13 @@ fn run_background_sequence(
             continue;
         };
 
+        // Extract inline_assignments from the original ExecCommand.
+        // Assign-variant stages were already handled above (continue'd).
+        let inline_assignments = match orig_cmd {
+            SimpleCommand::Exec(exec) => &exec.inline_assignments,
+            SimpleCommand::Assign(_) => unreachable!("Assign stages are skipped above"),
+        };
+
         let files = match open_stage_files(cmd) {
             Ok(f) => f,
             Err(()) => {
@@ -367,6 +374,8 @@ fn run_background_sequence(
                 return ExecOutcome::Continue(1);
             }
         };
+
+        let snap = apply_inline_assignments(inline_assignments, shell);
 
         let mut process = ProcessCommand::new(&cmd.program);
         process.args(&cmd.args);
@@ -404,13 +413,22 @@ fn run_background_sequence(
         }
 
         let mut child = match process.spawn() {
-            Ok(c) => c,
+            Ok(c) => {
+                // Child has forked and captured its env; restore the parent
+                // shell state immediately so the next stage starts clean.
+                // Background commands' inline assignments are always temp-scoped
+                // to the child — the parent shell is unaffected.
+                restore_inline_assignments(snap, shell);
+                c
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
+                restore_inline_assignments(snap, shell);
                 eprintln!("huck: command not found: {}", cmd.program);
                 cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(127);
             }
             Err(e) => {
+                restore_inline_assignments(snap, shell);
                 eprintln!("huck: {}: {e}", cmd.program);
                 cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(1);

@@ -157,6 +157,26 @@ fn inline_assignment_repeated_name_restores_original() {
 }
 
 // ---------------------------------------------------------------------------
+// Backgrounded external commands: inline assignments reach the child
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inline_assignment_backgrounded_external_command_sees_var() {
+    // Backgrounded externals must still see their inline assignments. Before
+    // the fix, run_background_sequence skipped apply_inline_assignments and
+    // the child's env was missing FOO entirely.
+    //
+    // We capture the child's env to a temp file (via shell redirection) since
+    // backgrounded stdout doesn't round-trip cleanly through the test harness.
+    let tmp = format!("/tmp/huck_bg_inline_test_{}", std::process::id());
+    let script = format!(
+        "FOO=hi env > {tmp} &\nwait\ncat {tmp} | grep ^FOO=\nrm -f {tmp}\nexit\n"
+    );
+    let (out, _) = run(&script);
+    assert!(out.contains("FOO=hi"), "got: {out}");
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline stage scoping (from Task 5 — kept here for completeness)
 // ---------------------------------------------------------------------------
 
