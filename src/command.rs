@@ -218,12 +218,6 @@ pub enum Redirect {
     /// `expand` is false for `<<'DELIM'` (any quoted part of the delim
     /// word triggers literal mode). `strip_tabs` is true for `<<-`.
     /// The body has tabs already stripped at lex time for `<<-`.
-    /// NOTE: Not yet produced by the parser — Task 2 (lexer) and Task 4
-    /// (executor) will wire this. The variant exists here for the AST shape.
-    ///
-    /// TODO(Task 2): Remove `#[allow(dead_code)]` once the lexer emits
-    /// Token::Heredoc and the parser routes it into ExecCommand.stdin.
-    #[allow(dead_code)]
     Heredoc { body: Word, expand: bool, strip_tabs: bool },
 }
 
@@ -858,11 +852,17 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
                 // A `(` or `)` outside a `case` pattern list is a syntax error.
                 return Err(ParseError::UnexpectedToken);
             }
+            Token::Heredoc { body, expand, strip_tabs } => {
+                // A here-doc token produced by the lexer — attach as stdin.
+                // Last-wins: a later heredoc or <file overwrites this.
+                stdin = Some(Redirect::Heredoc { body, expand, strip_tabs });
+            }
             Token::Op(op) => {
                 let target = match iter.next() {
                     Some(Token::Word(word)) => word,
                     Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                    Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
                 };
                 match op {
                     Operator::RedirIn => stdin = Some(Redirect::Read(target)),
@@ -2419,6 +2419,67 @@ mod tests {
         assert!(
             matches!(err, ParseError::UnexpectedKeyword(_)),
             "expected UnexpectedKeyword, got: {err:?}"
+        );
+    }
+
+    // --- Here-document parser tests (v24) ---
+
+    #[test]
+    fn parse_heredoc_redirect_attaches_to_command() {
+        // cmd <<EOF\nbody\nEOF → ExecCommand.stdin = Some(Redirect::Heredoc{...})
+        let tokens = crate::lexer::tokenize("cmd <<EOF\nbody\nEOF\n").unwrap();
+        let seq = parse(tokens).unwrap().unwrap();
+        let stdin = exec_stdin(&seq);
+        assert!(
+            matches!(stdin, Some(Redirect::Heredoc { .. })),
+            "expected Heredoc stdin, got: {stdin:?}"
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_last_wins_over_file_redirect() {
+        // cmd <file <<EOF\nbody\nEOF → stdin is the heredoc (last-wins)
+        let tokens = crate::lexer::tokenize("cmd <file <<EOF\nbody\nEOF\n").unwrap();
+        let seq = parse(tokens).unwrap().unwrap();
+        let stdin = exec_stdin(&seq);
+        assert!(
+            matches!(stdin, Some(Redirect::Heredoc { .. })),
+            "expected Heredoc to win over <file, got: {stdin:?}"
+        );
+    }
+
+    #[test]
+    fn parse_multiple_heredocs_keep_last() {
+        // cmd <<A <<B\nbody_a\nA\nbody_b\nB → stdin is body_b (last heredoc wins)
+        let tokens = crate::lexer::tokenize("cmd <<A <<B\nbody_a\nA\nbody_b\nB\n").unwrap();
+        let seq = parse(tokens).unwrap().unwrap();
+        let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
+        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!("expected Exec") };
+        // The last heredoc (B's body) should be in stdin.
+        if let Some(Redirect::Heredoc { body, .. }) = &e.stdin {
+            // body_b → Literal{"body_b", quoted:false} + Literal{"\n", quoted:true}
+            assert_eq!(body.0.len(), 2, "expected body_b parts, got: {:?}", body.0);
+        } else {
+            panic!("expected Heredoc stdin, got: {:?}", e.stdin);
+        }
+    }
+
+    #[test]
+    fn parse_heredoc_in_pipeline_stage() {
+        // cat <<EOF | grep foo\nbody\nEOF → stage 0 has heredoc, stage 1 doesn't
+        let tokens = crate::lexer::tokenize("cat <<EOF | grep foo\nbody\nEOF\n").unwrap();
+        let seq = parse(tokens).unwrap().unwrap();
+        let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
+        assert_eq!(p.commands.len(), 2, "expected 2 pipeline stages");
+        let SimpleCommand::Exec(stage0) = &p.commands[0] else { panic!() };
+        assert!(
+            matches!(stage0.stdin, Some(Redirect::Heredoc { .. })),
+            "stage 0 should have Heredoc stdin, got: {:?}", stage0.stdin
+        );
+        let SimpleCommand::Exec(stage1) = &p.commands[1] else { panic!() };
+        assert!(
+            stage1.stdin.is_none(),
+            "stage 1 should have no stdin, got: {:?}", stage1.stdin
         );
     }
 }

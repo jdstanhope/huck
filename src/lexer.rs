@@ -11,6 +11,7 @@ pub enum LexError {
     InvalidBraceOperand,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
+    UnterminatedHeredoc,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -73,6 +74,21 @@ pub enum Token {
     Word(Word),
     Op(Operator),
     Newline,
+    /// A complete here-doc with its body already collected. The lexer
+    /// builds this in two phases: the `<<DELIM` opener is seen on one
+    /// line, the body lines are consumed after the line's `\n`. The
+    /// resulting Token::Heredoc occupies the position where `<<DELIM`
+    /// appeared (the delim word itself is not emitted).
+    Heredoc { body: Word, expand: bool, strip_tabs: bool },
+}
+
+/// State for a heredoc whose body hasn't been collected yet.
+struct PendingHeredoc {
+    delim: String,
+    expand: bool,
+    strip_tabs: bool,
+    /// Index into `tokens` of the `Token::Heredoc` placeholder to patch.
+    token_idx: usize,
 }
 
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
@@ -83,6 +99,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut has_token = false;
     let mut in_assignment_value = false;
     let mut chars = input.chars().peekable();
+    let mut pending_heredocs: std::collections::VecDeque<PendingHeredoc> = std::collections::VecDeque::new();
 
     while let Some(c) = chars.next() {
         if c.is_whitespace() {
@@ -97,6 +114,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 in_assignment_value = false;
             }
             if c == '\n' {
+                // If there are pending heredocs, collect their bodies now
+                // before emitting the Newline token.
+                if !pending_heredocs.is_empty() {
+                    collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens)?;
+                }
                 tokens.push(Token::Newline);
             }
             continue;
@@ -293,7 +315,33 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
                     has_token = false;
                 }
-                tokens.push(Token::Op(Operator::RedirIn));
+                if chars.peek() == Some(&'<') {
+                    chars.next(); // consume second '<'
+                    let strip_tabs = if chars.peek() == Some(&'-') {
+                        chars.next(); // consume '-'
+                        true
+                    } else {
+                        false
+                    };
+                    // Parse the delimiter word and detect literal vs expanding mode.
+                    let (delim, expand) = parse_heredoc_delim(&mut chars)?;
+                    // Push a placeholder Token::Heredoc with empty body.
+                    // The body is back-patched after the line's \n.
+                    let placeholder_idx = tokens.len();
+                    tokens.push(Token::Heredoc {
+                        body: Word(Vec::new()),
+                        expand,
+                        strip_tabs,
+                    });
+                    pending_heredocs.push_back(PendingHeredoc {
+                        delim,
+                        expand,
+                        strip_tabs,
+                        token_idx: placeholder_idx,
+                    });
+                } else {
+                    tokens.push(Token::Op(Operator::RedirIn));
+                }
                 in_assignment_value = false;
             }
             '>' => {
@@ -336,10 +384,197 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         flush_literal(&mut parts, &mut current, false);
         tokens.push(Token::Word(Word(parts)));
     }
+    // If there are unresolved pending heredocs after end-of-input, it's an error.
+    if !pending_heredocs.is_empty() {
+        return Err(LexError::UnterminatedHeredoc);
+    }
     Ok(tokens)
 }
 
 fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
+    if !current.is_empty() {
+        parts.push(WordPart::Literal {
+            text: std::mem::take(current),
+            quoted,
+        });
+    }
+}
+
+/// Parses the heredoc delimiter word following `<<` or `<<-`.
+/// Returns `(delim_text, expand)` where `expand` is false if any character
+/// of the delimiter word was quoted (per POSIX 2.7.4: any quoting in the
+/// delimiter word forces literal-mode body collection).
+fn parse_heredoc_delim(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(String, bool), LexError> {
+    // Skip leading whitespace (POSIX: `<< EOF` is allowed).
+    while matches!(chars.peek(), Some(&' ') | Some(&'\t')) {
+        chars.next();
+    }
+    let mut delim = String::new();
+    let mut any_quoted = false;
+    while let Some(&c) = chars.peek() {
+        match c {
+            '\n' | ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => break,
+            '\'' => {
+                chars.next();
+                any_quoted = true;
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ch == '\'' { break; }
+                    delim.push(ch);
+                }
+            }
+            '"' => {
+                chars.next();
+                any_quoted = true;
+                while let Some(&ch) = chars.peek() {
+                    chars.next();
+                    if ch == '"' { break; }
+                    if ch == '\\' && let Some(&next) = chars.peek() { chars.next(); delim.push(next); continue; }
+                    delim.push(ch);
+                }
+            }
+            '\\' => {
+                chars.next();
+                any_quoted = true;
+                if let Some(&next) = chars.peek() {
+                    chars.next();
+                    delim.push(next);
+                }
+            }
+            _ => {
+                chars.next();
+                delim.push(c);
+            }
+        }
+    }
+    if delim.is_empty() {
+        return Err(LexError::UnterminatedHeredoc);
+    }
+    Ok((delim, !any_quoted))
+}
+
+/// Collects bodies for all pending heredocs in queue order.
+/// After each heredoc's body is collected, it is patched back into the
+/// placeholder `Token::Heredoc` at `token_idx`.
+fn collect_heredoc_bodies(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    pending: &mut std::collections::VecDeque<PendingHeredoc>,
+    tokens: &mut [Token],
+) -> Result<(), LexError> {
+    while let Some(ph) = pending.pop_front() {
+        let body = collect_one_heredoc_body(chars, &ph)?;
+        if let Some(Token::Heredoc { body: slot, expand, strip_tabs }) = tokens.get_mut(ph.token_idx) {
+            *slot = body;
+            *expand = ph.expand;
+            *strip_tabs = ph.strip_tabs;
+        } else {
+            unreachable!("placeholder token at index was not Token::Heredoc");
+        }
+    }
+    Ok(())
+}
+
+/// Collects the body of one heredoc, reading lines until the close-delimiter
+/// is matched (or end-of-input, which is an error).
+fn collect_one_heredoc_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ph: &PendingHeredoc,
+) -> Result<Word, LexError> {
+    let mut body_parts: Vec<WordPart> = Vec::new();
+    loop {
+        // Read one full line until \n or end of input.
+        let mut current_line = String::new();
+        let mut got_newline = false;
+        loop {
+            match chars.next() {
+                Some('\n') => {
+                    got_newline = true;
+                    break;
+                }
+                Some(c) => current_line.push(c),
+                None => break,
+            }
+        }
+        // For <<-, strip leading tabs from both body and close-delimiter lines.
+        let line_for_check = if ph.strip_tabs {
+            current_line.trim_start_matches('\t').to_string()
+        } else {
+            current_line.clone()
+        };
+        // Check if this is the close-delimiter line (must match exactly).
+        if line_for_check == ph.delim {
+            return Ok(Word(body_parts));
+        }
+        // Not the close — this is a body line.
+        // EOF without a matching close-delimiter is an error.
+        if !got_newline {
+            return Err(LexError::UnterminatedHeredoc);
+        }
+        let body_line = if ph.strip_tabs {
+            current_line.trim_start_matches('\t').to_string()
+        } else {
+            current_line
+        };
+        if ph.expand {
+            scan_expanding_body_line(&body_line, &mut body_parts)?;
+        } else {
+            // Literal mode: entire line verbatim as a single quoted Literal.
+            body_parts.push(WordPart::Literal {
+                text: body_line,
+                quoted: true,
+            });
+        }
+        // Append the line's terminating newline (literal, quoted).
+        body_parts.push(WordPart::Literal {
+            text: "\n".to_string(),
+            quoted: true,
+        });
+    }
+}
+
+/// Scans one body line of an expanding heredoc for `$`, `` ` ``, and `\`
+/// per POSIX 2.7.4. Pushes `WordPart`s into `parts`.
+fn scan_expanding_body_line(
+    line: &str,
+    parts: &mut Vec<WordPart>,
+) -> Result<(), LexError> {
+    let mut chars = line.chars().peekable();
+    let mut current = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // POSIX 2.7.4: inside expanding heredoc, `\` is special
+                // only before `$`, `` ` ``, `\`. Other backslashes are literal.
+                match chars.peek().copied() {
+                    Some('$') | Some('`') | Some('\\') => {
+                        let next = chars.next().unwrap();
+                        // Flush current as unquoted, then push escaped char as quoted Literal.
+                        flush_body_literal(parts, &mut current, false);
+                        parts.push(WordPart::Literal { text: next.to_string(), quoted: true });
+                    }
+                    _ => current.push('\\'),
+                }
+            }
+            '$' => {
+                flush_body_literal(parts, &mut current, false);
+                // Heredoc bodies are quoted-context (no word-splitting).
+                read_dollar_expansion(&mut chars, parts, true)?;
+            }
+            '`' => {
+                flush_body_literal(parts, &mut current, false);
+                let sequence = scan_backtick_substitution(&mut chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: true });
+            }
+            other => current.push(other),
+        }
+    }
+    flush_body_literal(parts, &mut current, false);
+    Ok(())
+}
+
+fn flush_body_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
     if !current.is_empty() {
         parts.push(WordPart::Literal {
             text: std::mem::take(current),
@@ -516,7 +751,7 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
                 parts.extend(ps);
                 first = false;
             }
-            Token::Op(_) | Token::Newline => return Err(LexError::InvalidBraceOperand),
+            Token::Op(_) | Token::Newline | Token::Heredoc { .. } => return Err(LexError::InvalidBraceOperand),
         }
     }
     Ok(Word(parts))
@@ -2659,5 +2894,240 @@ mod tests {
                 joined: false, quoted: false
             }]))]
         );
+    }
+
+    // --- Here-document tests (v24) ---
+
+    /// Helper: extract the body Word from the first Token::Heredoc in tokens.
+    fn heredoc_body(tokens: &[Token]) -> &Word {
+        for tok in tokens {
+            if let Token::Heredoc { body, .. } = tok {
+                return body;
+            }
+        }
+        panic!("no Token::Heredoc found in tokens: {tokens:?}");
+    }
+
+    /// Helper: assert a Literal part matches expected text and quoted flag.
+    fn assert_literal(part: &WordPart, expected_text: &str, expected_quoted: bool) {
+        match part {
+            WordPart::Literal { text, quoted } => {
+                assert_eq!(text, expected_text, "literal text mismatch");
+                assert_eq!(quoted, &expected_quoted, "literal quoted flag mismatch");
+            }
+            other => panic!("expected Literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_op_recognized() {
+        // Verify <<EOF lexes and produces a Token::Heredoc with body.
+        let result = tokenize("cat <<EOF\nhello\nEOF\n");
+        let tokens = result.expect("parse ok");
+        assert_eq!(tokens.len(), 3, "got: {tokens:?}"); // Word("cat"), Heredoc{...}, Newline
+        assert!(matches!(tokens[0], Token::Word(_)));
+        assert!(matches!(tokens[1], Token::Heredoc { .. }));
+        assert!(matches!(tokens[2], Token::Newline));
+    }
+
+    #[test]
+    fn tokenize_heredoc_simple_expand() {
+        // cat <<EOF\nhello\nEOF → Token::Heredoc{body=Word[Literal{"hello"}, Literal{"\n"}],
+        //                                         expand:true, strip_tabs:false}
+        let tokens = tokenize("cat <<EOF\nhello\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        // For an expanding heredoc, "hello" is a Literal{quoted:false} and "\n" is Literal{quoted:true}
+        assert_eq!(body.0.len(), 2);
+        assert_literal(&body.0[0], "hello", false);
+        assert_literal(&body.0[1], "\n", true);
+        if let Token::Heredoc { expand, strip_tabs, .. } = &tokens[1] {
+            assert!(expand, "should be expanding");
+            assert!(!strip_tabs, "should not strip tabs");
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_literal_no_expand() {
+        // cat <<'EOF'\n$HOME\nEOF → body is one Literal{quoted:true, text:"$HOME\n"}
+        let tokens = tokenize("cat <<'EOF'\n$HOME\nEOF\n").unwrap();
+        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[1] {
+            assert!(!expand, "quoted delim → literal mode (no expand)");
+            assert!(!strip_tabs);
+            // Literal mode: entire body as one quoted Literal per line, plus newline parts.
+            assert_eq!(body.0.len(), 2);
+            assert_literal(&body.0[0], "$HOME", true);
+            assert_literal(&body.0[1], "\n", true);
+        } else {
+            panic!("expected Token::Heredoc, got {:?}", tokens[1]);
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_strip_tabs_dash() {
+        // <<-EOF\n\t\thello\n\tEOF → body "hello\n" (tabs stripped from body AND close line)
+        let tokens = tokenize("<<-EOF\n\t\thello\n\tEOF\n").unwrap();
+        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[0] {
+            assert!(strip_tabs, "<<- should strip tabs");
+            assert!(expand);
+            // After tab stripping, body line is "hello"
+            assert_eq!(body.0.len(), 2);
+            assert_literal(&body.0[0], "hello", false);
+            assert_literal(&body.0[1], "\n", true);
+        } else {
+            panic!("expected Token::Heredoc");
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_strip_tabs_with_literal_delim() {
+        // <<-'EOF' composes strip + no-expansion
+        let tokens = tokenize("cat <<-'EOF'\n\thello\n\tEOF\n").unwrap();
+        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[1] {
+            assert!(strip_tabs, "<<- should strip tabs");
+            assert!(!expand, "quoted delim → literal mode");
+            assert_eq!(body.0.len(), 2);
+            assert_literal(&body.0[0], "hello", true);
+            assert_literal(&body.0[1], "\n", true);
+        } else {
+            panic!("expected Token::Heredoc");
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_unclosed_errors() {
+        // cat <<EOF\nhello → LexError::UnterminatedHeredoc
+        let result = tokenize("cat <<EOF\nhello");
+        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
+    }
+
+    #[test]
+    fn tokenize_heredoc_close_must_match_exactly() {
+        // Trailing space on close line → unterminated
+        let result = tokenize("cat <<EOF\nhello\nEOF \n");
+        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
+    }
+
+    #[test]
+    fn tokenize_heredoc_close_must_not_have_leading_spaces() {
+        // Leading spaces without <<- → unterminated
+        let result = tokenize("cat <<EOF\nhello\n  EOF\n");
+        assert_eq!(result, Err(LexError::UnterminatedHeredoc));
+    }
+
+    #[test]
+    fn tokenize_heredoc_multiple_in_order() {
+        // cmd <<A <<B\nbody_a\nA\nbody_b\nB
+        let tokens = tokenize("cmd <<A <<B\nbody_a\nA\nbody_b\nB\n").unwrap();
+        // tokens: Word("cmd"), Heredoc{A's body}, Heredoc{B's body}, Newline
+        assert_eq!(tokens.len(), 4, "got: {tokens:?}");
+        assert!(matches!(tokens[0], Token::Word(_)));
+        assert!(matches!(tokens[3], Token::Newline));
+        if let Token::Heredoc { body: body_a, .. } = &tokens[1] {
+            assert_eq!(body_a.0.len(), 2);
+            assert_literal(&body_a.0[0], "body_a", false);
+            assert_literal(&body_a.0[1], "\n", true);
+        } else {
+            panic!("tokens[1] should be Token::Heredoc for A");
+        }
+        if let Token::Heredoc { body: body_b, .. } = &tokens[2] {
+            assert_eq!(body_b.0.len(), 2);
+            assert_literal(&body_b.0[0], "body_b", false);
+            assert_literal(&body_b.0[1], "\n", true);
+        } else {
+            panic!("tokens[2] should be Token::Heredoc for B");
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_body_var_part() {
+        // cat <<EOF\n$USER\nEOF → body has Var{name:"USER"} part
+        let tokens = tokenize("cat <<EOF\n$USER\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        // Parts: Var{USER, quoted:true}, Literal{"\n", quoted:true}
+        assert_eq!(body.0.len(), 2);
+        match &body.0[0] {
+            WordPart::Var { name, quoted } => {
+                assert_eq!(name, "USER");
+                assert!(quoted, "heredoc body vars are quoted-context");
+            }
+            other => panic!("expected Var, got {other:?}"),
+        }
+        assert_literal(&body.0[1], "\n", true);
+    }
+
+    #[test]
+    fn tokenize_heredoc_body_command_sub() {
+        // cat <<EOF\n$(date)\nEOF → body has CommandSub part
+        let tokens = tokenize("cat <<EOF\n$(date)\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        // Parts: CommandSub{..., quoted:true}, Literal{"\n", quoted:true}
+        assert_eq!(body.0.len(), 2);
+        assert!(
+            matches!(body.0[0], WordPart::CommandSub { quoted: true, .. }),
+            "expected CommandSub{{quoted:true}}, got {:?}", body.0[0]
+        );
+        assert_literal(&body.0[1], "\n", true);
+    }
+
+    #[test]
+    fn tokenize_heredoc_body_escape_dollar() {
+        // cat <<EOF\n\$LITERAL\nEOF → body has Literal "$LITERAL"
+        // The backslash escapes the $ — result is literal text "$" followed by "LITERAL"
+        let tokens = tokenize("cat <<EOF\n\\$LITERAL\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        // \$ → Literal{"$", quoted:true}, then "LITERAL" → Literal{"LITERAL", quoted:false}
+        assert!(body.0.len() >= 2, "expected at least 2 parts, got {:?}", body.0);
+        // First part should be the escaped '$' as a quoted Literal
+        assert_literal(&body.0[0], "$", true);
+        // Second part should be the remaining text "LITERAL" (unquoted)
+        assert_literal(&body.0[1], "LITERAL", false);
+    }
+
+    #[test]
+    fn tokenize_heredoc_body_backslash_passthrough() {
+        // cat <<EOF\n\d\nEOF → body has Literal "\\d" (POSIX: \X other than \$\`\\ is literal)
+        let tokens = tokenize("cat <<EOF\n\\d\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        // \d → kept as literal "\d" (backslash not special before 'd')
+        assert_eq!(body.0.len(), 2);
+        assert_literal(&body.0[0], "\\d", false);
+        assert_literal(&body.0[1], "\n", true);
+    }
+
+    #[test]
+    fn tokenize_heredoc_empty_body() {
+        // cat <<EOF\nEOF → body Word has zero parts (empty)
+        let tokens = tokenize("cat <<EOF\nEOF\n").unwrap();
+        let body = heredoc_body(&tokens);
+        assert_eq!(body.0.len(), 0, "empty body should have no parts, got {:?}", body.0);
+    }
+
+    #[test]
+    fn tokenize_heredoc_delim_partially_quoted_is_literal_mode() {
+        // cat <<E"O"F\n$X\nEOF → expand:false, delim:"EOF"
+        let tokens = tokenize("cat <<E\"O\"F\n$X\nEOF\n").unwrap();
+        if let Token::Heredoc { body, expand, .. } = &tokens[1] {
+            assert!(!expand, "partial quoting triggers literal mode");
+            // Literal body: "$X" as-is
+            assert_eq!(body.0.len(), 2);
+            assert_literal(&body.0[0], "$X", true);
+            assert_literal(&body.0[1], "\n", true);
+        } else {
+            panic!("expected Token::Heredoc");
+        }
+    }
+
+    #[test]
+    fn tokenize_heredoc_delim_backslash_escaped_is_literal_mode() {
+        // cat <<\EOF\n$X\nEOF → expand:false (backslash-escaped delim = literal mode)
+        let tokens = tokenize("cat <<\\EOF\n$X\nEOF\n").unwrap();
+        if let Token::Heredoc { body, expand, .. } = &tokens[1] {
+            assert!(!expand, "backslash-escaped delim triggers literal mode");
+            assert_eq!(body.0.len(), 2);
+            assert_literal(&body.0[0], "$X", true);
+            assert_literal(&body.0[1], "\n", true);
+        } else {
+            panic!("expected Token::Heredoc");
+        }
     }
 }

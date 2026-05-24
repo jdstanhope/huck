@@ -280,5 +280,6 @@ fn lex_error_message(error: LexError) -> String {
         LexError::SubstitutionParseError(inner) => {
             format!(" in command substitution: {}", parse_error_message(inner))
         }
+        LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
     }
 }
