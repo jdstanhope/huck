@@ -151,7 +151,7 @@ fn is_assignment_word(w: &crate::lexer::Word) -> bool {
 fn finalize_stage(
     program: crate::lexer::Word,
     args: Vec<crate::lexer::Word>,
-    stdin: Option<crate::lexer::Word>,
+    stdin: Option<Redirect>,
     stdout: Option<Redirect>,
     stderr: Option<Redirect>,
 ) -> SimpleCommand {
@@ -208,8 +208,20 @@ fn finalize_stage(
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Redirect {
+    /// `<file` — open file for reading on stdin.
+    Read(Word),
+    /// `>file` — open file for writing (truncate first).
     Truncate(Word),
+    /// `>>file` — open file for writing (append).
     Append(Word),
+    /// `<<DELIM` (and friends) — heredoc body.
+    /// `expand` is false for `<<'DELIM'` (any quoted part of the delim
+    /// word triggers literal mode). `strip_tabs` is true for `<<-`.
+    /// The body has tabs already stripped at lex time for `<<-`.
+    /// NOTE: Not yet produced by the parser — Task 2 (lexer) and Task 4
+    /// (executor) will wire this. The variant exists here for the AST shape.
+    #[allow(dead_code)]
+    Heredoc { body: Word, expand: bool, strip_tabs: bool },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -219,7 +231,11 @@ pub struct ExecCommand {
     pub inline_assignments: Vec<(String, Word)>,
     pub program: Word,
     pub args: Vec<Word>,
-    pub stdin: Option<Word>,
+    // BREAKING CHANGE (v24): was Option<Word>; now Option<Redirect> so
+    // `<file` (Read), `<<EOF` (Heredoc), and (future) `<<<` share a
+    // uniform shape. Last-wins: a later redirect to stdin overwrites
+    // an earlier one.
+    pub stdin: Option<Redirect>,
     pub stdout: Option<Redirect>,
     pub stderr: Option<Redirect>,
 }
@@ -789,7 +805,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
 
     let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
-    let mut stdin: Option<Word> = None;
+    let mut stdin: Option<Redirect> = None;
     let mut stdout: Option<Redirect> = None;
     let mut stderr: Option<Redirect> = None;
 
@@ -846,7 +862,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
                     Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                 };
                 match op {
-                    Operator::RedirIn => stdin = Some(target),
+                    Operator::RedirIn => stdin = Some(Redirect::Read(target)),
                     Operator::RedirOut => stdout = Some(Redirect::Truncate(target)),
                     Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
                     Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
@@ -934,7 +950,7 @@ mod tests {
         }
     }
 
-    fn exec_stdin(seq: &Sequence) -> &Option<Word> {
+    fn exec_stdin(seq: &Sequence) -> &Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
             SimpleCommand::Exec(e) => &e.stdin,
             _ => panic!("expected Exec"),
@@ -990,7 +1006,7 @@ mod tests {
         let seq = parse(vec![w_tok("cat"), Token::Op(Operator::RedirIn), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(exec_stdin(&seq), &Some(ww("f")));
+        assert_eq!(exec_stdin(&seq), &Some(Redirect::Read(ww("f"))));
     }
 
     #[test]

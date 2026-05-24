@@ -560,7 +560,13 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         args.extend(glob_expand_fields(expand(word, shell)));
     }
     let stdin = match &cmd.stdin {
-        Some(word) => Some(expand_single(word, shell).map_err(|()| 1)?),
+        Some(Redirect::Read(word)) => Some(expand_single(word, shell).map_err(|()| 1)?),
+        Some(Redirect::Heredoc { .. }) => {
+            unreachable!("Heredoc handling lands in Task 4; parser does not produce this yet")
+        }
+        Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
+            unreachable!("parser never produces Truncate/Append for stdin")
+        }
         None => None,
     };
     let stdout = match &cmd.stdout {
@@ -570,6 +576,9 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Append(w)) => {
             Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
         }
+        Some(Redirect::Read(_) | Redirect::Heredoc { .. }) => {
+            unreachable!("parser never produces Read/Heredoc for stdout")
+        }
         None => None,
     };
     let stderr = match &cmd.stderr {
@@ -578,6 +587,9 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         }
         Some(Redirect::Append(w)) => {
             Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
+        }
+        Some(Redirect::Read(_) | Redirect::Heredoc { .. }) => {
+            unreachable!("parser never produces Read/Heredoc for stderr")
         }
         None => None,
     };
