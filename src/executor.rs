@@ -695,8 +695,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // Control builtins and special builtins: persistent.
     // User functions: persistent.
     // Regular builtins and external commands: temporary (restore after).
-    let persistent = is_control_builtin(&resolved.program)
-        || builtins::is_special_builtin(&resolved.program)
+    // Note: is_control_builtin's set {break,continue,exit,return} is a strict
+    // subset of is_special_builtin's set, so only the latter term is needed.
+    let persistent = builtins::is_special_builtin(&resolved.program)
         || shell.functions.contains_key(&resolved.program);
 
     // 1. Control builtins always win — they cannot be shadowed by functions.
@@ -707,9 +708,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         let files = match open_stage_files(&resolved) {
             Ok(f) => f,
             Err(()) => {
-                if !persistent {
-                    restore_inline_assignments(snap, shell);
-                }
+                // Control builtins always persist their inline assignments (POSIX
+                // special-builtin semantics); no restore needed on the redirect-open
+                // failure path.
                 return ExecOutcome::Continue(1);
             }
         };
@@ -2049,16 +2050,12 @@ mod tests {
 
     // ----- apply/restore inline assignment helper tests ----------------------
 
-    fn word_lit(s: &str) -> Word {
-        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
-    }
-
     #[test]
     fn apply_inline_assignments_sets_and_exports_left_to_right() {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/home/test".to_string());
         let assigns = vec![
-            ("A".to_string(), word_lit("1")),
+            ("A".to_string(), lit_word("1")),
             ("B".to_string(), Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell);
@@ -2072,7 +2069,7 @@ mod tests {
     #[test]
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
-        let assigns = vec![("FOO".to_string(), word_lit("bar"))];
+        let assigns = vec![("FOO".to_string(), lit_word("bar"))];
         let snap = apply_inline_assignments(&assigns, &mut shell);
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
@@ -2084,7 +2081,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
-        let assigns = vec![("FOO".to_string(), word_lit("inner"))];
+        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell);
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
@@ -2097,7 +2094,7 @@ mod tests {
     fn restore_inline_assignments_restores_prior_value_exported() {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
-        let assigns = vec![("FOO".to_string(), word_lit("inner"))];
+        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell);
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -2109,8 +2106,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let assigns = vec![
-            ("FOO".to_string(), word_lit("a")),
-            ("FOO".to_string(), word_lit("b")),
+            ("FOO".to_string(), lit_word("a")),
+            ("FOO".to_string(), lit_word("b")),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell);
         assert_eq!(shell.get("FOO"), Some("b"));
@@ -2126,8 +2123,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), word_lit("inner"))],
-            program: word_lit("true"),
+            inline_assignments: vec![("FOO".to_string(), lit_word("inner"))],
+            program: lit_word("true"),
             args: vec![],
             stdin: None,
             stdout: None,
@@ -2150,8 +2147,8 @@ mod tests {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), word_lit("val"))],
-            program: word_lit("myfunc"),
+            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            program: lit_word("myfunc"),
             args: vec![],
             stdin: None,
             stdout: None,
@@ -2167,9 +2164,9 @@ mod tests {
     fn run_exec_single_special_builtin_inline_assignment_persists() {
         let mut shell = Shell::new();
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), word_lit("val"))],
-            program: word_lit("export"),
-            args: vec![word_lit("FOO")],
+            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            program: lit_word("export"),
+            args: vec![lit_word("FOO")],
             stdin: None,
             stdout: None,
             stderr: None,
