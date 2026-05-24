@@ -220,6 +220,9 @@ pub enum Redirect {
     /// The body has tabs already stripped at lex time for `<<-`.
     /// NOTE: Not yet produced by the parser — Task 2 (lexer) and Task 4
     /// (executor) will wire this. The variant exists here for the AST shape.
+    ///
+    /// TODO(Task 2): Remove `#[allow(dead_code)]` once the lexer emits
+    /// Token::Heredoc and the parser routes it into ExecCommand.stdin.
     #[allow(dead_code)]
     Heredoc { body: Word, expand: bool, strip_tabs: bool },
 }

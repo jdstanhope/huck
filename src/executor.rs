@@ -562,7 +562,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let stdin = match &cmd.stdin {
         Some(Redirect::Read(word)) => Some(expand_single(word, shell).map_err(|()| 1)?),
         Some(Redirect::Heredoc { .. }) => {
-            unreachable!("Heredoc handling lands in Task 4; parser does not produce this yet")
+            unreachable!(
+                "Redirect::Heredoc is never constructed by the parser in Task 1 — \
+                 the lexer does not yet emit Token::Heredoc (Task 2 wires this)"
+            )
         }
         Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
             unreachable!("parser never produces Truncate/Append for stdin")
