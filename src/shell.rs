@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use libc;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{CompletionType, Config, Editor};
@@ -275,7 +274,7 @@ fn lex_error_message(error: LexError) -> String {
         LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
         LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
         LexError::InvalidBraceOperand => ": invalid operator in parameter-expansion operand".to_string(),
-        LexError::SubstitutionLexError(inner) => {
+        LexError::Substitution(inner) => {
             format!(" in command substitution{}", lex_error_message(*inner))
         }
         LexError::SubstitutionParseError(inner) => {

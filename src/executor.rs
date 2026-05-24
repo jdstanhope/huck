@@ -20,13 +20,13 @@ pub enum StdoutSink<'a> {
 
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    if seq.background {
-        if let Command::Pipeline(p) = &seq.first {
-            // Parser guarantees rest.is_empty() when background is set.
-            return run_background_sequence(p, shell, &mut sink, source);
-        }
-        // Backgrounding a compound command (if/while) is not supported;
-        // fall through and run it synchronously.
+    // Backgrounding a compound command (if/while) is not supported;
+    // fall through and run it synchronously.
+    if seq.background
+        && let Command::Pipeline(p) = &seq.first
+    {
+        // Parser guarantees rest.is_empty() when background is set.
+        return run_background_sequence(p, shell, &mut sink, source);
     }
     execute_sequence_body(seq, shell, &mut sink)
 }
@@ -195,10 +195,10 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
     };
     for pattern_word in &item.patterns {
         let pattern = expand_pattern(pattern_word, shell);
-        if let Ok(p) = glob::Pattern::new(&pattern) {
-            if p.matches_with(subject, opts) {
-                return true;
-            }
+        if let Ok(p) = glob::Pattern::new(&pattern)
+            && p.matches_with(subject, opts)
+        {
+            return true;
         }
     }
     false
@@ -616,7 +616,6 @@ fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
             .truncate(true)
             .open(path),
         ResolvedRedirect::Append(path) => OpenOptions::new()
-            .write(true)
             .create(true)
             .append(true)
             .open(path),
@@ -834,12 +833,11 @@ fn run_subprocess(
             } else {
                 // Capture path: use existing child.wait() semantics.
                 let mut copy_err: Option<io::Error> = None;
-                if let StdoutSink::Capture(buf) = sink {
-                    if let Some(mut child_stdout) = child.stdout.take() {
-                        if let Err(e) = io::copy(&mut child_stdout, *buf) {
-                            copy_err = Some(e);
-                        }
-                    }
+                if let StdoutSink::Capture(buf) = sink
+                    && let Some(mut child_stdout) = child.stdout.take()
+                    && let Err(e) = io::copy(&mut child_stdout, *buf)
+                {
+                    copy_err = Some(e);
                 }
                 match child.wait() {
                     Ok(status) => {
@@ -1048,10 +1046,10 @@ fn run_multi_stage(
             }
         };
 
-        if let Some(bytes) = pending_input {
-            if let Some(mut child_stdin) = child.stdin.take() {
-                let _ = child_stdin.write_all(&bytes);
-            }
+        if let Some(bytes) = pending_input
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            let _ = child_stdin.write_all(&bytes);
         }
 
         // Track pid for interactive job-control; setpgid in parent to
@@ -1075,24 +1073,22 @@ fn run_multi_stage(
             carry = Carry::ChildStdout(child.stdout.take().expect("stdout was set to piped"));
         } else if !is_last {
             carry = Carry::Buffer(Vec::new());
-        } else if want_terminal_capture {
-            if let StdoutSink::Capture(buf) = sink {
-                if let Some(mut child_stdout) = child.stdout.take() {
-                    if let Err(e) = io::copy(&mut child_stdout, *buf) {
-                        eprintln!("huck: {}: {e}", cmd.program);
-                    }
-                }
-            }
+        } else if want_terminal_capture
+            && let StdoutSink::Capture(buf) = sink
+            && let Some(mut child_stdout) = child.stdout.take()
+            && let Err(e) = io::copy(&mut child_stdout, *buf)
+        {
+            eprintln!("huck: {}: {e}", cmd.program);
         }
 
         stages.push(Stage::Process(child));
     }
 
     // Give the terminal to the pipeline's process group if interactive.
-    if interactive {
-        if let Some(pgid) = first_pid {
-            give_terminal_to(pgid);
-        }
+    if interactive
+        && let Some(pgid) = first_pid
+    {
+        give_terminal_to(pgid);
     }
 
     let last_status = if interactive {
@@ -1459,7 +1455,7 @@ mod tests {
         assert_eq!(status, 0);
     }
 
-    use crate::jobs::JobState;
+    
 
     #[test]
     fn background_pure_builtin_runs_synchronously_and_notifies_done() {

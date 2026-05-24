@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::shell_state::Shell;
-use libc;
 
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
@@ -514,7 +513,7 @@ fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
             (sig, &args[1..])
         } else {
-            (libc::SIGTERM, &args[..])
+            (libc::SIGTERM, args)
         }
     } else {
         eprintln!("huck: kill: usage: kill [-sig] pid | %job ...");

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::jobs::JobTable;
-use libc;
 
 #[derive(Debug, Clone)]
 struct Variable {

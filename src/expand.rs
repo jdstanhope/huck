@@ -71,7 +71,7 @@ impl Field {
     pub fn push_str(&mut self, s: &str, quoted: bool) {
         let count = s.chars().count();
         self.chars.push_str(s);
-        self.quoted.extend(std::iter::repeat(quoted).take(count));
+        self.quoted.extend(std::iter::repeat_n(quoted, count));
     }
 
     pub fn is_empty(&self) -> bool {

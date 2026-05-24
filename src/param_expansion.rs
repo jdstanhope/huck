@@ -185,12 +185,12 @@ mod tests {
 
     #[test]
     fn condition_is_null_table() {
-        assert_eq!(condition_is_null(None, false), true);
-        assert_eq!(condition_is_null(None, true), true);
-        assert_eq!(condition_is_null(Some(""), false), false);
-        assert_eq!(condition_is_null(Some(""), true), true);
-        assert_eq!(condition_is_null(Some("x"), false), false);
-        assert_eq!(condition_is_null(Some("x"), true), false);
+        assert!(condition_is_null(None, false));
+        assert!(condition_is_null(None, true));
+        assert!(!condition_is_null(Some(""), false));
+        assert!(condition_is_null(Some(""), true));
+        assert!(!condition_is_null(Some("x"), false));
+        assert!(!condition_is_null(Some("x"), true));
     }
 
     use crate::lexer::{Word, WordPart};

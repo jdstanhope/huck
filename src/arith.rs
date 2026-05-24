@@ -183,6 +183,10 @@ struct Parser {
     pos: usize,
 }
 
+/// A row in the Pratt-parser operator table: left binding power, right
+/// binding power, and the AST constructor for the binary node.
+type BinOpEntry = (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr);
+
 impl Parser {
     fn peek(&self) -> Option<&ArithToken> {
         self.tokens.get(self.pos)
@@ -196,11 +200,7 @@ impl Parser {
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<ArithExpr, ArithError> {
         let mut lhs = self.parse_prefix()?;
-        loop {
-            let op = match self.peek() {
-                Some(t) => t.clone(),
-                None => break,
-            };
+        while let Some(op) = self.peek().cloned() {
             // Ternary: `cond ? then : else`. Right-associative, lowest binding power.
             if op == ArithToken::Question && min_bp <= 1 {
                 self.bump();
@@ -208,30 +208,29 @@ impl Parser {
                 match self.bump() {
                     Some(ArithToken::Colon) => {}
                     other => return Err(ArithError::Parse(format!(
-                        "expected ':' in ternary, got {:?}", other
+                        "expected ':' in ternary, got {other:?}"
                     ))),
                 }
                 let else_branch = self.parse_expr(1)?;
                 lhs = ArithExpr::Ternary(Box::new(lhs), Box::new(then_branch), Box::new(else_branch));
                 continue;
             }
-            let (lbp, rbp, make): (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr) =
-                match op {
-                    ArithToken::OrOr   => (2, 3, ArithExpr::Or),
-                    ArithToken::AndAnd => (4, 5, ArithExpr::And),
-                    ArithToken::Eq     => (6, 7, ArithExpr::Eq),
-                    ArithToken::Ne     => (6, 7, ArithExpr::Ne),
-                    ArithToken::Lt     => (8, 9, ArithExpr::Lt),
-                    ArithToken::Le     => (8, 9, ArithExpr::Le),
-                    ArithToken::Gt     => (8, 9, ArithExpr::Gt),
-                    ArithToken::Ge     => (8, 9, ArithExpr::Ge),
-                    ArithToken::Plus   => (10, 11, ArithExpr::Add),
-                    ArithToken::Minus  => (10, 11, ArithExpr::Sub),
-                    ArithToken::Star   => (12, 13, ArithExpr::Mul),
-                    ArithToken::Slash  => (12, 13, ArithExpr::Div),
-                    ArithToken::Percent => (12, 13, ArithExpr::Mod),
-                    _ => break,
-                };
+            let (lbp, rbp, make): BinOpEntry = match op {
+                ArithToken::OrOr   => (2, 3, ArithExpr::Or),
+                ArithToken::AndAnd => (4, 5, ArithExpr::And),
+                ArithToken::Eq     => (6, 7, ArithExpr::Eq),
+                ArithToken::Ne     => (6, 7, ArithExpr::Ne),
+                ArithToken::Lt     => (8, 9, ArithExpr::Lt),
+                ArithToken::Le     => (8, 9, ArithExpr::Le),
+                ArithToken::Gt     => (8, 9, ArithExpr::Gt),
+                ArithToken::Ge     => (8, 9, ArithExpr::Ge),
+                ArithToken::Plus   => (10, 11, ArithExpr::Add),
+                ArithToken::Minus  => (10, 11, ArithExpr::Sub),
+                ArithToken::Star   => (12, 13, ArithExpr::Mul),
+                ArithToken::Slash  => (12, 13, ArithExpr::Div),
+                ArithToken::Percent => (12, 13, ArithExpr::Mod),
+                _ => break,
+            };
             if lbp < min_bp {
                 break;
             }

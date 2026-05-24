@@ -147,15 +147,15 @@ impl Default for History {
 /// Resolves the histfile path: `$HISTFILE`, else `$HOME/.huck_history`,
 /// else `None` (persistence disabled).
 fn resolve_histfile() -> Option<PathBuf> {
-    if let Ok(hf) = std::env::var("HISTFILE") {
-        if !hf.is_empty() {
-            return Some(PathBuf::from(hf));
-        }
+    if let Ok(hf) = std::env::var("HISTFILE")
+        && !hf.is_empty()
+    {
+        return Some(PathBuf::from(hf));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home).join(".huck_history"));
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home).join(".huck_history"));
     }
     None
 }

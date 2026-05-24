@@ -317,10 +317,10 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
             )) => break,
             Some(tok) => {
-                if let Some(kw) = keyword_of(tok) {
-                    if stop_at.contains(&kw) {
-                        break;
-                    }
+                if let Some(kw) = keyword_of(tok)
+                    && stop_at.contains(&kw)
+                {
+                    break;
                 }
             }
         }

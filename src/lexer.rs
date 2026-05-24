@@ -9,7 +9,7 @@ pub enum LexError {
     InvalidBraceModifier(String),
     EmptyParamName,
     InvalidBraceOperand,
-    SubstitutionLexError(Box<LexError>),
+    Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
 }
 
@@ -501,7 +501,7 @@ fn scan_braced_operand(
 /// IFS-split-relevant whitespace.
 fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
     let tokens = tokenize(body)
-        .map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
+        .map_err(|e| LexError::Substitution(Box::new(e)))?;
     let mut parts: Vec<WordPart> = Vec::new();
     let mut first = true;
     for tok in tokens {
@@ -591,12 +591,12 @@ fn scan_paren_substitution(
             }
             '$' => {
                 body.push(c);
-                if let Some(&next) = chars.peek() {
-                    if next == '(' {
-                        chars.next();
-                        body.push('(');
-                        depth += 1;
-                    }
+                if let Some(&next) = chars.peek()
+                    && next == '('
+                {
+                    chars.next();
+                    body.push('(');
+                    depth += 1;
                 }
             }
             _ => body.push(c),
@@ -609,7 +609,7 @@ fn scan_paren_substitution(
 /// substitution-context `LexError` variants. Empty bodies (whitespace only)
 /// produce an empty `Sequence`.
 fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexError> {
-    let tokens = tokenize(body).map_err(|e| LexError::SubstitutionLexError(Box::new(e)))?;
+    let tokens = tokenize(body).map_err(|e| LexError::Substitution(Box::new(e)))?;
     let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
 }
@@ -1789,13 +1789,13 @@ mod tests {
     fn tokenize_command_sub_inner_lex_error() {
         // `${1foo}` inside a substitution → UnterminatedBrace (v22 Task 4:
         // digits are consumed as positional name; `f` found where `}` expected),
-        // wrapped in SubstitutionLexError.
+        // wrapped in Substitution.
         let err = tokenize("$(echo ${1foo})").unwrap_err();
         match err {
-            LexError::SubstitutionLexError(inner) => {
+            LexError::Substitution(inner) => {
                 assert_eq!(*inner, LexError::UnterminatedBrace);
             }
-            other => panic!("expected SubstitutionLexError, got {other:?}"),
+            other => panic!("expected Substitution, got {other:?}"),
         }
     }
 
@@ -2156,7 +2156,7 @@ mod tests {
         let WordPart::Arith { expr, quoted } = &parts[0] else {
             panic!("expected Arith part, got {:?}", parts[0])
         };
-        assert_eq!(*quoted, false);
+        assert!(!(*quoted));
         assert_eq!(*expr, ArithExpr::Add(
             Box::new(ArithExpr::Num(1)),
             Box::new(ArithExpr::Num(2)),
@@ -2183,7 +2183,7 @@ mod tests {
         let tokens = tokenize("\"$((1+2))\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         let WordPart::Arith { quoted, .. } = &parts[0] else { panic!() };
-        assert_eq!(*quoted, true);
+        assert!(*quoted);
     }
 
     #[test]
@@ -2311,7 +2311,7 @@ mod tests {
             panic!("expected ParamExpansion, got {:?}", parts[0]);
         };
         assert_eq!(name, "foo");
-        assert_eq!(*quoted, false);
+        assert!(!(*quoted));
         assert!(matches!(modifier, ParamModifier::Length));
     }
 
@@ -2331,7 +2331,7 @@ mod tests {
         assert_eq!(name, "X");
         match modifier {
             ParamModifier::UseDefault { word, colon } => {
-                assert_eq!(*colon, true);
+                assert!(*colon);
                 assert_eq!(word.0, vec![WordPart::Literal { text: "w".to_string(), quoted: false }]);
             }
             other => panic!("expected UseDefault, got {:?}", other),
@@ -2433,7 +2433,7 @@ mod tests {
         let tokens = tokenize("\"${X:-w}\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         let WordPart::ParamExpansion { quoted, .. } = &parts[0] else { panic!() };
-        assert_eq!(*quoted, true);
+        assert!(*quoted);
     }
 
     #[test]
