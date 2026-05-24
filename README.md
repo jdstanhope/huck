@@ -30,6 +30,7 @@ spec, an implementation plan, and a test suite.
 | v20       | `for` loops (`for NAME in WORDS; do … done`)            |
 | v21       | `case` statements (`case W in PAT) … ;; esac`)          |
 | v22       | Functions (`name() { … }`) + positional parameters      |
+| v23       | Inline assignments (`VAR=val cmd`)                       |
 
 ## Build and run
 

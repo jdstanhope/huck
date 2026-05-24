@@ -111,7 +111,7 @@ group.
 
 ### Functions & scoping
 
-- **M-04: Inline assignments `VAR=val cmd`** — `[deferred]` high. huck: parses `VAR=val` as the program name and errors with command-not-found. bash: temporary env assignment for the single command. Ubiquitous shell idiom.
+- **M-04: Inline assignments `VAR=val cmd`** — `[fixed (2026-05-24)]` high. Now supported: leading `NAME=value` words on a simple command are applied left-to-right with the export flag, then restored (for external commands and regular builtins) or persisted (for special builtins, functions, and command-less assignment lists) per POSIX 2.14 / 2.9.1.
 - **M-05: IFS not configurable** — `[deferred]` high. huck: word-splitting hardcoded to ASCII whitespace. bash: any `IFS` value governs splitting.
 - **M-06: `local` / `typeset`** — `[deferred]` high. huck: no function-scoped variables. bash: `local` declares scoped vars.
 - **M-07: `shift [N]`** — `[deferred]` medium. huck: not implemented. bash: removes the first N positional args.
@@ -287,3 +287,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-23**: Initial audit, baseline = v22 (commits up to `498d27d` merged + the `727cfcb` warning cleanup).
 - **2026-05-23**: Quick-wins bug-fix batch shipped — B-01, B-02, B-04, B-05, B-06, B-07, B-08 all marked fixed.
 - **2026-05-24**: Tier 1 finished — B-03 (backslash-newline mid-buffer line continuation) and B-09 (foreground pipeline pgrp wait) marked fixed. Baseline clippy warnings reduced from 22 to 0. Tier 1 is now empty (every "bugs" entry has Status=fixed).
+- **2026-05-24**: M-04 (inline assignments) shipped as v23.
