@@ -285,3 +285,5 @@ Things huck deliberately does differently from bash. Document and keep.
 ## Change log
 
 - **2026-05-23**: Initial audit, baseline = v22 (commits up to `498d27d` merged + the `727cfcb` warning cleanup).
+- **2026-05-23**: Quick-wins bug-fix batch shipped — B-01, B-02, B-04, B-05, B-06, B-07, B-08 all marked fixed.
+- **2026-05-24**: Tier 1 finished — B-03 (backslash-newline mid-buffer line continuation) and B-09 (foreground pipeline pgrp wait) marked fixed. Baseline clippy warnings reduced from 22 to 0. Tier 1 is now empty (every "bugs" entry has Status=fixed).
