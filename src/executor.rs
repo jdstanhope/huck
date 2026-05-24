@@ -331,7 +331,7 @@ fn run_background_sequence(
     let mut all_resolved: Vec<Option<ResolvedCommand>> = Vec::with_capacity(n);
     for cmd in &pipeline.commands {
         match cmd {
-            SimpleCommand::Assign { .. } => {
+            SimpleCommand::Assign(_) => {
                 all_resolved.push(None);
             }
             SimpleCommand::Exec(exec) => match resolve(exec, shell) {
@@ -487,7 +487,7 @@ fn pipeline_is_pure_builtin(pipeline: &Pipeline) -> bool {
             Some(crate::lexer::WordPart::Literal { text: name, .. }) => builtins::is_builtin(name),
             _ => false,
         },
-        SimpleCommand::Assign { .. } => true,
+        SimpleCommand::Assign(_) => true,
     })
 }
 
@@ -639,9 +639,11 @@ fn status_code(status: &ExitStatus) -> i32 {
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
-        SimpleCommand::Assign { name, value } => {
-            let v = expand_assignment(value, shell);
-            shell.set(name, v);
+        SimpleCommand::Assign(items) => {
+            for (name, value) in items {
+                let v = expand_assignment(value, shell);
+                shell.set(name, v);
+            }
             ExecOutcome::Continue(0)
         }
     }
@@ -890,7 +892,7 @@ fn run_multi_stage(
     let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
-            SimpleCommand::Assign { .. } => {
+            SimpleCommand::Assign(_) => {
                 resolved_stages.push(None);
             }
             SimpleCommand::Exec(exec) => match resolve(exec, shell) {
@@ -1294,6 +1296,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww(word)],
                     stdin: None,
@@ -1316,6 +1319,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: ww("test"),
                     args: vec![ww(lhs), ww("-eq"), ww("0")],
                     stdin: None,
@@ -1334,6 +1338,7 @@ mod tests {
 
     fn exec(program: &str, args: &[&str]) -> SimpleCommand {
         SimpleCommand::Exec(ExecCommand {
+            inline_assignments: Vec::new(),
             program: lit_word(program),
             args: args.iter().map(|a| lit_word(a)).collect(),
             stdin: None,
@@ -1517,10 +1522,9 @@ mod tests {
     fn background_pure_builtin_assignment_runs_in_parent() {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Assign {
-                    name: "HUCK_TEST_BG_ASSIGN".to_string(),
-                    value: lit_word("v"),
-                }],
+                commands: vec![SimpleCommand::Assign(vec![
+                    ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
+                ])],
             }),
             rest: vec![],
             background: true,
@@ -1547,6 +1551,7 @@ mod tests {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
                     stdin: None,
@@ -1568,10 +1573,9 @@ mod tests {
         // is visible after.
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Assign {
-                    name: "BG_X".to_string(),
-                    value: Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]),
-                }],
+                commands: vec![SimpleCommand::Assign(vec![
+                    ("BG_X".to_string(), Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
+                ])],
             }),
             rest: vec![],
             background: false,
@@ -1628,6 +1632,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Var { name: var.to_string(), quoted: false }])],
                     stdin: None,
@@ -1645,6 +1650,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
                     args: vec![],
                     stdin: None,
@@ -1714,6 +1720,7 @@ mod tests {
         // every iteration, so nothing prints, yet all values are visited.
         let echo_nope = Command::Pipeline(Pipeline {
             commands: vec![SimpleCommand::Exec(ExecCommand {
+                inline_assignments: Vec::new(),
                 program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                 args: vec![Word(vec![WordPart::Literal { text: "NOPE".to_string(), quoted: false }])],
                 stdin: None,
@@ -1743,6 +1750,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
                     stdin: None,
@@ -1918,6 +1926,7 @@ mod tests {
         let body = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
                     stdin: None,

@@ -1655,6 +1655,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: args
                         .iter()
@@ -1725,6 +1726,7 @@ mod tests {
         let inner = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
                     stdin: None,
@@ -1757,6 +1759,7 @@ mod tests {
             Sequence {
                 first: Command::Pipeline(Pipeline {
                     commands: vec![SimpleCommand::Exec(ExecCommand {
+                        inline_assignments: Vec::new(),
                         program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                         args: vec![inner_word],
                         stdin: None,

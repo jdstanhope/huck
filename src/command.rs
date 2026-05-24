@@ -134,11 +134,13 @@ fn finalize_stage(
     stdout: Option<Redirect>,
     stderr: Option<Redirect>,
 ) -> SimpleCommand {
-    if args.is_empty() && stdin.is_none() && stdout.is_none() && stderr.is_none() {
+    let no_redirs = stdin.is_none() && stdout.is_none() && stderr.is_none();
+    if args.is_empty() && no_redirs {
         match try_split_assignment(program) {
-            Ok((name, value)) => return SimpleCommand::Assign { name, value },
+            Ok((name, value)) => return SimpleCommand::Assign(vec![(name, value)]),
             Err(restored) => {
                 return SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: restored,
                     args,
                     stdin,
@@ -149,6 +151,7 @@ fn finalize_stage(
         }
     }
     SimpleCommand::Exec(ExecCommand {
+        inline_assignments: Vec::new(),
         program,
         args,
         stdin,
@@ -165,6 +168,9 @@ pub enum Redirect {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExecCommand {
+    /// Leading `NAME=value` words preceding the command word. Empty
+    /// when the user wrote `cmd args` with no assignment prefix.
+    pub inline_assignments: Vec<(String, Word)>,
     pub program: Word,
     pub args: Vec<Word>,
     pub stdin: Option<Word>,
@@ -174,7 +180,10 @@ pub struct ExecCommand {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SimpleCommand {
-    Assign { name: String, value: Word },
+    /// `A=1 B=2 …` with no following command — every assignment
+    /// persists in the shell. Single-element vec is the v22-style
+    /// single-assignment case.
+    Assign(Vec<(String, Word)>),
     Exec(ExecCommand),
 }
 
@@ -841,6 +850,7 @@ mod tests {
     /// Builds a SimpleCommand::Exec with no redirections, all-Literal Words.
     fn plain(program: &str, args: &[&str]) -> SimpleCommand {
         SimpleCommand::Exec(ExecCommand {
+            inline_assignments: Vec::new(),
             program: ww(program),
             args: args.iter().map(|a| ww(a)).collect(),
             stdin: None,
@@ -1102,7 +1112,7 @@ mod tests {
     }
 
     fn assignment(name: &str, value: Word) -> SimpleCommand {
-        SimpleCommand::Assign { name: name.to_string(), value }
+        SimpleCommand::Assign(vec![(name.to_string(), value)])
     }
 
     #[test]
@@ -1187,6 +1197,7 @@ mod tests {
         let inner_seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww("bar")],
                     stdin: None,
@@ -1204,7 +1215,9 @@ mod tests {
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
         assert_eq!(first_pipeline(&seq).commands.len(), 1);
         match &first_pipeline(&seq).commands[0] {
-            SimpleCommand::Assign { name, value } => {
+            SimpleCommand::Assign(items) => {
+                assert_eq!(items.len(), 1);
+                let (name, value) = &items[0];
                 assert_eq!(name, "FOO");
                 assert_eq!(value.0.len(), 2);
                 match &value.0[0] {

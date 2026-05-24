@@ -486,6 +486,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: lit("echo"),
                     args: args.iter().map(|a| lit(a)).collect(),
                     stdin: None,
@@ -502,6 +503,7 @@ mod tests {
         Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: lit("exit"),
                     args: vec![lit(&code.to_string())],
                     stdin: None,
@@ -1307,6 +1309,7 @@ mod tests {
         let false_cmd = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![SimpleCommand::Exec(ExecCommand {
+                    inline_assignments: Vec::new(),
                     program: lit("false"),
                     args: vec![],
                     stdin: None,
