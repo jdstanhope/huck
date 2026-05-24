@@ -443,3 +443,24 @@ fn pty_ctrl_c_aborts_multiline_buffer() {
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
+
+#[test]
+fn pty_multi_stage_pipeline_completes_via_pgrp_wait() {
+    // After B-09, run_multi_stage's interactive path waits on the whole
+    // process group via waitpid(-pgid, …, WUNTRACED). This test exercises
+    // that path with a 3-stage pipeline and verifies the data flows through
+    // and the prompt returns.
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "echo PIPE_MARKER | cat | cat");
+    send(&mut session, ENTER);
+    expect(&mut session, "PIPE_MARKER");
+    // Subsequent prompt confirms the wait loop returned cleanly (no wedge).
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}

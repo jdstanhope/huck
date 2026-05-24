@@ -89,11 +89,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/executor.rs` `run_background_sequence` — the pure-builtin path now calls `crate::jobs::reap_and_notify(shell)` after `add_synthetic_done`. The job is formatted via `notification_line` (which uses `render_state` → "Done" vs "Exit N") AND marked notified, so `remove_notified` drops it on the same sweep. The defensive all-Assign fallback path was migrated the same way.
 
 ### B-09: `run_multi_stage` foreground wait loop iterates per-pid
-- **Status**: open
+- **Status**: fixed (2026-05-24)
 - **Severity**: medium
-- **huck**: the foreground pipeline wait loop iterates `stages` one PID at a time with per-pid `waitpid`. If one stage is stopped, huck can keep waiting on a sibling — wedging the prompt.
+- **huck (was)**: the foreground pipeline wait loop iterated `stages` one PID at a time with per-pid `waitpid`. If one stage stopped while the loop was blocked on a sibling (worst case: a producer/consumer deadlock pair), huck would wedge.
 - **bash**: foreground wait targets the whole process group.
-- **Fix location**: `src/executor.rs` `run_multi_stage` — wait on the pgrp via `waitpid(-pgid, …)`.
+- **Fix**: `src/executor.rs` — new `wait_pgrp_pipeline` helper calls `waitpid(-pgid, …, WUNTRACED)` in a loop until every process stage is reaped (or any one stops). EINTR is retried; ECHILD bails with status 1 for remaining slots. Pipeline exit status is the last stage's status per POSIX. PTY regression test in `tests/pty_interactive.rs`.
 
 ---
 

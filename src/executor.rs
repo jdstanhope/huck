@@ -1095,54 +1095,25 @@ fn run_multi_stage(
         }
     }
 
-    let mut last_status = 0;
-    for stage in stages {
-        match stage {
-            Stage::Done(code) => last_status = code,
-            Stage::Process(mut child) => {
-                if interactive {
-                    let pid = child.id() as i32;
-                    match wait_with_untraced(pid) {
-                        Ok((raw_status, true)) => {
-                            // Pipeline was stopped (Ctrl-Z).
-                            let sig = libc::WSTOPSIG(raw_status);
-                            let pgid = first_pid.unwrap_or(pid);
-                            let display = format!("(pipeline pid {pgid})");
-                            let job_id = shell.jobs.add(pgid, stage_pids.clone(), display.clone());
-                            for job in shell.jobs.jobs_mut() {
-                                if job.id == job_id {
-                                    job.state = crate::jobs::JobState::Stopped(sig);
-                                    job.notified = true;
-                                    break;
-                                }
-                            }
-                            let line = shell.jobs.iter()
-                                .find(|j| j.id == job_id)
-                                .map(|j| crate::jobs::notification_line(j, '+'))
-                                .unwrap_or_default();
-                            eprintln!("\n{line}");
-                            std::mem::forget(child);
-                            give_terminal_to(shell.shell_pgid);
-                            return ExecOutcome::Continue(128 + sig);
-                        }
-                        Ok((raw_status, false)) => {
-                            last_status = if libc::WIFEXITED(raw_status) {
-                                libc::WEXITSTATUS(raw_status)
-                            } else if libc::WIFSIGNALED(raw_status) {
-                                128 + libc::WTERMSIG(raw_status)
-                            } else {
-                                1
-                            };
-                            std::mem::forget(child);
-                        }
-                        Err(()) => {
-                            last_status = 1;
-                            std::mem::forget(child);
-                        }
-                    }
-                } else {
-                    last_status = match child.wait() {
-                        Ok(status) => status_code(&status),
+    let last_status = if interactive {
+        match wait_pgrp_pipeline(stages, &stage_pids, first_pid, shell) {
+            PipelineWait::AllExited(status) => {
+                give_terminal_to(shell.shell_pgid);
+                status
+            }
+            PipelineWait::Stopped(sig) => {
+                give_terminal_to(shell.shell_pgid);
+                return ExecOutcome::Continue(128 + sig);
+            }
+        }
+    } else {
+        let mut status = 0;
+        for stage in stages {
+            match stage {
+                Stage::Done(code) => status = code,
+                Stage::Process(mut child) => {
+                    status = match child.wait() {
+                        Ok(s) => status_code(&s),
                         Err(e) => {
                             eprintln!("huck: {e}");
                             1
@@ -1151,12 +1122,125 @@ fn run_multi_stage(
                 }
             }
         }
+        status
+    };
+
+    ExecOutcome::Continue(last_status)
+}
+
+enum PipelineWait {
+    /// Every process stage was reaped; pipeline exit status follows POSIX
+    /// (the last stage's status).
+    AllExited(i32),
+    /// At least one stage was stopped (Ctrl-Z); the job has already been
+    /// added to the table and the stop notification emitted.
+    Stopped(i32),
+}
+
+/// Waits on the entire process group for an interactive pipeline. Uses
+/// `waitpid(-pgid, …, WUNTRACED)` so a stop event on ANY stage surfaces
+/// immediately — fixing the wedge that per-pid waiting created when the
+/// loop was blocked on one stage while a sibling stopped. On a stop, the
+/// pipeline is registered as a Stopped job (so `fg` can resume it) and
+/// `Stopped(sig)` is returned. Consumes the `Stage::Process` children via
+/// `mem::forget`, since reaping has already been done via `libc::waitpid`.
+fn wait_pgrp_pipeline(
+    stages: Vec<Stage>,
+    stage_pids: &[i32],
+    first_pid: Option<i32>,
+    shell: &mut Shell,
+) -> PipelineWait {
+    let pid_per_stage: Vec<Option<i32>> = stages
+        .iter()
+        .map(|s| match s {
+            Stage::Done(_) => None,
+            Stage::Process(child) => Some(child.id() as i32),
+        })
+        .collect();
+    let mut stage_status: Vec<Option<i32>> = stages
+        .iter()
+        .map(|s| match s {
+            Stage::Done(code) => Some(*code),
+            Stage::Process(_) => None,
+        })
+        .collect();
+    let mut remaining: std::collections::HashSet<i32> =
+        pid_per_stage.iter().filter_map(|p| *p).collect();
+
+    if let Some(pgid) = first_pid {
+        while !remaining.is_empty() {
+            let mut raw: libc::c_int = 0;
+            let r = loop {
+                let r = unsafe { libc::waitpid(-pgid, &mut raw, libc::WUNTRACED) };
+                if r < 0 {
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(0);
+                    if errno == libc::EINTR {
+                        continue;
+                    }
+                }
+                break r;
+            };
+            if r < 0 {
+                // ECHILD — none of our pgrp children remain visible. Fill
+                // unfilled slots with status 1 so we still produce a
+                // deterministic result rather than hanging.
+                for slot in stage_status.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(1);
+                    }
+                }
+                break;
+            }
+            if libc::WIFSTOPPED(raw) {
+                let sig = libc::WSTOPSIG(raw);
+                let display = format!("(pipeline pid {pgid})");
+                let job_id = shell.jobs.add(pgid, stage_pids.to_vec(), display);
+                for job in shell.jobs.jobs_mut() {
+                    if job.id == job_id {
+                        job.state = crate::jobs::JobState::Stopped(sig);
+                        job.notified = true;
+                        break;
+                    }
+                }
+                let line = shell
+                    .jobs
+                    .iter()
+                    .find(|j| j.id == job_id)
+                    .map(|j| crate::jobs::notification_line(j, '+'))
+                    .unwrap_or_default();
+                eprintln!("\n{line}");
+                forget_process_children(stages);
+                return PipelineWait::Stopped(sig);
+            }
+            if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
+                let s = if libc::WIFEXITED(raw) {
+                    libc::WEXITSTATUS(raw)
+                } else {
+                    128 + libc::WTERMSIG(raw)
+                };
+                if let Some(idx) = pid_per_stage.iter().position(|p| *p == Some(r)) {
+                    stage_status[idx] = Some(s);
+                }
+                remaining.remove(&r);
+            }
+        }
     }
 
-    if interactive {
-        give_terminal_to(shell.shell_pgid);
+    forget_process_children(stages);
+    PipelineWait::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
+}
+
+/// Consumes `stages` and `mem::forget`s every `Stage::Process` child so
+/// Drop doesn't try to re-reap pids we've already collected via
+/// `libc::waitpid`. `Stage::Done` variants drop normally (no resources).
+fn forget_process_children(stages: Vec<Stage>) {
+    for stage in stages {
+        if let Stage::Process(child) = stage {
+            std::mem::forget(child);
+        }
     }
-    ExecOutcome::Continue(last_status)
 }
 
 // ----- job-control helpers -------------------------------------------------
