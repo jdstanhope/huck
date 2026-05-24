@@ -130,9 +130,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
                             // POSIX: inside `"..."`, backslash is special only
-                            // before `$`, ``, `"`, `\`, and newline. For other
+                            // before `$`, `, `"`, `\`, and newline. For other
                             // characters, the backslash is retained literally.
                             Some(esc @ ('"' | '\\' | '$' | '`')) => quoted_current.push(esc),
+                            // POSIX 2.2.3: `\<NL>` inside double quotes is also
+                            // line continuation — both characters deleted.
+                            Some('\n') => {}
                             Some(other) => {
                                 quoted_current.push('\\');
                                 quoted_current.push(other);
@@ -161,20 +164,27 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     parts.push(WordPart::Literal { text: String::new(), quoted: true });
                 }
             }
-            '\\' => {
-                has_token = true;
-                match chars.next() {
-                    Some(ch) => {
-                        // Flush any accumulated unquoted text, then push the
-                        // escaped char as a one-char quoted Literal. This is
-                        // what makes `\*` survive pathname expansion as a
-                        // literal `*` (the `quoted` flag inhibits globbing).
-                        flush_literal(&mut parts, &mut current, false);
-                        parts.push(WordPart::Literal { text: ch.to_string(), quoted: true });
-                    }
-                    None => current.push('\\'),
+            '\\' => match chars.next() {
+                Some('\n') => {
+                    // POSIX 2.2.1: `\<NL>` is line continuation — both chars
+                    // are deleted. `has_token` stays at its current value, so
+                    // `echo\<NL>foo` becomes the single word "echofoo" while
+                    // `echo \<NL>foo` keeps the space-driven separation.
                 }
-            }
+                Some(ch) => {
+                    // Flush any accumulated unquoted text, then push the
+                    // escaped char as a one-char quoted Literal. This is
+                    // what makes `\*` survive pathname expansion as a
+                    // literal `*` (the `quoted` flag inhibits globbing).
+                    has_token = true;
+                    flush_literal(&mut parts, &mut current, false);
+                    parts.push(WordPart::Literal { text: ch.to_string(), quoted: true });
+                }
+                None => {
+                    has_token = true;
+                    current.push('\\');
+                }
+            },
             '$' => {
                 // Expansion outside any quotes (quoted: false).
                 has_token = true;
@@ -1042,6 +1052,47 @@ mod tests {
             tokenize("echo \"# inside\"").unwrap(),
             vec![w("echo"), wq("# inside")]
         );
+    }
+
+    #[test]
+    fn tokenize_backslash_newline_is_line_continuation_with_space() {
+        // POSIX: \<NL> is deleted; surrounding whitespace still separates words.
+        assert_eq!(
+            tokenize("echo \\\nfoo").unwrap(),
+            vec![w("echo"), w("foo")]
+        );
+    }
+
+    #[test]
+    fn tokenize_backslash_newline_joins_adjacent_chars_into_one_word() {
+        // No separator on either side: result is one word "echofoo".
+        assert_eq!(
+            tokenize("echo\\\nfoo").unwrap(),
+            vec![w("echofoo")]
+        );
+    }
+
+    #[test]
+    fn tokenize_backslash_newline_inside_double_quotes_is_line_continuation() {
+        // POSIX 2.2.3: \<NL> retains its special meaning inside "...".
+        assert_eq!(
+            tokenize("\"foo\\\nbar\"").unwrap(),
+            vec![wq("foobar")]
+        );
+    }
+
+    #[test]
+    fn tokenize_backslash_newline_inside_single_quotes_is_literal() {
+        // POSIX 2.2.2: no escape interpretation inside '...'.
+        assert_eq!(
+            tokenize("'foo\\\nbar'").unwrap(),
+            vec![wq("foo\\\nbar")]
+        );
+    }
+
+    #[test]
+    fn tokenize_lone_backslash_newline_is_empty() {
+        assert_eq!(tokenize("\\\n").unwrap(), Vec::<Token>::new());
     }
 
     #[test]

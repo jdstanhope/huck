@@ -47,11 +47,11 @@ huck behaves wrong without a design reason; should be fixed.
 - **Fix**: `src/lexer.rs` — added `` ` `` to the double-quote escape set so the escape set now matches POSIX (`"`, `\`, `$`, `` ` ``; newline already handled at continuation time).
 
 ### B-03: backslash-newline only detected at end-of-buffer
-- **Status**: open
+- **Status**: fixed (2026-05-24)
 - **Severity**: low (rarely hit in practice)
-- **huck**: the v19 continuation classifier checks for a trailing `\` only at the very end of the assembled buffer; an embedded `\<NL>` inside an already-multi-line buffer is not re-spliced.
-- **bash**: `\<NL>` anywhere in a word is a line continuation.
-- **Fix location**: `src/lexer.rs` — handle `\<NL>` as deletion at lex time, not at continuation-classifier time.
+- **huck (was)**: only the v19 continuation classifier handled `\<NL>` (trailing, end-of-buffer); an embedded `\<NL>` inside an already-multi-line buffer fell through to the lexer and was emitted as a literal `\n` Literal.
+- **bash**: `\<NL>` anywhere in a word is a line continuation. Inside `"..."` too (POSIX 2.2.3); inside `'...'` it stays literal.
+- **Fix**: `src/lexer.rs` — outside-quote and inside-double-quote backslash arms each grow a `Some('\n') => {}` branch that deletes both characters.
 
 ### B-04: completion context doesn't reset after compound-command keywords
 - **Status**: fixed (2026-05-23)
