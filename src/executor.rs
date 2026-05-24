@@ -953,7 +953,12 @@ fn run_multi_stage(
     let mut stage_pids: Vec<i32> = Vec::with_capacity(n);
     let mut carry = Carry::None;
 
-    for (i, (resolved, files)) in resolved_stages.iter().zip(all_files).enumerate() {
+    for (i, ((resolved, files), orig_cmd)) in resolved_stages
+        .iter()
+        .zip(all_files)
+        .zip(commands.iter())
+        .enumerate()
+    {
         let is_last = i == n - 1;
         let incoming = std::mem::replace(&mut carry, Carry::None);
 
@@ -971,9 +976,21 @@ fn run_multi_stage(
         };
         let files = files.expect("non-Assign stage must have StageFiles");
 
+        // Extract inline_assignments from the original ExecCommand.
+        // Assign-variant stages were already handled above (continue'd).
+        let inline_assignments = match orig_cmd {
+            SimpleCommand::Exec(exec) => &exec.inline_assignments,
+            SimpleCommand::Assign(_) => unreachable!("Assign stages are skipped above"),
+        };
+
         if builtins::is_builtin(&cmd.program) {
             drop(incoming);
 
+            // `cd` and `exit` in a pipeline short-circuit immediately; they
+            // don't run any real command so inline assignments have no
+            // observable effect. We intentionally skip apply/restore here
+            // (option b from the plan) — `FOO=val cd` in a pipeline is
+            // unusual and bash's behaviour for it is itself unclear.
             if cmd.program == "cd" || cmd.program == "exit" {
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
@@ -982,8 +999,13 @@ fn run_multi_stage(
                 continue;
             }
 
+            let snap = apply_inline_assignments(inline_assignments, shell);
+            let persistent = builtins::is_special_builtin(&cmd.program);
             let mut buffer: Vec<u8> = Vec::new();
             let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer, shell);
+            if !persistent {
+                restore_inline_assignments(snap, shell);
+            }
             let mut status = match outcome {
                 ExecOutcome::Continue(code) => code,
                 ExecOutcome::Exit(code) => code,
@@ -1021,6 +1043,8 @@ fn run_multi_stage(
             stages.push(Stage::Done(status));
             continue;
         }
+
+        let snap = apply_inline_assignments(inline_assignments, shell);
 
         let mut process = ProcessCommand::new(&cmd.program);
         process.args(&cmd.args);
@@ -1065,8 +1089,14 @@ fn run_multi_stage(
         }
 
         let mut child = match process.spawn() {
-            Ok(child) => child,
+            Ok(child) => {
+                // Child has forked and captured its env; restore the parent
+                // shell state immediately so the next stage starts clean.
+                restore_inline_assignments(snap, shell);
+                child
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
+                restore_inline_assignments(snap, shell);
                 eprintln!("huck: command not found: {}", cmd.program);
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
@@ -1075,6 +1105,7 @@ fn run_multi_stage(
                 continue;
             }
             Err(e) => {
+                restore_inline_assignments(snap, shell);
                 eprintln!("huck: {}: {e}", cmd.program);
                 if !is_last {
                     carry = Carry::Buffer(Vec::new());
