@@ -30,7 +30,6 @@ pub fn is_builtin(name: &str) -> bool {
 /// builtin or external command are scoped to the command. The set is huck's
 /// existing builtins intersected with the POSIX special list; expand here as
 /// huck adds `set`/`shift`/`trap`/`eval`/`exec`/`:`/`readonly`/`.`.
-#[allow(dead_code)] // used by Task 4 executor apply/restore path
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name, "break" | "continue" | "exit" | "export" | "return" | "unset")
 }

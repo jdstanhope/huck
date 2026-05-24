@@ -684,14 +684,34 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         Err(code) => return ExecOutcome::Continue(code),
     };
 
+    // Apply inline assignments (e.g. FOO=bar in `FOO=bar cmd args`) before
+    // dispatch. The snapshot is used to restore state for temporary-scope
+    // targets (regular builtins and externals). Persistent-scope targets
+    // (control builtins, special builtins per POSIX 2.14, and functions per
+    // POSIX 2.9.1) skip the restore step.
+    let snap = apply_inline_assignments(&cmd.inline_assignments, shell);
+
+    // Determine whether the assignments should persist after the command.
+    // Control builtins and special builtins: persistent.
+    // User functions: persistent.
+    // Regular builtins and external commands: temporary (restore after).
+    let persistent = is_control_builtin(&resolved.program)
+        || builtins::is_special_builtin(&resolved.program)
+        || shell.functions.contains_key(&resolved.program);
+
     // 1. Control builtins always win — they cannot be shadowed by functions.
     // 2. User-defined function lookup.
     // 3. Regular builtin.
     // 4. PATH-exec.
-    if is_control_builtin(&resolved.program) {
+    let outcome = if is_control_builtin(&resolved.program) {
         let files = match open_stage_files(&resolved) {
             Ok(f) => f,
-            Err(()) => return ExecOutcome::Continue(1),
+            Err(()) => {
+                if !persistent {
+                    restore_inline_assignments(snap, shell);
+                }
+                return ExecOutcome::Continue(1);
+            }
         };
         match files.stdout {
             Some(mut file) => {
@@ -712,7 +732,12 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if builtins::is_builtin(&resolved.program) {
         let files = match open_stage_files(&resolved) {
             Ok(f) => f,
-            Err(()) => return ExecOutcome::Continue(1),
+            Err(()) => {
+                if !persistent {
+                    restore_inline_assignments(snap, shell);
+                }
+                return ExecOutcome::Continue(1);
+            }
         };
         match files.stdout {
             Some(mut file) => {
@@ -731,10 +756,20 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else {
         let files = match open_stage_files(&resolved) {
             Ok(f) => f,
-            Err(()) => return ExecOutcome::Continue(1),
+            Err(()) => {
+                if !persistent {
+                    restore_inline_assignments(snap, shell);
+                }
+                return ExecOutcome::Continue(1);
+            }
         };
         run_subprocess(&resolved, files, shell, sink)
+    };
+
+    if !persistent {
+        restore_inline_assignments(snap, shell);
     }
+    outcome
 }
 
 fn run_subprocess(
@@ -1237,6 +1272,48 @@ fn forget_process_children(stages: Vec<Stage>) {
     for stage in stages {
         if let Stage::Process(child) = stage {
             std::mem::forget(child);
+        }
+    }
+}
+
+// ----- inline-assignment apply/restore helpers ------------------------------
+
+/// Snapshot entry for one applied inline assignment: name, prior value
+/// (None if the var was unset), prior export flag.
+type AssignmentSnapshot = Vec<(String, Option<String>, bool)>;
+
+/// Expands and applies `assignments` left-to-right, exporting each, and
+/// returns a snapshot the caller can pass to `restore_inline_assignments`
+/// (for temporary-scope targets) or discard (for persistent-scope targets).
+fn apply_inline_assignments(
+    assignments: &[(String, crate::lexer::Word)],
+    shell: &mut Shell,
+) -> AssignmentSnapshot {
+    let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
+    for (name, rhs) in assignments {
+        let prior_value = shell.get(name).map(str::to_string);
+        let prior_exported = shell.is_exported(name);
+        let value = expand_assignment(rhs, shell);
+        shell.export_set(name, value);
+        snap.push((name.clone(), prior_value, prior_exported));
+    }
+    snap
+}
+
+/// Restores each snapshot entry in reverse order, so repeated names
+/// unwind LIFO and end up at their pre-prefix value.
+fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
+    for (name, prior_value, prior_exported) in snap.into_iter().rev() {
+        match (prior_value, prior_exported) {
+            (Some(v), true) => shell.export_set(&name, v),
+            (Some(v), false) => {
+                // `shell.set` preserves the existing export flag; we just
+                // wrote with export=true via export_set during apply, so
+                // we have to unset-then-set to land at unexported.
+                shell.unset(&name);
+                shell.set(&name, v);
+            }
+            (None, _) => shell.unset(&name),
         }
     }
 }
@@ -1968,5 +2045,139 @@ mod tests {
         assert_eq!(out_star.trim(), "hit", "literal * should match the string \"*\"");
         let (out_abc, _) = execute_capturing(&case_seq(make("abc")), &mut shell);
         assert_eq!(out_abc.trim(), "", "quoted * must not act as a wildcard");
+    }
+
+    // ----- apply/restore inline assignment helper tests ----------------------
+
+    fn word_lit(s: &str) -> Word {
+        Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    }
+
+    #[test]
+    fn apply_inline_assignments_sets_and_exports_left_to_right() {
+        let mut shell = Shell::new();
+        shell.export_set("HOME", "/home/test".to_string());
+        let assigns = vec![
+            ("A".to_string(), word_lit("1")),
+            ("B".to_string(), Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
+        ];
+        let snap = apply_inline_assignments(&assigns, &mut shell);
+        assert_eq!(shell.get("A"), Some("1"));
+        assert_eq!(shell.get("B"), Some("1"));
+        assert!(shell.is_exported("A"));
+        assert!(shell.is_exported("B"));
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn restore_inline_assignments_restores_prior_unset_state() {
+        let mut shell = Shell::new();
+        let assigns = vec![("FOO".to_string(), word_lit("bar"))];
+        let snap = apply_inline_assignments(&assigns, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("bar"));
+        restore_inline_assignments(snap, &mut shell);
+        assert_eq!(shell.get("FOO"), None);
+    }
+
+    #[test]
+    fn restore_inline_assignments_restores_prior_value_unexported() {
+        let mut shell = Shell::new();
+        shell.set("FOO", "outer".to_string());
+        assert!(!shell.is_exported("FOO"));
+        let assigns = vec![("FOO".to_string(), word_lit("inner"))];
+        let snap = apply_inline_assignments(&assigns, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("inner"));
+        assert!(shell.is_exported("FOO"));
+        restore_inline_assignments(snap, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("outer"));
+        assert!(!shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn restore_inline_assignments_restores_prior_value_exported() {
+        let mut shell = Shell::new();
+        shell.export_set("FOO", "outer".to_string());
+        let assigns = vec![("FOO".to_string(), word_lit("inner"))];
+        let snap = apply_inline_assignments(&assigns, &mut shell);
+        restore_inline_assignments(snap, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("outer"));
+        assert!(shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn restore_inline_assignments_handles_repeated_name() {
+        let mut shell = Shell::new();
+        shell.set("FOO", "outer".to_string());
+        let assigns = vec![
+            ("FOO".to_string(), word_lit("a")),
+            ("FOO".to_string(), word_lit("b")),
+        ];
+        let snap = apply_inline_assignments(&assigns, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("b"));
+        restore_inline_assignments(snap, &mut shell);
+        assert_eq!(shell.get("FOO"), Some("outer"));
+        assert!(!shell.is_exported("FOO"));
+    }
+
+    // ----- run_exec_single inline assignment integration tests ---------------
+
+    #[test]
+    fn run_exec_single_external_command_inline_assignment_restores_after() {
+        let mut shell = Shell::new();
+        shell.set("FOO", "outer".to_string());
+        let cmd = SimpleCommand::Exec(ExecCommand {
+            inline_assignments: vec![("FOO".to_string(), word_lit("inner"))],
+            program: word_lit("true"),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        });
+        let pipeline = Pipeline { commands: vec![cmd] };
+        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let _ = execute(&seq, &mut shell, "FOO=inner true");
+        assert_eq!(shell.get("FOO"), Some("outer"));
+        assert!(!shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn run_exec_single_function_call_inline_assignment_persists() {
+        let mut shell = Shell::new();
+        // Define a no-op function via the parser.
+        if let Some(tokens) = crate::lexer::tokenize("myfunc() { echo ok; }").ok()
+            && let Ok(Some(seq)) = crate::command::parse(tokens)
+        {
+            let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
+        }
+        let cmd = SimpleCommand::Exec(ExecCommand {
+            inline_assignments: vec![("FOO".to_string(), word_lit("val"))],
+            program: word_lit("myfunc"),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        });
+        let pipeline = Pipeline { commands: vec![cmd] };
+        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let _ = execute(&seq, &mut shell, "FOO=val myfunc");
+        assert_eq!(shell.get("FOO"), Some("val"));
+    }
+
+    #[test]
+    fn run_exec_single_special_builtin_inline_assignment_persists() {
+        let mut shell = Shell::new();
+        let cmd = SimpleCommand::Exec(ExecCommand {
+            inline_assignments: vec![("FOO".to_string(), word_lit("val"))],
+            program: word_lit("export"),
+            args: vec![word_lit("FOO")],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        });
+        let pipeline = Pipeline { commands: vec![cmd] };
+        let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
+        let _ = execute(&seq, &mut shell, "FOO=val export FOO");
+        assert_eq!(shell.get("FOO"), Some("val"));
+        assert!(shell.is_exported("FOO"));
     }
 }

@@ -110,7 +110,6 @@ impl Shell {
     }
 
     /// True if `name` is set and marked exported.
-    #[allow(dead_code)] // used by Task 4 executor apply/restore path
     pub fn is_exported(&self, name: &str) -> bool {
         self.vars.get(name).is_some_and(|v| v.exported)
     }
