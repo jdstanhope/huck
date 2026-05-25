@@ -367,15 +367,16 @@ fn run_background_sequence(
             SimpleCommand::Assign(_) => unreachable!("Assign stages are skipped above"),
         };
 
-        let files = match open_stage_files(cmd) {
+        let snap = apply_inline_assignments(inline_assignments, shell);
+
+        let files = match open_stage_files(cmd, shell) {
             Ok(f) => f,
             Err(()) => {
+                restore_inline_assignments(snap, shell);
                 cleanup_partial_pipeline(first_pid, children);
                 return ExecOutcome::Continue(1);
             }
         };
-
-        let snap = apply_inline_assignments(inline_assignments, shell);
 
         let mut process = ProcessCommand::new(&cmd.program);
         process.args(&cmd.args);
@@ -392,12 +393,22 @@ fn run_background_sequence(
 
         // Stdin: explicit redirect wins; otherwise carry from prev stage if
         // any; otherwise /dev/null for the first stage.
-        if let Some(file) = files.stdin {
-            process.stdin(Stdio::from(file));
-        } else if let Some(child_stdout) = carry.take() {
-            process.stdin(Stdio::from(child_stdout));
-        } else {
-            process.stdin(Stdio::null());
+        let mut pending_input: Option<Vec<u8>> = None;
+        match files.stdin {
+            Some(StdinInput::File(file)) => {
+                process.stdin(Stdio::from(file));
+            }
+            Some(StdinInput::Bytes(bytes)) => {
+                process.stdin(Stdio::piped());
+                pending_input = Some(bytes);
+            }
+            None => {
+                if let Some(child_stdout) = carry.take() {
+                    process.stdin(Stdio::from(child_stdout));
+                } else {
+                    process.stdin(Stdio::null());
+                }
+            }
         }
 
         // Stdout: explicit redirect wins; otherwise pipe onward if not last;
@@ -434,6 +445,12 @@ fn run_background_sequence(
                 return ExecOutcome::Continue(1);
             }
         };
+
+        if let Some(bytes) = pending_input
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            let _ = child_stdin.write_all(&bytes);
+        }
 
         let pid = child.id() as i32;
         spawned_pids.push(pid);
@@ -521,10 +538,22 @@ fn display_command(source: &str) -> String {
 
 // ----- resolved command (post-expansion) ------------------------------------
 
+/// Resolved stdin source for a command — either a file path or a heredoc body
+/// Word that will be expanded just before the child is spawned (so that inline
+/// assignments applied between resolve-time and spawn-time are visible).
+enum ResolvedStdin {
+    /// `< file` — path to open for reading.
+    File(String),
+    /// `<< EOF` — body Word to be expanded after inline assignments are applied.
+    /// Storing the Word (rather than pre-expanded bytes) ensures that
+    /// `FOO=hi cat <<EOF\n$FOO\nEOF` sees FOO=hi in the body expansion.
+    Heredoc(crate::lexer::Word),
+}
+
 struct ResolvedCommand {
     program: String,
     args: Vec<String>,
-    stdin: Option<String>,
+    stdin: Option<ResolvedStdin>,
     stdout: Option<ResolvedRedirect>,
     stderr: Option<ResolvedRedirect>,
 }
@@ -560,12 +589,14 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         args.extend(glob_expand_fields(expand(word, shell)));
     }
     let stdin = match &cmd.stdin {
-        Some(Redirect::Read(word)) => Some(expand_single(word, shell).map_err(|()| 1)?),
-        Some(Redirect::Heredoc { .. }) => {
-            unreachable!(
-                "Redirect::Heredoc is never constructed by the parser in Task 1 — \
-                 the lexer does not yet emit Token::Heredoc (Task 2 wires this)"
-            )
+        Some(Redirect::Read(word)) => {
+            Some(ResolvedStdin::File(expand_single(word, shell).map_err(|()| 1)?))
+        }
+        Some(Redirect::Heredoc { body, .. }) => {
+            // Store the body Word to be expanded later (after inline
+            // assignments have been applied). This ensures `FOO=hi cat <<EOF`
+            // body expansion sees FOO=hi.
+            Some(ResolvedStdin::Heredoc(body.clone()))
         }
         Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
             unreachable!("parser never produces Truncate/Append for stdin")
@@ -601,21 +632,35 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
 
 // ----- redirect file handling -----------------------------------------------
 
+/// Resolved stdin for a spawned subprocess — either an open file or
+/// heredoc bytes that will be written through a pipe.
+enum StdinInput {
+    File(File),
+    Bytes(Vec<u8>),
+}
+
 struct StageFiles {
-    stdin: Option<File>,
+    stdin: Option<StdinInput>,
     stdout: Option<File>,
     stderr: Option<File>,
 }
 
-fn open_stage_files(cmd: &ResolvedCommand) -> Result<StageFiles, ()> {
+fn open_stage_files(cmd: &ResolvedCommand, shell: &mut Shell) -> Result<StageFiles, ()> {
     let stdin = match &cmd.stdin {
-        Some(path) => match File::open(path) {
-            Ok(file) => Some(file),
+        Some(ResolvedStdin::File(path)) => match File::open(path) {
+            Ok(file) => Some(StdinInput::File(file)),
             Err(e) => {
                 eprintln!("huck: {path}: {e}");
                 return Err(());
             }
         },
+        Some(ResolvedStdin::Heredoc(body)) => {
+            // Expand the body now — inline assignments have already been applied
+            // to `shell` at this point (callers ensure this), so $var references
+            // in the body see the correct values.
+            let bytes = expand_assignment(body, shell).into_bytes();
+            Some(StdinInput::Bytes(bytes))
+        }
         None => None,
     };
     let stdout = match &cmd.stdout {
@@ -738,7 +783,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // 3. Regular builtin.
     // 4. PATH-exec.
     let outcome = if is_control_builtin(&resolved.program) {
-        let files = match open_stage_files(&resolved) {
+        let files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
             Err(()) => {
                 // Control builtins always persist their inline assignments (POSIX
@@ -764,7 +809,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
         call_function(body, resolved.args, shell, sink)
     } else if builtins::is_builtin(&resolved.program) {
-        let files = match open_stage_files(&resolved) {
+        let files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
             Err(()) => {
                 if !persistent {
@@ -788,7 +833,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             },
         }
     } else {
-        let files = match open_stage_files(&resolved) {
+        let files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
             Err(()) => {
                 if !persistent {
@@ -830,8 +875,16 @@ fn run_subprocess(
         process.process_group(0);
     }
 
-    if let Some(file) = files.stdin {
-        process.stdin(Stdio::from(file));
+    let mut pending_stdin_bytes: Option<Vec<u8>> = None;
+    match files.stdin {
+        Some(StdinInput::File(file)) => {
+            process.stdin(Stdio::from(file));
+        }
+        Some(StdinInput::Bytes(bytes)) => {
+            process.stdin(Stdio::piped());
+            pending_stdin_bytes = Some(bytes);
+        }
+        None => {}
     }
     let want_capture = matches!(sink, StdoutSink::Capture(_));
     if let Some(file) = files.stdout {
@@ -845,6 +898,15 @@ fn run_subprocess(
 
     match process.spawn() {
         Ok(mut child) => {
+            // Write heredoc bytes into the child's piped stdin, then drop
+            // the handle so the child sees EOF and can proceed.
+            if let Some(bytes) = pending_stdin_bytes
+                && let Some(mut child_stdin) = child.stdin.take()
+            {
+                let _ = child_stdin.write_all(&bytes);
+                // child_stdin drops here, closing the pipe.
+            }
+
             let pid = child.id() as i32;
 
             if interactive {
@@ -974,7 +1036,7 @@ fn run_multi_stage(
     for r in &resolved_stages {
         match r {
             None => all_files.push(None),
-            Some(r) => match open_stage_files(r) {
+            Some(r) => match open_stage_files(r, shell) {
                 Ok(f) => all_files.push(Some(f)),
                 Err(()) => return ExecOutcome::Continue(1),
             },
@@ -1093,17 +1155,25 @@ fn run_multi_stage(
         }
 
         let mut pending_input: Option<Vec<u8>> = None;
-        if let Some(file) = files.stdin {
-            process.stdin(Stdio::from(file));
-        } else {
-            match incoming {
-                Carry::None => {}
-                Carry::ChildStdout(child_stdout) => {
-                    process.stdin(Stdio::from(child_stdout));
-                }
-                Carry::Buffer(bytes) => {
-                    process.stdin(Stdio::piped());
-                    pending_input = Some(bytes);
+        match files.stdin {
+            Some(StdinInput::File(file)) => {
+                process.stdin(Stdio::from(file));
+            }
+            Some(StdinInput::Bytes(bytes)) => {
+                // Heredoc body: pipe stdin and schedule the write.
+                process.stdin(Stdio::piped());
+                pending_input = Some(bytes);
+            }
+            None => {
+                match incoming {
+                    Carry::None => {}
+                    Carry::ChildStdout(child_stdout) => {
+                        process.stdin(Stdio::from(child_stdout));
+                    }
+                    Carry::Buffer(bytes) => {
+                        process.stdin(Stdio::piped());
+                        pending_input = Some(bytes);
+                    }
                 }
             }
         }

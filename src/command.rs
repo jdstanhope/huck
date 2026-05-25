@@ -401,6 +401,13 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 if !rest.is_empty() {
                     return Err(ParseError::BackgroundedMultiPipelineSequence);
                 }
+                // Skip any trailing Newline tokens that the heredoc body
+                // collector emits at the end of the input (e.g. when the
+                // buffer is "cat <<EOF &\nbody\nEOF" the lexer emits a
+                // Newline after the heredoc body). Trailing Newlines after
+                // `&` are not meaningful — `&` already terminates the
+                // sequence.
+                skip_newlines(iter);
                 if iter.peek().is_some() {
                     return Err(ParseError::UnexpectedBackground);
                 }
