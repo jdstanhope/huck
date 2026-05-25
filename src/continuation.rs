@@ -4,7 +4,7 @@
 //! disagree with them.
 
 use crate::command::{self, ParseError};
-use crate::lexer::{self, LexError, Operator, Token};
+use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, Token};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ContinuationReason {
@@ -19,12 +19,6 @@ pub enum Completeness {
     Complete,
     Incomplete(ContinuationReason),
     Error,
-}
-
-/// True when `s` ends with an odd-length run of backslashes — the final
-/// backslash is an unescaped line-continuation marker.
-fn ends_with_continuation_backslash(s: &str) -> bool {
-    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
 /// The lexer errors that mean "a quote or expansion is still open" — as
