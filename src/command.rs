@@ -237,6 +237,25 @@ pub struct ExecCommand {
     pub stderr: Option<Redirect>,
 }
 
+impl ExecCommand {
+    /// Returns the program name as a plain `String` if the program Word
+    /// consists of exactly one unquoted `Literal` part — the common case
+    /// for statically-written commands like `cat` or `grep`. Returns `None`
+    /// for dynamic program words such as `$cmd` or `"name"` (quoted).
+    ///
+    /// Used by `classify_stage` in the executor for best-effort static
+    /// resolution: if this returns `None`, the stage falls back to the
+    /// InProcess (fork-subshell) path, which is always correct.
+    pub fn program_static_text(&self) -> Option<String> {
+        if self.program.0.len() == 1
+            && let WordPart::Literal { text, quoted: false } = &self.program.0[0]
+        {
+            return Some(text.clone());
+        }
+        None
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SimpleCommand {
     /// `A=1 B=2 …` with no following command — every assignment

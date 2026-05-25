@@ -1600,6 +1600,133 @@ pub fn fork_and_run_in_subshell(
     Ok(pid)
 }
 
+// ----- stage classification + raw-fd external spawn (Task 4) ---------------
+
+/// Decides whether a pipeline stage should run via `std::process::Command`
+/// (External) or via `fork_and_run_in_subshell` (InProcess).
+///
+/// Returns `External` only when:
+///   - `cmd` is `Command::Simple(SimpleCommand::Exec(exec))`,
+///   - AND `exec.program_static_text()` returns `Some(name)` (single unquoted Literal),
+///   - AND `name` is NOT in `shell.functions`,
+///   - AND NOT in `builtins::is_builtin`.
+///
+/// Everything else (compounds, function calls, builtins, dynamic program words,
+/// assignment-only stages) → `InProcess`.
+///
+/// TODO: Task 5 wires `classify_stage` + `spawn_external_with_fds` into
+/// `run_multi_stage`.
+#[allow(dead_code)]
+enum StageKind<'a> {
+    /// A `SimpleCommand::Exec` that resolves to an external binary.
+    External(&'a SimpleCommand),
+    /// Everything else: builtins, functions, compounds, dynamic program words.
+    InProcess(&'a Command),
+}
+
+// Task 5 wires classify_stage into run_multi_stage; suppress the warning until then.
+#[allow(dead_code)]
+fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
+    if let Command::Simple(simple) = cmd
+        && let SimpleCommand::Exec(exec) = simple
+        && let Some(prog) = exec.program_static_text()
+        && !shell.functions.contains_key(&prog)
+        && !builtins::is_builtin(&prog)
+    {
+        return StageKind::External(simple);
+    }
+    StageKind::InProcess(cmd)
+}
+
+/// Spawns an external command with pre-opened raw stdio fds.
+///
+/// Converts `stdin_fd`/`stdout_fd`/`stderr_fd` to `Stdio` via
+/// `OwnedFd::from_raw_fd` (transfers ownership — the caller must NOT close
+/// these fds after calling this function; `std::process::Command` handles
+/// closing them in the parent after the fork).
+///
+/// `pgid_target`: 0 = become own pgrp leader; >0 = join this pgrp.
+///
+/// `parent_fds_to_close`: pipe fds held by the parent that the child must
+/// close in its `pre_exec` hook so EOF propagates correctly downstream.
+///
+/// Returns the child's pid. The `Child` handle is `mem::forget`'d (matching
+/// the B-09 pattern) since the caller is responsible for `waitpid`.
+///
+/// TODO: Task 5 wires `spawn_external_with_fds` into `run_multi_stage`.
+#[allow(dead_code)]
+fn spawn_external_with_fds(
+    cmd: &SimpleCommand,
+    shell: &mut Shell,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+    pgid_target: i32,
+    parent_fds_to_close: &[RawFd],
+) -> Result<i32, io::Error> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let SimpleCommand::Exec(exec) = cmd else {
+        // Assign-only stages are classified as InProcess by classify_stage;
+        // reaching here is a caller bug.
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "spawn_external_with_fds called on Assign stage"));
+    };
+
+    // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
+    let resolved = resolve(exec, shell)
+        .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
+
+    let mut process = ProcessCommand::new(&resolved.program);
+    process.args(&resolved.args);
+    process.env_clear();
+    process.envs(shell.exported_env());
+
+    // Reset job-control signals to SIG_DFL before exec.
+    unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+
+    // Join the pgrp (or become pgrp leader if pgid_target == 0).
+    process.process_group(pgid_target);
+
+    // Convert raw fds to Stdio. OwnedFd::from_raw_fd transfers ownership;
+    // Stdio::from(OwnedFd) closes the fd in the parent after the fork
+    // (std::process::Command does so automatically).
+    let stdin_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stdin_fd)) };
+    let stdout_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stdout_fd)) };
+    let stderr_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stderr_fd)) };
+
+    process.stdin(stdin_stdio);
+    process.stdout(stdout_stdio);
+    process.stderr(stderr_stdio);
+
+    // In the child's pre_exec, close every parent-held pipe fd that this
+    // child shouldn't inherit (so downstream readers see EOF).
+    // The closure must be async-signal-safe; libc::close is.
+    let fds_to_close: Vec<RawFd> = parent_fds_to_close.to_vec();
+    unsafe {
+        process.pre_exec(move || {
+            for &fd in &fds_to_close {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
+    let child = process.spawn()?;
+    let pid = child.id() as i32;
+
+    // Defensive setpgid in parent to close the race with the child's setpgid
+    // (set via process_group above, which runs pre-exec in the child).
+    unsafe {
+        let _ = libc::setpgid(pid, pgid_target);
+    }
+
+    // mem::forget the Child handle — the caller waitpids manually (B-09 pattern).
+    std::mem::forget(child);
+
+    Ok(pid)
+}
+
 // ----- tests ---------------------------------------------------------------
 
 #[cfg(test)]
@@ -2485,5 +2612,169 @@ mod tests {
             output.contains("hi-from-subshell"),
             "expected 'hi-from-subshell' in pipe output, got: {output:?}"
         );
+    }
+
+    // ----- classify_stage unit tests (Task 4) ----------------------------------
+
+    /// Helper: builds `Command::Simple(SimpleCommand::Exec(...))` for `program`.
+    fn simple_exec_cmd(program: &str) -> Command {
+        Command::Simple(SimpleCommand::Exec(ExecCommand {
+            inline_assignments: Vec::new(),
+            program: lit_word(program),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        }))
+    }
+
+    /// Helper: builds `Command::Simple(SimpleCommand::Exec(...))` with a
+    /// dynamic (Var) program word — simulates `$cmd args`.
+    fn dynamic_exec_cmd() -> Command {
+        use crate::lexer::WordPart;
+        Command::Simple(SimpleCommand::Exec(ExecCommand {
+            inline_assignments: Vec::new(),
+            program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        }))
+    }
+
+    #[test]
+    fn classify_stage_external_for_unknown_command() {
+        // `cat` is not a builtin and not in functions → External.
+        let shell = Shell::new();
+        let cmd = simple_exec_cmd("cat");
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::External(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_builtin() {
+        // `cd` is a builtin → InProcess.
+        let shell = Shell::new();
+        let cmd = simple_exec_cmd("cd");
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_echo_builtin() {
+        // `echo` is a builtin → InProcess.
+        let shell = Shell::new();
+        let cmd = simple_exec_cmd("echo");
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_function() {
+        // A function named `myfunc` exists in shell.functions → InProcess.
+        let mut shell = Shell::new();
+        // Register myfunc in the function table via the parser.
+        if let Ok(tokens) = crate::lexer::tokenize("myfunc() { :; }")
+            && let Ok(Some(seq)) = crate::command::parse(tokens)
+        {
+            let _ = execute(&seq, &mut shell, "myfunc() { :; }");
+        }
+        let cmd = simple_exec_cmd("myfunc");
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_compound_if() {
+        // An `if` clause is never External.
+        use crate::command::IfClause;
+        let shell = Shell::new();
+        let cmd = Command::If(Box::new(IfClause {
+            condition: cond_seq(true),
+            then_body: echo_seq("yes"),
+            elif_branches: vec![],
+            else_body: None,
+        }));
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_assign_only_stage() {
+        // Assignment-only stage (SimpleCommand::Assign) → InProcess.
+        let shell = Shell::new();
+        let cmd = Command::Simple(SimpleCommand::Assign(vec![
+            ("FOO".to_string(), lit_word("bar")),
+        ]));
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    #[test]
+    fn classify_stage_inprocess_for_dynamic_program() {
+        // `$cmd args` — program word is a Var → static text resolution fails → InProcess.
+        let shell = Shell::new();
+        let cmd = dynamic_exec_cmd();
+        assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    // ----- program_static_text unit tests (Task 4) ----------------------------
+
+    #[test]
+    fn program_static_text_returns_some_for_plain_literal() {
+        use crate::command::ExecCommand;
+        let exec = ExecCommand {
+            inline_assignments: Vec::new(),
+            program: lit_word("cat"),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(exec.program_static_text(), Some("cat".to_string()));
+    }
+
+    #[test]
+    fn program_static_text_returns_none_for_quoted_literal() {
+        use crate::command::ExecCommand;
+        use crate::lexer::WordPart;
+        let exec = ExecCommand {
+            inline_assignments: Vec::new(),
+            program: Word(vec![WordPart::Literal { text: "cat".to_string(), quoted: true }]),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        };
+        // Quoted literal → None (could be a function or builtin masked by quoting).
+        assert_eq!(exec.program_static_text(), None);
+    }
+
+    #[test]
+    fn program_static_text_returns_none_for_var_word() {
+        use crate::command::ExecCommand;
+        use crate::lexer::WordPart;
+        let exec = ExecCommand {
+            inline_assignments: Vec::new(),
+            program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(exec.program_static_text(), None);
+    }
+
+    #[test]
+    fn program_static_text_returns_none_for_multi_part_word() {
+        use crate::command::ExecCommand;
+        use crate::lexer::WordPart;
+        // Two parts: e.g. `cat` + some suffix (weird, but defensive).
+        let exec = ExecCommand {
+            inline_assignments: Vec::new(),
+            program: Word(vec![
+                WordPart::Literal { text: "ca".to_string(), quoted: false },
+                WordPart::Literal { text: "t".to_string(), quoted: false },
+            ]),
+            args: vec![],
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(exec.program_static_text(), None);
     }
 }
