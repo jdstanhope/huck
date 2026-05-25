@@ -104,12 +104,16 @@ impl History {
     /// Reads the histfile into `entries`, keeping the most recent `max`
     /// lines. A missing file loads as empty history. Other I/O errors
     /// print a warning and leave history empty.
+    ///
+    /// Each line is unescape-decoded: `\\` → `\`, `\n` → newline; any
+    /// other `\X` stays as literal `\X` (backward-compat with pre-v24
+    /// files that contain raw backslashes).
     pub fn load(&mut self) {
         let Some(path) = &self.file else { return };
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut lines: Vec<String> =
-                    contents.lines().map(|l| l.to_string()).collect();
+                    contents.lines().map(unescape_for_load).collect();
                 if lines.len() > self.max {
                     lines.drain(0..lines.len() - self.max);
                 }
@@ -124,12 +128,14 @@ impl History {
     }
 
     /// Writes `entries` to the histfile, one command per line, overwriting.
-    /// A write error prints a warning; it never aborts the shell.
+    /// Embedded `\` and `\n` are escape-encoded so multi-line entries
+    /// round-trip losslessly. A write error prints a warning; it never
+    /// aborts the shell.
     pub fn save(&self) {
         let Some(path) = &self.file else { return };
         let mut out = String::new();
         for entry in &self.entries {
-            out.push_str(entry);
+            out.push_str(&escape_for_save(entry));
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
@@ -142,6 +148,40 @@ impl Default for History {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Encodes `\\` as `\\\\` and `\n` as `\\n` so that each history entry
+/// occupies exactly one line on disk.
+fn escape_for_save(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Decodes `\\\\` → `\` and `\\n` → newline. Any other `\X` is kept
+/// as-is (backward-compat: pre-v24 files with raw backslashes load
+/// unchanged because no other two-char sequence is recognised).
+fn unescape_for_load(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\\') => { chars.next(); out.push('\\'); }
+                Some('n')  => { chars.next(); out.push('\n'); }
+                _          => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Resolves the histfile path: `$HISTFILE`, else `$HOME/.huck_history`,
@@ -502,6 +542,72 @@ mod tests {
         h.load();
         h.save();
         assert_eq!(h.last(), None);
+    }
+
+    #[test]
+    fn history_round_trips_embedded_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hf");
+        {
+            let mut h = History {
+                entries: Vec::new(),
+                base_number: 1,
+                max: 1000,
+                file: Some(path.clone()),
+            };
+            h.add("cat <<EOF\nhello\nworld\nEOF".to_string());
+            h.save();
+        }
+        let mut h2 = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 1000,
+            file: Some(path.clone()),
+        };
+        h2.load();
+        let entries: Vec<String> = h2.entries().map(|(_, s)| s.to_string()).collect();
+        assert_eq!(entries, vec!["cat <<EOF\nhello\nworld\nEOF".to_string()]);
+    }
+
+    #[test]
+    fn history_round_trips_literal_backslash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hf");
+        {
+            let mut h = History {
+                entries: Vec::new(),
+                base_number: 1,
+                max: 1000,
+                file: Some(path.clone()),
+            };
+            h.add(r"echo a\b".to_string());
+            h.save();
+        }
+        let mut h2 = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 1000,
+            file: Some(path.clone()),
+        };
+        h2.load();
+        let entries: Vec<String> = h2.entries().map(|(_, s)| s.to_string()).collect();
+        assert_eq!(entries, vec![r"echo a\b".to_string()]);
+    }
+
+    #[test]
+    fn history_loads_pre_v24_format_without_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hf");
+        std::fs::write(&path, "echo hi\nls -la\n").unwrap();
+        let mut h = History {
+            entries: Vec::new(),
+            base_number: 1,
+            max: 1000,
+            file: Some(path.clone()),
+        };
+        h.load();
+        let entries: Vec<String> = h.entries().map(|(_, s)| s.to_string()).collect();
+        assert_eq!(entries, vec!["echo hi".to_string(), "ls -la".to_string()]);
     }
 
     fn hist_with(cmds: &[&str]) -> History {
