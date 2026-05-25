@@ -398,7 +398,11 @@ fn run_background_sequence(
             Some(StdinInput::File(file)) => {
                 process.stdin(Stdio::from(file));
             }
-            Some(StdinInput::Bytes(bytes)) => {
+            Some(StdinInput::DeferredHeredoc(body)) => {
+                // Inline assignments were applied before open_stage_files in
+                // this path (run_background_sequence), so expanding here is
+                // correct: $var references see the stage's inline assignments.
+                let bytes = expand_assignment(&body, shell).into_bytes();
                 process.stdin(Stdio::piped());
                 pending_input = Some(bytes);
             }
@@ -632,11 +636,15 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
 
 // ----- redirect file handling -----------------------------------------------
 
-/// Resolved stdin for a spawned subprocess — either an open file or
-/// heredoc bytes that will be written through a pipe.
+/// Resolved stdin for a spawned subprocess — either an open file or a
+/// heredoc body Word whose expansion is deferred until after per-stage inline
+/// assignments are applied, so that `$var` references in the body see the
+/// stage's own inline assignments.
 enum StdinInput {
     File(File),
-    Bytes(Vec<u8>),
+    /// Heredoc body to be expanded just before spawning the child, after
+    /// `apply_inline_assignments` has been called for this stage.
+    DeferredHeredoc(crate::lexer::Word),
 }
 
 struct StageFiles {
@@ -645,7 +653,7 @@ struct StageFiles {
     stderr: Option<File>,
 }
 
-fn open_stage_files(cmd: &ResolvedCommand, shell: &mut Shell) -> Result<StageFiles, ()> {
+fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFiles, ()> {
     let stdin = match &cmd.stdin {
         Some(ResolvedStdin::File(path)) => match File::open(path) {
             Ok(file) => Some(StdinInput::File(file)),
@@ -655,11 +663,12 @@ fn open_stage_files(cmd: &ResolvedCommand, shell: &mut Shell) -> Result<StageFil
             }
         },
         Some(ResolvedStdin::Heredoc(body)) => {
-            // Expand the body now — inline assignments have already been applied
-            // to `shell` at this point (callers ensure this), so $var references
-            // in the body see the correct values.
-            let bytes = expand_assignment(body, shell).into_bytes();
-            Some(StdinInput::Bytes(bytes))
+            // Defer body expansion: store the Word so the caller can expand it
+            // after applying per-stage inline assignments. Callers that have
+            // already applied inline assignments before calling open_stage_files
+            // (run_exec_single, run_background_sequence) will see a
+            // DeferredHeredoc and must expand it before spawning the child.
+            Some(StdinInput::DeferredHeredoc(body.clone()))
         }
         None => None,
     };
@@ -880,7 +889,11 @@ fn run_subprocess(
         Some(StdinInput::File(file)) => {
             process.stdin(Stdio::from(file));
         }
-        Some(StdinInput::Bytes(bytes)) => {
+        Some(StdinInput::DeferredHeredoc(body)) => {
+            // Inline assignments were applied before open_stage_files in this
+            // path (run_exec_single / run_subprocess), so expanding here is
+            // correct: $var references see the stage's inline assignments.
+            let bytes = expand_assignment(&body, shell).into_bytes();
             process.stdin(Stdio::piped());
             pending_stdin_bytes = Some(bytes);
         }
@@ -1159,8 +1172,11 @@ fn run_multi_stage(
             Some(StdinInput::File(file)) => {
                 process.stdin(Stdio::from(file));
             }
-            Some(StdinInput::Bytes(bytes)) => {
-                // Heredoc body: pipe stdin and schedule the write.
+            Some(StdinInput::DeferredHeredoc(body)) => {
+                // Expand the heredoc body NOW — apply_inline_assignments has
+                // already fired for this stage (line above), so $var references
+                // in the body see the stage's own inline assignments.
+                let bytes = expand_assignment(&body, shell).into_bytes();
                 process.stdin(Stdio::piped());
                 pending_input = Some(bytes);
             }

@@ -153,6 +153,19 @@ fn heredoc_multi_line_body() {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline stage with inline assignment: body expansion sees stage's own var
+// ---------------------------------------------------------------------------
+
+#[test]
+fn heredoc_pipeline_stage_with_inline_assignment_expand() {
+    // Per-stage scoping: FOO=hi is applied to cat's stage, so the body
+    // expansion sees FOO=hi. grep stage doesn't see it (per v23 pipeline
+    // per-stage scoping rules).
+    let (out, _) = run("FOO=hi cat <<EOF | grep PER_STAGE\nPER_STAGE=$FOO\nEOF\nexit\n");
+    assert!(out.contains("PER_STAGE=hi"), "got: {out}");
+}
+
+// ---------------------------------------------------------------------------
 // Backgrounded command sees heredoc body
 // ---------------------------------------------------------------------------
 
