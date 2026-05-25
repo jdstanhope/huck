@@ -464,3 +464,79 @@ fn pty_multi_stage_pipeline_completes_via_pgrp_wait() {
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
+
+#[test]
+fn pty_heredoc_simple() {
+    // Type a complete heredoc interactively: the body line is echoed back
+    // by `cat` and the main prompt returns.
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "cat <<EOF");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "PTY_HEREDOC_MARKER");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "EOF");
+    send(&mut session, ENTER);
+    // `cat` echoes the body; the prompt must return afterwards.
+    expect(&mut session, "PTY_HEREDOC_MARKER");
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn pty_heredoc_continuation_prompt_appears() {
+    // After `cat <<EOF<ENTER>`, the REPL should draw the `> ` continuation
+    // prompt while waiting for heredoc body lines.  Ctrl-C aborts and
+    // returns the main prompt.
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "cat <<EOF");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    // Abort the heredoc body collection.
+    settle();
+    send(&mut session, CTRL_C);
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn pty_heredoc_ctrl_c_aborts_body_collection() {
+    // Start a heredoc, type a partial body line, then abort with Ctrl-C.
+    // The partial command must be discarded; a subsequent `pwd` must run
+    // cleanly and print the temp-dir path.
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "cat <<EOF");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, "partial body");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    settle();
+    send(&mut session, CTRL_C);
+    // Buffer was discarded — confirm by running a fresh command.
+    expect(&mut session, "huck> ");
+    send(&mut session, "pwd");
+    send(&mut session, ENTER);
+    let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    expect(&mut session, marker);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}

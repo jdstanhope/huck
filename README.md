@@ -31,6 +31,7 @@ spec, an implementation plan, and a test suite.
 | v21       | `case` statements (`case W in PAT) … ;; esac`)          |
 | v22       | Functions (`name() { … }`) + positional parameters      |
 | v23       | Inline assignments (`VAR=val cmd`)                       |
+| v24       | Here-documents (`<<EOF`, `<<'EOF'`, `<<-EOF`)            |
 
 ## Build and run
 

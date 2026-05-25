@@ -122,7 +122,7 @@ group.
 ### Compound commands
 
 - **M-11: Subshells `( list )`** — `[deferred]` high. huck: bare `(`/`)` is now a parse error (v21). bash: runs the list in a forked subshell with isolated state.
-- **M-12: Here-documents `<<EOF`** — `[deferred]` high. huck: parse error. bash: heredoc body becomes the command's stdin.
+- **M-12: Here-documents `<<EOF`** — `[fixed (2026-05-24)]` high. Now supported: `<<DELIM` (expanding), `<<'DELIM'` (literal), `<<-DELIM` (tab-strip), composable; multiple here-docs per command; per-stage in pipelines; full POSIX expansion (`$var`, `${var}`, `$(cmd)`, backticks, `\$`, `\\`, `` \` ``).
 - **M-13: Here-strings `<<<word`** — `[deferred]` medium. huck: parse error. bash: the expanded word becomes stdin.
 - **M-14: `[[ … ]]` extended test** — `[deferred]` high. huck: not implemented. bash: keyword test with pattern matching, `=~` regex, `<`/`>` string ordering, no word-splitting.
 - **M-23: C-style `for ((init; cond; step))`** — `[deferred]` medium. huck: parse error. bash: standard counter loop.
@@ -288,3 +288,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-23**: Quick-wins bug-fix batch shipped — B-01, B-02, B-04, B-05, B-06, B-07, B-08 all marked fixed.
 - **2026-05-24**: Tier 1 finished — B-03 (backslash-newline mid-buffer line continuation) and B-09 (foreground pipeline pgrp wait) marked fixed. Baseline clippy warnings reduced from 22 to 0. Tier 1 is now empty (every "bugs" entry has Status=fixed).
 - **2026-05-24**: M-04 (inline assignments) shipped as v23.
+- **2026-05-24**: M-12 (here-documents) shipped as v24. Also reshapes ExecCommand.stdin from Option<Word> to Option<Redirect> so `<file`, `<<EOF`, and future `<<<word` share a uniform shape.
