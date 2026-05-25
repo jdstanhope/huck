@@ -476,6 +476,12 @@ fn collect_heredoc_bodies(
     Ok(())
 }
 
+/// True when `s` ends with an odd-length run of backslashes — the final
+/// backslash is an unescaped line-continuation marker.
+fn ends_with_continuation_backslash(s: &str) -> bool {
+    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
 /// Collects the body of one heredoc, reading lines until the close-delimiter
 /// is matched (or end-of-input, which is an error).
 fn collect_one_heredoc_body(
@@ -495,6 +501,29 @@ fn collect_one_heredoc_body(
                 }
                 Some(c) => current_line.push(c),
                 None => break,
+            }
+        }
+        // POSIX 2.7.4: in expanding heredocs, `\<NL>` is a line continuation —
+        // both the backslash and the newline are deleted, and the next line is
+        // joined directly. Literal heredocs keep `\` + NL verbatim.
+        while ph.expand
+            && got_newline
+            && ends_with_continuation_backslash(&current_line)
+            && chars.peek().is_some()
+        {
+            // Strip the trailing backslash (the newline is already consumed).
+            current_line.pop();
+            // Read the next line into the same buffer (no separator).
+            got_newline = false;
+            loop {
+                match chars.next() {
+                    Some('\n') => {
+                        got_newline = true;
+                        break;
+                    }
+                    Some(c) => current_line.push(c),
+                    None => break,
+                }
             }
         }
         // For <<-, strip leading tabs from both body and close-delimiter lines.
@@ -3129,5 +3158,39 @@ mod tests {
         } else {
             panic!("expected Token::Heredoc");
         }
+    }
+
+    #[test]
+    fn tokenize_heredoc_expanding_backslash_newline_joins_lines() {
+        // POSIX 2.7.4: \<NL> inside expanding heredoc is line continuation.
+        let tokens = tokenize("cat <<EOF\nhello \\\nworld\nEOF\n").unwrap();
+        // Find the Heredoc token and verify body literal is "hello world\n".
+        let body_text: String = match &tokens[1] {
+            Token::Heredoc { body, .. } => body.0.iter()
+                .filter_map(|p| match p {
+                    WordPart::Literal { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("expected Heredoc at index 1, got {:?}", tokens[1]),
+        };
+        assert_eq!(body_text, "hello world\n");
+    }
+
+    #[test]
+    fn tokenize_heredoc_literal_backslash_newline_is_literal() {
+        // Inside literal heredoc, \<NL> is two literal chars (POSIX 2.2.2 / 2.7.4).
+        let tokens = tokenize("cat <<'EOF'\nhello \\\nworld\nEOF\n").unwrap();
+        let body_text: String = match &tokens[1] {
+            Token::Heredoc { body, .. } => body.0.iter()
+                .filter_map(|p| match p {
+                    WordPart::Literal { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!(),
+        };
+        // Body contains literal "hello \\\nworld\n" — backslash + newline + world.
+        assert_eq!(body_text, "hello \\\nworld\n");
     }
 }
