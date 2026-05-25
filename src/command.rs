@@ -380,7 +380,37 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
     let at_top_level = stop_at.is_empty();
-    let first = parse_command(iter)?;
+    let raw_first = parse_command(iter)?;
+    // If the command is immediately followed by `|`, it is the first stage of
+    // a pipeline — even if it is a compound command (if/while/for/case/brace).
+    // `parse_command` dispatches compound commands without checking for a
+    // trailing `|`, so we handle that here.
+    let first = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+        let mut stages = vec![raw_first];
+        // Consume the `|` that was peeked above.
+        iter.next();
+        skip_newlines(iter);
+        let mut more_stages = true;
+        while more_stages {
+            let (cmd, next_pipe) = parse_next_stage(iter)?;
+            stages.push(cmd);
+            if next_pipe {
+                // Simple stage: it already consumed the `|` internally.
+                // Continue to collect the next stage.
+            } else {
+                // Compound stage: did not consume a trailing `|`. Check now.
+                if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                    iter.next(); // consume `|`
+                    skip_newlines(iter);
+                } else {
+                    more_stages = false;
+                }
+            }
+        }
+        Command::Pipeline(Pipeline { commands: stages })
+    } else {
+        raw_first
+    };
     let mut rest = Vec::new();
     let mut background = false;
 
@@ -973,20 +1003,18 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
         let (cmd, next_pipe) = parse_next_stage(iter)?;
         commands.push(cmd);
 
-        // If the stage was a compound command (pipe_follows=false from
-        // parse_next_stage), check whether the token stream has another `|`.
+        // If the stage was a compound command (next_pipe=false from
+        // parse_next_stage), it did not consume a trailing `|`; check manually.
         if !next_pipe {
-            // Compound stages don't consume the trailing `|`; check manually.
             if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
                 iter.next(); // consume `|`
                 skip_newlines(iter);
-                pipe_follows = true;
+                // pipe_follows remains true — loop continues.
             } else {
                 pipe_follows = false;
             }
-        } else {
-            pipe_follows = next_pipe;
         }
+        // else: simple stage already consumed `|`; pipe_follows remains true.
     }
 
     Ok(Pipeline { commands })
@@ -2651,5 +2679,65 @@ mod tests {
         // When M-11 subshell syntax lands, `echo | (a | b)` should be a
         // parse error (Command::Pipeline with len > 1 as a stage is rejected).
         // For v25, `(a | b)` isn't lexed so this test is unreachable.
+    }
+
+    // --- Pipeline compound-as-FIRST-stage parser tests (v25 Task 2 fix) ---
+
+    #[test]
+    fn parse_pipeline_with_if_as_first_stage() {
+        let tokens = crate::lexer::tokenize("if true; then echo hi; fi | cat").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::If(_)), "stage 0 should be If");
+        assert!(matches!(p.commands[1], Command::Simple(_)), "stage 1 should be Simple");
+    }
+
+    #[test]
+    fn parse_pipeline_with_brace_group_as_first_stage() {
+        let tokens = crate::lexer::tokenize("{ cat; } | grep foo").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::BraceGroup(_)), "stage 0 should be BraceGroup");
+        assert!(matches!(p.commands[1], Command::Simple(_)), "stage 1 should be Simple");
+    }
+
+    #[test]
+    fn parse_pipeline_with_while_as_first_stage() {
+        let tokens =
+            crate::lexer::tokenize("while true; do echo loop; done | head -n 3").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::While(_)), "stage 0 should be While");
+    }
+
+    #[test]
+    fn parse_pipeline_with_for_as_first_stage() {
+        let tokens = crate::lexer::tokenize("for x in a b; do echo $x; done | cat").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::For(_)), "stage 0 should be For");
+    }
+
+    #[test]
+    fn parse_pipeline_with_case_as_first_stage() {
+        let tokens = crate::lexer::tokenize("case foo in foo) echo yes;; esac | cat").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::Case(_)), "stage 0 should be Case");
     }
 }
