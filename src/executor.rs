@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
+use std::os::unix::io::RawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 
@@ -1514,6 +1515,91 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
     Ok(())
 }
 
+// ----- fork subshell helper -------------------------------------------------
+
+/// Forks a subshell and runs `cmd` in the child with the supplied stdio
+/// fds dup2'd to 0/1/2. After the body runs, the child `_exit`s with the
+/// resulting status. Returns the child pid in the parent.
+///
+/// `parent_fds_to_close` lists pipe fds the parent holds that this child
+/// must close (else EOF propagation fails downstream).
+///
+/// `pgid_target`: 0 = become own pgrp leader; >0 = join this pgrp.
+// Task 5 wires this into run_multi_stage; suppress the warning until then.
+#[allow(dead_code)]
+pub fn fork_and_run_in_subshell(
+    cmd: &Command,
+    shell: &mut Shell,
+    stdin_fd: RawFd,
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+    pgid_target: i32,
+    parent_fds_to_close: &[RawFd],
+) -> Result<i32, io::Error> {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        // CHILD: async-signal-safe-ish operations only until we dive into
+        // `run_command`. huck is single-threaded so this is fine.
+        unsafe {
+            // 1. Reset job-control signals.
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+            libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            // 2. Join the pgrp (or become pgrp leader if pgid_target == 0).
+            libc::setpgid(0, pgid_target);
+            // 3. dup2 the stdio fds to 0/1/2.
+            if stdin_fd != 0 {
+                libc::dup2(stdin_fd, 0);
+            }
+            if stdout_fd != 1 {
+                libc::dup2(stdout_fd, 1);
+            }
+            if stderr_fd != 2 {
+                libc::dup2(stderr_fd, 2);
+            }
+            // 4. Close the originals if not already at 0/1/2.
+            for fd in [stdin_fd, stdout_fd, stderr_fd] {
+                if fd > 2 {
+                    libc::close(fd);
+                }
+            }
+            // 5. Close every other pipe fd the parent held, skipping any
+            //    that were one of our stdio sources (they may have been > 2
+            //    and are already closed above, but guard against the case
+            //    where a parent_fds_to_close entry coincides with stdin/
+            //    stdout/stderr — we must not close what we just dup2'd from).
+            for &fd in parent_fds_to_close {
+                if fd != stdin_fd && fd != stdout_fd && fd != stderr_fd {
+                    libc::close(fd);
+                }
+            }
+        }
+        // 6. Run the body via the existing dispatcher.
+        //    The child's stdout is now fd 1 (the dup2'd pipe end), so
+        //    StdoutSink::Terminal routes writes to the right destination.
+        let mut sink = StdoutSink::Terminal;
+        let outcome = run_command(cmd, shell, &mut sink);
+        // 7. Translate outcome to an 8-bit exit status.
+        let status: i32 = match outcome {
+            ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
+            ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
+            ExecOutcome::FunctionReturn(n) => n,
+        };
+        let status = status.rem_euclid(256);
+        // _exit bypasses Drop and Rust's atexit/flush machinery, which is
+        // exactly what we want: the parent's history.save() etc. must not run.
+        unsafe { libc::_exit(status) };
+    }
+    // PARENT: defensive setpgid to close the race with the child's setpgid.
+    unsafe {
+        libc::setpgid(pid, pgid_target);
+    }
+    Ok(pid)
+}
+
 // ----- tests ---------------------------------------------------------------
 
 #[cfg(test)]
@@ -2335,5 +2421,69 @@ mod tests {
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
         assert!(shell.is_exported("FOO"));
+    }
+
+    /// Canonical "fork_and_run_in_subshell works" test.
+    ///
+    /// Pattern for future helpers: create a libc::pipe pair, fork via the
+    /// helper with stdout = pipe.write, in the parent read pipe.read and
+    /// waitpid the child, assert the buffer contains the expected output.
+    #[test]
+    fn fork_and_run_in_subshell_echo_stage_writes_to_pipe() {
+        // 1. Create a pipe pair.
+        let mut pipe_fds: [libc::c_int; 2] = [-1; 2];
+        let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "libc::pipe failed");
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        // 2. Build `echo hi-from-subshell` as a Command.
+        let cmd = Command::Simple(exec("echo", &["hi-from-subshell"]));
+
+        // 3. Fork: child writes to write_fd; parent keeps read_fd.
+        //    pass write_fd in parent_fds_to_close so the child closes its
+        //    own copy (it dup2'd it to fd 1, so the original > 2 copy is dead).
+        let mut shell = Shell::new();
+        let child_pid = fork_and_run_in_subshell(
+            &cmd,
+            &mut shell,
+            libc::STDIN_FILENO,  // stdin = terminal
+            write_fd,            // stdout → pipe write end
+            libc::STDERR_FILENO, // stderr = terminal
+            0,                   // pgid_target: become own pgrp leader
+            &[read_fd],          // close the read end in the child
+        )
+        .expect("fork_and_run_in_subshell failed");
+
+        // 4. Parent: close the write end so reading will eventually see EOF.
+        unsafe { libc::close(write_fd) };
+
+        // 5. Read from the pipe into a buffer.
+        let mut buf = vec![0u8; 256];
+        let mut total = 0usize;
+        loop {
+            let n = unsafe {
+                libc::read(read_fd, buf.as_mut_ptr().add(total).cast(), buf.len() - total)
+            };
+            if n <= 0 {
+                break;
+            }
+            total += n as usize;
+        }
+        unsafe { libc::close(read_fd) };
+        let output = std::str::from_utf8(&buf[..total]).expect("utf8").to_string();
+
+        // 6. Reap the child.
+        let mut raw_status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(child_pid, &mut raw_status, 0) };
+        assert_eq!(r, child_pid, "waitpid returned unexpected pid");
+        assert!(libc::WIFEXITED(raw_status), "child did not exit normally");
+        let exit_code = libc::WEXITSTATUS(raw_status);
+        assert_eq!(exit_code, 0);
+
+        // 7. Check output.
+        assert!(
+            output.contains("hi-from-subshell"),
+            "expected 'hi-from-subshell' in pipe output, got: {output:?}"
+        );
     }
 }
