@@ -1918,7 +1918,7 @@ mod tests {
         use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: args
@@ -1928,7 +1928,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1989,14 +1989,14 @@ mod tests {
         use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         let inner = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -2022,14 +2022,14 @@ mod tests {
             use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
             Sequence {
                 first: Command::Pipeline(Pipeline {
-                    commands: vec![SimpleCommand::Exec(ExecCommand {
+                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                         inline_assignments: Vec::new(),
                         program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                         args: vec![inner_word],
                         stdin: None,
                         stdout: None,
                         stderr: None,
-                    })],
+                    }))],
                 }),
                 rest: vec![],
                 background: false,
@@ -2163,7 +2163,7 @@ mod tests {
                         };
                         let inner_cmd = &inner_pipeline.commands[0];
                         match inner_cmd {
-                            crate::command::SimpleCommand::Exec(e) => {
+                            crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
                                 assert_eq!(e.args.len(), 1);
                                 match &e.args[0].0[0] {
                                     WordPart::Var { name, quoted: false } => {
@@ -2172,7 +2172,7 @@ mod tests {
                                     other => panic!("expected Var(FOO), got {other:?}"),
                                 }
                             }
-                            other => panic!("expected Exec, got {other:?}"),
+                            other => panic!("expected Simple(Exec), got {other:?}"),
                         }
                     }
                     other => panic!("expected CommandSub, got {other:?}"),
@@ -2195,7 +2195,7 @@ mod tests {
                         panic!("expected a pipeline");
                     };
                     match &inner_pipeline.commands[0] {
-                        crate::command::SimpleCommand::Exec(e) => {
+                        crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
                             // Inner body was `echo \` — backslash at end is literal.
                             assert_eq!(e.args.len(), 1);
                             match &e.args[0].0[0] {
@@ -2203,7 +2203,7 @@ mod tests {
                                 other => panic!("expected Literal(\\\\), got {other:?}"),
                             }
                         }
-                        other => panic!("expected Exec, got {other:?}"),
+                        other => panic!("expected Simple(Exec), got {other:?}"),
                     }
                 }
                 other => panic!("expected CommandSub, got {other:?}"),
@@ -2225,7 +2225,7 @@ mod tests {
                         panic!("expected a pipeline");
                     };
                     match &inner_pipeline.commands[0] {
-                        crate::command::SimpleCommand::Exec(e) => {
+                        crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
                             // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
                             assert_eq!(e.args.len(), 1);
                             match &e.args[0].0[0] {
@@ -2233,7 +2233,7 @@ mod tests {
                                 other => panic!("expected Literal(n), got {other:?}"),
                             }
                         }
-                        other => panic!("expected Exec, got {other:?}"),
+                        other => panic!("expected Simple(Exec), got {other:?}"),
                     }
                 }
                 other => panic!("expected CommandSub, got {other:?}"),

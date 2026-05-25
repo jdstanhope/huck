@@ -485,14 +485,14 @@ mod tests {
     fn echo_sequence(args: &[&str]) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("echo"),
                     args: args.iter().map(|a| lit(a)).collect(),
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -502,14 +502,14 @@ mod tests {
     fn exit_sequence(code: i32) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("exit"),
                     args: vec![lit(&code.to_string())],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1308,14 +1308,14 @@ mod tests {
         // the pre-expansion value (7) — not the post-`false` value (1).
         let false_cmd = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("false"),
                     args: vec![],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,

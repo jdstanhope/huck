@@ -248,7 +248,12 @@ pub enum SimpleCommand {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Pipeline {
-    pub commands: Vec<SimpleCommand>,
+    // BREAKING CHANGE (v25): was Vec<SimpleCommand>; now Vec<Command>.
+    // The parser rejects Command::Pipeline as a stage (nested multi-stage
+    // pipelines aren't a POSIX construct at this level).
+    // Task 1: parser still only emits Command::Simple stages.
+    // Task 2: parser will emit compound stages too.
+    pub commands: Vec<Command>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -261,6 +266,7 @@ pub enum Connector {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Pipeline(Pipeline),
+    Simple(SimpleCommand), // NEW (v25 Shape A): pipeline stage wrapping a SimpleCommand
     If(Box<IfClause>),
     While(Box<WhileClause>),
     For(Box<ForClause>),
@@ -805,7 +811,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
     first: Option<Word>,
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Pipeline, ParseError> {
-    let mut commands: Vec<SimpleCommand> = Vec::new();
+    let mut commands: Vec<Command> = Vec::new();
 
     let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
@@ -846,13 +852,13 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
             }
             Token::Op(Operator::Pipe) => {
                 let prog = program.take().ok_or(ParseError::MissingCommand)?;
-                commands.push(finalize_stage(
+                commands.push(Command::Simple(finalize_stage(
                     prog,
                     std::mem::take(&mut args),
                     stdin.take(),
                     stdout.take(),
                     stderr.take(),
-                ));
+                )));
                 skip_newlines(iter);
             }
             Token::Op(Operator::LParen | Operator::RParen) => {
@@ -895,7 +901,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
     }
 
     let prog = program.ok_or(ParseError::MissingCommand)?;
-    commands.push(finalize_stage(prog, args, stdin, stdout, stderr));
+    commands.push(Command::Simple(finalize_stage(prog, args, stdin, stdout, stderr)));
 
     Ok(Pipeline { commands })
 }
@@ -933,7 +939,9 @@ mod tests {
 
     fn one_pipeline(commands: Vec<SimpleCommand>) -> Sequence {
         Sequence {
-            first: Command::Pipeline(Pipeline { commands }),
+            first: Command::Pipeline(Pipeline {
+                commands: commands.into_iter().map(Command::Simple).collect(),
+            }),
             rest: vec![],
             background: false,
         }
@@ -944,6 +952,7 @@ mod tests {
     fn first_pipeline(seq: &Sequence) -> &Pipeline {
         match &seq.first {
             Command::Pipeline(p) => p,
+            Command::Simple(_) => panic!("expected a pipeline, got a simple command"),
             Command::If(_) => panic!("expected a pipeline, got an if"),
             Command::While(_) => panic!("expected a pipeline, got a while"),
             Command::For(_) => panic!("expected a pipeline, got a for"),
@@ -955,22 +964,22 @@ mod tests {
 
     fn exec_stdout(seq: &Sequence) -> &Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            SimpleCommand::Exec(e) => &e.stdout,
-            _ => panic!("expected Exec"),
+            Command::Simple(SimpleCommand::Exec(e)) => &e.stdout,
+            _ => panic!("expected Simple(Exec)"),
         }
     }
 
     fn exec_stdin(seq: &Sequence) -> &Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            SimpleCommand::Exec(e) => &e.stdin,
-            _ => panic!("expected Exec"),
+            Command::Simple(SimpleCommand::Exec(e)) => &e.stdin,
+            _ => panic!("expected Simple(Exec)"),
         }
     }
 
     fn exec_stderr(seq: &Sequence) -> &Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            SimpleCommand::Exec(e) => &e.stderr,
-            _ => panic!("expected Exec"),
+            Command::Simple(SimpleCommand::Exec(e)) => &e.stderr,
+            _ => panic!("expected Simple(Exec)"),
         }
     }
 
@@ -1044,7 +1053,10 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Pipe), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[]), plain("b", &[])]);
+        assert_eq!(
+            first_pipeline(&seq).commands,
+            vec![Command::Simple(plain("a", &[])), Command::Simple(plain("b", &[]))]
+        );
     }
 
     #[test]
@@ -1124,7 +1136,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), w_tok("b")])
             .unwrap()
             .unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("a", &[]))]);
         assert_eq!(seq.rest.len(), 1);
         assert_eq!(seq.rest[0].0, Connector::Semi);
     }
@@ -1150,7 +1162,7 @@ mod tests {
         let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi)])
             .unwrap()
             .unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("a", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("a", &[]))]);
         assert!(seq.rest.is_empty());
     }
 
@@ -1190,13 +1202,13 @@ mod tests {
     #[test]
     fn parse_simple_assignment() {
         let seq = parse(vec![w_tok("FOO=bar")]).unwrap().unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww("bar"))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(assignment("FOO", ww("bar")))]);
     }
 
     #[test]
     fn parse_empty_value_assignment() {
         let seq = parse(vec![w_tok("FOO=")]).unwrap().unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", ww(""))]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(assignment("FOO", ww("")))]);
     }
 
     #[test]
@@ -1211,13 +1223,13 @@ mod tests {
             WordPart::Literal { text: "".to_string(), quoted: false },
             WordPart::Var { name: "BAR".to_string(), quoted: false },
         ]);
-        assert_eq!(first_pipeline(&seq).commands, vec![assignment("FOO", expected_value)]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(assignment("FOO", expected_value))]);
     }
 
     #[test]
     fn parse_assignment_invalid_name_is_exec() {
         let seq = parse(vec![w_tok("1FOO=bar")]).unwrap().unwrap();
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("1FOO=bar", &[])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("1FOO=bar", &[]))]);
     }
 
     #[test]
@@ -1225,13 +1237,13 @@ mod tests {
         // `FOO=bar baz` — FOO=bar is an inline assignment; `baz` becomes the program.
         let seq = parse(vec![w_tok("FOO=bar"), w_tok("baz")]).unwrap().unwrap();
         match &first_pipeline(&seq).commands[0] {
-            SimpleCommand::Exec(e) => {
+            Command::Simple(SimpleCommand::Exec(e)) => {
                 assert_eq!(e.inline_assignments.len(), 1);
                 assert_eq!(e.inline_assignments[0].0, "FOO");
                 assert_eq!(e.program, ww("baz"));
                 assert!(e.args.is_empty());
             }
-            _ => panic!("expected Exec"),
+            _ => panic!("expected Simple(Exec)"),
         }
     }
 
@@ -1246,13 +1258,13 @@ mod tests {
         .unwrap()
         .unwrap();
         match &first_pipeline(&seq).commands[0] {
-            SimpleCommand::Exec(e) => {
+            Command::Simple(SimpleCommand::Exec(e)) => {
                 assert_eq!(e.inline_assignments.len(), 1);
                 assert_eq!(e.inline_assignments[0].0, "FOO");
                 assert_eq!(e.program, Word(Vec::new()));
                 assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
             }
-            _ => panic!("expected Exec"),
+            _ => panic!("expected Simple(Exec)"),
         }
     }
 
@@ -1266,8 +1278,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(first_pipeline(&seq).commands.len(), 2);
-        assert_eq!(first_pipeline(&seq).commands[0], assignment("FOO", ww("bar")));
-        assert_eq!(first_pipeline(&seq).commands[1], plain("cat", &[]));
+        assert_eq!(first_pipeline(&seq).commands[0], Command::Simple(assignment("FOO", ww("bar"))));
+        assert_eq!(first_pipeline(&seq).commands[1], Command::Simple(plain("cat", &[])));
     }
 
     #[test]
@@ -1280,14 +1292,14 @@ mod tests {
         use crate::lexer::WordPart;
         let inner_seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww("bar")],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1299,7 +1311,7 @@ mod tests {
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
         assert_eq!(first_pipeline(&seq).commands.len(), 1);
         match &first_pipeline(&seq).commands[0] {
-            SimpleCommand::Assign(items) => {
+            Command::Simple(SimpleCommand::Assign(items)) => {
                 assert_eq!(items.len(), 1);
                 let (name, value) = &items[0];
                 assert_eq!(name, "FOO");
@@ -1310,7 +1322,7 @@ mod tests {
                 }
                 assert!(matches!(&value.0[1], WordPart::CommandSub { .. }));
             }
-            other => panic!("expected Assign, got {other:?}"),
+            other => panic!("expected Simple(Assign), got {other:?}"),
         }
     }
 
@@ -1321,7 +1333,7 @@ mod tests {
             .unwrap();
         assert!(seq.background);
         assert!(seq.rest.is_empty());
-        assert_eq!(first_pipeline(&seq).commands, vec![plain("sleep", &["1"])]);
+        assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("sleep", &["1"]))]);
     }
 
     #[test]
@@ -1425,6 +1437,7 @@ mod tests {
     fn first_if(seq: &Sequence) -> &IfClause {
         match &seq.first {
             Command::If(c) => c,
+            Command::Simple(_) => panic!("expected an if, got a simple command"),
             Command::Pipeline(_) => panic!("expected an if, got a pipeline"),
             Command::While(_) => panic!("expected an if, got a while"),
             Command::For(_) => panic!("expected an if, got a for"),
@@ -1611,7 +1624,7 @@ mod tests {
         assert_eq!(clause.words.len(), 3);
         assert_eq!(
             clause.body.first,
-            Command::Pipeline(Pipeline { commands: vec![plain("echo", &[])] })
+            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("echo", &[]))] })
         );
     }
 
@@ -1735,8 +1748,8 @@ mod tests {
             kw("fi"),
         ]).unwrap().unwrap();
         let c = first_if(&seq);
-        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
-        assert_eq!(c.then_body.first, Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] }));
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
+        assert_eq!(c.then_body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] }));
         assert!(c.elif_branches.is_empty());
         assert!(c.else_body.is_none());
     }
@@ -1873,7 +1886,7 @@ mod tests {
     fn parse_keyword_as_argument_is_literal() {
         let seq = parse(vec![w_tok("echo"), w_tok("if")]).unwrap().unwrap();
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
-            commands: vec![plain("echo", &["if"])],
+            commands: vec![Command::Simple(plain("echo", &["if"]))],
         }));
     }
 
@@ -1908,8 +1921,8 @@ mod tests {
         ]).unwrap().unwrap();
         let c = first_while(&seq);
         assert!(!c.until);
-        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
-        assert_eq!(c.body.first, Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] }));
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
+        assert_eq!(c.body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] }));
     }
 
     #[test]
@@ -2040,7 +2053,7 @@ mod tests {
     fn parse_keyword_while_as_argument_is_literal() {
         let seq = parse(vec![w_tok("echo"), w_tok("while")]).unwrap().unwrap();
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
-            commands: vec![plain("echo", &["while"])],
+            commands: vec![Command::Simple(plain("echo", &["while"]))],
         }));
     }
 
@@ -2070,7 +2083,7 @@ mod tests {
         let clause = first_if(&seq);
         assert_eq!(
             clause.then_body.first,
-            Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] })
+            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] })
         );
     }
 
@@ -2085,7 +2098,7 @@ mod tests {
         assert!(!clause.until);
         assert_eq!(
             clause.body.first,
-            Command::Pipeline(Pipeline { commands: vec![plain("b", &[])] })
+            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] })
         );
     }
 
@@ -2103,7 +2116,7 @@ mod tests {
         let seq = parse(vec![Token::Newline, Token::Newline, w_tok("a")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first, Command::Pipeline(Pipeline { commands: vec![plain("a", &[])] }));
+        assert_eq!(seq.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
     }
 
     #[test]
@@ -2213,7 +2226,7 @@ mod tests {
             Command::BraceGroup(b) => b.as_ref(),
             other => panic!("expected a brace group, got {other:?}"),
         };
-        assert_eq!(body.first, Command::Pipeline(Pipeline { commands: vec![plain("echo", &["hi"])] }));
+        assert_eq!(body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("echo", &["hi"]))] }));
     }
 
     #[test]
@@ -2359,8 +2372,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!("expected Pipeline") };
         assert_eq!(p.commands.len(), 1);
-        let SimpleCommand::Exec(e) = &p.commands[0] else {
-            panic!("expected Exec, got {:?}", p.commands[0])
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+            panic!("expected Simple(Exec), got {:?}", p.commands[0])
         };
         assert_eq!(e.inline_assignments.len(), 2);
         assert_eq!(e.inline_assignments[0].0, "A");
@@ -2375,8 +2388,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 1);
-        let SimpleCommand::Assign(items) = &p.commands[0] else {
-            panic!("expected Assign(Vec), got {:?}", p.commands[0])
+        let Command::Simple(SimpleCommand::Assign(items)) = &p.commands[0] else {
+            panic!("expected Simple(Assign(Vec)), got {:?}", p.commands[0])
         };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, "A");
@@ -2388,7 +2401,7 @@ mod tests {
         let tokens = crate::lexer::tokenize("FOO=bar").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
-        let SimpleCommand::Assign(items) = &p.commands[0] else { panic!() };
+        let Command::Simple(SimpleCommand::Assign(items)) = &p.commands[0] else { panic!() };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, "FOO");
     }
@@ -2398,7 +2411,7 @@ mod tests {
         let tokens = crate::lexer::tokenize("cmd A=1").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
-        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
         assert!(e.inline_assignments.is_empty());
         assert_eq!(e.program, ww("cmd"));
         assert_eq!(e.args, vec![ww("A=1")]);
@@ -2409,7 +2422,7 @@ mod tests {
         let tokens = crate::lexer::tokenize("1FOO=bar cmd").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
-        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
         assert!(e.inline_assignments.is_empty());
         assert_eq!(e.program, ww("1FOO=bar"));
         assert_eq!(e.args, vec![ww("cmd")]);
@@ -2461,7 +2474,7 @@ mod tests {
         let tokens = crate::lexer::tokenize("cmd <<A <<B\nbody_a\nA\nbody_b\nB\n").unwrap();
         let seq = parse(tokens).unwrap().unwrap();
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
-        let SimpleCommand::Exec(e) = &p.commands[0] else { panic!("expected Exec") };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("expected Simple(Exec)") };
         // The last heredoc (B's body) should be in stdin.
         if let Some(Redirect::Heredoc { body, .. }) = &e.stdin {
             // body_b → Literal{"body_b", quoted:false} + Literal{"\n", quoted:true}
@@ -2478,12 +2491,12 @@ mod tests {
         let seq = parse(tokens).unwrap().unwrap();
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
         assert_eq!(p.commands.len(), 2, "expected 2 pipeline stages");
-        let SimpleCommand::Exec(stage0) = &p.commands[0] else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
         assert!(
             matches!(stage0.stdin, Some(Redirect::Heredoc { .. })),
             "stage 0 should have Heredoc stdin, got: {:?}", stage0.stdin
         );
-        let SimpleCommand::Exec(stage1) = &p.commands[1] else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
         assert!(
             stage1.stdin.is_none(),
             "stage 1 should have no stdin, got: {:?}", stage1.stdin

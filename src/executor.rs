@@ -83,6 +83,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
 fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     match cmd {
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
+        Command::Simple(s) => run_single(s, shell, sink),
         Command::If(clause) => run_if(clause, shell, sink),
         Command::While(clause) => run_while(clause, shell, sink),
         Command::For(clause) => run_for(clause, shell, sink),
@@ -282,7 +283,10 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     if pipeline.commands.len() == 1 {
-        run_single(&pipeline.commands[0], shell, sink)
+        match &pipeline.commands[0] {
+            Command::Simple(s) => run_single(s, shell, sink),
+            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 only emits Simple"),
+        }
     } else {
         run_multi_stage(&pipeline.commands, shell, sink)
     }
@@ -331,10 +335,10 @@ fn run_background_sequence(
     let mut all_resolved: Vec<Option<ResolvedCommand>> = Vec::with_capacity(n);
     for cmd in &pipeline.commands {
         match cmd {
-            SimpleCommand::Assign(_) => {
+            Command::Simple(SimpleCommand::Assign(_)) => {
                 all_resolved.push(None);
             }
-            SimpleCommand::Exec(exec) => match resolve(exec, shell) {
+            Command::Simple(SimpleCommand::Exec(exec)) => match resolve(exec, shell) {
                 Ok(r) => all_resolved.push(Some(r)),
                 Err(code) => {
                     // Failed to expand; print the [N] line for the failed
@@ -342,6 +346,7 @@ fn run_background_sequence(
                     return ExecOutcome::Continue(code);
                 }
             },
+            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
         }
     }
 
@@ -363,8 +368,9 @@ fn run_background_sequence(
         // Extract inline_assignments from the original ExecCommand.
         // Assign-variant stages were already handled above (continue'd).
         let inline_assignments = match orig_cmd {
-            SimpleCommand::Exec(exec) => &exec.inline_assignments,
-            SimpleCommand::Assign(_) => unreachable!("Assign stages are skipped above"),
+            Command::Simple(SimpleCommand::Exec(exec)) => &exec.inline_assignments,
+            Command::Simple(SimpleCommand::Assign(_)) => unreachable!("Assign stages are skipped above"),
+            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
         };
 
         let snap = apply_inline_assignments(inline_assignments, shell);
@@ -522,11 +528,12 @@ fn cleanup_partial_pipeline(pgid: Option<i32>, children: Vec<Child>) {
 /// True iff every stage in the pipeline is a builtin (or an Assign).
 fn pipeline_is_pure_builtin(pipeline: &Pipeline) -> bool {
     pipeline.commands.iter().all(|cmd| match cmd {
-        SimpleCommand::Exec(e) => match e.program.0.first() {
+        Command::Simple(SimpleCommand::Exec(e)) => match e.program.0.first() {
             Some(crate::lexer::WordPart::Literal { text: name, .. }) => builtins::is_builtin(name),
             _ => false,
         },
-        SimpleCommand::Assign(_) => true,
+        Command::Simple(SimpleCommand::Assign(_)) => true,
+        _ => false, // non-Simple stages (Task 2+) are never pure-builtins
     })
 }
 
@@ -1026,7 +1033,7 @@ enum Stage {
 }
 
 fn run_multi_stage(
-    commands: &[SimpleCommand],
+    commands: &[Command],
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
@@ -1036,13 +1043,14 @@ fn run_multi_stage(
     let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
-            SimpleCommand::Assign(_) => {
+            Command::Simple(SimpleCommand::Assign(_)) => {
                 resolved_stages.push(None);
             }
-            SimpleCommand::Exec(exec) => match resolve(exec, shell) {
+            Command::Simple(SimpleCommand::Exec(exec)) => match resolve(exec, shell) {
                 Ok(r) => resolved_stages.push(Some(r)),
                 Err(code) => return ExecOutcome::Continue(code),
             },
+            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
         }
     }
     let mut all_files: Vec<Option<StageFiles>> = Vec::with_capacity(resolved_stages.len());
@@ -1087,8 +1095,9 @@ fn run_multi_stage(
         // Extract inline_assignments from the original ExecCommand.
         // Assign-variant stages were already handled above (continue'd).
         let inline_assignments = match orig_cmd {
-            SimpleCommand::Exec(exec) => &exec.inline_assignments,
-            SimpleCommand::Assign(_) => unreachable!("Assign stages are skipped above"),
+            Command::Simple(SimpleCommand::Exec(exec)) => &exec.inline_assignments,
+            Command::Simple(SimpleCommand::Assign(_)) => unreachable!("Assign stages are skipped above"),
+            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
         };
 
         if builtins::is_builtin(&cmd.program) {
@@ -1523,14 +1532,14 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww(word)],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1546,14 +1555,14 @@ mod tests {
         let lhs = if succeed { "0" } else { "1" };
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("test"),
                     args: vec![ww(lhs), ww("-eq"), ww("0")],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1577,7 +1586,7 @@ mod tests {
 
     fn one_command_sequence(cmd: SimpleCommand) -> Sequence {
         Sequence {
-            first: Command::Pipeline(Pipeline { commands: vec![cmd] }),
+            first: Command::Pipeline(Pipeline { commands: vec![Command::Simple(cmd)] }),
             rest: vec![],
             background: false,
         }
@@ -1677,7 +1686,7 @@ mod tests {
         // stdin), so we just confirm the terminal echo's output is captured.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![exec("echo", &["first"]), exec("echo", &["second"])],
+                commands: vec![Command::Simple(exec("echo", &["first"])), Command::Simple(exec("echo", &["second"]))],
             }),
             rest: vec![],
             background: false,
@@ -1699,7 +1708,7 @@ mod tests {
         // that would otherwise fire when the next prompt calls reap_and_notify.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![exec("echo", &["hi"])],
+                commands: vec![Command::Simple(exec("echo", &["hi"]))],
             }),
             rest: vec![],
             background: true,
@@ -1716,7 +1725,7 @@ mod tests {
         // `Exit 1` (via render_state) rather than `Done`.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![exec("test", &["-z", "hi"])],
+                commands: vec![Command::Simple(exec("test", &["-z", "hi"]))],
             }),
             rest: vec![],
             background: true,
@@ -1733,7 +1742,7 @@ mod tests {
         // `$(cmd &)` must wait and capture, not spawn an escaped bg job.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![exec("echo", &["captured"])],
+                commands: vec![Command::Simple(exec("echo", &["captured"]))],
             }),
             rest: vec![],
             background: true,
@@ -1750,9 +1759,9 @@ mod tests {
     fn background_pure_builtin_assignment_runs_in_parent() {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Assign(vec![
+                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
-                ])],
+                ]))],
             }),
             rest: vec![],
             background: true,
@@ -1778,14 +1787,14 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1801,9 +1810,9 @@ mod tests {
         // is visible after.
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Assign(vec![
+                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     ("BG_X".to_string(), Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
-                ])],
+                ]))],
             }),
             rest: vec![],
             background: false,
@@ -1859,14 +1868,14 @@ mod tests {
     fn echo_var_seq(var: &str) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Var { name: var.to_string(), quoted: false }])],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1877,14 +1886,14 @@ mod tests {
     fn continue_seq() -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
                     args: vec![],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -1947,14 +1956,14 @@ mod tests {
         // body: `continue ; echo NOPE` — `continue` must skip the echo on
         // every iteration, so nothing prints, yet all values are visited.
         let echo_nope = Command::Pipeline(Pipeline {
-            commands: vec![SimpleCommand::Exec(ExecCommand {
+            commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                 inline_assignments: Vec::new(),
                 program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                 args: vec![Word(vec![WordPart::Literal { text: "NOPE".to_string(), quoted: false }])],
                 stdin: None,
                 stdout: None,
                 stderr: None,
-            })],
+            }))],
         });
         let mut body = continue_seq();
         body.rest.push((crate::command::Connector::Semi, echo_nope));
@@ -1977,14 +1986,14 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -2153,14 +2162,14 @@ mod tests {
     fn function_def_registers_and_returns_zero() {
         let body = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![SimpleCommand::Exec(ExecCommand {
+                commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
                     stdin: None,
                     stdout: None,
                     stderr: None,
-                })],
+                }))],
             }),
             rest: vec![],
             background: false,
@@ -2280,7 +2289,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![cmd] };
+        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=inner true");
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -2304,7 +2313,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![cmd] };
+        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=val myfunc");
         assert_eq!(shell.get("FOO"), Some("val"));
@@ -2321,7 +2330,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![cmd] };
+        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
