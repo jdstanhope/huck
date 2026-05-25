@@ -12,6 +12,7 @@ pub enum ContinuationReason {
     OpenQuote,
     Operator,
     Compound,
+    Heredoc,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -40,6 +41,9 @@ pub fn classify(buffer: &str) -> Completeness {
     }
     let tokens = match lexer::tokenize(buffer) {
         Ok(tokens) => tokens,
+        Err(LexError::UnterminatedHeredoc) => {
+            return Completeness::Incomplete(ContinuationReason::Heredoc);
+        }
         Err(e) => {
             return if is_unterminated_lex(&e) {
                 Completeness::Incomplete(ContinuationReason::OpenQuote)
@@ -91,6 +95,7 @@ pub fn joiner_for(reason: ContinuationReason, last_line: &str) -> &'static str {
                 "; "
             }
         }
+        ContinuationReason::Heredoc => "\n",
     }
 }
 
@@ -303,5 +308,26 @@ mod tests {
             classify("foo()"),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
+    }
+
+    #[test]
+    fn classify_heredoc_unclosed_is_incomplete() {
+        assert_eq!(
+            classify("cat <<EOF\nhello"),
+            Completeness::Incomplete(ContinuationReason::Heredoc)
+        );
+    }
+
+    #[test]
+    fn classify_heredoc_closed_is_complete() {
+        assert_eq!(
+            classify("cat <<EOF\nhello\nEOF\n"),
+            Completeness::Complete
+        );
+    }
+
+    #[test]
+    fn joiner_for_heredoc_is_newline() {
+        assert_eq!(joiner_for(ContinuationReason::Heredoc, ""), "\n");
     }
 }
