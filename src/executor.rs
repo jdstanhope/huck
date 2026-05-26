@@ -460,6 +460,29 @@ fn run_background_sequence(
                         }
                     }
                 }
+                Some(Redirect::HereString(body)) => {
+                    if let Some(r) = prev_pipe_read.take() {
+                        parent_held.retain(|&fd| fd != r);
+                        unsafe { libc::close(r); }
+                    }
+                    // Here-string: expand with no split/glob + trailing newline.
+                    let mut bytes = expand_assignment(body, shell).into_bytes();
+                    bytes.push(b'\n');
+                    heredoc_body_bytes = Some(bytes);
+                    match make_pipe() {
+                        Ok((r, w)) => {
+                            heredoc_write_fd = Some(w);
+                            r
+                        }
+                        Err(e) => {
+                            eprintln!("huck: pipe: {e}");
+                            restore_inline_assignments(snap, shell);
+                            cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                }
                 _ => prev_pipe_read.take().unwrap_or(devnull_fd),
             }
         } else {
@@ -769,6 +792,10 @@ enum ResolvedStdin {
     /// Storing the Word (rather than pre-expanded bytes) ensures that
     /// `FOO=hi cat <<EOF\n$FOO\nEOF` sees FOO=hi in the body expansion.
     Heredoc(crate::lexer::Word),
+    /// `<<< word` — here-string body Word to be expanded just before spawning.
+    /// Expansion uses expand_assignment (no split/glob); a trailing `\n` is
+    /// appended per bash semantics.
+    HereString(crate::lexer::Word),
 }
 
 struct ResolvedCommand {
@@ -819,10 +846,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             // body expansion sees FOO=hi.
             Some(ResolvedStdin::Heredoc(body.clone()))
         }
-        Some(Redirect::HereString(_)) => unreachable!(
-            "Redirect::HereString handling lands in Task 2; parser produces this now \
-             but the executor doesn't route it yet"
-        ),
+        Some(Redirect::HereString(w)) => Some(ResolvedStdin::HereString(w.clone())),
         Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
             unreachable!("parser never produces Truncate/Append for stdin")
         }
@@ -866,6 +890,9 @@ enum StdinInput {
     /// Heredoc body to be expanded just before spawning the child, after
     /// `apply_inline_assignments` has been called for this stage.
     DeferredHeredoc(crate::lexer::Word),
+    /// Here-string body to be expanded just before spawning the child.
+    /// Expansion via expand_assignment (no split/glob) + trailing `\n`.
+    DeferredHereString(crate::lexer::Word),
 }
 
 struct StageFiles {
@@ -890,6 +917,9 @@ fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFi
             // (run_exec_single, run_background_sequence) will see a
             // DeferredHeredoc and must expand it before spawning the child.
             Some(StdinInput::DeferredHeredoc(body.clone()))
+        }
+        Some(ResolvedStdin::HereString(body)) => {
+            Some(StdinInput::DeferredHereString(body.clone()))
         }
         None => None,
     };
@@ -1118,6 +1148,13 @@ fn run_subprocess(
             // path (run_exec_single / run_subprocess), so expanding here is
             // correct: $var references see the stage's inline assignments.
             let bytes = expand_assignment(&body, shell).into_bytes();
+            process.stdin(Stdio::piped());
+            pending_stdin_bytes = Some(bytes);
+        }
+        Some(StdinInput::DeferredHereString(body)) => {
+            // Here-string: expand with no split/glob, append trailing newline.
+            let mut bytes = expand_assignment(&body, shell).into_bytes();
+            bytes.push(b'\n');
             process.stdin(Stdio::piped());
             pending_stdin_bytes = Some(bytes);
         }
@@ -1444,6 +1481,31 @@ fn run_multi_stage(
                     // Expand the body NOW while inline assignments are still applied.
                     // Store the bytes; write them to the pipe after the child is spawned.
                     heredoc_body_bytes = Some(expand_assignment(body, shell).into_bytes());
+                    // Create a pipe: child reads from r; parent writes body to w.
+                    match make_pipe() {
+                        Ok((r, w)) => {
+                            heredoc_write_fd = Some(w);
+                            r
+                        }
+                        Err(e) => {
+                            eprintln!("huck: pipe: {e}");
+                            restore_inline_assignments(snap, shell);
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                }
+                Some(Redirect::HereString(body)) => {
+                    // Discard the previous stage's pipe read-end: this stage
+                    // overrides stdin via here-string.
+                    if let Some(r) = prev_pipe_read.take() {
+                        parent_held.retain(|&fd| fd != r);
+                        unsafe { libc::close(r); }
+                    }
+                    // Expand NOW (inline assignments still applied) + trailing newline.
+                    let mut bytes = expand_assignment(body, shell).into_bytes();
+                    bytes.push(b'\n');
+                    heredoc_body_bytes = Some(bytes);
                     // Create a pipe: child reads from r; parent writes body to w.
                     match make_pipe() {
                         Ok((r, w)) => {
