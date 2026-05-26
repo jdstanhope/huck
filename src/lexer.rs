@@ -47,7 +47,6 @@ pub enum TildeSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
-#[allow(dead_code)] // variants constructed in Task 2 (lexer `/` arm).
 pub enum SubstAnchor {
     None,    // ${var/pat/repl} and ${var//pat/repl}
     Prefix,  // ${var/#pat/repl}
@@ -63,7 +62,6 @@ pub enum ParamModifier {
     UseAlternate  { word: Word, colon: bool },
     RemovePrefix  { pattern: Word, longest: bool },
     RemoveSuffix  { pattern: Word, longest: bool },
-    #[allow(dead_code)] // constructed in Task 2 (lexer `/` arm).
     Substitute {
         pattern: Word,
         replacement: Word,
@@ -1124,6 +1122,22 @@ fn read_braced_param_expansion(
             parts.push(WordPart::ParamExpansion { name, modifier, quoted });
             Ok(())
         }
+        Some('/') => {
+            let all = chars.peek() == Some(&'/');
+            if all { chars.next(); }
+            let anchor = match chars.peek().copied() {
+                Some('#') if !all => { chars.next(); SubstAnchor::Prefix }
+                Some('%') if !all => { chars.next(); SubstAnchor::Suffix }
+                _ => SubstAnchor::None,
+            };
+            let (pattern, replacement) = scan_substitution_operand(chars)?;
+            parts.push(WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
+                quoted,
+            });
+            Ok(())
+        }
         Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
         None => Err(LexError::UnterminatedBrace),
     }
@@ -1161,6 +1175,56 @@ where
     let body = scan_braced_operand(chars)?;
     let word = parse_braced_operand(&body)?;
     Ok(build(word))
+}
+
+/// Walks the chars iterator from just after the leading `/` of a
+/// substitution operand. Splits pattern from replacement on the first
+/// unescaped `/`. `\/` becomes a literal `/` in the pattern half; `\\`
+/// becomes a literal `\`; any other `\x` passes through unchanged so the
+/// existing operand parser sees it. Consumes through the closing `}`.
+fn scan_substitution_operand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(Word, Word), LexError> {
+    let mut pattern_src = String::new();
+    let mut replacement_src = String::new();
+    let mut in_replacement = false;
+    let mut found_close = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '}' => { found_close = true; break; }
+            '\\' => {
+                match chars.peek().copied() {
+                    Some('/') => {
+                        chars.next();
+                        let dst = if in_replacement { &mut replacement_src } else { &mut pattern_src };
+                        dst.push('/');
+                    }
+                    Some('\\') => {
+                        chars.next();
+                        let dst = if in_replacement { &mut replacement_src } else { &mut pattern_src };
+                        dst.push('\\');
+                    }
+                    _ => {
+                        let dst = if in_replacement { &mut replacement_src } else { &mut pattern_src };
+                        dst.push('\\');
+                    }
+                }
+            }
+            '/' if !in_replacement => {
+                in_replacement = true;
+            }
+            _ => {
+                let dst = if in_replacement { &mut replacement_src } else { &mut pattern_src };
+                dst.push(c);
+            }
+        }
+    }
+    if !found_close {
+        return Err(LexError::UnterminatedBrace);
+    }
+    let pattern = parse_braced_operand(&pattern_src)?;
+    let replacement = parse_braced_operand(&replacement_src)?;
+    Ok((pattern, replacement))
 }
 
 fn is_name_start(c: char) -> bool {
@@ -1299,6 +1363,33 @@ mod tests {
     /// Builds a Vec<Token> of all-Literal words.
     fn words(parts: &[&str]) -> Vec<Token> {
         parts.iter().map(|s| w(s)).collect()
+    }
+
+    /// Test alias so the v32 substitution tests read more naturally.
+    fn tokenize_words(input: &str) -> Result<Vec<Token>, LexError> {
+        tokenize(input)
+    }
+
+    /// Pops the first token from `tokens`, asserts it's a single-part Word,
+    /// and returns that `WordPart`.
+    fn single_param_expansion(tokens: &mut Vec<Token>) -> WordPart {
+        let word = match tokens.remove(0) {
+            Token::Word(w) => w,
+            other => panic!("expected Word, got {:?}", other),
+        };
+        word.0.into_iter().next().expect("non-empty word")
+    }
+
+    /// Flattens the literal text parts of a `Word`, ignoring non-literal
+    /// parts. Useful for asserting on simple operand bodies in tests.
+    fn word_to_literal(w: &Word) -> String {
+        let mut s = String::new();
+        for p in &w.0 {
+            if let WordPart::Literal { text, .. } = p {
+                s.push_str(text);
+            }
+        }
+        s
     }
 
     #[test]
@@ -2727,6 +2818,87 @@ mod tests {
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: true, .. }));
+    }
+
+    #[test]
+    fn brace_substitute_first_match() {
+        let mut t = tokenize_words("\"${name/foo/bar}\"").unwrap();
+        let part = single_param_expansion(&mut t);
+        match part {
+            WordPart::ParamExpansion { name, modifier, quoted } => {
+                assert_eq!(name, "name");
+                assert!(quoted);
+                match modifier {
+                    ParamModifier::Substitute { pattern, replacement, anchor, all } => {
+                        assert_eq!(word_to_literal(&pattern), "foo");
+                        assert_eq!(word_to_literal(&replacement), "bar");
+                        assert_eq!(anchor, SubstAnchor::None);
+                        assert!(!all);
+                    }
+                    _ => panic!("expected Substitute"),
+                }
+            }
+            _ => panic!("expected ParamExpansion"),
+        }
+    }
+
+    #[test]
+    fn brace_substitute_all_matches() {
+        let mut t = tokenize_words("${name//foo/bar}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { all, anchor, .. }, .. } = part {
+            assert!(all);
+            assert_eq!(anchor, SubstAnchor::None);
+        } else { panic!("expected Substitute") }
+    }
+
+    #[test]
+    fn brace_substitute_anchored_prefix() {
+        let mut t = tokenize_words("${name/#foo/bar}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { anchor, all, .. }, .. } = part {
+            assert_eq!(anchor, SubstAnchor::Prefix);
+            assert!(!all);
+        } else { panic!("expected Substitute") }
+    }
+
+    #[test]
+    fn brace_substitute_anchored_suffix() {
+        let mut t = tokenize_words("${name/%foo/bar}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { anchor, all, .. }, .. } = part {
+            assert_eq!(anchor, SubstAnchor::Suffix);
+            assert!(!all);
+        } else { panic!("expected Substitute") }
+    }
+
+    #[test]
+    fn brace_substitute_missing_replacement_is_empty_word() {
+        let mut t = tokenize_words("${name/foo}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, .. }, .. } = part {
+            assert_eq!(word_to_literal(&pattern), "foo");
+            assert_eq!(word_to_literal(&replacement), "");
+        } else { panic!("expected Substitute") }
+    }
+
+    #[test]
+    fn brace_substitute_escaped_slash_in_pattern() {
+        let mut t = tokenize_words("${path//\\//-}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substitute { pattern, replacement, all, .. }, .. } = part {
+            assert_eq!(word_to_literal(&pattern), "/");
+            assert_eq!(word_to_literal(&replacement), "-");
+            assert!(all);
+        } else { panic!("expected Substitute") }
+    }
+
+    #[test]
+    fn brace_substitute_unterminated_is_error() {
+        assert!(matches!(
+            tokenize_words("${name/foo/bar"),
+            Err(LexError::UnterminatedBrace)
+        ));
     }
 
     #[test]
