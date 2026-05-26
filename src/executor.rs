@@ -1188,6 +1188,14 @@ fn run_multi_stage(
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.stdin {
                 Some(Redirect::Read(word)) => {
+                    // Discard the previous stage's pipe read-end: this stage
+                    // overrides stdin, so that pipe would otherwise be leaked
+                    // into parent_held, keeping the write-end alive and
+                    // deadlocking the previous stage's writer.
+                    if let Some(r) = prev_pipe_read.take() {
+                        parent_held.retain(|&fd| fd != r);
+                        unsafe { libc::close(r); }
+                    }
                     let path = match expand_single(word, shell) {
                         Ok(p) => p,
                         Err(()) => {
@@ -1208,6 +1216,14 @@ fn run_multi_stage(
                     }
                 }
                 Some(Redirect::Heredoc { body, .. }) => {
+                    // Discard the previous stage's pipe read-end: this stage
+                    // overrides stdin via heredoc, so that pipe would otherwise
+                    // be leaked into parent_held, deadlocking the previous
+                    // stage's writer once the pipe buffer fills.
+                    if let Some(r) = prev_pipe_read.take() {
+                        parent_held.retain(|&fd| fd != r);
+                        unsafe { libc::close(r); }
+                    }
                     // Expand the body NOW while inline assignments are still applied.
                     // Store the bytes; write them to the pipe after the child is spawned.
                     heredoc_body_bytes = Some(expand_assignment(body, shell).into_bytes());
@@ -1485,6 +1501,11 @@ fn run_multi_stage(
                     }
                 }
                 if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                // Exclude capture_read_fd from the drain: it will be closed
+                // explicitly below, avoiding a double-close.
+                if let Some(r) = capture_read_fd {
+                    parent_held.retain(|&fd| fd != r);
+                }
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
                 return ExecOutcome::Continue(1);
