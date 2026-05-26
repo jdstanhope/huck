@@ -125,7 +125,7 @@ group.
 - **M-07: `shift [N]`** — `[deferred]` medium. huck: not implemented. bash: removes the first N positional args.
 - **M-08: `set --` and `set` flags** — `[deferred]` medium. huck: not implemented. bash: `set -- a b c` resets positionals; `set -o`/`-e`/`-u`/`-x`/`pipefail` set shell options.
 - **M-09: `function name { … }` keyword form** — `[deferred]` medium. huck: only the POSIX `name() …` form. bash: also accepts the `function` keyword form.
-- **M-10: Functions as pipeline stages** — `[fixed (2026-05-26)]` high. Pipeline stages of any Command type — simple commands, builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions — now run in forked subshells per POSIX 2.12. The parent's function table is inherited across the fork so `cmd | myfunc` finds and runs `myfunc`.
+- **M-10: Functions as pipeline stages** — `[fixed (2026-05-25)]` high. Pipeline stages of any Command type — simple commands, builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions — now run in forked subshells per POSIX 2.12. The parent's function table is inherited across the fork so `cmd | myfunc` finds and runs `myfunc`.
 
 ### Compound commands
 
@@ -277,11 +277,11 @@ Things huck deliberately does differently from bash. Document and keep.
 - **bash**: byte-faithful.
 
 ### I-16: Builtins in pipelines affect the parent shell
-- **Status**: fixed (2026-05-26) by v25
+- **Status**: fixed (2026-05-26) by v25 (partially) + v26 (fully)
 - **Severity**: medium
-- **huck (was)**: `cd /tmp | true` mutated the parent shell's cwd because builtin pipeline stages ran in-process in the parent.
+- **huck (was)**: `cd /tmp | true` mutated the parent shell's cwd because builtin pipeline stages ran in-process in the parent. Additionally, single-stage pure-builtin pipelines run as background jobs (`echo hi &`, `cd /tmp &`) bypassed the fork entirely via a `pipeline_is_pure_builtin` shortcut in `run_background_sequence`, so `$!` was never updated and side effects still leaked to the parent.
 - **bash**: every pipeline stage runs in a subshell; side effects are local.
-- **Fix**: v25 rewrote `run_multi_stage` so every stage forks a subshell. See spec/plan dated 2026-05-25. (Informally referenced as "I-04" in the v25 spec/plan; the canonical ID here is I-16 since I-04 was already taken.)
+- **Fix**: v25 rewrote `run_multi_stage` so every multi-stage pipeline forks a subshell per stage (spec/plan dated 2026-05-25; informally "I-04" in the v25 spec, canonical ID here is I-16 since I-04 was already taken). v26 completed the fix by removing the `pipeline_is_pure_builtin` shortcut in `run_background_sequence` — all backgrounded pipelines now go through the same fork machinery regardless of whether they are pure-builtin, so `$!` receives a real pid and parent state is no longer mutated.
 
 ---
 
@@ -307,3 +307,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: M-10 (functions and compound commands as pipeline stages) shipped as v25. Every pipeline stage now runs in a forked subshell per POSIX 2.12 — builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions all work as stages. Side-effect isolation is now correct: `cd /tmp | true` no longer mutates the parent's cwd.
 - **2026-05-26**: I-16 added — the previously-undocumented "builtins in pipelines affect parent" divergence (informally "I-04" in the v25 spec) is resolved as a direct consequence of v25. Tracked here for discoverability. Compound-command redirects (`if …; fi <<EOF`) remain unimplemented (separate gap, not v25 scope).
 - **2026-05-26**: M-01/02/03 (special parameters `$0`, `$$`, `$!`) shipped as v26. B-10 (history scanner intercepted `$!` inside double quotes) fixed as part of v26 testing — one-line guard in `src/history.rs::scan()`.
+- **2026-05-26**: I-16 fix completed by v26 post-review patch. v25's fix covered multi-stage pipelines but a `pipeline_is_pure_builtin` shortcut in `run_background_sequence` still ran single-stage pure-builtin backgrounds synchronously in the parent (preventing `$!` update and leaking side effects). Shortcut removed; all backgrounded pipelines now fork. M-10 fixed-date corrected to 2026-05-25.

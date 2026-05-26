@@ -106,13 +106,48 @@ fn dollar_bang_set_after_backgrounded_external() {
 
 #[test]
 fn dollar_bang_is_last_stage_of_pipeline() {
-    let (out, _) = run("echo hi | /usr/bin/sleep 0.1 &\necho \"[$!]\"\nwait\nexit\n");
-    let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).expect("[pid] line");
+    // Spawn a pipeline where the first stage prints its own pid (via $$).
+    // $! should be the LAST stage's pid (the cat), not the first stage's.
+    let (out, _) = run(
+        "/usr/bin/sh -c 'echo $$' | /usr/bin/cat &\nLAST=$!\nwait\necho \"[$LAST]\"\nexit\n"
+    );
+    let bracketed = out.lines().find(|l| l.starts_with('[')).expect("bracketed");
+    let last_pid: i32 = bracketed[1..bracketed.len()-1].parse().expect("int");
+    let first_pid: i32 = out.lines()
+        .find(|l| l.trim().parse::<i32>().is_ok())
+        .and_then(|l| l.trim().parse().ok())
+        .expect("first stage pid printed");
+    assert_ne!(last_pid, first_pid, "$! should be last stage's pid, not first; got: {out}");
+    assert!(last_pid > 0);
+}
+
+#[test]
+fn dollar_bang_set_after_backgrounded_pure_builtin() {
+    // Pre-fix: pipeline_is_pure_builtin shortcut in run_background_sequence
+    // ran echo synchronously in the parent without forking; last_bg_pid
+    // stayed unset/stale. Post-fix: echo runs in a forked subshell and $!
+    // returns that pid.
+    let (out, _) = run("echo hi &\necho \"[$!]\"\nwait\nexit\n");
+    let bracketed = out.lines()
+        .find(|l| l.starts_with('[') && l.ends_with(']') && l.len() > 2)
+        .unwrap_or_else(|| panic!("expected non-empty bracketed pid line, got: {out}"));
     let inner = &bracketed[1..bracketed.len()-1];
-    let _pid: i32 = inner.parse().expect("integer inside brackets");
-    // The exact pid isn't predictable; just verify it's a valid integer pid.
-    // The semantic (LAST stage's pid) is covered by the spec; this test
-    // documents that $! is a valid pid after a pipeline &.
+    let pid: i32 = inner.parse().expect("integer inside brackets");
+    assert!(pid > 0, "got: {out}");
+}
+
+#[test]
+fn dollar_bang_updates_after_second_background() {
+    // After cmd1 &; cmd2 &, $! should reflect cmd2's pid, not cmd1's.
+    let (out, _) = run(
+        "/usr/bin/sleep 0.2 &\nFIRST=$!\necho hi &\nSECOND=$!\nwait\necho \"[$FIRST] [$SECOND]\"\nexit\n"
+    );
+    let line = out.lines()
+        .find(|l| l.contains("[") && l.contains("]"))
+        .unwrap_or_else(|| panic!("got: {out}"));
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(parts.len(), 2, "got: {out}");
+    assert_ne!(parts[0], parts[1], "$! should differ between two backgrounds; got: {out}");
 }
 
 #[test]

@@ -297,34 +297,10 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -
 fn run_background_sequence(
     pipeline: &Pipeline,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
+    _sink: &mut StdoutSink,
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
-
-    if pipeline_is_pure_builtin(pipeline) {
-        // Run synchronously in the parent shell. Side effects (cd, exports,
-        // exit) take effect on the parent — documented divergence from bash,
-        // which would fork a subshell.
-        let outcome = run_pipeline(pipeline, shell, sink);
-        if matches!(outcome, ExecOutcome::Exit(_)) {
-            return outcome;
-        }
-        let exit = match outcome {
-            ExecOutcome::Continue(c) => c,
-            ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
-            ExecOutcome::FunctionReturn(n) => n,
-            ExecOutcome::Exit(_) => unreachable!(),
-        };
-        shell.jobs.add_synthetic_done(display, exit);
-        // Route through the normal notification path so the line is formatted
-        // with notification_line (includes `Exit N` for non-zero exits, the
-        // command text, and the trailing `&`) and marked notified — preventing
-        // the duplicate "[N] Done" line that would otherwise fire at the next
-        // reap_and_notify pass.
-        crate::jobs::reap_and_notify(shell);
-        return ExecOutcome::Continue(0);
-    }
 
     // Spawn each stage using the same per-stage fork dispatch as run_multi_stage
     // (classify_stage → External via spawn_external_with_fds, or InProcess via
@@ -769,18 +745,6 @@ fn cleanup_partial_pipeline_raw(pgid: Option<i32>, pids: &[i32]) {
         let mut raw: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut raw, 0); }
     }
-}
-
-/// True iff every stage in the pipeline is a builtin (or an Assign).
-fn pipeline_is_pure_builtin(pipeline: &Pipeline) -> bool {
-    pipeline.commands.iter().all(|cmd| match cmd {
-        Command::Simple(SimpleCommand::Exec(e)) => match e.program.0.first() {
-            Some(crate::lexer::WordPart::Literal { text: name, .. }) => builtins::is_builtin(name),
-            _ => false,
-        },
-        Command::Simple(SimpleCommand::Assign(_)) => true,
-        _ => false, // non-Simple stages (Task 2+) are never pure-builtins
-    })
 }
 
 /// Strips a trailing `&` and surrounding whitespace from the source line for
@@ -2446,12 +2410,11 @@ mod tests {
     
 
     #[test]
-    fn background_pure_builtin_runs_synchronously_and_notifies_done() {
-        // The synthetic Done job is added then immediately notified via the
-        // normal reap_and_notify path (which formats via notification_line and
-        // marks notified), so remove_notified drops it on the same sweep —
-        // leaving the table empty. This prevents the duplicate `[N] Done` line
-        // that would otherwise fire when the next prompt calls reap_and_notify.
+    fn background_pure_builtin_forks_and_registers_job() {
+        // Post-fix: `echo hi &` (a single-stage pure-builtin pipeline) now forks
+        // a subshell rather than running synchronously in the parent. The job
+        // should appear in the table immediately after execute() returns (before
+        // wait/reap), because the fork registered it as Running.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![Command::Simple(exec("echo", &["hi"]))],
@@ -2462,25 +2425,29 @@ mod tests {
         let mut shell = Shell::new();
         let outcome = execute(&seq, &mut shell, "echo hi &");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.jobs.iter().count(), 0);
+        // last_bg_pid must have been set to a real forked pid.
+        assert!(shell.last_bg_pid.is_some(), "last_bg_pid should be set after pure-builtin &");
+        let pid = shell.last_bg_pid.unwrap();
+        assert!(pid > 0, "pid should be positive, got {pid}");
     }
 
     #[test]
-    fn background_pure_builtin_nonzero_exit_runs_and_notifies() {
-        // `test -z hi` returns 1 (non-empty). The notification path must surface
-        // `Exit 1` (via render_state) rather than `Done`.
+    fn background_pure_builtin_does_not_mutate_parent_env() {
+        // Post-fix: `HUCK_TEST_BG_ASSIGN=v &` runs in a forked subshell, so
+        // the assignment must NOT leak back to the parent shell's environment.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
-                commands: vec![Command::Simple(exec("test", &["-z", "hi"]))],
+                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
+                    ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
+                ]))],
             }),
             rest: vec![],
             background: true,
         };
         let mut shell = Shell::new();
-        let outcome = execute(&seq, &mut shell, "test -z hi &");
-        assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.jobs.iter().count(), 0);
-        // Format coverage is in jobs::tests::notification_line_for_nonzero_exit.
+        let _ = execute(&seq, &mut shell, "HUCK_TEST_BG_ASSIGN=v &");
+        // The assignment ran in a forked subshell — should NOT be visible in parent.
+        assert_eq!(shell.get("HUCK_TEST_BG_ASSIGN"), None);
     }
 
     #[test]
@@ -2499,23 +2466,6 @@ mod tests {
         assert_eq!(status, 0);
         // And nothing should have been registered in the job table.
         assert_eq!(shell.jobs.iter().count(), 0);
-    }
-
-    #[test]
-    fn background_pure_builtin_assignment_runs_in_parent() {
-        let seq = Sequence {
-            first: Command::Pipeline(Pipeline {
-                commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
-                ]))],
-            }),
-            rest: vec![],
-            background: true,
-        };
-        let mut shell = Shell::new();
-        let _ = execute(&seq, &mut shell, "HUCK_TEST_BG_ASSIGN=v &");
-        // The assignment ran in the parent (pure-builtin path).
-        assert_eq!(shell.get("HUCK_TEST_BG_ASSIGN"), Some("v"));
     }
 
     #[test]
