@@ -31,6 +31,15 @@ pub struct Shell {
     pub sigint_flag: Arc<AtomicBool>,
     pub shell_pgid: i32,
     pub history: crate::history::History,
+    /// Shell PID, cached at startup via `getpid()`. Used for `$$`.
+    pub shell_pid: i32,
+    /// PID of the most-recently-backgrounded pipeline's last stage. Used for `$!`.
+    pub last_bg_pid: Option<i32>,
+    /// The shell's argv[0], cached at startup. Used for `$0` at the top level.
+    pub shell_argv0: String,
+    /// Stack of function names pushed/popped around each `call_function`.
+    /// `$0` returns the top of this stack when inside a function.
+    pub function_arg0: Vec<String>,
 }
 
 impl Shell {
@@ -39,6 +48,8 @@ impl Shell {
         for (key, value) in std::env::vars() {
             vars.insert(key, Variable { value, exported: true });
         }
+        let shell_pid = unsafe { libc::getpid() };
+        let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
         Self {
             vars,
             last_status: 0,
@@ -49,6 +60,10 @@ impl Shell {
             sigint_flag: Arc::new(AtomicBool::new(false)),
             shell_pgid: unsafe { libc::getpgrp() },
             history: crate::history::History::new(),
+            shell_pid,
+            last_bg_pid: None,
+            shell_argv0,
+            function_arg0: Vec::new(),
         }
     }
 
@@ -61,13 +76,25 @@ impl Shell {
     /// regular variable HashMap. Returns an owned `String` because
     /// positional/computed values are not stored as references.
     pub fn lookup_var(&self, name: &str) -> Option<String> {
+        // Special parameters (v26).
+        match name {
+            "0" => return Some(
+                self.function_arg0.last().cloned().unwrap_or_else(|| self.shell_argv0.clone())
+            ),
+            "$" => return Some(self.shell_pid.to_string()),
+            "!" => return Some(
+                self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default()
+            ),
+            _ => {}
+        }
         if name == "#" {
             return Some(self.positional_args.len().to_string());
         }
         if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
             let n: usize = name.parse().ok()?;
             if n == 0 {
-                return None; // $0 deferred
+                // unreachable: "0" is matched by the special-params block above
+                return None;
             }
             return self.positional_args.get(n - 1).cloned();
         }
@@ -259,5 +286,61 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("FOO", "bar".to_string());
         assert!(shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn shell_new_caches_pid_and_argv0() {
+        let shell = Shell::new();
+        assert!(shell.shell_pid > 0, "shell_pid should be positive");
+        assert!(!shell.shell_argv0.is_empty(), "shell_argv0 should be non-empty");
+        assert_eq!(shell.last_bg_pid, None);
+        assert!(shell.function_arg0.is_empty());
+    }
+
+    #[test]
+    fn lookup_var_dollar_returns_cached_pid_as_string() {
+        let mut shell = Shell::new();
+        shell.shell_pid = 12345;
+        assert_eq!(shell.lookup_var("$"), Some("12345".to_string()));
+    }
+
+    #[test]
+    fn lookup_var_bang_unset_returns_empty_string() {
+        let shell = Shell::new();
+        assert_eq!(shell.lookup_var("!"), Some(String::new()));
+    }
+
+    #[test]
+    fn lookup_var_bang_after_set_returns_pid_string() {
+        let mut shell = Shell::new();
+        shell.last_bg_pid = Some(54321);
+        assert_eq!(shell.lookup_var("!"), Some("54321".to_string()));
+    }
+
+    #[test]
+    fn lookup_var_zero_top_level_returns_shell_argv0() {
+        let mut shell = Shell::new();
+        shell.shell_argv0 = "my-shell".to_string();
+        assert_eq!(shell.lookup_var("0"), Some("my-shell".to_string()));
+    }
+
+    #[test]
+    fn lookup_var_zero_in_function_returns_function_name() {
+        let mut shell = Shell::new();
+        shell.shell_argv0 = "my-shell".to_string();
+        shell.function_arg0.push("myfunc".to_string());
+        assert_eq!(shell.lookup_var("0"), Some("myfunc".to_string()));
+    }
+
+    #[test]
+    fn lookup_var_zero_nested_returns_innermost() {
+        let mut shell = Shell::new();
+        shell.function_arg0.push("outer".to_string());
+        shell.function_arg0.push("inner".to_string());
+        assert_eq!(shell.lookup_var("0"), Some("inner".to_string()));
+        shell.function_arg0.pop();
+        assert_eq!(shell.lookup_var("0"), Some("outer".to_string()));
+        shell.function_arg0.pop();
+        assert!(shell.lookup_var("0").is_some());  // falls through to shell_argv0
     }
 }
