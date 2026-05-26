@@ -75,9 +75,11 @@ pub fn expand_modifier(
             let p = expand_word_to_string(pattern, shell);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest))
         }
-        ParamModifier::Substitute { .. } => {
-            // Filled in by Task 4.
-            ExpansionResult::Value(shell.get(name).unwrap_or("").to_string())
+        ParamModifier::Substitute { pattern, replacement, anchor, all } => {
+            let v = shell.get(name).unwrap_or("").to_string();
+            let pat = expand_word_to_string(pattern, shell);
+            let rep = expand_word_to_string(replacement, shell);
+            ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
         }
     }
 }
@@ -152,7 +154,6 @@ fn remove_suffix(value: &str, pattern: &str, longest: bool) -> String {
     value.to_string()
 }
 
-#[allow(dead_code)] // wired in Task 4
 fn substitute(
     value: &str,
     pattern: &str,
@@ -611,5 +612,60 @@ mod tests {
         // `f*` against "foo bar foo" — greedy, all-mode still only one
         // replacement (matches whole tail from first `f`).
         assert_eq!(substitute("foo bar foo", "f*", "X", SubstAnchor::None, true), "X");
+    }
+
+    #[test]
+    fn expand_modifier_substitute_first_match() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU1", "foobar".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("fXobar".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_all() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU2", "foobar".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: true,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("fXXbar".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_unset_var_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU_UNSET", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_anchored_prefix() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU3", "hello".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("he"),
+            replacement: lit("HI"),
+            anchor: SubstAnchor::Prefix,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU3", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("HIllo".to_string()));
     }
 }
