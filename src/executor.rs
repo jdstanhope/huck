@@ -819,6 +819,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             // body expansion sees FOO=hi.
             Some(ResolvedStdin::Heredoc(body.clone()))
         }
+        Some(Redirect::HereString(_)) => unreachable!(
+            "Redirect::HereString handling lands in Task 2; parser produces this now \
+             but the executor doesn't route it yet"
+        ),
         Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
             unreachable!("parser never produces Truncate/Append for stdin")
         }
@@ -831,8 +835,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Append(w)) => {
             Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
         }
-        Some(Redirect::Read(_) | Redirect::Heredoc { .. }) => {
-            unreachable!("parser never produces Read/Heredoc for stdout")
+        Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
+            unreachable!("parser never produces Read/Heredoc/HereString for stdout")
         }
         None => None,
     };
@@ -843,8 +847,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Append(w)) => {
             Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
         }
-        Some(Redirect::Read(_) | Redirect::Heredoc { .. }) => {
-            unreachable!("parser never produces Read/Heredoc for stderr")
+        Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
+            unreachable!("parser never produces Read/Heredoc/HereString for stderr")
         }
         None => None,
     };

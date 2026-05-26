@@ -219,6 +219,9 @@ pub enum Redirect {
     /// word triggers literal mode). `strip_tabs` is true for `<<-`.
     /// The body has tabs already stripped at lex time for `<<-`.
     Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    /// `<<<word` — here-string: the body is a single Word to be expanded
+    /// (no split/glob) with a trailing newline appended.
+    HereString(Word),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -931,6 +934,7 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                     Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
                     Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
                     Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
+                    Operator::HereString => stdin = Some(Redirect::HereString(target)),
                     Operator::Pipe
                     | Operator::And
                     | Operator::Or
@@ -2758,5 +2762,53 @@ mod tests {
         };
         assert_eq!(p.commands.len(), 2);
         assert!(matches!(p.commands[0], Command::Case(_)), "stage 0 should be Case");
+    }
+
+    // ---- v27 here-string parser tests ------------------------------------------
+
+    #[test]
+    fn parse_here_string_attaches_to_stdin() {
+        let tokens = crate::lexer::tokenize("cat <<< hi").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+    }
+
+    #[test]
+    fn parse_here_string_last_wins_over_file() {
+        let tokens = crate::lexer::tokenize("cat <file <<< hi").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+    }
+
+    #[test]
+    fn parse_here_string_last_wins_over_heredoc() {
+        let tokens = crate::lexer::tokenize("cat <<EOF <<< override\nignored\nEOF\n").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+    }
+
+    #[test]
+    fn parse_here_string_missing_word_errors() {
+        let tokens = crate::lexer::tokenize("cat <<<").unwrap();
+        let result = parse(tokens);
+        assert!(result.is_err(), "expected parse error, got {:?}", result);
+    }
+
+    #[test]
+    fn parse_here_string_in_pipeline_stage() {
+        let tokens = crate::lexer::tokenize("cat <<< x | grep x").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        assert_eq!(p.commands.len(), 2);
+        let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&stage0.stdin, Some(Redirect::HereString(_))));
+        let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
+        assert!(stage1.stdin.is_none());
     }
 }

@@ -31,6 +31,7 @@ pub enum Operator {
     DoubleSemi,     // ;;
     SemiAmp,        // ;&
     DoubleSemiAmp,  // ;;&
+    HereString,     // <<<
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -317,28 +318,33 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 if chars.peek() == Some(&'<') {
                     chars.next(); // consume second '<'
-                    let strip_tabs = if chars.peek() == Some(&'-') {
-                        chars.next(); // consume '-'
-                        true
+                    if chars.peek() == Some(&'<') {
+                        chars.next(); // consume third '<' — here-string
+                        tokens.push(Token::Op(Operator::HereString));
                     } else {
-                        false
-                    };
-                    // Parse the delimiter word and detect literal vs expanding mode.
-                    let (delim, expand) = parse_heredoc_delim(&mut chars)?;
-                    // Push a placeholder Token::Heredoc with empty body.
-                    // The body is back-patched after the line's \n.
-                    let placeholder_idx = tokens.len();
-                    tokens.push(Token::Heredoc {
-                        body: Word(Vec::new()),
-                        expand,
-                        strip_tabs,
-                    });
-                    pending_heredocs.push_back(PendingHeredoc {
-                        delim,
-                        expand,
-                        strip_tabs,
-                        token_idx: placeholder_idx,
-                    });
+                        let strip_tabs = if chars.peek() == Some(&'-') {
+                            chars.next(); // consume '-'
+                            true
+                        } else {
+                            false
+                        };
+                        // Parse the delimiter word and detect literal vs expanding mode.
+                        let (delim, expand) = parse_heredoc_delim(&mut chars)?;
+                        // Push a placeholder Token::Heredoc with empty body.
+                        // The body is back-patched after the line's \n.
+                        let placeholder_idx = tokens.len();
+                        tokens.push(Token::Heredoc {
+                            body: Word(Vec::new()),
+                            expand,
+                            strip_tabs,
+                        });
+                        pending_heredocs.push_back(PendingHeredoc {
+                            delim,
+                            expand,
+                            strip_tabs,
+                            token_idx: placeholder_idx,
+                        });
+                    }
                 } else {
                     tokens.push(Token::Op(Operator::RedirIn));
                 }
@@ -3255,5 +3261,51 @@ mod tests {
         assert!(matches!(&parts[0], WordPart::Literal { text, .. } if text == "pre-"));
         assert!(matches!(&parts[1], WordPart::Var { name, .. } if name == "$"));
         assert!(matches!(&parts[2], WordPart::Literal { text, .. } if text == "-post"));
+    }
+
+    // ---- v27 here-string lexer tests -------------------------------------------
+
+    #[test]
+    fn tokenize_here_string_op_alone() {
+        let tokens = tokenize("<<<").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::HereString)]);
+    }
+
+    #[test]
+    fn tokenize_here_string_with_unquoted_word() {
+        let tokens = tokenize("cat <<< hello").unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert!(matches!(tokens[0], Token::Word(_)));
+        assert!(matches!(tokens[1], Token::Op(Operator::HereString)));
+        assert!(matches!(tokens[2], Token::Word(_)));
+    }
+
+    #[test]
+    fn tokenize_here_string_with_quoted_word() {
+        let tokens = tokenize("cat <<< \"hi there\"").unwrap();
+        let Token::Word(Word(parts)) = &tokens[2] else { panic!("got {:?}", tokens[2]) };
+        assert!(matches!(&parts[0], WordPart::Literal { text, quoted: true } if text == "hi there"));
+    }
+
+    #[test]
+    fn tokenize_here_string_with_var_in_body() {
+        let tokens = tokenize("cat <<< $FOO").unwrap();
+        let Token::Word(Word(parts)) = &tokens[2] else { panic!() };
+        assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "FOO"));
+    }
+
+    #[test]
+    fn tokenize_here_string_with_command_sub_in_body() {
+        let tokens = tokenize("cat <<< $(echo hi)").unwrap();
+        let Token::Word(Word(parts)) = &tokens[2] else { panic!() };
+        assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
+    }
+
+    #[test]
+    fn tokenize_double_less_still_heredoc() {
+        // Regression: `<<EOF` must still lex as Heredoc, not split into `<<` + `<EOF`.
+        let tokens = tokenize("cat <<EOF\nbody\nEOF\n").unwrap();
+        assert!(tokens.iter().any(|t| matches!(t, Token::Heredoc { .. })),
+            "expected Heredoc token, got {:?}", tokens);
     }
 }
