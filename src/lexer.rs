@@ -654,6 +654,14 @@ fn read_dollar_expansion(
             chars.next();
             parts.push(WordPart::Var { name: "#".to_string(), quoted });
         }
+        Some('$') => {
+            chars.next();
+            parts.push(WordPart::Var { name: "$".to_string(), quoted });
+        }
+        Some('!') => {
+            chars.next();
+            parts.push(WordPart::Var { name: "!".to_string(), quoted });
+        }
         Some(c) if c.is_ascii_digit() => {
             let d = chars.next().unwrap();
             parts.push(WordPart::Var { name: d.to_string(), quoted });
@@ -1775,12 +1783,12 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_double_dollar_is_two_literal_dollars() {
+    fn tokenize_double_dollar_is_var_name_dollar() {
+        // v26: $$ is the shell PID special parameter, not two literal dollars.
         assert_eq!(
             tokenize("$$").unwrap(),
             vec![Token::Word(Word(vec![
-                WordPart::Literal { text: "$".to_string(), quoted: false },
-                WordPart::Literal { text: "$".to_string(), quoted: false },
+                WordPart::Var { name: "$".to_string(), quoted: false },
             ]))]
         );
     }
@@ -3192,5 +3200,60 @@ mod tests {
         };
         // Body contains literal "hello \\\nworld\n" — backslash + newline + world.
         assert_eq!(body_text, "hello \\\nworld\n");
+    }
+
+    #[test]
+    fn lexer_dollar_dollar_emits_var_name_dollar() {
+        let tokens = tokenize("$$").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!("expected Word, got {:?}", tokens[0]) };
+        assert_eq!(parts.len(), 1);
+        assert!(
+            matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "$"),
+            "got {:?}", parts[0]
+        );
+    }
+
+    #[test]
+    fn lexer_dollar_bang_emits_var_name_bang() {
+        let tokens = tokenize("$!").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(
+            matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "!"),
+            "got {:?}", parts[0]
+        );
+    }
+
+    #[test]
+    fn lexer_dollar_zero_already_emits_var_name_zero() {
+        // Regression test: $0 was lexed by the existing digit path pre-v26;
+        // confirm it still produces Var { name: "0" }.
+        let tokens = tokenize("$0").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "0"));
+    }
+
+    #[test]
+    fn lexer_dollar_dollar_inside_double_quotes() {
+        let tokens = tokenize("\"$$\"").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(matches!(&parts[0], WordPart::Var { name, quoted: true } if name == "$"));
+    }
+
+    #[test]
+    fn lexer_dollar_bang_inside_double_quotes() {
+        let tokens = tokenize("\"$!\"").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(matches!(&parts[0], WordPart::Var { name, quoted: true } if name == "!"));
+    }
+
+    #[test]
+    fn lexer_dollar_dollar_concatenates_with_literal() {
+        let tokens = tokenize("pre-$$-post").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], WordPart::Literal { text, .. } if text == "pre-"));
+        assert!(matches!(&parts[1], WordPart::Var { name, .. } if name == "$"));
+        assert!(matches!(&parts[2], WordPart::Literal { text, .. } if text == "-post"));
     }
 }
