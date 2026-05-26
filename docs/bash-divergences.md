@@ -23,7 +23,7 @@ messages so the doc stays in sync.
 | --- | --- | --- |
 | Bugs (Tier 1) | 9 | Things to fix |
 | Missing features (Tier 2) | 59 | Bash-compat backlog (M-10 fixed by v25) |
-| Intentional (Tier 3) | 9 | Deliberate divergences we're keeping |
+| Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
 
 ---
@@ -268,6 +268,13 @@ Things huck deliberately does differently from bash. Document and keep.
 - **huck**: invalid UTF-8 from `$(cmd)` → `U+FFFD` replacement.
 - **bash**: byte-faithful.
 
+### I-16: Builtins in pipelines affect the parent shell
+- **Status**: fixed (2026-05-26) by v25
+- **Severity**: medium
+- **huck (was)**: `cd /tmp | true` mutated the parent shell's cwd because builtin pipeline stages ran in-process in the parent.
+- **bash**: every pipeline stage runs in a subshell; side effects are local.
+- **Fix**: v25 rewrote `run_multi_stage` so every stage forks a subshell. See spec/plan dated 2026-05-25. (Informally referenced as "I-04" in the v25 spec/plan; the canonical ID here is I-16 since I-04 was already taken.)
+
 ---
 
 ## Tier 4: Low-impact / edge cases
@@ -290,3 +297,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-24**: M-04 (inline assignments) shipped as v23.
 - **2026-05-24**: M-12 (here-documents) shipped as v24. Also reshapes ExecCommand.stdin from Option<Word> to Option<Redirect> so `<file`, `<<EOF`, and future `<<<word` share a uniform shape.
 - **2026-05-26**: M-10 (functions and compound commands as pipeline stages) shipped as v25. Every pipeline stage now runs in a forked subshell per POSIX 2.12 — builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions all work as stages. Side-effect isolation is now correct: `cd /tmp | true` no longer mutates the parent's cwd.
+- **2026-05-26**: I-16 added — the previously-undocumented "builtins in pipelines affect parent" divergence (informally "I-04" in the v25 spec) is resolved as a direct consequence of v25. Tracked here for discoverability. Compound-command redirects (`if …; fi <<EOF`) remain unimplemented (separate gap, not v25 scope).

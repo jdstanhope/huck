@@ -56,6 +56,8 @@ fn pipeline_brace_group_as_stage() {
 
 #[test]
 fn pipeline_while_loop_as_stage() {
+    // TODO: replace with the idiomatic `while read x; do echo got:$x; done`
+    // form once the `read` builtin is implemented (M-XX — currently deferred).
     // huck lacks `read`, so we can't use `while IFS= read -r x; do …; done`.
     // Instead: `seq 1 3 | while true; do cat; break; done` — the while body
     // runs `cat` which drains all of stdin (the pipe from seq), then `break`
@@ -132,16 +134,40 @@ fn pipeline_exit_in_first_stage_does_not_exit_shell() {
 
 #[test]
 fn pipeline_compound_with_redirect() {
-    // Heredoc inside the compound body, compound stage as the first pipeline
-    // stage, grep as the second.
+    // Heredoc inside the compound body (inner-cat form): compound stage as the
+    // first pipeline stage, grep as the second.
     // `if true; then cat <<EOF; fi | grep foo`
     //   foo
     //   bar
     //   EOF
     // → output contains "foo" but not "bar".
+    // This exercises the per-command heredoc path inside a pipeline-stage
+    // compound, which is valid coverage distinct from the outer-redirect form.
     let (out, _) = run("if true; then cat <<EOF; fi | grep foo\nfoo\nbar\nEOF\nexit\n");
     assert!(out.contains("foo"), "expected 'foo', got: {out}");
     assert!(!out.contains("bar"), "unexpected 'bar' leaked, got: {out}");
+}
+
+#[test]
+#[ignore = "compound-command redirects not parsed by huck — separate issue"]
+fn pipeline_compound_with_outer_redirect() {
+    // Heredoc attached to the OUTER `if` compound, not to inner cat.
+    // This is the spec's intended form: exercises v24-heredoc-on-compound
+    // + v25-compound-as-pipeline-stage composition.
+    //
+    // `if true; then cat; fi <<EOF | grep foo`
+    //    foo
+    //    bar
+    //    EOF
+    //
+    // Outcome: huck's parser currently rejects the `<<EOF` after `fi` with
+    // "syntax error: unexpected token after command" — compound-command
+    // redirects are not yet parsed.  Ignored until that gap is addressed
+    // (separate from v25's scope).  When compound-command redirects land,
+    // this test should pass: the v24 heredoc machinery attaches the body to
+    // the if-stage's stdin; the inner `cat` reads from it; grep filters.
+    let (out, _) = run("if true; then cat; fi <<EOF | grep foo\nfoo\nbar\nEOF\nexit\n");
+    assert!(out.contains("foo"), "got: {out}");
 }
 
 #[test]
