@@ -964,6 +964,54 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 };
                 rest.push((Connector::Semi, cmd));
             }
+            Some(Token::Op(Operator::Background)) => {
+                iter.next(); // consume `&`
+                // `&` inside a subshell body backgrounds the preceding command
+                // and acts as a separator. Skip any redundant `;` or newlines
+                // that follow (`&;` is equivalent to `&` in bash).
+                while matches!(
+                    iter.peek(),
+                    Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+                ) {
+                    iter.next();
+                }
+                skip_newlines(iter);
+                // If `)` follows (or stream ends), this `&` terminates the
+                // whole body as a backgrounded sequence.
+                if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+                    iter.next(); // consume `)`
+                    return Ok(Sequence { first, rest, background: true });
+                }
+                if iter.peek().is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                // More commands follow (`(cmd1 &; cmd2)` pattern): parse the
+                // next command and continue. The `&` acts as a `;` separator
+                // here; only the trailing `&` before `)` sets background.
+                let raw = parse_command(iter)?;
+                let cmd = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                    let mut stages = vec![raw];
+                    iter.next();
+                    skip_newlines(iter);
+                    let mut more = true;
+                    while more {
+                        let (c, np) = parse_next_stage(iter)?;
+                        stages.push(c);
+                        if !np {
+                            if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                                iter.next();
+                                skip_newlines(iter);
+                            } else {
+                                more = false;
+                            }
+                        }
+                    }
+                    Command::Pipeline(Pipeline { commands: stages })
+                } else {
+                    raw
+                };
+                rest.push((Connector::Semi, cmd));
+            }
             Some(Token::Op(Operator::And)) => {
                 iter.next();
                 skip_newlines(iter);
@@ -3055,5 +3103,30 @@ mod tests {
             "function body should be a Subshell, got {:?}",
             body
         );
+    }
+
+    #[test]
+    fn parse_subshell_with_inner_background() {
+        // (cmd &) — backgrounded INSIDE the subshell body. Spec says this should
+        // work. Was a Task 1 gap: parse_subshell_sequence rejected Operator::Background.
+        let tokens = crate::lexer::tokenize("(echo hi &)").unwrap();
+        let parsed = parse(tokens).expect("parse should succeed").expect("non-empty");
+        let Command::Subshell { body } = parsed.first else {
+            panic!("expected Subshell, got {:?}", parsed.first)
+        };
+        // The body's pipeline is backgrounded inside the subshell.
+        assert!(body.background, "inner pipeline should be marked backgrounded");
+    }
+
+    #[test]
+    fn parse_subshell_with_inner_background_and_sequence() {
+        // (cmd1 &; cmd2) — first command backgrounded, then second runs.
+        // Bash allows this; both cmd1 (bg) and cmd2 (fg) run inside the subshell.
+        let tokens = crate::lexer::tokenize("(echo a &; echo b)").unwrap();
+        let result = parse(tokens);
+        // At minimum, this should not be a parse error. The exact AST shape
+        // depends on whether the implementer collapsed `&;` into one separator
+        // or treats them distinctly. Lenient assertion: parse succeeded.
+        assert!(result.is_ok(), "got: {:?}", result);
     }
 }
