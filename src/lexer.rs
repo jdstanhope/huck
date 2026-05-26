@@ -46,6 +46,14 @@ pub enum TildeSpec {
     OldPwd,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+#[allow(dead_code)] // variants constructed in Task 2 (lexer `/` arm).
+pub enum SubstAnchor {
+    None,    // ${var/pat/repl} and ${var//pat/repl}
+    Prefix,  // ${var/#pat/repl}
+    Suffix,  // ${var/%pat/repl}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamModifier {
     Length,
@@ -55,6 +63,13 @@ pub enum ParamModifier {
     UseAlternate  { word: Word, colon: bool },
     RemovePrefix  { pattern: Word, longest: bool },
     RemoveSuffix  { pattern: Word, longest: bool },
+    #[allow(dead_code)] // constructed in Task 2 (lexer `/` arm).
+    Substitute {
+        pattern: Word,
+        replacement: Word,
+        anchor: SubstAnchor,
+        all: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

@@ -75,6 +75,10 @@ pub fn expand_modifier(
             let p = expand_word_to_string(pattern, shell);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest))
         }
+        ParamModifier::Substitute { .. } => {
+            // Filled in by Task 4.
+            ExpansionResult::Value(shell.get(name).unwrap_or("").to_string())
+        }
     }
 }
 
