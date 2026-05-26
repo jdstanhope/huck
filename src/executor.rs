@@ -21,13 +21,14 @@ pub enum StdoutSink<'a> {
 
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    // Backgrounding a compound command (if/while) is not supported;
-    // fall through and run it synchronously.
-    if seq.background
-        && let Command::Pipeline(p) = &seq.first
-    {
-        // Parser guarantees rest.is_empty() when background is set.
-        return run_background_sequence(p, shell, &mut sink, source);
+    if seq.background {
+        if let Command::Pipeline(p) = &seq.first {
+            // Parser guarantees rest.is_empty() when background is set.
+            return run_background_sequence(p, shell, &mut sink, source);
+        }
+        if let Command::Subshell { .. } = &seq.first {
+            return run_background_subshell(&seq.first, shell, &mut sink, source);
+        }
     }
     execute_sequence_body(seq, shell, &mut sink)
 }
@@ -360,6 +361,41 @@ fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -
 }
 
 // ----- background pipeline --------------------------------------------------
+
+/// Backgrounds a `Command::Subshell` via fork + job registration.
+/// Used by `execute()` when `seq.background` is set and `seq.first` is
+/// `Command::Subshell`.  Does NOT waitpid — returns immediately after
+/// registering the job.
+fn run_background_subshell(
+    cmd: &Command,
+    shell: &mut Shell,
+    _sink: &mut StdoutSink,
+    source: &str,
+) -> ExecOutcome {
+    let display = display_command(source);
+    // Inherit stdin from the terminal (unlike pipeline backgrounds that use
+    // /dev/null) — match bash/dash behaviour for `(cmd) &`.
+    match fork_and_run_in_subshell(
+        cmd,
+        shell,
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+        /*pgid_target=*/ 0,
+        /*parent_fds_to_close=*/ &[],
+    ) {
+        Ok(pid) => {
+            shell.last_bg_pid = Some(pid);
+            let id = shell.jobs.add(pid, vec![pid], display);
+            eprintln!("[{id}] {pid}");
+            ExecOutcome::Continue(0)
+        }
+        Err(e) => {
+            eprintln!("huck: fork: {e}");
+            ExecOutcome::Continue(1)
+        }
+    }
+}
 
 fn run_background_sequence(
     pipeline: &Pipeline,
@@ -2206,12 +2242,13 @@ pub fn fork_and_run_in_subshell(
         let mut sink = StdoutSink::Terminal;
         // Anti-recursion guard: when a Command::Subshell is used as a
         // pipeline stage, the pipeline forks via this helper.  If we called
-        // run_command here, it would fork AGAIN.  Instead, run the inner
-        // Sequence directly via execute_sequence_body so we get exactly one
-        // fork per Subshell regardless of whether it appears at top level or
-        // as a pipeline stage.
+        // run_command here, it would fork AGAIN.  Instead, dispatch via
+        // execute() so that body.background is honoured — `(cmd &)` inside a
+        // subshell must background the inner command and let the subshell exit.
+        // execute() calls execute_sequence_body when background is false
+        // (the common case), preserving the single-fork invariant.
         let outcome = match cmd {
-            Command::Subshell { body } => execute_sequence_body(body, shell, &mut sink),
+            Command::Subshell { body } => execute(body, shell, "(subshell)"),
             other => run_command(other, shell, &mut sink),
         };
         // 7. Translate outcome to an 8-bit exit status.
