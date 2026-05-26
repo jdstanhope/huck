@@ -146,7 +146,7 @@ group.
 
 ### Parameter expansion modifiers
 
-- **M-15: `${var/pat/repl}` and `${var//pat/repl}`** — `[deferred]` high. huck: `InvalidBraceModifier("/")`. bash: substitution.
+- **M-15: `${var/pat/repl}` and `${var//pat/repl}`** — `[fixed v32]` high. All six forms: `/`, `//`, `/#`, `/%`, plus empty-repl shortcut. Glob pattern engine; `\/` escapes literal slash in pattern. Bash-compat empty-pattern no-op + trailing-empty-match suppression for greedy patterns like `*`.
 - **M-16: `${var:off:len}` substring** — `[deferred]` high. huck: `InvalidBraceModifier(":N")`. bash: substring extraction.
 - **M-17: `${var^^}` / `${var,,}` case modification** — `[deferred]` medium. huck: `InvalidBraceModifier("^")`. bash: upper/lower case.
 - **M-58: `${var:?w}` doesn't abort non-interactive scripts** — `[open]` medium. huck: prints error, sets `$?` = 1, continues. bash: exits the script.
@@ -338,3 +338,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: v30 Task 3 follow-up: added `dbracket_in_while` integration test (was in spec table, missed by implementer); added `parse_dbracket_with_inline_assignment` parser unit test strengthening the speculative-peel path. Logged B-11 (`false; echo $?` prints 0 instead of 1 — pre-existing bug, entire test suite works around it via `\n` separators).
 - **2026-05-26**: M-14 (`[[ ]]` extended test) shipped as v30. Regex engine is `regex` crate (RE2-style; L-09 documents the divergence from POSIX ERE).
 - **2026-05-26**: B-11 fixed (v31). `execute_sequence_body` now calls `shell.set_last_status` after each command's `Continue(c)` outcome so `$?` propagates across `;`/`&&`/`||` within a sequence. Tier 1 is empty again.
+- **2026-05-26**: M-15 (`${var/pat/repl}` pattern substitution) shipped as v32. All six bash forms: first-match `/`, all-matches `//`, anchored-prefix `/#`, anchored-suffix `/%`, plus empty-replacement shortcut. New `ParamModifier::Substitute` + `SubstAnchor` AST, new lexer `Some('/')` arm with `scan_substitution_operand` (`\/` escapes literal slash), `substitute()` evaluator using `glob::Pattern` over a `char_indices` boundary scan. Empty pattern is a no-op (bash-compat); trailing empty match suppressed so `${var//*/Q}` emits a single replacement.

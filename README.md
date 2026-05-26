@@ -39,6 +39,7 @@ spec, an implementation plan, and a test suite.
 | v28       | Subshell syntax (`(list)`)                               |
 | v29       | FD-duplication redirects (`2>&1`, `1>&2`, `&>file`, `&>>file`) |
 | v30       | `[[ ]]` extended test (pattern/regex/int/file/combinators)      |
+| v32       | Pattern substitution `${var/pat/repl}` (all six bash forms)      |
 
 ## Build and run
 
@@ -110,8 +111,11 @@ or longest matching prefix; `${var%pat}`/`${var%%pat}` strip the
 suffix. Patterns use glob syntax (`*`, `?`, `[abc]`) and `*` can
 cross `/`. The operand `w` (or `pat`) is recursively expanded —
 variables, arithmetic, command sub, and tilde all work inside.
-Pattern substitution `${var/pat/repl}`, substring `${var:off:len}`,
-and case modification are not yet implemented.
+Pattern substitution `${var/pat/repl}` (v32) replaces the first match;
+`${var//pat/repl}` replaces all; `${var/#pat/repl}` and
+`${var/%pat/repl}` anchor at start or end; the replacement is optional
+(missing → empty); `\/` escapes a literal slash in the pattern.
+Substring `${var:off:len}` and case modification are not yet implemented.
 
 **Command history (v13):**
 Commands are recorded in memory and persisted to `$HISTFILE` (default
@@ -219,7 +223,8 @@ brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
 **Not yet implemented:**
-pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
+substring parameter expansion (`${var:off:len}`),
+case modification (`${var^^}`/`${var,,}`),
 brace expansion (`{a,b,c}`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
