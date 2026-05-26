@@ -3791,4 +3791,15 @@ mod tests {
         let tokens = crate::lexer::tokenize("[[ x == y").unwrap();
         assert!(parse(tokens).is_err(), "expected parse error for unterminated [[");
     }
+
+    #[test]
+    fn parse_dbracket_with_inline_assignment() {
+        let tokens = crate::lexer::tokenize("FOO=hi [[ $FOO == hi ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::DoubleBracket { expr: _, inline_assignments } = parsed.first else {
+            panic!("expected DoubleBracket, got {:?}", parsed.first)
+        };
+        assert_eq!(inline_assignments.len(), 1);
+        assert_eq!(inline_assignments[0].0, "FOO");
+    }
 }

@@ -21,7 +21,7 @@ messages so the doc stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 10 | Things to fix (B-10 fixed 2026-05-26) |
+| Bugs (Tier 1) | 11 | Things to fix (B-10 fixed 2026-05-26; B-11 open) |
 | Missing features (Tier 2) | 53 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 8 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence) |
@@ -94,6 +94,15 @@ huck behaves wrong without a design reason; should be fixed.
 - **huck (was)**: the foreground pipeline wait loop iterated `stages` one PID at a time with per-pid `waitpid`. If one stage stopped while the loop was blocked on a sibling (worst case: a producer/consumer deadlock pair), huck would wedge.
 - **bash**: foreground wait targets the whole process group.
 - **Fix**: `src/executor.rs` — new `wait_pgrp_pipeline` helper calls `waitpid(-pgid, …, WUNTRACED)` in a loop until every process stage is reaped (or any one stops). EINTR is retried; ECHILD bails with status 1 for remaining slots. Pipeline exit status is the last stage's status per POSIX. PTY regression test in `tests/pty_interactive.rs`.
+
+### B-11: `$?` doesn't propagate across `;` separator
+- **Status**: open
+- **Severity**: medium
+- **huck**: `false; echo $?` prints `0` instead of `1`. The `;` separator appears to reset or fail to thread `$?` through. Same for `[ 1 -eq 2 ]; echo $?`. Workaround: use `\n` instead (`false\necho $?` works correctly).
+- **bash**: `$?` after `;` is the previous command's exit status.
+- **Surfaced**: noticed during v30 integration tests; the entire huck test suite has been working around it by using `\n` separators for `$?` checks.
+- **Suspected cause**: `parse_sequence` or `execute_sequence_body` may be resetting `shell.last_status` on the `;` connector before evaluating `$?` in the next command. Worth tracing.
+- **Fix location (probably)**: `src/executor.rs::execute_sequence_body` — verify last_status isn't being overwritten before the next command's expansion sees it.
 
 ### B-10: history expansion intercepted `$!` inside double quotes
 - **Status**: fixed (2026-05-26)
@@ -319,3 +328,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: M-13 (here-strings `<<<word`) shipped as v27.
 - **2026-05-26**: M-11 (subshell syntax `(list)`) shipped as v28.
 - **2026-05-26**: M-18/19 (fd-duplication redirects) shipped as v29. Supports `2>&1`, `1>&2`, `&>file`, `&>>file`. Documented order-divergence for `2>&1 >file` anti-pattern as L-08.
+- **2026-05-26**: v30 Task 3 follow-up: added `dbracket_in_while` integration test (was in spec table, missed by implementer); added `parse_dbracket_with_inline_assignment` parser unit test strengthening the speculative-peel path. Logged B-11 (`false; echo $?` prints 0 instead of 1 — pre-existing bug, entire test suite works around it via `\n` separators).

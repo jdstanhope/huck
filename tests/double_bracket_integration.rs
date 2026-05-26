@@ -149,3 +149,11 @@ fn dbracket_in_subshell() {
     let (out, _) = run("([[ a == a ]]) && echo ok\nexit\n");
     assert!(out.lines().any(|l| l.trim() == "ok"), "got: {out}");
 }
+
+#[test]
+fn dbracket_in_while() {
+    // Test that `[[ ]]` works as a while-loop condition. Loop runs once
+    // when the counter is 0, increments, then [[ ]] becomes false and exits.
+    let (out, _) = run("i=0\nwhile [[ $i -lt 1 ]]; do echo iter:$i; i=1; done\nexit\n");
+    assert!(out.lines().any(|l| l.trim() == "iter:0"), "got: {out}");
+}
