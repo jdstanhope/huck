@@ -61,6 +61,13 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     ) {
         return status;
     }
+    // B-11: propagate `$?` across sequence connectors. The top-level loop
+    // in shell.rs only refreshes `shell.last_status` after `process_line`
+    // returns, so without this update the second command in `false; echo $?`
+    // would see a stale value.
+    if let ExecOutcome::Continue(c) = status {
+        shell.set_last_status(c);
+    }
     for (connector, command) in &seq.rest {
         let should_run = match connector {
             Connector::Semi => true,
@@ -75,6 +82,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                     | ExecOutcome::FunctionReturn(_)
             ) {
                 return status;
+            }
+            if let ExecOutcome::Continue(c) = status {
+                shell.set_last_status(c);
             }
         }
     }

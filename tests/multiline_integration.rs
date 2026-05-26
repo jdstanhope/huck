@@ -113,3 +113,26 @@ fn multiline_command_stored_as_single_history_line() {
         "history did not show the collapsed form; stdout: {out}"
     );
 }
+
+// B-11 regression: `$?` after `;` must see the previous command's exit
+// status, not the stale value from before the current sequence began.
+#[test]
+fn dollar_question_after_semi_sees_prev_status() {
+    let (out, _) = run("false; echo $?\nexit\n");
+    assert!(out.lines().any(|l| l == "1"), "stdout: {out}");
+}
+
+#[test]
+fn dollar_question_chains_across_multiple_semis() {
+    let (out, _) = run("true; false; echo $?; true; echo $?\nexit\n");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines.contains(&"1"), "expected 1 from false; stdout: {out}");
+    assert!(lines.contains(&"0"), "expected 0 from true; stdout: {out}");
+}
+
+#[test]
+fn dollar_question_propagates_through_and_or_connectors() {
+    // After `||` short-circuit branch runs, $? reflects its result.
+    let (out, _) = run("false || true; echo $?\nexit\n");
+    assert!(out.lines().any(|l| l == "0"), "stdout: {out}");
+}
