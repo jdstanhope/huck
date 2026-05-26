@@ -32,6 +32,10 @@ pub enum Operator {
     SemiAmp,        // ;&
     DoubleSemiAmp,  // ;;&
     HereString,     // <<<
+    DupOut,         // >&
+    DupErr,         // 2>&
+    AndRedirOut,    // &>
+    AndRedirAppend, // &>>
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -264,6 +268,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::And));
+                } else if chars.peek() == Some(&'>') {
+                    chars.next();
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                        tokens.push(Token::Op(Operator::AndRedirAppend));
+                    } else {
+                        tokens.push(Token::Op(Operator::AndRedirOut));
+                    }
                 } else {
                     tokens.push(Token::Op(Operator::Background));
                 }
@@ -359,6 +371,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirAppend));
+                } else if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::DupOut));
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
@@ -369,6 +384,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirErrAppend));
+                } else if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::DupErr));
                 } else {
                     tokens.push(Token::Op(Operator::RedirErr));
                 }
@@ -3307,5 +3325,56 @@ mod tests {
         let tokens = tokenize("cat <<EOF\nbody\nEOF\n").unwrap();
         assert!(tokens.iter().any(|t| matches!(t, Token::Heredoc { .. })),
             "expected Heredoc token, got {:?}", tokens);
+    }
+
+    #[test]
+    fn tokenize_dup_out_basic() {
+        let tokens = tokenize(">&").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::DupOut)]);
+    }
+
+    #[test]
+    fn tokenize_dup_err_basic() {
+        let tokens = tokenize("2>&").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::DupErr)]);
+    }
+
+    #[test]
+    fn tokenize_and_redir_out() {
+        let tokens = tokenize("&>").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::AndRedirOut)]);
+    }
+
+    #[test]
+    fn tokenize_and_redir_append() {
+        let tokens = tokenize("&>>").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::AndRedirAppend)]);
+    }
+
+    #[test]
+    fn tokenize_dup_in_context() {
+        let tokens = tokenize("cmd 2>&1").unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert!(matches!(tokens[0], Token::Word(_)));
+        assert!(matches!(tokens[1], Token::Op(Operator::DupErr)));
+        assert!(matches!(tokens[2], Token::Word(_)));
+    }
+
+    #[test]
+    fn tokenize_redir_out_regression() {
+        assert_eq!(tokenize(">").unwrap(), vec![Token::Op(Operator::RedirOut)]);
+        assert_eq!(tokenize(">>").unwrap(), vec![Token::Op(Operator::RedirAppend)]);
+    }
+
+    #[test]
+    fn tokenize_redir_err_regression() {
+        assert_eq!(tokenize("2>").unwrap(), vec![Token::Op(Operator::RedirErr)]);
+        assert_eq!(tokenize("2>>").unwrap(), vec![Token::Op(Operator::RedirErrAppend)]);
+    }
+
+    #[test]
+    fn tokenize_background_regression() {
+        assert_eq!(tokenize("&").unwrap(), vec![Token::Op(Operator::Background)]);
+        assert_eq!(tokenize("&&").unwrap(), vec![Token::Op(Operator::And)]);
     }
 }

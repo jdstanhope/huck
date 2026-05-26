@@ -148,6 +148,12 @@ fn is_assignment_word(w: &crate::lexer::Word) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// Constructs a single-part unquoted literal `Word` from a static string.
+/// Used by the parser to synthesize the "1" source-word in `&>` / `&>>` desugaring.
+fn lit_word(s: &str) -> Word {
+    Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+}
+
 fn finalize_stage(
     program: crate::lexer::Word,
     args: Vec<crate::lexer::Word>,
@@ -222,6 +228,9 @@ pub enum Redirect {
     /// `<<<word` — here-string: the body is a single Word to be expanded
     /// (no split/glob) with a trailing newline appended.
     HereString(Word),
+    /// `>&N` / `2>&N` — duplicate an fd. `fd` is the target fd (1 for stdout,
+    /// 2 for stderr); `source` is the Word to expand to get the source fd number.
+    Dup { fd: i32, source: Word },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1133,6 +1142,20 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                     Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
                     Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
                     Operator::HereString => stdin = Some(Redirect::HereString(target)),
+                    Operator::DupOut => {
+                        stdout = Some(Redirect::Dup { fd: 1, source: target });
+                    }
+                    Operator::DupErr => {
+                        stderr = Some(Redirect::Dup { fd: 2, source: target });
+                    }
+                    Operator::AndRedirOut => {
+                        stdout = Some(Redirect::Truncate(target));
+                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
+                    }
+                    Operator::AndRedirAppend => {
+                        stdout = Some(Redirect::Append(target));
+                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
+                    }
                     Operator::Pipe
                     | Operator::And
                     | Operator::Or
@@ -3128,5 +3151,87 @@ mod tests {
         // depends on whether the implementer collapsed `&;` into one separator
         // or treats them distinctly. Lenient assertion: parse succeeded.
         assert!(result.is_ok(), "got: {:?}", result);
+    }
+
+    #[test]
+    fn parse_dup_stdout_from_fd2() {
+        let tokens = crate::lexer::tokenize("cmd >&2").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        let Some(Redirect::Dup { fd, source }) = &e.stdout else { panic!("got {:?}", e.stdout) };
+        assert_eq!(*fd, 1);
+        // source Word's first part should be Literal "2".
+        assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "2"));
+    }
+
+    #[test]
+    fn parse_dup_stderr_from_fd1() {
+        let tokens = crate::lexer::tokenize("cmd 2>&1").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        let Some(Redirect::Dup { fd, source }) = &e.stderr else { panic!("got {:?}", e.stderr) };
+        assert_eq!(*fd, 2);
+        assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
+    }
+
+    #[test]
+    fn parse_and_redir_out_desugars() {
+        let tokens = crate::lexer::tokenize("cmd &>file").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        // stdout = Truncate(file)
+        let Some(Redirect::Truncate(file)) = &e.stdout else { panic!("got {:?}", e.stdout) };
+        assert!(matches!(&file.0[0], WordPart::Literal { text, .. } if text == "file"));
+        // stderr = Dup{fd:2, source:"1"}
+        let Some(Redirect::Dup { fd, source }) = &e.stderr else { panic!("got {:?}", e.stderr) };
+        assert_eq!(*fd, 2);
+        assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
+    }
+
+    #[test]
+    fn parse_and_redir_append_desugars() {
+        let tokens = crate::lexer::tokenize("cmd &>>file").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        let Some(Redirect::Append(_)) = &e.stdout else { panic!("got {:?}", e.stdout) };
+        let Some(Redirect::Dup { fd, .. }) = &e.stderr else { panic!() };
+        assert_eq!(*fd, 2);
+    }
+
+    #[test]
+    fn parse_dup_with_var_target() {
+        // 2>&$FD — source is a Word with a Var part, not a literal.
+        let tokens = crate::lexer::tokenize("cmd 2>&$FD").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        let Some(Redirect::Dup { source, .. }) = &e.stderr else { panic!() };
+        assert!(source.0.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "FD")));
+    }
+
+    #[test]
+    fn parse_dup_in_pipeline_stage() {
+        let tokens = crate::lexer::tokenize("cmd 2>&1 | grep").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        assert_eq!(p.commands.len(), 2);
+        let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&stage0.stderr, Some(Redirect::Dup { .. })));
+        let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
+        assert!(stage1.stderr.is_none());
+    }
+
+    #[test]
+    fn parse_combined_dup_and_file_redirect() {
+        let tokens = crate::lexer::tokenize("cmd >file 2>&1").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
+        assert!(matches!(&e.stdout, Some(Redirect::Truncate(_))));
+        assert!(matches!(&e.stderr, Some(Redirect::Dup { fd: 2, .. })));
     }
 }

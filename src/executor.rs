@@ -953,6 +953,9 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
             unreachable!("parser never produces Truncate/Append for stdin")
         }
+        Some(Redirect::Dup { .. }) => unreachable!(
+            "Redirect::Dup on stdin (<&n) is out of scope for v29"
+        ),
         None => None,
     };
     let stdout = match &cmd.stdout {
@@ -965,6 +968,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stdout")
         }
+        Some(Redirect::Dup { .. }) => unreachable!(
+            "Redirect::Dup handling lands in Task 2; parser produces this now \
+             but the executor doesn't route it yet"
+        ),
         None => None,
     };
     let stderr = match &cmd.stderr {
@@ -977,6 +984,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stderr")
         }
+        Some(Redirect::Dup { .. }) => unreachable!(
+            "Redirect::Dup handling lands in Task 2; parser produces this now \
+             but the executor doesn't route it yet"
+        ),
         None => None,
     };
     Ok(ResolvedCommand { program, args, stdin, stdout, stderr })
