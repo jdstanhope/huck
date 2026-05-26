@@ -90,6 +90,10 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::For(clause) => run_for(clause, shell, sink),
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
+        Command::Subshell { .. } => {
+            unreachable!("Command::Subshell execution lands in Task 3; \
+                          parser produces this now but the executor doesn't route it yet")
+        }
         Command::FunctionDef { name, body } => {
             shell.functions.insert(name.clone(), body.clone());
             ExecOutcome::Continue(0)

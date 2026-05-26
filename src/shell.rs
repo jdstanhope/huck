@@ -255,6 +255,10 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnterminatedFunction => {
             "unterminated function definition (expected a compound-command body)".to_string()
         }
+        ParseError::EmptySubshell => "empty subshell '()' is not allowed".to_string(),
+        ParseError::UnterminatedSubshell => {
+            "unterminated '(' (expected matching ')')".to_string()
+        }
     }
 }
 

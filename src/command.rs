@@ -294,6 +294,7 @@ pub enum Command {
     For(Box<ForClause>),
     Case(Box<CaseClause>),
     BraceGroup(Box<Sequence>),
+    Subshell { body: Box<Sequence> }, // NEW (v28): `(list)` subshell
     FunctionDef { name: String, body: Box<Command> },
 }
 
@@ -376,6 +377,8 @@ pub enum ParseError {
     FunctionName,
     FunctionBody,
     UnterminatedFunction,
+    EmptySubshell,         // NEW (v28): `()` — empty subshell body
+    UnterminatedSubshell,  // NEW (v28): `(cmd` with no closing `)`
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -509,7 +512,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     Ok(Sequence { first, rest, background })
 }
 
-/// Parses a single sequence element: an `if` clause or a pipeline.
+/// Parses a single sequence element: a subshell, compound command, or pipeline.
 fn parse_command<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Command, ParseError> {
@@ -524,8 +527,16 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
-            // Non-keyword: may be a function definition `name() compound`, or
-            // a plain pipeline. Need two-token lookahead.
+            // Check for bare `(` at command-start → subshell `(list)`.
+            // This check MUST come BEFORE the IDENT+LParen function-def path,
+            // but in practice they don't overlap: function-def starts with
+            // a Word token, not an Op(LParen). Still, the comment clarifies
+            // intent.
+            if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+                return parse_subshell(iter);
+            }
+            // Non-keyword, non-LParen: may be a function definition
+            // `name() compound`, or a plain pipeline. Need two-token lookahead.
             if matches!(iter.peek(), Some(Token::Word(_))) {
                 // Consume the word; peek for `(`.
                 let Some(Token::Word(w)) = iter.next() else { unreachable!() };
@@ -564,6 +575,7 @@ fn parse_function_def<I: Iterator<Item = Token>>(
         body,
         Command::If(_) | Command::While(_) | Command::For(_)
             | Command::Case(_) | Command::BraceGroup(_)
+            | Command::Subshell { .. }
     ) {
         return Err(ParseError::FunctionBody);
     }
@@ -842,6 +854,135 @@ fn parse_brace_group<I: Iterator<Item = Token>>(
     Ok(body)
 }
 
+/// Parses `( LIST )`. The caller has already confirmed the next token is `(`.
+///
+/// Consumes the leading `(`, parses an inner sequence stopping at `)`, then
+/// expects the closing `)`. Returns:
+/// - `Err(ParseError::EmptySubshell)` if the body is empty (bare `()`).
+/// - `Err(ParseError::UnterminatedSubshell)` if no closing `)` is found.
+/// - `Ok(Command::Subshell { body })` otherwise.
+fn parse_subshell<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    // Consume `(`.
+    iter.next();
+
+    // Empty subshell `()` — immediately hit `)` with no commands inside.
+    if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+        iter.next(); // consume `)`
+        return Err(ParseError::EmptySubshell);
+    }
+
+    // No tokens at all → unterminated.
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedSubshell);
+    }
+
+    // Parse the inner sequence using parse_subshell_sequence, which mirrors
+    // parse_sequence but terminates on `)` instead of on stop-keywords.
+    let body = parse_subshell_sequence(iter)?;
+    Ok(Command::Subshell { body: Box::new(body) })
+}
+
+/// Parses a sequence of commands terminated by `)`. Mirrors `parse_sequence`
+/// but:
+/// - breaks on `Token::Op(Operator::RParen)` (consuming it) instead of keywords.
+/// - returns `Err(UnterminatedSubshell)` if the token stream ends before `)`.
+fn parse_subshell_sequence<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Sequence, ParseError> {
+    // Parse first command. It may itself be a subshell, compound command, etc.
+    let raw_first = parse_command(iter)?;
+
+    // If followed by `|`, wrap into a pipeline (same logic as parse_sequence).
+    let first = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+        let mut stages = vec![raw_first];
+        iter.next(); // consume `|`
+        skip_newlines(iter);
+        let mut more_stages = true;
+        while more_stages {
+            let (cmd, next_pipe) = parse_next_stage(iter)?;
+            stages.push(cmd);
+            if next_pipe {
+                // simple stage already consumed `|`; continue.
+            } else {
+                if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                    iter.next();
+                    skip_newlines(iter);
+                } else {
+                    more_stages = false;
+                }
+            }
+        }
+        Command::Pipeline(Pipeline { commands: stages })
+    } else {
+        raw_first
+    };
+
+    let mut rest = Vec::new();
+    loop {
+        match iter.peek() {
+            // End of tokens before `)` → unterminated.
+            None => return Err(ParseError::UnterminatedSubshell),
+            // `)` terminates the subshell body — consume and return.
+            Some(Token::Op(Operator::RParen)) => {
+                iter.next();
+                break;
+            }
+            Some(Token::Op(Operator::Semi)) | Some(Token::Newline) => {
+                iter.next(); // consume `;` or newline
+                skip_newlines(iter);
+                // Trailing `;` or newline before `)` — break cleanly.
+                if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+                    iter.next(); // consume `)`
+                    break;
+                }
+                if iter.peek().is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                let raw = parse_command(iter)?;
+                let cmd = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                    let mut stages = vec![raw];
+                    iter.next();
+                    skip_newlines(iter);
+                    let mut more = true;
+                    while more {
+                        let (c, np) = parse_next_stage(iter)?;
+                        stages.push(c);
+                        if !np {
+                            if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                                iter.next();
+                                skip_newlines(iter);
+                            } else {
+                                more = false;
+                            }
+                        }
+                    }
+                    Command::Pipeline(Pipeline { commands: stages })
+                } else {
+                    raw
+                };
+                rest.push((Connector::Semi, cmd));
+            }
+            Some(Token::Op(Operator::And)) => {
+                iter.next();
+                skip_newlines(iter);
+                rest.push((Connector::And, parse_command(iter)?));
+            }
+            Some(Token::Op(Operator::Or)) => {
+                iter.next();
+                skip_newlines(iter);
+                rest.push((Connector::Or, parse_command(iter)?));
+            }
+            // Any other token (stray keyword, another `(`, etc.) after a
+            // complete command and before `)` is unexpected.
+            Some(_) => return Err(ParseError::UnterminatedSubshell),
+        }
+    }
+
+    Ok(Sequence { first, rest, background: false })
+}
+
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
 /// The caller has already peeked the leading `while`/`until`.
 fn parse_while<I: Iterator<Item = Token>>(
@@ -889,6 +1030,9 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                     | Operator::DoubleSemi
                     | Operator::SemiAmp
                     | Operator::DoubleSemiAmp
+                    // RParen terminates a subshell body — stop without
+                    // consuming so parse_subshell_sequence can handle it.
+                    | Operator::RParen
             ) | Token::Newline
         ) {
             break;
@@ -912,9 +1056,15 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                 skip_newlines(iter);
                 break;
             }
-            Token::Op(Operator::LParen | Operator::RParen) => {
-                // A `(` or `)` outside a `case` pattern list is a syntax error.
+            Token::Op(Operator::LParen) => {
+                // A `(` mid-argument (e.g. `cmd (args)`) is a syntax error.
+                // Note: `(` at command-start is dispatched by parse_command
+                // before parse_simple_stage is called.
                 return Err(ParseError::UnexpectedToken);
+            }
+            Token::Op(Operator::RParen) => {
+                // Unreachable: the peek-break above stops on RParen.
+                unreachable!("RParen terminates the stage via the peek-break above");
             }
             Token::Heredoc { body, expand, strip_tabs } => {
                 // A here-doc token produced by the lexer — attach as stdin.
@@ -984,6 +1134,10 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
         }
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
+            // Bare `(` at pipeline-stage position → subshell.
+            if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+                return Ok((parse_subshell(iter)?, false));
+            }
             // Non-keyword: may be a function definition `name() compound` or
             // a plain simple stage. Need two-token lookahead.
             if matches!(iter.peek(), Some(Token::Word(_))) {
@@ -1095,6 +1249,7 @@ mod tests {
             Command::For(_) => panic!("expected a pipeline, got a for"),
             Command::Case(_) => panic!("expected a pipeline, got a case"),
             Command::BraceGroup(_) => panic!("expected a pipeline, got a brace group"),
+            Command::Subshell { .. } => panic!("expected a pipeline, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected a pipeline, got a function def"),
         }
     }
@@ -1580,6 +1735,7 @@ mod tests {
             Command::For(_) => panic!("expected an if, got a for"),
             Command::Case(_) => panic!("expected an if, got a case"),
             Command::BraceGroup(_) => panic!("expected an if, got a brace group"),
+            Command::Subshell { .. } => panic!("expected an if, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected an if, got a function def"),
         }
     }
@@ -2810,5 +2966,94 @@ mod tests {
         assert!(matches!(&stage0.stdin, Some(Redirect::HereString(_))));
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
         assert!(stage1.stdin.is_none());
+    }
+
+    // ── v28 subshell parser tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_subshell_simple() {
+        let tokens = crate::lexer::tokenize("(echo hi)").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Subshell { body } = parsed.first else {
+            panic!("expected Subshell, got {:?}", parsed.first)
+        };
+        // body is a Sequence with one command (the `echo hi` pipeline).
+        assert_eq!(body.rest.len(), 0);
+    }
+
+    #[test]
+    fn parse_subshell_with_sequence() {
+        let tokens = crate::lexer::tokenize("(cmd1; cmd2)").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Subshell { body } = parsed.first else { panic!() };
+        assert_eq!(body.rest.len(), 1); // first + 1 more = 2 commands
+    }
+
+    #[test]
+    fn parse_subshell_with_and_or() {
+        let tokens = crate::lexer::tokenize("(true && echo hi)").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Subshell { body } = parsed.first else { panic!() };
+        // Body's first command + the And-connected rest.
+        assert!(body.rest.iter().any(|(conn, _)| matches!(conn, Connector::And)));
+    }
+
+    #[test]
+    fn parse_subshell_nested() {
+        let tokens = crate::lexer::tokenize("((echo hi))").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Subshell { body: outer } = parsed.first else { panic!() };
+        let Command::Subshell { .. } = outer.first else {
+            panic!("expected nested Subshell, got {:?}", outer.first)
+        };
+    }
+
+    #[test]
+    fn parse_subshell_empty_errors() {
+        let tokens = crate::lexer::tokenize("()").unwrap();
+        let err = parse(tokens).expect_err("expected ParseError::EmptySubshell");
+        assert!(matches!(err, ParseError::EmptySubshell), "got {:?}", err);
+    }
+
+    #[test]
+    fn parse_subshell_unterminated_errors() {
+        let tokens = crate::lexer::tokenize("(echo hi").unwrap();
+        let err = parse(tokens).expect_err("expected ParseError::UnterminatedSubshell");
+        assert!(matches!(err, ParseError::UnterminatedSubshell), "got {:?}", err);
+    }
+
+    #[test]
+    fn parse_subshell_as_pipeline_first_stage() {
+        let tokens = crate::lexer::tokenize("(echo hi) | cat").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[0], Command::Subshell { .. }));
+    }
+
+    #[test]
+    fn parse_subshell_as_pipeline_later_stage() {
+        let tokens = crate::lexer::tokenize("echo hi | (cat)").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::Pipeline(p) = parsed.first else { panic!() };
+        assert_eq!(p.commands.len(), 2);
+        assert!(matches!(p.commands[1], Command::Subshell { .. }));
+    }
+
+    #[test]
+    fn parse_subshell_does_not_conflict_with_function_def() {
+        // `f() (echo hi)` is a function definition whose body is a subshell.
+        // The parser must dispatch on IDENT + `(` for function-def, not LParen-alone-at-start.
+        let tokens = crate::lexer::tokenize("f() (echo hi)").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::FunctionDef { name, body } = parsed.first else {
+            panic!("expected FunctionDef, got {:?}", parsed.first)
+        };
+        assert_eq!(name, "f");
+        assert!(
+            matches!(*body, Command::Subshell { .. }),
+            "function body should be a Subshell, got {:?}",
+            body
+        );
     }
 }
