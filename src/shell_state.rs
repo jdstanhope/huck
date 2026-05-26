@@ -83,6 +83,8 @@ impl Shell {
             ),
             "$" => return Some(self.shell_pid.to_string()),
             "!" => return Some(
+                // Returns "" not None when unset: bash expands $! to empty before
+                // any background has happened (v26 spec §lookup_var changes).
                 self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default()
             ),
             _ => {}
