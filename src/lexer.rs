@@ -379,6 +379,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 in_assignment_value = false;
             }
+            '1' if !has_token && chars.peek() == Some(&'>') => {
+                chars.next();
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::RedirAppend));
+                } else if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::DupOut));
+                } else {
+                    tokens.push(Token::Op(Operator::RedirOut));
+                }
+                in_assignment_value = false;
+            }
             '2' if !has_token && chars.peek() == Some(&'>') => {
                 chars.next();
                 if chars.peek() == Some(&'>') {
@@ -3370,6 +3383,34 @@ mod tests {
     fn tokenize_redir_err_regression() {
         assert_eq!(tokenize("2>").unwrap(), vec![Token::Op(Operator::RedirErr)]);
         assert_eq!(tokenize("2>>").unwrap(), vec![Token::Op(Operator::RedirErrAppend)]);
+    }
+
+    #[test]
+    fn tokenize_explicit_fd1_redir_out() {
+        // `1>` lexes as RedirOut (same as `>`).
+        let tokens = tokenize("1>").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::RedirOut)]);
+    }
+
+    #[test]
+    fn tokenize_explicit_fd1_redir_append() {
+        let tokens = tokenize("1>>").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::RedirAppend)]);
+    }
+
+    #[test]
+    fn tokenize_explicit_fd1_dup() {
+        let tokens = tokenize("1>&").unwrap();
+        assert_eq!(tokens, vec![Token::Op(Operator::DupOut)]);
+    }
+
+    #[test]
+    fn tokenize_one_as_arg_when_has_token() {
+        // `cmd 1` where 1 is an argument — should NOT trigger the new arm.
+        let tokens = tokenize("cmd 1").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0], Token::Word(_)));
+        assert!(matches!(tokens[1], Token::Word(_)));
     }
 
     #[test]

@@ -34,10 +34,8 @@ fn dup_stderr_to_stdout_canonical() {
 #[test]
 fn dup_stdout_to_stderr() {
     let tmp = format!("/tmp/v29_dup_stdout_{}", std::process::id());
-    // Use `>&2` (DupOut) to redirect stdout to stderr, then capture stderr to file.
-    // huck's DupOut (`>&`) redirects fd 1; the `1>&2` form (explicit fd prefix) is out of scope for v29.
     let script = format!(
-        "echo hi >&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
+        "echo hi 1>&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
     );
     let (out, _) = run(&script);
     assert!(out.lines().any(|l| l.trim() == "hi"), "got: {out}");
