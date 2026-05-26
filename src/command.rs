@@ -353,7 +353,12 @@ pub enum Command {
     BraceGroup(Box<Sequence>),
     Subshell { body: Box<Sequence> }, // NEW (v28): `(list)` subshell
     FunctionDef { name: String, body: Box<Command> },
-    DoubleBracket(Box<TestExpr>),     // NEW (v30): `[[ … ]]` extended test
+    /// NEW (v30): `[[ … ]]` extended test.
+    /// `inline_assignments` holds any `NAME=value` prefixes (e.g. `FOO=hi [[ … ]]`).
+    DoubleBracket {
+        expr: Box<TestExpr>,
+        inline_assignments: Vec<(String, Word)>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -605,6 +610,64 @@ fn parse_command<I: Iterator<Item = Token>>(
                 let Some(Token::Word(w)) = iter.next() else { unreachable!() };
                 if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
                     return parse_function_def(w, iter);
+                }
+                // Detect inline assignments before `[[`:
+                // e.g. `FOO=hi [[ $FOO == hi ]]`.
+                //
+                // We speculatively peel assignment words. If `[[` follows,
+                // dispatch to `parse_double_bracket_with_assigns`. Otherwise
+                // fall through to normal pipeline parsing using the cloned
+                // words — we must NOT drain `iter` in the fallback path.
+                if is_assignment_word(&w) {
+                    let w_clone = w.clone();
+                    let mut assigns: Vec<(String, Word)> = Vec::new();
+                    match try_split_assignment(w) {
+                        Ok(pair) => assigns.push(pair),
+                        Err(_) => unreachable!("is_assignment_word confirmed"),
+                    }
+                    let mut extra_clones: Vec<Word> = Vec::new();
+                    // Peel further consecutive assignment words.
+                    while let Some(Token::Word(nw)) = iter.peek() {
+                        if !is_assignment_word(nw) {
+                            break;
+                        }
+                        let Some(Token::Word(nw)) = iter.next() else { unreachable!() };
+                        let nw_clone = nw.clone();
+                        match try_split_assignment(nw) {
+                            Ok(pair) => assigns.push(pair),
+                            Err(_) => unreachable!("is_assignment_word confirmed"),
+                        }
+                        extra_clones.push(nw_clone);
+                    }
+                    // If `[[` follows, dispatch as DoubleBracket with assigns.
+                    if iter.peek().and_then(keyword_of) == Some(Keyword::DoubleBracketOpen) {
+                        return parse_double_bracket_with_assigns(iter, assigns);
+                    }
+                    // Fallback: no `[[`. Restore the pipeline starting from the
+                    // first cloned assignment word.
+                    //
+                    // Single-assign case (most common — e.g. `A=1 cmd`):
+                    // extra_clones is empty; pass w_clone directly to
+                    // parse_pipeline_with_first with the original iter.
+                    if extra_clones.is_empty() {
+                        return Ok(Command::Pipeline(
+                            parse_pipeline_with_first(Some(w_clone), iter)?
+                        ));
+                    }
+                    // Multi-assign case (e.g. `A=1 B=2 cmd`): extra words were
+                    // consumed from `iter`. Rebuild by collecting the extras +
+                    // the rest of `iter` into a single Vec-backed sub-iterator.
+                    // This exhausts `iter`, but since parse_command is called
+                    // serially by parse_sequence the outer loop will naturally
+                    // stop when iter is empty — all remaining tokens are in the
+                    // sub-iter and parsed here.
+                    let mut rest: Vec<Token> =
+                        extra_clones.into_iter().map(Token::Word).collect();
+                    rest.extend(iter.by_ref());
+                    let mut sub = rest.into_iter().peekable();
+                    return Ok(Command::Pipeline(
+                        parse_pipeline_with_first(Some(w_clone), &mut sub)?
+                    ));
                 }
                 // Not a function def — pipeline with `w` as the first word.
                 Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), iter)?))
@@ -1576,10 +1639,20 @@ fn parse_test_atom<I: Iterator<Item = Token>>(
 /// Parses `[[ EXPR ]]`. The caller has already peeked the `[[` keyword and
 /// confirmed we should dispatch here (via `parse_command`).
 ///
+/// `inline_assignments` carries any `NAME=value` words that appeared before `[[`
+/// on the same command line (e.g. `FOO=hi [[ $FOO == hi ]]`).
+///
 /// Consumes `[[`, parses the test expression tree via Pratt precedence,
-/// then consumes `]]`. Returns `Command::DoubleBracket(Box::new(expr))`.
+/// then consumes `]]`. Returns `Command::DoubleBracket { expr, inline_assignments }`.
 fn parse_double_bracket<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    parse_double_bracket_with_assigns(iter, Vec::new())
+}
+
+fn parse_double_bracket_with_assigns<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+    inline_assignments: Vec<(String, Word)>,
 ) -> Result<Command, ParseError> {
     // Consume `[[`.
     iter.next();
@@ -1608,7 +1681,7 @@ fn parse_double_bracket<I: Iterator<Item = Token>>(
         _ => return Err(ParseError::UnterminatedDoubleBracket),
     }
 
-    Ok(Command::DoubleBracket(Box::new(expr)))
+    Ok(Command::DoubleBracket { expr: Box::new(expr), inline_assignments })
 }
 
 #[cfg(test)]
@@ -1659,7 +1732,7 @@ mod tests {
             Command::BraceGroup(_) => panic!("expected a pipeline, got a brace group"),
             Command::Subshell { .. } => panic!("expected a pipeline, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected a pipeline, got a function def"),
-            Command::DoubleBracket(_) => panic!("expected a pipeline, got a double bracket"),
+            Command::DoubleBracket { .. } => panic!("expected a pipeline, got a double bracket"),
         }
     }
 
@@ -2146,7 +2219,7 @@ mod tests {
             Command::BraceGroup(_) => panic!("expected an if, got a brace group"),
             Command::Subshell { .. } => panic!("expected an if, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected an if, got a function def"),
-            Command::DoubleBracket(_) => panic!("expected an if, got a double bracket"),
+            Command::DoubleBracket { .. } => panic!("expected an if, got a double bracket"),
         }
     }
 
@@ -3582,7 +3655,7 @@ mod tests {
     fn parse_dbracket_string_eq_literal() {
         let tokens = crate::lexer::tokenize("[[ a == b ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
-        let Command::DoubleBracket(expr) = parsed.first else {
+        let Command::DoubleBracket { expr, .. } = parsed.first else {
             panic!("expected DoubleBracket, got {:?}", parsed.first)
         };
         let TestExpr::Binary { op, .. } = &*expr else { panic!("expected Binary, got {:?}", expr) };
@@ -3594,7 +3667,7 @@ mod tests {
         // `[[ a = b ]]` is bash alias for `[[ a == b ]]`.
         let tokens = crate::lexer::tokenize("[[ a = b ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::StringEq));
     }
@@ -3603,7 +3676,7 @@ mod tests {
     fn parse_dbracket_string_ne() {
         let tokens = crate::lexer::tokenize("[[ x != y ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::StringNe));
     }
@@ -3613,7 +3686,7 @@ mod tests {
         // RHS is an unquoted glob — still parses as StringEq (runtime interprets glob).
         let tokens = crate::lexer::tokenize("[[ $f == *.txt ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::StringEq));
     }
@@ -3622,7 +3695,7 @@ mod tests {
     fn parse_dbracket_regex() {
         let tokens = crate::lexer::tokenize("[[ s =~ ^foo$ ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         assert!(matches!(&*expr, TestExpr::Regex { .. }));
     }
 
@@ -3630,7 +3703,7 @@ mod tests {
     fn parse_dbracket_integer_compare() {
         let tokens = crate::lexer::tokenize("[[ 5 -eq 5 ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::IntEq));
     }
@@ -3639,7 +3712,7 @@ mod tests {
     fn parse_dbracket_integer_gt() {
         let tokens = crate::lexer::tokenize("[[ 5 -gt 3 ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::IntGt));
     }
@@ -3649,7 +3722,7 @@ mod tests {
         // `<` is lexed as RedirIn by the lexer; parser handles it as StringLt inside [[ ]].
         let tokens = crate::lexer::tokenize("[[ a < b ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Binary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestBinaryOp::StringLt));
     }
@@ -3658,7 +3731,7 @@ mod tests {
     fn parse_dbracket_unary_file() {
         let tokens = crate::lexer::tokenize("[[ -f /tmp ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Unary { op, .. } = &*expr else { panic!("expected Unary, got {:?}", expr) };
         assert!(matches!(op, TestUnaryOp::IsRegFile));
     }
@@ -3667,7 +3740,7 @@ mod tests {
     fn parse_dbracket_unary_string_empty() {
         let tokens = crate::lexer::tokenize("[[ -z foo ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Unary { op, .. } = &*expr else { panic!() };
         assert!(matches!(op, TestUnaryOp::StringEmpty));
     }
@@ -3676,7 +3749,7 @@ mod tests {
     fn parse_dbracket_not() {
         let tokens = crate::lexer::tokenize("[[ ! -f /tmp/x ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Not(inner) = &*expr else { panic!("expected Not, got {:?}", expr) };
         assert!(matches!(&**inner, TestExpr::Unary { .. }));
     }
@@ -3685,7 +3758,7 @@ mod tests {
     fn parse_dbracket_and() {
         let tokens = crate::lexer::tokenize("[[ -f a && -r a ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         assert!(matches!(&*expr, TestExpr::And(_, _)));
     }
 
@@ -3693,7 +3766,7 @@ mod tests {
     fn parse_dbracket_or() {
         let tokens = crate::lexer::tokenize("[[ x == a || x == b ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         assert!(matches!(&*expr, TestExpr::Or(_, _)));
     }
 
@@ -3701,7 +3774,7 @@ mod tests {
     fn parse_dbracket_grouped() {
         let tokens = crate::lexer::tokenize("[[ ( a == a || b == c ) && d == d ]]").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty");
-        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         // Top-level should be And with the first operand being the grouped Or.
         let TestExpr::And(lhs, _) = &*expr else { panic!("expected And, got {:?}", expr) };
         assert!(matches!(&**lhs, TestExpr::Or(_, _)));

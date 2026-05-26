@@ -164,7 +164,9 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             shell.functions.insert(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
-        Command::DoubleBracket(expr) => run_double_bracket(expr, shell),
+        Command::DoubleBracket { expr, inline_assignments } => {
+            run_double_bracket(expr, inline_assignments, shell)
+        }
     }
 }
 
@@ -357,15 +359,22 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
 // v30: `[[ ]]` extended test evaluator
 // ──────────────────────────────────────────────────────────────
 
-fn run_double_bracket(expr: &TestExpr, shell: &mut Shell) -> ExecOutcome {
-    match eval_test_expr(expr, shell) {
+fn run_double_bracket(
+    expr: &TestExpr,
+    inline_assignments: &[(String, crate::lexer::Word)],
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let snap = apply_inline_assignments(inline_assignments, shell);
+    let result = match eval_test_expr(expr, shell) {
         Ok(true)  => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg)  => {
             eprintln!("huck: [[: {msg}");
             ExecOutcome::Continue(2)
         }
-    }
+    };
+    restore_inline_assignments(snap, shell);
+    result
 }
 
 fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
