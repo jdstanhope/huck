@@ -91,8 +91,71 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
         Command::Subshell { .. } => {
-            unreachable!("Command::Subshell execution lands in Task 3; \
-                          parser produces this now but the executor doesn't route it yet")
+            // Determine stdout fd for the child.  For Terminal (the common
+            // case) we pass STDOUT_FILENO directly.  For Capture we create a
+            // pipe so the parent can read the child's output back into the
+            // capture buffer after the child exits.
+            let (stdout_fd, capture_read_fd): (RawFd, Option<RawFd>) = match sink {
+                StdoutSink::Terminal => (libc::STDOUT_FILENO, None),
+                StdoutSink::Capture(_) => match make_pipe() {
+                    Ok((r, w)) => (w, Some(r)),
+                    Err(e) => {
+                        eprintln!("huck: pipe: {e}");
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+
+            let pid = match fork_and_run_in_subshell(
+                cmd,
+                shell,
+                libc::STDIN_FILENO,
+                stdout_fd,
+                libc::STDERR_FILENO,
+                0,
+                &[],
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("huck: fork: {e}");
+                    if let Some(r) = capture_read_fd {
+                        unsafe { libc::close(r); }
+                    }
+                    if stdout_fd != libc::STDOUT_FILENO {
+                        unsafe { libc::close(stdout_fd); }
+                    }
+                    return ExecOutcome::Continue(1);
+                }
+            };
+
+            // Close the write-end in the parent so the child's write-end is
+            // the only writer; once the child exits, the read-end sees EOF.
+            if stdout_fd != libc::STDOUT_FILENO {
+                unsafe { libc::close(stdout_fd); }
+            }
+
+            // Drain capture pipe before waitpid to avoid deadlock.
+            if let (Some(r), StdoutSink::Capture(buf)) = (capture_read_fd, &mut *sink) {
+                use std::os::fd::FromRawFd;
+                let mut f = unsafe { File::from_raw_fd(r) };
+                let _ = io::copy(&mut f, *buf);
+                // f is dropped here, closing r.
+            }
+
+            // Wait for the child.
+            let mut raw_status: libc::c_int = 0;
+            let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+            if r < 0 {
+                return ExecOutcome::Continue(1);
+            }
+            let code = if libc::WIFEXITED(raw_status) {
+                libc::WEXITSTATUS(raw_status)
+            } else if libc::WIFSIGNALED(raw_status) {
+                128 + libc::WTERMSIG(raw_status)
+            } else {
+                1
+            };
+            ExecOutcome::Continue(code)
         }
         Command::FunctionDef { name, body } => {
             shell.functions.insert(name.clone(), body.clone());
@@ -2141,7 +2204,16 @@ pub fn fork_and_run_in_subshell(
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.
         let mut sink = StdoutSink::Terminal;
-        let outcome = run_command(cmd, shell, &mut sink);
+        // Anti-recursion guard: when a Command::Subshell is used as a
+        // pipeline stage, the pipeline forks via this helper.  If we called
+        // run_command here, it would fork AGAIN.  Instead, run the inner
+        // Sequence directly via execute_sequence_body so we get exactly one
+        // fork per Subshell regardless of whether it appears at top level or
+        // as a pipeline stage.
+        let outcome = match cmd {
+            Command::Subshell { body } => execute_sequence_body(body, shell, &mut sink),
+            other => run_command(other, shell, &mut sink),
+        };
         // 7. Translate outcome to an 8-bit exit status.
         let status: i32 = match outcome {
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
