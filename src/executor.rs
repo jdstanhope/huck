@@ -115,6 +115,8 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 libc::STDERR_FILENO,
                 0,
                 &[],
+                None, // no Dup redirect at this call site
+                None,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -383,6 +385,8 @@ fn run_background_subshell(
         libc::STDERR_FILENO,
         /*pgid_target=*/ 0,
         /*parent_fds_to_close=*/ &[],
+        None, // no Dup redirect at this call site
+        None,
     ) {
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
@@ -473,7 +477,7 @@ fn run_background_sequence(
             let fds_to_close: Vec<RawFd> = parent_held.iter().copied()
                 .filter(|&fd| fd != stdout_fd && fd != stdin_fd)
                 .collect();
-            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close) {
+            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close, None, None) {
                 Ok(pid) => {
                     if stdout_fd > 2 {
                         parent_held.retain(|&fd| fd != stdout_fd);
@@ -762,6 +766,50 @@ fn run_background_sequence(
             fds_to_close_in_child.push(w);
         }
 
+        // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
+        // allocate; not async-signal-safe). External stages handle this inside
+        // spawn_external_with_fds itself.
+        let (stdout_dup_target, stderr_dup_target) =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                let sdt = match &exec.stdout {
+                    Some(Redirect::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                eprintln!("huck: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let sedt = match &exec.stderr {
+                    Some(Redirect::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                eprintln!("huck: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                (sdt, sedt)
+            } else {
+                (None, None)
+            };
+
         let went_external;
         let spawn_result = match classify_stage(stage_cmd, shell) {
             StageKind::External(simple) => {
@@ -770,7 +818,7 @@ fn run_background_sequence(
             }
             StageKind::InProcess(cmd) => {
                 went_external = false;
-                fork_and_run_in_subshell(cmd, shell, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child)
+                fork_and_run_in_subshell(cmd, shell, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child, stdout_dup_target, stderr_dup_target)
             }
         };
 
@@ -927,6 +975,16 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
     }
 }
 
+/// Expands `source` to a string and parses it as an fd number (e.g. "1" or "2").
+/// Used for `Redirect::Dup { source }` to obtain the target fd pre-fork.
+/// Errors with "bad fd: ..." if the expansion is not a valid non-negative integer.
+fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i32, io::Error> {
+    let expanded = expand_assignment(source, shell);
+    expanded
+        .parse::<i32>()
+        .map_err(|_| io::Error::other(format!("bad fd: {expanded}")))
+}
+
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
     let prog_fields = glob_expand_fields(expand(&cmd.program, shell));
     if prog_fields.is_empty() {
@@ -968,10 +1026,11 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stdout")
         }
-        Some(Redirect::Dup { .. }) => unreachable!(
-            "Redirect::Dup handling lands in Task 2; parser produces this now \
-             but the executor doesn't route it yet"
-        ),
+        Some(Redirect::Dup { .. }) => {
+            // Dup is handled via dup2 (pre_exec or direct), not by opening a file.
+            // Return None here; callers check exec.stdout for Dup and apply dup2.
+            None
+        }
         None => None,
     };
     let stderr = match &cmd.stderr {
@@ -984,10 +1043,11 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stderr")
         }
-        Some(Redirect::Dup { .. }) => unreachable!(
-            "Redirect::Dup handling lands in Task 2; parser produces this now \
-             but the executor doesn't route it yet"
-        ),
+        Some(Redirect::Dup { .. }) => {
+            // Dup is handled via dup2 (pre_exec or direct), not by opening a file.
+            // Return None here; callers check exec.stderr for Dup and apply dup2.
+            None
+        }
         None => None,
     };
     Ok(ResolvedCommand { program, args, stdin, stdout, stderr })
@@ -1219,7 +1279,34 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
-        run_subprocess(&resolved, files, shell, sink)
+        // Resolve Dup targets pre-fork (expansion may allocate; not async-signal-safe).
+        let stdout_dup_target = match &cmd.stdout {
+            Some(Redirect::Dup { source, .. }) => {
+                match resolve_fd_target(source, shell) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        eprintln!("huck: {e}");
+                        if !persistent { restore_inline_assignments(snap, shell); }
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
+            _ => None,
+        };
+        let stderr_dup_target = match &cmd.stderr {
+            Some(Redirect::Dup { source, .. }) => {
+                match resolve_fd_target(source, shell) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        eprintln!("huck: {e}");
+                        if !persistent { restore_inline_assignments(snap, shell); }
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
+            _ => None,
+        };
+        run_subprocess(&resolved, files, shell, sink, stdout_dup_target, stderr_dup_target)
     };
 
     if !persistent {
@@ -1228,11 +1315,17 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     outcome
 }
 
+/// `stdout_dup_target` / `stderr_dup_target`: if `Some(fd)`, a pre_exec closure
+/// applies `dup2(fd, 1)` and/or `dup2(fd, 2)` in the child after stdio setup.
+/// Used for `Redirect::Dup` (e.g. `2>&1`). Resolution happens in the parent
+/// (pre-fork) so these are always resolved i32, never a Word.
 fn run_subprocess(
     cmd: &ResolvedCommand,
     files: StageFiles,
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    stdout_dup_target: Option<i32>,
+    stderr_dup_target: Option<i32>,
 ) -> ExecOutcome {
     let interactive = matches!(sink, StdoutSink::Terminal);
 
@@ -1247,6 +1340,23 @@ fn run_subprocess(
     // vim/less, and background readers could never receive SIGTTIN.
     use std::os::unix::process::CommandExt;
     unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+
+    // If there are Dup redirects, add a second pre_exec to apply dup2 in the
+    // child after stdio is configured but before exec. stdout-dup BEFORE
+    // stderr-dup matches canonical `>file 2>&1` semantics.
+    if stdout_dup_target.is_some() || stderr_dup_target.is_some() {
+        unsafe {
+            process.pre_exec(move || {
+                if let Some(fd) = stdout_dup_target && libc::dup2(fd, 1) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(fd) = stderr_dup_target && libc::dup2(fd, 2) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     if interactive {
         process.process_group(0);
@@ -1277,11 +1387,19 @@ fn run_subprocess(
     let want_capture = matches!(sink, StdoutSink::Capture(_));
     if let Some(file) = files.stdout {
         process.stdout(Stdio::from(file));
+    } else if stdout_dup_target.is_some() {
+        // Dup redirect on stdout: inherit the parent's stdout (the dup2 pre_exec
+        // will redirect to the target fd in the child). Stdio::inherit() avoids
+        // the close-on-drop trap of OwnedFd::from_raw_fd for the parent's fd 1.
+        process.stdout(Stdio::inherit());
     } else if want_capture {
         process.stdout(Stdio::piped());
     }
     if let Some(file) = files.stderr {
         process.stderr(Stdio::from(file));
+    } else if stderr_dup_target.is_some() {
+        // Dup redirect on stderr: inherit parent's stderr; dup2 applied in child.
+        process.stderr(Stdio::inherit());
     }
 
     match process.spawn() {
@@ -1508,7 +1626,7 @@ fn run_multi_stage(
             let fds_to_close: Vec<RawFd> = parent_held.iter().copied()
                 .filter(|&fd| fd != stdout_fd)
                 .collect();
-            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close) {
+            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close, None, None) {
                 Ok(pid) => {
                     // Close the stdout fd we gave to the child.
                     if stdout_fd > 2 {
@@ -1837,6 +1955,56 @@ fn run_multi_stage(
             fds_to_close_in_child.push(w);
         }
 
+        // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
+        // allocate; not async-signal-safe). External stages handle this inside
+        // spawn_external_with_fds itself.
+        let (stdout_dup_target, stderr_dup_target) =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                let sdt = match &exec.stdout {
+                    Some(Redirect::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                eprintln!("huck: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(r) = capture_read_fd {
+                                    parent_held.retain(|&fd| fd != r);
+                                    unsafe { libc::close(r); }
+                                }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let sedt = match &exec.stderr {
+                    Some(Redirect::Dup { source, .. }) => {
+                        match resolve_fd_target(source, shell) {
+                            Ok(fd) => Some(fd),
+                            Err(e) => {
+                                eprintln!("huck: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(r) = capture_read_fd {
+                                    parent_held.retain(|&fd| fd != r);
+                                    unsafe { libc::close(r); }
+                                }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                (sdt, sedt)
+            } else {
+                (None, None)
+            };
+
         // Track whether we went External (in which case spawn_external_with_fds
         // consumes stdin/stdout/stderr via OwnedFd and the parent must NOT close
         // them) or InProcess (in which case the parent must close them since
@@ -1868,6 +2036,8 @@ fn run_multi_stage(
                     stderr_fd,
                     pgid_target,
                     &fds_to_close_in_child,
+                    stdout_dup_target,
+                    stderr_dup_target,
                 )
             }
         };
@@ -2197,6 +2367,12 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 /// must close (else EOF propagation fails downstream).
 ///
 /// `pgid_target`: 0 = become own pgrp leader; >0 = join this pgrp.
+///
+/// `stdout_dup_target` / `stderr_dup_target`: if `Some(fd)`, after the
+/// normal stdio dup2s, apply `dup2(fd, 1)` and/or `dup2(fd, 2)` in the
+/// child. Used for `Redirect::Dup` (e.g. `2>&1`). Resolution happens in
+/// the parent (pre-fork) so this is always an i32, never a Word.
+#[allow(clippy::too_many_arguments)]
 pub fn fork_and_run_in_subshell(
     cmd: &Command,
     shell: &mut Shell,
@@ -2205,6 +2381,8 @@ pub fn fork_and_run_in_subshell(
     stderr_fd: RawFd,
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
+    stdout_dup_target: Option<i32>,
+    stderr_dup_target: Option<i32>,
 ) -> Result<i32, io::Error> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -2246,8 +2424,18 @@ pub fn fork_and_run_in_subshell(
                     libc::close(fd);
                 }
             }
+            // 6. Apply Dup redirects: stdout-dup BEFORE stderr-dup (matches
+            //    canonical `>file 2>&1` semantics where stdout is set first).
+            //    These run after the normal stdio dup2s so the target fds are
+            //    already at their final positions.
+            if let Some(fd) = stdout_dup_target {
+                libc::dup2(fd, 1);
+            }
+            if let Some(fd) = stderr_dup_target {
+                libc::dup2(fd, 2);
+            }
         }
-        // 6. Run the body via the existing dispatcher.
+        // 8. Run the body via the existing dispatcher.
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.
         let mut sink = StdoutSink::Terminal;
@@ -2262,7 +2450,7 @@ pub fn fork_and_run_in_subshell(
             Command::Subshell { body } => execute(body, shell, "(subshell)"),
             other => run_command(other, shell, &mut sink),
         };
-        // 7. Translate outcome to an 8-bit exit status.
+        // 9. Translate outcome to an 8-bit exit status.
         let status: i32 = match outcome {
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
             ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
@@ -2350,6 +2538,17 @@ fn spawn_external_with_fds(
     let resolved = resolve(exec, shell)
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
 
+    // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
+    // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
+    let stdout_dup_target: Option<i32> = match &exec.stdout {
+        Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+        _ => None,
+    };
+    let stderr_dup_target: Option<i32> = match &exec.stderr {
+        Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
+        _ => None,
+    };
+
     let mut process = ProcessCommand::new(&resolved.program);
     process.args(&resolved.args);
     process.env_clear();
@@ -2357,6 +2556,23 @@ fn spawn_external_with_fds(
 
     // Reset job-control signals to SIG_DFL before exec.
     unsafe { process.pre_exec(reset_job_control_signals_in_child); }
+
+    // If there are Dup redirects, chain a second pre_exec to apply dup2 in the
+    // child. This runs AFTER the signal-reset pre_exec (registration order).
+    // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
+    if stdout_dup_target.is_some() || stderr_dup_target.is_some() {
+        unsafe {
+            process.pre_exec(move || {
+                if let Some(fd) = stdout_dup_target && libc::dup2(fd, 1) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(fd) = stderr_dup_target && libc::dup2(fd, 2) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     // Join the pgrp (or become pgrp leader if pgid_target == 0).
     process.process_group(pgid_target);
@@ -2366,17 +2582,33 @@ fn spawn_external_with_fds(
     // accidentally close the parent's standard streams. For other fds, use
     // OwnedFd::from_raw_fd which transfers ownership — std::process::Command
     // closes the original fd in the parent after forking.
+    // For Dup-redirect fds, always use Stdio::inherit() to avoid the
+    // close-on-drop trap of OwnedFd (the dup2 pre_exec handles the actual
+    // redirect in the child).
     let stdin_stdio = if stdin_fd == 0 {
         Stdio::inherit()
     } else {
         unsafe { Stdio::from(OwnedFd::from_raw_fd(stdin_fd)) }
     };
-    let stdout_stdio = if stdout_fd == 1 {
+    let stdout_stdio = if stdout_dup_target.is_some() {
+        // Dup on stdout: inherit so the dup2 pre_exec can redirect to target.
+        // We must still consume stdout_fd so it isn't leaked in the parent.
+        if stdout_fd != 1 {
+            unsafe { libc::close(stdout_fd); }
+        }
+        Stdio::inherit()
+    } else if stdout_fd == 1 {
         Stdio::inherit()
     } else {
         unsafe { Stdio::from(OwnedFd::from_raw_fd(stdout_fd)) }
     };
-    let stderr_stdio = if stderr_fd == 2 {
+    let stderr_stdio = if stderr_dup_target.is_some() {
+        // Dup on stderr: inherit so the dup2 pre_exec can redirect to target.
+        if stderr_fd != 2 {
+            unsafe { libc::close(stderr_fd); }
+        }
+        Stdio::inherit()
+    } else if stderr_fd == 2 {
         Stdio::inherit()
     } else {
         unsafe { Stdio::from(OwnedFd::from_raw_fd(stderr_fd)) }
@@ -3251,6 +3483,8 @@ mod tests {
             libc::STDERR_FILENO, // stderr = terminal
             0,                   // pgid_target: become own pgrp leader
             &[read_fd],          // close the read end in the child
+            None,                // no Dup redirect
+            None,
         )
         .expect("fork_and_run_in_subshell failed");
 
@@ -3383,6 +3617,22 @@ mod tests {
         let shell = Shell::new();
         let cmd = dynamic_exec_cmd();
         assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
+    }
+
+    // ----- resolve_fd_target unit tests (Task 2 / v29) -------------------------
+
+    #[test]
+    fn resolve_fd_target_parses_literal_number() {
+        let mut shell = Shell::new();
+        let word = lit_word("1");
+        assert_eq!(resolve_fd_target(&word, &mut shell).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_fd_target_rejects_non_numeric() {
+        let mut shell = Shell::new();
+        let word = lit_word("notanumber");
+        assert!(resolve_fd_target(&word, &mut shell).is_err());
     }
 
     // ----- program_static_text unit tests (Task 4) ----------------------------
