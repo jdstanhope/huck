@@ -513,6 +513,34 @@ fn pty_heredoc_continuation_prompt_appears() {
 }
 
 #[test]
+fn pty_compound_stage_pipeline_stops_and_resumes() {
+    // Start `cat | if true; then sleep 5; fi` — both stages are in the
+    // pipeline's process group.  Ctrl-Z (SIGTSTP) stops the whole group.
+    // We expect a "Stopped" notification and the prompt to return.  Then we
+    // kill the job so the test doesn't hang waiting for sleep to finish.
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "cat | if true; then sleep 5; fi");
+    send(&mut session, ENTER);
+    // Give the pipeline time to start and reach the blocking sleep.
+    settle();
+    // Ctrl-Z stops both stages (the whole pgrp via SIGTSTP).
+    send(&mut session, "\x1a");
+    expect(&mut session, "Stopped");
+    expect(&mut session, "huck> ");
+    // Kill the stopped job so the test exits cleanly.
+    send(&mut session, "kill %1");
+    send(&mut session, ENTER);
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
 fn pty_heredoc_ctrl_c_aborts_body_collection() {
     // Start a heredoc, type a partial body line, then abort with Ctrl-C.
     // The partial command must be discarded; a subsequent `pwd` must run

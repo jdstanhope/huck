@@ -32,6 +32,8 @@ spec, an implementation plan, and a test suite.
 | v22       | Functions (`name() { … }`) + positional parameters      |
 | v23       | Inline assignments (`VAR=val cmd`)                       |
 | v24       | Here-documents (`<<EOF`, `<<'EOF'`, `<<-EOF`)            |
+| v25       | Pipelines as subshells (functions, compounds, builtins    |
+|           | all run in forked subshells per POSIX)                    |
 
 ## Build and run
 

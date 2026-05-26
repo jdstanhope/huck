@@ -22,7 +22,7 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 9 | Things to fix |
-| Missing features (Tier 2) | 60 | Bash-compat backlog |
+| Missing features (Tier 2) | 59 | Bash-compat backlog (M-10 fixed by v25) |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping |
 | Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
 
@@ -117,7 +117,7 @@ group.
 - **M-07: `shift [N]`** — `[deferred]` medium. huck: not implemented. bash: removes the first N positional args.
 - **M-08: `set --` and `set` flags** — `[deferred]` medium. huck: not implemented. bash: `set -- a b c` resets positionals; `set -o`/`-e`/`-u`/`-x`/`pipefail` set shell options.
 - **M-09: `function name { … }` keyword form** — `[deferred]` medium. huck: only the POSIX `name() …` form. bash: also accepts the `function` keyword form.
-- **M-10: Functions as pipeline stages** — `[deferred]` high. huck: `cmd | myfunc` doesn't find `myfunc` in the forked child (function table isn't carried across fork). bash: runs function bodies in-process as pipeline stages.
+- **M-10: Functions as pipeline stages** — `[fixed (2026-05-26)]` high. Pipeline stages of any Command type — simple commands, builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions — now run in forked subshells per POSIX 2.12. The parent's function table is inherited across the fork so `cmd | myfunc` finds and runs `myfunc`.
 
 ### Compound commands
 
@@ -289,3 +289,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-24**: Tier 1 finished — B-03 (backslash-newline mid-buffer line continuation) and B-09 (foreground pipeline pgrp wait) marked fixed. Baseline clippy warnings reduced from 22 to 0. Tier 1 is now empty (every "bugs" entry has Status=fixed).
 - **2026-05-24**: M-04 (inline assignments) shipped as v23.
 - **2026-05-24**: M-12 (here-documents) shipped as v24. Also reshapes ExecCommand.stdin from Option<Word> to Option<Redirect> so `<file`, `<<EOF`, and future `<<<word` share a uniform shape.
+- **2026-05-26**: M-10 (functions and compound commands as pipeline stages) shipped as v25. Every pipeline stage now runs in a forked subshell per POSIX 2.12 — builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions all work as stages. Side-effect isolation is now correct: `cd /tmp | true` no longer mutates the parent's cwd.
