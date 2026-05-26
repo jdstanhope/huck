@@ -284,10 +284,9 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     if pipeline.commands.len() == 1 {
-        match &pipeline.commands[0] {
-            Command::Simple(s) => run_single(s, shell, sink),
-            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 only emits Simple"),
-        }
+        // Single-stage pipeline: run directly in the parent shell (no fork needed).
+        // This covers both Simple commands and compound commands as single stages.
+        run_command(&pipeline.commands[0], shell, sink)
     } else {
         run_multi_stage(&pipeline.commands, shell, sink)
     }
@@ -1022,419 +1021,678 @@ fn run_subprocess(
 
 // ----- multi-stage pipeline -------------------------------------------------
 
-enum Carry {
-    None,
-    ChildStdout(ChildStdout),
-    Buffer(Vec<u8>),
+/// Per-stage outcome after spawning: a forked child pid to be waited for.
+enum PipelineStage {
+    Forked(i32),
 }
 
-enum Stage {
-    Done(i32),
-    Process(Child),
+/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds.
+fn make_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
 }
 
+/// Rewrites `run_multi_stage` around raw `libc::pipe` fds.
+///
+/// Each stage is classified via `classify_stage`:
+/// - External (single unquoted literal program, not a builtin or function):
+///   spawned via `spawn_external_with_fds`.
+/// - InProcess (builtins, functions, compounds, dynamic program words, Assign):
+///   forked via `fork_and_run_in_subshell` (which runs the body via `run_command`
+///   in the child, then `_exit`s).
+///
+/// Pipe-fd lifecycle:
+///   - For each inter-stage boundary, a `libc::pipe()` pair is created.
+///   - The write-end is given to stage N as stdout_fd (consumed by spawn/fork).
+///   - The read-end is kept in `prev_pipe_read` and passed to stage N+1 as stdin_fd.
+///   - After spawning a stage, the parent closes any fd it passed to the child
+///     (so that EOF propagates correctly when the child exits).
+///   - Heredoc body bytes are written from the parent to a pipe write-end
+///     immediately after the child is spawned.
+///
+/// v23 inline-assignment scoping: apply before spawning, restore after.
+/// v24 heredoc plumbing: create a pipe for the heredoc body; parent writes it.
+/// I-04 fix: every stage now runs in its own forked subshell → side effects
+///   (cd, variable mutation) are confined to the child.
 fn run_multi_stage(
     commands: &[Command],
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
+    use std::os::fd::FromRawFd;
+
     let interactive = matches!(sink, StdoutSink::Terminal);
+    let n = commands.len();
+
+    // Fd for the capture-sink case: last stage's stdout is piped back to parent.
+    let mut capture_read_fd: Option<RawFd> = None;
+
+    // Pid tracking.
     let mut first_pid: Option<i32> = None;
-
-    let mut resolved_stages: Vec<Option<ResolvedCommand>> = Vec::with_capacity(commands.len());
-    for cmd in commands {
-        match cmd {
-            Command::Simple(SimpleCommand::Assign(_)) => {
-                resolved_stages.push(None);
-            }
-            Command::Simple(SimpleCommand::Exec(exec)) => match resolve(exec, shell) {
-                Ok(r) => resolved_stages.push(Some(r)),
-                Err(code) => return ExecOutcome::Continue(code),
-            },
-            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
-        }
-    }
-    let mut all_files: Vec<Option<StageFiles>> = Vec::with_capacity(resolved_stages.len());
-    for r in &resolved_stages {
-        match r {
-            None => all_files.push(None),
-            Some(r) => match open_stage_files(r, shell) {
-                Ok(f) => all_files.push(Some(f)),
-                Err(()) => return ExecOutcome::Continue(1),
-            },
-        }
-    }
-
-    let n = resolved_stages.len();
-    let mut stages: Vec<Stage> = Vec::with_capacity(n);
     let mut stage_pids: Vec<i32> = Vec::with_capacity(n);
-    let mut carry = Carry::None;
 
-    for (i, ((resolved, files), orig_cmd)) in resolved_stages
-        .iter()
-        .zip(all_files)
-        .zip(commands.iter())
-        .enumerate()
-    {
+    // All forked stages (pid + optional inline exit status for Done stages).
+    let mut pipeline_stages: Vec<PipelineStage> = Vec::with_capacity(n);
+
+    // Read-end of the pipe from the previous stage (None for stage 0).
+    let mut prev_pipe_read: Option<RawFd> = None;
+
+    // All raw fds the parent currently holds (for the child's
+    // parent_fds_to_close list so it doesn't inherit stale pipe ends).
+    let mut parent_held: Vec<RawFd> = Vec::new();
+
+    for (i, stage_cmd) in commands.iter().enumerate() {
         let is_last = i == n - 1;
-        let incoming = std::mem::replace(&mut carry, Carry::None);
 
-        let cmd = match resolved {
-            Some(r) => r,
-            None => {
-                drop(incoming);
-                if !is_last {
-                    carry = Carry::Buffer(Vec::new());
-                }
-                stages.push(Stage::Done(0));
-                let _ = files;
-                continue;
+        // ---- Assign-only stages: no-op, just pass stdin through as empty ----
+        if let Command::Simple(SimpleCommand::Assign(items)) = stage_cmd {
+            // In a pipeline, assignment-only stages are a no-op: they don't
+            // produce output and are run as InProcess. But since assignments
+            // in a subshell don't affect the parent, they're truly inert.
+            // Close any incoming pipe read-end (it goes nowhere).
+            if let Some(r) = prev_pipe_read.take() {
+                let pos = parent_held.iter().position(|&fd| fd == r);
+                if let Some(p) = pos { parent_held.remove(p); }
+                unsafe { libc::close(r); }
             }
-        };
-        let files = files.expect("non-Assign stage must have StageFiles");
-
-        // Extract inline_assignments from the original ExecCommand.
-        // Assign-variant stages were already handled above (continue'd).
-        let inline_assignments = match orig_cmd {
-            Command::Simple(SimpleCommand::Exec(exec)) => &exec.inline_assignments,
-            Command::Simple(SimpleCommand::Assign(_)) => unreachable!("Assign stages are skipped above"),
-            _ => unreachable!("Task 2 enables non-Simple stages; Task 1 doesn't"),
-        };
-
-        if builtins::is_builtin(&cmd.program) {
-            drop(incoming);
-
-            // `cd` and `exit` in a pipeline short-circuit immediately; they
-            // don't run any real command so inline assignments have no
-            // observable effect. We intentionally skip apply/restore here
-            // (option b from the plan) — `FOO=val cd` in a pipeline is
-            // unusual and bash's behaviour for it is itself unclear.
-            if cmd.program == "cd" || cmd.program == "exit" {
-                if !is_last {
-                    carry = Carry::Buffer(Vec::new());
-                }
-                stages.push(Stage::Done(0));
-                continue;
-            }
-
-            let snap = apply_inline_assignments(inline_assignments, shell);
-            let persistent = builtins::is_special_builtin(&cmd.program);
-            let mut buffer: Vec<u8> = Vec::new();
-            let outcome = builtins::run_builtin(&cmd.program, &cmd.args, &mut buffer, shell);
-            if !persistent {
-                restore_inline_assignments(snap, shell);
-            }
-            let mut status = match outcome {
-                ExecOutcome::Continue(code) => code,
-                ExecOutcome::Exit(code) => code,
-                ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => 0,
-                ExecOutcome::FunctionReturn(n) => n,
-            };
-            match files.stdout {
-                Some(mut file) => {
-                    if let Err(e) = file.write_all(&buffer) {
-                        eprintln!("huck: {}: {e}", cmd.program);
-                        status = 1;
+            // Run the assignments via fork so they're isolated.
+            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone()));
+            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+            let stdin_fd = libc::STDIN_FILENO;
+            let stdout_fd = if !is_last {
+                // Create a pipe; next stage reads from it (will be empty).
+                match make_pipe() {
+                    Ok((r, w)) => {
+                        prev_pipe_read = Some(r);
+                        parent_held.push(r);
+                        parent_held.push(w);
+                        w
                     }
-                    if !is_last {
-                        carry = Carry::Buffer(Vec::new());
+                    Err(e) => {
+                        eprintln!("huck: pipe: {e}");
+                        // Clean up all held fds.
+                        for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                        return ExecOutcome::Continue(1);
                     }
                 }
-                None => {
-                    if is_last {
-                        match sink {
-                            StdoutSink::Terminal => {
-                                if let Err(e) = io::stdout().write_all(&buffer) {
-                                    eprintln!("huck: {}: {e}", cmd.program);
-                                    status = 1;
-                                }
+            } else {
+                match sink {
+                    StdoutSink::Capture(_) => {
+                        match make_pipe() {
+                            Ok((r, w)) => {
+                                capture_read_fd = Some(r);
+                                parent_held.push(r);
+                                w
                             }
-                            StdoutSink::Capture(buf) => {
-                                buf.extend_from_slice(&buffer);
+                            Err(e) => {
+                                eprintln!("huck: pipe: {e}");
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
                             }
                         }
-                    } else {
-                        carry = Carry::Buffer(buffer);
                     }
+                    StdoutSink::Terminal => libc::STDOUT_FILENO,
+                }
+            };
+            let fds_to_close: Vec<RawFd> = parent_held.iter().copied()
+                .filter(|&fd| fd != stdout_fd)
+                .collect();
+            match fork_and_run_in_subshell(&assign_cmd, shell, stdin_fd, stdout_fd, libc::STDERR_FILENO, pgid_target, &fds_to_close) {
+                Ok(pid) => {
+                    // Close the stdout fd we gave to the child.
+                    if stdout_fd > 2 {
+                        let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
+                        if let Some(p) = pos { parent_held.remove(p); }
+                        unsafe { libc::close(stdout_fd); }
+                    }
+                    if interactive && first_pid.is_none() {
+                        first_pid = Some(pid);
+                    }
+                    stage_pids.push(pid);
+                    pipeline_stages.push(PipelineStage::Forked(pid));
+                }
+                Err(e) => {
+                    eprintln!("huck: fork: {e}");
+                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                    return ExecOutcome::Continue(1);
                 }
             }
-            stages.push(Stage::Done(status));
             continue;
         }
 
+        // ---- Apply inline assignments (v23 per-stage scoping) ---------------
+        let inline_assignments: &[(String, crate::lexer::Word)] =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                &exec.inline_assignments
+            } else {
+                &[]
+            };
         let snap = apply_inline_assignments(inline_assignments, shell);
 
-        let mut process = ProcessCommand::new(&cmd.program);
-        process.args(&cmd.args);
-        process.env_clear();
-        process.envs(shell.exported_env());
+        // ---- Build stdin fd --------------------------------------------------
+        // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
+        // For InProcess compound stages, there are no explicit redirects at the
+        // stage level; the child handles them internally via run_command.
 
-        // Reset job-control signals to SIG_DFL in every child.
-        use std::os::unix::process::CommandExt;
-        unsafe { process.pre_exec(reset_job_control_signals_in_child); }
-        if interactive {
-            let pgid_target = first_pid.unwrap_or(0);
-            process.process_group(pgid_target);
-        }
+        // We may need to create a heredoc pipe and write its body after spawning.
+        // The body is expanded NOW (while inline assignments are applied) so that
+        // $var references in the body see the stage's own inline assignments (v24
+        // deferred-heredoc contract). The bytes are stored here and written to the
+        // pipe write-end after the child is spawned.
+        let mut heredoc_write_fd: Option<RawFd> = None;
+        let mut heredoc_body_bytes: Option<Vec<u8>> = None;
 
-        let mut pending_input: Option<Vec<u8>> = None;
-        match files.stdin {
-            Some(StdinInput::File(file)) => {
-                process.stdin(Stdio::from(file));
-            }
-            Some(StdinInput::DeferredHeredoc(body)) => {
-                // Expand the heredoc body NOW — apply_inline_assignments has
-                // already fired for this stage (line above), so $var references
-                // in the body see the stage's own inline assignments.
-                let bytes = expand_assignment(&body, shell).into_bytes();
-                process.stdin(Stdio::piped());
-                pending_input = Some(bytes);
-            }
-            None => {
-                match incoming {
-                    Carry::None => {}
-                    Carry::ChildStdout(child_stdout) => {
-                        process.stdin(Stdio::from(child_stdout));
-                    }
-                    Carry::Buffer(bytes) => {
-                        process.stdin(Stdio::piped());
-                        pending_input = Some(bytes);
+        let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+            match &exec.stdin {
+                Some(Redirect::Read(word)) => {
+                    let path = match expand_single(word, shell) {
+                        Ok(p) => p,
+                        Err(()) => {
+                            restore_inline_assignments(snap, shell);
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
+                    };
+                    use std::os::unix::io::IntoRawFd;
+                    match File::open(&path) {
+                        Ok(f) => f.into_raw_fd(),
+                        Err(e) => {
+                            eprintln!("huck: {path}: {e}");
+                            restore_inline_assignments(snap, shell);
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
                     }
                 }
-            }
-        }
-
-        let pipe_onward = !is_last && cmd.stdout.is_none();
-        let want_terminal_capture =
-            is_last && cmd.stdout.is_none() && matches!(sink, StdoutSink::Capture(_));
-        if let Some(file) = files.stdout {
-            process.stdout(Stdio::from(file));
-        } else if pipe_onward || want_terminal_capture {
-            process.stdout(Stdio::piped());
-        }
-
-        if let Some(file) = files.stderr {
-            process.stderr(Stdio::from(file));
-        }
-
-        let mut child = match process.spawn() {
-            Ok(child) => {
-                // Child has forked and captured its env; restore the parent
-                // shell state immediately so the next stage starts clean.
-                restore_inline_assignments(snap, shell);
-                child
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                restore_inline_assignments(snap, shell);
-                eprintln!("huck: command not found: {}", cmd.program);
-                if !is_last {
-                    carry = Carry::Buffer(Vec::new());
+                Some(Redirect::Heredoc { body, .. }) => {
+                    // Expand the body NOW while inline assignments are still applied.
+                    // Store the bytes; write them to the pipe after the child is spawned.
+                    heredoc_body_bytes = Some(expand_assignment(body, shell).into_bytes());
+                    // Create a pipe: child reads from r; parent writes body to w.
+                    match make_pipe() {
+                        Ok((r, w)) => {
+                            heredoc_write_fd = Some(w);
+                            r
+                        }
+                        Err(e) => {
+                            eprintln!("huck: pipe: {e}");
+                            restore_inline_assignments(snap, shell);
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
                 }
-                stages.push(Stage::Done(127));
-                continue;
-            }
-            Err(e) => {
-                restore_inline_assignments(snap, shell);
-                eprintln!("huck: {}: {e}", cmd.program);
-                if !is_last {
-                    carry = Carry::Buffer(Vec::new());
+                _ => {
+                    // No explicit stdin redirect: use prev_pipe_read or STDIN_FILENO.
+                    prev_pipe_read.take().unwrap_or(libc::STDIN_FILENO)
                 }
-                stages.push(Stage::Done(1));
-                continue;
+            }
+        } else {
+            // Compound command: no explicit stdin at stage level.
+            prev_pipe_read.take().unwrap_or(libc::STDIN_FILENO)
+        };
+
+        // stdin_fd is now consumed by this stage; remove from parent_held if it was there.
+        {
+            let pos = parent_held.iter().position(|&fd| fd == stdin_fd);
+            if let Some(p) = pos { parent_held.remove(p); }
+        }
+
+        // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
+        let explicit_stdout_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.stdout {
+                    Some(Redirect::Truncate(w)) => {
+                        let path = match expand_single(w, shell) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                eprintln!("huck: {path}: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    Some(Redirect::Append(w)) => {
+                        let path = match expand_single(w, shell) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                eprintln!("huck: {path}: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
+        let explicit_stderr_fd: Option<RawFd> =
+            if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
+                match &exec.stderr {
+                    Some(Redirect::Truncate(w)) => {
+                        let path = match expand_single(w, shell) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                eprintln!("huck: {path}: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    Some(Redirect::Append(w)) => {
+                        let path = match expand_single(w, shell) {
+                            Ok(p) => p,
+                            Err(()) => {
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        };
+                        use std::os::unix::io::IntoRawFd;
+                        match OpenOptions::new().create(true).append(true).open(&path) {
+                            Ok(f) => Some(f.into_raw_fd()),
+                            Err(e) => {
+                                eprintln!("huck: {path}: {e}");
+                                restore_inline_assignments(snap, shell);
+                                if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                                if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        // ---- Build stdout fd -------------------------------------------------
+        // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
+        let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+            fd
+        } else if !is_last {
+            // Create the inter-stage pipe.
+            match make_pipe() {
+                Ok((r, w)) => {
+                    prev_pipe_read = Some(r);
+                    parent_held.push(r);
+                    // w is given to the child; track it so other children can close it.
+                    parent_held.push(w);
+                    w
+                }
+                Err(e) => {
+                    eprintln!("huck: pipe: {e}");
+                    restore_inline_assignments(snap, shell);
+                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                    if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                    if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        } else {
+            match sink {
+                StdoutSink::Capture(_) => {
+                    match make_pipe() {
+                        Ok((r, w)) => {
+                            capture_read_fd = Some(r);
+                            parent_held.push(r);
+                            w
+                        }
+                        Err(e) => {
+                            eprintln!("huck: pipe: {e}");
+                            restore_inline_assignments(snap, shell);
+                            if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                            if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                            if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                            return ExecOutcome::Continue(1);
+                        }
+                    }
+                }
+                StdoutSink::Terminal => libc::STDOUT_FILENO,
             }
         };
 
-        if let Some(bytes) = pending_input
-            && let Some(mut child_stdin) = child.stdin.take()
-        {
-            let _ = child_stdin.write_all(&bytes);
+        let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
+
+        // ---- Classify and spawn ----------------------------------------------
+        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+
+        // parent_fds_to_close: all fds the parent currently holds that the
+        // child must close (so it doesn't hold downstream pipe write-ends open,
+        // which would prevent EOF propagation). We exclude the fds being passed
+        // to this stage as stdio (those are the child's to keep). We also
+        // include the heredoc_write_fd so the child doesn't hold its own
+        // stdin-pipe write-end open.
+        let mut fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
+            .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
+            .collect();
+        if let Some(w) = heredoc_write_fd {
+            // The child must close the write-end of its own heredoc pipe.
+            fds_to_close_in_child.push(w);
         }
 
-        // Track pid for interactive job-control; setpgid in parent to
-        // close the race with the child's setpgid (via process_group).
-        let pid = child.id() as i32;
-        stage_pids.push(pid);
-        if interactive && first_pid.is_none() {
-            first_pid = Some(pid);
-            unsafe {
-                if libc::setpgid(pid, pid) != 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    debug_assert!(
-                        errno == libc::ESRCH || errno == libc::EACCES,
-                        "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
-                    );
+        // Track whether we went External (in which case spawn_external_with_fds
+        // consumes stdin/stdout/stderr via OwnedFd and the parent must NOT close
+        // them) or InProcess (in which case the parent must close them since
+        // fork_and_run_in_subshell only dup2's in the child).
+        let went_external;
+        let spawn_result = match classify_stage(stage_cmd, shell) {
+            StageKind::External(simple) => {
+                went_external = true;
+                // spawn_external_with_fds takes ownership of stdin_fd/stdout_fd/stderr_fd
+                // via OwnedFd::from_raw_fd. The parent's copies are closed inside the
+                // function. Do NOT close them in the parent after this call.
+                spawn_external_with_fds(
+                    simple,
+                    shell,
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                )
+            }
+            StageKind::InProcess(cmd) => {
+                went_external = false;
+                fork_and_run_in_subshell(
+                    cmd,
+                    shell,
+                    stdin_fd,
+                    stdout_fd,
+                    stderr_fd,
+                    pgid_target,
+                    &fds_to_close_in_child,
+                )
+            }
+        };
+
+        // ---- Restore inline assignments (v23 scoping) -----------------------
+        restore_inline_assignments(snap, shell);
+
+        let pid = match spawn_result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("huck: {e}");
+                // For InProcess (fork failed), close the fds we were going to
+                // pass. For External, they were already consumed by OwnedFd.
+                if !went_external {
+                    if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                    if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
+                    if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
                 }
+                // Remove consumed fds from parent_held.
+                for fd in [stdout_fd, stdin_fd, stderr_fd] {
+                    if fd > 2 {
+                        let pos = parent_held.iter().position(|&x| x == fd);
+                        if let Some(p) = pos { parent_held.remove(p); }
+                    }
+                }
+                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
+                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
+                return ExecOutcome::Continue(1);
+            }
+        };
+
+        // ---- Close fds the child consumed in the parent ---------------------
+        // For InProcess: the child dup2'd stdin/stdout/stderr but the parent's
+        // copies still exist. Close them here.
+        // For External: spawn_external_with_fds consumed them via OwnedFd;
+        // they are already closed. Do NOT close again.
+        if !went_external {
+            if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+            // stdout_fd will be closed below (shared with External path).
+            if stderr_fd > 2 { unsafe { libc::close(stderr_fd); } }
+        }
+        // stdout_fd (write-end of the inter-stage pipe or explicit redirect):
+        // - For External: already closed by OwnedFd inside spawn_external_with_fds.
+        // - For InProcess: closed above if stderr, here for stdout.
+        // But we still need to remove it from parent_held in both cases so
+        // subsequent stages don't include it in their fds_to_close_in_child.
+        if stdout_fd > 2 {
+            let pos = parent_held.iter().position(|&fd| fd == stdout_fd);
+            if let Some(p) = pos { parent_held.remove(p); }
+            // Only close if InProcess (External already closed it).
+            if !went_external {
+                unsafe { libc::close(stdout_fd); }
             }
         }
 
-        if pipe_onward {
-            carry = Carry::ChildStdout(child.stdout.take().expect("stdout was set to piped"));
-        } else if !is_last {
-            carry = Carry::Buffer(Vec::new());
-        } else if want_terminal_capture
-            && let StdoutSink::Capture(buf) = sink
-            && let Some(mut child_stdout) = child.stdout.take()
-            && let Err(e) = io::copy(&mut child_stdout, *buf)
-        {
-            eprintln!("huck: {}: {e}", cmd.program);
+        // ---- Write heredoc body to child's stdin pipe -----------------------
+        // The body was pre-expanded (while inline assignments were applied) and
+        // stored in `heredoc_body_bytes`. Write it now so the child's stdin
+        // doesn't block. Dropping `write_file` closes the write-end, signalling
+        // EOF to the child.
+        if let (Some(w), Some(bytes)) = (heredoc_write_fd.take(), heredoc_body_bytes.take()) {
+            let mut write_file = unsafe { File::from_raw_fd(w) };
+            let _ = write_file.write_all(&bytes);
+            // write_file drops here, closing w — child sees EOF.
         }
 
-        stages.push(Stage::Process(child));
+        // ---- Track pid -------------------------------------------------------
+        if interactive && first_pid.is_none() {
+            first_pid = Some(pid);
+        }
+        stage_pids.push(pid);
+        pipeline_stages.push(PipelineStage::Forked(pid));
     }
 
+    // Close any remaining parent-held fds that weren't consumed
+    // (e.g., if the last stage had an explicit stdout redirect, prev_pipe_read
+    // might still hold a stale value from a stage with a broken pipe — but that
+    // shouldn't happen in a well-formed pipeline).
+    // The capture_read_fd is intentionally kept open until after wait.
+    for fd in parent_held.iter().copied() {
+        // Don't close the capture_read_fd; we need it after wait.
+        if Some(fd) != capture_read_fd {
+            unsafe { libc::close(fd); }
+        }
+    }
+    parent_held.retain(|&fd| Some(fd) == capture_read_fd);
+
     // Give the terminal to the pipeline's process group if interactive.
-    if interactive
-        && let Some(pgid) = first_pid
-    {
+    if interactive && let Some(pgid) = first_pid {
         give_terminal_to(pgid);
     }
 
-    let last_status = if interactive {
-        match wait_pgrp_pipeline(stages, &stage_pids, first_pid, shell) {
-            PipelineWait::AllExited(status) => {
-                give_terminal_to(shell.shell_pgid);
-                status
-            }
-            PipelineWait::Stopped(sig) => {
-                give_terminal_to(shell.shell_pgid);
-                return ExecOutcome::Continue(128 + sig);
-            }
-        }
-    } else {
-        let mut status = 0;
-        for stage in stages {
-            match stage {
-                Stage::Done(code) => status = code,
-                Stage::Process(mut child) => {
-                    status = match child.wait() {
-                        Ok(s) => status_code(&s),
-                        Err(e) => {
-                            eprintln!("huck: {e}");
-                            1
-                        }
-                    };
-                }
-            }
-        }
-        status
-    };
+    // ---- Wait for all stages ------------------------------------------------
+    let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, interactive);
 
-    ExecOutcome::Continue(last_status)
+    if interactive {
+        give_terminal_to(shell.shell_pgid);
+        if let PipelineWaitResult::Stopped(sig) = last_status {
+            // Capture fd cleanup.
+            if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
+            return ExecOutcome::Continue(128 + sig);
+        }
+    }
+
+    // ---- Read capture sink --------------------------------------------------
+    if let Some(r) = capture_read_fd.take() {
+        if let StdoutSink::Capture(buf) = sink {
+            let mut f = unsafe { File::from_raw_fd(r) };
+            let _ = io::copy(&mut f, *buf);
+            // f drops here, closing r.
+        } else {
+            unsafe { libc::close(r); }
+        }
+    }
+
+    let status = match last_status {
+        PipelineWaitResult::AllExited(s) => s,
+        PipelineWaitResult::Stopped(sig) => 128 + sig,
+    };
+    ExecOutcome::Continue(status)
 }
 
-enum PipelineWait {
-    /// Every process stage was reaped; pipeline exit status follows POSIX
-    /// (the last stage's status).
+enum PipelineWaitResult {
     AllExited(i32),
-    /// At least one stage was stopped (Ctrl-Z); the job has already been
-    /// added to the table and the stop notification emitted.
     Stopped(i32),
 }
 
-/// Waits on the entire process group for an interactive pipeline. Uses
-/// `waitpid(-pgid, …, WUNTRACED)` so a stop event on ANY stage surfaces
-/// immediately — fixing the wedge that per-pid waiting created when the
-/// loop was blocked on one stage while a sibling stopped. On a stop, the
-/// pipeline is registered as a Stopped job (so `fg` can resume it) and
-/// `Stopped(sig)` is returned. Consumes the `Stage::Process` children via
-/// `mem::forget`, since reaping has already been done via `libc::waitpid`.
-fn wait_pgrp_pipeline(
-    stages: Vec<Stage>,
+/// Waits for all forked stages in a pipeline. Works with raw pids (both
+/// External and InProcess stages produce a pid).
+///
+/// For interactive pipelines: uses `waitpid(-pgid, WUNTRACED)` on the whole
+/// process group (B-09 pattern). On stop, registers the job and returns
+/// `Stopped`. The terminal is NOT reclaimed here — the caller does it.
+///
+/// For non-interactive pipelines: waits on each pid sequentially.
+fn wait_pipeline_raw(
+    stages: &[PipelineStage],
     stage_pids: &[i32],
     first_pid: Option<i32>,
     shell: &mut Shell,
-) -> PipelineWait {
+    interactive: bool,
+) -> PipelineWaitResult {
+    // All stages are Forked; initialize status slots to None.
+    let mut stage_status: Vec<Option<i32>> = stages.iter().map(|_| None).collect();
+
     let pid_per_stage: Vec<Option<i32>> = stages
         .iter()
         .map(|s| match s {
-            Stage::Done(_) => None,
-            Stage::Process(child) => Some(child.id() as i32),
+            PipelineStage::Forked(pid) => Some(*pid),
         })
         .collect();
-    let mut stage_status: Vec<Option<i32>> = stages
-        .iter()
-        .map(|s| match s {
-            Stage::Done(code) => Some(*code),
-            Stage::Process(_) => None,
-        })
-        .collect();
-    let mut remaining: std::collections::HashSet<i32> =
-        pid_per_stage.iter().filter_map(|p| *p).collect();
 
-    if let Some(pgid) = first_pid {
-        while !remaining.is_empty() {
-            let mut raw: libc::c_int = 0;
-            let r = loop {
-                let r = unsafe { libc::waitpid(-pgid, &mut raw, libc::WUNTRACED) };
+    if interactive {
+        if let Some(pgid) = first_pid {
+            let mut remaining: std::collections::HashSet<i32> =
+                pid_per_stage.iter().filter_map(|p| *p).collect();
+
+            while !remaining.is_empty() {
+                let mut raw: libc::c_int = 0;
+                let r = loop {
+                    let r = unsafe { libc::waitpid(-pgid, &mut raw, libc::WUNTRACED) };
+                    if r < 0 {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                    }
+                    break r;
+                };
                 if r < 0 {
-                    let errno = std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(0);
-                    if errno == libc::EINTR {
-                        continue;
+                    // ECHILD — fill unfilled with 1.
+                    for slot in stage_status.iter_mut() {
+                        if slot.is_none() { *slot = Some(1); }
                     }
+                    break;
                 }
-                break r;
-            };
-            if r < 0 {
-                // ECHILD — none of our pgrp children remain visible. Fill
-                // unfilled slots with status 1 so we still produce a
-                // deterministic result rather than hanging.
-                for slot in stage_status.iter_mut() {
-                    if slot.is_none() {
-                        *slot = Some(1);
+                if libc::WIFSTOPPED(raw) {
+                    let sig = libc::WSTOPSIG(raw);
+                    let display = format!("(pipeline pid {pgid})");
+                    let job_id = shell.jobs.add(pgid, stage_pids.to_vec(), display);
+                    for job in shell.jobs.jobs_mut() {
+                        if job.id == job_id {
+                            job.state = crate::jobs::JobState::Stopped(sig);
+                            job.notified = true;
+                            break;
+                        }
                     }
+                    let line = shell
+                        .jobs
+                        .iter()
+                        .find(|j| j.id == job_id)
+                        .map(|j| crate::jobs::notification_line(j, '+'))
+                        .unwrap_or_default();
+                    eprintln!("\n{line}");
+                    return PipelineWaitResult::Stopped(sig);
+                }
+                if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
+                    let s = if libc::WIFEXITED(raw) {
+                        libc::WEXITSTATUS(raw)
+                    } else {
+                        128 + libc::WTERMSIG(raw)
+                    };
+                    if let Some(idx) = pid_per_stage.iter().position(|p| *p == Some(r)) {
+                        stage_status[idx] = Some(s);
+                    }
+                    remaining.remove(&r);
+                }
+            }
+        }
+    } else {
+        // Non-interactive: wait on each pid in order.
+        for (stage, slot) in stages.iter().zip(stage_status.iter_mut()) {
+            let PipelineStage::Forked(pid) = stage;
+            let mut raw: libc::c_int = 0;
+            loop {
+                let r = unsafe { libc::waitpid(*pid, &mut raw, 0) };
+                if r < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno == libc::EINTR { continue; }
+                    *slot = Some(1);
+                    break;
+                }
+                if libc::WIFEXITED(raw) {
+                    *slot = Some(libc::WEXITSTATUS(raw));
+                } else if libc::WIFSIGNALED(raw) {
+                    *slot = Some(128 + libc::WTERMSIG(raw));
                 }
                 break;
             }
-            if libc::WIFSTOPPED(raw) {
-                let sig = libc::WSTOPSIG(raw);
-                let display = format!("(pipeline pid {pgid})");
-                let job_id = shell.jobs.add(pgid, stage_pids.to_vec(), display);
-                for job in shell.jobs.jobs_mut() {
-                    if job.id == job_id {
-                        job.state = crate::jobs::JobState::Stopped(sig);
-                        job.notified = true;
-                        break;
-                    }
-                }
-                let line = shell
-                    .jobs
-                    .iter()
-                    .find(|j| j.id == job_id)
-                    .map(|j| crate::jobs::notification_line(j, '+'))
-                    .unwrap_or_default();
-                eprintln!("\n{line}");
-                forget_process_children(stages);
-                return PipelineWait::Stopped(sig);
-            }
-            if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
-                let s = if libc::WIFEXITED(raw) {
-                    libc::WEXITSTATUS(raw)
-                } else {
-                    128 + libc::WTERMSIG(raw)
-                };
-                if let Some(idx) = pid_per_stage.iter().position(|p| *p == Some(r)) {
-                    stage_status[idx] = Some(s);
-                }
-                remaining.remove(&r);
-            }
         }
     }
 
-    forget_process_children(stages);
-    PipelineWait::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
-}
-
-/// Consumes `stages` and `mem::forget`s every `Stage::Process` child so
-/// Drop doesn't try to re-reap pids we've already collected via
-/// `libc::waitpid`. `Stage::Done` variants drop normally (no resources).
-fn forget_process_children(stages: Vec<Stage>) {
-    for stage in stages {
-        if let Stage::Process(child) = stage {
-            std::mem::forget(child);
-        }
-    }
+    PipelineWaitResult::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
 }
 
 // ----- inline-assignment apply/restore helpers ------------------------------
@@ -1525,8 +1783,6 @@ fn reset_job_control_signals_in_child() -> std::io::Result<()> {
 /// must close (else EOF propagation fails downstream).
 ///
 /// `pgid_target`: 0 = become own pgrp leader; >0 = join this pgrp.
-// Task 5 wires this into run_multi_stage; suppress the warning until then.
-#[allow(dead_code)]
 pub fn fork_and_run_in_subshell(
     cmd: &Command,
     shell: &mut Shell,
@@ -1614,9 +1870,6 @@ pub fn fork_and_run_in_subshell(
 /// Everything else (compounds, function calls, builtins, dynamic program words,
 /// assignment-only stages) → `InProcess`.
 ///
-/// TODO: Task 5 wires `classify_stage` + `spawn_external_with_fds` into
-/// `run_multi_stage`.
-#[allow(dead_code)]
 enum StageKind<'a> {
     /// A `SimpleCommand::Exec` that resolves to an external binary.
     External(&'a SimpleCommand),
@@ -1624,8 +1877,6 @@ enum StageKind<'a> {
     InProcess(&'a Command),
 }
 
-// Task 5 wires classify_stage into run_multi_stage; suppress the warning until then.
-#[allow(dead_code)]
 fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
     if let Command::Simple(simple) = cmd
         && let SimpleCommand::Exec(exec) = simple
@@ -1653,8 +1904,6 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
 /// Returns the child's pid. The `Child` handle is `mem::forget`'d (matching
 /// the B-09 pattern) since the caller is responsible for `waitpid`.
 ///
-/// TODO: Task 5 wires `spawn_external_with_fds` into `run_multi_stage`.
-#[allow(dead_code)]
 fn spawn_external_with_fds(
     cmd: &SimpleCommand,
     shell: &mut Shell,
@@ -1688,12 +1937,26 @@ fn spawn_external_with_fds(
     // Join the pgrp (or become pgrp leader if pgid_target == 0).
     process.process_group(pgid_target);
 
-    // Convert raw fds to Stdio. OwnedFd::from_raw_fd transfers ownership;
-    // Stdio::from(OwnedFd) closes the fd in the parent after the fork
-    // (std::process::Command does so automatically).
-    let stdin_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stdin_fd)) };
-    let stdout_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stdout_fd)) };
-    let stderr_stdio = unsafe { Stdio::from(OwnedFd::from_raw_fd(stderr_fd)) };
+    // Convert raw fds to Stdio. For fds that are already at their "natural"
+    // slot (stdin=0, stdout=1, stderr=2), use Stdio::inherit() so we don't
+    // accidentally close the parent's standard streams. For other fds, use
+    // OwnedFd::from_raw_fd which transfers ownership — std::process::Command
+    // closes the original fd in the parent after forking.
+    let stdin_stdio = if stdin_fd == 0 {
+        Stdio::inherit()
+    } else {
+        unsafe { Stdio::from(OwnedFd::from_raw_fd(stdin_fd)) }
+    };
+    let stdout_stdio = if stdout_fd == 1 {
+        Stdio::inherit()
+    } else {
+        unsafe { Stdio::from(OwnedFd::from_raw_fd(stdout_fd)) }
+    };
+    let stderr_stdio = if stderr_fd == 2 {
+        Stdio::inherit()
+    } else {
+        unsafe { Stdio::from(OwnedFd::from_raw_fd(stderr_fd)) }
+    };
 
     process.stdin(stdin_stdio);
     process.stdout(stdout_stdio);
