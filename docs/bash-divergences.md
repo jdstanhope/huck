@@ -22,9 +22,9 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 10 | Things to fix (B-10 fixed 2026-05-26) |
-| Missing features (Tier 2) | 54 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28) |
+| Missing features (Tier 2) | 53 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
-| Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
+| Low-impact (Tier 4) | 8 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence) |
 
 ---
 
@@ -145,8 +145,8 @@ group.
 
 ### Redirects
 
-- **M-18: `2>&1` and `n>&m` fd-duplication** — `[deferred]` high. huck: parse error. bash: duplicates fds.
-- **M-19: `&>file` combined redirect** — `[deferred]` medium. huck: parse error. bash: `>file 2>&1`.
+- **M-18: fd-duplication `n>&m` and `&>file`** — `[fixed (2026-05-26)]` high. Now supported: `2>&1` (POSIX), `1>&2`, `&>file` (bash), `&>>file` (bash). Limited to fds 1 and 2 (arbitrary `n>&m` with n≠1,2 may parse but isn't claimed to work). `>&-` (close-fd) is out of scope. **Known divergence**: huck applies stdout-redirect before stderr-redirect (field-based AST loses source order); `cmd 2>&1 >file` (rare anti-pattern) produces both-to-file rather than bash's stderr-to-terminal. Canonical `>file 2>&1` works correctly. See L-08.
+- **M-19: `&>file` combined redirect** — `[fixed (2026-05-26)]` medium. Covered by M-18 fix; `&>file` and `&>>file` are fully supported as bash shorthand for `>file 2>&1` / `>>file 2>&1`.
 - **M-20: `n<>file` read-write open** — `[deferred]` low. huck: not implemented. bash: opens fd for read+write.
 - **M-21: `>|` and `noclobber`** — `[deferred]` low. huck: no `set -o noclobber`, no `>|`. bash: `noclobber` blocks overwriting; `>|` forces.
 - **M-51: `|&` pipe stdout+stderr** — `[deferred]` low. huck: parse error. bash: shorthand for `2>&1 |`.
@@ -295,6 +295,14 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-06**: `jobs` column width is fixed at 24; bash uses terminal width.
 - **L-07**: `wait` polls (50ms) rather than blocking — small latency / minor CPU usage.
 
+### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
+- **Status**: intentional (v29)
+- **Severity**: low
+- **huck**: `cmd 2>&1 >file` is treated identically to `cmd >file 2>&1` — both fds end up at the file. The field-based `ExecCommand` AST (`stdin`/`stdout`/`stderr`) stores at most one redirect per fd and cannot preserve source order.
+- **bash**: `cmd 2>&1 >file` puts stderr to the terminal and stdout to the file (because `2>&1` dups stderr to the CURRENT stdout, which is the terminal at that point, then `>file` redirects stdout). The canonical form is `cmd >file 2>&1`.
+- **Why intentional**: source-order preservation requires refactoring `ExecCommand` to `redirects: Vec<(SourceFd, Redirect)>` — a substantial change. The canonical form covers >99% of real usage.
+- **Workaround**: write `cmd >file 2>&1` (or `cmd &>file`).
+
 ---
 
 ## Change log
@@ -310,3 +318,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: I-16 fix completed by v26 post-review patch. v25's fix covered multi-stage pipelines but a `pipeline_is_pure_builtin` shortcut in `run_background_sequence` still ran single-stage pure-builtin backgrounds synchronously in the parent (preventing `$!` update and leaking side effects). Shortcut removed; all backgrounded pipelines now fork. M-10 fixed-date corrected to 2026-05-25.
 - **2026-05-26**: M-13 (here-strings `<<<word`) shipped as v27.
 - **2026-05-26**: M-11 (subshell syntax `(list)`) shipped as v28.
+- **2026-05-26**: M-18/19 (fd-duplication redirects) shipped as v29. Supports `2>&1`, `1>&2`, `&>file`, `&>>file`. Documented order-divergence for `2>&1 >file` anti-pattern as L-08.

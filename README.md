@@ -37,6 +37,7 @@ spec, an implementation plan, and a test suite.
 | v26       | Special parameters (`$0`, `$$`, `$!`)                    |
 | v27       | Here-strings (`<<<word`)                                  |
 | v28       | Subshell syntax (`(list)`)                               |
+| v29       | FD-duplication redirects (`2>&1`, `1>&2`, `&>file`, `&>>file`) |
 
 ## Build and run
 
