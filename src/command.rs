@@ -651,26 +651,23 @@ fn parse_command<I: Iterator<Item = Token>>(
                     // parse_pipeline_with_first with the original iter.
                     if extra_clones.is_empty() {
                         return Ok(Command::Pipeline(
-                            parse_pipeline_with_first(Some(w_clone), iter)?
+                            parse_pipeline_with_first(Some(w_clone), vec![], iter)?
                         ));
                     }
-                    // Multi-assign case (e.g. `A=1 B=2 cmd`): extra words were
-                    // consumed from `iter`. Rebuild by collecting the extras +
-                    // the rest of `iter` into a single Vec-backed sub-iterator.
-                    // This exhausts `iter`, but since parse_command is called
-                    // serially by parse_sequence the outer loop will naturally
-                    // stop when iter is empty — all remaining tokens are in the
-                    // sub-iter and parsed here.
-                    let mut rest: Vec<Token> =
+                    // Multi-assign case (e.g. `A=1 B=2 cmd`): extra assignment
+                    // words were consumed from `iter` during speculative peeling.
+                    // Re-inject them as prefix_tokens so that `iter` is NOT
+                    // drained — the outer parse_sequence needs `iter` intact to
+                    // pick up any trailing `;`/`&&`/`||` separators after this
+                    // pipeline ends.
+                    let prefix: Vec<Token> =
                         extra_clones.into_iter().map(Token::Word).collect();
-                    rest.extend(iter.by_ref());
-                    let mut sub = rest.into_iter().peekable();
                     return Ok(Command::Pipeline(
-                        parse_pipeline_with_first(Some(w_clone), &mut sub)?
+                        parse_pipeline_with_first(Some(w_clone), prefix, iter)?
                     ));
                 }
                 // Not a function def — pipeline with `w` as the first word.
-                Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), iter)?))
+                Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), vec![], iter)?))
             } else {
                 Ok(Command::Pipeline(parse_pipeline(iter)?))
             }
@@ -1184,6 +1181,7 @@ fn parse_while<I: Iterator<Item = Token>>(
 /// function reads the initial word from the iterator.
 fn parse_simple_stage<I: Iterator<Item = Token>>(
     first: Option<Word>,
+    prefix_tokens: Vec<Token>,
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<(Command, bool), ParseError> {
     let mut program: Option<Word> = first;
@@ -1192,6 +1190,25 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
     let mut stdout: Option<Redirect> = None;
     let mut stderr: Option<Redirect> = None;
     let mut pipe_follows = false;
+
+    // Drain prefix_tokens first (extra assignment words re-injected by the
+    // multi-assign speculative-peel path). These are always Token::Word items
+    // so we process them directly without going through the pipeline-terminator
+    // peek-break that guards the main loop.
+    for tok in prefix_tokens {
+        match tok {
+            Token::Word(word) => {
+                if program.is_none() {
+                    program = Some(word);
+                } else {
+                    args.push(word);
+                }
+            }
+            // prefix_tokens only ever contains Token::Word items in the
+            // current caller; guard other variants to prevent silent misbehaviour.
+            _ => unreachable!("prefix_tokens should only contain Token::Word"),
+        }
+    }
 
     while let Some(token) = iter.peek() {
         if matches!(
@@ -1336,9 +1353,9 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
                     return Ok((cmd, false));
                 }
                 // Not a function def — simple stage with `w` as the first word.
-                parse_simple_stage(Some(w), iter)
+                parse_simple_stage(Some(w), vec![], iter)
             } else {
-                parse_simple_stage(None, iter)
+                parse_simple_stage(None, vec![], iter)
             }
         }
     }
@@ -1346,6 +1363,7 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
 
 fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
     first: Option<Word>,
+    prefix_tokens: Vec<Token>,
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<Command> = Vec::new();
@@ -1355,7 +1373,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
     // pass it along). The first stage is always a simple command because
     // `parse_command` dispatches compound commands before calling us, so
     // we only arrive here for simple-command pipelines.
-    let (first_cmd, mut pipe_follows) = parse_simple_stage(first, iter)?;
+    let (first_cmd, mut pipe_follows) = parse_simple_stage(first, prefix_tokens, iter)?;
     commands.push(first_cmd);
 
     // For each subsequent stage (after `|`), dispatch via `parse_next_stage`
@@ -1389,7 +1407,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
 fn parse_pipeline<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Pipeline, ParseError> {
-    parse_pipeline_with_first(None, iter)
+    parse_pipeline_with_first(None, vec![], iter)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -3801,5 +3819,48 @@ mod tests {
         };
         assert_eq!(inline_assignments.len(), 1);
         assert_eq!(inline_assignments[0].0, "FOO");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests: multi-assign speculative-peel iterator-drain bug
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_assign_then_pipeline_then_semi_then_next_cmd_preserves_next() {
+        // Regression: v30's speculative-peel for FOO=hi [[ ]] introduced an
+        // iterator-drain bug in the multi-assign (A=1 B=2 ...) fallback path.
+        // The iter.by_ref() drain caused parse_pipeline_with_first to swallow
+        // all remaining tokens into a sub-iter; anything after the pipeline
+        // terminator (`;`) was silently dropped when sub went out of scope.
+        // After the fix, the outer iter stays intact so parse_sequence picks
+        // up `foo` after the semicolon.
+        let tokens = crate::lexer::tokenize("A=1 B=2 cmd; foo").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        assert_eq!(
+            parsed.rest.len(), 1,
+            "expected `; foo` to survive parse; got {:?}", parsed
+        );
+        // The first pipeline should carry both inline assignments.
+        let Command::Pipeline(ref p) = parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first)
+        };
+        let Command::Simple(SimpleCommand::Exec(ref e)) = p.commands[0] else {
+            panic!("expected Simple(Exec), got {:?}", p.commands[0])
+        };
+        assert_eq!(e.inline_assignments.len(), 2);
+        assert_eq!(e.inline_assignments[0].0, "A");
+        assert_eq!(e.inline_assignments[1].0, "B");
+    }
+
+    #[test]
+    fn multi_assign_then_pipeline_then_and_then_next_cmd_preserves_next() {
+        // Same shape but with `&&` connector — verifies the fix is not
+        // specific to the `;` terminator.
+        let tokens = crate::lexer::tokenize("A=1 B=2 cmd && other").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        assert_eq!(
+            parsed.rest.len(), 1,
+            "expected `&& other` to survive parse; got {:?}", parsed
+        );
     }
 }

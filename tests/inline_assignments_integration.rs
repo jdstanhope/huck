@@ -177,6 +177,21 @@ fn inline_assignment_backgrounded_external_command_sees_var() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression: multi-assign speculative-peel iterator-drain bug (v30)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_assign_with_trailing_semi_command_runs_both() {
+    // Before the fix, `A=1 B=2 echo first; echo second` silently lost
+    // `echo second` because iter.by_ref() drained the outer iterator into a
+    // sub-iter, and tokens after the `;` in the sub-iter were dropped when
+    // parse_pipeline_with_first returned.
+    let (out, _) = run("A=1 B=2 echo first; echo second\nexit\n");
+    let lines: Vec<&str> = out.lines().filter(|l| *l == "first" || *l == "second").collect();
+    assert_eq!(lines, vec!["first", "second"], "got: {out}");
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline stage scoping (from Task 5 — kept here for completeness)
 // ---------------------------------------------------------------------------
 
