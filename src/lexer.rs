@@ -3418,4 +3418,49 @@ mod tests {
         assert_eq!(tokenize("&").unwrap(), vec![Token::Op(Operator::Background)]);
         assert_eq!(tokenize("&&").unwrap(), vec![Token::Op(Operator::And)]);
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // [[ ]] keyword recognition tests (v30)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_double_bracket_open_at_word_start() {
+        // `[[` at command-start → single Word token containing the literal `[[`.
+        // The keyword is recognised by the *parser* (command.rs `keyword_of`),
+        // not the lexer, so the lexer emits an ordinary Word.
+        let tokens = tokenize("[[").unwrap();
+        assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
+        assert!(
+            matches!(&tokens[0], Token::Word(Word(parts))
+                if parts.len() == 1
+                && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "[[")
+            ),
+            "expected Word([[), got {:?}", tokens[0]
+        );
+    }
+
+    #[test]
+    fn tokenize_double_bracket_close() {
+        // `]]` → Word token with literal `]]`.
+        let tokens = tokenize("]]").unwrap();
+        assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
+        assert!(
+            matches!(&tokens[0], Token::Word(Word(parts))
+                if parts.len() == 1
+                && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "]]")
+            ),
+            "expected Word(]]), got {:?}", tokens[0]
+        );
+    }
+
+    #[test]
+    fn tokenize_double_bracket_not_at_word_start_is_literal() {
+        // `cmd[[foo]]` — `[[` appears mid-word-sequence; because there is no
+        // space before it the lexer folds everything into a single Word.
+        // The important thing is that no separate keyword token is emitted.
+        let tokens = tokenize("cmd[[foo]]").unwrap();
+        // The whole thing is one word token (the lexer has no special-casing for [[ )].
+        assert_eq!(tokens.len(), 1, "expected 1 word token, got {:?}", tokens);
+        assert!(matches!(&tokens[0], Token::Word(_)), "expected Word, got {:?}", tokens[0]);
+    }
 }

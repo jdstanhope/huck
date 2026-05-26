@@ -259,6 +259,18 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::UnterminatedSubshell => {
             "unterminated '(' (expected matching ')')".to_string()
         }
+        ParseError::EmptyDoubleBracket => {
+            "'[[ ]]' with empty body is not allowed".to_string()
+        }
+        ParseError::UnterminatedDoubleBracket => {
+            "unterminated '[[ ]]' (missing ']]')".to_string()
+        }
+        ParseError::TestExprBadOperator(op) => {
+            format!("unrecognised operator in '[[ ]]': '{op}'")
+        }
+        ParseError::TestExprMissingOperand => {
+            "missing operand in '[[ ]]'".to_string()
+        }
     }
 }
 

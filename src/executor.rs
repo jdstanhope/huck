@@ -164,6 +164,12 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             shell.functions.insert(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
+        Command::DoubleBracket(_) => {
+            unreachable!(
+                "Command::DoubleBracket execution lands in Task 2; \
+                 parser produces this now but the executor doesn't route it yet"
+            )
+        }
     }
 }
 

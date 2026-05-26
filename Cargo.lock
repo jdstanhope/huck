@@ -173,6 +173,7 @@ dependencies = [
  "expectrl",
  "glob",
  "libc",
+ "regex",
  "rustyline",
  "signal-hook",
  "tempfile",

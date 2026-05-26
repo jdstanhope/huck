@@ -17,6 +17,8 @@ enum Keyword {
     Esac,
     LBrace,
     RBrace,
+    DoubleBracketOpen,   // [[
+    DoubleBracketClose,  // ]]
 }
 
 impl Keyword {
@@ -37,6 +39,8 @@ impl Keyword {
             Keyword::Esac => "esac",
             Keyword::LBrace => "{",
             Keyword::RBrace => "}",
+            Keyword::DoubleBracketOpen => "[[",
+            Keyword::DoubleBracketClose => "]]",
         }
     }
 }
@@ -68,6 +72,8 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "esac" => Some(Keyword::Esac),
         "{" => Some(Keyword::LBrace),
         "}" => Some(Keyword::RBrace),
+        "[[" => Some(Keyword::DoubleBracketOpen),
+        "]]" => Some(Keyword::DoubleBracketClose),
         _ => None,
     }
 }
@@ -294,6 +300,48 @@ pub enum Connector {
     Or,
 }
 
+// ──────────────────────────────────────────────────────────────
+// [[ ]] extended test — AST types (v30)
+// ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TestUnaryOp {
+    FileExists,      // -e
+    IsRegFile,       // -f
+    IsDir,           // -d
+    IsReadable,      // -r
+    IsWritable,      // -w
+    IsExecutable,    // -x
+    IsNonEmpty,      // -s (non-empty file)
+    IsSymlink,       // -L
+    StringNonEmpty,  // -n
+    StringEmpty,     // -z
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TestBinaryOp {
+    StringEq,  // == or = (bash alias)
+    StringNe,  // !=
+    StringLt,  // <  (lexicographic)
+    StringGt,  // >  (lexicographic)
+    IntEq,     // -eq
+    IntNe,     // -ne
+    IntLt,     // -lt
+    IntGt,     // -gt
+    IntLe,     // -le
+    IntGe,     // -ge
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum TestExpr {
+    Unary  { op: TestUnaryOp,  operand: Word },
+    Binary { op: TestBinaryOp, lhs: Word, rhs: Word },
+    Regex  { lhs: Word, pattern: Word },
+    Not(Box<TestExpr>),
+    And(Box<TestExpr>, Box<TestExpr>),
+    Or(Box<TestExpr>,  Box<TestExpr>),
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Pipeline(Pipeline),
@@ -305,6 +353,7 @@ pub enum Command {
     BraceGroup(Box<Sequence>),
     Subshell { body: Box<Sequence> }, // NEW (v28): `(list)` subshell
     FunctionDef { name: String, body: Box<Command> },
+    DoubleBracket(Box<TestExpr>),     // NEW (v30): `[[ … ]]` extended test
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -386,8 +435,12 @@ pub enum ParseError {
     FunctionName,
     FunctionBody,
     UnterminatedFunction,
-    EmptySubshell,         // NEW (v28): `()` — empty subshell body
-    UnterminatedSubshell,  // NEW (v28): `(cmd` with no closing `)`
+    EmptySubshell,              // NEW (v28): `()` — empty subshell body
+    UnterminatedSubshell,       // NEW (v28): `(cmd` with no closing `)`
+    EmptyDoubleBracket,         // NEW (v30): `[[ ]]` — no expression
+    UnterminatedDoubleBracket,  // NEW (v30): `[[ x == y` — missing `]]`
+    TestExprBadOperator(String),// NEW (v30): unrecognised operator inside `[[ ]]`
+    TestExprMissingOperand,     // NEW (v30): e.g. `[[ -f ]]` or `[[ x == ]]`
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -534,6 +587,7 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
+        Some(Keyword::DoubleBracketOpen) => parse_double_bracket(iter),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Check for bare `(` at command-start → subshell `(list)`.
@@ -1203,6 +1257,7 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
         Some(Keyword::LBrace) => {
             Ok((Command::BraceGroup(Box::new(parse_brace_group(iter)?)), false))
         }
+        Some(Keyword::DoubleBracketOpen) => Ok((parse_double_bracket(iter)?, false)),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Bare `(` at pipeline-stage position → subshell.
@@ -1274,6 +1329,288 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
     parse_pipeline_with_first(None, iter)
 }
 
+// ──────────────────────────────────────────────────────────────
+// [[ ]] extended test — Pratt-style parser (v30)
+// ──────────────────────────────────────────────────────────────
+
+/// Returns `true` if the next token signals the end of a `[[ ]]` expression
+/// body (i.e. we should stop trying to parse more at this precedence level).
+/// This means we've hit `]]` (DoubleBracketClose keyword), `)` (RParen for
+/// grouped sub-expressions), or end of input.
+fn is_test_expr_stop<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) -> bool {
+    match iter.peek() {
+        None => true,
+        Some(tok) => keyword_of(tok) == Some(Keyword::DoubleBracketClose)
+            || matches!(tok, Token::Op(Operator::RParen)),
+    }
+}
+
+/// Returns the Word's single unquoted Literal text, if it is exactly that shape.
+/// Used to identify operator words like `==`, `!=`, `-eq`, etc.
+fn word_literal_text(w: &Word) -> Option<&str> {
+    if w.0.len() != 1 {
+        return None;
+    }
+    match &w.0[0] {
+        WordPart::Literal { text, quoted: false } => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// Try to parse a unary test operator from a Word token.  Returns `Some(op)`
+/// if the word is a single unquoted literal matching one of the file/string
+/// test flags, otherwise `None`.
+fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
+    match word_literal_text(w)? {
+        "-e" => Some(TestUnaryOp::FileExists),
+        "-f" => Some(TestUnaryOp::IsRegFile),
+        "-d" => Some(TestUnaryOp::IsDir),
+        "-r" => Some(TestUnaryOp::IsReadable),
+        "-w" => Some(TestUnaryOp::IsWritable),
+        "-x" => Some(TestUnaryOp::IsExecutable),
+        "-s" => Some(TestUnaryOp::IsNonEmpty),
+        "-L" => Some(TestUnaryOp::IsSymlink),
+        "-n" => Some(TestUnaryOp::StringNonEmpty),
+        "-z" => Some(TestUnaryOp::StringEmpty),
+        _ => None,
+    }
+}
+
+
+/// Returns true if `w` is the literal word `!` (unquoted).
+fn is_bang_word(tok: &Token) -> bool {
+    match tok {
+        Token::Word(w) => word_literal_text(w) == Some("!"),
+        _ => false,
+    }
+}
+
+/// Reads the next token and asserts it is a Word. Returns the Word, or
+/// `ParseError::TestExprMissingOperand` if the iterator is exhausted or the
+/// token is not a Word.
+fn next_test_word<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Word, ParseError> {
+    match iter.peek() {
+        None => return Err(ParseError::TestExprMissingOperand),
+        Some(tok) => {
+            if keyword_of(tok) == Some(Keyword::DoubleBracketClose)
+                || matches!(tok, Token::Op(_))
+            {
+                return Err(ParseError::TestExprMissingOperand);
+            }
+        }
+    }
+    match iter.next() {
+        Some(Token::Word(w)) => Ok(w),
+        _ => Err(ParseError::TestExprMissingOperand),
+    }
+}
+
+/// Lowest precedence: `||`.
+fn parse_test_or<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<TestExpr, ParseError> {
+    let mut lhs = parse_test_and(iter)?;
+    while matches!(iter.peek(), Some(Token::Op(Operator::Or))) {
+        iter.next(); // consume `||`
+        let rhs = parse_test_and(iter)?;
+        lhs = TestExpr::Or(Box::new(lhs), Box::new(rhs));
+    }
+    Ok(lhs)
+}
+
+/// Next precedence: `&&`.
+fn parse_test_and<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<TestExpr, ParseError> {
+    let mut lhs = parse_test_not(iter)?;
+    while matches!(iter.peek(), Some(Token::Op(Operator::And))) {
+        iter.next(); // consume `&&`
+        let rhs = parse_test_not(iter)?;
+        lhs = TestExpr::And(Box::new(lhs), Box::new(rhs));
+    }
+    Ok(lhs)
+}
+
+/// Next precedence: `!` (right-associative).
+fn parse_test_not<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<TestExpr, ParseError> {
+    if iter.peek().map(is_bang_word).unwrap_or(false) {
+        iter.next(); // consume `!`
+        let inner = parse_test_not(iter)?;
+        return Ok(TestExpr::Not(Box::new(inner)));
+    }
+    parse_test_primary(iter)
+}
+
+/// Highest precedence: `( expr )` grouping or a single test atom.
+fn parse_test_primary<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<TestExpr, ParseError> {
+    // Grouping: `( expr )`.
+    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+        iter.next(); // consume `(`
+        let inner = parse_test_or(iter)?;
+        // Expect `)`.
+        match iter.next() {
+            Some(Token::Op(Operator::RParen)) => {}
+            _ => return Err(ParseError::TestExprMissingOperand),
+        }
+        return Ok(inner);
+    }
+    parse_test_atom(iter)
+}
+
+/// Parses a single test — either a unary test (`-f path`) or a
+/// binary/regex test (`lhs op rhs`).
+fn parse_test_atom<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<TestExpr, ParseError> {
+    // Nothing at all (empty body or stop token).
+    if is_test_expr_stop(iter) {
+        return Err(ParseError::EmptyDoubleBracket);
+    }
+
+    // Peek at the first word to check if it is a unary op.
+    let first_word = match iter.peek() {
+        Some(Token::Word(w)) => w.clone(),
+        _ => return Err(ParseError::TestExprMissingOperand),
+    };
+
+    // Unary op path: `-f`, `-d`, `-n`, `-z`, …
+    if let Some(op) = try_unary_op(&first_word) {
+        iter.next(); // consume the op word
+        let operand = next_test_word(iter)?;
+        return Ok(TestExpr::Unary { op, operand });
+    }
+
+    // Binary / regex path: lhs op rhs.
+    // Consume the LHS word (first_word peeked above).
+    iter.next();
+    let lhs = first_word;
+
+    // Peek at the operator token.  Operators like `==`, `!=`, `=~`, `<`, `>`,
+    // `-eq`, etc. arrive as Word tokens because the lexer doesn't have them as
+    // separate operators.  `<` and `>` ARE lexer operator tokens (RedirIn /
+    // RedirOut) — handle those too.
+    let op_token = iter.next();
+    match op_token {
+        None => Err(ParseError::UnterminatedDoubleBracket),
+        // `<` and `>` are lexed as RedirIn / RedirOut even inside `[[ ]]`.
+        Some(Token::Op(Operator::RedirIn)) => {
+            let rhs = next_test_word(iter)?;
+            Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs })
+        }
+        Some(Token::Op(Operator::RedirOut)) => {
+            let rhs = next_test_word(iter)?;
+            Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs })
+        }
+        Some(Token::Word(op_word)) => {
+            let op_text = match word_literal_text(&op_word) {
+                Some(t) => t.to_string(),
+                None => return Err(ParseError::TestExprBadOperator(
+                    format!("{op_word:?}")
+                )),
+            };
+            match op_text.as_str() {
+                "==" | "=" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs })
+                }
+                "!=" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs })
+                }
+                "=~" => {
+                    let pattern = next_test_word(iter)?;
+                    Ok(TestExpr::Regex { lhs, pattern })
+                }
+                "<" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs })
+                }
+                ">" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs })
+                }
+                "-eq" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntEq, lhs, rhs })
+                }
+                "-ne" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntNe, lhs, rhs })
+                }
+                "-lt" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntLt, lhs, rhs })
+                }
+                "-gt" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntGt, lhs, rhs })
+                }
+                "-le" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntLe, lhs, rhs })
+                }
+                "-ge" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::IntGe, lhs, rhs })
+                }
+                other => Err(ParseError::TestExprBadOperator(other.to_string())),
+            }
+        }
+        Some(other_tok) => {
+            // Something unexpected (a keyword, stray operator, …).
+            if keyword_of(&other_tok) == Some(Keyword::DoubleBracketClose) {
+                // Consumed `]]` where the operator should be — unterminated.
+                return Err(ParseError::UnterminatedDoubleBracket);
+            }
+            Err(ParseError::TestExprBadOperator(format!("{other_tok:?}")))
+        }
+    }
+}
+
+/// Parses `[[ EXPR ]]`. The caller has already peeked the `[[` keyword and
+/// confirmed we should dispatch here (via `parse_command`).
+///
+/// Consumes `[[`, parses the test expression tree via Pratt precedence,
+/// then consumes `]]`. Returns `Command::DoubleBracket(Box::new(expr))`.
+fn parse_double_bracket<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    // Consume `[[`.
+    iter.next();
+
+    // Immediately hit `]]` — empty body.
+    if iter.peek().and_then(keyword_of) == Some(Keyword::DoubleBracketClose) {
+        return Err(ParseError::EmptyDoubleBracket);
+    }
+
+    // End of input — unterminated.
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedDoubleBracket);
+    }
+
+    let expr = parse_test_or(iter)
+        .map_err(|e| match e {
+            // Propagate unterminated from deeper levels.
+            ParseError::UnterminatedDoubleBracket => ParseError::UnterminatedDoubleBracket,
+            other => other,
+        })?;
+
+    // Consume `]]`.
+    match iter.next() {
+        Some(tok) if keyword_of(&tok) == Some(Keyword::DoubleBracketClose) => {}
+        None => return Err(ParseError::UnterminatedDoubleBracket),
+        _ => return Err(ParseError::UnterminatedDoubleBracket),
+    }
+
+    Ok(Command::DoubleBracket(Box::new(expr)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,6 +1659,7 @@ mod tests {
             Command::BraceGroup(_) => panic!("expected a pipeline, got a brace group"),
             Command::Subshell { .. } => panic!("expected a pipeline, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected a pipeline, got a function def"),
+            Command::DoubleBracket(_) => panic!("expected a pipeline, got a double bracket"),
         }
     }
 
@@ -1808,6 +2146,7 @@ mod tests {
             Command::BraceGroup(_) => panic!("expected an if, got a brace group"),
             Command::Subshell { .. } => panic!("expected an if, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected an if, got a function def"),
+            Command::DoubleBracket(_) => panic!("expected an if, got a double bracket"),
         }
     }
 
@@ -3233,5 +3572,150 @@ mod tests {
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
         assert!(matches!(&e.stdout, Some(Redirect::Truncate(_))));
         assert!(matches!(&e.stderr, Some(Redirect::Dup { fd: 2, .. })));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // [[ ]] parser tests (v30)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_dbracket_string_eq_literal() {
+        let tokens = crate::lexer::tokenize("[[ a == b ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        let Command::DoubleBracket(expr) = parsed.first else {
+            panic!("expected DoubleBracket, got {:?}", parsed.first)
+        };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!("expected Binary, got {:?}", expr) };
+        assert!(matches!(op, TestBinaryOp::StringEq));
+    }
+
+    #[test]
+    fn parse_dbracket_string_eq_single_equals() {
+        // `[[ a = b ]]` is bash alias for `[[ a == b ]]`.
+        let tokens = crate::lexer::tokenize("[[ a = b ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::StringEq));
+    }
+
+    #[test]
+    fn parse_dbracket_string_ne() {
+        let tokens = crate::lexer::tokenize("[[ x != y ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::StringNe));
+    }
+
+    #[test]
+    fn parse_dbracket_string_eq_pattern() {
+        // RHS is an unquoted glob — still parses as StringEq (runtime interprets glob).
+        let tokens = crate::lexer::tokenize("[[ $f == *.txt ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::StringEq));
+    }
+
+    #[test]
+    fn parse_dbracket_regex() {
+        let tokens = crate::lexer::tokenize("[[ s =~ ^foo$ ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        assert!(matches!(&*expr, TestExpr::Regex { .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_integer_compare() {
+        let tokens = crate::lexer::tokenize("[[ 5 -eq 5 ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::IntEq));
+    }
+
+    #[test]
+    fn parse_dbracket_integer_gt() {
+        let tokens = crate::lexer::tokenize("[[ 5 -gt 3 ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::IntGt));
+    }
+
+    #[test]
+    fn parse_dbracket_string_lex_lt() {
+        // `<` is lexed as RedirIn by the lexer; parser handles it as StringLt inside [[ ]].
+        let tokens = crate::lexer::tokenize("[[ a < b ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestBinaryOp::StringLt));
+    }
+
+    #[test]
+    fn parse_dbracket_unary_file() {
+        let tokens = crate::lexer::tokenize("[[ -f /tmp ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Unary { op, .. } = &*expr else { panic!("expected Unary, got {:?}", expr) };
+        assert!(matches!(op, TestUnaryOp::IsRegFile));
+    }
+
+    #[test]
+    fn parse_dbracket_unary_string_empty() {
+        let tokens = crate::lexer::tokenize("[[ -z foo ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Unary { op, .. } = &*expr else { panic!() };
+        assert!(matches!(op, TestUnaryOp::StringEmpty));
+    }
+
+    #[test]
+    fn parse_dbracket_not() {
+        let tokens = crate::lexer::tokenize("[[ ! -f /tmp/x ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        let TestExpr::Not(inner) = &*expr else { panic!("expected Not, got {:?}", expr) };
+        assert!(matches!(&**inner, TestExpr::Unary { .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_and() {
+        let tokens = crate::lexer::tokenize("[[ -f a && -r a ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        assert!(matches!(&*expr, TestExpr::And(_, _)));
+    }
+
+    #[test]
+    fn parse_dbracket_or() {
+        let tokens = crate::lexer::tokenize("[[ x == a || x == b ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        assert!(matches!(&*expr, TestExpr::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_dbracket_grouped() {
+        let tokens = crate::lexer::tokenize("[[ ( a == a || b == c ) && d == d ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket(expr) = parsed.first else { panic!() };
+        // Top-level should be And with the first operand being the grouped Or.
+        let TestExpr::And(lhs, _) = &*expr else { panic!("expected And, got {:?}", expr) };
+        assert!(matches!(&**lhs, TestExpr::Or(_, _)));
+    }
+
+    #[test]
+    fn parse_dbracket_empty_errors() {
+        let tokens = crate::lexer::tokenize("[[ ]]").unwrap();
+        assert!(parse(tokens).is_err(), "expected parse error for empty [[]]");
+    }
+
+    #[test]
+    fn parse_dbracket_unterminated_errors() {
+        let tokens = crate::lexer::tokenize("[[ x == y").unwrap();
+        assert!(parse(tokens).is_err(), "expected parse error for unterminated [[");
     }
 }
