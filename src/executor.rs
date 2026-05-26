@@ -750,6 +750,7 @@ fn run_background_sequence(
     };
 
     let last_pid = *spawned_pids.last().unwrap();
+    shell.last_bg_pid = Some(last_pid);
     let id = shell.jobs.add(pgid, spawned_pids, display);
     eprintln!("[{id}] {last_pid}");
     ExecOutcome::Continue(0)
@@ -1002,6 +1003,7 @@ fn is_control_builtin(name: &str) -> bool {
 /// propagate unchanged so `break` inside a function targets the
 /// caller's enclosing loop (matching bash).
 fn call_function(
+    name: &str,
     body: Box<crate::command::Command>,
     args: Vec<String>,
     shell: &mut Shell,
@@ -1009,7 +1011,9 @@ fn call_function(
 ) -> ExecOutcome {
     let saved = std::mem::take(&mut shell.positional_args);
     shell.positional_args = args;
+    shell.function_arg0.push(name.to_string());
     let result = run_command(&body, shell, sink);
+    shell.function_arg0.pop();
     shell.positional_args = saved;
     match result {
         ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
@@ -1068,7 +1072,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             },
         }
     } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
-        call_function(body, resolved.args, shell, sink)
+        call_function(&resolved.program.clone(), body, resolved.args, shell, sink)
     } else if builtins::is_builtin(&resolved.program) {
         let files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
@@ -3305,5 +3309,79 @@ mod tests {
             stderr: None,
         };
         assert_eq!(exec.program_static_text(), None);
+    }
+
+    // --- v26 special parameters: executor wiring ---
+
+    /// Helper: parse and execute a complete multi-statement script by
+    /// accumulating lines and executing each parseable sequence in turn,
+    /// mirroring how the interactive REPL processes input.
+    fn exec_script(src: &str, shell: &mut Shell) {
+        // The shell's normal execution reads one token stream at a time from
+        // the parser. We can simulate this by iterating over lines and
+        // accumulating until we have a parseable sequence.
+        let mut buf = String::new();
+        for line in src.lines() {
+            buf.push_str(line);
+            buf.push('\n');
+            let tokens = match crate::lexer::tokenize(&buf) {
+                Ok(t) if !t.is_empty() => t,
+                _ => continue,
+            };
+            match crate::command::parse(tokens) {
+                Ok(Some(seq)) => {
+                    let outcome = execute(&seq, shell, &buf);
+                    buf.clear();
+                    if matches!(outcome, ExecOutcome::Exit(_)) {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    buf.clear();
+                }
+                Err(_) => {
+                    // Incomplete parse — keep accumulating.
+                    continue;
+                }
+            }
+        }
+        // Execute any remaining buffered content.
+        if !buf.is_empty()
+            && let Ok(tokens) = crate::lexer::tokenize(&buf)
+            && let Ok(Some(seq)) = crate::command::parse(tokens)
+        {
+            let _ = execute(&seq, shell, &buf);
+        }
+    }
+
+    #[test]
+    fn call_function_pushes_arg0_during_body() {
+        // Define a function whose body reads $0 into a var; verify the var
+        // contains the function name after the call.
+        let mut shell = Shell::new();
+        exec_script("myfunc() { CAPTURED=$0; }\nmyfunc\n", &mut shell);
+        assert_eq!(shell.get("CAPTURED"), Some("myfunc"));
+    }
+
+    #[test]
+    fn call_function_pops_arg0_after_return() {
+        let mut shell = Shell::new();
+        exec_script("myfunc() { :; }\nmyfunc\n", &mut shell);
+        assert!(shell.function_arg0.is_empty(),
+            "function_arg0 should be empty after function returns, got: {:?}",
+            shell.function_arg0);
+    }
+
+    #[test]
+    fn run_background_sequence_sets_last_bg_pid() {
+        // Background an external command and check that last_bg_pid is set.
+        let mut shell = Shell::new();
+        exec_script("/usr/bin/true &\n", &mut shell);
+        assert!(shell.last_bg_pid.is_some(), "last_bg_pid should be set after background command");
+        // Reap the child to avoid zombies.
+        if let Some(pid) = shell.last_bg_pid {
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG); }
+        }
     }
 }
