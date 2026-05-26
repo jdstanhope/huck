@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, ForClause, IfClause,
-    Pipeline, Redirect, Sequence, SimpleCommand, WhileClause,
+    Pipeline, Redirect, Sequence, SimpleCommand, TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields};
 use crate::shell_state::Shell;
@@ -164,12 +164,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             shell.functions.insert(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
-        Command::DoubleBracket(_) => {
-            unreachable!(
-                "Command::DoubleBracket execution lands in Task 2; \
-                 parser produces this now but the executor doesn't route it yet"
-            )
-        }
+        Command::DoubleBracket(expr) => run_double_bracket(expr, shell),
     }
 }
 
@@ -356,6 +351,116 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         return execute_sequence_body(else_body, shell, sink);
     }
     ExecOutcome::Continue(0)
+}
+
+// ──────────────────────────────────────────────────────────────
+// v30: `[[ ]]` extended test evaluator
+// ──────────────────────────────────────────────────────────────
+
+fn run_double_bracket(expr: &TestExpr, shell: &mut Shell) -> ExecOutcome {
+    match eval_test_expr(expr, shell) {
+        Ok(true)  => ExecOutcome::Continue(0),
+        Ok(false) => ExecOutcome::Continue(1),
+        Err(msg)  => {
+            eprintln!("huck: [[: {msg}");
+            ExecOutcome::Continue(2)
+        }
+    }
+}
+
+fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
+    match expr {
+        TestExpr::Unary { op, operand } => {
+            let s = expand_assignment(operand, shell);
+            Ok(eval_unary(*op, &s))
+        }
+        TestExpr::Binary { op, lhs, rhs } => {
+            let l = expand_assignment(lhs, shell);
+            eval_binary(*op, &l, rhs, shell)
+        }
+        TestExpr::Regex { lhs, pattern } => {
+            let l = expand_assignment(lhs, shell);
+            let p = expand_assignment(pattern, shell);
+            let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
+            Ok(re.is_match(&l))
+        }
+        TestExpr::Not(inner) => eval_test_expr(inner, shell).map(|b| !b),
+        TestExpr::And(a, b) => {
+            if eval_test_expr(a, shell)? {
+                eval_test_expr(b, shell)
+            } else {
+                Ok(false)
+            }
+        }
+        TestExpr::Or(a, b) => {
+            if eval_test_expr(a, shell)? {
+                Ok(true)
+            } else {
+                eval_test_expr(b, shell)
+            }
+        }
+    }
+}
+
+fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
+    use crate::test_builtin;
+    match op {
+        TestUnaryOp::StringNonEmpty => !s.is_empty(),
+        TestUnaryOp::StringEmpty    => s.is_empty(),
+        // Delegate all file tests to the shared test_builtin logic.
+        TestUnaryOp::FileExists   => test_builtin::evaluate(&["-e".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsRegFile    => test_builtin::evaluate(&["-f".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsDir        => test_builtin::evaluate(&["-d".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsReadable   => test_builtin::evaluate(&["-r".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsWritable   => test_builtin::evaluate(&["-w".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsExecutable => test_builtin::evaluate(&["-x".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsNonEmpty   => test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsSymlink    => test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false),
+    }
+}
+
+fn eval_binary(
+    op: TestBinaryOp,
+    lhs: &str,
+    rhs_word: &crate::lexer::Word,
+    shell: &mut Shell,
+) -> Result<bool, String> {
+    match op {
+        TestBinaryOp::StringEq | TestBinaryOp::StringNe => {
+            let pattern_str = expand_pattern(rhs_word, shell);
+            let pat = glob::Pattern::new(&pattern_str)
+                .map_err(|e| format!("bad pattern: {e}"))?;
+            let matched = pat.matches(lhs);
+            Ok(if matches!(op, TestBinaryOp::StringEq) { matched } else { !matched })
+        }
+        TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
+            let rhs = expand_assignment(rhs_word, shell);
+            Ok(match op {
+                TestBinaryOp::StringLt => lhs < rhs.as_str(),
+                TestBinaryOp::StringGt => lhs > rhs.as_str(),
+                _ => unreachable!(),
+            })
+        }
+        TestBinaryOp::IntEq
+        | TestBinaryOp::IntNe
+        | TestBinaryOp::IntLt
+        | TestBinaryOp::IntGt
+        | TestBinaryOp::IntLe
+        | TestBinaryOp::IntGe => {
+            let rhs = expand_assignment(rhs_word, shell);
+            let l: i64 = lhs.parse().map_err(|_| format!("bad integer: {lhs}"))?;
+            let r: i64 = rhs.parse().map_err(|_| format!("bad integer: {rhs}"))?;
+            Ok(match op {
+                TestBinaryOp::IntEq => l == r,
+                TestBinaryOp::IntNe => l != r,
+                TestBinaryOp::IntLt => l < r,
+                TestBinaryOp::IntGt => l > r,
+                TestBinaryOp::IntLe => l <= r,
+                TestBinaryOp::IntGe => l >= r,
+                _ => unreachable!(),
+            })
+        }
+    }
 }
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
