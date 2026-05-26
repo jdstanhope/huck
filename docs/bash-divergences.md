@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Divergence Reference
 
-**Last updated:** 2026-05-23 (after v22 functions, before any quick-wins).
+**Last updated:** 2026-05-26 (after v26 special parameters).
 
 This is the running audit of where huck differs from bash 5.x. Update each
 entry's **Status** as fixes land. Reference an ID (e.g. `B-01`) in commit
@@ -22,7 +22,7 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 9 | Things to fix |
-| Missing features (Tier 2) | 59 | Bash-compat backlog (M-10 fixed by v25) |
+| Missing features (Tier 2) | 56 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
 
@@ -104,9 +104,9 @@ group.
 
 ### Special parameters
 
-- **M-01: `$0`** — `[deferred]` high. huck: empty. bash: shell/script/function name. (`lookup_var` returns `None` for `"0"`.)
-- **M-02: `$$`** — `[deferred]` high. huck: empty. bash: shell PID.
-- **M-03: `$!`** — `[deferred]` high. huck: empty. bash: last backgrounded job's PID.
+- **M-01: `$0`** — `[fixed (2026-05-26)]` high. Now supported: top-level returns argv[0] (typically `huck` or the full path); inside a function call, returns the function name (bash semantics).
+- **M-02: `$$`** — `[fixed (2026-05-26)]` high. Now supported: returns the shell's PID, cached at startup. Subshells (v25) inherit the cached value via fork — `$$` is stable across the subshell boundary, matching bash.
+- **M-03: `$!`** — `[fixed (2026-05-26)]` high. Now supported: after each backgrounded pipeline (`cmd &`), `$!` returns the LAST stage's PID per POSIX. Empty string until first background.
 - **M-60: `${#1}` (length of positional)** — `[open]` low. huck: `${#name}` requires non-digit name; rejects `${#1}` as `InvalidVarName`. bash: returns the length of `$1`.
 
 ### Functions & scoping
@@ -298,3 +298,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-24**: M-12 (here-documents) shipped as v24. Also reshapes ExecCommand.stdin from Option<Word> to Option<Redirect> so `<file`, `<<EOF`, and future `<<<word` share a uniform shape.
 - **2026-05-26**: M-10 (functions and compound commands as pipeline stages) shipped as v25. Every pipeline stage now runs in a forked subshell per POSIX 2.12 — builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions all work as stages. Side-effect isolation is now correct: `cd /tmp | true` no longer mutates the parent's cwd.
 - **2026-05-26**: I-16 added — the previously-undocumented "builtins in pipelines affect parent" divergence (informally "I-04" in the v25 spec) is resolved as a direct consequence of v25. Tracked here for discoverability. Compound-command redirects (`if …; fi <<EOF`) remain unimplemented (separate gap, not v25 scope).
+- **2026-05-26**: M-01/02/03 (special parameters `$0`, `$$`, `$!`) shipped as v26.
