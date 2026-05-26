@@ -38,6 +38,7 @@ spec, an implementation plan, and a test suite.
 | v27       | Here-strings (`<<<word`)                                  |
 | v28       | Subshell syntax (`(list)`)                               |
 | v29       | FD-duplication redirects (`2>&1`, `1>&2`, `&>file`, `&>>file`) |
+| v30       | `[[ ]]` extended test (pattern/regex/int/file/combinators)      |
 
 ## Build and run
 

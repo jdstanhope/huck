@@ -22,9 +22,9 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 11 | Things to fix (B-10 fixed 2026-05-26; B-11 open) |
-| Missing features (Tier 2) | 53 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29) |
+| Missing features (Tier 2) | 52 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
-| Low-impact (Tier 4) | 8 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence) |
+| Low-impact (Tier 4) | 9 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence) |
 
 ---
 
@@ -141,7 +141,7 @@ group.
 - **M-11: Subshells `( list )`** — `[fixed (2026-05-26)]` high. Now supported: `(list)` runs the inner sequence in a forked subshell with isolated side effects. Reuses v25's fork machinery; the helper's child-side dispatch handles Subshell-as-pipeline-stage without a recursive double-fork. Top-level `(cmd)`, pipeline stages, backgrounded `(cmd) &`, nested `((cmd))`, and composition with heredocs/here-strings all work.
 - **M-12: Here-documents `<<EOF`** — `[fixed (2026-05-24)]` high. Now supported: `<<DELIM` (expanding), `<<'DELIM'` (literal), `<<-DELIM` (tab-strip), composable; multiple here-docs per command; per-stage in pipelines; full POSIX expansion (`$var`, `${var}`, `$(cmd)`, backticks, `\$`, `\\`, `` \` ``).
 - **M-13: Here-strings `<<<word`** — `[fixed (2026-05-26)]` medium. Now supported: `<<<word` feeds the expanded word (no split/glob) plus a trailing newline as stdin to the command. Reuses v24's deferred-expansion + stdin-pipe machinery — per-stage scoping, backgrounded forms, and pipeline composition all work.
-- **M-14: `[[ … ]]` extended test** — `[deferred]` high. huck: not implemented. bash: keyword test with pattern matching, `=~` regex, `<`/`>` string ordering, no word-splitting.
+- **M-14: `[[ … ]]` extended test** — `[fixed (2026-05-26)]` high. Now supported: pattern `==`/`!=` (RHS glob; quoted → literal), regex `=~` (via Rust `regex` crate — RE2-style; no lookbehind/lookahead), lexicographic `<`/`>` (byte-order; no LC_COLLATE), integer `-eq`/`-ne`/`-lt`/`-gt`/`-le`/`-ge`, file tests (`-f`/`-d`/`-r`/`-w`/`-x`/`-e`/`-s`/`-L`), string tests (`-n`/`-z`), combinators (`!`, `&&`, `||`, grouping `()`). No word-splitting or pathname expansion on operands per bash. Out of scope: `-v var` (var-set), `-nt`/`-ot`/`-ef` (file age/identity), bash arrays.
 - **M-23: C-style `for ((init; cond; step))`** — `[deferred]` medium. huck: parse error. bash: standard counter loop.
 - **M-24: `select` loops** — `[deferred]` medium. huck: not implemented. bash: interactive menu loop.
 
@@ -312,6 +312,14 @@ Things huck deliberately does differently from bash. Document and keep.
 - **Why intentional**: source-order preservation requires refactoring `ExecCommand` to `redirects: Vec<(SourceFd, Redirect)>` — a substantial change. The canonical form covers >99% of real usage.
 - **Workaround**: write `cmd >file 2>&1` (or `cmd &>file`).
 
+### L-09: Regex `=~` is RE2-style, not POSIX ERE
+- **Status**: intentional (v30)
+- **Severity**: low
+- **huck**: `[[ $s =~ regex ]]` uses the Rust `regex` crate (RE2-based). No lookbehind / lookahead (`(?<=...)`, `(?=...)`); minor syntax differences from POSIX ERE for some edge cases (e.g., `(?:...)` non-capturing groups are supported in both, but bash's POSIX-mode is stricter).
+- **bash**: POSIX ERE. Has its own quirks.
+- **Why intentional**: `regex` is a mature, fast, well-maintained Rust crate. Implementing POSIX-ERE-faithful regex isn't worth the cost for the rare divergences. Most real-world shell-regex usage works identically.
+- **Workaround**: if a script relies on POSIX-ERE-specific features, fall back to `grep -E "pattern"` (which uses libc's POSIX ERE).
+
 ---
 
 ## Change log
@@ -329,3 +337,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: M-11 (subshell syntax `(list)`) shipped as v28.
 - **2026-05-26**: M-18/19 (fd-duplication redirects) shipped as v29. Supports `2>&1`, `1>&2`, `&>file`, `&>>file`. Documented order-divergence for `2>&1 >file` anti-pattern as L-08.
 - **2026-05-26**: v30 Task 3 follow-up: added `dbracket_in_while` integration test (was in spec table, missed by implementer); added `parse_dbracket_with_inline_assignment` parser unit test strengthening the speculative-peel path. Logged B-11 (`false; echo $?` prints 0 instead of 1 — pre-existing bug, entire test suite works around it via `\n` separators).
+- **2026-05-26**: M-14 (`[[ ]]` extended test) shipped as v30. Regex engine is `regex` crate (RE2-style; L-09 documents the divergence from POSIX ERE).
