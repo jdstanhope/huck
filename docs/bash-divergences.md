@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Divergence Reference
 
-**Last updated:** 2026-05-26 (after v26 special parameters).
+**Last updated:** 2026-05-26 (after v27 here-strings).
 
 This is the running audit of where huck differs from bash 5.x. Update each
 entry's **Status** as fixes land. Reference an ID (e.g. `B-01`) in commit
@@ -22,7 +22,7 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 10 | Things to fix (B-10 fixed 2026-05-26) |
-| Missing features (Tier 2) | 56 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26) |
+| Missing features (Tier 2) | 55 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
 
@@ -131,7 +131,7 @@ group.
 
 - **M-11: Subshells `( list )`** — `[deferred]` high. huck: bare `(`/`)` is now a parse error (v21). bash: runs the list in a forked subshell with isolated state.
 - **M-12: Here-documents `<<EOF`** — `[fixed (2026-05-24)]` high. Now supported: `<<DELIM` (expanding), `<<'DELIM'` (literal), `<<-DELIM` (tab-strip), composable; multiple here-docs per command; per-stage in pipelines; full POSIX expansion (`$var`, `${var}`, `$(cmd)`, backticks, `\$`, `\\`, `` \` ``).
-- **M-13: Here-strings `<<<word`** — `[deferred]` medium. huck: parse error. bash: the expanded word becomes stdin.
+- **M-13: Here-strings `<<<word`** — `[fixed (2026-05-26)]` medium. Now supported: `<<<word` feeds the expanded word (no split/glob) plus a trailing newline as stdin to the command. Reuses v24's deferred-expansion + stdin-pipe machinery — per-stage scoping, backgrounded forms, and pipeline composition all work.
 - **M-14: `[[ … ]]` extended test** — `[deferred]` high. huck: not implemented. bash: keyword test with pattern matching, `=~` regex, `<`/`>` string ordering, no word-splitting.
 - **M-23: C-style `for ((init; cond; step))`** — `[deferred]` medium. huck: parse error. bash: standard counter loop.
 - **M-24: `select` loops** — `[deferred]` medium. huck: not implemented. bash: interactive menu loop.
@@ -308,3 +308,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: I-16 added — the previously-undocumented "builtins in pipelines affect parent" divergence (informally "I-04" in the v25 spec) is resolved as a direct consequence of v25. Tracked here for discoverability. Compound-command redirects (`if …; fi <<EOF`) remain unimplemented (separate gap, not v25 scope).
 - **2026-05-26**: M-01/02/03 (special parameters `$0`, `$$`, `$!`) shipped as v26. B-10 (history scanner intercepted `$!` inside double quotes) fixed as part of v26 testing — one-line guard in `src/history.rs::scan()`.
 - **2026-05-26**: I-16 fix completed by v26 post-review patch. v25's fix covered multi-stage pipelines but a `pipeline_is_pure_builtin` shortcut in `run_background_sequence` still ran single-stage pure-builtin backgrounds synchronously in the parent (preventing `$!` update and leaking side effects). Shortcut removed; all backgrounded pipelines now fork. M-10 fixed-date corrected to 2026-05-25.
+- **2026-05-26**: M-13 (here-strings `<<<word`) shipped as v27.

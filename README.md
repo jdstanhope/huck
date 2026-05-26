@@ -35,6 +35,7 @@ spec, an implementation plan, and a test suite.
 | v25       | Pipelines as subshells (functions, compounds, builtins    |
 |           | all run in forked subshells per POSIX)                    |
 | v26       | Special parameters (`$0`, `$$`, `$!`)                    |
+| v27       | Here-strings (`<<<word`)                                  |
 
 ## Build and run
 
@@ -218,7 +219,7 @@ isolation).
 pattern-substitution and substring parameter expansion (`${var/pat/repl}`, `${var:off:len}`),
 brace expansion (`{a,b,c}`), extended job specs
 (`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), here-docs, aliases.
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
 
 ## Project layout
 
