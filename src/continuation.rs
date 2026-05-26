@@ -13,6 +13,7 @@ pub enum ContinuationReason {
     Operator,
     Compound,
     Heredoc,
+    Subshell,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -60,6 +61,9 @@ pub fn classify(buffer: &str) -> Completeness {
     }
     match command::parse(tokens) {
         Ok(_) => Completeness::Complete,
+        Err(ParseError::UnterminatedSubshell) => {
+            Completeness::Incomplete(ContinuationReason::Subshell)
+        }
         Err(ParseError::UnterminatedIf
             | ParseError::UnterminatedLoop
             | ParseError::UnterminatedCase
@@ -96,6 +100,7 @@ pub fn joiner_for(reason: ContinuationReason, last_line: &str) -> &'static str {
             }
         }
         ContinuationReason::Heredoc => "\n",
+        ContinuationReason::Subshell => "; ",
     }
 }
 
@@ -329,5 +334,23 @@ mod tests {
     #[test]
     fn joiner_for_heredoc_is_newline() {
         assert_eq!(joiner_for(ContinuationReason::Heredoc, ""), "\n");
+    }
+
+    #[test]
+    fn classify_subshell_unclosed_is_incomplete() {
+        assert_eq!(
+            classify("(echo hi"),
+            Completeness::Incomplete(ContinuationReason::Subshell)
+        );
+    }
+
+    #[test]
+    fn classify_subshell_closed_is_complete() {
+        assert_eq!(classify("(echo hi)"), Completeness::Complete);
+    }
+
+    #[test]
+    fn joiner_for_subshell_is_semi_space() {
+        assert_eq!(joiner_for(ContinuationReason::Subshell, ""), "; ");
     }
 }
