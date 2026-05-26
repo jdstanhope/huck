@@ -568,3 +568,44 @@ fn pty_heredoc_ctrl_c_aborts_body_collection() {
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
+
+#[test]
+fn pty_subshell_continuation_prompt_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "(echo hi");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    send(&mut session, ")");
+    send(&mut session, ENTER);
+    expect(&mut session, "hi");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+#[test]
+fn pty_subshell_ctrl_c_aborts_body_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(&mut session, "(echo hi");
+    send(&mut session, ENTER);
+    expect(&mut session, "> ");
+    settle();
+    send(&mut session, CTRL_C);
+    expect(&mut session, "huck> ");
+    // Buffer was discarded — confirm by running a fresh command.
+    send(&mut session, "pwd");
+    send(&mut session, ENTER);
+    let marker = dir.path().file_name().unwrap().to_str().unwrap();
+    expect(&mut session, marker);
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}

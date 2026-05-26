@@ -36,6 +36,7 @@ spec, an implementation plan, and a test suite.
 |           | all run in forked subshells per POSIX)                    |
 | v26       | Special parameters (`$0`, `$$`, `$!`)                    |
 | v27       | Here-strings (`<<<word`)                                  |
+| v28       | Subshell syntax (`(list)`)                               |
 
 ## Build and run
 
