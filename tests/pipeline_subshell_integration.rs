@@ -213,3 +213,28 @@ fn pipeline_capture_with_spawn_failure_doesnt_double_close() {
     // we just verify huck didn't crash.
     assert!(out.contains("["), "got: {out}");
 }
+
+// ---------------------------------------------------------------------------
+// Final-review bug fix: backgrounded compound-stage pipelines must not panic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipeline_backgrounded_with_compound_stage_doesnt_panic() {
+    // Pre-fix: `echo hi | { cat; } &` reached unreachable!() in
+    // run_background_sequence for the non-Simple BraceGroup arm, panicking
+    // the shell process. Post-fix: the pipeline starts in the background;
+    // `wait` collects it; `echo done` confirms the shell is still running.
+    let (out, _) = run("echo hi | { cat; } &\nwait\necho done\nexit\n");
+    // The shell must not have panicked: "done" must appear.
+    assert!(out.contains("done"), "shell panicked or exited early, got: {out}");
+    // The brace group runs cat which reads "hi" from the pipe and writes it.
+    assert!(out.contains("hi"), "expected 'hi' from pipeline, got: {out}");
+}
+
+#[test]
+fn pipeline_backgrounded_with_if_stage_doesnt_panic() {
+    // Same as above but with an `if` compound as the pipeline stage.
+    let (out, _) = run("echo hi | if true; then cat; fi &\nwait\necho done\nexit\n");
+    assert!(out.contains("done"), "shell panicked or exited early, got: {out}");
+    assert!(out.contains("hi"), "expected 'hi' from pipeline, got: {out}");
+}
