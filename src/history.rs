@@ -276,13 +276,16 @@ fn scan(line: &str, history: &History) -> Result<Option<String>, HistError> {
                 i += 1;
             }
             '!' if !in_single => {
+                // `$!` is a special parameter reference; the `!` must not be
+                // treated as a history event prefix.
+                let preceded_by_dollar = i > 0 && chars[i - 1] == '$';
                 let next = chars.get(i + 1).copied();
                 match next {
                     None => {
                         out.push('!');
                         i += 1;
                     }
-                    Some(n) if n.is_whitespace() || n == '=' || n == '(' || n == '\'' || n == '"' => {
+                    Some(n) if preceded_by_dollar || n.is_whitespace() || n == '=' || n == '(' || n == '\'' || n == '"' => {
                         out.push('!');
                         i += 1;
                     }
@@ -854,5 +857,22 @@ mod tests {
         // `!` immediately before a quote must NOT expand to the last entry.
         assert_eq!(expand("echo !'hi'", &h).unwrap(), None);
         assert_eq!(expand("echo !\"hi\"", &h).unwrap(), None);
+    }
+
+    #[test]
+    fn expand_does_not_treat_dollar_bang_as_history_event() {
+        let history = History::new();
+        let result = expand("echo \"[$!]\"", &history);
+        // No expansion should happen — $! is a parameter reference, not a history event.
+        assert!(result.is_ok(), "got: {result:?}");
+        assert!(result.unwrap().is_none(), "expected no expansion");
+    }
+
+    #[test]
+    fn expand_does_not_treat_dollar_bang_unquoted_as_history_event() {
+        let history = History::new();
+        let result = expand("echo $!", &history);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

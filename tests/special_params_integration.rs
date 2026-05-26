@@ -1,9 +1,4 @@
 //! End-to-end tests for v26 special parameters $0, $$, $!.
-//!
-//! NOTE: huck runs history expansion on raw input lines before lexing, so
-//! `"[$!]"` triggers "event not found" because `!]` looks like a history
-//! event prefix. Tests capture `$!` into a plain variable immediately after
-//! use and then print the variable in brackets — same semantic, no trigger.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -89,23 +84,19 @@ fn dollar_dollar_same_in_subshell() {
 
 // ---------------------------------------------------------------------------
 // $! tests
-//
-// Capture $! into BANG immediately; print $BANG in brackets. This avoids
-// huck's history-expansion treating "!]" as a prefix-search event.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn dollar_bang_unset_initially_is_empty() {
-    // Capture $! before any background command — should be empty string.
-    let (out, _) = run("BANG=$!\necho \"[$BANG]\"\nexit\n");
+    // Before any background command, $! should expand to an empty string.
+    let (out, _) = run("echo \"[$!]\"\nexit\n");
     assert!(out.contains("[]"), "got: {out}");
 }
 
 #[test]
 fn dollar_bang_set_after_backgrounded_external() {
     // /usr/bin/sleep is universally available on Linux.
-    // Capture $! immediately after the background command.
-    let (out, _) = run("/usr/bin/sleep 0.1 &\nBANG=$!\necho \"[$BANG]\"\nwait\nexit\n");
+    let (out, _) = run("/usr/bin/sleep 0.1 &\necho \"[$!]\"\nwait\nexit\n");
     // Output should contain "[N]" where N is a positive integer.
     let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).expect("[pid] line");
     let inner = &bracketed[1..bracketed.len()-1];
@@ -115,21 +106,20 @@ fn dollar_bang_set_after_backgrounded_external() {
 
 #[test]
 fn dollar_bang_is_last_stage_of_pipeline() {
-    let (out, _) = run("echo hi | /usr/bin/sleep 0.1 &\nBANG=$!\necho \"[$BANG]\"\nwait\nexit\n");
+    let (out, _) = run("echo hi | /usr/bin/sleep 0.1 &\necho \"[$!]\"\nwait\nexit\n");
     let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).expect("[pid] line");
     let inner = &bracketed[1..bracketed.len()-1];
     let _pid: i32 = inner.parse().expect("integer inside brackets");
-    // The exact pid isn't predictable; just verify it's a valid pid.
+    // The exact pid isn't predictable; just verify it's a valid integer pid.
     // The semantic (LAST stage's pid) is covered by the spec; this test
     // documents that $! is a valid pid after a pipeline &.
 }
 
 #[test]
 fn dollar_bang_preserves_across_subsequent_foreground() {
-    // Capture $! right after the background, then capture again after `true`;
-    // both captures should be identical (foreground commands don't reset $!).
+    // $! should not change after a foreground command.
     let (out, _) = run(
-        "/usr/bin/sleep 0.1 &\nBG_PID=$!\ntrue\nBANG=$!\necho \"[$BG_PID] [$BANG]\"\nwait\nexit\n"
+        "/usr/bin/sleep 0.1 &\nBG_PID=$!\ntrue\necho \"[$BG_PID] [$!]\"\nwait\nexit\n"
     );
     let line = out.lines().find(|l| l.contains('[')).expect("bracketed line");
     // Both bracketed values should be identical.

@@ -21,7 +21,7 @@ messages so the doc stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 9 | Things to fix |
+| Bugs (Tier 1) | 10 | Things to fix (B-10 fixed 2026-05-26) |
 | Missing features (Tier 2) | 56 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 7 | Edge cases, cosmetic |
@@ -94,6 +94,14 @@ huck behaves wrong without a design reason; should be fixed.
 - **huck (was)**: the foreground pipeline wait loop iterated `stages` one PID at a time with per-pid `waitpid`. If one stage stopped while the loop was blocked on a sibling (worst case: a producer/consumer deadlock pair), huck would wedge.
 - **bash**: foreground wait targets the whole process group.
 - **Fix**: `src/executor.rs` — new `wait_pgrp_pipeline` helper calls `waitpid(-pgid, …, WUNTRACED)` in a loop until every process stage is reaped (or any one stops). EINTR is retried; ECHILD bails with status 1 for remaining slots. Pipeline exit status is the last stage's status per POSIX. PTY regression test in `tests/pty_interactive.rs`.
+
+### B-10: history expansion intercepted `$!` inside double quotes
+- **Status**: fixed (2026-05-26)
+- **Severity**: medium
+- **huck (was)**: `echo "[$!]"` triggered "event not found" because the history-expansion scanner saw `!]` as a `!event` prefix-search. The scanner fired before the lexer and didn't suppress `!` when preceded by `$`.
+- **bash**: `$!` is recognised as a special parameter reference; history expansion never sees the `!` because of the preceding `$`.
+- **Fix**: `src/history.rs::scan()` — added a guard so `!` preceded by `$` is never treated as a history event.
+- **Why this hit during v26**: surfaced when adding tests for the new `$!` special parameter; `[$!]` failed before the lexer got a chance.
 
 ---
 
@@ -298,4 +306,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-24**: M-12 (here-documents) shipped as v24. Also reshapes ExecCommand.stdin from Option<Word> to Option<Redirect> so `<file`, `<<EOF`, and future `<<<word` share a uniform shape.
 - **2026-05-26**: M-10 (functions and compound commands as pipeline stages) shipped as v25. Every pipeline stage now runs in a forked subshell per POSIX 2.12 — builtins, function calls, `if`/`while`/`for`/`case`/`{ }`, and function definitions all work as stages. Side-effect isolation is now correct: `cd /tmp | true` no longer mutates the parent's cwd.
 - **2026-05-26**: I-16 added — the previously-undocumented "builtins in pipelines affect parent" divergence (informally "I-04" in the v25 spec) is resolved as a direct consequence of v25. Tracked here for discoverability. Compound-command redirects (`if …; fi <<EOF`) remain unimplemented (separate gap, not v25 scope).
-- **2026-05-26**: M-01/02/03 (special parameters `$0`, `$$`, `$!`) shipped as v26.
+- **2026-05-26**: M-01/02/03 (special parameters `$0`, `$$`, `$!`) shipped as v26. B-10 (history scanner intercepted `$!` inside double quotes) fixed as part of v26 testing — one-line guard in `src/history.rs::scan()`.
