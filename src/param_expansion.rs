@@ -81,9 +81,50 @@ pub fn expand_modifier(
             let rep = expand_word_to_string(replacement, shell);
             ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
         }
-        ParamModifier::Substring { .. } => {
-            // Filled in by Task 4.
-            ExpansionResult::Value(shell.lookup_var(name).unwrap_or_default())
+        ParamModifier::Substring { offset, length } => {
+            let value = shell.lookup_var(name).unwrap_or_default();
+            let off_n = match eval_arith_word(offset, shell) {
+                Ok(n) => n,
+                Err(()) => return ExpansionResult::Empty,
+            };
+            let len_n = match length {
+                Some(w) => match eval_arith_word(w, shell) {
+                    Ok(n) => Some(n),
+                    Err(()) => return ExpansionResult::Empty,
+                },
+                None => None,
+            };
+            match substring(&value, off_n, len_n) {
+                Ok(s) => ExpansionResult::Value(s),
+                Err(msg) => {
+                    eprintln!("huck: {}: {}", name, msg);
+                    shell.set_last_status(1);
+                    ExpansionResult::Empty
+                }
+            }
+        }
+    }
+}
+
+/// Expands `word` to a string (no field-splitting), parses it as
+/// arithmetic, evaluates it. On any error, prints `huck: arithmetic: <msg>`
+/// and sets `$? = 1`, returning `Err(())`.
+fn eval_arith_word(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
+    let s = crate::expand::expand_assignment(word, shell);
+    let expr = match crate::arith::parse(&s) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("huck: arithmetic: {}", e);
+            shell.set_last_status(1);
+            return Err(());
+        }
+    };
+    match crate::arith::eval(&expr, shell) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            eprintln!("huck: arithmetic: {}", e);
+            shell.set_last_status(1);
+            Err(())
         }
     }
 }
@@ -784,5 +825,90 @@ mod tests {
     #[test]
     fn substring_zero_length_is_empty() {
         assert_eq!(substring("abc", 1, Some(0)), Ok("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_scalar_var() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS1", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("1"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("ell".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_no_length() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS2", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("2"),
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("llo".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_unset_var_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS_UNSET", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_negative_offset() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS3", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("-2"),
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS3", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("lo".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_negative_length_below_zero_errors_and_empty() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS4", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("-4")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS4", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_modifier_substring_bad_arith_returns_empty_sets_status() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS5", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("@@@"), // not a valid arith expression
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS5", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_modifier_substring_positional_lookup() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello".to_string()];
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("hel".to_string()));
     }
 }
