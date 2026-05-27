@@ -40,6 +40,7 @@ spec, an implementation plan, and a test suite.
 | v29       | FD-duplication redirects (`2>&1`, `1>&2`, `&>file`, `&>>file`) |
 | v30       | `[[ ]]` extended test (pattern/regex/int/file/combinators)      |
 | v32       | Pattern substitution `${var/pat/repl}` (all six bash forms)      |
+| v33       | Substring expansion `${var:off:len}` (M-16)                      |
 
 ## Build and run
 

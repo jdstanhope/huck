@@ -81,6 +81,51 @@ pub fn expand_modifier(
             let rep = expand_word_to_string(replacement, shell);
             ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
         }
+        ParamModifier::Substring { offset, length } => {
+            let value = shell.lookup_var(name).unwrap_or_default();
+            let off_n = match eval_arith_word(offset, shell) {
+                Ok(n) => n,
+                Err(()) => return ExpansionResult::Empty,
+            };
+            let len_n = match length {
+                Some(w) => match eval_arith_word(w, shell) {
+                    Ok(n) => Some(n),
+                    Err(()) => return ExpansionResult::Empty,
+                },
+                None => None,
+            };
+            match substring(&value, off_n, len_n) {
+                Ok(s) => ExpansionResult::Value(s),
+                Err(msg) => {
+                    eprintln!("huck: {}: {}", name, msg);
+                    shell.set_last_status(1);
+                    ExpansionResult::Empty
+                }
+            }
+        }
+    }
+}
+
+/// Expands `word` to a string (no field-splitting), parses it as
+/// arithmetic, evaluates it. On any error, prints `huck: arithmetic: <msg>`
+/// and sets `$? = 1`, returning `Err(())`.
+fn eval_arith_word(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
+    let s = crate::expand::expand_assignment(word, shell);
+    let expr = match crate::arith::parse(&s) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("huck: arithmetic: {}", e);
+            shell.set_last_status(1);
+            return Err(());
+        }
+    };
+    match crate::arith::eval(&expr, shell) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            eprintln!("huck: arithmetic: {}", e);
+            shell.set_last_status(1);
+            Err(())
+        }
     }
 }
 
@@ -258,6 +303,38 @@ fn substitute(
             out
         }
     }
+}
+
+/// Bash substring semantics for `${var:offset[:length]}`. Char-counting
+/// throughout (Unicode codepoints), consistent with the existing `${#var}`
+/// divergence (L-04). Returns `Err("substring expression < 0")` only when
+/// a negative `length` produces a computed length < 0.
+fn substring(value: &str, offset: i64, length: Option<i64>) -> Result<String, &'static str> {
+    let chars: Vec<char> = value.chars().collect();
+    let strlen = chars.len() as i64;
+
+    let eff_off: i64 = if offset >= 0 {
+        offset.min(strlen)
+    } else {
+        (strlen + offset).max(0)
+    };
+
+    let eff_len: i64 = match length {
+        None => strlen - eff_off,
+        Some(n) if n >= 0 => n.min(strlen - eff_off),
+        Some(n) => {
+            // n < 0: count from end of string.
+            let computed = strlen + n - eff_off;
+            if computed < 0 {
+                return Err("substring expression < 0");
+            }
+            computed
+        }
+    };
+
+    let start = eff_off as usize;
+    let end = (eff_off + eff_len) as usize;
+    Ok(chars[start..end].iter().collect())
 }
 
 #[cfg(test)]
@@ -669,5 +746,169 @@ mod tests {
         };
         let r = expand_modifier("HUCK_TEST_PE_SU3", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("HIllo".to_string()));
+    }
+
+    #[test]
+    fn substring_no_length_full() {
+        assert_eq!(substring("abc", 0, None), Ok("abc".to_string()));
+    }
+
+    #[test]
+    fn substring_no_length_offset_one() {
+        assert_eq!(substring("abc", 1, None), Ok("bc".to_string()));
+    }
+
+    #[test]
+    fn substring_offset_equals_strlen_is_empty() {
+        assert_eq!(substring("abc", 3, None), Ok("".to_string()));
+    }
+
+    #[test]
+    fn substring_offset_beyond_strlen_clamps_to_empty() {
+        assert_eq!(substring("abc", 5, None), Ok("".to_string()));
+    }
+
+    #[test]
+    fn substring_negative_offset_counts_from_end() {
+        assert_eq!(substring("abc", -1, None), Ok("c".to_string()));
+        assert_eq!(substring("abc", -3, None), Ok("abc".to_string()));
+    }
+
+    #[test]
+    fn substring_negative_offset_beyond_start_clamps_to_zero() {
+        // eff_off = max(3 + -5, 0) = 0; eff_len = strlen - 0 = 3.
+        assert_eq!(substring("abc", -5, None), Ok("abc".to_string()));
+    }
+
+    #[test]
+    fn substring_positive_length_clamps_to_remaining() {
+        assert_eq!(substring("abc", 1, Some(5)), Ok("bc".to_string()));
+    }
+
+    #[test]
+    fn substring_positive_length_within_range() {
+        assert_eq!(substring("abcdef", 1, Some(3)), Ok("bcd".to_string()));
+    }
+
+    #[test]
+    fn substring_negative_length_counts_from_end() {
+        // eff_len = strlen + length - eff_off = 3 + -1 - 1 = 1.
+        assert_eq!(substring("abc", 1, Some(-1)), Ok("b".to_string()));
+    }
+
+    #[test]
+    fn substring_negative_length_yields_empty_when_zero() {
+        // eff_len = 3 + -3 - 0 = 0.
+        assert_eq!(substring("abc", 0, Some(-3)), Ok("".to_string()));
+    }
+
+    #[test]
+    fn substring_negative_length_below_zero_is_error() {
+        // eff_len = 3 + -4 - 0 = -1, below zero.
+        assert_eq!(substring("abc", 0, Some(-4)), Err("substring expression < 0"));
+    }
+
+    #[test]
+    fn substring_empty_value_returns_empty() {
+        assert_eq!(substring("", 0, None), Ok("".to_string()));
+        assert_eq!(substring("", 0, Some(3)), Ok("".to_string()));
+    }
+
+    #[test]
+    fn substring_unicode_counts_codepoints_not_bytes() {
+        // café: 4 codepoints, é is 2 bytes. Slice indices are by codepoint.
+        assert_eq!(substring("café", 1, Some(2)), Ok("af".to_string()));
+        assert_eq!(substring("café", 3, Some(1)), Ok("é".to_string()));
+        assert_eq!(substring("café", -1, None), Ok("é".to_string()));
+    }
+
+    #[test]
+    fn substring_zero_length_is_empty() {
+        assert_eq!(substring("abc", 1, Some(0)), Ok("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_scalar_var() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS1", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("1"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("ell".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_no_length() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS2", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("2"),
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("llo".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_unset_var_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS_UNSET", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_negative_offset() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS3", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("-2"),
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS3", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("lo".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_negative_length_below_zero_errors_and_empty() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS4", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("-4")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS4", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_modifier_substring_bad_arith_returns_empty_sets_status() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SS5", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("@@@"), // not a valid arith expression
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SS5", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn expand_modifier_substring_positional_lookup() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello".to_string()];
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("3")),
+        };
+        let r = expand_modifier("1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("hel".to_string()));
     }
 }
