@@ -96,16 +96,16 @@ pub fn clear_for_subshell(shell: &mut Shell) {
 }
 
 /// Installs a trap action for `sig`. `action = Some(text)` registers;
-/// `action = None` ignores the signal (SIG_IGN). For EXIT, no OS-level
-/// handler is needed — just store the action and let `fire_exit_trap`
+/// `action = None` ignores the signal (SIG_IGN). For pseudo-signals, no OS-level
+/// handler is needed — just store the action and let the firing helpers
 /// handle the firing.
 ///
 /// Returns `Err(msg)` if `sig` was ignored at shell startup (POSIX
 /// "Signals ignored upon entry to the shell cannot be trapped").
 pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Result<(), String> {
     match sig {
-        TrapSignal::Exit => {
-            shell.traps.insert(TrapSignal::Exit, action);
+        TrapSignal::Exit | TrapSignal::Err | TrapSignal::Debug | TrapSignal::Return => {
+            shell.traps.insert(sig, action);
             Ok(())
         }
         TrapSignal::Real(signum) => {
@@ -153,15 +153,15 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
     }
 }
 
-/// Resets `sig` to default disposition. For EXIT, just removes the
+/// Resets `sig` to default disposition. For pseudo-signals, just removes the
 /// stored action. For real signals, unregisters any installed handler
 /// — signal-hook's existing SIGINT/SIGCHLD handlers (installed by
 /// `shell::install_sigint_handler` etc.) are unaffected because they
 /// were registered separately and have their own SigIds.
 pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
     match sig {
-        TrapSignal::Exit => {
-            shell.traps.remove(&TrapSignal::Exit);
+        TrapSignal::Exit | TrapSignal::Err | TrapSignal::Debug | TrapSignal::Return => {
+            shell.traps.remove(&sig);
             Ok(())
         }
         TrapSignal::Real(signum) => {
@@ -180,6 +180,9 @@ pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrapSignal {
     Exit,
+    Err,
+    Debug,
+    Return,
     Real(i32),
 }
 
@@ -210,6 +213,9 @@ pub fn name_table() -> &'static [(&'static str, i32)] {
 
 /// Parses `name` as a signal specification. Accepts:
 /// - `"EXIT"` → `TrapSignal::Exit`
+/// - `"ERR"` → `TrapSignal::Err`
+/// - `"DEBUG"` → `TrapSignal::Debug`
+/// - `"RETURN"` → `TrapSignal::Return`
 /// - `"INT"` / `"SIGINT"` / `"2"` → `TrapSignal::Real(2)`
 /// - Same dual-form for every trappable signal.
 ///
@@ -218,6 +224,15 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     // EXIT pseudo-signal (case-sensitive to match bash).
     if name == "EXIT" {
         return Ok(TrapSignal::Exit);
+    }
+    if name == "ERR" {
+        return Ok(TrapSignal::Err);
+    }
+    if name == "DEBUG" {
+        return Ok(TrapSignal::Debug);
+    }
+    if name == "RETURN" {
+        return Ok(TrapSignal::Return);
     }
 
     // Numeric form.
@@ -395,6 +410,21 @@ mod tests {
     fn parse_trap_signal_stop_by_number_errors() {
         let n = libc::SIGSTOP.to_string();
         assert!(matches!(parse_trap_signal(&n), Err(s) if s.contains("cannot trap")));
+    }
+
+    #[test]
+    fn parse_trap_signal_err() {
+        assert_eq!(parse_trap_signal("ERR"), Ok(TrapSignal::Err));
+    }
+
+    #[test]
+    fn parse_trap_signal_debug() {
+        assert_eq!(parse_trap_signal("DEBUG"), Ok(TrapSignal::Debug));
+    }
+
+    #[test]
+    fn parse_trap_signal_return() {
+        assert_eq!(parse_trap_signal("RETURN"), Ok(TrapSignal::Return));
     }
 
     #[test]
