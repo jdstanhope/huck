@@ -70,6 +70,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         if shell.pending_fatal_pe_error.is_some() {
             return ExecOutcome::Continue(c);
         }
+        crate::traps::dispatch_pending_traps(shell);
     }
     for (connector, command) in &seq.rest {
         let should_run = match connector {
@@ -91,6 +92,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 if shell.pending_fatal_pe_error.is_some() {
                     return ExecOutcome::Continue(c);
                 }
+                crate::traps::dispatch_pending_traps(shell);
             }
         }
     }
@@ -2441,6 +2443,7 @@ fn wait_pipeline_raw(
         }
     }
 
+    crate::traps::dispatch_pending_traps(shell);
     PipelineWaitResult::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
 }
 

@@ -22,10 +22,8 @@ pub fn init_pending_bitmask(arc: Arc<AtomicU32>) {
 /// Set of signal numbers that were ignored when huck started. Per
 /// POSIX, these cannot be trapped or reset. Populated lazily on
 /// first `install` / `reset` call.
-#[allow(dead_code)]  // used by install/reset; referenced in Task 4+
 static IGNORED_AT_STARTUP: OnceLock<HashSet<i32>> = OnceLock::new();
 
-#[allow(dead_code)]  // used by install/reset; referenced in Task 4+
 fn ignored_at_startup_set() -> &'static HashSet<i32> {
     IGNORED_AT_STARTUP.get_or_init(|| {
         let mut set = HashSet::new();
@@ -47,7 +45,6 @@ fn ignored_at_startup_set() -> &'static HashSet<i32> {
 
 /// Returns the bits that were pending and atomically clears them.
 /// Each returned value is a signal number (bit position).
-#[allow(dead_code)]  // called by dispatch_pending_traps + tests; wired to REPL in Task 5
 pub fn drain_pending(shell: &mut Shell) -> Vec<i32> {
     let bits = shell.trap_pending.swap(0, Ordering::SeqCst);
     let mut out = Vec::new();
@@ -64,7 +61,6 @@ pub fn drain_pending(shell: &mut Shell) -> Vec<i32> {
 /// current shell scope; return values from `process_line` are
 /// ignored (an `exit` from within a trap action propagates through
 /// the outer caller's normal exit handling).
-#[allow(dead_code)]  // called by REPL + executor in Task 5
 pub fn dispatch_pending_traps(shell: &mut Shell) {
     for sig in drain_pending(shell) {
         let action = match shell.traps.get(&TrapSignal::Real(sig)) {
@@ -78,7 +74,6 @@ pub fn dispatch_pending_traps(shell: &mut Shell) {
 /// Fires the EXIT pseudo-signal trap, if one is registered. Self-
 /// removes the action before running so recursive `exit` from within
 /// the action doesn't re-fire.
-#[allow(dead_code)]  // called at shell exit paths in Task 5
 pub fn fire_exit_trap(shell: &mut Shell) {
     let action = match shell.traps.remove(&TrapSignal::Exit) {
         Some(Some(text)) => text,
@@ -186,7 +181,6 @@ pub enum TrapSignal {
 /// Trappable real signals — huck's existing 15-name table from `kill`,
 /// minus KILL (9) and STOP (19) which POSIX says cannot be trapped.
 /// Each entry: (name without SIG prefix, libc signal number).
-#[allow(dead_code)]  // used by parse_trap_signal
 const TRAPPABLE: &[(&str, i32)] = &[
     ("HUP",   libc::SIGHUP),
     ("INT",   libc::SIGINT),

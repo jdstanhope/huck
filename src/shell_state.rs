@@ -55,7 +55,6 @@ pub struct Shell {
     /// (corresponds to `trap "" SIGNAL`); `Some(text)` = action to
     /// re-parse and execute when the signal fires. Absent key =
     /// default disposition.
-    #[allow(dead_code)]  // used by traps module + builtins; remove in Task 5
     pub traps: std::collections::HashMap<crate::traps::TrapSignal, Option<String>>,
 
     /// Per-signal bitmask of "trap pending" flags. Signal handlers set
@@ -63,12 +62,10 @@ pub struct Shell {
     /// polling checkpoints. Bit N corresponds to libc signal number N.
     /// EXIT is NOT here — it fires at the exit-path boundary, not via
     /// a real signal.
-    #[allow(dead_code)]  // used by traps module + REPL; remove in Task 5
     pub trap_pending: std::sync::Arc<std::sync::atomic::AtomicU32>,
 
     /// Map of signal number → signal-hook SigId for each currently-
     /// installed trap handler. Used by `traps::reset` to unregister.
-    #[allow(dead_code)]  // populated by traps module; remove in Task 5
     pub trap_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
 }
 
