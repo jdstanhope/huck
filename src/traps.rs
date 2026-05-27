@@ -1,6 +1,74 @@
 //! Trap handler storage, signal-name parsing, and signal-delivery
 //! plumbing for the `trap` builtin (huck v35).
 
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::shell_state::Shell;
+
+/// Shared bitmask written by async-signal-safe signal handlers. Set
+/// once per process at first `Shell::new()`; identical Arc across all
+/// shells in this process.
+static TRAP_PENDING: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+
+/// Sets the process-global `TRAP_PENDING` to `arc` the first time;
+/// subsequent calls are no-ops (the existing Arc is kept).
+pub fn init_pending_bitmask(arc: Arc<AtomicU32>) {
+    let _ = TRAP_PENDING.set(arc);
+}
+
+/// Returns the bits that were pending and atomically clears them.
+/// Each returned value is a signal number (bit position).
+#[allow(dead_code)]  // called by dispatch_pending_traps + tests; wired to REPL in Task 5
+pub fn drain_pending(shell: &mut Shell) -> Vec<i32> {
+    let bits = shell.trap_pending.swap(0, Ordering::SeqCst);
+    let mut out = Vec::new();
+    for sig in 0u32..32u32 {
+        if bits & (1u32 << sig) != 0 {
+            out.push(sig as i32);
+        }
+    }
+    out
+}
+
+/// Drains pending signals and executes registered trap actions in
+/// signal-number order. Trap actions run via `process_line` in the
+/// current shell scope; return values from `process_line` are
+/// ignored (an `exit` from within a trap action propagates through
+/// the outer caller's normal exit handling).
+#[allow(dead_code)]  // called by REPL + executor in Task 5
+pub fn dispatch_pending_traps(shell: &mut Shell) {
+    for sig in drain_pending(shell) {
+        let action = match shell.traps.get(&TrapSignal::Real(sig)) {
+            Some(Some(text)) => text.clone(),
+            Some(None) | None => continue,
+        };
+        let _ = crate::shell::process_line(&action, shell);
+    }
+}
+
+/// Fires the EXIT pseudo-signal trap, if one is registered. Self-
+/// removes the action before running so recursive `exit` from within
+/// the action doesn't re-fire.
+#[allow(dead_code)]  // called at shell exit paths in Task 5
+pub fn fire_exit_trap(shell: &mut Shell) {
+    let action = match shell.traps.remove(&TrapSignal::Exit) {
+        Some(Some(text)) => text,
+        _ => return,
+    };
+    let _ = crate::shell::process_line(&action, shell);
+}
+
+/// Resets all trap state in a freshly-forked subshell child. POSIX:
+/// trapped signals reset to their original values in subshells; we
+/// also clear EXIT so the parent's EXIT fires only when the parent
+/// exits, not when the subshell does.
+pub fn clear_for_subshell(shell: &mut Shell) {
+    shell.traps.clear();
+    shell.trap_pending = Arc::new(AtomicU32::new(0));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]  // used by traps module + builtins; remove in Task 5
 pub enum TrapSignal {
@@ -86,6 +154,84 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_state::Shell;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn drain_pending_returns_signals_in_ascending_order() {
+        let mut shell = Shell::new();
+        // Simulate three signal deliveries by manually setting bits.
+        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        shell.trap_pending.fetch_or(1 << libc::SIGTERM, Ordering::SeqCst);
+        shell.trap_pending.fetch_or(1 << libc::SIGHUP, Ordering::SeqCst);
+        let drained = drain_pending(&mut shell);
+        assert_eq!(drained, vec![libc::SIGHUP, libc::SIGINT, libc::SIGTERM]);
+    }
+
+    #[test]
+    fn drain_pending_clears_the_bitmask() {
+        let mut shell = Shell::new();
+        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        let _ = drain_pending(&mut shell);
+        assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dispatch_pending_traps_runs_registered_action() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Real(libc::SIGUSR1), Some("FOO=ran".to_string()));
+        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        dispatch_pending_traps(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("ran"));
+    }
+
+    #[test]
+    fn dispatch_pending_traps_skips_ignored_signal() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Real(libc::SIGUSR1), None); // ignore
+        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        dispatch_pending_traps(&mut shell);
+        // No action ran; no side effect to assert. The drain happened
+        // (asserted by trap_pending now being 0).
+        assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dispatch_pending_traps_skips_unregistered_signal() {
+        let mut shell = Shell::new();
+        // No entry in shell.traps for SIGUSR1.
+        shell.trap_pending.fetch_or(1 << libc::SIGUSR1, Ordering::SeqCst);
+        dispatch_pending_traps(&mut shell);
+        assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fire_exit_trap_runs_action_then_removes_it() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Exit, Some("FOO=ran".to_string()));
+        fire_exit_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("ran"));
+        // Trap is now absent: a second fire is a no-op.
+        assert!(!shell.traps.contains_key(&TrapSignal::Exit));
+    }
+
+    #[test]
+    fn fire_exit_trap_no_action_is_noop() {
+        let mut shell = Shell::new();
+        fire_exit_trap(&mut shell);  // no panic, no side effect
+        assert!(!shell.traps.contains_key(&TrapSignal::Exit));
+    }
+
+    #[test]
+    fn clear_for_subshell_resets_traps_and_bitmask() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Exit, Some("nope".to_string()));
+        shell.traps.insert(TrapSignal::Real(libc::SIGINT), Some("nope".to_string()));
+        shell.trap_pending.fetch_or(1 << libc::SIGINT, Ordering::SeqCst);
+        clear_for_subshell(&mut shell);
+        assert!(shell.traps.is_empty());
+        assert_eq!(shell.trap_pending.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn parse_trap_signal_exit() {

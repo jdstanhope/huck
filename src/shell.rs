@@ -224,7 +224,7 @@ fn install_job_control_signals() {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
+pub fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
         Err(e) => {

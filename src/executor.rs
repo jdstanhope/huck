@@ -2600,6 +2600,10 @@ pub fn fork_and_run_in_subshell(
                 libc::dup2(fd, 2);
             }
         }
+        // POSIX: subshells reset traps to default. Clear all huck
+        // trap state so the parent's EXIT trap and real-signal traps
+        // don't inherit into the child.
+        crate::traps::clear_for_subshell(shell);
         // 8. Run the body via the existing dispatcher.
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.

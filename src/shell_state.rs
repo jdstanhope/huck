@@ -50,6 +50,21 @@ pub struct Shell {
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
+
+    /// Registered trap handlers. `None` value = ignore that signal
+    /// (corresponds to `trap "" SIGNAL`); `Some(text)` = action to
+    /// re-parse and execute when the signal fires. Absent key =
+    /// default disposition.
+    #[allow(dead_code)]  // used by traps module + builtins; remove in Task 5
+    pub traps: std::collections::HashMap<crate::traps::TrapSignal, Option<String>>,
+
+    /// Per-signal bitmask of "trap pending" flags. Signal handlers set
+    /// bits via `fetch_or`; the main loop drains via `swap` at the
+    /// polling checkpoints. Bit N corresponds to libc signal number N.
+    /// EXIT is NOT here — it fires at the exit-path boundary, not via
+    /// a real signal.
+    #[allow(dead_code)]  // used by traps module + REPL; remove in Task 5
+    pub trap_pending: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Shell {
@@ -60,7 +75,7 @@ impl Shell {
         }
         let shell_pid = unsafe { libc::getpid() };
         let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
-        Self {
+        let shell = Self {
             vars,
             last_status: 0,
             positional_args: Vec::new(),
@@ -76,7 +91,13 @@ impl Shell {
             function_arg0: Vec::new(),
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
-        }
+            traps: std::collections::HashMap::new(),
+            trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        };
+        // Make the trap_pending Arc visible to async-signal-safe
+        // signal handlers installed by the traps module.
+        crate::traps::init_pending_bitmask(std::sync::Arc::clone(&shell.trap_pending));
+        shell
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
