@@ -70,6 +70,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         if shell.pending_fatal_pe_error.is_some() {
             return ExecOutcome::Continue(c);
         }
+        crate::traps::dispatch_pending_traps(shell);
     }
     for (connector, command) in &seq.rest {
         let should_run = match connector {
@@ -91,6 +92,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 if shell.pending_fatal_pe_error.is_some() {
                     return ExecOutcome::Continue(c);
                 }
+                crate::traps::dispatch_pending_traps(shell);
             }
         }
     }
@@ -2441,6 +2443,7 @@ fn wait_pipeline_raw(
         }
     }
 
+    crate::traps::dispatch_pending_traps(shell);
     PipelineWaitResult::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
 }
 
@@ -2600,6 +2603,10 @@ pub fn fork_and_run_in_subshell(
                 libc::dup2(fd, 2);
             }
         }
+        // POSIX: subshells reset traps to default. Clear all huck
+        // trap state so the parent's EXIT trap and real-signal traps
+        // don't inherit into the child.
+        crate::traps::clear_for_subshell(shell);
         // 8. Run the body via the existing dispatcher.
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.

@@ -58,6 +58,7 @@ pub fn run() -> i32 {
 
     loop {
         crate::jobs::reap_and_notify(&mut shell);
+        crate::traps::dispatch_pending_traps(&mut shell);
         if let Some(helper) = editor.helper_mut() {
             helper.refresh(&shell);
         }
@@ -69,6 +70,7 @@ pub fn run() -> i32 {
                 }
                 match process_line(&buffer, &mut shell) {
                     ExecOutcome::Exit(code) => {
+                        crate::traps::fire_exit_trap(&mut shell);
                         shell.history.save();
                         return code;
                     }
@@ -81,6 +83,7 @@ pub fn run() -> i32 {
                         if let Some(fatal_status) = shell.take_pending_fatal_pe_error()
                             && !shell.is_interactive
                         {
+                            crate::traps::fire_exit_trap(&mut shell);
                             shell.history.save();
                             return fatal_status;
                         }
@@ -93,16 +96,19 @@ pub fn run() -> i32 {
             }
             ReadResult::Interrupted => continue,
             ReadResult::Eof => {
+                crate::traps::fire_exit_trap(&mut shell);
                 shell.history.save();
                 return shell.last_status();
             }
             ReadResult::EofMidCommand => {
                 eprintln!("huck: syntax error: unexpected end of input");
+                crate::traps::fire_exit_trap(&mut shell);
                 shell.history.save();
                 return 2;
             }
             ReadResult::ReadError(msg) => {
                 eprintln!("huck: input error: {msg}");
+                crate::traps::fire_exit_trap(&mut shell);
                 return 1;
             }
         }
@@ -224,7 +230,7 @@ fn install_job_control_signals() {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
+pub fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
         Err(e) => {

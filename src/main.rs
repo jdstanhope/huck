@@ -13,6 +13,7 @@ mod param_expansion;
 mod shell;
 mod shell_state;
 mod test_builtin;
+mod traps;
 
 fn main() {
     std::process::exit(shell::run());
