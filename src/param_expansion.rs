@@ -11,6 +11,7 @@ pub enum ExpansionResult {
     /// surrounding simple command and (in non-interactive mode) exit
     /// the shell. The message has already been printed by the arm that
     /// produced this; `status` is the exit code.
+    #[allow(dead_code)]  // wired in Task 3
     Fatal { status: i32 },
 }
 
