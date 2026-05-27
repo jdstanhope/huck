@@ -181,8 +181,10 @@ fn substitute(
     // such that value[start..end] matches. Returns None if no end works.
     // For empty-pattern callers this can return Some(start) (empty match).
     let longest_match_at = |start: usize| -> Option<usize> {
+        // `boundaries` is ascending, so iter().rev() yields descending —
+        // once we drop below `start`, every remaining entry is also below.
         for &end in boundaries.iter().rev() {
-            if end < start { continue; }
+            if end < start { break; }
             if pat.matches_with(&value[start..end], opts) {
                 return Some(end);
             }

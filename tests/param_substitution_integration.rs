@@ -96,6 +96,26 @@ fn subst_pattern_expansion_uses_other_var() {
 }
 
 #[test]
+fn subst_replacement_expansion_uses_other_var() {
+    let (out, _) = run("name=foobar\nr=Z\necho ${name//o/$r}\nexit\n");
+    assert!(out.lines().any(|l| l == "fZZbar"), "stdout: {out}");
+}
+
+#[test]
+fn subst_braced_var_in_pattern() {
+    // ${var/${X}/Y} — the inner `}` must not prematurely close the outer
+    // substitution; the lexer's depth-aware split picks the right `/`.
+    let (out, _) = run("path=/home/user/bin\nh=/home/user\necho ${path/${h}/HOME}\nexit\n");
+    assert!(out.lines().any(|l| l == "HOME/bin"), "stdout: {out}");
+}
+
+#[test]
+fn subst_braced_var_in_replacement() {
+    let (out, _) = run("name=foobar\nr=Z\necho ${name//o/${r}}\nexit\n");
+    assert!(out.lines().any(|l| l == "fZZbar"), "stdout: {out}");
+}
+
+#[test]
 fn subst_unicode_safe() {
     let (out, _) = run("name=café\necho ${name/é/E}\nexit\n");
     assert!(out.lines().any(|l| l == "cafE"), "stdout: {out}");
