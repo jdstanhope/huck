@@ -147,7 +147,7 @@ group.
 ### Parameter expansion modifiers
 
 - **M-15: `${var/pat/repl}` and `${var//pat/repl}`** — `[fixed v32]` high. All six forms: `/`, `//`, `/#`, `/%`, plus empty-repl shortcut. Glob pattern engine; `\/` escapes literal slash in pattern. Bash-compat empty-pattern no-op + trailing-empty-match suppression for greedy patterns like `*`.
-- **M-16: `${var:off:len}` substring** — `[deferred]` high. huck: `InvalidBraceModifier(":N")`. bash: substring extraction.
+- **M-16: `${var:off:len}` substring** — `[fixed v33]` high. `${var:offset}` and `${var:offset:length}` for scalar vars and positional params (`${1:0:3}`). Offset/length are full arithmetic expressions via `arith::parse` + `arith::eval` (variable refs, `+`/`-`/`*`/`/`/`%`, parentheses). Char-counting (codepoints), bash 5.x edge-case semantics: negative offset counts from end, negative length counts from end, negative computed length errors. **Inherits M-58 divergence**: a substring expansion error prints the message and sets `$?=1` but does NOT abort the surrounding simple command (so `echo "[${s:0:-4}]"; echo $?` prints `[]` then `0`, not `1`). **Out of scope (still open)**: `${@:off:len}` and `${*:off:len}` array slicing on positional params.
 - **M-17: `${var^^}` / `${var,,}` case modification** — `[deferred]` medium. huck: `InvalidBraceModifier("^")`. bash: upper/lower case.
 - **M-58: `${var:?w}` doesn't abort non-interactive scripts** — `[open]` medium. huck: prints error, sets `$?` = 1, continues. bash: exits the script.
 
@@ -298,7 +298,7 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-01**: `~user` lookup capped at 16 KiB buffer. (Never hit in practice.)
 - **L-02**: Glob sort order is byte-lexicographic, not `LC_COLLATE`-aware.
 - **L-03**: Non-integer variable in `$((…))` errors instead of bash's "treat as recursive arith expression."
-- **L-04**: `${#var}` counts Unicode chars; bash counts bytes (matches in UTF-8 locale).
+- **L-04**: `${#var}` counts Unicode chars; bash counts bytes (matches in UTF-8 locale). v33 extends the same char-counting convention to `${var:off:len}` — offset/length units are codepoints, never byte indices. Slices never split a multi-byte UTF-8 codepoint.
 - **L-05**: `[N] PID` spawn notification shows only the last pipeline stage's PID; bash shows all.
 - **L-06**: `jobs` column width is fixed at 24; bash uses terminal width.
 - **L-07**: `wait` polls (50ms) rather than blocking — small latency / minor CPU usage.
@@ -339,3 +339,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-26**: M-14 (`[[ ]]` extended test) shipped as v30. Regex engine is `regex` crate (RE2-style; L-09 documents the divergence from POSIX ERE).
 - **2026-05-26**: B-11 fixed (v31). `execute_sequence_body` now calls `shell.set_last_status` after each command's `Continue(c)` outcome so `$?` propagates across `;`/`&&`/`||` within a sequence. Tier 1 is empty again.
 - **2026-05-26**: M-15 (`${var/pat/repl}` pattern substitution) shipped as v32. All six bash forms: first-match `/`, all-matches `//`, anchored-prefix `/#`, anchored-suffix `/%`, plus empty-replacement shortcut. New `ParamModifier::Substitute` + `SubstAnchor` AST, new lexer `Some('/')` arm with `scan_substitution_operand` (`\/` escapes literal slash), `substitute()` evaluator using `glob::Pattern` over a `char_indices` boundary scan. Empty pattern is a no-op (bash-compat); trailing empty match suppressed so `${var//*/Q}` emits a single replacement.
+- **2026-05-27**: M-16 (`${var:off:len}` substring expansion) shipped as v33. Scalar vars + positional params; full arith in offset/length via reuse of v22's `arith::parse` + `arith::eval`; bash 5.x edge-case semantics with char-counting per L-04. Inherits M-58 divergence (PE errors don't abort the surrounding command). Array slicing on `$@`/`$*` deferred.
