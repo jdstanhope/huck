@@ -1,6 +1,7 @@
 //! Trap handler storage, signal-name parsing, and signal-delivery
 //! plumbing for the `trap` builtin (huck v35).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +17,32 @@ static TRAP_PENDING: OnceLock<Arc<AtomicU32>> = OnceLock::new();
 /// subsequent calls are no-ops (the existing Arc is kept).
 pub fn init_pending_bitmask(arc: Arc<AtomicU32>) {
     let _ = TRAP_PENDING.set(arc);
+}
+
+/// Set of signal numbers that were ignored when huck started. Per
+/// POSIX, these cannot be trapped or reset. Populated lazily on
+/// first `install` / `reset` call.
+#[allow(dead_code)]  // used by install/reset; referenced in Task 4+
+static IGNORED_AT_STARTUP: OnceLock<HashSet<i32>> = OnceLock::new();
+
+#[allow(dead_code)]  // used by install/reset; referenced in Task 4+
+fn ignored_at_startup_set() -> &'static HashSet<i32> {
+    IGNORED_AT_STARTUP.get_or_init(|| {
+        let mut set = HashSet::new();
+        for (_, signum) in TRAPPABLE {
+            // SAFETY: sigaction with null new pointer just queries the
+            // current disposition without changing it.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(*signum, std::ptr::null(), &mut act) == 0
+                    && act.sa_sigaction == libc::SIG_IGN
+                {
+                    set.insert(*signum);
+                }
+            }
+        }
+        set
+    })
 }
 
 /// Returns the bits that were pending and atomically clears them.
@@ -65,8 +92,91 @@ pub fn fire_exit_trap(shell: &mut Shell) {
 /// also clear EXIT so the parent's EXIT fires only when the parent
 /// exits, not when the subshell does.
 pub fn clear_for_subshell(shell: &mut Shell) {
+    // Unregister every installed signal handler before clearing.
+    for (_, sigid) in shell.trap_sigids.drain() {
+        signal_hook::low_level::unregister(sigid);
+    }
     shell.traps.clear();
     shell.trap_pending = Arc::new(AtomicU32::new(0));
+}
+
+/// Installs a trap action for `sig`. `action = Some(text)` registers;
+/// `action = None` ignores the signal (SIG_IGN). For EXIT, no OS-level
+/// handler is needed — just store the action and let `fire_exit_trap`
+/// handle the firing.
+///
+/// Returns `Err(msg)` if `sig` was ignored at shell startup (POSIX
+/// "Signals ignored upon entry to the shell cannot be trapped").
+#[allow(dead_code)]  // called by builtin_trap in Task 4
+pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Result<(), String> {
+    match sig {
+        TrapSignal::Exit => {
+            shell.traps.insert(TrapSignal::Exit, action);
+            Ok(())
+        }
+        TrapSignal::Real(signum) => {
+            if ignored_at_startup_set().contains(&signum) {
+                return Err(format!("signal {signum}: cannot reset ignored signal"));
+            }
+            // Remove any existing handler before installing a new one
+            // so we don't accumulate multiple trap closures per signal.
+            if let Some(sigid) = shell.trap_sigids.remove(&signum) {
+                signal_hook::low_level::unregister(sigid);
+            }
+            let sigid = match &action {
+                Some(_) => {
+                    // Install closure that sets the bitmask bit.
+                    let pending = TRAP_PENDING.get()
+                        .expect("TRAP_PENDING initialised by Shell::new")
+                        .clone();
+                    // SAFETY: signal_hook::low_level::register requires
+                    // the closure to be async-signal-safe. fetch_or on
+                    // AtomicU32 is lock-free and signal-safe.
+                    unsafe {
+                        signal_hook::low_level::register(signum, move || {
+                            pending.fetch_or(1u32 << signum, Ordering::SeqCst);
+                        })
+                    }.map_err(|e| format!("install signal handler: {e}"))?
+                }
+                None => {
+                    // SIG_IGN — register an empty closure (effectively
+                    // ignoring the signal, since the closure does
+                    // nothing).
+                    unsafe {
+                        signal_hook::low_level::register(signum, || {})
+                    }.map_err(|e| format!("install signal handler: {e}"))?
+                }
+            };
+            shell.trap_sigids.insert(signum, sigid);
+            shell.traps.insert(TrapSignal::Real(signum), action);
+            Ok(())
+        }
+    }
+}
+
+/// Resets `sig` to default disposition. For EXIT, just removes the
+/// stored action. For real signals, unregisters any installed handler
+/// — signal-hook's existing SIGINT/SIGCHLD handlers (installed by
+/// `shell::install_sigint_handler` etc.) are unaffected because they
+/// were registered separately and have their own SigIds.
+#[allow(dead_code)]  // called by builtin_trap in Task 4
+pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
+    match sig {
+        TrapSignal::Exit => {
+            shell.traps.remove(&TrapSignal::Exit);
+            Ok(())
+        }
+        TrapSignal::Real(signum) => {
+            if ignored_at_startup_set().contains(&signum) {
+                return Err(format!("signal {signum}: cannot reset ignored signal"));
+            }
+            if let Some(sigid) = shell.trap_sigids.remove(&signum) {
+                signal_hook::low_level::unregister(sigid);
+            }
+            shell.traps.remove(&TrapSignal::Real(signum));
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -300,5 +410,53 @@ mod tests {
         // parse time, so the table has 14 entries. (HUP/INT/QUIT/USR1/
         // USR2/PIPE/ALRM/TERM/CHLD/CONT/TSTP/TTIN/TTOU/WINCH.)
         assert_eq!(name_table().len(), 14);
+    }
+
+    #[test]
+    fn install_exit_stores_action() {
+        let mut shell = Shell::new();
+        install(&mut shell, TrapSignal::Exit, Some("echo bye".to_string())).unwrap();
+        assert_eq!(
+            shell.traps.get(&TrapSignal::Exit),
+            Some(&Some("echo bye".to_string()))
+        );
+    }
+
+    #[test]
+    fn install_exit_ignore_stores_none() {
+        let mut shell = Shell::new();
+        install(&mut shell, TrapSignal::Exit, None).unwrap();
+        assert_eq!(shell.traps.get(&TrapSignal::Exit), Some(&None));
+    }
+
+    #[test]
+    fn reset_exit_removes_from_traps() {
+        let mut shell = Shell::new();
+        install(&mut shell, TrapSignal::Exit, Some("echo bye".to_string())).unwrap();
+        reset(&mut shell, TrapSignal::Exit).unwrap();
+        assert!(!shell.traps.contains_key(&TrapSignal::Exit));
+    }
+
+    #[test]
+    fn install_real_signal_stores_action_and_sigid() {
+        let mut shell = Shell::new();
+        // Use SIGUSR1 — unlikely to be ignored-at-startup in test env.
+        install(&mut shell, TrapSignal::Real(libc::SIGUSR1), Some("echo usr1".to_string())).unwrap();
+        assert!(shell.trap_sigids.contains_key(&libc::SIGUSR1));
+        assert_eq!(
+            shell.traps.get(&TrapSignal::Real(libc::SIGUSR1)),
+            Some(&Some("echo usr1".to_string()))
+        );
+        // Cleanup so the handler doesn't leak across tests.
+        reset(&mut shell, TrapSignal::Real(libc::SIGUSR1)).unwrap();
+    }
+
+    #[test]
+    fn reset_real_signal_unregisters_handler() {
+        let mut shell = Shell::new();
+        install(&mut shell, TrapSignal::Real(libc::SIGUSR2), Some("echo usr2".to_string())).unwrap();
+        reset(&mut shell, TrapSignal::Real(libc::SIGUSR2)).unwrap();
+        assert!(!shell.trap_sigids.contains_key(&libc::SIGUSR2));
+        assert!(!shell.traps.contains_key(&TrapSignal::Real(libc::SIGUSR2)));
     }
 }

@@ -65,6 +65,11 @@ pub struct Shell {
     /// a real signal.
     #[allow(dead_code)]  // used by traps module + REPL; remove in Task 5
     pub trap_pending: std::sync::Arc<std::sync::atomic::AtomicU32>,
+
+    /// Map of signal number → signal-hook SigId for each currently-
+    /// installed trap handler. Used by `traps::reset` to unregister.
+    #[allow(dead_code)]  // populated by traps module; remove in Task 5
+    pub trap_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
 }
 
 impl Shell {
@@ -93,6 +98,7 @@ impl Shell {
             is_interactive: std::io::stdin().is_terminal(),
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            trap_sigids: std::collections::HashMap::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
