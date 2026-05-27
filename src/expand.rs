@@ -212,7 +212,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         has_emitted = true;
                     }
                     crate::param_expansion::ExpansionResult::Fatal { .. } => {
-                        // Wired in Task 4.
+                        // Wired in Task 4: will stash status on
+                        // shell.pending_fatal_pe_error. For now, treat as
+                        // Empty so the surrounding field is preserved.
+                        has_emitted = true;
                     }
                 }
             }
@@ -1299,7 +1302,14 @@ mod tests {
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "");
-        assert_eq!(shell.last_status(), 1);
+        // v34: ErrorIfUnset now returns Fatal; the expand() layer stashes the
+        // fatal status on pending_fatal_pe_error (Task 4). last_status is NOT
+        // set by expand_modifier itself anymore — it's set by the executor
+        // after draining pending_fatal_pe_error. This test checks the
+        // pending flag is set (Task 4 wires this; for now it stays None until
+        // the Fatal arm is fully wired). After Task 4, assert:
+        //   assert_eq!(shell.pending_fatal_pe_error, Some(1));
+        // For Task 3, we just confirm expand() returns an empty field.
     }
 
     #[test]
