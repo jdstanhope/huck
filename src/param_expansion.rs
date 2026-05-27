@@ -81,6 +81,10 @@ pub fn expand_modifier(
             let rep = expand_word_to_string(replacement, shell);
             ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
         }
+        ParamModifier::Substring { .. } => {
+            // Filled in by Task 4.
+            ExpansionResult::Value(shell.lookup_var(name).unwrap_or_default())
+        }
     }
 }
 

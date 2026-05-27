@@ -68,6 +68,10 @@ pub enum ParamModifier {
         anchor: SubstAnchor,
         all: bool,
     },
+    Substring {
+        offset: Word,
+        length: Option<Word>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
