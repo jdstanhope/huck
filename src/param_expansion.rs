@@ -16,8 +16,11 @@ pub fn expand_modifier(
 ) -> ExpansionResult {
     match modifier {
         ParamModifier::Length => {
-            let v = shell.get(name).unwrap_or("");
-            ExpansionResult::Value(v.chars().count().to_string())
+            let n = match name {
+                "@" | "*" => shell.positional_args.len(),
+                _ => shell.lookup_var(name).unwrap_or_default().chars().count(),
+            };
+            ExpansionResult::Value(n.to_string())
         }
         ParamModifier::UseDefault { word, colon } => {
             let raw = shell.get(name).map(|s| s.to_string());
@@ -370,6 +373,42 @@ mod tests {
         shell.export_set("HUCK_TEST_PE_UNI", "é".to_string());
         let r = expand_modifier("HUCK_TEST_PE_UNI", &ParamModifier::Length, &mut shell);
         assert_eq!(r, ExpansionResult::Value("1".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_at_returns_positional_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("@", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("3".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_star_returns_positional_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "bb".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("*", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("2".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_positional_returns_char_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("5".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_unset_positional_returns_zero() {
+        let mut shell = Shell::new();
+        // positional_args is empty by default; ${#5} → 0.
+        let m = ParamModifier::Length;
+        let r = expand_modifier("5", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("0".to_string()));
     }
 
     #[test]
