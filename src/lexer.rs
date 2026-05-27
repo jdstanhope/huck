@@ -1290,32 +1290,15 @@ fn split_substitution_body(body: &str) -> (String, String) {
     (pattern, replacement)
 }
 
-/// Walks the chars iterator from just after the leading `:` of a substring
-/// operand. Delegates to `scan_braced_operand` to collect the raw body
-/// (which depth-tracks nested `${...}` and protects `}` inside quoted
-/// spans), then splits on the first unescaped `:` at brace-depth zero
-/// outside any quoted span. Returns `(offset_word, Some(length_word))` if a
-/// delimiter was found, or `(offset_word, None)` if no `:` appeared in the
-/// body. Escapes follow the same rules as `split_substitution_body`:
-/// `\:` is reserved for a literal colon, `\\` is a literal backslash,
-/// any other `\x` passes through unchanged.
+/// Scans a `${var:offset}` / `${var:offset:length}` operand pair. Delegates
+/// to `scan_braced_operand` + `split_substring_body` + `parse_braced_operand`
+/// to collect and parse the offset and optional length Words.
 fn scan_substring_operands(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<(Word, Option<Word>), LexError> {
     let body = scan_braced_operand(chars)?;
     let (offset_src, length_src) = split_substring_body(&body);
-    // Preserve any leading whitespace in the offset (e.g. `${name: -3}`) as a
-    // literal space part so that arithmetic evaluation sees ` -3` (which is
-    // equivalent to `-3` but the space is the syntactic disambiguation signal
-    // that distinguishes it from `:-` UseDefault).
-    let offset = {
-        let leading: String = offset_src.chars().take_while(|c| c.is_whitespace()).collect();
-        let mut w = parse_braced_operand(&offset_src)?;
-        if !leading.is_empty() {
-            w.0.insert(0, WordPart::Literal { text: leading, quoted: false });
-        }
-        w
-    };
+    let offset = parse_braced_operand(&offset_src)?;
     let length = match length_src {
         Some(s) => Some(parse_braced_operand(&s)?),
         None => None,
@@ -3873,7 +3856,7 @@ mod tests {
         let mut t = tokenize_words("${name: -3}").unwrap();
         let part = single_param_expansion(&mut t);
         if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, .. }, .. } = part {
-            assert_eq!(word_to_literal(&offset), " -3");
+            assert_eq!(word_to_literal(&offset), "-3");
         } else { panic!("expected Substring, got {part:?}") }
     }
 
