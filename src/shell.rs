@@ -72,7 +72,19 @@ pub fn run() -> i32 {
                         shell.history.save();
                         return code;
                     }
-                    ExecOutcome::Continue(status) => shell.set_last_status(status),
+                    ExecOutcome::Continue(status) => {
+                        shell.set_last_status(status);
+                        // Drain any fatal PE error. In non-interactive mode
+                        // (stdin not a TTY), exit immediately with the fatal
+                        // status. Interactive: $? already set; fall through
+                        // to the next prompt iteration.
+                        if let Some(fatal_status) = shell.take_pending_fatal_pe_error()
+                            && !shell.is_interactive
+                        {
+                            shell.history.save();
+                            return fatal_status;
+                        }
+                    }
                     ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
                     | ExecOutcome::FunctionReturn(_) => {
                         shell.set_last_status(0)

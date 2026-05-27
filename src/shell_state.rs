@@ -49,7 +49,6 @@ pub struct Shell {
     pub pending_fatal_pe_error: Option<i32>,
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
-    #[allow(dead_code)]  // wired in Task 5
     pub is_interactive: bool,
 }
 
@@ -165,7 +164,6 @@ impl Shell {
     }
 
     /// Returns and clears the pending fatal-PE-error flag.
-    #[allow(dead_code)]  // wired in Task 5
     pub fn take_pending_fatal_pe_error(&mut self) -> Option<i32> {
         self.pending_fatal_pe_error.take()
     }

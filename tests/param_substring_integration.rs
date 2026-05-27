@@ -66,16 +66,16 @@ fn substring_negative_length_counts_from_end() {
 }
 
 #[test]
-fn substring_negative_computed_length_errors() {
-    // The error path returns Empty (so the field is empty) and the eprintln
-    // fires. We don't assert $?==1 here because of huck's M-58 divergence:
-    // parameter-expansion errors set $? but do NOT abort the simple command,
-    // so `echo "[${s:0:-4}]"` proceeds with the empty field and echo's own
-    // exit=0 immediately overwrites the status. The unit test
-    // `expand_modifier_substring_negative_length_below_zero_errors_and_empty`
-    // asserts the status-setting directly at the expand layer.
-    let (out, err) = run("s=abc\necho \"[${s:0:-4}]\"\nexit\n");
-    assert!(out.lines().any(|l| l == "[]"), "stdout: {out}");
+fn substring_negative_computed_length_aborts_command() {
+    // v34 (M-58 fix): negative computed length aborts the surrounding
+    // simple command. The `echo "[...]"` never runs, so no `[]` line in
+    // stdout. The script then runs `echo after`, which DOES run because
+    // huck is in non-interactive mode (piped stdin) and the abort would
+    // exit the shell. So in this test we verify the non-interactive
+    // exit-on-fatal behavior: huck exits before reaching `echo after`.
+    let (out, err) = run("s=abc\necho \"[${s:0:-4}]\"\necho after\nexit\n");
+    assert!(!out.lines().any(|l| l == "[]"), "stdout should NOT have []: {out}");
+    assert!(!out.lines().any(|l| l == "after"), "stdout should NOT have 'after': {out}");
     assert!(err.contains("substring expression < 0"), "stderr: {err}");
 }
 
@@ -124,8 +124,10 @@ fn substring_positional_in_function() {
 
 #[test]
 fn substring_bad_arith_returns_empty_sets_status() {
-    // See substring_negative_computed_length_errors for why $? is not asserted
-    // here (M-58 family divergence: PE errors set $? then `echo` resets it).
+    // Bad arith in substring offset/length stays NON-fatal in v34: prints
+    // the arithmetic error, sets $?=1, but does not abort the surrounding
+    // command (matches bash, which only treats `:?` and substring-<0 as
+    // exit-the-script errors). The echo still runs and prints `[]`.
     let (out, err) = run("s=hello\necho \"[${s:@@@}]\"\nexit\n");
     assert!(out.lines().any(|l| l == "[]"), "stdout: {out}");
     assert!(err.contains("arithmetic"), "stderr: {err}");
