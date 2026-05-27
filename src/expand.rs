@@ -211,11 +211,9 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     crate::param_expansion::ExpansionResult::Empty => {
                         has_emitted = true;
                     }
-                    crate::param_expansion::ExpansionResult::Fatal { .. } => {
-                        // Wired in Task 4: will stash status on
-                        // shell.pending_fatal_pe_error. For now, treat as
-                        // Empty so the surrounding field is preserved.
-                        has_emitted = true;
+                    crate::param_expansion::ExpansionResult::Fatal { status } => {
+                        shell.pending_fatal_pe_error = Some(status);
+                        return result;
                     }
                 }
             }
@@ -274,8 +272,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match crate::param_expansion::expand_modifier(name, modifier, shell) {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
                     crate::param_expansion::ExpansionResult::Empty => {}
-                    crate::param_expansion::ExpansionResult::Fatal { .. } => {
-                        // Wired in Task 4.
+                    crate::param_expansion::ExpansionResult::Fatal { status } => {
+                        shell.pending_fatal_pe_error = Some(status);
+                        return result;
                     }
                 }
             }
@@ -1300,16 +1299,11 @@ mod tests {
             quoted: false,
         }]);
         let fields = expand(&word, &mut shell);
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].chars, "");
-        // v34: ErrorIfUnset now returns Fatal; the expand() layer stashes the
-        // fatal status on pending_fatal_pe_error (Task 4). last_status is NOT
-        // set by expand_modifier itself anymore — it's set by the executor
-        // after draining pending_fatal_pe_error. This test checks the
-        // pending flag is set (Task 4 wires this; for now it stays None until
-        // the Fatal arm is fully wired). After Task 4, assert:
-        //   assert_eq!(shell.pending_fatal_pe_error, Some(1));
-        // For Task 3, we just confirm expand() returns an empty field.
+        // v34 (Task 4): expand() now bails early on Fatal, stashing status on
+        // pending_fatal_pe_error and returning the partial (empty) result
+        // without the end-of-word push, so fields is empty.
+        assert_eq!(fields.len(), 0);
+        assert_eq!(shell.pending_fatal_pe_error, Some(1));
     }
 
     #[test]

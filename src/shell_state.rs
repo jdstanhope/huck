@@ -46,7 +46,6 @@ pub struct Shell {
     /// current simple command; the REPL loop drains it via
     /// `take_pending_fatal_pe_error` to decide whether to exit (in
     /// non-interactive mode) or return to prompt (interactive).
-    #[allow(dead_code)]  // wired in Task 4
     pub pending_fatal_pe_error: Option<i32>,
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
