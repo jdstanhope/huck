@@ -7,6 +7,11 @@ use crate::shell_state::Shell;
 pub enum ExpansionResult {
     Value(String),
     Empty,
+    /// Fatal parameter-expansion error: the caller must abort the
+    /// surrounding simple command and (in non-interactive mode) exit
+    /// the shell. The message has already been printed by the arm that
+    /// produced this; `status` is the exit code.
+    Fatal { status: i32 },
 }
 
 pub fn expand_modifier(

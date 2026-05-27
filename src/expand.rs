@@ -211,6 +211,9 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     crate::param_expansion::ExpansionResult::Empty => {
                         has_emitted = true;
                     }
+                    crate::param_expansion::ExpansionResult::Fatal { .. } => {
+                        // Wired in Task 4.
+                    }
                 }
             }
         }
@@ -268,6 +271,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match crate::param_expansion::expand_modifier(name, modifier, shell) {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
                     crate::param_expansion::ExpansionResult::Empty => {}
+                    crate::param_expansion::ExpansionResult::Fatal { .. } => {
+                        // Wired in Task 4.
+                    }
                 }
             }
             WordPart::AllArgs { .. } => {
