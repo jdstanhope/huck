@@ -67,6 +67,19 @@ pub struct Shell {
     /// Map of signal number → signal-hook SigId for each currently-
     /// installed trap handler. Used by `traps::reset` to unregister.
     pub trap_sigids: std::collections::HashMap<i32, signal_hook::SigId>,
+
+    /// Currently-firing pseudo-trap, if any. Set on entry to
+    /// fire_err/fire_debug/fire_return; cleared on exit. Used to
+    /// suppress re-firing of the SAME trap from within its own action.
+    /// Different signals do NOT cross-suppress (a DEBUG action that
+    /// triggers ERR still fires ERR).
+    #[allow(dead_code)]  // used by traps module + executor; remove in Task 3
+    pub firing_trap: Option<crate::traps::TrapSignal>,
+
+    /// Depth counter for ERR-suppression contexts (if/elif/while/until
+    /// conditions). ERR trap only fires when this is 0.
+    #[allow(dead_code)]  // used by executor; remove in Task 4
+    pub err_suppressed_depth: u32,
 }
 
 impl Shell {
@@ -96,6 +109,8 @@ impl Shell {
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             trap_sigids: std::collections::HashMap::new(),
+            firing_trap: None,
+            err_suppressed_depth: 0,
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
