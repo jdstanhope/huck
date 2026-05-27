@@ -77,7 +77,6 @@ pub struct Shell {
 
     /// Depth counter for ERR-suppression contexts (if/elif/while/until
     /// conditions). ERR trap only fires when this is 0.
-    #[allow(dead_code)]  // used by executor; remove in Task 4
     pub err_suppressed_depth: u32,
 }
 
