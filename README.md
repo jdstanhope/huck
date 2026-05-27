@@ -43,6 +43,7 @@ spec, an implementation plan, and a test suite.
 | v33       | Substring expansion `${var:off:len}` (M-16)                      |
 | v34       | Fatal PE errors (M-58) + `${#1}`/`${#@}`/`${#*}` length (M-60)   |
 | v35       | `trap` builtin (M-22 partial — EXIT + 13 real signals)            |
+| v36       | `trap` pseudo-signals ERR/DEBUG/RETURN (closes M-22)            |
 
 ## Build and run
 
