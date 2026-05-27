@@ -41,6 +41,7 @@ spec, an implementation plan, and a test suite.
 | v30       | `[[ ]]` extended test (pattern/regex/int/file/combinators)      |
 | v32       | Pattern substitution `${var/pat/repl}` (all six bash forms)      |
 | v33       | Substring expansion `${var:off:len}` (M-16)                      |
+| v34       | Fatal PE errors (M-58) + `${#1}`/`${#@}`/`${#*}` length (M-60)   |
 
 ## Build and run
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -40,6 +41,15 @@ pub struct Shell {
     /// Stack of function names pushed/popped around each `call_function`.
     /// `$0` returns the top of this stack when inside a function.
     pub function_arg0: Vec<String>,
+    /// `Some(status)` after a fatal parameter-expansion error fires
+    /// inside an `expand_*` call. The executor peeks this to bail the
+    /// current simple command; the REPL loop drains it via
+    /// `take_pending_fatal_pe_error` to decide whether to exit (in
+    /// non-interactive mode) or return to prompt (interactive).
+    pub pending_fatal_pe_error: Option<i32>,
+    /// True if stdin was a TTY at startup. Determines whether fatal PE
+    /// errors exit the shell or just return to the prompt.
+    pub is_interactive: bool,
 }
 
 impl Shell {
@@ -64,6 +74,8 @@ impl Shell {
             last_bg_pid: None,
             shell_argv0,
             function_arg0: Vec::new(),
+            pending_fatal_pe_error: None,
+            is_interactive: std::io::stdin().is_terminal(),
         }
     }
 
@@ -149,6 +161,11 @@ impl Shell {
 
     pub fn set_last_status(&mut self, status: i32) {
         self.last_status = status;
+    }
+
+    /// Returns and clears the pending fatal-PE-error flag.
+    pub fn take_pending_fatal_pe_error(&mut self) -> Option<i32> {
+        self.pending_fatal_pe_error.take()
     }
 
     /// Iterates only the exported variables, suitable for passing to a child

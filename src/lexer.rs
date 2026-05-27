@@ -1030,14 +1030,28 @@ fn read_braced_param_expansion(
     // Otherwise read the identifier name and emit a Length ParamExpansion.
     if chars.peek() == Some(&'#') {
         chars.next(); // consume '#'
-        if chars.peek() == Some(&'}') {
+        let next = chars.peek().copied();
+        if next == Some('}') {
             // ${#} — count of positional args.
-            chars.next(); // consume '}'
+            chars.next();
             parts.push(WordPart::Var { name: "#".to_string(), quoted });
             return Ok(());
         }
-        // ${#name} — length of $name.
-        let name = read_braced_name(chars)?;
+        // ${#name}: name may be a regular identifier, a digit-only
+        // positional name (${#1}, ${#10}), or a special name @/* that
+        // means "count of positional args" (same as ${#}).
+        let name = match next {
+            Some(c) if c.is_ascii_digit() => {
+                let mut s = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                }
+                s
+            }
+            Some('@') => { chars.next(); "@".to_string() }
+            Some('*') => { chars.next(); "*".to_string() }
+            _ => read_braced_name(chars)?,
+        };
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
         }
@@ -2877,10 +2891,12 @@ mod tests {
 
     #[test]
     fn tokenize_length_modifier_digit_leading_name_errors() {
-        // `${#1foo}` — the name part starts with a digit, which is not a
-        // valid identifier (special parameters are out of scope for v12).
+        // `${#1foo}` — v34: digit-only positional names are now supported
+        // (${#1}, ${#10}), but ${#1foo} is still invalid: after parsing the
+        // positional "1", the lexer expects "}" but finds "f", so
+        // UnterminatedBrace.
         let err = tokenize("${#1foo}").unwrap_err();
-        assert_eq!(err, LexError::InvalidVarName);
+        assert_eq!(err, LexError::UnterminatedBrace);
     }
 
     #[test]
@@ -3922,5 +3938,67 @@ mod tests {
             tokenize_words("${name:}"),
             Err(LexError::InvalidBraceModifier(s)) if s == ":"
         ));
+    }
+
+    #[test]
+    fn brace_length_positional() {
+        let mut t = tokenize_words("${#1}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier, quoted } = part {
+            assert_eq!(name, "1");
+            assert!(!quoted);
+            assert!(matches!(modifier, ParamModifier::Length));
+        } else { panic!("expected ParamExpansion, got {part:?}") }
+    }
+
+    #[test]
+    fn brace_length_multi_digit_positional() {
+        let mut t = tokenize_words("${#10}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier, .. } = part {
+            assert_eq!(name, "10");
+            assert!(matches!(modifier, ParamModifier::Length));
+        } else { panic!("expected ParamExpansion") }
+    }
+
+    #[test]
+    fn brace_length_at() {
+        let mut t = tokenize_words("${#@}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier, .. } = part {
+            assert_eq!(name, "@");
+            assert!(matches!(modifier, ParamModifier::Length));
+        } else { panic!("expected ParamExpansion") }
+    }
+
+    #[test]
+    fn brace_length_star() {
+        let mut t = tokenize_words("${#*}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier, .. } = part {
+            assert_eq!(name, "*");
+            assert!(matches!(modifier, ParamModifier::Length));
+        } else { panic!("expected ParamExpansion") }
+    }
+
+    #[test]
+    fn brace_length_unchanged_for_named() {
+        // Regression: `${#foo}` still parses as Length on a named var.
+        let mut t = tokenize_words("${#foo}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier, .. } = part {
+            assert_eq!(name, "foo");
+            assert!(matches!(modifier, ParamModifier::Length));
+        } else { panic!("expected ParamExpansion") }
+    }
+
+    #[test]
+    fn brace_length_bare_hash_unchanged() {
+        // Regression: `${#}` still parses as Var { name: "#" }.
+        let mut t = tokenize_words("${#}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::Var { name, .. } = part {
+            assert_eq!(name, "#");
+        } else { panic!("expected Var(#), got {part:?}") }
     }
 }

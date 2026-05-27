@@ -211,6 +211,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     crate::param_expansion::ExpansionResult::Empty => {
                         has_emitted = true;
                     }
+                    crate::param_expansion::ExpansionResult::Fatal { status } => {
+                        shell.pending_fatal_pe_error = Some(status);
+                        return result;
+                    }
                 }
             }
         }
@@ -268,6 +272,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match crate::param_expansion::expand_modifier(name, modifier, shell) {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
                     crate::param_expansion::ExpansionResult::Empty => {}
+                    crate::param_expansion::ExpansionResult::Fatal { status } => {
+                        shell.pending_fatal_pe_error = Some(status);
+                        return result;
+                    }
                 }
             }
             WordPart::AllArgs { .. } => {
@@ -311,6 +319,9 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
         } else {
             expand_assignment(&Word(vec![part.clone()]), shell)
         };
+        if shell.pending_fatal_pe_error.is_some() {
+            return result;
+        }
         if word_part_is_quoted(part) {
             result.push_str(&glob::Pattern::escape(&text));
         } else {
@@ -1291,9 +1302,11 @@ mod tests {
             quoted: false,
         }]);
         let fields = expand(&word, &mut shell);
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].chars, "");
-        assert_eq!(shell.last_status(), 1);
+        // v34 (Task 4): expand() now bails early on Fatal, stashing status on
+        // pending_fatal_pe_error and returning the partial (empty) result
+        // without the end-of-word push, so fields is empty.
+        assert_eq!(fields.len(), 0);
+        assert_eq!(shell.pending_fatal_pe_error, Some(1));
     }
 
     #[test]

@@ -67,6 +67,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     // would see a stale value.
     if let ExecOutcome::Continue(c) = status {
         shell.set_last_status(c);
+        if shell.pending_fatal_pe_error.is_some() {
+            return ExecOutcome::Continue(c);
+        }
     }
     for (connector, command) in &seq.rest {
         let should_run = match connector {
@@ -85,6 +88,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             }
             if let ExecOutcome::Continue(c) = status {
                 shell.set_last_status(c);
+                if shell.pending_fatal_pe_error.is_some() {
+                    return ExecOutcome::Continue(c);
+                }
             }
         }
     }
@@ -302,6 +308,9 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
     while i < clause.items.len() {
         let item = &clause.items[i];
         let run_this = fall_through || case_item_matches(item, &subject, shell);
+        if let Some(status) = shell.pending_fatal_pe_error {
+            return ExecOutcome::Continue(status);
+        }
         if !run_this {
             i += 1;
             continue;
@@ -1117,6 +1126,9 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
 
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
     let prog_fields = glob_expand_fields(expand(&cmd.program, shell));
+    if let Some(status) = shell.pending_fatal_pe_error {
+        return Err(status);
+    }
     if prog_fields.is_empty() {
         eprintln!("huck: command not found:");
         return Err(127);
@@ -1126,10 +1138,17 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let mut args: Vec<String> = iter.collect();
     for word in &cmd.args {
         args.extend(glob_expand_fields(expand(word, shell)));
+        if let Some(status) = shell.pending_fatal_pe_error {
+            return Err(status);
+        }
     }
     let stdin = match &cmd.stdin {
         Some(Redirect::Read(word)) => {
-            Some(ResolvedStdin::File(expand_single(word, shell).map_err(|()| 1)?))
+            let path = expand_single(word, shell).map_err(|()| 1)?;
+            if let Some(status) = shell.pending_fatal_pe_error {
+                return Err(status);
+            }
+            Some(ResolvedStdin::File(path))
         }
         Some(Redirect::Heredoc { body, .. }) => {
             // Store the body Word to be expanded later (after inline
@@ -1148,10 +1167,18 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     };
     let stdout = match &cmd.stdout {
         Some(Redirect::Truncate(w)) => {
-            Some(ResolvedRedirect::Truncate(expand_single(w, shell).map_err(|()| 1)?))
+            let path = expand_single(w, shell).map_err(|()| 1)?;
+            if let Some(status) = shell.pending_fatal_pe_error {
+                return Err(status);
+            }
+            Some(ResolvedRedirect::Truncate(path))
         }
         Some(Redirect::Append(w)) => {
-            Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
+            let path = expand_single(w, shell).map_err(|()| 1)?;
+            if let Some(status) = shell.pending_fatal_pe_error {
+                return Err(status);
+            }
+            Some(ResolvedRedirect::Append(path))
         }
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stdout")
@@ -1165,10 +1192,18 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     };
     let stderr = match &cmd.stderr {
         Some(Redirect::Truncate(w)) => {
-            Some(ResolvedRedirect::Truncate(expand_single(w, shell).map_err(|()| 1)?))
+            let path = expand_single(w, shell).map_err(|()| 1)?;
+            if let Some(status) = shell.pending_fatal_pe_error {
+                return Err(status);
+            }
+            Some(ResolvedRedirect::Truncate(path))
         }
         Some(Redirect::Append(w)) => {
-            Some(ResolvedRedirect::Append(expand_single(w, shell).map_err(|()| 1)?))
+            let path = expand_single(w, shell).map_err(|()| 1)?;
+            if let Some(status) = shell.pending_fatal_pe_error {
+                return Err(status);
+            }
+            Some(ResolvedRedirect::Append(path))
         }
         Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
             unreachable!("parser never produces Read/Heredoc/HereString for stderr")

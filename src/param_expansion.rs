@@ -7,6 +7,11 @@ use crate::shell_state::Shell;
 pub enum ExpansionResult {
     Value(String),
     Empty,
+    /// Fatal parameter-expansion error: the caller must abort the
+    /// surrounding simple command and (in non-interactive mode) exit
+    /// the shell. The message has already been printed by the arm that
+    /// produced this; `status` is the exit code.
+    Fatal { status: i32 },
 }
 
 pub fn expand_modifier(
@@ -14,10 +19,16 @@ pub fn expand_modifier(
     modifier: &ParamModifier,
     shell: &mut Shell,
 ) -> ExpansionResult {
+    if shell.pending_fatal_pe_error.is_some() {
+        return ExpansionResult::Empty;
+    }
     match modifier {
         ParamModifier::Length => {
-            let v = shell.get(name).unwrap_or("");
-            ExpansionResult::Value(v.chars().count().to_string())
+            let n = match name {
+                "@" | "*" => shell.positional_args.len(),
+                _ => shell.lookup_var(name).unwrap_or_default().chars().count(),
+            };
+            ExpansionResult::Value(n.to_string())
         }
         ParamModifier::UseDefault { word, colon } => {
             let raw = shell.get(name).map(|s| s.to_string());
@@ -51,8 +62,7 @@ pub fn expand_modifier(
                 } else {
                     eprintln!("huck: {}: {}", name, msg);
                 }
-                shell.set_last_status(1);
-                ExpansionResult::Empty
+                ExpansionResult::Fatal { status: 1 }
             } else {
                 ExpansionResult::Value(raw.unwrap_or_default())
             }
@@ -98,8 +108,7 @@ pub fn expand_modifier(
                 Ok(s) => ExpansionResult::Value(s),
                 Err(msg) => {
                     eprintln!("huck: {}: {}", name, msg);
-                    shell.set_last_status(1);
-                    ExpansionResult::Empty
+                    ExpansionResult::Fatal { status: 1 }
                 }
             }
         }
@@ -373,6 +382,42 @@ mod tests {
     }
 
     #[test]
+    fn expand_modifier_length_at_returns_positional_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("@", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("3".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_star_returns_positional_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "bb".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("*", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("2".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_positional_returns_char_count() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello".to_string()];
+        let m = ParamModifier::Length;
+        let r = expand_modifier("1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("5".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_length_unset_positional_returns_zero() {
+        let mut shell = Shell::new();
+        // positional_args is empty by default; ${#5} → 0.
+        let m = ParamModifier::Length;
+        let r = expand_modifier("5", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("0".to_string()));
+    }
+
+    #[test]
     fn condition_is_null_table() {
         assert!(condition_is_null(None, false));
         assert!(condition_is_null(None, true));
@@ -447,8 +492,8 @@ mod tests {
         let mut shell = Shell::new();
         let m = ParamModifier::ErrorIfUnset { word: lit("msg"), colon: true };
         let r = expand_modifier("HUCK_TEST_PE_EU1", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Empty);
-        assert_eq!(shell.last_status(), 1);
+        // v34: ErrorIfUnset now returns Fatal instead of Empty + $?=1.
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
     }
 
     #[test]
@@ -467,8 +512,8 @@ mod tests {
         let mut shell = Shell::new();
         let m = ParamModifier::ErrorIfUnset { word: Word(vec![]), colon: true };
         let r = expand_modifier("HUCK_TEST_PE_EU_EMPTY", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Empty);
-        assert_eq!(shell.last_status(), 1);
+        // v34: ErrorIfUnset now returns Fatal instead of Empty + $?=1.
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
     }
 
     #[test]
@@ -883,8 +928,8 @@ mod tests {
             length: Some(lit("-4")),
         };
         let r = expand_modifier("HUCK_TEST_PE_SS4", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Empty);
-        assert_eq!(shell.last_status(), 1);
+        // v34: Substring negative-length now returns Fatal instead of Empty + $?=1.
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
     }
 
     #[test]
@@ -910,5 +955,89 @@ mod tests {
         };
         let r = expand_modifier("1", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("hel".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_error_if_unset_returns_fatal() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::ErrorIfUnset {
+            word: lit("missing"),
+            colon: true,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
+    }
+
+    #[test]
+    fn expand_modifier_error_if_unset_with_message_returns_fatal_and_prints() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::ErrorIfUnset {
+            word: lit("custom message"),
+            colon: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
+        // We can't easily capture stderr here — the integration tests
+        // in Task 5 verify the printed message. The unit test confirms
+        // only the return shape.
+    }
+
+    #[test]
+    fn expand_modifier_error_if_unset_when_set_returns_value() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_FATAL3", "set".to_string());
+        let m = ParamModifier::ErrorIfUnset {
+            word: lit("missing"),
+            colon: true,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL3", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("set".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substring_negative_computed_length_returns_fatal() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_FATAL4", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("-4")),
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL4", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
+    }
+
+    #[test]
+    fn expand_modifier_substring_bad_arith_stays_empty_not_fatal() {
+        // Regression guard: bad arith in offset stays non-fatal (matches
+        // bash: arithmetic errors inside ${var:off:len} operands don't
+        // exit the script).
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_FATAL5", "hello".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("@@@"),
+            length: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL5", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        assert_eq!(shell.last_status(), 1);
+        assert_eq!(shell.pending_fatal_pe_error, None);
+    }
+
+    #[test]
+    fn expand_modifier_short_circuits_when_pending_fatal_is_set() {
+        // Entry guard: if a previous expansion already set the fatal
+        // flag, expand_modifier returns Empty immediately without doing
+        // work — no eprintln, no side-effects.
+        let mut shell = Shell::new();
+        shell.pending_fatal_pe_error = Some(1);
+        shell.export_set("HUCK_TEST_PE_FATAL6", "abc".to_string());
+        let m = ParamModifier::Substring {
+            offset: lit("0"),
+            length: Some(lit("-4")), // would normally be fatal
+        };
+        let r = expand_modifier("HUCK_TEST_PE_FATAL6", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Empty);
+        // The flag must remain set (not cleared by the guard).
+        assert_eq!(shell.pending_fatal_pe_error, Some(1));
     }
 }
