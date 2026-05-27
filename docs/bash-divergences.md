@@ -24,7 +24,7 @@ messages so the doc stays in sync.
 | Bugs (Tier 1) | 11 | Things to fix (all 11 fixed; B-11 fixed 2026-05-26) |
 | Missing features (Tier 2) | 52 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
-| Low-impact (Tier 4) | 9 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence) |
+| Low-impact (Tier 4) | 10 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation) |
 
 ---
 
@@ -318,6 +318,14 @@ Things huck deliberately does differently from bash. Document and keep.
 - **bash**: POSIX ERE. Has its own quirks.
 - **Why intentional**: `regex` is a mature, fast, well-maintained Rust crate. Implementing POSIX-ERE-faithful regex isn't worth the cost for the rare divergences. Most real-world shell-regex usage works identically.
 - **Workaround**: if a script relies on POSIX-ERE-specific features, fall back to `grep -E "pattern"` (which uses libc's POSIX ERE).
+
+### L-10: `${var:…}` and `${var/…/…}` mis-split on `:` or `/` inside command substitutions
+- **Status**: intentional (v33)
+- **Severity**: low
+- **huck**: `${s:$(echo 1:2)}` corrupts the split — the inner `:` inside `$(echo 1:2)` is treated as the offset/length delimiter, yielding offset `$(echo 1` and length `2)`. Same issue for `${var/$(cmd/with/slash)/repl}`. The `scan_braced_operand` helper handles brace depth and quoted spans but does not depth-track `$(…)` or `$((…))`, so the second-pass split scanners (`split_substring_body`, `split_substitution_body`) see the inner metacharacter at depth 0.
+- **bash**: parses at the grammar level so the inner metacharacter is never visible to the split.
+- **Why intentional**: real scripts almost never put a `:` or `/` literal inside a command substitution that itself sits inside a parameter expansion operand. The split scanners are simple by design, and adding `$(`/`$((` depth tracking would touch both v32 and v33 helpers for a vanishingly rare pattern.
+- **Workaround**: stash the command-substitution result in a variable and reference the variable inside the operand.
 
 ---
 

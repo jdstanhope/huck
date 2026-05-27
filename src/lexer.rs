@@ -1134,6 +1134,7 @@ fn dispatch_braced_modifier(
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted });
                     Ok(())
                 }
+                Some('}') => Err(LexError::InvalidBraceModifier(":".to_string())),
                 Some(_) => {
                     let (offset, length) = scan_substring_operands(chars)?;
                     parts.push(WordPart::ParamExpansion {
@@ -3909,6 +3910,17 @@ mod tests {
         assert!(matches!(
             tokenize_words("${name:1:3"),
             Err(LexError::UnterminatedBrace)
+        ));
+    }
+
+    #[test]
+    fn brace_substring_empty_operand_is_lex_error() {
+        // `${var:}` — colon followed immediately by close brace has no
+        // semantic meaning; reject at lex time rather than letting a
+        // confusing arithmetic error fire later.
+        assert!(matches!(
+            tokenize_words("${name:}"),
+            Err(LexError::InvalidBraceModifier(s)) if s == ":"
         ));
     }
 }
