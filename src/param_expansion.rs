@@ -1,6 +1,6 @@
 //! Parameter-expansion modifier evaluation (`${var:-w}`, `${#var}`, etc.).
 
-use crate::lexer::{ParamModifier, Word};
+use crate::lexer::{ParamModifier, SubstAnchor, Word};
 use crate::shell_state::Shell;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,6 +75,12 @@ pub fn expand_modifier(
             let p = expand_word_to_string(pattern, shell);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest))
         }
+        ParamModifier::Substitute { pattern, replacement, anchor, all } => {
+            let v = shell.get(name).unwrap_or("").to_string();
+            let pat = expand_word_to_string(pattern, shell);
+            let rep = expand_word_to_string(replacement, shell);
+            ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
+        }
     }
 }
 
@@ -146,6 +152,112 @@ fn remove_suffix(value: &str, pattern: &str, longest: bool) -> String {
         }
     }
     value.to_string()
+}
+
+fn substitute(
+    value: &str,
+    pattern: &str,
+    replacement: &str,
+    anchor: SubstAnchor,
+    all: bool,
+) -> String {
+    // Bash treats an empty pattern as a no-op (`${var//}` → `$var`).
+    if pattern.is_empty() {
+        return value.to_string();
+    }
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    let pat = match glob::Pattern::new(pattern) {
+        Ok(p) => p,
+        Err(_) => return value.to_string(),
+    };
+    let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(value.len());
+
+    // Longest match at `start`: largest `end` (from boundaries) > start
+    // such that value[start..end] matches. Returns None if no end works.
+    // For empty-pattern callers this can return Some(start) (empty match).
+    let longest_match_at = |start: usize| -> Option<usize> {
+        // `boundaries` is ascending, so iter().rev() yields descending —
+        // once we drop below `start`, every remaining entry is also below.
+        for &end in boundaries.iter().rev() {
+            if end < start { break; }
+            if pat.matches_with(&value[start..end], opts) {
+                return Some(end);
+            }
+        }
+        None
+    };
+
+    match anchor {
+        SubstAnchor::Prefix => {
+            // Only try at index 0; longest match wins.
+            if let Some(end) = longest_match_at(0) {
+                let mut out = String::with_capacity(replacement.len() + value.len() - end);
+                out.push_str(replacement);
+                out.push_str(&value[end..]);
+                out
+            } else {
+                value.to_string()
+            }
+        }
+        SubstAnchor::Suffix => {
+            // Smallest start such that value[start..] matches → longest
+            // suffix match.
+            for &start in &boundaries {
+                if pat.matches_with(&value[start..], opts) {
+                    let mut out = String::with_capacity(start + replacement.len());
+                    out.push_str(&value[..start]);
+                    out.push_str(replacement);
+                    return out;
+                }
+            }
+            value.to_string()
+        }
+        SubstAnchor::None => {
+            let mut out = String::new();
+            let mut cursor = 0;
+            let mut bi = 0; // index into boundaries
+            while bi < boundaries.len() {
+                let start = boundaries[bi];
+                if start < cursor {
+                    bi += 1;
+                    continue;
+                }
+                if let Some(end) = longest_match_at(start) {
+                    if end == start && start == value.len() {
+                        // Trailing empty match (e.g. `*` against the slot
+                        // after the last char). Nothing left to substitute;
+                        // matching bash, no extra replacement is emitted.
+                        break;
+                    }
+                    out.push_str(&value[cursor..start]);
+                    out.push_str(replacement);
+                    if end == start {
+                        // Empty match mid-string: advance one char so we
+                        // don't re-enter at the same position.
+                        let next = boundaries.iter().copied().find(|&b| b > start).unwrap_or(value.len());
+                        out.push_str(&value[start..next]);
+                        cursor = next;
+                        bi += 1;
+                    } else {
+                        cursor = end;
+                    }
+                    if !all {
+                        out.push_str(&value[cursor..]);
+                        return out;
+                    }
+                } else {
+                    bi += 1;
+                }
+            }
+            out.push_str(&value[cursor..]);
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -408,5 +520,154 @@ mod tests {
         let m = ParamModifier::RemovePrefix { pattern: lit("*"), longest: true };
         let r = expand_modifier("HUCK_TEST_PE_UNSET_RP", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn substitute_first_match_unanchored() {
+        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, false), "fXobar");
+    }
+
+    #[test]
+    fn substitute_all_unanchored() {
+        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, true), "fXXbar");
+    }
+
+    #[test]
+    fn substitute_first_unanchored_no_match_returns_value() {
+        assert_eq!(substitute("foobar", "z", "X", SubstAnchor::None, false), "foobar");
+    }
+
+    #[test]
+    fn substitute_all_with_empty_replacement_removes() {
+        assert_eq!(substitute("aaa", "a", "", SubstAnchor::None, true), "");
+    }
+
+    #[test]
+    fn substitute_anchored_prefix_hit() {
+        assert_eq!(substitute("hello", "he", "HI", SubstAnchor::Prefix, false), "HIllo");
+    }
+
+    #[test]
+    fn substitute_anchored_prefix_miss() {
+        assert_eq!(substitute("hello", "xo", "HI", SubstAnchor::Prefix, false), "hello");
+    }
+
+    #[test]
+    fn substitute_anchored_suffix_hit() {
+        assert_eq!(substitute("hello", "lo", "LO", SubstAnchor::Suffix, false), "helLO");
+    }
+
+    #[test]
+    fn substitute_anchored_suffix_miss() {
+        assert_eq!(substitute("hello", "xo", "LO", SubstAnchor::Suffix, false), "hello");
+    }
+
+    #[test]
+    fn substitute_glob_star_longest_match() {
+        // `*` matches the whole tail at i=0; with all=true, the second pass
+        // starts past the replacement and finds nothing more.
+        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true), "Q");
+    }
+
+    #[test]
+    fn substitute_glob_question_mark() {
+        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, false), "Xbc");
+        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, true), "XXX");
+    }
+
+    #[test]
+    fn substitute_unicode_boundaries() {
+        assert_eq!(substitute("café", "é", "E", SubstAnchor::None, false), "cafE");
+    }
+
+    #[test]
+    fn substitute_invalid_glob_returns_value_unchanged() {
+        assert_eq!(substitute("hello", "[abc", "X", SubstAnchor::None, false), "hello");
+    }
+
+    #[test]
+    fn substitute_empty_value_returns_empty() {
+        assert_eq!(substitute("", "foo", "bar", SubstAnchor::None, true), "");
+    }
+
+    #[test]
+    fn substitute_empty_pattern_is_noop_first() {
+        // Bash: empty pattern is a no-op for both /first and //all.
+        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, false), "abc");
+    }
+
+    #[test]
+    fn substitute_empty_pattern_is_noop_all() {
+        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, true), "abc");
+    }
+
+    #[test]
+    fn substitute_glob_star_all_replaces_once_no_trailing_empty_match() {
+        // `*` matches the whole string at i=0; after the replacement,
+        // the empty-match guard must not emit a second replacement at
+        // the trailing position.
+        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true), "Q");
+    }
+
+    #[test]
+    fn substitute_glob_star_with_prefix_match_advances_past_match() {
+        // `f*` against "foo bar foo" — greedy, all-mode still only one
+        // replacement (matches whole tail from first `f`).
+        assert_eq!(substitute("foo bar foo", "f*", "X", SubstAnchor::None, true), "X");
+    }
+
+    #[test]
+    fn expand_modifier_substitute_first_match() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU1", "foobar".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("fXobar".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_all() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU2", "foobar".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: true,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU2", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("fXXbar".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_unset_var_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::Substitute {
+            pattern: lit("o"),
+            replacement: lit("X"),
+            anchor: SubstAnchor::None,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU_UNSET", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_substitute_anchored_prefix() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_SU3", "hello".to_string());
+        let m = ParamModifier::Substitute {
+            pattern: lit("he"),
+            replacement: lit("HI"),
+            anchor: SubstAnchor::Prefix,
+            all: false,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_SU3", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("HIllo".to_string()));
     }
 }
