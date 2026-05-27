@@ -319,6 +319,9 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
         } else {
             expand_assignment(&Word(vec![part.clone()]), shell)
         };
+        if shell.pending_fatal_pe_error.is_some() {
+            return result;
+        }
         if word_part_is_quoted(part) {
             result.push_str(&glob::Pattern::escape(&text));
         } else {

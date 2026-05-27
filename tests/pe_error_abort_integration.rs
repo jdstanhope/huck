@@ -100,3 +100,24 @@ fn error_if_unset_inside_subshell_does_not_kill_parent() {
     let (out, _err, _) = run("(${X:?missing})\necho after\nexit\n");
     assert!(out.lines().any(|l| l == "after"), "stdout: {out}");
 }
+
+#[test]
+fn error_if_unset_in_case_pattern_aborts() {
+    // The case pattern contains ${X:?missing}. The expansion fires fatal;
+    // the case statement should not execute any arm body, and subsequent
+    // commands should not run.
+    let (out, _err, status) = run("case foo in\n${X:?missing}) echo matched;;\nesac\necho after\n");
+    assert!(!out.lines().any(|l| l == "matched"), "stdout should not have 'matched': {out}");
+    assert!(!out.lines().any(|l| l == "after"), "stdout should not have 'after': {out}");
+    assert_eq!(status.code(), Some(1));
+}
+
+#[test]
+fn error_if_unset_in_redirect_target_aborts() {
+    // The redirect target contains ${X:?missing}. The command should
+    // not fork — no file created, no command runs, exit before `echo after`.
+    let (out, _err, status) = run("echo hello > ${X:?missing}\necho after\n");
+    assert!(!out.lines().any(|l| l == "hello"), "stdout should not have 'hello': {out}");
+    assert!(!out.lines().any(|l| l == "after"), "stdout should not have 'after': {out}");
+    assert_eq!(status.code(), Some(1));
+}
