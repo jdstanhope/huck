@@ -133,9 +133,14 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                     }.map_err(|e| format!("install signal handler: {e}"))?
                 }
                 None => {
-                    // SIG_IGN — register an empty closure (effectively
-                    // ignoring the signal, since the closure does
-                    // nothing).
+                    // `trap "" SIGNAL` (ignore form): register an empty closure that
+                    // does nothing when the signal fires. NOTE: this is NOT the same
+                    // as POSIX SIG_IGN — custom handlers are reset to SIG_DFL at exec,
+                    // so `trap '' PIPE; cmd | head` does NOT propagate SIG_IGN to the
+                    // child `cmd` the way bash does. Tracked as a known gap in M-22's
+                    // "Out of scope" note in docs/bash-divergences.md. True SIG_IGN
+                    // would require libc::sigaction with SIG_IGN action + tracking
+                    // trap-installed-ignores separately from startup-ignored signals.
                     unsafe {
                         signal_hook::low_level::register(signum, || {})
                     }.map_err(|e| format!("install signal handler: {e}"))?
