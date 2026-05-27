@@ -85,19 +85,16 @@ pub fn fire_exit_trap(shell: &mut Shell) {
 /// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
 /// NOT removed after firing (unlike EXIT). Respects the recursion
 /// guard via `Shell::firing_trap`.
-#[allow(dead_code)]  // used by executor; remove in Task 3
 pub fn fire_err_trap(shell: &mut Shell) {
     fire_pseudo_trap(shell, TrapSignal::Err);
 }
 
 /// Fires the DEBUG pseudo-signal trap. Repeatable; recursion-guarded.
-#[allow(dead_code)]  // used by executor; remove in Task 3
 pub fn fire_debug_trap(shell: &mut Shell) {
     fire_pseudo_trap(shell, TrapSignal::Debug);
 }
 
 /// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
-#[allow(dead_code)]  // used by executor; remove in Task 3
 pub fn fire_return_trap(shell: &mut Shell) {
     fire_pseudo_trap(shell, TrapSignal::Return);
 }
@@ -107,7 +104,6 @@ pub fn fire_return_trap(shell: &mut Shell) {
 /// Looks up the action via `traps.get` (NOT remove), executes via
 /// `process_line`. Save-and-restore of `firing_trap` allows different
 /// pseudo-signals to nest (e.g. a DEBUG action that triggers ERR).
-#[allow(dead_code)]  // used by executor; remove in Task 3
 fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
     if shell.firing_trap == Some(sig) {
         return;
