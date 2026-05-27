@@ -1063,34 +1063,88 @@ fn read_braced_param_expansion(
                 break;
             }
         }
-        if chars.next() != Some('}') {
-            return Err(LexError::UnterminatedBrace);
-        }
-        parts.push(WordPart::Var { name, quoted });
-        return Ok(());
+        return dispatch_braced_modifier(name, quoted, chars, parts);
     }
 
     let name = read_braced_name(chars)?;
     if name.is_empty() {
         return Err(LexError::EmptyParamName);
     }
+    dispatch_braced_modifier(name, quoted, chars, parts)
+}
 
+/// Reads identifier chars (the parameter name) inside a `${...}` until it
+/// hits a non-identifier char. Does NOT consume the terminator.
+fn read_braced_name(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut name = String::new();
+    while let Some(&c) = chars.peek() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            if name.is_empty() && c.is_ascii_digit() {
+                return Err(LexError::InvalidVarName);
+            }
+            name.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    Ok(name)
+}
+
+/// Dispatches a `${name<modifier>...}` form once `name` has been read. The
+/// next char to read from `chars` is whatever follows the name (typically
+/// `}`, `:`, `-`, `=`, `?`, `+`, `#`, `%`, or `/`). Pushes a single
+/// `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
+fn dispatch_braced_modifier(
+    name: String,
+    quoted: bool,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    parts: &mut Vec<WordPart>,
+) -> Result<(), LexError> {
     match chars.next() {
         Some('}') => {
             parts.push(WordPart::Var { name, quoted });
             Ok(())
         }
         Some(':') => {
-            let modifier = match chars.next() {
-                Some('-') => modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?,
-                Some('=') => modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?,
-                Some('?') => modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?,
-                Some('+') => modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?,
-                Some(c) => return Err(LexError::InvalidBraceModifier(format!(":{c}"))),
-                None => return Err(LexError::UnterminatedBrace),
-            };
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
-            Ok(())
+            match chars.peek().copied() {
+                Some('-') => {
+                    chars.next();
+                    let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?;
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    Ok(())
+                }
+                Some('=') => {
+                    chars.next();
+                    let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    Ok(())
+                }
+                Some('?') => {
+                    chars.next();
+                    let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    Ok(())
+                }
+                Some('+') => {
+                    chars.next();
+                    let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    Ok(())
+                }
+                Some(_) => {
+                    let (offset, length) = scan_substring_operands(chars)?;
+                    parts.push(WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::Substring { offset, length },
+                        quoted,
+                    });
+                    Ok(())
+                }
+                None => Err(LexError::UnterminatedBrace),
+            }
         }
         Some('-') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: false })?;
@@ -1145,26 +1199,6 @@ fn read_braced_param_expansion(
         Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
         None => Err(LexError::UnterminatedBrace),
     }
-}
-
-/// Reads identifier chars (the parameter name) inside a `${...}` until it
-/// hits a non-identifier char. Does NOT consume the terminator.
-fn read_braced_name(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<String, LexError> {
-    let mut name = String::new();
-    while let Some(&c) = chars.peek() {
-        if c == '_' || c.is_ascii_alphanumeric() {
-            if name.is_empty() && c.is_ascii_digit() {
-                return Err(LexError::InvalidVarName);
-            }
-            name.push(c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    Ok(name)
 }
 
 /// Scans the operand text until the matching `}` and parses it as a single
@@ -1254,6 +1288,100 @@ fn split_substitution_body(body: &str) -> (String, String) {
         }
     }
     (pattern, replacement)
+}
+
+/// Walks the chars iterator from just after the leading `:` of a substring
+/// operand. Delegates to `scan_braced_operand` to collect the raw body
+/// (which depth-tracks nested `${...}` and protects `}` inside quoted
+/// spans), then splits on the first unescaped `:` at brace-depth zero
+/// outside any quoted span. Returns `(offset_word, Some(length_word))` if a
+/// delimiter was found, or `(offset_word, None)` if no `:` appeared in the
+/// body. Escapes follow the same rules as `split_substitution_body`:
+/// `\:` is reserved for a literal colon, `\\` is a literal backslash,
+/// any other `\x` passes through unchanged.
+fn scan_substring_operands(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(Word, Option<Word>), LexError> {
+    let body = scan_braced_operand(chars)?;
+    let (offset_src, length_src) = split_substring_body(&body);
+    // Preserve any leading whitespace in the offset (e.g. `${name: -3}`) as a
+    // literal space part so that arithmetic evaluation sees ` -3` (which is
+    // equivalent to `-3` but the space is the syntactic disambiguation signal
+    // that distinguishes it from `:-` UseDefault).
+    let offset = {
+        let leading: String = offset_src.chars().take_while(|c| c.is_whitespace()).collect();
+        let mut w = parse_braced_operand(&offset_src)?;
+        if !leading.is_empty() {
+            w.0.insert(0, WordPart::Literal { text: leading, quoted: false });
+        }
+        w
+    };
+    let length = match length_src {
+        Some(s) => Some(parse_braced_operand(&s)?),
+        None => None,
+    };
+    Ok((offset, length))
+}
+
+/// Splits a substring-operand body (as returned by `scan_braced_operand`)
+/// on the first unescaped `:` that sits at brace-depth zero outside any
+/// quoted span. Returns `(offset_src, Some(length_src))` if a delimiter
+/// was found, or `(offset_src, None)` otherwise (the no-length form).
+fn split_substring_body(body: &str) -> (String, Option<String>) {
+    let mut offset = String::new();
+    let mut length = String::new();
+    let mut delim_seen = false;
+    let mut depth: u32 = 0;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let lit = match chars.peek().copied() {
+                    Some(':') => { chars.next(); ':' }
+                    Some('\\') => { chars.next(); '\\' }
+                    _ => '\\',
+                };
+                if delim_seen { length.push(lit); } else { offset.push(lit); }
+            }
+            '"' => {
+                let dst = if delim_seen { &mut length } else { &mut offset };
+                dst.push('"');
+                while let Some(qc) = chars.next() {
+                    dst.push(qc);
+                    if qc == '\\' {
+                        if let Some(nc) = chars.next() { dst.push(nc); }
+                    } else if qc == '"' {
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                let dst = if delim_seen { &mut length } else { &mut offset };
+                dst.push('\'');
+                for qc in chars.by_ref() {
+                    dst.push(qc);
+                    if qc == '\'' { break; }
+                }
+            }
+            '{' => {
+                depth += 1;
+                if delim_seen { length.push('{'); } else { offset.push('{'); }
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if delim_seen { length.push('}'); } else { offset.push('}'); }
+            }
+            ':' if depth == 0 && !delim_seen => { delim_seen = true; }
+            _ => {
+                if delim_seen { length.push(c); } else { offset.push(c); }
+            }
+        }
+    }
+    if delim_seen {
+        (offset, Some(length))
+    } else {
+        (offset, None)
+    }
 }
 
 fn is_name_start(c: char) -> bool {
@@ -2038,8 +2166,9 @@ mod tests {
     #[test]
     fn tokenize_braced_var_invalid_name() {
         // ${1foo}: digits are consumed as a positional name, then `f` is
-        // found where `}` is expected → UnterminatedBrace (v22 Task 4).
-        assert_eq!(tokenize("${1foo}").unwrap_err(), LexError::UnterminatedBrace);
+        // found which is not a valid modifier → InvalidBraceModifier (v33:
+        // digit branch now routes through dispatch_braced_modifier).
+        assert!(matches!(tokenize("${1foo}").unwrap_err(), LexError::InvalidBraceModifier(_)));
     }
 
     #[test]
@@ -2234,13 +2363,13 @@ mod tests {
 
     #[test]
     fn tokenize_command_sub_inner_lex_error() {
-        // `${1foo}` inside a substitution → UnterminatedBrace (v22 Task 4:
-        // digits are consumed as positional name; `f` found where `}` expected),
-        // wrapped in Substitution.
+        // `${1foo}` inside a substitution → InvalidBraceModifier (v33:
+        // digit branch routes through dispatch_braced_modifier; `f` is not
+        // a valid modifier), wrapped in Substitution.
         let err = tokenize("$(echo ${1foo})").unwrap_err();
         match err {
             LexError::Substitution(inner) => {
-                assert_eq!(*inner, LexError::UnterminatedBrace);
+                assert!(matches!(*inner, LexError::InvalidBraceModifier(_)));
             }
             other => panic!("expected Substitution, got {other:?}"),
         }
@@ -2999,8 +3128,11 @@ mod tests {
 
     #[test]
     fn tokenize_invalid_modifier_errors() {
+        // ${X:&Y}: `:` followed by `&` — `&` is not `-=?+` so falls through
+        // to substring dispatch; `&` inside the brace operand is an operator
+        // → InvalidBraceOperand (v33: replaced by substring fall-through).
         let err = tokenize("${X:&Y}").unwrap_err();
-        assert!(matches!(err, LexError::InvalidBraceModifier(_)));
+        assert!(matches!(err, LexError::InvalidBraceOperand | LexError::Substitution(_)));
     }
 
     #[test]
@@ -3711,5 +3843,89 @@ mod tests {
         // The whole thing is one word token (the lexer has no special-casing for [[ )].
         assert_eq!(tokens.len(), 1, "expected 1 word token, got {:?}", tokens);
         assert!(matches!(&tokens[0], Token::Word(_)), "expected Word, got {:?}", tokens[0]);
+    }
+
+    #[test]
+    fn brace_substring_simple() {
+        let mut t = tokenize_words("${name:1}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, quoted } = part {
+            assert_eq!(name, "name");
+            assert!(!quoted);
+            assert_eq!(word_to_literal(&offset), "1");
+            assert!(length.is_none());
+        } else { panic!("expected Substring") }
+    }
+
+    #[test]
+    fn brace_substring_with_length() {
+        let mut t = tokenize_words("${name:1:3}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, length }, .. } = part {
+            assert_eq!(word_to_literal(&offset), "1");
+            assert_eq!(word_to_literal(&length.expect("length")), "3");
+        } else { panic!("expected Substring") }
+    }
+
+    #[test]
+    fn brace_substring_negative_offset_with_space() {
+        // `${name: -3}` — the space disambiguates from `:-` (UseDefault).
+        let mut t = tokenize_words("${name: -3}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, .. }, .. } = part {
+            assert_eq!(word_to_literal(&offset), " -3");
+        } else { panic!("expected Substring, got {part:?}") }
+    }
+
+    #[test]
+    fn brace_substring_no_space_is_use_default_regression() {
+        // `${name:-3}` — no space, so this MUST remain UseDefault with default "3".
+        let mut t = tokenize_words("${name:-3}").unwrap();
+        let part = single_param_expansion(&mut t);
+        assert!(
+            matches!(part, WordPart::ParamExpansion { modifier: ParamModifier::UseDefault { colon: true, .. }, .. }),
+            "expected UseDefault, got {part:?}",
+        );
+    }
+
+    #[test]
+    fn brace_substring_positional() {
+        // `${1:0:3}` — must emit ParamExpansion (not Var) so the modifier runs.
+        let mut t = tokenize_words("${1:0:3}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, .. } = part {
+            assert_eq!(name, "1");
+            assert_eq!(word_to_literal(&offset), "0");
+            assert_eq!(word_to_literal(&length.expect("length")), "3");
+        } else { panic!("expected Substring on positional, got {part:?}") }
+    }
+
+    #[test]
+    fn brace_substring_nested_braced_var_in_operand() {
+        // The depth-aware split must not break on the inner `${start}`'s `}`.
+        let mut t = tokenize_words("${name:${start}:${len}}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, length }, .. } = part {
+            // Offset word should contain a Var part for `start`.
+            let Word(off_parts) = &offset;
+            assert!(
+                off_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "start")),
+                "expected Var(start) in offset, got {off_parts:?}",
+            );
+            // Length word should contain a Var part for `len`.
+            let Word(len_parts) = length.as_ref().expect("length");
+            assert!(
+                len_parts.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "len")),
+                "expected Var(len) in length, got {len_parts:?}",
+            );
+        } else { panic!("expected Substring") }
+    }
+
+    #[test]
+    fn brace_substring_unterminated_is_error() {
+        assert!(matches!(
+            tokenize_words("${name:1:3"),
+            Err(LexError::UnterminatedBrace)
+        ));
     }
 }
