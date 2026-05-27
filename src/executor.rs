@@ -1352,6 +1352,17 @@ fn call_function(
     shell.positional_args = args;
     shell.function_arg0.push(name.to_string());
     let result = run_command(&body, shell, sink);
+    // RETURN trap fires with $? set to the function's status AND the
+    // function's positional args still in scope. After the action runs,
+    // restore the caller's frame.
+    let status_for_trap = match &result {
+        ExecOutcome::FunctionReturn(n) => *n,
+        ExecOutcome::Continue(c) => *c,
+        // Exit/LoopBreak/LoopContinue propagate up; keep $? as-is.
+        _ => shell.last_status(),
+    };
+    shell.set_last_status(status_for_trap);
+    crate::traps::fire_return_trap(shell);
     shell.function_arg0.pop();
     shell.positional_args = saved;
     match result {
@@ -1361,6 +1372,7 @@ fn call_function(
 }
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    crate::traps::fire_debug_trap(shell);
     let resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),

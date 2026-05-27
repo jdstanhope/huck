@@ -73,7 +73,6 @@ pub struct Shell {
     /// suppress re-firing of the SAME trap from within its own action.
     /// Different signals do NOT cross-suppress (a DEBUG action that
     /// triggers ERR still fires ERR).
-    #[allow(dead_code)]  // used by traps module + executor; remove in Task 3
     pub firing_trap: Option<crate::traps::TrapSignal>,
 
     /// Depth counter for ERR-suppression contexts (if/elif/while/until
