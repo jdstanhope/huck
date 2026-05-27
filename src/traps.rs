@@ -107,7 +107,6 @@ pub fn clear_for_subshell(shell: &mut Shell) {
 ///
 /// Returns `Err(msg)` if `sig` was ignored at shell startup (POSIX
 /// "Signals ignored upon entry to the shell cannot be trapped").
-#[allow(dead_code)]  // called by builtin_trap in Task 4
 pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Result<(), String> {
     match sig {
         TrapSignal::Exit => {
@@ -159,7 +158,6 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
 /// — signal-hook's existing SIGINT/SIGCHLD handlers (installed by
 /// `shell::install_sigint_handler` etc.) are unaffected because they
 /// were registered separately and have their own SigIds.
-#[allow(dead_code)]  // called by builtin_trap in Task 4
 pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
     match sig {
         TrapSignal::Exit => {
@@ -180,7 +178,6 @@ pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]  // used by traps module + builtins; remove in Task 5
 pub enum TrapSignal {
     Exit,
     Real(i32),
@@ -208,7 +205,6 @@ const TRAPPABLE: &[(&str, i32)] = &[
 ];
 
 /// Returns the trappable signal table (name → signal-number pairs).
-#[allow(dead_code)]  // used by builtins; remove in Task 5
 pub fn name_table() -> &'static [(&'static str, i32)] {
     TRAPPABLE
 }
@@ -219,7 +215,6 @@ pub fn name_table() -> &'static [(&'static str, i32)] {
 /// - Same dual-form for every trappable signal.
 ///
 /// Returns an error for `KILL`/`STOP`/unknown names/non-trappable numbers.
-#[allow(dead_code)]  // used by builtins + tests; remove in Task 5
 pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     // EXIT pseudo-signal (case-sensitive to match bash).
     if name == "EXIT" {

@@ -18,7 +18,7 @@ pub enum ExecOutcome {
 pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
-    "break", "continue", "return",
+    "break", "continue", "return", "trap",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -31,7 +31,7 @@ pub fn is_builtin(name: &str) -> bool {
 /// existing builtins intersected with the POSIX special list; expand here as
 /// huck adds `set`/`shift`/`trap`/`eval`/`exec`/`:`/`readonly`/`.`.
 pub fn is_special_builtin(name: &str) -> bool {
-    matches!(name, "break" | "continue" | "exit" | "export" | "return" | "unset")
+    matches!(name, "break" | "continue" | "exit" | "export" | "return" | "trap" | "unset")
 }
 
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
@@ -57,6 +57,7 @@ pub fn run_builtin(
         "kill" => builtin_kill(args, shell),
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
+        "trap" => builtin_trap(args, out, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -761,6 +762,161 @@ fn builtin_history(
     }
 }
 
+fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    use crate::traps::{TrapSignal, install, reset, parse_trap_signal};
+
+    // No args: same as `trap -p`.
+    if args.is_empty() {
+        print_active_traps(out, shell, None);
+        return ExecOutcome::Continue(0);
+    }
+
+    // -l: list signal name/number pairs.
+    if args[0] == "-l" {
+        if args.len() != 1 {
+            eprintln!("huck: trap: -l takes no arguments");
+            return ExecOutcome::Continue(1);
+        }
+        print_signal_table(out);
+        return ExecOutcome::Continue(0);
+    }
+
+    // -p [SIGNAL...]: list active traps (optionally filtered).
+    if args[0] == "-p" {
+        if args.len() == 1 {
+            print_active_traps(out, shell, None);
+            return ExecOutcome::Continue(0);
+        }
+        let mut filter: Vec<TrapSignal> = Vec::new();
+        for name in &args[1..] {
+            match parse_trap_signal(name) {
+                Ok(sig) => filter.push(sig),
+                Err(msg) => {
+                    eprintln!("huck: trap: {msg}");
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
+        print_active_traps(out, shell, Some(&filter));
+        return ExecOutcome::Continue(0);
+    }
+
+    // `trap - SIGNAL...`: reset each signal.
+    if args[0] == "-" {
+        if args.len() < 2 {
+            eprintln!("huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+            return ExecOutcome::Continue(1);
+        }
+        for name in &args[1..] {
+            let sig = match parse_trap_signal(name) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("huck: trap: {msg}");
+                    return ExecOutcome::Continue(1);
+                }
+            };
+            if let Err(msg) = reset(shell, sig) {
+                eprintln!("huck: trap: {msg}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    // `trap ACTION SIGNAL...`: install action for each signal.
+    if args.len() < 2 {
+        eprintln!("huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        return ExecOutcome::Continue(1);
+    }
+    let action_text = args[0].clone();
+    let action = if action_text.is_empty() {
+        None  // empty string → ignore
+    } else {
+        Some(action_text)
+    };
+    for name in &args[1..] {
+        let sig = match parse_trap_signal(name) {
+            Ok(s) => s,
+            Err(msg) => {
+                eprintln!("huck: trap: {msg}");
+                return ExecOutcome::Continue(1);
+            }
+        };
+        if let Err(msg) = install(shell, sig, action.clone()) {
+            eprintln!("huck: trap: {msg}");
+            return ExecOutcome::Continue(1);
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
+/// Prints active traps in re-readable form. If `filter` is `Some`, only
+/// the listed signals are printed; if `None`, all active traps print.
+/// Bash sorts by signal number, with EXIT printed first.
+fn print_active_traps(
+    out: &mut dyn Write,
+    shell: &Shell,
+    filter: Option<&[crate::traps::TrapSignal]>,
+) {
+    use crate::traps::TrapSignal;
+
+    // Collect entries in (sort-key, signal, action) form. EXIT sorts
+    // first (key 0); real signals sort by signal number.
+    let mut entries: Vec<(i32, TrapSignal, &Option<String>)> = Vec::new();
+    for (sig, action) in &shell.traps {
+        if let Some(f) = filter
+            && !f.contains(sig)
+        {
+            continue;
+        }
+        let key = match sig {
+            TrapSignal::Exit => 0,
+            TrapSignal::Real(n) => *n,
+        };
+        entries.push((key, *sig, action));
+    }
+    entries.sort_by_key(|(k, _, _)| *k);
+
+    for (_, sig, action) in entries {
+        let name = match sig {
+            TrapSignal::Exit => "EXIT".to_string(),
+            TrapSignal::Real(n) => signal_number_to_name(n).unwrap_or_else(|| n.to_string()),
+        };
+        let text = action.as_deref().unwrap_or("");
+        // Escape single quotes in action text via the standard bash
+        // shell-quote idiom: ' → '\''
+        let escaped = text.replace('\'', "'\\''");
+        let _ = writeln!(out, "trap -- '{escaped}' {name}");
+    }
+}
+
+/// Prints the trappable signal table in bash's 4-column format:
+///   1) HUP   2) INT   3) QUIT  10) USR1
+fn print_signal_table(out: &mut dyn Write) {
+    use crate::traps::name_table;
+    let table = name_table();
+    // Sort by signal number for the listing.
+    let mut sorted: Vec<&(&str, i32)> = table.iter().collect();
+    sorted.sort_by_key(|(_, n)| *n);
+    let cols = 4;
+    for chunk in sorted.chunks(cols) {
+        let mut line = String::new();
+        for (i, (name, num)) in chunk.iter().enumerate() {
+            if i > 0 { line.push(' '); }
+            line.push_str(&format!("{num:>2}) {name:<5}"));
+        }
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// Returns the canonical name (no SIG prefix) for `signum`, or None
+/// if `signum` is not in the trappable table.
+fn signal_number_to_name(signum: i32) -> Option<String> {
+    crate::traps::name_table().iter().find_map(|(name, n)| {
+        if *n == signum { Some(name.to_string()) } else { None }
+    })
+}
+
 fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
     let eval_args: &[String] = if name == "[" {
         match args.last() {
@@ -1218,6 +1374,169 @@ mod tests {
             run_builtin("return", &["not-a-num".to_string()], &mut out, &mut shell),
             ExecOutcome::FunctionReturn(13)
         );
+    }
+
+    #[test]
+    fn is_builtin_trap() {
+        assert!(is_builtin("trap"));
+    }
+
+    #[test]
+    fn is_special_builtin_trap() {
+        assert!(is_special_builtin("trap"));
+    }
+
+    #[test]
+    fn trap_exit_action_signal_registers() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["echo bye".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(shell.traps.contains_key(&crate::traps::TrapSignal::Exit));
+    }
+
+    #[test]
+    fn trap_empty_action_ignores_signal() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(
+            shell.traps.get(&crate::traps::TrapSignal::Exit),
+            Some(&None),  // None = ignore
+        );
+    }
+
+    #[test]
+    fn trap_dash_resets_signal() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        // Install first.
+        let _ = run_builtin(
+            "trap",
+            &["echo bye".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        // Then reset.
+        let outcome = run_builtin(
+            "trap",
+            &["-".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(!shell.traps.contains_key(&crate::traps::TrapSignal::Exit));
+    }
+
+    #[test]
+    fn trap_p_prints_active_traps_in_re_readable_form() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        // Register a trap.
+        let _ = run_builtin(
+            "trap",
+            &["echo bye".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        // Clear the buffer (the install printed nothing, but be defensive).
+        buf.clear();
+        // List.
+        let outcome = run_builtin(
+            "trap",
+            &["-p".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("trap -- 'echo bye' EXIT"),
+            "expected trap -p to print 'trap -- echo bye EXIT', got: {out}"
+        );
+    }
+
+    #[test]
+    fn trap_no_args_same_as_dash_p() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = run_builtin(
+            "trap",
+            &["echo bye".to_string(), "EXIT".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        buf.clear();
+        let outcome = run_builtin("trap", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("trap -- 'echo bye' EXIT"));
+    }
+
+    #[test]
+    fn trap_l_lists_signals() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["-l".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("2) INT"), "stdout: {out}");
+        assert!(out.contains("15) TERM"), "stdout: {out}");
+    }
+
+    #[test]
+    fn trap_unknown_signal_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["echo bye".to_string(), "NOPE".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn trap_kill_signal_errors_uncatchable() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["echo nope".to_string(), "KILL".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn trap_no_signals_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "trap",
+            &["echo bye".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 }
 
