@@ -339,27 +339,97 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     ExecOutcome::Continue(0)
 }
 
-fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
-    match args.len() {
-        0 => wait_all(shell),
-        1 if args[0].starts_with('%') => {
-            let id = match resolve_spec_or_error(&args[0], "wait", shell) {
-                Ok(id) => id,
-                Err(outcome) => return outcome,
-            };
-            wait_for_job(id, shell)
-        }
-        1 => match args[0].parse::<i32>() {
-            Ok(pid) if pid > 0 => wait_for_pid(pid, shell),
-            _ => {
-                eprintln!("huck: wait: usage: wait [%job | pid]");
-                ExecOutcome::Continue(2)
+/// A single positional `wait` target. Built by `parse_wait_args` from a
+/// `%spec` (resolved to a job id) or a positive integer PID.
+enum WaitTarget {
+    Job(u32),
+    Pid(i32),
+}
+
+/// Parsed form of the `wait` argv after flag and positional separation.
+struct WaitArgs {
+    wait_any: bool,
+    pid_var: Option<String>,
+    targets: Vec<WaitTarget>,
+}
+
+/// Parses `wait`'s argv into flags + targets. Returns `Err(ExecOutcome)`
+/// on any usage / parse failure, with the appropriate stderr message
+/// already printed.
+fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutcome> {
+    let mut wait_any = false;
+    let mut pid_var: Option<String> = None;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let a = &args[idx];
+        match a.as_str() {
+            "-n" => {
+                wait_any = true;
+                idx += 1;
             }
-        },
-        _ => {
-            eprintln!("huck: wait: usage: wait [%job | pid]");
-            ExecOutcome::Continue(2)
+            "-p" => {
+                if idx + 1 >= args.len() {
+                    eprintln!("huck: wait: -p: option requires a variable name");
+                    return Err(ExecOutcome::Continue(2));
+                }
+                pid_var = Some(args[idx + 1].clone());
+                idx += 2;
+            }
+            "--" => {
+                idx += 1;
+                break;
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: wait: {s}: invalid option");
+                eprintln!("huck: wait: usage: wait [-n] [-p var] [id ...]");
+                return Err(ExecOutcome::Continue(2));
+            }
+            _ => break,
         }
+    }
+
+    if pid_var.is_some() && !wait_any {
+        eprintln!("huck: wait: -p: option requires -n");
+        return Err(ExecOutcome::Continue(2));
+    }
+
+    let mut targets = Vec::with_capacity(args.len() - idx);
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg.starts_with('%') {
+            let id = resolve_spec_or_error(arg, "wait", shell)?;
+            targets.push(WaitTarget::Job(id));
+        } else {
+            match arg.parse::<i32>() {
+                Ok(pid) if pid > 0 => targets.push(WaitTarget::Pid(pid)),
+                _ => {
+                    eprintln!("huck: wait: {arg}: not a pid or valid job spec");
+                    return Err(ExecOutcome::Continue(2));
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(WaitArgs { wait_any, pid_var, targets })
+}
+
+fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
+    let parsed = match parse_wait_args(args, shell) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
+
+    match (parsed.wait_any, parsed.targets.len()) {
+        (false, 0) => wait_all(shell),
+        (false, 1) => match &parsed.targets[0] {
+            WaitTarget::Job(id) => wait_for_job(*id, shell),
+            WaitTarget::Pid(pid) => wait_for_pid(*pid, shell),
+        },
+        (false, _) => wait_for_all(parsed.targets, shell),
+        (true, 0) => wait_any_pending(parsed.pid_var, shell),
+        (true, _) => wait_any_of(parsed.targets, parsed.pid_var, shell),
     }
 }
 
@@ -439,6 +509,187 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
         first = false;
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Multi-arg `wait` (M-38): wait sequentially for each target. Return
+/// the status of the LAST target waited.
+fn wait_for_all(targets: Vec<WaitTarget>, shell: &mut Shell) -> ExecOutcome {
+    let mut last = 0;
+    for t in targets {
+        let outcome = match t {
+            WaitTarget::Job(id) => wait_for_job(id, shell),
+            WaitTarget::Pid(pid) => wait_for_pid(pid, shell),
+        };
+        match outcome {
+            ExecOutcome::Continue(c) => last = c,
+            other => return other,
+        }
+    }
+    ExecOutcome::Continue(last)
+}
+
+/// `wait -n` with no positional args (M-37 bare). Snapshot the set of
+/// currently-Running job ids at entry, then poll until one of them
+/// transitions to `Done(c)` or `Signaled(s)`. Returns 127 immediately
+/// if no Running jobs at entry, or if all snapshotted jobs vanish from
+/// the table mid-wait. Captures the finished job's pgid into `$pid_var`
+/// when provided; on the 127 path sets `$pid_var = ""`.
+fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
+    let snapshot: Vec<u32> = shell
+        .jobs
+        .iter()
+        .filter(|j| matches!(j.state, crate::jobs::JobState::Running))
+        .map(|j| j.id)
+        .collect();
+
+    if snapshot.is_empty() {
+        if let Some(name) = &pid_var {
+            shell.set(name, String::new());
+        }
+        return ExecOutcome::Continue(127);
+    }
+
+    loop {
+        let found = shell.jobs.iter().find_map(|j| {
+            if !snapshot.contains(&j.id) {
+                return None;
+            }
+            match j.state {
+                crate::jobs::JobState::Done(c) => Some((j.pgid, c)),
+                crate::jobs::JobState::Signaled(s) => Some((j.pgid, 128 + s)),
+                _ => None,
+            }
+        });
+        if let Some((pgid, status)) = found {
+            if let Some(name) = &pid_var {
+                shell.set(name, pgid.to_string());
+            }
+            return ExecOutcome::Continue(status);
+        }
+
+        let still_present = shell
+            .jobs
+            .iter()
+            .any(|j| snapshot.contains(&j.id));
+        if !still_present {
+            if let Some(name) = &pid_var {
+                shell.set(name, String::new());
+            }
+            return ExecOutcome::Continue(127);
+        }
+
+        if check_sigint(shell) {
+            return ExecOutcome::Continue(130);
+        }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// `wait -n` with explicit target list (M-37 with subset). Returns the
+/// status of the first listed target to finish. Captures the finished
+/// PID into `$pid_var` when provided — for `WaitTarget::Job(id)` that's
+/// the job's pgid; for `WaitTarget::Pid(pid)` that's the literal PID.
+/// If at entry no target can ever finish (all unknown / not children),
+/// returns 127 with `$pid_var = ""`.
+fn wait_any_of(
+    targets: Vec<WaitTarget>,
+    pid_var: Option<String>,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    if let Some((pid, status)) = check_targets_terminal(&targets, shell) {
+        if let Some(name) = &pid_var {
+            shell.set(name, pid.to_string());
+        }
+        return ExecOutcome::Continue(status);
+    }
+
+    let any_active = targets.iter().any(|t| match t {
+        WaitTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
+        WaitTarget::Pid(pid) => {
+            let mut s: libc::c_int = 0;
+            let r = unsafe { libc::waitpid(*pid, &mut s, libc::WNOHANG | libc::WUNTRACED) };
+            if r > 0 {
+                shell.jobs.reap(r, s);
+                true
+            } else {
+                r == 0
+            }
+        }
+    });
+    if !any_active {
+        if let Some(name) = &pid_var {
+            shell.set(name, String::new());
+        }
+        return ExecOutcome::Continue(127);
+    }
+
+    if let Some((pid, status)) = check_targets_terminal(&targets, shell) {
+        if let Some(name) = &pid_var {
+            shell.set(name, pid.to_string());
+        }
+        return ExecOutcome::Continue(status);
+    }
+
+    loop {
+        if check_sigint(shell) {
+            return ExecOutcome::Continue(130);
+        }
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if r > 0 {
+            shell.jobs.reap(r, status);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        if let Some((pid, st)) = check_targets_terminal(&targets, shell) {
+            if let Some(name) = &pid_var {
+                shell.set(name, pid.to_string());
+            }
+            return ExecOutcome::Continue(st);
+        }
+    }
+}
+
+/// Returns `(captured_pid, exit_status)` for the first target that is
+/// currently terminal, or `None`.
+///
+/// For `WaitTarget::Job(id)` the captured pid is the job's `pgid`. For
+/// `WaitTarget::Pid(pid)` the captured pid is the literal PID arg.
+fn check_targets_terminal(targets: &[WaitTarget], shell: &Shell) -> Option<(i32, i32)> {
+    for t in targets {
+        match t {
+            WaitTarget::Job(id) => {
+                if let Some(job) = shell.jobs.iter().find(|j| j.id == *id) {
+                    match job.state {
+                        crate::jobs::JobState::Done(c) => return Some((job.pgid, c)),
+                        crate::jobs::JobState::Signaled(s) => {
+                            return Some((job.pgid, 128 + s))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WaitTarget::Pid(pid) => {
+                if let Some(job) = shell.jobs.iter().find(|j| j.pids.contains(pid)) {
+                    match job.state {
+                        crate::jobs::JobState::Done(c) => return Some((*pid, c)),
+                        crate::jobs::JobState::Signaled(s) => {
+                            return Some((*pid, 128 + s))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn check_sigint(shell: &Shell) -> bool {
@@ -1691,12 +1942,13 @@ mod fg_bg_tests {
     }
 
     #[test]
-    fn wait_with_multiple_args_returns_usage_status_2() {
+    fn wait_multiarg_unparseable_returns_usage_status_2() {
+        // Multi-arg wait is now valid; only bad arg syntax should usage-error.
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin(
             "wait",
-            &["%1".to_string(), "%2".to_string()],
+            &["1234".to_string(), "abc".to_string()],
             &mut buf,
             &mut shell,
         );
@@ -1729,6 +1981,120 @@ mod fg_bg_tests {
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn wait_multiarg_two_done_returns_last_status() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("true".to_string(), 0);
+        shell.jobs.add_synthetic_done("exit 5".to_string(), 5);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(5)));
+    }
+
+    #[test]
+    fn wait_multiarg_unparseable_rejects_before_waiting() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("true".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["%1".to_string(), "abc".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_n_with_no_jobs_returns_127() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(127)));
+    }
+
+    #[test]
+    fn wait_n_with_only_done_jobs_returns_127() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("true".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(127)));
+    }
+
+    #[test]
+    fn wait_n_with_explicit_already_done_returns_its_status() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("exit 7".to_string(), 7);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["-n".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(7)));
+    }
+
+    #[test]
+    fn wait_n_p_var_captures_pgid_via_explicit_target() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("true".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &[
+                "-n".to_string(),
+                "-p".to_string(),
+                "PID".to_string(),
+                "%1".to_string(),
+            ],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("PID").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn wait_p_without_n_is_usage_error() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["-p".to_string(), "PID".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_n_p_without_var_name_is_usage_error() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "wait",
+            &["-n".to_string(), "-p".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn wait_invalid_flag_is_usage_error() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("wait", &["-x".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
 
