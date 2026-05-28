@@ -24,7 +24,7 @@ messages so the doc stays in sync.
 | Bugs (Tier 1) | 11 | Things to fix (all 11 fixed; B-11 fixed 2026-05-26) |
 | Missing features (Tier 2) | 52 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
-| Low-impact (Tier 4) | 10 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation) |
+| Low-impact (Tier 4) | 11 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation; L-11 added v39: `$'\xHH'` Unicode-vs-byte) |
 
 ---
 
@@ -167,7 +167,7 @@ group.
 
 ### Quoting
 
-- **M-28: `$'…'` ANSI-C quoting** — `[deferred]` high. huck: parses `$'\n'` as `$` + literal `\n` text. bash: processes C escapes.
+- **M-28: `$'…'` ANSI-C quoting** — `[fixed v39]` high. All 16 bash escapes: `\a`, `\b`, `\e`/`\E`, `\f`, `\n`, `\r`, `\t`, `\v`, `\\`, `\'`, `\"`, `\?`, `\nnn` (1-3 octal), `\xHH` (1-2 hex), `\uXXXX` (1-4 hex), `\UXXXXXXXX` (1-8 hex), `\cX` (control). Numeric escapes are interpreted as Unicode codepoints rather than raw bytes — see L-11. Unknown escapes preserve both the backslash and the following character (`$'\q'` → literal `\q`). Result emitted as a quoted Literal: no further expansion, no word splitting, no globbing. Implemented purely in the lexer (`read_dollar_expansion` + `read_ansi_c_quoted` + `decode_ansi_c_escape`).
 - **M-29: `$"…"` locale quoting** — `[deferred]` low. huck: parses as `$` + double-quoted word. bash: gettext lookup.
 
 ### Job control
@@ -327,6 +327,23 @@ Things huck deliberately does differently from bash. Document and keep.
 - **Why intentional**: real scripts almost never put a `:` or `/` literal inside a command substitution that itself sits inside a parameter expansion operand. The split scanners are simple by design, and adding `$(`/`$((` depth tracking would touch both v32 and v33 helpers for a vanishingly rare pattern.
 - **Workaround**: stash the command-substitution result in a variable and reference the variable inside the operand.
 
+### L-11: `$'\xHH'` and `$'\nnn'` produce Unicode codepoints, not raw bytes
+
+Bash inserts the raw byte value (0x00–0xFF) directly into the output
+string. huck, whose strings are Rust `String` (UTF-8), interprets the
+numeric value as a Unicode codepoint via `char::from_u32`. For ASCII-range
+values (< 0x80) the two encodings are bit-identical. For high-bit values
+the divergence is visible: bash's `$'\xFF'` is a single byte (`0xFF`),
+huck's `$'\xFF'` is the two-byte UTF-8 encoding of U+00FF
+(`0xC3 0xBF`).
+
+This aligns with L-04 (huck's Unicode-by-default convention for parameter
+expansion). Scripts that depend on injecting raw high bytes via
+`$'\xHH'` — rare in practice — will see different output sizes.
+Surrogate-range escapes (`\uD800`..`\uDFFF`) and codepoints above
+U+10FFFF are rejected with a `LexError::AnsiCInvalidCodepoint` rather
+than silently producing invalid UTF-8.
+
 ---
 
 ## Change log
@@ -353,3 +370,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-27**: M-22 (`trap` builtin) closed as fixed v36. ERR, DEBUG, RETURN pseudo-signals added alongside v35's EXIT + 13 real signals. Per-event firing helpers (`fire_err_trap` / `fire_debug_trap` / `fire_return_trap`) share a `fire_pseudo_trap` body with a `Shell::firing_trap` recursion guard. ERR uses a `Shell::err_suppressed_depth` counter pushed/popped in `run_if` / `run_while` to implement bash 5.x exemptions. DEBUG hooks at `run_exec_single` entry; RETURN at `call_function` with $? set to the function's status. M-22 status: `[fixed v36]`.
 - **2026-05-28**: M-17 (`${var^^}` / `${var,,}` case modification) shipped as v37. All eight forms (`^^`/`^`/`,,`/`,` × bare/with-pattern). Reuses glob::Pattern for the per-character pattern filter; Rust's `char::to_uppercase` / `char::to_lowercase` iterators for the Unicode-aware case mapping. Closes the parameter-expansion-modifier cluster started by v32/v33/v34.
 - **2026-05-28**: M-55 (bitwise operators), M-56 (assignment + inc/dec), and M-57 (non-decimal literals) shipped together as v38 — closes the arithmetic-feature cluster started by v22. Bundled `**` exponentiation. `arith::eval` signature changed from `&Shell` to `&mut Shell` (3 call sites updated). Pratt-parser precedence table renumbered to match bash's documented order. Shift counts out of `[0, 64)` produce explicit errors (deliberate divergence from bash's C-undefined behavior).
+- **2026-05-28**: M-28 (`$'…'` ANSI-C quoting) shipped as v39. New arm in `read_dollar_expansion` dispatches to `read_ansi_c_quoted` + `decode_ansi_c_escape`. All 16 bash escape forms supported. Numeric escapes resolve to Unicode codepoints (new L-11 divergence for `\xHH`/`\nnn` > 0x7F). Unknown escapes preserve `\` + following char. New `LexError::AnsiCInvalidCodepoint(u32)` for surrogates / out-of-range values. Pure lexer change — no parser, AST, executor, or expansion changes.
