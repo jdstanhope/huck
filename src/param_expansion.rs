@@ -1,6 +1,6 @@
 //! Parameter-expansion modifier evaluation (`${var:-w}`, `${#var}`, etc.).
 
-use crate::lexer::{ParamModifier, SubstAnchor, Word};
+use crate::lexer::{CaseDirection, ParamModifier, SubstAnchor, Word};
 use crate::shell_state::Shell;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -316,6 +316,74 @@ fn substitute(
             out
         }
     }
+}
+
+/// Applies bash-style case modification to `value`. The `direction`
+/// (Upper/Lower) and `all` flag together determine whether every char
+/// or only the first matching char gets converted. `pattern` filters
+/// per-character — if `None`, every char matches; if `Some(p)`, only
+/// chars matching the glob `p` get converted. Glob compile errors
+/// return `value` unchanged (silent fallthrough, matches v32's
+/// `substitute`). Unicode-aware via Rust's `char::to_uppercase` /
+/// `char::to_lowercase` iterators — handles multi-char expansions
+/// like `'ß'.to_uppercase()` → "SS".
+#[allow(dead_code)] // Wired in Task 4
+fn case_modify(
+    value: &str,
+    direction: CaseDirection,
+    all: bool,
+    pattern: Option<&str>,
+) -> String {
+    // Compile the pattern, if any. On compile failure, return value
+    // unchanged (matches v32 substitute's silent-no-op convention).
+    let compiled = match pattern {
+        Some(p) => match glob::Pattern::new(p) {
+            Ok(pat) => Some(pat),
+            Err(_) => return value.to_string(),
+        },
+        None => None,
+    };
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    let should_modify = |c: char| -> bool {
+        match &compiled {
+            None => true,
+            Some(pat) => pat.matches_with(&c.to_string(), opts),
+        }
+    };
+
+    let apply = |c: char| -> String {
+        match direction {
+            CaseDirection::Upper => c.to_uppercase().collect(),
+            CaseDirection::Lower => c.to_lowercase().collect(),
+        }
+    };
+
+    let mut out = String::with_capacity(value.len());
+    if all {
+        for c in value.chars() {
+            if should_modify(c) {
+                out.push_str(&apply(c));
+            } else {
+                out.push(c);
+            }
+        }
+    } else {
+        let mut done = false;
+        for c in value.chars() {
+            if !done && should_modify(c) {
+                out.push_str(&apply(c));
+                done = true;
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// Bash substring semantics for `${var:offset[:length]}`. Char-counting
@@ -1043,5 +1111,60 @@ mod tests {
         assert_eq!(r, ExpansionResult::Empty);
         // The flag must remain set (not cleared by the guard).
         assert_eq!(shell.pending_fatal_pe_error, Some(1));
+    }
+
+    #[test]
+    fn case_modify_upper_all_no_pattern() {
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, None), "HELLO");
+    }
+
+    #[test]
+    fn case_modify_upper_first_no_pattern() {
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, None), "Hello");
+    }
+
+    #[test]
+    fn case_modify_lower_all_no_pattern() {
+        assert_eq!(case_modify("HELLO", CaseDirection::Lower, true, None), "hello");
+    }
+
+    #[test]
+    fn case_modify_lower_first_no_pattern() {
+        assert_eq!(case_modify("HELLO", CaseDirection::Lower, false, None), "hELLO");
+    }
+
+    #[test]
+    fn case_modify_upper_all_with_pattern_filters_chars() {
+        // [aeiou] — only vowels upper-cased.
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[aeiou]")), "hEllO");
+    }
+
+    #[test]
+    fn case_modify_upper_first_with_pattern_picks_first_match() {
+        // Only the first MATCHING char (the `e`) gets upper-cased.
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]")), "hEllo");
+    }
+
+    #[test]
+    fn case_modify_unicode_handles_multichar_uppercase() {
+        // Rust's `'ß'.to_uppercase()` yields two chars: 'S', 'S'.
+        assert_eq!(case_modify("straße", CaseDirection::Upper, true, None), "STRASSE");
+    }
+
+    #[test]
+    fn case_modify_empty_value_returns_empty() {
+        assert_eq!(case_modify("", CaseDirection::Upper, true, None), "");
+    }
+
+    #[test]
+    fn case_modify_invalid_glob_returns_value_unchanged() {
+        // `[abc` (unclosed bracket) — glob::Pattern::new returns Err.
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[abc")), "hello");
+    }
+
+    #[test]
+    fn case_modify_no_match_first_form_returns_unchanged() {
+        // No char in "hello" matches [xyz]; all=false → return unchanged.
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[xyz]")), "hello");
     }
 }
