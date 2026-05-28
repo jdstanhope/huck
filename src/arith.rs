@@ -297,6 +297,22 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]  // variants constructed by parser in Task 3
+pub enum AssignOp {
+    Set,    // =
+    Add,    // +=
+    Sub,    // -=
+    Mul,    // *=
+    Div,    // /=
+    Mod,    // %=
+    Shl,    // <<=
+    Shr,    // >>=
+    BitAnd, // &=
+    BitXor, // ^=
+    BitOr,  // |=
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArithExpr {
     Num(i64),
@@ -317,6 +333,34 @@ pub enum ArithExpr {
     And(Box<ArithExpr>, Box<ArithExpr>),
     Or(Box<ArithExpr>, Box<ArithExpr>),
     Ternary(Box<ArithExpr>, Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — bitwise binops:
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    BitAnd(Box<ArithExpr>, Box<ArithExpr>),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    BitOr(Box<ArithExpr>, Box<ArithExpr>),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    BitXor(Box<ArithExpr>, Box<ArithExpr>),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    BitNot(Box<ArithExpr>),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    Shl(Box<ArithExpr>, Box<ArithExpr>),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    Shr(Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — power (right-associative):
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    Pow(Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — assignment (LHS must be a Var; enforced at parse time):
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    Assign { name: String, op: AssignOp, rhs: Box<ArithExpr> },
+    // v38 — pre/post inc/dec (LHS must be a Var):
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    PreInc(String),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    PreDec(String),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    PostInc(String),
+    #[allow(dead_code)]  // constructed by parser in Task 3
+    PostDec(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +369,10 @@ pub enum ArithError {
     DivisionByZero,
     ModuloByZero,
     NotAnInteger { var: String, value: String },
+    #[allow(dead_code)]  // constructed by evaluator in Task 4
+    NegativeExponent,
+    #[allow(dead_code)]  // constructed by evaluator in Task 4
+    ShiftCountOutOfRange { count: i64 },
 }
 
 impl std::fmt::Display for ArithError {
@@ -335,6 +383,9 @@ impl std::fmt::Display for ArithError {
             Self::ModuloByZero => write!(f, "modulo by zero"),
             Self::NotAnInteger { var, value } =>
                 write!(f, "variable '{var}' is not an integer: '{value}'"),
+            Self::NegativeExponent => write!(f, "exponentiation with negative exponent"),
+            Self::ShiftCountOutOfRange { count } =>
+                write!(f, "shift count out of range: {count}"),
         }
     }
 }
@@ -506,6 +557,19 @@ pub fn eval(expr: &ArithExpr, shell: &Shell) -> Result<i64, ArithError> {
                 eval(e, shell)
             }
         }
+        // v38 variants — implementation in Task 4
+        ArithExpr::BitAnd(_, _) => unreachable!("BitAnd: Task 4"),
+        ArithExpr::BitOr(_, _) => unreachable!("BitOr: Task 4"),
+        ArithExpr::BitXor(_, _) => unreachable!("BitXor: Task 4"),
+        ArithExpr::BitNot(_) => unreachable!("BitNot: Task 4"),
+        ArithExpr::Shl(_, _) => unreachable!("Shl: Task 4"),
+        ArithExpr::Shr(_, _) => unreachable!("Shr: Task 4"),
+        ArithExpr::Pow(_, _) => unreachable!("Pow: Task 4"),
+        ArithExpr::Assign { .. } => unreachable!("Assign: Task 4"),
+        ArithExpr::PreInc(_) => unreachable!("PreInc: Task 4"),
+        ArithExpr::PreDec(_) => unreachable!("PreDec: Task 4"),
+        ArithExpr::PostInc(_) => unreachable!("PostInc: Task 4"),
+        ArithExpr::PostDec(_) => unreachable!("PostDec: Task 4"),
     }
 }
 
