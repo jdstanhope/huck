@@ -243,9 +243,39 @@ const TRAPPABLE: &[(&str, i32)] = &[
     ("WINCH", libc::SIGWINCH),
 ];
 
+/// All signals huck knows how to SEND via `kill`. This is the
+/// trappable list plus KILL and STOP, which can be sent but not
+/// trapped.
+const KILLABLE: &[(&str, i32)] = &[
+    ("HUP",   libc::SIGHUP),
+    ("INT",   libc::SIGINT),
+    ("QUIT",  libc::SIGQUIT),
+    ("KILL",  libc::SIGKILL),
+    ("USR1",  libc::SIGUSR1),
+    ("USR2",  libc::SIGUSR2),
+    ("PIPE",  libc::SIGPIPE),
+    ("ALRM",  libc::SIGALRM),
+    ("TERM",  libc::SIGTERM),
+    ("CHLD",  libc::SIGCHLD),
+    ("CONT",  libc::SIGCONT),
+    ("STOP",  libc::SIGSTOP),
+    ("TSTP",  libc::SIGTSTP),
+    ("TTIN",  libc::SIGTTIN),
+    ("TTOU",  libc::SIGTTOU),
+    ("WINCH", libc::SIGWINCH),
+];
+
 /// Returns the trappable signal table (name → signal-number pairs).
 pub fn name_table() -> &'static [(&'static str, i32)] {
     TRAPPABLE
+}
+
+/// Returns the table of signal names huck knows how to SEND via
+/// `kill`. This is the 14-entry trappable table plus KILL and STOP,
+/// which are not trappable but ARE sendable. Used by `kill -l` and
+/// the `signal_by_name` helper in `builtins.rs`.
+pub fn killable_signals() -> &'static [(&'static str, i32)] {
+    KILLABLE
 }
 
 /// Parses `name` as a signal specification. Accepts:

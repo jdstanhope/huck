@@ -54,7 +54,7 @@ pub fn run_builtin(
         "wait" => builtin_wait(args, out, shell),
         "fg" => builtin_fg(args, shell),
         "bg" => builtin_bg(args, out, shell),
-        "kill" => builtin_kill(args, shell),
+        "kill" => builtin_kill(args, out, shell),
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
         "trap" => builtin_trap(args, out, shell),
@@ -709,27 +709,74 @@ fn check_sigint(shell: &Shell) -> bool {
     }
 }
 
+fn print_killable_table(out: &mut dyn Write) {
+    let table = crate::traps::killable_signals();
+    let mut sorted: Vec<&(&str, i32)> = table.iter().collect();
+    sorted.sort_by_key(|(_, n)| *n);
+    let cols = 4;
+    for chunk in sorted.chunks(cols) {
+        let mut line = String::new();
+        for (i, (name, num)) in chunk.iter().enumerate() {
+            if i > 0 { line.push(' '); }
+            line.push_str(&format!("{num:>2}) {name:<5}"));
+        }
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+fn handle_kill_l(args: &[String], out: &mut dyn Write) -> ExecOutcome {
+    if args.is_empty() {
+        print_killable_table(out);
+        return ExecOutcome::Continue(0);
+    }
+
+    for arg in args {
+        if let Ok(n) = arg.parse::<i32>() {
+            let lookup = if n >= 128 { n - 128 } else { n };
+            match crate::traps::killable_signals()
+                .iter()
+                .find(|(_, num)| *num == lookup)
+            {
+                Some((name, _)) => {
+                    let _ = writeln!(out, "{name}");
+                }
+                None => {
+                    eprintln!("huck: kill: {arg}: invalid signal specification");
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        } else {
+            let upper = arg.to_ascii_uppercase();
+            let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+            match crate::traps::killable_signals()
+                .iter()
+                .find(|(table_name, _)| *table_name == name)
+            {
+                Some((_, num)) => {
+                    let _ = writeln!(out, "{num}");
+                }
+                None => {
+                    eprintln!("huck: kill: {arg}: invalid signal specification");
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
 fn signal_by_name(s: &str) -> Option<i32> {
     let upper = s.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    Some(match name {
-        "HUP"  => libc::SIGHUP,
-        "INT"  => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "KILL" => libc::SIGKILL,
-        "TERM" => libc::SIGTERM,
-        "PIPE" => libc::SIGPIPE,
-        "ALRM" => libc::SIGALRM,
-        "STOP" => libc::SIGSTOP,
-        "TSTP" => libc::SIGTSTP,
-        "CONT" => libc::SIGCONT,
-        "TTIN" => libc::SIGTTIN,
-        "TTOU" => libc::SIGTTOU,
-        "CHLD" => libc::SIGCHLD,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        _ => return None,
-    })
+    crate::traps::killable_signals()
+        .iter()
+        .find_map(|(table_name, num)| {
+            if *table_name == name {
+                Some(*num)
+            } else {
+                None
+            }
+        })
 }
 
 /// Parses `arg` as a job spec and resolves it to a job id. On parse or
@@ -750,7 +797,10 @@ fn resolve_spec_or_error(
     })
 }
 
-fn builtin_kill(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if matches!(args.first().map(|s| s.as_str()), Some("-l")) {
+        return handle_kill_l(&args[1..], out);
+    }
     let (sig, targets) = if let Some(first) = args.first() {
         if let Some(rest) = first.strip_prefix('-') {
             // -<sig> form
@@ -2198,6 +2248,149 @@ mod kill_tests {
         let outcome = run_builtin("kill", &["-0".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)),
             "kill -0 (no targets) should reach usage check, not signal check");
+    }
+
+    #[test]
+    fn kill_l_no_args_lists_all_16_signals() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["-l".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.matches(')').count(), 16, "output: {s}");
+        assert!(s.contains("KILL"), "output missing KILL: {s}");
+        assert!(s.contains("TERM"), "output missing TERM: {s}");
+        assert!(s.contains("WINCH"), "output missing WINCH: {s}");
+    }
+
+    #[test]
+    fn kill_l_with_name_returns_number() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), "TERM".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.trim(), libc::SIGTERM.to_string());
+    }
+
+    #[test]
+    fn kill_l_with_sig_prefix_returns_number() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), "SIGTERM".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.trim(), libc::SIGTERM.to_string());
+    }
+
+    #[test]
+    fn kill_l_lowercase_name_returns_number() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), "term".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.trim(), libc::SIGTERM.to_string());
+    }
+
+    #[test]
+    fn kill_l_with_number_returns_name() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), libc::SIGTERM.to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.trim(), "TERM");
+    }
+
+    #[test]
+    fn kill_l_status_decode() {
+        let arg = (128 + libc::SIGKILL).to_string();
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), arg],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s.trim(), "KILL");
+    }
+
+    #[test]
+    fn kill_l_unknown_name_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), "xyz".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_l_invalid_number_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-l".to_string(), "99".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_l_multiple_args_decodes_each() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &[
+                "-l".to_string(),
+                libc::SIGHUP.to_string(),
+                libc::SIGKILL.to_string(),
+                libc::SIGTERM.to_string(),
+            ],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines, vec!["HUP", "KILL", "TERM"]);
+    }
+
+    #[test]
+    fn signal_by_name_resolves_winch() {
+        assert_eq!(signal_by_name("WINCH"), Some(libc::SIGWINCH));
+        assert_eq!(signal_by_name("SIGWINCH"), Some(libc::SIGWINCH));
+        assert_eq!(signal_by_name("winch"), Some(libc::SIGWINCH));
     }
 }
 
