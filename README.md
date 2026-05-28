@@ -48,6 +48,7 @@ spec, an implementation plan, and a test suite.
 | v38       | Arithmetic completion (M-55 + M-56 + M-57 + `**`)              |
 | v39       | ANSI-C quoting `$'…'` (M-28)                                   |
 | v40       | `wait -n` + multi-arg `wait` (M-37 + M-38)                     |
+| v41       | `kill -l` (M-39) + README cleanup                              |
 
 ## Build and run
 
@@ -231,10 +232,8 @@ brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
 **Not yet implemented:**
-substring parameter expansion (`${var:off:len}`),
-case modification (`${var^^}`/`${var,,}`),
 brace expansion (`{a,b,c}`), extended job specs
-(`%cmd`/`%?cmd`), `wait -n`, `kill -l`/`-s`, `disown -a`/`-r`/`-h`,
+(`%cmd`/`%?cmd`), `kill -s`, `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
 
 ## Project layout
