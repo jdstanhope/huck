@@ -9,6 +9,95 @@ pub(crate) enum ArithToken {
     Eq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Bang,
     Question, Colon,
+    // v38 — bitwise & shift:
+    Amp, Pipe, Caret, Tilde,
+    Shl, Shr,
+    // v38 — power:
+    Power,
+    // v38 — assignment:
+    Assign,
+    PlusEq, MinusEq, StarEq,
+    SlashEq, PercentEq,
+    ShlEq, ShrEq,
+    AmpEq, CaretEq, PipeEq,
+    // v38 — inc/dec:
+    PlusPlus, MinusMinus,
+}
+
+/// Parses hex digits 0-9, a-f, A-F after the `0x` / `0X` prefix has
+/// been consumed. Returns the i64 value. Errors on no digits, invalid
+/// digits, or out-of-range value.
+fn parse_hex_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<i64, ArithError> {
+    let mut s = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_hexdigit() {
+            s.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        return Err(ArithError::Parse("hex literal requires at least one digit".to_string()));
+    }
+    i64::from_str_radix(&s, 16).map_err(|_|
+        ArithError::Parse(format!("hex literal out of range: 0x{s}")))
+}
+
+/// Parses base-N digits after the `N#` prefix has been consumed. The
+/// digit alphabet (matches bash):
+///   0-9 → 0-9
+///   a-z → 10-35
+///   A-Z → 36-61
+///   @   → 62
+///   _   → 63
+/// For bases ≤ 36, a-z and A-Z are both valid as 10-35 (case-insensitive).
+/// For bases > 36, a-z (10-35) and A-Z (36-61) are distinct.
+fn parse_base_n_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    base: u32,
+) -> Result<i64, ArithError> {
+    let mut value: i64 = 0;
+    let mut any_digit = false;
+    while let Some(&c) = chars.peek() {
+        let digit = match c {
+            '0'..='9' => (c as u32) - ('0' as u32),
+            'a'..='z' => (c as u32) - ('a' as u32) + 10,
+            'A'..='Z' => {
+                if base <= 36 {
+                    // Case-insensitive: A-Z → 10-35.
+                    (c as u32) - ('A' as u32) + 10
+                } else {
+                    // Case-sensitive: A-Z → 36-61.
+                    (c as u32) - ('A' as u32) + 36
+                }
+            }
+            '@' => 62,
+            '_' => 63,
+            _ => break,
+        };
+        if digit >= base {
+            return Err(ArithError::Parse(format!(
+                "invalid digit for base {base}: '{c}'"
+            )));
+        }
+        value = value
+            .checked_mul(base as i64)
+            .and_then(|v| v.checked_add(digit as i64))
+            .ok_or_else(|| ArithError::Parse(format!(
+                "base-{base} literal out of range"
+            )))?;
+        any_digit = true;
+        chars.next();
+    }
+    if !any_digit {
+        return Err(ArithError::Parse(format!(
+            "base-{base} literal requires at least one digit"
+        )));
+    }
+    Ok(value)
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
@@ -18,12 +107,38 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
         match c {
             ' ' | '\t' | '\n' | '\r' => { chars.next(); }
             '0'..='9' => {
-                let mut s = String::new();
+                // Read greedy leading decimal digits.
+                let mut digits = String::new();
                 while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                    if d.is_ascii_digit() { digits.push(d); chars.next(); } else { break; }
                 }
-                let n: i64 = s.parse().map_err(|_|
-                    ArithError::Parse(format!("integer literal out of range: {s}")))?;
+                let n: i64 = if chars.peek() == Some(&'#') {
+                    // Base-N literal: leading digits parsed as decimal base.
+                    chars.next();
+                    let base: u32 = digits.parse()
+                        .map_err(|_| ArithError::Parse(format!("invalid base: {digits}")))?;
+                    if !(2..=64).contains(&base) {
+                        return Err(ArithError::Parse(format!(
+                            "base must be 2-64, got {base}"
+                        )));
+                    }
+                    parse_base_n_digits(&mut chars, base)?
+                } else if digits == "0" && matches!(chars.peek(), Some('x') | Some('X')) {
+                    // Hex literal: 0x... / 0X...
+                    chars.next();
+                    parse_hex_digits(&mut chars)?
+                } else if digits.len() > 1 && digits.starts_with('0') {
+                    // Octal literal: 010 → 8. All digits must be 0-7.
+                    i64::from_str_radix(&digits, 8)
+                        .map_err(|_| ArithError::Parse(format!(
+                            "invalid octal literal: {digits}"
+                        )))?
+                } else {
+                    digits.parse()
+                        .map_err(|_| ArithError::Parse(format!(
+                            "integer literal out of range: {digits}"
+                        )))?
+                };
                 out.push(ArithToken::Number(n));
             }
             '$' => {
@@ -51,11 +166,48 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
             }
             '(' => { chars.next(); out.push(ArithToken::LParen); }
             ')' => { chars.next(); out.push(ArithToken::RParen); }
-            '+' => { chars.next(); out.push(ArithToken::Plus); }
-            '-' => { chars.next(); out.push(ArithToken::Minus); }
-            '*' => { chars.next(); out.push(ArithToken::Star); }
-            '/' => { chars.next(); out.push(ArithToken::Slash); }
-            '%' => { chars.next(); out.push(ArithToken::Percent); }
+            '+' => {
+                chars.next();
+                match chars.peek() {
+                    Some('+') => { chars.next(); out.push(ArithToken::PlusPlus); }
+                    Some('=') => { chars.next(); out.push(ArithToken::PlusEq); }
+                    _ => out.push(ArithToken::Plus),
+                }
+            }
+            '-' => {
+                chars.next();
+                match chars.peek() {
+                    Some('-') => { chars.next(); out.push(ArithToken::MinusMinus); }
+                    Some('=') => { chars.next(); out.push(ArithToken::MinusEq); }
+                    _ => out.push(ArithToken::Minus),
+                }
+            }
+            '*' => {
+                chars.next();
+                match chars.peek() {
+                    Some('*') => { chars.next(); out.push(ArithToken::Power); }
+                    Some('=') => { chars.next(); out.push(ArithToken::StarEq); }
+                    _ => out.push(ArithToken::Star),
+                }
+            }
+            '/' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::SlashEq);
+                } else {
+                    out.push(ArithToken::Slash);
+                }
+            }
+            '%' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::PercentEq);
+                } else {
+                    out.push(ArithToken::Percent);
+                }
+            }
             '?' => { chars.next(); out.push(ArithToken::Question); }
             ':' => { chars.next(); out.push(ArithToken::Colon); }
             '!' => {
@@ -73,48 +225,69 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                     chars.next();
                     out.push(ArithToken::Eq);
                 } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '=' (assignment is out of scope; did you mean '=='?)"
-                            .to_string()));
+                    out.push(ArithToken::Assign);
                 }
             }
             '<' => {
                 chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Le);
-                } else {
-                    out.push(ArithToken::Lt);
+                match chars.peek() {
+                    Some('<') => {
+                        chars.next();
+                        if chars.peek() == Some(&'=') {
+                            chars.next();
+                            out.push(ArithToken::ShlEq);
+                        } else {
+                            out.push(ArithToken::Shl);
+                        }
+                    }
+                    Some('=') => { chars.next(); out.push(ArithToken::Le); }
+                    _ => out.push(ArithToken::Lt),
                 }
             }
             '>' => {
                 chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Ge);
-                } else {
-                    out.push(ArithToken::Gt);
+                match chars.peek() {
+                    Some('>') => {
+                        chars.next();
+                        if chars.peek() == Some(&'=') {
+                            chars.next();
+                            out.push(ArithToken::ShrEq);
+                        } else {
+                            out.push(ArithToken::Shr);
+                        }
+                    }
+                    Some('=') => { chars.next(); out.push(ArithToken::Ge); }
+                    _ => out.push(ArithToken::Gt),
                 }
             }
             '&' => {
                 chars.next();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    out.push(ArithToken::AndAnd);
-                } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '&' (bitwise operators are out of scope)".to_string()));
+                match chars.peek() {
+                    Some('&') => { chars.next(); out.push(ArithToken::AndAnd); }
+                    Some('=') => { chars.next(); out.push(ArithToken::AmpEq); }
+                    _ => out.push(ArithToken::Amp),
                 }
             }
             '|' => {
                 chars.next();
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    out.push(ArithToken::OrOr);
-                } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '|' (bitwise operators are out of scope)".to_string()));
+                match chars.peek() {
+                    Some('|') => { chars.next(); out.push(ArithToken::OrOr); }
+                    Some('=') => { chars.next(); out.push(ArithToken::PipeEq); }
+                    _ => out.push(ArithToken::Pipe),
                 }
+            }
+            '^' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::CaretEq);
+                } else {
+                    out.push(ArithToken::Caret);
+                }
+            }
+            '~' => {
+                chars.next();
+                out.push(ArithToken::Tilde);
             }
             other => {
                 return Err(ArithError::Parse(format!("unexpected character: {other:?}")));
@@ -447,15 +620,119 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_single_amp_is_parse_error() {
-        let err = tokenize("1 & 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+    fn tokenize_single_amp_is_bitwise_and() {
+        // v38: bare & is now bitwise AND (was: parse error).
+        assert_eq!(tokenize("1 & 2").unwrap(), vec![
+            ArithToken::Number(1), ArithToken::Amp, ArithToken::Number(2),
+        ]);
     }
 
     #[test]
-    fn tokenize_single_pipe_is_parse_error() {
-        let err = tokenize("1 | 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+    fn tokenize_single_pipe_is_bitwise_or() {
+        // v38: bare | is now bitwise OR (was: parse error).
+        assert_eq!(tokenize("1 | 2").unwrap(), vec![
+            ArithToken::Number(1), ArithToken::Pipe, ArithToken::Number(2),
+        ]);
+    }
+
+    #[test]
+    fn tokenize_hex_literal() {
+        assert_eq!(tokenize("0x10").unwrap(), vec![ArithToken::Number(16)]);
+    }
+
+    #[test]
+    fn tokenize_hex_literal_uppercase() {
+        assert_eq!(tokenize("0X1F").unwrap(), vec![ArithToken::Number(31)]);
+    }
+
+    #[test]
+    fn tokenize_octal_literal() {
+        assert_eq!(tokenize("010").unwrap(), vec![ArithToken::Number(8)]);
+    }
+
+    #[test]
+    fn tokenize_octal_invalid_digit_errors() {
+        // 08 has a digit (8) that's invalid for octal.
+        assert!(tokenize("08").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_binary() {
+        assert_eq!(tokenize("2#1010").unwrap(), vec![ArithToken::Number(10)]);
+    }
+
+    #[test]
+    fn tokenize_base_n_hex_via_pound() {
+        assert_eq!(tokenize("16#FF").unwrap(), vec![ArithToken::Number(255)]);
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_base_low_errors() {
+        assert!(tokenize("1#0").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_base_high_errors() {
+        assert!(tokenize("65#0").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_digit_errors() {
+        // Base 8 cannot have digit 9.
+        assert!(tokenize("8#9").is_err());
+    }
+
+    #[test]
+    fn tokenize_bitwise_operators() {
+        assert_eq!(
+            tokenize("&|^~<<>>").unwrap(),
+            vec![
+                ArithToken::Amp, ArithToken::Pipe,
+                ArithToken::Caret, ArithToken::Tilde,
+                ArithToken::Shl, ArithToken::Shr,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_power_operator() {
+        assert_eq!(tokenize("2**3").unwrap(), vec![
+            ArithToken::Number(2), ArithToken::Power, ArithToken::Number(3),
+        ]);
+    }
+
+    #[test]
+    fn tokenize_compound_assignments() {
+        // = += -= *= /= %= <<= >>= &= ^= |=
+        let input = "= += -= *= /= %= <<= >>= &= ^= |=";
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens, vec![
+            ArithToken::Assign,
+            ArithToken::PlusEq, ArithToken::MinusEq, ArithToken::StarEq,
+            ArithToken::SlashEq, ArithToken::PercentEq,
+            ArithToken::ShlEq, ArithToken::ShrEq,
+            ArithToken::AmpEq, ArithToken::CaretEq, ArithToken::PipeEq,
+        ]);
+    }
+
+    #[test]
+    fn tokenize_inc_dec_operators() {
+        assert_eq!(tokenize("++ --").unwrap(), vec![
+            ArithToken::PlusPlus, ArithToken::MinusMinus,
+        ]);
+    }
+
+    #[test]
+    fn tokenize_distinguishes_eq_from_assign() {
+        assert_eq!(tokenize("==").unwrap(), vec![ArithToken::Eq]);
+        assert_eq!(tokenize("=").unwrap(), vec![ArithToken::Assign]);
+    }
+
+    #[test]
+    fn tokenize_distinguishes_lt_from_shl() {
+        assert_eq!(tokenize("<").unwrap(), vec![ArithToken::Lt]);
+        assert_eq!(tokenize("<<").unwrap(), vec![ArithToken::Shl]);
+        assert_eq!(tokenize("<<=").unwrap(), vec![ArithToken::ShlEq]);
     }
 
     fn n(x: i64) -> Box<ArithExpr> { Box::new(ArithExpr::Num(x)) }
