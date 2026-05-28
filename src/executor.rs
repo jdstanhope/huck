@@ -71,8 +71,15 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             return ExecOutcome::Continue(c);
         }
         crate::traps::dispatch_pending_traps(shell);
+        // ERR fires for seq.first's failure if not suppressed AND the
+        // next connector (if any) is not Or.
+        let next_is_or = matches!(seq.rest.first(), Some((Connector::Or, _)));
+        if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+            crate::traps::fire_err_trap(shell);
+        }
     }
-    for (connector, command) in &seq.rest {
+    for i in 0..seq.rest.len() {
+        let (connector, command) = &seq.rest[i];
         let should_run = match connector {
             Connector::Semi => true,
             Connector::And => matches!(status, ExecOutcome::Continue(0)),
@@ -93,6 +100,13 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                     return ExecOutcome::Continue(c);
                 }
                 crate::traps::dispatch_pending_traps(shell);
+                // ERR fires if this command failed AND we're not in a
+                // suppression context AND the NEXT connector is not Or
+                // (i.e. the failure isn't "handled" by a following || clause).
+                let next_is_or = matches!(seq.rest.get(i + 1), Some((Connector::Or, _)));
+                if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+                    crate::traps::fire_err_trap(shell);
+                }
             }
         }
     }
@@ -203,7 +217,9 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
         {
             return ExecOutcome::Continue(130);
         }
+        shell.err_suppressed_depth += 1;
         let cond = execute_sequence_body(&clause.condition, shell, sink);
+        shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
                 | ExecOutcome::FunctionReturn(_) => {
@@ -346,7 +362,9 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
 /// branch whose condition succeeds (exit 0), or the `else` body, or
 /// nothing (status 0). An `exit` anywhere inside propagates.
 fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    shell.err_suppressed_depth += 1;
     let cond = execute_sequence_body(&clause.condition, shell, sink);
+    shell.err_suppressed_depth -= 1;
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
@@ -358,7 +376,9 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         return execute_sequence_body(&clause.then_body, shell, sink);
     }
     for elif in &clause.elif_branches {
+        shell.err_suppressed_depth += 1;
         let elif_cond = execute_sequence_body(&elif.condition, shell, sink);
+        shell.err_suppressed_depth -= 1;
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
@@ -1352,6 +1372,17 @@ fn call_function(
     shell.positional_args = args;
     shell.function_arg0.push(name.to_string());
     let result = run_command(&body, shell, sink);
+    // RETURN trap fires with $? set to the function's status AND the
+    // function's positional args still in scope. After the action runs,
+    // restore the caller's frame.
+    let status_for_trap = match &result {
+        ExecOutcome::FunctionReturn(n) => *n,
+        ExecOutcome::Continue(c) => *c,
+        // Exit/LoopBreak/LoopContinue propagate up; keep $? as-is.
+        _ => shell.last_status(),
+    };
+    shell.set_last_status(status_for_trap);
+    crate::traps::fire_return_trap(shell);
     shell.function_arg0.pop();
     shell.positional_args = saved;
     match result {
@@ -1361,6 +1392,7 @@ fn call_function(
 }
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    crate::traps::fire_debug_trap(shell);
     let resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),

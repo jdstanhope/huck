@@ -82,6 +82,41 @@ pub fn fire_exit_trap(shell: &mut Shell) {
     let _ = crate::shell::process_line(&action, shell);
 }
 
+/// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
+/// NOT removed after firing (unlike EXIT). Respects the recursion
+/// guard via `Shell::firing_trap`.
+pub fn fire_err_trap(shell: &mut Shell) {
+    fire_pseudo_trap(shell, TrapSignal::Err);
+}
+
+/// Fires the DEBUG pseudo-signal trap. Repeatable; recursion-guarded.
+pub fn fire_debug_trap(shell: &mut Shell) {
+    fire_pseudo_trap(shell, TrapSignal::Debug);
+}
+
+/// Fires the RETURN pseudo-signal trap. Repeatable; recursion-guarded.
+pub fn fire_return_trap(shell: &mut Shell) {
+    fire_pseudo_trap(shell, TrapSignal::Return);
+}
+
+/// Shared body for the three repeating pseudo-signal traps. Returns
+/// immediately if `shell.firing_trap == Some(sig)` (recursion guard).
+/// Looks up the action via `traps.get` (NOT remove), executes via
+/// `process_line`. Save-and-restore of `firing_trap` allows different
+/// pseudo-signals to nest (e.g. a DEBUG action that triggers ERR).
+fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
+    if shell.firing_trap == Some(sig) {
+        return;
+    }
+    let action = match shell.traps.get(&sig) {
+        Some(Some(text)) => text.clone(),
+        _ => return,
+    };
+    let prev = shell.firing_trap.replace(sig);
+    let _ = crate::shell::process_line(&action, shell);
+    shell.firing_trap = prev;
+}
+
 /// Resets all trap state in a freshly-forked subshell child. POSIX:
 /// trapped signals reset to their original values in subshells; we
 /// also clear EXIT so the parent's EXIT fires only when the parent
@@ -93,19 +128,21 @@ pub fn clear_for_subshell(shell: &mut Shell) {
     }
     shell.traps.clear();
     shell.trap_pending = Arc::new(AtomicU32::new(0));
+    shell.firing_trap = None;
+    shell.err_suppressed_depth = 0;
 }
 
 /// Installs a trap action for `sig`. `action = Some(text)` registers;
-/// `action = None` ignores the signal (SIG_IGN). For EXIT, no OS-level
-/// handler is needed — just store the action and let `fire_exit_trap`
+/// `action = None` ignores the signal (SIG_IGN). For pseudo-signals, no OS-level
+/// handler is needed — just store the action and let the firing helpers
 /// handle the firing.
 ///
 /// Returns `Err(msg)` if `sig` was ignored at shell startup (POSIX
 /// "Signals ignored upon entry to the shell cannot be trapped").
 pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Result<(), String> {
     match sig {
-        TrapSignal::Exit => {
-            shell.traps.insert(TrapSignal::Exit, action);
+        TrapSignal::Exit | TrapSignal::Err | TrapSignal::Debug | TrapSignal::Return => {
+            shell.traps.insert(sig, action);
             Ok(())
         }
         TrapSignal::Real(signum) => {
@@ -153,15 +190,15 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
     }
 }
 
-/// Resets `sig` to default disposition. For EXIT, just removes the
+/// Resets `sig` to default disposition. For pseudo-signals, just removes the
 /// stored action. For real signals, unregisters any installed handler
 /// — signal-hook's existing SIGINT/SIGCHLD handlers (installed by
 /// `shell::install_sigint_handler` etc.) are unaffected because they
 /// were registered separately and have their own SigIds.
 pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
     match sig {
-        TrapSignal::Exit => {
-            shell.traps.remove(&TrapSignal::Exit);
+        TrapSignal::Exit | TrapSignal::Err | TrapSignal::Debug | TrapSignal::Return => {
+            shell.traps.remove(&sig);
             Ok(())
         }
         TrapSignal::Real(signum) => {
@@ -180,6 +217,9 @@ pub fn reset(shell: &mut Shell, sig: TrapSignal) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrapSignal {
     Exit,
+    Err,
+    Debug,
+    Return,
     Real(i32),
 }
 
@@ -210,6 +250,9 @@ pub fn name_table() -> &'static [(&'static str, i32)] {
 
 /// Parses `name` as a signal specification. Accepts:
 /// - `"EXIT"` → `TrapSignal::Exit`
+/// - `"ERR"` → `TrapSignal::Err`
+/// - `"DEBUG"` → `TrapSignal::Debug`
+/// - `"RETURN"` → `TrapSignal::Return`
 /// - `"INT"` / `"SIGINT"` / `"2"` → `TrapSignal::Real(2)`
 /// - Same dual-form for every trappable signal.
 ///
@@ -218,6 +261,15 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     // EXIT pseudo-signal (case-sensitive to match bash).
     if name == "EXIT" {
         return Ok(TrapSignal::Exit);
+    }
+    if name == "ERR" {
+        return Ok(TrapSignal::Err);
+    }
+    if name == "DEBUG" {
+        return Ok(TrapSignal::Debug);
+    }
+    if name == "RETURN" {
+        return Ok(TrapSignal::Return);
     }
 
     // Numeric form.
@@ -398,6 +450,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_trap_signal_err() {
+        assert_eq!(parse_trap_signal("ERR"), Ok(TrapSignal::Err));
+    }
+
+    #[test]
+    fn parse_trap_signal_debug() {
+        assert_eq!(parse_trap_signal("DEBUG"), Ok(TrapSignal::Debug));
+    }
+
+    #[test]
+    fn parse_trap_signal_return() {
+        assert_eq!(parse_trap_signal("RETURN"), Ok(TrapSignal::Return));
+    }
+
+    #[test]
     fn name_table_has_14_trappable_entries() {
         // 15 total minus KILL minus STOP = 13 trappable… wait, the
         // table never included KILL/STOP since they're filtered at
@@ -452,5 +519,84 @@ mod tests {
         reset(&mut shell, TrapSignal::Real(libc::SIGUSR2)).unwrap();
         assert!(!shell.trap_sigids.contains_key(&libc::SIGUSR2));
         assert!(!shell.traps.contains_key(&TrapSignal::Real(libc::SIGUSR2)));
+    }
+
+    #[test]
+    fn fire_err_trap_runs_action_without_remove() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
+        fire_err_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("err_ran"));
+        // Trap entry MUST still be present (unlike EXIT which self-removes).
+        assert!(shell.traps.contains_key(&TrapSignal::Err));
+    }
+
+    #[test]
+    fn fire_debug_trap_runs_action_without_remove() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Debug, Some("FOO=dbg_ran".to_string()));
+        fire_debug_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("dbg_ran"));
+        assert!(shell.traps.contains_key(&TrapSignal::Debug));
+    }
+
+    #[test]
+    fn fire_return_trap_runs_action_without_remove() {
+        let mut shell = Shell::new();
+        shell.traps.insert(TrapSignal::Return, Some("FOO=ret_ran".to_string()));
+        fire_return_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("ret_ran"));
+        assert!(shell.traps.contains_key(&TrapSignal::Return));
+    }
+
+    #[test]
+    fn fire_err_trap_recursion_guard_suppresses_reentry() {
+        let mut shell = Shell::new();
+        shell.firing_trap = Some(TrapSignal::Err);
+        shell.traps.insert(TrapSignal::Err, Some("FOO=should_not_run".to_string()));
+        fire_err_trap(&mut shell);
+        // Action should NOT have run because firing_trap was already set.
+        assert_eq!(shell.get("FOO"), None);
+    }
+
+    #[test]
+    fn fire_debug_trap_recursion_guard_suppresses_reentry() {
+        let mut shell = Shell::new();
+        shell.firing_trap = Some(TrapSignal::Debug);
+        shell.traps.insert(TrapSignal::Debug, Some("FOO=should_not_run".to_string()));
+        fire_debug_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), None);
+    }
+
+    #[test]
+    fn fire_return_trap_recursion_guard_suppresses_reentry() {
+        let mut shell = Shell::new();
+        shell.firing_trap = Some(TrapSignal::Return);
+        shell.traps.insert(TrapSignal::Return, Some("FOO=should_not_run".to_string()));
+        fire_return_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), None);
+    }
+
+    #[test]
+    fn fire_err_trap_different_signal_in_flight_does_not_suppress() {
+        // firing_trap is Some(Debug), but we're firing Err — should fire.
+        let mut shell = Shell::new();
+        shell.firing_trap = Some(TrapSignal::Debug);
+        shell.traps.insert(TrapSignal::Err, Some("FOO=err_ran".to_string()));
+        fire_err_trap(&mut shell);
+        assert_eq!(shell.get("FOO"), Some("err_ran"));
+        // firing_trap restored to its previous value (Debug) after the
+        // ERR action finished.
+        assert_eq!(shell.firing_trap, Some(TrapSignal::Debug));
+    }
+
+    #[test]
+    fn clear_for_subshell_resets_firing_trap_and_err_depth() {
+        let mut shell = Shell::new();
+        shell.firing_trap = Some(TrapSignal::Err);
+        shell.err_suppressed_depth = 5;
+        clear_for_subshell(&mut shell);
+        assert_eq!(shell.firing_trap, None);
+        assert_eq!(shell.err_suppressed_depth, 0);
     }
 }
