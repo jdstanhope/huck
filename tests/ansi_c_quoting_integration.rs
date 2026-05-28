@@ -48,15 +48,9 @@ fn ansi_c_hex_escapes_form_string() {
 
 #[test]
 fn ansi_c_in_assignment_then_double_quoted_expansion() {
-    // x=$'\n'; echo "[$x]" → "[<NL>]" i.e. "[\n]\n"
+    // x=$'\n'; echo "[$x]" → "[<NL>]" — exact stdout is "[\n]\n"
     let (out, _) = run("x=$'\\n'\necho \"[$x]\"\nexit\n");
-    // Expect a line "[" then a line "]"
-    let lines: Vec<&str> = out.lines().collect();
-    assert!(
-        lines.contains(&"[") && lines.contains(&"]"),
-        "stdout: {:?}",
-        out
-    );
+    assert_eq!(out, "[\n]\n", "stdout: {:?}", out);
 }
 
 #[test]
