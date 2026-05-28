@@ -102,3 +102,21 @@ fn arith_post_increment_in_expression() {
     let sixes = lines.iter().filter(|l| ***l == *"6").count();
     assert_eq!(sixes, 2, "expected two '6' lines; stdout: {out}");
 }
+
+#[test]
+fn arith_shift_assign() {
+    // a=1; a <<= 3 → 1 * 2^3 = 8. Both echo lines print "8".
+    let (out, _) = run("a=1\necho $((a <<= 3))\necho $a\nexit\n");
+    let lines: Vec<&str> = out.lines().collect();
+    let eights = lines.iter().filter(|l| ***l == *"8").count();
+    assert_eq!(eights, 2, "expected two '8' lines; stdout: {out}");
+}
+
+#[test]
+fn arith_prefix_decrement() {
+    // a=5; --a → 4 (pre-decrement returns new value). $a is 4 after.
+    let (out, _) = run("a=5\necho $((--a))\necho $a\nexit\n");
+    let lines: Vec<&str> = out.lines().collect();
+    let fours = lines.iter().filter(|l| ***l == *"4").count();
+    assert_eq!(fours, 2, "expected two '4' lines; stdout: {out}");
+}
