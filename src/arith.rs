@@ -9,6 +9,95 @@ pub(crate) enum ArithToken {
     Eq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Bang,
     Question, Colon,
+    // v38 — bitwise & shift:
+    Amp, Pipe, Caret, Tilde,
+    Shl, Shr,
+    // v38 — power:
+    Power,
+    // v38 — assignment:
+    Assign,
+    PlusEq, MinusEq, StarEq,
+    SlashEq, PercentEq,
+    ShlEq, ShrEq,
+    AmpEq, CaretEq, PipeEq,
+    // v38 — inc/dec:
+    PlusPlus, MinusMinus,
+}
+
+/// Parses hex digits 0-9, a-f, A-F after the `0x` / `0X` prefix has
+/// been consumed. Returns the i64 value. Errors on no digits, invalid
+/// digits, or out-of-range value.
+fn parse_hex_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<i64, ArithError> {
+    let mut s = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_hexdigit() {
+            s.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        return Err(ArithError::Parse("hex literal requires at least one digit".to_string()));
+    }
+    i64::from_str_radix(&s, 16).map_err(|_|
+        ArithError::Parse(format!("hex literal out of range: 0x{s}")))
+}
+
+/// Parses base-N digits after the `N#` prefix has been consumed. The
+/// digit alphabet (matches bash):
+///   0-9 → 0-9
+///   a-z → 10-35
+///   A-Z → 36-61
+///   @   → 62
+///   _   → 63
+/// For bases ≤ 36, a-z and A-Z are both valid as 10-35 (case-insensitive).
+/// For bases > 36, a-z (10-35) and A-Z (36-61) are distinct.
+fn parse_base_n_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    base: u32,
+) -> Result<i64, ArithError> {
+    let mut value: i64 = 0;
+    let mut any_digit = false;
+    while let Some(&c) = chars.peek() {
+        let digit = match c {
+            '0'..='9' => (c as u32) - ('0' as u32),
+            'a'..='z' => (c as u32) - ('a' as u32) + 10,
+            'A'..='Z' => {
+                if base <= 36 {
+                    // Case-insensitive: A-Z → 10-35.
+                    (c as u32) - ('A' as u32) + 10
+                } else {
+                    // Case-sensitive: A-Z → 36-61.
+                    (c as u32) - ('A' as u32) + 36
+                }
+            }
+            '@' => 62,
+            '_' => 63,
+            _ => break,
+        };
+        if digit >= base {
+            return Err(ArithError::Parse(format!(
+                "invalid digit for base {base}: '{c}'"
+            )));
+        }
+        value = value
+            .checked_mul(base as i64)
+            .and_then(|v| v.checked_add(digit as i64))
+            .ok_or_else(|| ArithError::Parse(format!(
+                "base-{base} literal out of range"
+            )))?;
+        any_digit = true;
+        chars.next();
+    }
+    if !any_digit {
+        return Err(ArithError::Parse(format!(
+            "base-{base} literal requires at least one digit"
+        )));
+    }
+    Ok(value)
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
@@ -18,12 +107,38 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
         match c {
             ' ' | '\t' | '\n' | '\r' => { chars.next(); }
             '0'..='9' => {
-                let mut s = String::new();
+                // Read greedy leading decimal digits.
+                let mut digits = String::new();
                 while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                    if d.is_ascii_digit() { digits.push(d); chars.next(); } else { break; }
                 }
-                let n: i64 = s.parse().map_err(|_|
-                    ArithError::Parse(format!("integer literal out of range: {s}")))?;
+                let n: i64 = if chars.peek() == Some(&'#') {
+                    // Base-N literal: leading digits parsed as decimal base.
+                    chars.next();
+                    let base: u32 = digits.parse()
+                        .map_err(|_| ArithError::Parse(format!("invalid base: {digits}")))?;
+                    if !(2..=64).contains(&base) {
+                        return Err(ArithError::Parse(format!(
+                            "base must be 2-64, got {base}"
+                        )));
+                    }
+                    parse_base_n_digits(&mut chars, base)?
+                } else if digits == "0" && matches!(chars.peek(), Some('x') | Some('X')) {
+                    // Hex literal: 0x... / 0X...
+                    chars.next();
+                    parse_hex_digits(&mut chars)?
+                } else if digits.len() > 1 && digits.starts_with('0') {
+                    // Octal literal: 010 → 8. All digits must be 0-7.
+                    i64::from_str_radix(&digits, 8)
+                        .map_err(|_| ArithError::Parse(format!(
+                            "invalid octal literal: {digits}"
+                        )))?
+                } else {
+                    digits.parse()
+                        .map_err(|_| ArithError::Parse(format!(
+                            "integer literal out of range: {digits}"
+                        )))?
+                };
                 out.push(ArithToken::Number(n));
             }
             '$' => {
@@ -51,11 +166,48 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
             }
             '(' => { chars.next(); out.push(ArithToken::LParen); }
             ')' => { chars.next(); out.push(ArithToken::RParen); }
-            '+' => { chars.next(); out.push(ArithToken::Plus); }
-            '-' => { chars.next(); out.push(ArithToken::Minus); }
-            '*' => { chars.next(); out.push(ArithToken::Star); }
-            '/' => { chars.next(); out.push(ArithToken::Slash); }
-            '%' => { chars.next(); out.push(ArithToken::Percent); }
+            '+' => {
+                chars.next();
+                match chars.peek() {
+                    Some('+') => { chars.next(); out.push(ArithToken::PlusPlus); }
+                    Some('=') => { chars.next(); out.push(ArithToken::PlusEq); }
+                    _ => out.push(ArithToken::Plus),
+                }
+            }
+            '-' => {
+                chars.next();
+                match chars.peek() {
+                    Some('-') => { chars.next(); out.push(ArithToken::MinusMinus); }
+                    Some('=') => { chars.next(); out.push(ArithToken::MinusEq); }
+                    _ => out.push(ArithToken::Minus),
+                }
+            }
+            '*' => {
+                chars.next();
+                match chars.peek() {
+                    Some('*') => { chars.next(); out.push(ArithToken::Power); }
+                    Some('=') => { chars.next(); out.push(ArithToken::StarEq); }
+                    _ => out.push(ArithToken::Star),
+                }
+            }
+            '/' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::SlashEq);
+                } else {
+                    out.push(ArithToken::Slash);
+                }
+            }
+            '%' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::PercentEq);
+                } else {
+                    out.push(ArithToken::Percent);
+                }
+            }
             '?' => { chars.next(); out.push(ArithToken::Question); }
             ':' => { chars.next(); out.push(ArithToken::Colon); }
             '!' => {
@@ -73,48 +225,69 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                     chars.next();
                     out.push(ArithToken::Eq);
                 } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '=' (assignment is out of scope; did you mean '=='?)"
-                            .to_string()));
+                    out.push(ArithToken::Assign);
                 }
             }
             '<' => {
                 chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Le);
-                } else {
-                    out.push(ArithToken::Lt);
+                match chars.peek() {
+                    Some('<') => {
+                        chars.next();
+                        if chars.peek() == Some(&'=') {
+                            chars.next();
+                            out.push(ArithToken::ShlEq);
+                        } else {
+                            out.push(ArithToken::Shl);
+                        }
+                    }
+                    Some('=') => { chars.next(); out.push(ArithToken::Le); }
+                    _ => out.push(ArithToken::Lt),
                 }
             }
             '>' => {
                 chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Ge);
-                } else {
-                    out.push(ArithToken::Gt);
+                match chars.peek() {
+                    Some('>') => {
+                        chars.next();
+                        if chars.peek() == Some(&'=') {
+                            chars.next();
+                            out.push(ArithToken::ShrEq);
+                        } else {
+                            out.push(ArithToken::Shr);
+                        }
+                    }
+                    Some('=') => { chars.next(); out.push(ArithToken::Ge); }
+                    _ => out.push(ArithToken::Gt),
                 }
             }
             '&' => {
                 chars.next();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    out.push(ArithToken::AndAnd);
-                } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '&' (bitwise operators are out of scope)".to_string()));
+                match chars.peek() {
+                    Some('&') => { chars.next(); out.push(ArithToken::AndAnd); }
+                    Some('=') => { chars.next(); out.push(ArithToken::AmpEq); }
+                    _ => out.push(ArithToken::Amp),
                 }
             }
             '|' => {
                 chars.next();
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    out.push(ArithToken::OrOr);
-                } else {
-                    return Err(ArithError::Parse(
-                        "unexpected '|' (bitwise operators are out of scope)".to_string()));
+                match chars.peek() {
+                    Some('|') => { chars.next(); out.push(ArithToken::OrOr); }
+                    Some('=') => { chars.next(); out.push(ArithToken::PipeEq); }
+                    _ => out.push(ArithToken::Pipe),
                 }
+            }
+            '^' => {
+                chars.next();
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    out.push(ArithToken::CaretEq);
+                } else {
+                    out.push(ArithToken::Caret);
+                }
+            }
+            '~' => {
+                chars.next();
+                out.push(ArithToken::Tilde);
             }
             other => {
                 return Err(ArithError::Parse(format!("unexpected character: {other:?}")));
@@ -122,6 +295,21 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
         }
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    Set,    // =
+    Add,    // +=
+    Sub,    // -=
+    Mul,    // *=
+    Div,    // /=
+    Mod,    // %=
+    Shl,    // <<=
+    Shr,    // >>=
+    BitAnd, // &=
+    BitXor, // ^=
+    BitOr,  // |=
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +332,22 @@ pub enum ArithExpr {
     And(Box<ArithExpr>, Box<ArithExpr>),
     Or(Box<ArithExpr>, Box<ArithExpr>),
     Ternary(Box<ArithExpr>, Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — bitwise binops:
+    BitAnd(Box<ArithExpr>, Box<ArithExpr>),
+    BitOr(Box<ArithExpr>, Box<ArithExpr>),
+    BitXor(Box<ArithExpr>, Box<ArithExpr>),
+    BitNot(Box<ArithExpr>),
+    Shl(Box<ArithExpr>, Box<ArithExpr>),
+    Shr(Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — power (right-associative):
+    Pow(Box<ArithExpr>, Box<ArithExpr>),
+    // v38 — assignment (LHS must be a Var; enforced at parse time):
+    Assign { name: String, op: AssignOp, rhs: Box<ArithExpr> },
+    // v38 — pre/post inc/dec (LHS must be a Var):
+    PreInc(String),
+    PreDec(String),
+    PostInc(String),
+    PostDec(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +356,8 @@ pub enum ArithError {
     DivisionByZero,
     ModuloByZero,
     NotAnInteger { var: String, value: String },
+    NegativeExponent,
+    ShiftCountOutOfRange { count: i64 },
 }
 
 impl std::fmt::Display for ArithError {
@@ -162,6 +368,9 @@ impl std::fmt::Display for ArithError {
             Self::ModuloByZero => write!(f, "modulo by zero"),
             Self::NotAnInteger { var, value } =>
                 write!(f, "variable '{var}' is not an integer: '{value}'"),
+            Self::NegativeExponent => write!(f, "exponentiation with negative exponent"),
+            Self::ShiftCountOutOfRange { count } =>
+                write!(f, "shift count out of range: {count}"),
         }
     }
 }
@@ -187,6 +396,25 @@ struct Parser {
 /// binding power, and the AST constructor for the binary node.
 type BinOpEntry = (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr);
 
+/// Maps an assignment token to its corresponding AssignOp variant.
+/// Returns None for non-assignment tokens.
+fn assign_op_from_token(t: &ArithToken) -> Option<AssignOp> {
+    match t {
+        ArithToken::Assign     => Some(AssignOp::Set),
+        ArithToken::PlusEq     => Some(AssignOp::Add),
+        ArithToken::MinusEq    => Some(AssignOp::Sub),
+        ArithToken::StarEq     => Some(AssignOp::Mul),
+        ArithToken::SlashEq    => Some(AssignOp::Div),
+        ArithToken::PercentEq  => Some(AssignOp::Mod),
+        ArithToken::ShlEq      => Some(AssignOp::Shl),
+        ArithToken::ShrEq      => Some(AssignOp::Shr),
+        ArithToken::AmpEq      => Some(AssignOp::BitAnd),
+        ArithToken::CaretEq    => Some(AssignOp::BitXor),
+        ArithToken::PipeEq     => Some(AssignOp::BitOr),
+        _ => None,
+    }
+}
+
 impl Parser {
     fn peek(&self) -> Option<&ArithToken> {
         self.tokens.get(self.pos)
@@ -201,8 +429,42 @@ impl Parser {
     fn parse_expr(&mut self, min_bp: u8) -> Result<ArithExpr, ArithError> {
         let mut lhs = self.parse_prefix()?;
         while let Some(op) = self.peek().cloned() {
-            // Ternary: `cond ? then : else`. Right-associative, lowest binding power.
-            if op == ArithToken::Question && min_bp <= 1 {
+
+            // 1. Postfix ++/-- (BP 27 — highest). Must come before infix
+            //    handling so a++ + 1 parses as (a++) + 1.
+            if matches!(op, ArithToken::PlusPlus | ArithToken::MinusMinus) && 27 >= min_bp {
+                self.bump();
+                let name = match lhs {
+                    ArithExpr::Var(name) => name,
+                    _ => return Err(ArithError::Parse(
+                        "postfix ++/-- requires variable on LHS".to_string()
+                    )),
+                };
+                lhs = match op {
+                    ArithToken::PlusPlus => ArithExpr::PostInc(name),
+                    _ => ArithExpr::PostDec(name),
+                };
+                continue;
+            }
+
+            // 2. Assignment (lbp = 2, rbp = 1 — right-associative).
+            //    LHS must be a Var.
+            if let Some(assign_op) = assign_op_from_token(&op) {
+                if 2 < min_bp { break; }
+                self.bump();
+                let name = match lhs {
+                    ArithExpr::Var(name) => name,
+                    _ => return Err(ArithError::Parse(
+                        "assignment requires variable on LHS".to_string()
+                    )),
+                };
+                let rhs = self.parse_expr(1)?;  // rbp = 1 allows cascading assigns
+                lhs = ArithExpr::Assign { name, op: assign_op, rhs: Box::new(rhs) };
+                continue;
+            }
+
+            // 3. Ternary (BP 3 — right-associative, special-cased like assignment).
+            if op == ArithToken::Question && 3 >= min_bp {
                 self.bump();
                 let then_branch = self.parse_expr(0)?;
                 match self.bump() {
@@ -211,29 +473,44 @@ impl Parser {
                         "expected ':' in ternary, got {other:?}"
                     ))),
                 }
-                let else_branch = self.parse_expr(1)?;
-                lhs = ArithExpr::Ternary(Box::new(lhs), Box::new(then_branch), Box::new(else_branch));
+                let else_branch = self.parse_expr(3)?;  // rbp = 3 for right-assoc
+                lhs = ArithExpr::Ternary(
+                    Box::new(lhs), Box::new(then_branch), Box::new(else_branch)
+                );
                 continue;
             }
+
+            // 4. Power ** (lbp = 25, rbp = 24 — right-associative).
+            if op == ArithToken::Power && 25 >= min_bp {
+                self.bump();
+                let rhs = self.parse_expr(24)?;
+                lhs = ArithExpr::Pow(Box::new(lhs), Box::new(rhs));
+                continue;
+            }
+
+            // 5. Standard left-associative binops via the precedence table.
             let (lbp, rbp, make): BinOpEntry = match op {
-                ArithToken::OrOr   => (2, 3, ArithExpr::Or),
-                ArithToken::AndAnd => (4, 5, ArithExpr::And),
-                ArithToken::Eq     => (6, 7, ArithExpr::Eq),
-                ArithToken::Ne     => (6, 7, ArithExpr::Ne),
-                ArithToken::Lt     => (8, 9, ArithExpr::Lt),
-                ArithToken::Le     => (8, 9, ArithExpr::Le),
-                ArithToken::Gt     => (8, 9, ArithExpr::Gt),
-                ArithToken::Ge     => (8, 9, ArithExpr::Ge),
-                ArithToken::Plus   => (10, 11, ArithExpr::Add),
-                ArithToken::Minus  => (10, 11, ArithExpr::Sub),
-                ArithToken::Star   => (12, 13, ArithExpr::Mul),
-                ArithToken::Slash  => (12, 13, ArithExpr::Div),
-                ArithToken::Percent => (12, 13, ArithExpr::Mod),
+                ArithToken::OrOr    => (4, 5, ArithExpr::Or),
+                ArithToken::AndAnd  => (6, 7, ArithExpr::And),
+                ArithToken::Pipe    => (8, 9, ArithExpr::BitOr),
+                ArithToken::Caret   => (10, 11, ArithExpr::BitXor),
+                ArithToken::Amp     => (12, 13, ArithExpr::BitAnd),
+                ArithToken::Eq      => (14, 15, ArithExpr::Eq),
+                ArithToken::Ne      => (14, 15, ArithExpr::Ne),
+                ArithToken::Lt      => (16, 17, ArithExpr::Lt),
+                ArithToken::Le      => (16, 17, ArithExpr::Le),
+                ArithToken::Gt      => (16, 17, ArithExpr::Gt),
+                ArithToken::Ge      => (16, 17, ArithExpr::Ge),
+                ArithToken::Shl     => (18, 19, ArithExpr::Shl),
+                ArithToken::Shr     => (18, 19, ArithExpr::Shr),
+                ArithToken::Plus    => (20, 21, ArithExpr::Add),
+                ArithToken::Minus   => (20, 21, ArithExpr::Sub),
+                ArithToken::Star    => (22, 23, ArithExpr::Mul),
+                ArithToken::Slash   => (22, 23, ArithExpr::Div),
+                ArithToken::Percent => (22, 23, ArithExpr::Mod),
                 _ => break,
             };
-            if lbp < min_bp {
-                break;
-            }
+            if lbp < min_bp { break; }
             self.bump();
             let rhs = self.parse_expr(rbp)?;
             lhs = make(Box::new(lhs), Box::new(rhs));
@@ -246,15 +523,37 @@ impl Parser {
             Some(ArithToken::Number(n)) => Ok(ArithExpr::Num(n)),
             Some(ArithToken::Ident(s)) => Ok(ArithExpr::Var(s)),
             Some(ArithToken::Minus) => {
-                let inner = self.parse_expr(14)?;
+                let inner = self.parse_expr(26)?;
                 Ok(ArithExpr::Neg(Box::new(inner)))
             }
             Some(ArithToken::Plus) => {
-                self.parse_expr(14)
+                self.parse_expr(26)
             }
             Some(ArithToken::Bang) => {
-                let inner = self.parse_expr(14)?;
+                let inner = self.parse_expr(26)?;
                 Ok(ArithExpr::Not(Box::new(inner)))
+            }
+            Some(ArithToken::Tilde) => {
+                let inner = self.parse_expr(26)?;
+                Ok(ArithExpr::BitNot(Box::new(inner)))
+            }
+            Some(ArithToken::PlusPlus) => {
+                // ++name: prefix increment requires identifier next.
+                match self.bump() {
+                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreInc(name)),
+                    _ => Err(ArithError::Parse(
+                        "prefix ++ requires variable".to_string()
+                    )),
+                }
+            }
+            Some(ArithToken::MinusMinus) => {
+                // --name: prefix decrement requires identifier next.
+                match self.bump() {
+                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreDec(name)),
+                    _ => Err(ArithError::Parse(
+                        "prefix -- requires variable".to_string()
+                    )),
+                }
             }
             Some(ArithToken::LParen) => {
                 let inner = self.parse_expr(0)?;
@@ -275,7 +574,25 @@ impl Parser {
 
 use crate::shell_state::Shell;
 
-pub fn eval(expr: &ArithExpr, shell: &Shell) -> Result<i64, ArithError> {
+/// Reads a shell variable's current i64 value. Returns 0 if unset or
+/// empty (matches existing eval Var behavior).
+fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
+    let raw = shell.lookup_var(name).unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+        var: name.to_string(),
+        value: raw,
+    })
+}
+
+/// Writes an i64 back to a shell variable as a decimal string.
+fn write_var_i64(shell: &mut Shell, name: &str, value: i64) {
+    shell.set(name, value.to_string());
+}
+
+pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
     match expr {
         ArithExpr::Num(n) => Ok(*n),
         ArithExpr::Var(name) => {
@@ -332,6 +649,92 @@ pub fn eval(expr: &ArithExpr, shell: &Shell) -> Result<i64, ArithError> {
             } else {
                 eval(e, shell)
             }
+        }
+        ArithExpr::BitAnd(a, b) => Ok(eval(a, shell)? & eval(b, shell)?),
+        ArithExpr::BitOr(a, b)  => Ok(eval(a, shell)? | eval(b, shell)?),
+        ArithExpr::BitXor(a, b) => Ok(eval(a, shell)? ^ eval(b, shell)?),
+        ArithExpr::BitNot(e)    => Ok(!eval(e, shell)?),
+        ArithExpr::Shl(a, b) => {
+            let lhs = eval(a, shell)?;
+            let rhs = eval(b, shell)?;
+            if !(0..64).contains(&rhs) {
+                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+            }
+            Ok(lhs.wrapping_shl(rhs as u32))
+        }
+        ArithExpr::Shr(a, b) => {
+            let lhs = eval(a, shell)?;
+            let rhs = eval(b, shell)?;
+            if !(0..64).contains(&rhs) {
+                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+            }
+            Ok(lhs.wrapping_shr(rhs as u32))
+        }
+        ArithExpr::Pow(a, b) => {
+            let base = eval(a, shell)?;
+            let exp = eval(b, shell)?;
+            if exp < 0 {
+                return Err(ArithError::NegativeExponent);
+            }
+            Ok(base.wrapping_pow(exp as u32))
+        }
+        ArithExpr::Assign { name, op, rhs } => {
+            let rhs_val = eval(rhs, shell)?;
+            let new_val = match op {
+                AssignOp::Set    => rhs_val,
+                AssignOp::Add    => read_var_i64(shell, name)?.wrapping_add(rhs_val),
+                AssignOp::Sub    => read_var_i64(shell, name)?.wrapping_sub(rhs_val),
+                AssignOp::Mul    => read_var_i64(shell, name)?.wrapping_mul(rhs_val),
+                AssignOp::Div => {
+                    let lhs = read_var_i64(shell, name)?;
+                    if rhs_val == 0 { return Err(ArithError::DivisionByZero); }
+                    lhs.wrapping_div(rhs_val)
+                }
+                AssignOp::Mod => {
+                    let lhs = read_var_i64(shell, name)?;
+                    if rhs_val == 0 { return Err(ArithError::ModuloByZero); }
+                    lhs.wrapping_rem(rhs_val)
+                }
+                AssignOp::Shl => {
+                    let lhs = read_var_i64(shell, name)?;
+                    if !(0..64).contains(&rhs_val) {
+                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                    }
+                    lhs.wrapping_shl(rhs_val as u32)
+                }
+                AssignOp::Shr => {
+                    let lhs = read_var_i64(shell, name)?;
+                    if !(0..64).contains(&rhs_val) {
+                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                    }
+                    lhs.wrapping_shr(rhs_val as u32)
+                }
+                AssignOp::BitAnd => read_var_i64(shell, name)? & rhs_val,
+                AssignOp::BitXor => read_var_i64(shell, name)? ^ rhs_val,
+                AssignOp::BitOr  => read_var_i64(shell, name)? | rhs_val,
+            };
+            write_var_i64(shell, name, new_val);
+            Ok(new_val)
+        }
+        ArithExpr::PreInc(name) => {
+            let new_val = read_var_i64(shell, name)?.wrapping_add(1);
+            write_var_i64(shell, name, new_val);
+            Ok(new_val)
+        }
+        ArithExpr::PreDec(name) => {
+            let new_val = read_var_i64(shell, name)?.wrapping_sub(1);
+            write_var_i64(shell, name, new_val);
+            Ok(new_val)
+        }
+        ArithExpr::PostInc(name) => {
+            let old_val = read_var_i64(shell, name)?;
+            write_var_i64(shell, name, old_val.wrapping_add(1));
+            Ok(old_val)
+        }
+        ArithExpr::PostDec(name) => {
+            let old_val = read_var_i64(shell, name)?;
+            write_var_i64(shell, name, old_val.wrapping_sub(1));
+            Ok(old_val)
         }
     }
 }
@@ -447,15 +850,119 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_single_amp_is_parse_error() {
-        let err = tokenize("1 & 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+    fn tokenize_single_amp_is_bitwise_and() {
+        // v38: bare & is now bitwise AND (was: parse error).
+        assert_eq!(tokenize("1 & 2").unwrap(), vec![
+            ArithToken::Number(1), ArithToken::Amp, ArithToken::Number(2),
+        ]);
     }
 
     #[test]
-    fn tokenize_single_pipe_is_parse_error() {
-        let err = tokenize("1 | 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+    fn tokenize_single_pipe_is_bitwise_or() {
+        // v38: bare | is now bitwise OR (was: parse error).
+        assert_eq!(tokenize("1 | 2").unwrap(), vec![
+            ArithToken::Number(1), ArithToken::Pipe, ArithToken::Number(2),
+        ]);
+    }
+
+    #[test]
+    fn tokenize_hex_literal() {
+        assert_eq!(tokenize("0x10").unwrap(), vec![ArithToken::Number(16)]);
+    }
+
+    #[test]
+    fn tokenize_hex_literal_uppercase() {
+        assert_eq!(tokenize("0X1F").unwrap(), vec![ArithToken::Number(31)]);
+    }
+
+    #[test]
+    fn tokenize_octal_literal() {
+        assert_eq!(tokenize("010").unwrap(), vec![ArithToken::Number(8)]);
+    }
+
+    #[test]
+    fn tokenize_octal_invalid_digit_errors() {
+        // 08 has a digit (8) that's invalid for octal.
+        assert!(tokenize("08").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_binary() {
+        assert_eq!(tokenize("2#1010").unwrap(), vec![ArithToken::Number(10)]);
+    }
+
+    #[test]
+    fn tokenize_base_n_hex_via_pound() {
+        assert_eq!(tokenize("16#FF").unwrap(), vec![ArithToken::Number(255)]);
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_base_low_errors() {
+        assert!(tokenize("1#0").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_base_high_errors() {
+        assert!(tokenize("65#0").is_err());
+    }
+
+    #[test]
+    fn tokenize_base_n_invalid_digit_errors() {
+        // Base 8 cannot have digit 9.
+        assert!(tokenize("8#9").is_err());
+    }
+
+    #[test]
+    fn tokenize_bitwise_operators() {
+        assert_eq!(
+            tokenize("&|^~<<>>").unwrap(),
+            vec![
+                ArithToken::Amp, ArithToken::Pipe,
+                ArithToken::Caret, ArithToken::Tilde,
+                ArithToken::Shl, ArithToken::Shr,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_power_operator() {
+        assert_eq!(tokenize("2**3").unwrap(), vec![
+            ArithToken::Number(2), ArithToken::Power, ArithToken::Number(3),
+        ]);
+    }
+
+    #[test]
+    fn tokenize_compound_assignments() {
+        // = += -= *= /= %= <<= >>= &= ^= |=
+        let input = "= += -= *= /= %= <<= >>= &= ^= |=";
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens, vec![
+            ArithToken::Assign,
+            ArithToken::PlusEq, ArithToken::MinusEq, ArithToken::StarEq,
+            ArithToken::SlashEq, ArithToken::PercentEq,
+            ArithToken::ShlEq, ArithToken::ShrEq,
+            ArithToken::AmpEq, ArithToken::CaretEq, ArithToken::PipeEq,
+        ]);
+    }
+
+    #[test]
+    fn tokenize_inc_dec_operators() {
+        assert_eq!(tokenize("++ --").unwrap(), vec![
+            ArithToken::PlusPlus, ArithToken::MinusMinus,
+        ]);
+    }
+
+    #[test]
+    fn tokenize_distinguishes_eq_from_assign() {
+        assert_eq!(tokenize("==").unwrap(), vec![ArithToken::Eq]);
+        assert_eq!(tokenize("=").unwrap(), vec![ArithToken::Assign]);
+    }
+
+    #[test]
+    fn tokenize_distinguishes_lt_from_shl() {
+        assert_eq!(tokenize("<").unwrap(), vec![ArithToken::Lt]);
+        assert_eq!(tokenize("<<").unwrap(), vec![ArithToken::Shl]);
+        assert_eq!(tokenize("<<=").unwrap(), vec![ArithToken::ShlEq]);
     }
 
     fn n(x: i64) -> Box<ArithExpr> { Box::new(ArithExpr::Num(x)) }
@@ -506,8 +1013,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_double_unary_minus() {
-        assert_eq!(parse("--5").unwrap(), ArithExpr::Neg(Box::new(ArithExpr::Neg(n(5)))));
+    fn parse_double_minus_with_number_is_prefix_dec_error() {
+        // v38: -- is now MinusMinus (prefix decrement), which requires a
+        // variable name after it. --5 → parse error.
+        assert!(matches!(parse("--5"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_unary_minus_double_negation_uses_space() {
+        // To express double negation of a literal, use a space: - -5.
+        assert_eq!(parse("- -5").unwrap(), ArithExpr::Neg(Box::new(ArithExpr::Neg(n(5)))));
     }
 
     #[test]
@@ -570,159 +1085,255 @@ mod tests {
             ArithExpr::Add(v("x"), n(1)));
     }
 
+    #[test]
+    fn parse_bitwise_precedence_or_below_and() {
+        // 1 | 2 & 3 parses as 1 | (2 & 3) — & binds tighter than |.
+        let expr = parse("1 | 2 & 3").unwrap();
+        assert_eq!(expr, ArithExpr::BitOr(
+            n(1),
+            Box::new(ArithExpr::BitAnd(n(2), n(3))),
+        ));
+    }
+
+    #[test]
+    fn parse_shift_below_addition() {
+        // 1 + 2 << 3 parses as (1 + 2) << 3 — << has lower precedence than +.
+        let expr = parse("1 + 2 << 3").unwrap();
+        assert_eq!(expr, ArithExpr::Shl(
+            Box::new(ArithExpr::Add(n(1), n(2))),
+            n(3),
+        ));
+    }
+
+    #[test]
+    fn parse_power_right_associative() {
+        // 2 ** 3 ** 2 parses as Pow(2, Pow(3, 2)).
+        let expr = parse("2 ** 3 ** 2").unwrap();
+        assert_eq!(expr, ArithExpr::Pow(
+            n(2),
+            Box::new(ArithExpr::Pow(n(3), n(2))),
+        ));
+    }
+
+    #[test]
+    fn parse_assignment_right_associative() {
+        // a = b = 5 parses as Assign(a, Set, Assign(b, Set, 5)).
+        let expr = parse("a = b = 5").unwrap();
+        assert_eq!(expr, ArithExpr::Assign {
+            name: "a".to_string(),
+            op: AssignOp::Set,
+            rhs: Box::new(ArithExpr::Assign {
+                name: "b".to_string(),
+                op: AssignOp::Set,
+                rhs: n(5),
+            }),
+        });
+    }
+
+    #[test]
+    fn parse_assignment_lhs_must_be_var() {
+        // (a + b) = 5 → parse error (LHS not a Var).
+        assert!(matches!(parse("(a + b) = 5"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_postfix_lhs_must_be_var() {
+        // (a + b)++ → parse error.
+        assert!(matches!(parse("(a + b)++"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_compound_assignment_all_forms() {
+        // All 11 compound assignment forms.
+        let cases = [
+            ("a = 1", AssignOp::Set),
+            ("a += 1", AssignOp::Add),
+            ("a -= 1", AssignOp::Sub),
+            ("a *= 1", AssignOp::Mul),
+            ("a /= 1", AssignOp::Div),
+            ("a %= 1", AssignOp::Mod),
+            ("a <<= 1", AssignOp::Shl),
+            ("a >>= 1", AssignOp::Shr),
+            ("a &= 1", AssignOp::BitAnd),
+            ("a ^= 1", AssignOp::BitXor),
+            ("a |= 1", AssignOp::BitOr),
+        ];
+        for (input, expected_op) in cases {
+            let expr = parse(input).unwrap();
+            match expr {
+                ArithExpr::Assign { name, op, rhs } => {
+                    assert_eq!(name, "a", "for input {input}");
+                    assert_eq!(op, expected_op, "for input {input}");
+                    assert_eq!(*rhs, ArithExpr::Num(1), "for input {input}");
+                }
+                other => panic!("expected Assign for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_pre_post_inc_dec() {
+        assert_eq!(parse("++a").unwrap(), ArithExpr::PreInc("a".to_string()));
+        assert_eq!(parse("--a").unwrap(), ArithExpr::PreDec("a".to_string()));
+        assert_eq!(parse("a++").unwrap(), ArithExpr::PostInc("a".to_string()));
+        assert_eq!(parse("a--").unwrap(), ArithExpr::PostDec("a".to_string()));
+    }
+
     use crate::shell_state::Shell;
 
-    fn eval_str(s: &str, shell: &Shell) -> Result<i64, ArithError> {
+    fn eval_str(s: &str, shell: &mut Shell) -> Result<i64, ArithError> {
         eval(&parse(s).unwrap(), shell)
     }
 
     #[test]
     fn eval_number_literal() {
-        let s = Shell::new();
-        assert_eq!(eval_str("42", &s).unwrap(), 42);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("42", &mut s).unwrap(), 42);
     }
 
     #[test]
     fn eval_addition() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1+2", &s).unwrap(), 3);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1+2", &mut s).unwrap(), 3);
     }
 
     #[test]
     fn eval_precedence() {
-        let s = Shell::new();
-        assert_eq!(eval_str("2+3*4", &s).unwrap(), 14);
-        assert_eq!(eval_str("(2+3)*4", &s).unwrap(), 20);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("2+3*4", &mut s).unwrap(), 14);
+        assert_eq!(eval_str("(2+3)*4", &mut s).unwrap(), 20);
     }
 
     #[test]
     fn eval_subtraction_left_assoc() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1-2-3", &s).unwrap(), -4);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1-2-3", &mut s).unwrap(), -4);
     }
 
     #[test]
     fn eval_unary_minus() {
-        let s = Shell::new();
-        assert_eq!(eval_str("-5", &s).unwrap(), -5);
-        assert_eq!(eval_str("--5", &s).unwrap(), 5);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("-5", &mut s).unwrap(), -5);
+        // v38: "--5" now parses as prefix-decrement on a literal → error.
+        // Use "- -5" (with space) for explicit double-negation.
+        assert_eq!(eval_str("- -5", &mut s).unwrap(), 5);
     }
 
     #[test]
     fn eval_division_truncates_toward_zero() {
-        let s = Shell::new();
-        assert_eq!(eval_str("7/2", &s).unwrap(), 3);
-        assert_eq!(eval_str("-7/2", &s).unwrap(), -3);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("7/2", &mut s).unwrap(), 3);
+        assert_eq!(eval_str("-7/2", &mut s).unwrap(), -3);
     }
 
     #[test]
     fn eval_modulo() {
-        let s = Shell::new();
-        assert_eq!(eval_str("7%3", &s).unwrap(), 1);
-        assert_eq!(eval_str("-7%3", &s).unwrap(), -1);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("7%3", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("-7%3", &mut s).unwrap(), -1);
     }
 
     #[test]
     fn eval_division_by_zero() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1/0", &s).unwrap_err(), ArithError::DivisionByZero);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError::DivisionByZero);
     }
 
     #[test]
     fn eval_modulo_by_zero() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1%0", &s).unwrap_err(), ArithError::ModuloByZero);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError::ModuloByZero);
     }
 
     #[test]
     fn eval_comparison_returns_one_or_zero() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1<2", &s).unwrap(), 1);
-        assert_eq!(eval_str("2<1", &s).unwrap(), 0);
-        assert_eq!(eval_str("1==1", &s).unwrap(), 1);
-        assert_eq!(eval_str("1!=1", &s).unwrap(), 0);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1<2", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("2<1", &mut s).unwrap(), 0);
+        assert_eq!(eval_str("1==1", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("1!=1", &mut s).unwrap(), 0);
     }
 
     #[test]
     fn eval_logical_not() {
-        let s = Shell::new();
-        assert_eq!(eval_str("!0", &s).unwrap(), 1);
-        assert_eq!(eval_str("!5", &s).unwrap(), 0);
-        assert_eq!(eval_str("!!5", &s).unwrap(), 1);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("!0", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("!5", &mut s).unwrap(), 0);
+        assert_eq!(eval_str("!!5", &mut s).unwrap(), 1);
     }
 
     #[test]
     fn eval_logical_and_short_circuits() {
-        let s = Shell::new();
-        assert_eq!(eval_str("0 && 1/0", &s).unwrap(), 0);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("0 && 1/0", &mut s).unwrap(), 0);
     }
 
     #[test]
     fn eval_logical_or_short_circuits() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1 || 1/0", &s).unwrap(), 1);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1 || 1/0", &mut s).unwrap(), 1);
     }
 
     #[test]
     fn eval_logical_and_returns_one_when_both_truthy() {
-        let s = Shell::new();
-        assert_eq!(eval_str("5 && 3", &s).unwrap(), 1);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("5 && 3", &mut s).unwrap(), 1);
     }
 
     #[test]
     fn eval_logical_or_returns_one_when_either_truthy() {
-        let s = Shell::new();
-        assert_eq!(eval_str("0 || 3", &s).unwrap(), 1);
-        assert_eq!(eval_str("0 || 0", &s).unwrap(), 0);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("0 || 3", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("0 || 0", &mut s).unwrap(), 0);
     }
 
     #[test]
     fn eval_ternary() {
-        let s = Shell::new();
-        assert_eq!(eval_str("1 ? 42 : 99", &s).unwrap(), 42);
-        assert_eq!(eval_str("0 ? 42 : 99", &s).unwrap(), 99);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1 ? 42 : 99", &mut s).unwrap(), 42);
+        assert_eq!(eval_str("0 ? 42 : 99", &mut s).unwrap(), 99);
     }
 
     #[test]
     fn eval_overflow_wraps() {
-        let s = Shell::new();
+        let mut s = Shell::new();
         let max = i64::MAX.to_string();
         let expr = format!("{max} + 1");
-        assert_eq!(eval_str(&expr, &s).unwrap(), i64::MIN);
+        assert_eq!(eval_str(&expr, &mut s).unwrap(), i64::MIN);
     }
 
     #[test]
     fn eval_unset_var_is_zero() {
-        let s = Shell::new();
-        assert_eq!(eval_str("HUCK_TEST_UNSET_ARITH + 5", &s).unwrap(), 5);
+        let mut s = Shell::new();
+        assert_eq!(eval_str("HUCK_TEST_UNSET_ARITH + 5", &mut s).unwrap(), 5);
     }
 
     #[test]
     fn eval_set_var_lookup() {
         let mut s = Shell::new();
         s.export_set("HUCK_TEST_ARITH_X", "10".to_string());
-        assert_eq!(eval_str("HUCK_TEST_ARITH_X * 2", &s).unwrap(), 20);
+        assert_eq!(eval_str("HUCK_TEST_ARITH_X * 2", &mut s).unwrap(), 20);
     }
 
     #[test]
     fn eval_var_with_dollar_prefix_same_as_bare() {
         let mut s = Shell::new();
         s.export_set("HUCK_TEST_ARITH_Y", "7".to_string());
-        assert_eq!(eval_str("$HUCK_TEST_ARITH_Y + 1", &s).unwrap(), 8);
+        assert_eq!(eval_str("$HUCK_TEST_ARITH_Y + 1", &mut s).unwrap(), 8);
     }
 
     #[test]
     fn eval_empty_var_is_zero() {
         let mut s = Shell::new();
         s.export_set("HUCK_TEST_ARITH_EMPTY", "".to_string());
-        assert_eq!(eval_str("HUCK_TEST_ARITH_EMPTY + 3", &s).unwrap(), 3);
+        assert_eq!(eval_str("HUCK_TEST_ARITH_EMPTY + 3", &mut s).unwrap(), 3);
     }
 
     #[test]
     fn eval_non_integer_var_is_error() {
         let mut s = Shell::new();
         s.export_set("HUCK_TEST_ARITH_BAD", "abc".to_string());
-        let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &s).unwrap_err();
+        let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap_err();
         assert_eq!(
             err,
             ArithError::NotAnInteger {
@@ -730,5 +1341,124 @@ mod tests {
                 value: "abc".to_string()
             }
         );
+    }
+
+    #[test]
+    fn eval_bitwise_and() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("0xF0 & 0x0F", &mut s).unwrap(), 0);
+        assert_eq!(eval_str("0xFF & 0x33", &mut s).unwrap(), 0x33);
+    }
+
+    #[test]
+    fn eval_bitwise_or() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("0xF0 | 0x0F", &mut s).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn eval_bitwise_xor() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("0xFF ^ 0x0F", &mut s).unwrap(), 0xF0);
+    }
+
+    #[test]
+    fn eval_bitwise_not() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("~0", &mut s).unwrap(), -1);
+        assert_eq!(eval_str("~(-1)", &mut s).unwrap(), 0);
+    }
+
+    #[test]
+    fn eval_left_shift() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1 << 4", &mut s).unwrap(), 16);
+        assert_eq!(eval_str("1 << 0", &mut s).unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_arithmetic_right_shift_preserves_sign() {
+        let mut s = Shell::new();
+        // Rust's i64 >> is arithmetic right shift; sign bit replicates.
+        assert_eq!(eval_str("(-8) >> 1", &mut s).unwrap(), -4);
+        assert_eq!(eval_str("16 >> 2", &mut s).unwrap(), 4);
+    }
+
+    #[test]
+    fn eval_shift_negative_count_errors() {
+        let mut s = Shell::new();
+        assert!(matches!(
+            eval_str("1 << -1", &mut s),
+            Err(ArithError::ShiftCountOutOfRange { count: -1 })
+        ));
+    }
+
+    #[test]
+    fn eval_shift_count_64_or_more_errors() {
+        let mut s = Shell::new();
+        assert!(matches!(
+            eval_str("1 << 64", &mut s),
+            Err(ArithError::ShiftCountOutOfRange { count: 64 })
+        ));
+    }
+
+    #[test]
+    fn eval_pow_basic() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("2 ** 10", &mut s).unwrap(), 1024);
+    }
+
+    #[test]
+    fn eval_pow_zero_exponent() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("5 ** 0", &mut s).unwrap(), 1);
+        assert_eq!(eval_str("0 ** 0", &mut s).unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_pow_negative_exponent_errors() {
+        let mut s = Shell::new();
+        assert!(matches!(
+            eval_str("2 ** -1", &mut s),
+            Err(ArithError::NegativeExponent)
+        ));
+    }
+
+    #[test]
+    fn eval_assign_basic_mutates_shell() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("a = 5", &mut s).unwrap(), 5);
+        assert_eq!(s.lookup_var("a"), Some("5".to_string()));
+    }
+
+    #[test]
+    fn eval_assign_compound_add() {
+        let mut s = Shell::new();
+        s.set("a", "3".to_string());
+        assert_eq!(eval_str("a += 4", &mut s).unwrap(), 7);
+        assert_eq!(s.lookup_var("a"), Some("7".to_string()));
+    }
+
+    #[test]
+    fn eval_assign_div_by_zero_errors() {
+        let mut s = Shell::new();
+        s.set("a", "10".to_string());
+        assert!(matches!(eval_str("a /= 0", &mut s), Err(ArithError::DivisionByZero)));
+    }
+
+    #[test]
+    fn eval_pre_inc_returns_new_value() {
+        let mut s = Shell::new();
+        s.set("a", "5".to_string());
+        assert_eq!(eval_str("++a", &mut s).unwrap(), 6);
+        assert_eq!(s.lookup_var("a"), Some("6".to_string()));
+    }
+
+    #[test]
+    fn eval_post_inc_returns_old_value() {
+        let mut s = Shell::new();
+        s.set("a", "5".to_string());
+        assert_eq!(eval_str("a++", &mut s).unwrap(), 5);
+        assert_eq!(s.lookup_var("a"), Some("6".to_string()));
     }
 }
