@@ -801,6 +801,11 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     if matches!(args.first().map(|s| s.as_str()), Some("-l")) {
         return handle_kill_l(&args[1..], out);
     }
+    match args.first().map(|s| s.as_str()) {
+        Some("-s") => return kill_with_s_flag(&args[1..], shell),
+        Some("-n") => return kill_with_n_flag(&args[1..], shell),
+        _ => {}
+    }
     let (sig, targets) = if let Some(first) = args.first() {
         if let Some(rest) = first.strip_prefix('-') {
             // -<sig> form
@@ -819,7 +824,7 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
                 },
             };
             if args.len() < 2 {
-                eprintln!("huck: kill: usage: kill [-sig] pid | %job ...");
+                eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
                 return ExecOutcome::Continue(2);
             }
             (sig, &args[1..])
@@ -827,10 +832,79 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             (libc::SIGTERM, args)
         }
     } else {
-        eprintln!("huck: kill: usage: kill [-sig] pid | %job ...");
+        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     };
 
+    send_signal_to_targets(sig, targets, shell)
+}
+
+/// Handles `kill -s SIGNAME [targets...]`. The `-s` token has already
+/// been consumed by the dispatcher; `args` is everything after it.
+fn kill_with_s_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let name = match args.first() {
+        Some(n) => n,
+        None => {
+            eprintln!("huck: kill: -s: option requires an argument");
+            return ExecOutcome::Continue(2);
+        }
+    };
+    let sig = match signal_by_name(name) {
+        Some(n) => n,
+        None => {
+            eprintln!("huck: kill: {name}: invalid signal specification");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let targets = &args[1..];
+    if targets.is_empty() {
+        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        return ExecOutcome::Continue(2);
+    }
+    send_signal_to_targets(sig, targets, shell)
+}
+
+/// Handles `kill -n SIGNUM [targets...]`. The `-n` token has already
+/// been consumed by the dispatcher; `args` is everything after it.
+/// Number must be in `killable_signals()` (matching `kill -l`'s set).
+fn kill_with_n_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let num_arg = match args.first() {
+        Some(s) => s,
+        None => {
+            eprintln!("huck: kill: -n: option requires an argument");
+            return ExecOutcome::Continue(2);
+        }
+    };
+    let n = match num_arg.parse::<i32>() {
+        Ok(n) if (1..=64).contains(&n) => n,
+        _ => {
+            eprintln!("huck: kill: {num_arg}: invalid signal specification");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    if !crate::traps::killable_signals()
+        .iter()
+        .any(|(_, num)| *num == n)
+    {
+        eprintln!("huck: kill: {num_arg}: invalid signal specification");
+        return ExecOutcome::Continue(1);
+    }
+    let targets = &args[1..];
+    if targets.is_empty() {
+        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        return ExecOutcome::Continue(2);
+    }
+    send_signal_to_targets(n, targets, shell)
+}
+
+/// Sends `sig` to each target (`%spec` or PID). Returns `Continue(1)`
+/// if any send failed (with errors already on stderr), `Continue(0)`
+/// otherwise. Shared between every kill dispatch arm.
+fn send_signal_to_targets(
+    sig: i32,
+    targets: &[String],
+    shell: &mut Shell,
+) -> ExecOutcome {
     let mut any_failed = false;
     for target in targets {
         if let Some(_rest) = target.strip_prefix('%') {
@@ -872,8 +946,11 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             }
         }
     }
-
-    if any_failed { ExecOutcome::Continue(1) } else { ExecOutcome::Continue(0) }
+    if any_failed {
+        ExecOutcome::Continue(1)
+    } else {
+        ExecOutcome::Continue(0)
+    }
 }
 
 fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -2391,6 +2468,135 @@ mod kill_tests {
         assert_eq!(signal_by_name("WINCH"), Some(libc::SIGWINCH));
         assert_eq!(signal_by_name("SIGWINCH"), Some(libc::SIGWINCH));
         assert_eq!(signal_by_name("winch"), Some(libc::SIGWINCH));
+    }
+
+    #[test]
+    fn kill_s_with_name_resolves_and_dispatches() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let pid = unsafe { libc::getpid() }.to_string();
+        let outcome = run_builtin(
+            "kill",
+            &["-s".to_string(), "WINCH".to_string(), pid],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn kill_s_with_sig_prefix_resolves() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let pid = unsafe { libc::getpid() }.to_string();
+        let outcome = run_builtin(
+            "kill",
+            &["-s".to_string(), "SIGWINCH".to_string(), pid],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn kill_s_lowercase_name_resolves() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let pid = unsafe { libc::getpid() }.to_string();
+        let outcome = run_builtin(
+            "kill",
+            &["-s".to_string(), "winch".to_string(), pid],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn kill_s_missing_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["-s".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_s_invalid_name_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-s".to_string(), "BOGUS".to_string(), "99999".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_s_no_targets_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-s".to_string(), "TERM".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_n_with_number_resolves_and_dispatches() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let pid = unsafe { libc::getpid() }.to_string();
+        let outcome = run_builtin(
+            "kill",
+            &[
+                "-n".to_string(),
+                libc::SIGWINCH.to_string(),
+                pid,
+            ],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn kill_n_missing_arg_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("kill", &["-n".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn kill_n_invalid_number_returns_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "kill",
+            &["-n".to_string(), "99".to_string(), "12345".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn kill_dash_sig_short_form_still_works_after_refactor() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let pid = unsafe { libc::getpid() }.to_string();
+        let outcome = run_builtin(
+            "kill",
+            &["-WINCH".to_string(), pid],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 }
 
