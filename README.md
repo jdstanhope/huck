@@ -234,7 +234,7 @@ isolation).
 
 **Not yet implemented:**
 brace expansion (`{a,b,c}`), extended job specs
-(`%cmd`/`%?cmd`), `kill -s`, `disown -a`/`-r`/`-h`,
+(`%cmd`/`%?cmd`), `disown -a`/`-r`/`-h`,
 backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
 
 ## Project layout
