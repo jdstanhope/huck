@@ -12,6 +12,7 @@ pub enum LexError {
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
+    AnsiCInvalidCodepoint(u32),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -703,6 +704,11 @@ fn read_dollar_expansion(
             chars.next();
             read_braced_param_expansion(chars, parts, quoted)?;
         }
+        Some('\'') => {
+            chars.next();
+            let text = read_ansi_c_quoted(chars)?;
+            parts.push(WordPart::Literal { text, quoted: true });
+        }
         Some('?') => {
             chars.next();
             parts.push(WordPart::LastStatus { quoted });
@@ -740,6 +746,136 @@ fn read_dollar_expansion(
         }
     }
     Ok(())
+}
+
+/// Reads the body of a `$'...'` ANSI-C quoted string. The opening `$'` has
+/// already been consumed; this scans forward, processing C-style backslash
+/// escapes, until the matching unescaped `'` is consumed. Returns the
+/// decoded string.
+fn read_ansi_c_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedQuote),
+            Some('\'') => return Ok(out),
+            Some('\\') => decode_ansi_c_escape(chars, &mut out)?,
+            Some(c) => out.push(c),
+        }
+    }
+}
+
+/// Decodes a single backslash escape inside `$'...'` and appends the
+/// result to `out`. The leading `\` has already been consumed.
+fn decode_ansi_c_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+) -> Result<(), LexError> {
+    match chars.next() {
+        None => return Err(LexError::UnterminatedQuote),
+        Some('a') => out.push('\x07'),
+        Some('b') => out.push('\x08'),
+        Some('e') | Some('E') => out.push('\x1B'),
+        Some('f') => out.push('\x0C'),
+        Some('n') => out.push('\n'),
+        Some('r') => out.push('\r'),
+        Some('t') => out.push('\t'),
+        Some('v') => out.push('\x0B'),
+        Some('\\') => out.push('\\'),
+        Some('\'') => out.push('\''),
+        Some('"') => out.push('"'),
+        Some('?') => out.push('?'),
+        Some(c @ '0'..='7') => {
+            let mut v: u32 = c.to_digit(8).unwrap();
+            for _ in 0..2 {
+                match chars.peek().copied() {
+                    Some(d @ '0'..='7') => {
+                        chars.next();
+                        v = v * 8 + d.to_digit(8).unwrap();
+                    }
+                    _ => break,
+                }
+            }
+            push_codepoint(out, v)?;
+        }
+        Some('x') => {
+            if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
+                let v = scan_hex_digits(chars, 2);
+                push_codepoint(out, v)?;
+            } else {
+                out.push('\\');
+                out.push('x');
+            }
+        }
+        Some('u') => {
+            if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
+                let v = scan_hex_digits(chars, 4);
+                push_codepoint(out, v)?;
+            } else {
+                out.push('\\');
+                out.push('u');
+            }
+        }
+        Some('U') => {
+            if chars.peek().copied().is_some_and(|c| c.is_ascii_hexdigit()) {
+                let v = scan_hex_digits(chars, 8);
+                push_codepoint(out, v)?;
+            } else {
+                out.push('\\');
+                out.push('U');
+            }
+        }
+        Some('c') => match chars.next() {
+            None => {
+                out.push('\\');
+                out.push('c');
+            }
+            Some('?') => out.push('\x7F'),
+            Some('@') => out.push('\0'),
+            Some(c) => {
+                let v = (c.to_ascii_uppercase() as u32) & 0x1F;
+                push_codepoint(out, v)?;
+            }
+        },
+        Some(other) => {
+            out.push('\\');
+            out.push(other);
+        }
+    }
+    Ok(())
+}
+
+/// Reads up to `max` hex digits (greedy, stops at first non-hex char) and
+/// returns their value. Caller has already confirmed at least one hex
+/// digit is available.
+fn scan_hex_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max: u32,
+) -> u32 {
+    let mut v: u32 = 0;
+    for _ in 0..max {
+        match chars.peek().copied() {
+            Some(d) if d.is_ascii_hexdigit() => {
+                chars.next();
+                v = v.wrapping_mul(16) + d.to_digit(16).unwrap();
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Appends a codepoint to `out`, or errors if the value is not a valid
+/// Unicode scalar (surrogate range or > U+10FFFF).
+fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
+    match char::from_u32(v) {
+        Some(c) => {
+            out.push(c);
+            Ok(())
+        }
+        None => Err(LexError::AnsiCInvalidCodepoint(v)),
+    }
 }
 
 /// Reads the inner text of a `$((...))` arithmetic expansion. The opening
@@ -4126,5 +4262,144 @@ mod tests {
         if let WordPart::Var { name, .. } = part {
             assert_eq!(name, "#");
         } else { panic!("expected Var(#), got {part:?}") }
+    }
+
+    #[test]
+    fn ansi_c_quote_newline_escape() {
+        let toks = tokenize("$'a\\nb'").expect("lex");
+        // Single Word token with one quoted Literal containing "a\nb"
+        match &toks[0] {
+            Token::Word(Word(parts)) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    WordPart::Literal { text, quoted } => {
+                        assert_eq!(text, "a\nb");
+                        assert!(*quoted, "expected quoted Literal");
+                    }
+                    other => panic!("expected Literal, got {:?}", other),
+                }
+            }
+            other => panic!("expected Word token, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ansi_c_quote_tab_escape() {
+        let toks = tokenize("$'a\\tb'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "a\tb");
+        assert!(*quoted);
+    }
+
+    #[test]
+    fn ansi_c_quote_backslash_and_quote() {
+        // $'\\\'' → literal backslash + literal quote (two chars)
+        let toks = tokenize("$'\\\\\\''").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "\\'");
+    }
+
+    #[test]
+    fn ansi_c_quote_hex_escapes() {
+        // \x48\x69 → "Hi"
+        let toks = tokenize("$'\\x48\\x69'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "Hi");
+    }
+
+    #[test]
+    fn ansi_c_quote_octal_escapes() {
+        // \110\151 → "Hi"  (0o110=72='H', 0o151=105='i')
+        let toks = tokenize("$'\\110\\151'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "Hi");
+    }
+
+    #[test]
+    fn ansi_c_quote_octal_greedy_stops_at_non_octal() {
+        // \18 → \1 followed by literal '8' → "\x01" + "8"
+        let toks = tokenize("$'\\18'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "\x018");
+    }
+
+    #[test]
+    fn ansi_c_quote_unicode_4digit() {
+        // é → é (U+00E9, "LATIN SMALL LETTER E WITH ACUTE")
+        let toks = tokenize("$'\\u00e9'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "é");
+    }
+
+    #[test]
+    fn ansi_c_quote_unicode_8digit() {
+        // \U0001F600 → 😀 (grinning face)
+        let toks = tokenize("$'\\U0001F600'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "\u{1F600}");
+    }
+
+    #[test]
+    fn ansi_c_quote_control_chars() {
+        // \cA → \x01, \cZ → \x1A
+        let toks = tokenize("$'\\cA\\cZ'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "\x01\x1a");
+    }
+
+    #[test]
+    fn ansi_c_quote_unknown_escape_preserves_both() {
+        // \q → literal "\q" (two chars)
+        let toks = tokenize("$'\\q'").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "\\q");
+    }
+
+    #[test]
+    fn ansi_c_quote_empty() {
+        let toks = tokenize("$''").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal") };
+        assert_eq!(text, "");
+        assert!(*quoted);
+    }
+
+    #[test]
+    fn ansi_c_quote_unterminated_is_error() {
+        let err = tokenize("$'foo").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedQuote);
+    }
+
+    #[test]
+    fn ansi_c_quote_invalid_codepoint_is_error() {
+        // \uD800 is a surrogate, not a valid Unicode scalar
+        let err = tokenize("$'\\uD800'").unwrap_err();
+        assert_eq!(err, LexError::AnsiCInvalidCodepoint(0xD800));
+    }
+
+    #[test]
+    fn ansi_c_quote_concatenates_with_adjacent_word() {
+        // $'a\nb'foo → single Word with two Literal parts
+        let toks = tokenize("$'a\\nb'foo").expect("lex");
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        assert_eq!(parts.len(), 2);
+        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal at [0]") };
+        assert_eq!(text, "a\nb");
+        assert!(*quoted);
+        let WordPart::Literal { text, quoted } = &parts[1] else { panic!("expected Literal at [1]") };
+        assert_eq!(text, "foo");
+        assert!(!*quoted);
     }
 }

@@ -315,5 +315,8 @@ fn lex_error_message(error: LexError) -> String {
             format!(" in command substitution: {}", parse_error_message(inner))
         }
         LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
+        LexError::AnsiCInvalidCodepoint(v) => {
+            format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)
+        }
     }
 }
