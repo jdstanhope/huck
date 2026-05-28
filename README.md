@@ -45,6 +45,7 @@ spec, an implementation plan, and a test suite.
 | v35       | `trap` builtin (M-22 partial — EXIT + 13 real signals)            |
 | v36       | `trap` pseudo-signals ERR/DEBUG/RETURN (closes M-22)            |
 | v37       | Case modification `${var^^}` / `${var,,}` (M-17)               |
+| v38       | Arithmetic completion (M-55 + M-56 + M-57 + `**`)              |
 
 ## Build and run
 

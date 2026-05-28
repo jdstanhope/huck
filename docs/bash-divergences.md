@@ -161,9 +161,9 @@ group.
 
 ### Arithmetic (`$((…))`)
 
-- **M-55: Bitwise operators `&`/`|`/`^`/`~`/`<<`/`>>`** — `[deferred]` high. huck: parse error. bash: full bitwise.
-- **M-56: Assignment operators `=`/`+=`/`-=`/`*=`/`/=`/`%=`/`++`/`--`** — `[deferred]` medium. huck: bare `=` errors; `++`/`--` silently parse as double unary. bash: assignment mutates the shell var.
-- **M-57: Non-decimal literals (`0x…`, `0…`, `N#…`)** — `[deferred]` medium. huck: hex/octal/base# all rejected. bash: full numeric base support.
+- **M-55: Bitwise operators `&`/`|`/`^`/`~`/`<<`/`>>`** — `[fixed v38]` high. All six bitwise operators supported in `$((…))`. Shift counts must be in `[0, 64)` — out-of-range produces `ShiftCountOutOfRange` error (deliberate divergence from bash's C-undefined behavior). Bundled with `**` exponentiation (right-associative; negative exponents error). v38 also closes M-56 and M-57.
+- **M-56: Assignment operators `=`/`+=`/`-=`/`*=`/`/=`/`%=`/`<<=`/`>>=`/`&=`/`^=`/`\|=`/`++`/`--`** — `[fixed v38]` medium. All 11 assignment operators + prefix/postfix `++`/`--` supported. `arith::eval` signature now takes `&mut Shell`. LHS must be a variable (enforced at parse time): `(a + b) = 5` rejects with parse error. v38 also closes M-55 and M-57.
+- **M-57: Non-decimal literals (`0x…`, `0…`, `N#…`)** — `[fixed v38]` medium. Hex (`0x…` / `0X…`), octal (`0…` with digits 0-7), and base-N (`N#…` for 2 ≤ N ≤ 64) all supported. Bash's full digit alphabet (0-9, a-z, A-Z, @, _) implemented; for bases ≤ 36 letters are case-insensitive, for bases > 36 they're distinct. v38 also closes M-55 and M-56.
 
 ### Quoting
 
@@ -352,3 +352,4 @@ Things huck deliberately does differently from bash. Document and keep.
 - **2026-05-27**: M-22 (`trap` builtin) shipped partially as v35. EXIT pseudo-signal + 13 trappable real signals via huck's existing 15-name table. New `src/traps.rs` module owns signal-handler installation (via `signal_hook::low_level::register`), the `Arc<AtomicU32>` pending-signal bitmask, and the dispatch/fire helpers. ERR/DEBUG/RETURN pseudo-signals deferred to a follow-up iteration; M-22 stays `[partial v35]` until they land.
 - **2026-05-27**: M-22 (`trap` builtin) closed as fixed v36. ERR, DEBUG, RETURN pseudo-signals added alongside v35's EXIT + 13 real signals. Per-event firing helpers (`fire_err_trap` / `fire_debug_trap` / `fire_return_trap`) share a `fire_pseudo_trap` body with a `Shell::firing_trap` recursion guard. ERR uses a `Shell::err_suppressed_depth` counter pushed/popped in `run_if` / `run_while` to implement bash 5.x exemptions. DEBUG hooks at `run_exec_single` entry; RETURN at `call_function` with $? set to the function's status. M-22 status: `[fixed v36]`.
 - **2026-05-28**: M-17 (`${var^^}` / `${var,,}` case modification) shipped as v37. All eight forms (`^^`/`^`/`,,`/`,` × bare/with-pattern). Reuses glob::Pattern for the per-character pattern filter; Rust's `char::to_uppercase` / `char::to_lowercase` iterators for the Unicode-aware case mapping. Closes the parameter-expansion-modifier cluster started by v32/v33/v34.
+- **2026-05-28**: M-55 (bitwise operators), M-56 (assignment + inc/dec), and M-57 (non-decimal literals) shipped together as v38 — closes the arithmetic-feature cluster started by v22. Bundled `**` exponentiation. `arith::eval` signature changed from `&Shell` to `&mut Shell` (3 call sites updated). Pratt-parser precedence table renumbered to match bash's documented order. Shift counts out of `[0, 64)` produce explicit errors (deliberate divergence from bash's C-undefined behavior).
