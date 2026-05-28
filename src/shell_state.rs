@@ -218,6 +218,34 @@ impl Shell {
     pub fn var_names(&self) -> impl Iterator<Item = &str> {
         self.vars.keys().map(|s| s.as_str())
     }
+
+    /// Sends SIGHUP to every live job not marked for nohup. Called
+    /// on each clean shell-exit path. Stopped jobs get SIGCONT first
+    /// so they wake to die. Errors from `killpg` (e.g. ESRCH for an
+    /// already-reaped pgid) are intentionally ignored; this is a
+    /// best-effort cleanup.
+    pub fn hangup_jobs(&mut self) {
+        for job in self.jobs.iter() {
+            if !should_hangup(job) {
+                continue;
+            }
+            unsafe {
+                libc::killpg(job.pgid, libc::SIGCONT);
+                libc::killpg(job.pgid, libc::SIGHUP);
+            }
+        }
+    }
+}
+
+/// Pure predicate: should this job receive SIGHUP at shell exit?
+/// True iff the job is still alive (Running or Stopped) AND has
+/// not been marked for nohup by `disown -h`.
+fn should_hangup(job: &crate::jobs::Job) -> bool {
+    let live = matches!(
+        job.state,
+        crate::jobs::JobState::Running | crate::jobs::JobState::Stopped(_)
+    );
+    live && !job.marked_for_nohup
 }
 
 impl Default for Shell {
@@ -398,5 +426,27 @@ mod tests {
         assert_eq!(shell.lookup_var("0"), Some("outer".to_string()));
         shell.function_arg0.pop();
         assert!(shell.lookup_var("0").is_some());  // falls through to shell_argv0
+    }
+
+    #[test]
+    fn should_hangup_skips_marked_and_done_jobs() {
+        use crate::jobs::{JobState, JobTable};
+        let mut t = JobTable::new();
+        let id = t.add(0, vec![1234], "sleep 30".to_string());
+
+        // Running + not marked → hangup
+        let job = t.iter().find(|j| j.id == id).unwrap();
+        assert!(super::should_hangup(job));
+
+        // Running + marked → skip
+        t.mark_for_nohup(id);
+        let job = t.iter().find(|j| j.id == id).unwrap();
+        assert!(!super::should_hangup(job));
+
+        // Done + not marked → skip
+        t.jobs_mut()[0].marked_for_nohup = false;
+        t.jobs_mut()[0].state = JobState::Done(0);
+        let job = t.iter().find(|j| j.id == id).unwrap();
+        assert!(!super::should_hangup(job));
     }
 }

@@ -954,28 +954,87 @@ fn send_signal_to_targets(
 }
 
 fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
-    if args.len() > 1 {
-        eprintln!("huck: disown: usage: disown [%job]");
-        return ExecOutcome::Continue(2);
-    }
-    let id = match args.first() {
-        Some(arg) if arg.starts_with('%') => match resolve_spec_or_error(arg, "disown", shell) {
-            Ok(id) => id,
-            Err(outcome) => return outcome,
-        },
-        Some(_) => {
-            eprintln!("huck: disown: usage: disown [%job]");
-            return ExecOutcome::Continue(2);
+    let mut all = false;
+    let mut running_only = false;
+    let mut mark_nohup = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" {
+            idx += 1;
+            break;
         }
-        None => match shell.jobs.current_id() {
-            Some(id) => id,
+        if let Some(rest) = a.strip_prefix('-') {
+            if rest.is_empty() {
+                break;
+            }
+            for c in rest.chars() {
+                match c {
+                    'a' => all = true,
+                    'r' => running_only = true,
+                    'h' => mark_nohup = true,
+                    _ => {
+                        eprintln!("huck: disown: -{c}: invalid option");
+                        eprintln!("huck: disown: usage: disown [-ahr] [%job ...]");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let positional = &args[idx..];
+
+    let mut target_ids: Vec<u32> = if all {
+        shell.jobs.iter().map(|j| j.id).collect()
+    } else if !positional.is_empty() {
+        let mut ids = Vec::new();
+        for arg in positional {
+            if !arg.starts_with('%') {
+                eprintln!("huck: disown: {arg}: not a valid job spec");
+                return ExecOutcome::Continue(1);
+            }
+            match resolve_spec_or_error(arg, "disown", shell) {
+                Ok(id) => ids.push(id),
+                Err(outcome) => return outcome,
+            }
+        }
+        ids
+    } else {
+        match shell.jobs.current_id() {
+            Some(id) => vec![id],
             None => {
                 eprintln!("huck: disown: no current job");
                 return ExecOutcome::Continue(1);
             }
-        },
+        }
     };
-    shell.jobs.jobs_mut().retain(|j| j.id != id);
+
+    if running_only {
+        target_ids.retain(|id| {
+            shell
+                .jobs
+                .iter()
+                .find(|j| j.id == *id)
+                .map(|j| matches!(j.state, crate::jobs::JobState::Running))
+                .unwrap_or(false)
+        });
+    }
+
+    if mark_nohup {
+        for id in &target_ids {
+            shell.jobs.mark_for_nohup(*id);
+        }
+    } else {
+        shell
+            .jobs
+            .jobs_mut()
+            .retain(|j| !target_ids.contains(&j.id));
+    }
+
     ExecOutcome::Continue(0)
 }
 
@@ -2692,24 +2751,11 @@ mod disown_tests {
     }
 
     #[test]
-    fn disown_with_non_percent_arg_returns_usage_status_2() {
+    fn disown_with_non_percent_arg_returns_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("disown", &["1".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
-    }
-
-    #[test]
-    fn disown_with_multiple_args_returns_usage_status_2() {
-        let mut shell = Shell::new();
-        let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
-            "disown",
-            &["%1".to_string(), "%2".to_string()],
-            &mut buf,
-            &mut shell,
-        );
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
@@ -2721,6 +2767,137 @@ mod disown_tests {
         shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    use crate::jobs::JobState;
+
+    #[test]
+    fn disown_a_removes_all_jobs() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("a".to_string(), 0);
+        shell.jobs.add_synthetic_done("b".to_string(), 0);
+        shell.jobs.add_synthetic_done("c".to_string(), 0);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-a".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_r_filters_to_running_only() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "sleep".to_string()); // %1 Running
+        shell.jobs.add_synthetic_done("a".to_string(), 0);     // %2 Done
+        shell.jobs.add_synthetic_done("b".to_string(), 0);     // %3 Done
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-r".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 2);
+        assert!(shell.jobs.iter().all(|j| matches!(j.state, JobState::Done(_))));
+    }
+
+    #[test]
+    fn disown_h_marks_for_nohup_keeps_in_table() {
+        let mut shell = Shell::new();
+        let id = shell.jobs.add(1234, vec![1234], "sleep".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["-h".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let job = shell.jobs.iter().find(|j| j.id == id).expect("job removed!");
+        assert!(job.marked_for_nohup);
+    }
+
+    #[test]
+    fn disown_multiple_args_processes_each() {
+        let mut shell = Shell::new();
+        shell.jobs.add_synthetic_done("a".to_string(), 0); // %1
+        shell.jobs.add_synthetic_done("b".to_string(), 0); // %2
+        shell.jobs.add_synthetic_done("c".to_string(), 0); // %3
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["%1".to_string(), "%2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let ids: Vec<u32> = shell.jobs.iter().map(|j| j.id).collect();
+        assert_eq!(ids, vec![3]);
+    }
+
+    #[test]
+    fn disown_ah_marks_all() {
+        let mut shell = Shell::new();
+        let id1 = shell.jobs.add(1234, vec![1234], "a".to_string());
+        let id2 = shell.jobs.add(1235, vec![1235], "b".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-ah".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 2);
+        assert!(shell.jobs.iter().find(|j| j.id == id1).unwrap().marked_for_nohup);
+        assert!(shell.jobs.iter().find(|j| j.id == id2).unwrap().marked_for_nohup);
+    }
+
+    #[test]
+    fn disown_ar_removes_all_running() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "a".to_string()); // %1 Running
+        shell.jobs.add(1235, vec![1235], "b".to_string()); // %2 Running
+        shell.jobs.add_synthetic_done("c".to_string(), 0); // %3 Done
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-ar".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let states: Vec<JobState> = shell.jobs.iter().map(|j| j.state.clone()).collect();
+        assert_eq!(states.len(), 1);
+        assert!(matches!(states[0], JobState::Done(_)));
+    }
+
+    #[test]
+    fn disown_arh_marks_all_running() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "a".to_string()); // %1 Running
+        shell.jobs.add(1235, vec![1235], "b".to_string()); // %2 Running
+        shell.jobs.add_synthetic_done("c".to_string(), 0); // %3 Done
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-arh".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 3);
+        for job in shell.jobs.iter() {
+            match job.state {
+                JobState::Running => assert!(job.marked_for_nohup, "running job not marked"),
+                _ => assert!(!job.marked_for_nohup, "non-running job got marked"),
+            }
+        }
+    }
+
+    #[test]
+    fn disown_invalid_flag_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["-x".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn disown_a_ignores_positional_args() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "a".to_string()); // %1
+        shell.jobs.add(1235, vec![1235], "b".to_string()); // %2
+        shell.jobs.add(1236, vec![1236], "c".to_string()); // %3
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["-a".to_string(), "%1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }

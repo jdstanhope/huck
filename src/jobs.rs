@@ -27,6 +27,7 @@ pub struct Job {
     pub state: JobState,
     pub notified: bool,
     pub created_at: u64,
+    pub marked_for_nohup: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +56,7 @@ impl JobTable {
             state: JobState::Running,
             notified: false,
             created_at: self.next_created_at,
+            marked_for_nohup: false,
         };
         self.next_created_at += 1;
         self.jobs.push(job);
@@ -78,6 +80,7 @@ impl JobTable {
             state: JobState::Done(exit),
             notified: false,
             created_at: self.next_created_at,
+            marked_for_nohup: false,
         };
         self.next_created_at += 1;
         self.jobs.push(job);
@@ -204,6 +207,14 @@ impl JobTable {
 
     pub fn jobs_mut(&mut self) -> &mut Vec<Job> {
         &mut self.jobs
+    }
+
+    /// Marks the job with id `id` as exempt from the shell's
+    /// SIGHUP-on-exit broadcast. No-op if the id doesn't exist.
+    pub fn mark_for_nohup(&mut self, id: u32) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.marked_for_nohup = true;
+        }
     }
 
     fn next_id(&self) -> u32 {
