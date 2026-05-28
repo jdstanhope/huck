@@ -13,3 +13,4 @@ regex = "1.10"
 [dev-dependencies]
 expectrl = "0.9.0"
 tempfile = "3"
+libc = "0.2"
