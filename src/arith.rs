@@ -411,6 +411,25 @@ struct Parser {
 /// binding power, and the AST constructor for the binary node.
 type BinOpEntry = (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr);
 
+/// Maps an assignment token to its corresponding AssignOp variant.
+/// Returns None for non-assignment tokens.
+fn assign_op_from_token(t: &ArithToken) -> Option<AssignOp> {
+    match t {
+        ArithToken::Assign     => Some(AssignOp::Set),
+        ArithToken::PlusEq     => Some(AssignOp::Add),
+        ArithToken::MinusEq    => Some(AssignOp::Sub),
+        ArithToken::StarEq     => Some(AssignOp::Mul),
+        ArithToken::SlashEq    => Some(AssignOp::Div),
+        ArithToken::PercentEq  => Some(AssignOp::Mod),
+        ArithToken::ShlEq      => Some(AssignOp::Shl),
+        ArithToken::ShrEq      => Some(AssignOp::Shr),
+        ArithToken::AmpEq      => Some(AssignOp::BitAnd),
+        ArithToken::CaretEq    => Some(AssignOp::BitXor),
+        ArithToken::PipeEq     => Some(AssignOp::BitOr),
+        _ => None,
+    }
+}
+
 impl Parser {
     fn peek(&self) -> Option<&ArithToken> {
         self.tokens.get(self.pos)
@@ -425,8 +444,42 @@ impl Parser {
     fn parse_expr(&mut self, min_bp: u8) -> Result<ArithExpr, ArithError> {
         let mut lhs = self.parse_prefix()?;
         while let Some(op) = self.peek().cloned() {
-            // Ternary: `cond ? then : else`. Right-associative, lowest binding power.
-            if op == ArithToken::Question && min_bp <= 1 {
+
+            // 1. Postfix ++/-- (BP 27 — highest). Must come before infix
+            //    handling so a++ + 1 parses as (a++) + 1.
+            if matches!(op, ArithToken::PlusPlus | ArithToken::MinusMinus) && 27 >= min_bp {
+                self.bump();
+                let name = match lhs {
+                    ArithExpr::Var(name) => name,
+                    _ => return Err(ArithError::Parse(
+                        "postfix ++/-- requires variable on LHS".to_string()
+                    )),
+                };
+                lhs = match op {
+                    ArithToken::PlusPlus => ArithExpr::PostInc(name),
+                    _ => ArithExpr::PostDec(name),
+                };
+                continue;
+            }
+
+            // 2. Assignment (lbp = 2, rbp = 1 — right-associative).
+            //    LHS must be a Var.
+            if let Some(assign_op) = assign_op_from_token(&op) {
+                if 2 < min_bp { break; }
+                self.bump();
+                let name = match lhs {
+                    ArithExpr::Var(name) => name,
+                    _ => return Err(ArithError::Parse(
+                        "assignment requires variable on LHS".to_string()
+                    )),
+                };
+                let rhs = self.parse_expr(1)?;  // rbp = 1 allows cascading assigns
+                lhs = ArithExpr::Assign { name, op: assign_op, rhs: Box::new(rhs) };
+                continue;
+            }
+
+            // 3. Ternary (BP 3 — right-associative, special-cased like assignment).
+            if op == ArithToken::Question && 3 >= min_bp {
                 self.bump();
                 let then_branch = self.parse_expr(0)?;
                 match self.bump() {
@@ -435,29 +488,44 @@ impl Parser {
                         "expected ':' in ternary, got {other:?}"
                     ))),
                 }
-                let else_branch = self.parse_expr(1)?;
-                lhs = ArithExpr::Ternary(Box::new(lhs), Box::new(then_branch), Box::new(else_branch));
+                let else_branch = self.parse_expr(3)?;  // rbp = 3 for right-assoc
+                lhs = ArithExpr::Ternary(
+                    Box::new(lhs), Box::new(then_branch), Box::new(else_branch)
+                );
                 continue;
             }
+
+            // 4. Power ** (lbp = 25, rbp = 24 — right-associative).
+            if op == ArithToken::Power && 25 >= min_bp {
+                self.bump();
+                let rhs = self.parse_expr(24)?;
+                lhs = ArithExpr::Pow(Box::new(lhs), Box::new(rhs));
+                continue;
+            }
+
+            // 5. Standard left-associative binops via the precedence table.
             let (lbp, rbp, make): BinOpEntry = match op {
-                ArithToken::OrOr   => (2, 3, ArithExpr::Or),
-                ArithToken::AndAnd => (4, 5, ArithExpr::And),
-                ArithToken::Eq     => (6, 7, ArithExpr::Eq),
-                ArithToken::Ne     => (6, 7, ArithExpr::Ne),
-                ArithToken::Lt     => (8, 9, ArithExpr::Lt),
-                ArithToken::Le     => (8, 9, ArithExpr::Le),
-                ArithToken::Gt     => (8, 9, ArithExpr::Gt),
-                ArithToken::Ge     => (8, 9, ArithExpr::Ge),
-                ArithToken::Plus   => (10, 11, ArithExpr::Add),
-                ArithToken::Minus  => (10, 11, ArithExpr::Sub),
-                ArithToken::Star   => (12, 13, ArithExpr::Mul),
-                ArithToken::Slash  => (12, 13, ArithExpr::Div),
-                ArithToken::Percent => (12, 13, ArithExpr::Mod),
+                ArithToken::OrOr    => (4, 5, ArithExpr::Or),
+                ArithToken::AndAnd  => (6, 7, ArithExpr::And),
+                ArithToken::Pipe    => (8, 9, ArithExpr::BitOr),
+                ArithToken::Caret   => (10, 11, ArithExpr::BitXor),
+                ArithToken::Amp     => (12, 13, ArithExpr::BitAnd),
+                ArithToken::Eq      => (14, 15, ArithExpr::Eq),
+                ArithToken::Ne      => (14, 15, ArithExpr::Ne),
+                ArithToken::Lt      => (16, 17, ArithExpr::Lt),
+                ArithToken::Le      => (16, 17, ArithExpr::Le),
+                ArithToken::Gt      => (16, 17, ArithExpr::Gt),
+                ArithToken::Ge      => (16, 17, ArithExpr::Ge),
+                ArithToken::Shl     => (18, 19, ArithExpr::Shl),
+                ArithToken::Shr     => (18, 19, ArithExpr::Shr),
+                ArithToken::Plus    => (20, 21, ArithExpr::Add),
+                ArithToken::Minus   => (20, 21, ArithExpr::Sub),
+                ArithToken::Star    => (22, 23, ArithExpr::Mul),
+                ArithToken::Slash   => (22, 23, ArithExpr::Div),
+                ArithToken::Percent => (22, 23, ArithExpr::Mod),
                 _ => break,
             };
-            if lbp < min_bp {
-                break;
-            }
+            if lbp < min_bp { break; }
             self.bump();
             let rhs = self.parse_expr(rbp)?;
             lhs = make(Box::new(lhs), Box::new(rhs));
@@ -470,15 +538,37 @@ impl Parser {
             Some(ArithToken::Number(n)) => Ok(ArithExpr::Num(n)),
             Some(ArithToken::Ident(s)) => Ok(ArithExpr::Var(s)),
             Some(ArithToken::Minus) => {
-                let inner = self.parse_expr(14)?;
+                let inner = self.parse_expr(26)?;
                 Ok(ArithExpr::Neg(Box::new(inner)))
             }
             Some(ArithToken::Plus) => {
-                self.parse_expr(14)
+                self.parse_expr(26)
             }
             Some(ArithToken::Bang) => {
-                let inner = self.parse_expr(14)?;
+                let inner = self.parse_expr(26)?;
                 Ok(ArithExpr::Not(Box::new(inner)))
+            }
+            Some(ArithToken::Tilde) => {
+                let inner = self.parse_expr(26)?;
+                Ok(ArithExpr::BitNot(Box::new(inner)))
+            }
+            Some(ArithToken::PlusPlus) => {
+                // ++name: prefix increment requires identifier next.
+                match self.bump() {
+                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreInc(name)),
+                    _ => Err(ArithError::Parse(
+                        "prefix ++ requires variable".to_string()
+                    )),
+                }
+            }
+            Some(ArithToken::MinusMinus) => {
+                // --name: prefix decrement requires identifier next.
+                match self.bump() {
+                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreDec(name)),
+                    _ => Err(ArithError::Parse(
+                        "prefix -- requires variable".to_string()
+                    )),
+                }
             }
             Some(ArithToken::LParen) => {
                 let inner = self.parse_expr(0)?;
@@ -847,8 +937,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_double_unary_minus() {
-        assert_eq!(parse("--5").unwrap(), ArithExpr::Neg(Box::new(ArithExpr::Neg(n(5)))));
+    fn parse_double_minus_with_number_is_prefix_dec_error() {
+        // v38: -- is now MinusMinus (prefix decrement), which requires a
+        // variable name after it. --5 → parse error.
+        assert!(matches!(parse("--5"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_unary_minus_double_negation_uses_space() {
+        // To express double negation of a literal, use a space: - -5.
+        assert_eq!(parse("- -5").unwrap(), ArithExpr::Neg(Box::new(ArithExpr::Neg(n(5)))));
     }
 
     #[test]
@@ -909,6 +1007,100 @@ mod tests {
     fn parse_strips_dollar_on_var() {
         assert_eq!(parse("$x + 1").unwrap(),
             ArithExpr::Add(v("x"), n(1)));
+    }
+
+    #[test]
+    fn parse_bitwise_precedence_or_below_and() {
+        // 1 | 2 & 3 parses as 1 | (2 & 3) — & binds tighter than |.
+        let expr = parse("1 | 2 & 3").unwrap();
+        assert_eq!(expr, ArithExpr::BitOr(
+            n(1),
+            Box::new(ArithExpr::BitAnd(n(2), n(3))),
+        ));
+    }
+
+    #[test]
+    fn parse_shift_below_addition() {
+        // 1 + 2 << 3 parses as (1 + 2) << 3 — << has lower precedence than +.
+        let expr = parse("1 + 2 << 3").unwrap();
+        assert_eq!(expr, ArithExpr::Shl(
+            Box::new(ArithExpr::Add(n(1), n(2))),
+            n(3),
+        ));
+    }
+
+    #[test]
+    fn parse_power_right_associative() {
+        // 2 ** 3 ** 2 parses as Pow(2, Pow(3, 2)).
+        let expr = parse("2 ** 3 ** 2").unwrap();
+        assert_eq!(expr, ArithExpr::Pow(
+            n(2),
+            Box::new(ArithExpr::Pow(n(3), n(2))),
+        ));
+    }
+
+    #[test]
+    fn parse_assignment_right_associative() {
+        // a = b = 5 parses as Assign(a, Set, Assign(b, Set, 5)).
+        let expr = parse("a = b = 5").unwrap();
+        assert_eq!(expr, ArithExpr::Assign {
+            name: "a".to_string(),
+            op: AssignOp::Set,
+            rhs: Box::new(ArithExpr::Assign {
+                name: "b".to_string(),
+                op: AssignOp::Set,
+                rhs: n(5),
+            }),
+        });
+    }
+
+    #[test]
+    fn parse_assignment_lhs_must_be_var() {
+        // (a + b) = 5 → parse error (LHS not a Var).
+        assert!(matches!(parse("(a + b) = 5"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_postfix_lhs_must_be_var() {
+        // (a + b)++ → parse error.
+        assert!(matches!(parse("(a + b)++"), Err(ArithError::Parse(_))));
+    }
+
+    #[test]
+    fn parse_compound_assignment_all_forms() {
+        // All 11 compound assignment forms.
+        let cases = [
+            ("a = 1", AssignOp::Set),
+            ("a += 1", AssignOp::Add),
+            ("a -= 1", AssignOp::Sub),
+            ("a *= 1", AssignOp::Mul),
+            ("a /= 1", AssignOp::Div),
+            ("a %= 1", AssignOp::Mod),
+            ("a <<= 1", AssignOp::Shl),
+            ("a >>= 1", AssignOp::Shr),
+            ("a &= 1", AssignOp::BitAnd),
+            ("a ^= 1", AssignOp::BitXor),
+            ("a |= 1", AssignOp::BitOr),
+        ];
+        for (input, expected_op) in cases {
+            let expr = parse(input).unwrap();
+            match expr {
+                ArithExpr::Assign { name, op, rhs } => {
+                    assert_eq!(name, "a", "for input {input}");
+                    assert_eq!(op, expected_op, "for input {input}");
+                    assert_eq!(*rhs, ArithExpr::Num(1), "for input {input}");
+                }
+                other => panic!("expected Assign for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_pre_post_inc_dec() {
+        assert_eq!(parse("++a").unwrap(), ArithExpr::PreInc("a".to_string()));
+        assert_eq!(parse("--a").unwrap(), ArithExpr::PreDec("a".to_string()));
+        assert_eq!(parse("a++").unwrap(), ArithExpr::PostInc("a".to_string()));
+        assert_eq!(parse("a--").unwrap(), ArithExpr::PostDec("a".to_string()));
     }
 
     use crate::shell_state::Shell;
