@@ -1003,6 +1003,9 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
         }
         ids
+    } else if running_only {
+        // bash-faithful: `disown -r` alone operates on ALL running jobs.
+        shell.jobs.iter().map(|j| j.id).collect()
     } else {
         match shell.jobs.current_id() {
             Some(id) => vec![id],
@@ -2788,14 +2791,18 @@ mod disown_tests {
     #[test]
     fn disown_r_filters_to_running_only() {
         let mut shell = Shell::new();
-        shell.jobs.add(1234, vec![1234], "sleep".to_string()); // %1 Running
-        shell.jobs.add_synthetic_done("a".to_string(), 0);     // %2 Done
-        shell.jobs.add_synthetic_done("b".to_string(), 0);     // %3 Done
+        // 2 Running + 1 Done — verifies bare `disown -r` removes BOTH
+        // running jobs (bash semantics), not just the current.
+        shell.jobs.add(1234, vec![1234], "sleep a".to_string()); // %1 Running
+        shell.jobs.add(1235, vec![1235], "sleep b".to_string()); // %2 Running
+        shell.jobs.add_synthetic_done("c".to_string(), 0);       // %3 Done
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("disown", &["-r".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.jobs.iter().count(), 2);
-        assert!(shell.jobs.iter().all(|j| matches!(j.state, JobState::Done(_))));
+        // Both Running jobs gone; only %3 (Done) remains.
+        let states: Vec<JobState> = shell.jobs.iter().map(|j| j.state.clone()).collect();
+        assert_eq!(states.len(), 1);
+        assert!(matches!(states[0], JobState::Done(_)));
     }
 
     #[test]

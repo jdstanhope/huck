@@ -448,5 +448,11 @@ mod tests {
         t.jobs_mut()[0].state = JobState::Done(0);
         let job = t.iter().find(|j| j.id == id).unwrap();
         assert!(!super::should_hangup(job));
+
+        // Stopped + not marked → hangup (Stopped is "live" for SIGHUP purposes)
+        t.jobs_mut()[0].marked_for_nohup = false;
+        t.jobs_mut()[0].state = JobState::Stopped(::libc::SIGTSTP);
+        let job = t.iter().find(|j| j.id == id).unwrap();
+        assert!(super::should_hangup(job));
     }
 }
