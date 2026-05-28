@@ -49,6 +49,7 @@ spec, an implementation plan, and a test suite.
 | v39       | ANSI-C quoting `$'…'` (M-28)                                   |
 | v40       | `wait -n` + multi-arg `wait` (M-37 + M-38)                     |
 | v41       | `kill -l` (M-39) + README cleanup                              |
+| v42       | `kill -s SIGNAME` + `kill -n SIGNUM` (M-40)                    |
 
 ## Build and run
 
