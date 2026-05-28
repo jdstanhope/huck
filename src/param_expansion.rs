@@ -112,9 +112,10 @@ pub fn expand_modifier(
                 }
             }
         }
-        ParamModifier::Case { .. } => {
-            // Filled in by Task 4.
-            ExpansionResult::Value(shell.lookup_var(name).unwrap_or_default())
+        ParamModifier::Case { direction, all, pattern } => {
+            let v = shell.lookup_var(name).unwrap_or_default();
+            let pat_string = pattern.as_ref().map(|w| expand_word_to_string(w, shell));
+            ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref()))
         }
     }
 }
@@ -327,7 +328,6 @@ fn substitute(
 /// `substitute`). Unicode-aware via Rust's `char::to_uppercase` /
 /// `char::to_lowercase` iterators — handles multi-char expansions
 /// like `'ß'.to_uppercase()` → "SS".
-#[allow(dead_code)] // Wired in Task 4
 fn case_modify(
     value: &str,
     direction: CaseDirection,
@@ -1166,5 +1166,44 @@ mod tests {
     fn case_modify_no_match_first_form_returns_unchanged() {
         // No char in "hello" matches [xyz]; all=false → return unchanged.
         assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[xyz]")), "hello");
+    }
+
+    #[test]
+    fn expand_modifier_case_upper_all_named_var() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_TEST_PE_CASE1", "hello".to_string());
+        let m = ParamModifier::Case {
+            direction: CaseDirection::Upper,
+            all: true,
+            pattern: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_CASE1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("HELLO".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_case_upper_positional_lookup() {
+        // Verifies the arm uses lookup_var (so digit names resolve).
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["hello".to_string()];
+        let m = ParamModifier::Case {
+            direction: CaseDirection::Upper,
+            all: true,
+            pattern: None,
+        };
+        let r = expand_modifier("1", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("HELLO".to_string()));
+    }
+
+    #[test]
+    fn expand_modifier_case_unset_var_returns_empty() {
+        let mut shell = Shell::new();
+        let m = ParamModifier::Case {
+            direction: CaseDirection::Upper,
+            all: true,
+            pattern: None,
+        };
+        let r = expand_modifier("HUCK_TEST_PE_CASE_UNSET", &m, &mut shell);
+        assert_eq!(r, ExpansionResult::Value("".to_string()));
     }
 }
