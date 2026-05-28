@@ -112,6 +112,10 @@ pub fn expand_modifier(
                 }
             }
         }
+        ParamModifier::Case { .. } => {
+            // Filled in by Task 4.
+            ExpansionResult::Value(shell.lookup_var(name).unwrap_or_default())
+        }
     }
 }
 

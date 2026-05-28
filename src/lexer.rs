@@ -53,6 +53,13 @@ pub enum SubstAnchor {
     Suffix,  // ${var/%pat/repl}
 }
 
+#[allow(dead_code)]  // removed when lexer emits Case in Task 2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseDirection {
+    Upper,  // ^ / ^^
+    Lower,  // , / ,,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamModifier {
     Length,
@@ -71,6 +78,12 @@ pub enum ParamModifier {
     Substring {
         offset: Word,
         length: Option<Word>,
+    },
+    #[allow(dead_code)]  // constructed by lexer in Task 2; read in Task 4
+    Case {
+        direction: CaseDirection,
+        all: bool,
+        pattern: Option<Word>,
     },
 }
 
