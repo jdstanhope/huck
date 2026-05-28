@@ -50,6 +50,7 @@ spec, an implementation plan, and a test suite.
 | v40       | `wait -n` + multi-arg `wait` (M-37 + M-38)                     |
 | v41       | `kill -l` (M-39) + README cleanup                              |
 | v42       | `kill -s SIGNAME` + `kill -n SIGNUM` (M-40)                    |
+| v43       | `disown -a`/`-r`/`-h` + SIGHUP-on-exit (M-43)                  |
 
 ## Build and run
 
@@ -234,8 +235,8 @@ isolation).
 
 **Not yet implemented:**
 brace expansion (`{a,b,c}`), extended job specs
-(`%cmd`/`%?cmd`), `disown -a`/`-r`/`-h`,
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
+(`%cmd`/`%?cmd`), backgrounded multi-pipeline sequences
+(`cmd1 && cmd2 &`), aliases.
 
 ## Project layout
 
