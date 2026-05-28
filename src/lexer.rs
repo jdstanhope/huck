@@ -53,6 +53,12 @@ pub enum SubstAnchor {
     Suffix,  // ${var/%pat/repl}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseDirection {
+    Upper,  // ^ / ^^
+    Lower,  // , / ,,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamModifier {
     Length,
@@ -71,6 +77,11 @@ pub enum ParamModifier {
     Substring {
         offset: Word,
         length: Option<Word>,
+    },
+    Case {
+        direction: CaseDirection,
+        all: bool,
+        pattern: Option<Word>,
     },
 }
 
@@ -1211,6 +1222,28 @@ fn dispatch_braced_modifier(
             });
             Ok(())
         }
+        Some('^') => {
+            let all = chars.peek() == Some(&'^');
+            if all { chars.next(); }
+            let pattern = scan_optional_braced_operand(chars)?;
+            parts.push(WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
+                quoted,
+            });
+            Ok(())
+        }
+        Some(',') => {
+            let all = chars.peek() == Some(&',');
+            if all { chars.next(); }
+            let pattern = scan_optional_braced_operand(chars)?;
+            parts.push(WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
+                quoted,
+            });
+            Ok(())
+        }
         Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
         None => Err(LexError::UnterminatedBrace),
     }
@@ -1228,6 +1261,22 @@ where
     let body = scan_braced_operand(chars)?;
     let word = parse_braced_operand(&body)?;
     Ok(build(word))
+}
+
+/// Scans a single optional operand inside a `${name<mod>OPERAND}` form.
+/// Returns `None` if the operand body is empty (i.e. the modifier is
+/// immediately followed by `}`), or `Some(Word)` for a non-empty body.
+/// Delegates to `scan_braced_operand` (depth + quote aware) so nested
+/// `${...}` constructs in the operand are handled correctly.
+fn scan_optional_braced_operand(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Option<Word>, LexError> {
+    let body = scan_braced_operand(chars)?;
+    if body.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parse_braced_operand(&body)?))
+    }
 }
 
 /// Walks the chars iterator from just after the leading `/` of a
@@ -3937,6 +3986,83 @@ mod tests {
         assert!(matches!(
             tokenize_words("${name:}"),
             Err(LexError::InvalidBraceModifier(s)) if s == ":"
+        ));
+    }
+
+    #[test]
+    fn brace_case_upper_all() {
+        let mut t = tokenize_words("${name^^}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { direction, all, pattern }, quoted } = part {
+            assert_eq!(name, "name");
+            assert!(!quoted);
+            assert_eq!(direction, CaseDirection::Upper);
+            assert!(all);
+            assert!(pattern.is_none());
+        } else { panic!("expected Case, got {part:?}") }
+    }
+
+    #[test]
+    fn brace_case_upper_first() {
+        let mut t = tokenize_words("${name^}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
+            assert_eq!(direction, CaseDirection::Upper);
+            assert!(!all);
+            assert!(pattern.is_none());
+        } else { panic!("expected Case") }
+    }
+
+    #[test]
+    fn brace_case_lower_all() {
+        let mut t = tokenize_words("${name,,}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
+            assert_eq!(direction, CaseDirection::Lower);
+            assert!(all);
+            assert!(pattern.is_none());
+        } else { panic!("expected Case") }
+    }
+
+    #[test]
+    fn brace_case_lower_first() {
+        let mut t = tokenize_words("${name,}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
+            assert_eq!(direction, CaseDirection::Lower);
+            assert!(!all);
+            assert!(pattern.is_none());
+        } else { panic!("expected Case") }
+    }
+
+    #[test]
+    fn brace_case_upper_all_with_pattern() {
+        let mut t = tokenize_words("${name^^[aeiou]}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { modifier: ParamModifier::Case { direction, all, pattern }, .. } = part {
+            assert_eq!(direction, CaseDirection::Upper);
+            assert!(all);
+            let p = pattern.expect("pattern");
+            assert_eq!(word_to_literal(&p), "[aeiou]");
+        } else { panic!("expected Case") }
+    }
+
+    #[test]
+    fn brace_case_positional() {
+        // `${1^^}` — emits ParamExpansion (not Var) so the modifier runs.
+        let mut t = tokenize_words("${1^^}").unwrap();
+        let part = single_param_expansion(&mut t);
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { all, .. }, .. } = part {
+            assert_eq!(name, "1");
+            assert!(all);
+        } else { panic!("expected Case on positional, got {part:?}") }
+    }
+
+    #[test]
+    fn brace_case_unterminated_is_error() {
+        assert!(matches!(
+            tokenize_words("${name^^"),
+            Err(LexError::UnterminatedBrace)
         ));
     }
 
