@@ -993,13 +993,27 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
     } else if !positional.is_empty() {
         let mut ids = Vec::new();
         for arg in positional {
-            if !arg.starts_with('%') {
-                eprintln!("huck: disown: {arg}: not a valid job spec");
-                return ExecOutcome::Continue(1);
-            }
-            match resolve_spec_or_error(arg, "disown", shell) {
-                Ok(id) => ids.push(id),
-                Err(outcome) => return outcome,
+            if arg.starts_with('%') {
+                match resolve_spec_or_error(arg, "disown", shell) {
+                    Ok(id) => ids.push(id),
+                    Err(outcome) => return outcome,
+                }
+            } else {
+                match arg.parse::<i32>() {
+                    Ok(pid) if pid > 0 => {
+                        match shell.jobs.iter().find(|j| j.pids.contains(&pid)) {
+                            Some(job) => ids.push(job.id),
+                            None => {
+                                eprintln!("huck: disown: {arg}: no such job");
+                                return ExecOutcome::Continue(1);
+                            }
+                        }
+                    }
+                    _ => {
+                        eprintln!("huck: disown: {arg}: not a valid job spec");
+                        return ExecOutcome::Continue(1);
+                    }
+                }
             }
         }
         ids
@@ -2907,6 +2921,50 @@ mod disown_tests {
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_bare_pid_matches_job_leader() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "sleep".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["1234".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_bare_pid_matches_pipeline_stage() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234, 1235, 1236], "a | b | c".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["1235".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.jobs.iter().count(), 0);
+    }
+
+    #[test]
+    fn disown_unknown_pid_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("disown", &["99999".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn disown_h_with_bare_pid_marks_job() {
+        let mut shell = Shell::new();
+        let id = shell.jobs.add(1234, vec![1234], "sleep".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "disown",
+            &["-h".to_string(), "1234".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let job = shell.jobs.iter().find(|j| j.id == id).expect("job removed!");
+        assert!(job.marked_for_nohup);
     }
 }
 
