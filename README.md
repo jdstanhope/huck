@@ -54,6 +54,7 @@ spec, an implementation plan, and a test suite.
 | v44       | `disown` accepts bare PID (M-44)                               |
 | v45       | `jobs -l`/`-p`/`-n`/`-r`/`-s` (M-45)                           |
 | v46       | Brace expansion `{a,b,c}` / `{1..5}` (M-61)                    |
+| v47       | Extended job specs `%cmd`/`%?cmd` (M-62)                       |
 
 ## Build and run
 
@@ -237,8 +238,7 @@ brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
 **Not yet implemented:**
-extended job specs (`%cmd`/`%?cmd`), backgrounded multi-pipeline
-sequences (`cmd1 && cmd2 &`), aliases.
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
 
 ## Project layout
 
