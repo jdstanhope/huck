@@ -13,6 +13,7 @@ pub enum LexError {
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
+    BraceExpansionLimit,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -143,7 +144,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     !parts.is_empty(),
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
-                tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                 has_token = false;
                 in_assignment_value = false;
             }
@@ -277,7 +278,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '|' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
@@ -291,7 +292,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
@@ -313,7 +314,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 let op = if chars.peek() == Some(&';') {
@@ -336,7 +337,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::LParen));
@@ -345,7 +346,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::RParen));
@@ -354,7 +355,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '<' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'<') {
@@ -394,7 +395,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
             '>' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    tokens.push(Token::Word(Word(std::mem::take(&mut parts))));
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
@@ -448,13 +449,102 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 
     if has_token {
         flush_literal(&mut parts, &mut current, false);
-        tokens.push(Token::Word(Word(parts)));
+        emit_word_with_braces(&mut tokens, parts)?;
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
     if !pending_heredocs.is_empty() {
         return Err(LexError::UnterminatedHeredoc);
     }
     Ok(tokens)
+}
+
+/// Returns true if any unquoted Literal part in `parts` contains
+/// an unquoted `{`. The fast-path check for brace expansion.
+fn word_contains_unquoted_brace(parts: &[WordPart]) -> bool {
+    parts.iter().any(|p| {
+        matches!(p, WordPart::Literal { text, quoted: false } if text.contains('{'))
+    })
+}
+
+/// Builds a concat string for brace expansion. Unquoted Literal
+/// text is appended verbatim. Other parts (quoted Literals, Var,
+/// Arith, CommandSub, Tilde, etc.) get a sentinel block
+/// `\u{E000}<idx>\u{E001}` and are recorded in `placeholders`.
+fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
+    let mut concat = String::new();
+    let mut placeholders: Vec<WordPart> = Vec::new();
+    for p in parts {
+        match p {
+            WordPart::Literal { text, quoted: false } => {
+                concat.push_str(text);
+            }
+            other => {
+                let idx = placeholders.len();
+                placeholders.push(other.clone());
+                concat.push('\u{E000}');
+                concat.push_str(&idx.to_string());
+                concat.push('\u{E001}');
+            }
+        }
+    }
+    (concat, placeholders)
+}
+
+/// Walks an expanded brace-expansion string and reconstructs a
+/// `Vec<WordPart>`. Literal runs (no sentinels) become Literals
+/// with `quoted: false`. Each sentinel block `\u{E000}<idx>\u{E001}`
+/// is replaced by `placeholders[idx].clone()`.
+fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
+    let mut out: Vec<WordPart> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{E000}' {
+            if !buf.is_empty() {
+                out.push(WordPart::Literal { text: std::mem::take(&mut buf), quoted: false });
+            }
+            let mut idx_str = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc == '\u{E001}' {
+                    chars.next();
+                    break;
+                }
+                idx_str.push(nc);
+                chars.next();
+            }
+            if let Ok(idx) = idx_str.parse::<usize>()
+                && let Some(p) = placeholders.get(idx)
+            {
+                out.push(p.clone());
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(WordPart::Literal { text: buf, quoted: false });
+    }
+    out
+}
+
+/// Emits a Word into `tokens`. If the parts contain an unquoted
+/// `{`, runs brace expansion and emits one Word per expansion.
+fn emit_word_with_braces(
+    tokens: &mut Vec<Token>,
+    parts: Vec<WordPart>,
+) -> Result<(), LexError> {
+    if !word_contains_unquoted_brace(&parts) {
+        tokens.push(Token::Word(Word(parts)));
+        return Ok(());
+    }
+    let (concat, placeholders) = build_concat_with_sentinels(&parts);
+    let expansions = crate::brace_expand::expand(&concat)
+        .map_err(|_| LexError::BraceExpansionLimit)?;
+    for s in expansions {
+        let new_parts = split_on_sentinels(&s, &placeholders);
+        tokens.push(Token::Word(Word(new_parts)));
+    }
+    Ok(())
 }
 
 fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
@@ -4401,5 +4491,75 @@ mod tests {
         let WordPart::Literal { text, quoted } = &parts[1] else { panic!("expected Literal at [1]") };
         assert_eq!(text, "foo");
         assert!(!*quoted);
+    }
+
+    #[test]
+    fn tokenize_brace_emits_multiple_words() {
+        let toks = tokenize("echo {a,b,c}").expect("lex");
+        // Should produce 4 Word tokens: echo, a, b, c (plus any
+        // separators we don't care about).
+        let word_texts: Vec<String> = toks
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word(Word(parts)) => {
+                    let s: String = parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            WordPart::Literal { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    Some(s)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(word_texts, vec!["echo", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn tokenize_brace_preserves_var() {
+        let toks = tokenize("echo $x{a,b}").expect("lex");
+        // First word is `echo`. Then two more Words, each with
+        // a Var part followed by a Literal part.
+        let word_tokens: Vec<&Vec<WordPart>> = toks
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word(Word(parts)) => Some(parts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(word_tokens.len(), 3);
+        // word_tokens[0] is `echo` (one Literal part).
+        // word_tokens[1] and [2] are Var+Literal pairs.
+        for w in &word_tokens[1..] {
+            assert!(matches!(w[0], WordPart::Var { .. }));
+            assert!(matches!(w[1], WordPart::Literal { quoted: false, .. }));
+        }
+    }
+
+    #[test]
+    fn tokenize_quoted_brace_not_expanded() {
+        let toks = tokenize("echo \"{a,b}\"").expect("lex");
+        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        assert_eq!(word_count, 2, "expected 2 Words (echo + the quoted literal), got {word_count}");
+    }
+
+    #[test]
+    fn tokenize_single_quoted_brace_not_expanded() {
+        let toks = tokenize("echo '{a,b}'").expect("lex");
+        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
+    }
+
+    #[test]
+    fn tokenize_backslash_brace_not_expanded() {
+        // The lexer's `\X` arm pushes each escaped char as a
+        // one-char QUOTED Literal (quoted: true). Brace expansion
+        // only fires on UNQUOTED Literals, so `\{a,b\}` survives
+        // as a single Word.
+        let toks = tokenize("echo \\{a,b\\}").expect("lex");
+        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
     }
 }
