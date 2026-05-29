@@ -68,7 +68,8 @@ pub fn run() -> i32 {
                     shell.history.add(history.clone());
                     let _ = editor.add_history_entry(history.as_str());
                 }
-                let do_alias = shell.is_interactive;
+                let do_alias = shell.is_interactive
+                    || std::env::var("HUCK_EXPAND_ALIASES").is_ok();
                 match process_line(&buffer, &mut shell, do_alias) {
                     ExecOutcome::Exit(code) => {
                         crate::traps::fire_exit_trap(&mut shell);
