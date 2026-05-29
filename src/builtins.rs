@@ -427,11 +427,14 @@ fn builtin_readonly(
     if names.is_empty() || want_list {
         for name in shell.readonly_names() {
             let value = shell.lookup_var(&name).unwrap_or_default();
-            let _ = writeln!(
+            if let Err(e) = writeln!(
                 out,
                 "readonly {name}='{}'",
                 escape_alias_value(&value)
-            );
+            ) {
+                eprintln!("huck: readonly: {e}");
+                return ExecOutcome::Continue(1);
+            }
         }
         return ExecOutcome::Continue(0);
     }
@@ -4657,6 +4660,21 @@ mod readonly_tests {
         let bare = run_builtin("export", &["X".to_string()], &mut buf, &mut shell);
         assert!(matches!(bare, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn export_set_preserves_readonly_flag_on_existing_var() {
+        // Regression: export_set must not silently strip the readonly
+        // flag on an already-present Variable. Without the fix, a
+        // future Task 2 caller (apply_inline_assignments) that bypasses
+        // the is_readonly check would clobber readonly state.
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        // Direct call to export_set on an already-readonly var.
+        shell.export_set("X", "new".to_string());
+        // Value updated, but readonly flag must stay set.
         assert!(shell.is_readonly("X"));
     }
 }

@@ -196,12 +196,23 @@ impl Shell {
             });
     }
 
-    /// Sets a variable's value AND marks it exported.
+    /// Sets a variable's value AND marks it exported. Preserves the
+    /// `readonly` flag on an existing entry — callers that need to
+    /// reject writes to readonly vars must check `is_readonly` first
+    /// (see `builtin_export` and `apply_inline_assignments`).
     pub fn export_set(&mut self, name: &str, value: String) {
-        self.vars.insert(
-            name.to_string(),
-            Variable { value, exported: true, readonly: false },
-        );
+        match self.vars.get_mut(name) {
+            Some(existing) => {
+                existing.value = value;
+                existing.exported = true;
+            }
+            None => {
+                self.vars.insert(
+                    name.to_string(),
+                    Variable { value, exported: true, readonly: false },
+                );
+            }
+        }
     }
 
     pub fn unset(&mut self, name: &str) {
