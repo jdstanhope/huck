@@ -217,6 +217,16 @@ impl JobTable {
         }
     }
 
+    /// Marks every job in `ids` as notified. Used by `jobs -n` to
+    /// consume the state-change flag after printing.
+    pub fn mark_notified(&mut self, ids: &[u32]) {
+        for job in self.jobs.iter_mut() {
+            if ids.contains(&job.id) {
+                job.notified = true;
+            }
+        }
+    }
+
     fn next_id(&self) -> u32 {
         let mut id = 1u32;
         loop {
@@ -292,6 +302,28 @@ pub fn notification_line(job: &Job, flag: char) -> String {
         _ => " &",
     };
     format!("[{}]{} {:<24} {}{}", job.id, flag, state, job.command, suffix)
+}
+
+/// Bash-faithful `jobs -l` output for a single job. Returns one
+/// String per pipeline stage. First stage carries the `[N]<flag>`
+/// prefix, state, command, and trailing `&`. Subsequent stages are
+/// indented 5 spaces and carry only the PID.
+pub fn notification_line_long(job: &Job, flag: char) -> Vec<String> {
+    let state = render_state(&job.state);
+    let suffix = match job.state {
+        JobState::Stopped(_) => "",
+        _ => " &",
+    };
+    let mut lines = Vec::with_capacity(job.pids.len().max(1));
+    let first_pid = job.pids.first().copied().unwrap_or(job.pgid);
+    lines.push(format!(
+        "[{}]{} {} {:<24} {}{}",
+        job.id, flag, first_pid, state, job.command, suffix
+    ));
+    for pid in job.pids.iter().skip(1) {
+        lines.push(format!("     {}", pid));
+    }
+    lines
 }
 
 /// Decodes a raw waitpid status into a JobState terminal variant.

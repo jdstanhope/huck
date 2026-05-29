@@ -317,13 +317,105 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     }
 }
 
-fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if !args.is_empty() {
-        eprintln!("huck: jobs: arguments not supported in this version");
-        return ExecOutcome::Continue(2);
+/// Parsed form of the `jobs` argv after flag and positional separation.
+struct JobsArgs {
+    long: bool,
+    pids_only: bool,
+    only_new: bool,
+    only_running: bool,
+    only_stopped: bool,
+    targets: Vec<u32>,
+}
+
+/// Parses `jobs`'s argv into flags + target ids. Returns
+/// `Err(ExecOutcome)` on any usage / lookup failure with the error
+/// already printed.
+fn parse_jobs_args(args: &[String], shell: &Shell) -> Result<JobsArgs, ExecOutcome> {
+    let mut long = false;
+    let mut pids_only = false;
+    let mut only_new = false;
+    let mut only_running = false;
+    let mut only_stopped = false;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if let Some(rest) = a.strip_prefix('-') {
+            if rest.is_empty() {
+                break;
+            }
+            for c in rest.chars() {
+                match c {
+                    'l' => long = true,
+                    'p' => pids_only = true,
+                    'n' => only_new = true,
+                    'r' => only_running = true,
+                    's' => only_stopped = true,
+                    _ => {
+                        eprintln!("huck: jobs: -{c}: invalid option");
+                        eprintln!("huck: jobs: usage: jobs [-lpnrs] [%spec ...]");
+                        return Err(ExecOutcome::Continue(2));
+                    }
+                }
+            }
+            idx += 1;
+        } else {
+            break;
+        }
     }
+
+    let mut targets = Vec::new();
+    for arg in &args[idx..] {
+        if !arg.starts_with('%') {
+            eprintln!("huck: jobs: {arg}: no such job");
+            return Err(ExecOutcome::Continue(1));
+        }
+        let id = resolve_spec_or_error(arg, "jobs", shell)?;
+        targets.push(id);
+    }
+
+    Ok(JobsArgs {
+        long,
+        pids_only,
+        only_new,
+        only_running,
+        only_stopped,
+        targets,
+    })
+}
+
+/// Returns true if `job` passes the filters in `parsed`.
+fn matches_jobs_filter(parsed: &JobsArgs, job: &crate::jobs::Job) -> bool {
+    if !parsed.targets.is_empty() && !parsed.targets.contains(&job.id) {
+        return false;
+    }
+    if parsed.only_running && !matches!(job.state, crate::jobs::JobState::Running) {
+        return false;
+    }
+    if parsed.only_stopped && !matches!(job.state, crate::jobs::JobState::Stopped(_)) {
+        return false;
+    }
+    if parsed.only_new && job.notified {
+        return false;
+    }
+    true
+}
+
+fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let parsed = match parse_jobs_args(args, shell) {
+        Ok(p) => p,
+        Err(outcome) => return outcome,
+    };
     let (current, previous) = shell.jobs.current_and_previous();
+    let mut printed_ids: Vec<u32> = Vec::new();
     for job in shell.jobs.iter() {
+        if !matches_jobs_filter(&parsed, job) {
+            continue;
+        }
         let flag = if Some(job.id) == current {
             '+'
         } else if Some(job.id) == previous {
@@ -331,10 +423,28 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
         } else {
             ' '
         };
-        if let Err(e) = writeln!(out, "{}", crate::jobs::notification_line(job, flag)) {
+        let write_result: std::io::Result<()> = if parsed.pids_only {
+            writeln!(out, "{}", job.pgid)
+        } else if parsed.long {
+            let mut r = Ok(());
+            for line in crate::jobs::notification_line_long(job, flag) {
+                if let Err(e) = writeln!(out, "{}", line) {
+                    r = Err(e);
+                    break;
+                }
+            }
+            r
+        } else {
+            writeln!(out, "{}", crate::jobs::notification_line(job, flag))
+        };
+        if let Err(e) = write_result {
             eprintln!("huck: jobs: {e}");
             return ExecOutcome::Continue(1);
         }
+        printed_ids.push(job.id);
+    }
+    if parsed.only_new {
+        shell.jobs.mark_notified(&printed_ids);
     }
     ExecOutcome::Continue(0)
 }
@@ -1685,14 +1795,6 @@ mod tests {
     }
 
     #[test]
-    fn jobs_with_args_errors() {
-        let mut shell = Shell::new();
-        let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_jobs(&["-l".to_string()], &mut out, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
-    }
-
-    #[test]
     fn jobs_lists_stopped_without_ampersand_suffix() {
         let mut shell = Shell::new();
         shell.jobs.add(100, vec![100], "sleep 100".to_string());
@@ -1703,6 +1805,135 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("Stopped"), "got: {out:?}");
         assert!(!out.trim_end().ends_with('&'), "Stopped line must NOT end with &; got: {out:?}");
+    }
+
+    #[test]
+    fn jobs_l_includes_pid_for_single_stage() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "sleep 30".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("1234"), "expected pid 1234 in: {out:?}");
+        assert!(out.contains("[1]"), "expected job number in: {out:?}");
+    }
+
+    #[test]
+    fn jobs_l_multistage_shows_all_pids() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234, 1235, 1236], "a | b | c".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("1234"), "missing 1234 in: {out:?}");
+        assert!(out.contains("1235"), "missing 1235 in: {out:?}");
+        assert!(out.contains("1236"), "missing 1236 in: {out:?}");
+        let line_count = out.lines().count();
+        assert!(line_count >= 3, "expected >=3 lines, got {line_count}: {out:?}");
+    }
+
+    #[test]
+    fn jobs_p_prints_pgids_only() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "a".to_string());
+        shell.jobs.add(2345, vec![2345], "b".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-p".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, got {lines:?}");
+        for l in &lines {
+            assert!(
+                l.parse::<i32>().is_ok(),
+                "expected each line to be an int, got {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_r_filters_running() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "running_cmd".to_string()); // %1 Running
+        shell.jobs.add_synthetic_done("done_cmd".to_string(), 0);     // %2 Done
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-r".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("running_cmd"), "missing running_cmd: {out:?}");
+        assert!(!out.contains("done_cmd"), "should not contain done_cmd: {out:?}");
+    }
+
+    #[test]
+    fn jobs_s_filters_stopped() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "running_cmd".to_string()); // %1 Running
+        shell.jobs.add(2345, vec![2345], "stopped_cmd".to_string()); // %2 then forced Stopped
+        shell.jobs.jobs_mut()[1].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-s".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("stopped_cmd"), "missing stopped_cmd: {out:?}");
+        assert!(!out.contains("running_cmd"), "should not contain running_cmd: {out:?}");
+    }
+
+    #[test]
+    fn jobs_n_filters_notified_false_and_marks() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "a".to_string()); // notified=false default
+        shell.jobs.add(2345, vec![2345], "b".to_string()); // notified=false default
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-n".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("[1]"), "first call should show [1]: {out:?}");
+        assert!(out.contains("[2]"), "first call should show [2]: {out:?}");
+
+        // Second call: both jobs are now marked notified -> empty output.
+        let mut buf2: Vec<u8> = Vec::new();
+        let outcome2 = run_builtin("jobs", &["-n".to_string()], &mut buf2, &mut shell);
+        assert!(matches!(outcome2, ExecOutcome::Continue(0)));
+        let out2 = String::from_utf8(buf2).unwrap();
+        assert!(out2.is_empty(), "second call should be empty: {out2:?}");
+    }
+
+    #[test]
+    fn jobs_positional_spec_filters_to_target() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "first_cmd".to_string());  // %1
+        shell.jobs.add(2345, vec![2345], "second_cmd".to_string()); // %2
+        shell.jobs.add(3456, vec![3456], "third_cmd".to_string());  // %3
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["%2".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("second_cmd"), "missing second_cmd: {out:?}");
+        assert!(!out.contains("first_cmd"), "should not contain first_cmd: {out:?}");
+        assert!(!out.contains("third_cmd"), "should not contain third_cmd: {out:?}");
+    }
+
+    #[test]
+    fn jobs_invalid_flag_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-x".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn jobs_p_overrides_l() {
+        let mut shell = Shell::new();
+        shell.jobs.add(1234, vec![1234], "sleep".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("jobs", &["-lp".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        // -p output is just digits + newline, no [N] prefix.
+        assert!(!out.contains("[1]"), "expected -p override, got: {out:?}");
+        assert_eq!(out.trim(), "1234");
     }
 
     #[test]
