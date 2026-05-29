@@ -59,6 +59,7 @@ spec, an implementation plan, and a test suite.
 | v49       | Backgrounded multi-pipeline sequences (M-52)                   |
 | v50       | `shift` + `set --` (M-65)                                      |
 | v51       | `source` / `.` (M-66)                                          |
+| v52       | `local` (M-67)                                                 |
 
 ## Build and run
 
