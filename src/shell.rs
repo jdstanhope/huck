@@ -267,7 +267,7 @@ pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> Exec
     }
 }
 
-fn parse_error_message(error: ParseError) -> String {
+pub(crate) fn parse_error_message(error: ParseError) -> String {
     match error {
         ParseError::MissingCommand => "expected a command".to_string(),
         ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
@@ -312,7 +312,7 @@ fn parse_error_message(error: ParseError) -> String {
 /// `"huck: syntax error"` prefix reads naturally. Substitution-wrapper
 /// variants start with `" in command substitution"` (no colon) so the
 /// rendered line reads `"huck: syntax error in command substitution: ..."`.
-fn lex_error_message(error: LexError) -> String {
+pub(crate) fn lex_error_message(error: LexError) -> String {
     match error {
         LexError::UnterminatedQuote => ": unterminated quote".to_string(),
         LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
