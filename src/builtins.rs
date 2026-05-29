@@ -21,6 +21,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
+    "readonly",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -34,7 +35,7 @@ pub fn is_builtin(name: &str) -> bool {
 /// huck adds `eval`/`exec`/`:`/`readonly`.
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
-        ":" | "." | "break" | "continue" | "exit" | "export" | "return"
+        ":" | "." | "break" | "continue" | "exit" | "export" | "readonly" | "return"
         | "set" | "shift" | "source" | "trap" | "unset"
     )
 }
@@ -73,6 +74,7 @@ pub fn run_builtin(
         "true" => builtin_true(args, shell),
         "false" => builtin_false(args, shell),
         "command" => builtin_command(args, out, shell),
+        "readonly" => builtin_readonly(args, out, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -296,6 +298,11 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
                     any_error = true;
                     continue;
                 }
+                if shell.is_readonly(name) {
+                    eprintln!("huck: export: {name}: readonly variable");
+                    any_error = true;
+                    continue;
+                }
                 shell.export_set(name, value.to_string());
             }
             None => {
@@ -304,6 +311,9 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
                     any_error = true;
                     continue;
                 }
+                // Bare `export NAME` (no `=`) is exempt from the
+                // readonly check: bash allows flipping the export flag
+                // on a readonly variable without changing its value.
                 shell.export(arg);
             }
         }
@@ -323,6 +333,11 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             any_error = true;
             continue;
         }
+        if shell.is_readonly(arg) {
+            eprintln!("huck: unset: {arg}: readonly variable");
+            any_error = true;
+            continue;
+        }
         shell.unset(arg);
     }
     if any_error {
@@ -337,6 +352,7 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
         eprintln!("huck: local: can only be used in a function");
         return ExecOutcome::Continue(1);
     }
+    let mut exit: i32 = 0;
     for arg in args {
         let (name, value): (&str, Option<String>) = match arg.find('=') {
             Some(eq) => (&arg[..eq], Some(arg[eq + 1..].to_string())),
@@ -344,7 +360,15 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
         };
         if !is_valid_name(name) {
             eprintln!("huck: local: `{arg}': not a valid identifier");
-            return ExecOutcome::Continue(1);
+            exit = 1;
+            continue;
+        }
+        // Refuse to shadow a readonly variable. Do NOT snapshot or
+        // set; the outer (readonly) binding stays live.
+        if shell.is_readonly(name) {
+            eprintln!("huck: local: {name}: readonly variable");
+            exit = 1;
+            continue;
         }
         // Snapshot pre-local state only if NAME is not already saved
         // in this frame. Compute the snapshot via shell.snapshot_var
@@ -364,7 +388,80 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
         }
         shell.set(name, value.unwrap_or_default());
     }
-    ExecOutcome::Continue(0)
+    ExecOutcome::Continue(exit)
+}
+
+/// `readonly [-p] [NAME[=VALUE] ...]`. POSIX special builtin. With no
+/// names (or with `-p`), lists every readonly variable in
+/// `readonly NAME='value'` form (using the existing single-quote
+/// escape). For each NAME=VALUE arg, sets the value and marks readonly;
+/// for each bare NAME arg, marks readonly (creating an empty var if
+/// unset). Refuses to overwrite an already-readonly variable. Invalid
+/// identifiers → status 1 (other args still processed).
+fn builtin_readonly(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut want_list = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                want_list = true;
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: readonly: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+    let names = &args[i..];
+
+    if names.is_empty() || want_list {
+        for name in shell.readonly_names() {
+            let value = shell.lookup_var(&name).unwrap_or_default();
+            if let Err(e) = writeln!(
+                out,
+                "readonly {name}='{}'",
+                escape_alias_value(&value)
+            ) {
+                eprintln!("huck: readonly: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut exit = 0;
+    for arg in names {
+        let (name, value): (&str, Option<String>) = match arg.find('=') {
+            Some(eq) => (&arg[..eq], Some(arg[eq + 1..].to_string())),
+            None => (arg.as_str(), None),
+        };
+        if !is_valid_name(name) {
+            eprintln!("huck: readonly: `{arg}': not a valid identifier");
+            exit = 1;
+            continue;
+        }
+        if let Some(v) = value {
+            // Refuse to overwrite an already-readonly variable.
+            if shell.is_readonly(name) {
+                eprintln!("huck: readonly: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
+            shell.set(name, v);
+        }
+        shell.mark_readonly(name);
+    }
+    ExecOutcome::Continue(exit)
 }
 
 /// Parsed form of the `jobs` argv after flag and positional separation.
@@ -4420,5 +4517,164 @@ mod command_tests {
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), r"alias greet='echo it'\''s me'");
+    }
+}
+
+#[cfg(test)]
+mod readonly_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn readonly_with_value_sets_and_locks() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["X=hi".to_string()];
+        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("hi"));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn readonly_no_value_creates_empty_and_locks() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["X".to_string()];
+        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn readonly_no_value_keeps_existing_value() {
+        let mut shell = Shell::new();
+        shell.set("X", "prev".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["X".to_string()];
+        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("prev"));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn readonly_multi_arg_mixed_forms() {
+        let mut shell = Shell::new();
+        shell.set("B", "had".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["A=1".to_string(), "B".to_string(), "C=3".to_string()];
+        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("A").as_deref(), Some("1"));
+        assert_eq!(shell.lookup_var("B").as_deref(), Some("had"));
+        assert_eq!(shell.lookup_var("C").as_deref(), Some("3"));
+        assert!(shell.is_readonly("A"));
+        assert!(shell.is_readonly("B"));
+        assert!(shell.is_readonly("C"));
+    }
+
+    #[test]
+    fn readonly_invalid_identifier_errors() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["1foo=bar".to_string()];
+        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(shell.lookup_var("1foo").is_none());
+    }
+
+    #[test]
+    fn readonly_listing_no_args() {
+        let mut shell = Shell::new();
+        shell.set("X", "v".to_string());
+        shell.mark_readonly("X");
+        shell.set("Y", "w".to_string());
+        shell.mark_readonly("Y");
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("readonly", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        // Sorted; POSIX-escape format.
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.contains(&"readonly X='v'"));
+        assert!(lines.contains(&"readonly Y='w'"));
+    }
+
+    #[test]
+    fn readonly_dash_p_same_as_no_args() {
+        let mut shell = Shell::new();
+        shell.set("X", "v".to_string());
+        shell.mark_readonly("X");
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("readonly", &["-p".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.lines().any(|l| l == "readonly X='v'"));
+    }
+
+    #[test]
+    fn readonly_overwrite_existing_readonly_errors() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        run_builtin("readonly", &["X=first".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin(
+            "readonly",
+            &["X=second".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("first"));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn unset_readonly_errors_status_1() {
+        let mut shell = Shell::new();
+        shell.set("X", "v".to_string());
+        shell.mark_readonly("X");
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("unset", &["X".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn export_readonly_value_errors_but_bare_export_succeeds() {
+        let mut shell = Shell::new();
+        shell.set("X", "v".to_string());
+        shell.mark_readonly("X");
+        let mut buf: Vec<u8> = Vec::new();
+        // `export X=newval` should error and not overwrite.
+        let bad = run_builtin(
+            "export",
+            &["X=newval".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(bad, ExecOutcome::Continue(1)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
+        // `export X` (bare) should succeed and flip the export flag.
+        let bare = run_builtin("export", &["X".to_string()], &mut buf, &mut shell);
+        assert!(matches!(bare, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
+        assert!(shell.is_readonly("X"));
+    }
+
+    #[test]
+    fn export_set_preserves_readonly_flag_on_existing_var() {
+        // Regression: export_set must not silently strip the readonly
+        // flag on an already-present Variable. Without the fix, a
+        // future Task 2 caller (apply_inline_assignments) that bypasses
+        // the is_readonly check would clobber readonly state.
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        // Direct call to export_set on an already-readonly var.
+        shell.export_set("X", "new".to_string());
+        // Value updated, but readonly flag must stay set.
+        assert!(shell.is_readonly("X"));
     }
 }

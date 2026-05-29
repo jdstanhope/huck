@@ -42,7 +42,10 @@ pub fn expand_modifier(
             let raw = shell.get(name).map(|s| s.to_string());
             if condition_is_null(raw.as_deref(), *colon) {
                 let v = expand_word_to_string(word, shell);
-                shell.set(name, v.clone());
+                if shell.try_set(name, v.clone()).is_err() {
+                    eprintln!("huck: {name}: readonly variable");
+                    return ExpansionResult::Fatal { status: 1 };
+                }
                 ExpansionResult::Value(v)
             } else {
                 ExpansionResult::Value(raw.unwrap_or_default())

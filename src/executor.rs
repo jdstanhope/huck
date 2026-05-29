@@ -288,7 +288,10 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
         {
             return ExecOutcome::Continue(130);
         }
-        shell.set(&clause.var, value);
+        if shell.try_set(&clause.var, value).is_err() {
+            eprintln!("huck: {}: readonly variable", clause.var);
+            return ExecOutcome::Continue(1);
+        }
         match execute_sequence_body(&clause.body, shell, sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak => {
@@ -419,7 +422,13 @@ fn run_double_bracket(
     inline_assignments: &[(String, crate::lexer::Word)],
     shell: &mut Shell,
 ) -> ExecOutcome {
-    let snap = apply_inline_assignments(inline_assignments, shell);
+    let snap = match apply_inline_assignments(inline_assignments, shell) {
+        Ok(s) => s,
+        Err(s) => {
+            restore_inline_assignments(s, shell);
+            return ExecOutcome::Continue(1);
+        }
+    };
     let result = match eval_test_expr(expr, shell) {
         Ok(true)  => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
@@ -688,7 +697,15 @@ fn run_background_sequence(
             } else {
                 &[]
             };
-        let snap = apply_inline_assignments(inline_assignments, shell);
+        let snap = match apply_inline_assignments(inline_assignments, shell) {
+            Ok(s) => s,
+            Err(s) => {
+                restore_inline_assignments(s, shell);
+                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
+                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                return ExecOutcome::Continue(1);
+            }
+        };
 
         // ---- Stdin fd ---------------------------------------------------------
         let mut heredoc_write_fd: Option<RawFd> = None;
@@ -1355,7 +1372,10 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
         SimpleCommand::Assign(items) => {
             for (name, value) in items {
                 let v = expand_assignment(value, shell);
-                shell.set(name, v);
+                if shell.try_set(name, v).is_err() {
+                    eprintln!("huck: {name}: readonly variable");
+                    return ExecOutcome::Continue(1);
+                }
             }
             ExecOutcome::Continue(0)
         }
@@ -1430,7 +1450,13 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // targets (regular builtins and externals). Persistent-scope targets
     // (control builtins, special builtins per POSIX 2.14, and functions per
     // POSIX 2.9.1) skip the restore step.
-    let snap = apply_inline_assignments(&cmd.inline_assignments, shell);
+    let snap = match apply_inline_assignments(&cmd.inline_assignments, shell) {
+        Ok(s) => s,
+        Err(s) => {
+            restore_inline_assignments(s, shell);
+            return ExecOutcome::Continue(1);
+        }
+    };
 
     // Determine whether the assignments should persist after the command.
     // Control builtins and special builtins: persistent.
@@ -1882,7 +1908,14 @@ fn run_multi_stage(
             } else {
                 &[]
             };
-        let snap = apply_inline_assignments(inline_assignments, shell);
+        let snap = match apply_inline_assignments(inline_assignments, shell) {
+            Ok(s) => s,
+            Err(s) => {
+                restore_inline_assignments(s, shell);
+                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                return ExecOutcome::Continue(1);
+            }
+        };
 
         // ---- Build stdin fd --------------------------------------------------
         // Priority: explicit redirect on ExecCommand > prev_pipe_read > STDIN_FILENO.
@@ -2518,16 +2551,20 @@ type AssignmentSnapshot = Vec<(String, Option<String>, bool)>;
 fn apply_inline_assignments(
     assignments: &[(String, crate::lexer::Word)],
     shell: &mut Shell,
-) -> AssignmentSnapshot {
+) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
     for (name, rhs) in assignments {
         let prior_value = shell.get(name).map(str::to_string);
         let prior_exported = shell.is_exported(name);
+        if shell.is_readonly(name) {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(snap);
+        }
         let value = expand_assignment(rhs, shell);
         shell.export_set(name, value);
         snap.push((name.clone(), prior_value, prior_exported));
     }
-    snap
+    Ok(snap)
 }
 
 /// Restores each snapshot entry in reverse order, so repeated names
@@ -3566,7 +3603,7 @@ mod tests {
             ("A".to_string(), lit_word("1")),
             ("B".to_string(), Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
         ];
-        let snap = apply_inline_assignments(&assigns, &mut shell);
+        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("A"), Some("1"));
         assert_eq!(shell.get("B"), Some("1"));
         assert!(shell.is_exported("A"));
@@ -3578,7 +3615,7 @@ mod tests {
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
         let assigns = vec![("FOO".to_string(), lit_word("bar"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell);
+        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), None);
@@ -3590,7 +3627,7 @@ mod tests {
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
         let assigns = vec![("FOO".to_string(), lit_word("inner"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell);
+        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
         restore_inline_assignments(snap, &mut shell);
@@ -3603,7 +3640,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
         let assigns = vec![("FOO".to_string(), lit_word("inner"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell);
+        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
         assert!(shell.is_exported("FOO"));
@@ -3617,7 +3654,7 @@ mod tests {
             ("FOO".to_string(), lit_word("a")),
             ("FOO".to_string(), lit_word("b")),
         ];
-        let snap = apply_inline_assignments(&assigns, &mut shell);
+        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("b"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -4064,5 +4101,85 @@ mod tests {
         for job in shell.jobs.iter() {
             unsafe { libc::kill(job.pgid, libc::SIGTERM); }
         }
+    }
+
+    // ----- v54: readonly enforcement at executor-layer write paths ----------
+
+    #[test]
+    fn top_level_assign_to_readonly_errors() {
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        exec_script("X=new\n", &mut shell);
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn inline_assignment_to_readonly_aborts_command() {
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        // Inline `X=new echo hi` — bash aborts the command. Use a
+        // builtin (echo) to keep the assertion deterministic.
+        exec_script("X=new echo hi\n", &mut shell);
+        // X is still its original value (not changed by the failed
+        // inline). The echo should NOT have run. Status is 1.
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn for_loop_iter_var_readonly_aborts_at_first_iter() {
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        exec_script(
+            "for X in a b c; do echo got=$X; done\n",
+            &mut shell,
+        );
+        // X unchanged; status 1; body should not have executed.
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn param_expansion_default_assign_to_readonly_errors() {
+        let mut shell = Shell::new();
+        shell.set("X", "".to_string());
+        shell.mark_readonly("X");
+        // `: ${X:=hello}` — colon command + AssignDefault that
+        // tries to write hello to readonly X.
+        exec_script(": ${X:=hello}\n", &mut shell);
+        assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn arith_assign_to_readonly_errors() {
+        let mut shell = Shell::new();
+        shell.set("X", "0".to_string());
+        shell.mark_readonly("X");
+        // The arith expansion machinery in expand.rs maps any
+        // ArithError to "huck: arithmetic: <msg>" + set_last_status(1)
+        // with empty substitution; the surrounding command may then
+        // overwrite the status (echo returns 0). The load-bearing
+        // assertion is that the readonly X was NOT clobbered.
+        exec_script("echo $((X=5))\n", &mut shell);
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn local_readonly_in_function_errors() {
+        let mut shell = Shell::new();
+        shell.set("X", "outer".to_string());
+        shell.mark_readonly("X");
+        exec_script(
+            "f() { local X=inner; }\nf\n",
+            &mut shell,
+        );
+        // local should have errored; X unchanged.
+        assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
+        assert_eq!(shell.last_status(), 1);
     }
 }
