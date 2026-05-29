@@ -82,6 +82,11 @@ pub struct Shell {
     /// Depth counter for ERR-suppression contexts (if/elif/while/until
     /// conditions). ERR trap only fires when this is 0.
     pub err_suppressed_depth: u32,
+
+    /// Recursive `source`/`.` call depth. Capped at 64 in
+    /// `builtin_source` to prevent runaway loops. Increment on
+    /// enter, decrement on exit.
+    pub source_depth: u32,
 }
 
 impl Shell {
@@ -114,6 +119,7 @@ impl Shell {
             trap_sigids: std::collections::HashMap::new(),
             firing_trap: None,
             err_suppressed_depth: 0,
+            source_depth: 0,
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.

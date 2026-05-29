@@ -58,6 +58,7 @@ spec, an implementation plan, and a test suite.
 | v48       | Aliases (M-63)                                                 |
 | v49       | Backgrounded multi-pipeline sequences (M-52)                   |
 | v50       | `shift` + `set --` (M-65)                                      |
+| v51       | `source` / `.` (M-66)                                          |
 
 ## Build and run
 

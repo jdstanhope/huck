@@ -19,7 +19,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
-    "set", "shift",
+    "set", "shift", ".", "source",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -30,11 +30,11 @@ pub fn is_builtin(name: &str) -> bool {
 /// special builtin persist in the shell; assignments preceding a regular
 /// builtin or external command are scoped to the command. The set is huck's
 /// existing builtins intersected with the POSIX special list; expand here as
-/// huck adds `eval`/`exec`/`:`/`readonly`/`.`.
+/// huck adds `eval`/`exec`/`:`/`readonly`.
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
-        "break" | "continue" | "exit" | "export" | "return"
-        | "set" | "shift" | "trap" | "unset"
+        "." | "break" | "continue" | "exit" | "export" | "return"
+        | "set" | "shift" | "source" | "trap" | "unset"
     )
 }
 
@@ -64,6 +64,7 @@ pub fn run_builtin(
         "trap" => builtin_trap(args, out, shell),
         "set" => builtin_set(args, out, shell),
         "shift" => builtin_shift(args, shell),
+        "." | "source" => builtin_source(args, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         "test" | "[" => builtin_test(name, args),
@@ -1550,6 +1551,132 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
 
 fn set_escape_value(v: &str) -> String {
     format!("'{}'", v.replace('\'', r#"'\''"#))
+}
+
+fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        eprintln!("huck: .: usage: . filename [arguments]");
+        return ExecOutcome::Continue(2);
+    }
+    if shell.source_depth >= 64 {
+        eprintln!("huck: .: maximum source depth (64) exceeded");
+        return ExecOutcome::Continue(1);
+    }
+    let filename = &args[0];
+    let path = match resolve_source_path(filename, shell) {
+        Some(p) => p,
+        None => {
+            eprintln!("huck: .: {filename}: file not found");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("huck: .: {}: {e}", path.display());
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let extra: Vec<String> = args[1..].to_vec();
+    let saved_positional = if !extra.is_empty() {
+        let saved = std::mem::take(&mut shell.positional_args);
+        shell.positional_args = extra;
+        Some(saved)
+    } else {
+        None
+    };
+
+    shell.source_depth += 1;
+    let result = run_sourced_contents(&contents, &path, shell);
+    shell.source_depth -= 1;
+
+    if let Some(saved) = saved_positional {
+        shell.positional_args = saved;
+    }
+    result
+}
+
+fn resolve_source_path(
+    filename: &str,
+    shell: &crate::shell_state::Shell,
+) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if filename.contains('/') {
+        let p = PathBuf::from(filename);
+        return if p.is_file() { Some(p) } else { None };
+    }
+    let path_var = shell.lookup_var("PATH").unwrap_or_default();
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(dir).join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_sourced_contents(
+    contents: &str,
+    path: &std::path::Path,
+    shell: &mut crate::shell_state::Shell,
+) -> ExecOutcome {
+    use crate::continuation::{classify, Completeness};
+    let mut last_status = shell.last_status();
+    let mut buf = String::new();
+    for line in contents.lines() {
+        buf.push_str(line);
+        buf.push('\n');
+        if let Completeness::Incomplete(_) = classify(&buf) {
+            continue;
+        }
+        let tokens = match crate::lexer::tokenize(&buf) {
+            Ok(t) if t.is_empty() => {
+                buf.clear();
+                continue;
+            }
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "huck: {}: syntax error{}",
+                    path.display(),
+                    crate::shell::lex_error_message(e)
+                );
+                last_status = 2;
+                buf.clear();
+                continue;
+            }
+        };
+        match crate::command::parse(tokens) {
+            Ok(Some(seq)) => {
+                let outcome = crate::executor::execute(&seq, shell, &buf);
+                buf.clear();
+                match outcome {
+                    ExecOutcome::Continue(c) => last_status = c,
+                    ExecOutcome::Exit(n) => return ExecOutcome::Exit(n),
+                    ExecOutcome::FunctionReturn(n) => {
+                        return ExecOutcome::Continue(n);
+                    }
+                    ExecOutcome::LoopBreak | ExecOutcome::LoopContinue => {
+                        last_status = 0;
+                    }
+                }
+            }
+            Ok(None) => buf.clear(),
+            Err(e) => {
+                eprintln!(
+                    "huck: {}: syntax error: {}",
+                    path.display(),
+                    crate::shell::parse_error_message(e)
+                );
+                last_status = 2;
+                buf.clear();
+            }
+        }
+    }
+    ExecOutcome::Continue(last_status)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
@@ -3739,5 +3866,63 @@ mod set_tests {
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("set", &["+x".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn source_no_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(".", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn source_missing_file_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            ".",
+            &["/nonexistent/file/path/huck-v51-test".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn source_depth_limit_errors_status_1() {
+        let mut shell = Shell::new();
+        shell.source_depth = 64;
+        let mut buf: Vec<u8> = Vec::new();
+        // Use a path that would otherwise resolve fine — depth check
+        // fires before the path resolution.
+        let outcome = run_builtin(
+            ".",
+            &["/etc/hostname".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        // Counter unchanged because the early return bypasses the
+        // increment.
+        assert_eq!(shell.source_depth, 64);
+    }
+
+    #[test]
+    fn is_builtin_recognises_dot_and_source() {
+        assert!(is_builtin("."));
+        assert!(is_builtin("source"));
+    }
+
+    #[test]
+    fn is_special_builtin_includes_dot_and_source() {
+        assert!(is_special_builtin("."));
+        assert!(is_special_builtin("source"));
     }
 }
