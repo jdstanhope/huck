@@ -775,15 +775,22 @@ fn builtin_read(
         }
     };
 
+    // Restore echo. Only emit the trailing newline when we ACTUALLY
+    // suppressed echo (tty AND tcsetattr succeeded), so that
+    // `read -s X < pipe` doesn't print a stray blank line. EOF
+    // doesn't change that — if echo was off on a tty, the user's
+    // Enter (or Ctrl-D) still didn't show, so the newline belongs.
+    #[cfg(unix)]
+    let was_silenced = saved_term.is_some();
+    #[cfg(not(unix))]
+    let was_silenced = false;
     #[cfg(unix)]
     if let Some(s) = saved_term {
         unsafe {
             silent_restore_echo(s);
         }
     }
-    // If we suppressed echo, emit the newline the user expected but
-    // never saw.
-    if silent {
+    if was_silenced {
         eprintln!();
     }
 
