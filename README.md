@@ -57,6 +57,7 @@ spec, an implementation plan, and a test suite.
 | v47       | Extended job specs `%cmd`/`%?cmd` (M-62)                       |
 | v48       | Aliases (M-63)                                                 |
 | v49       | Backgrounded multi-pipeline sequences (M-52)                   |
+| v50       | `shift` + `set --` (M-65)                                      |
 
 ## Build and run
 
