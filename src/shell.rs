@@ -273,9 +273,6 @@ fn parse_error_message(error: ParseError) -> String {
         ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
         ParseError::RedirectTargetIsOperator => "expected a filename after redirection".to_string(),
         ParseError::UnexpectedBackground => "'&' not allowed here".to_string(),
-        ParseError::BackgroundedMultiPipelineSequence => {
-            "'&' on multi-command sequence not supported; use a single pipeline".to_string()
-        }
         ParseError::UnterminatedIf => "unterminated 'if' (expected 'then'/'fi')".to_string(),
         ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
         ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
