@@ -19,6 +19,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
+    "set", "shift",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -29,9 +30,12 @@ pub fn is_builtin(name: &str) -> bool {
 /// special builtin persist in the shell; assignments preceding a regular
 /// builtin or external command are scoped to the command. The set is huck's
 /// existing builtins intersected with the POSIX special list; expand here as
-/// huck adds `set`/`shift`/`trap`/`eval`/`exec`/`:`/`readonly`/`.`.
+/// huck adds `eval`/`exec`/`:`/`readonly`/`.`.
 pub fn is_special_builtin(name: &str) -> bool {
-    matches!(name, "break" | "continue" | "exit" | "export" | "return" | "trap" | "unset")
+    matches!(name,
+        "break" | "continue" | "exit" | "export" | "return"
+        | "set" | "shift" | "trap" | "unset"
+    )
 }
 
 /// Runs a builtin. Caller must ensure `is_builtin(name)` is true. `out` is the
@@ -58,6 +62,8 @@ pub fn run_builtin(
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
         "trap" => builtin_trap(args, out, shell),
+        "set" => builtin_set(args, out, shell),
+        "shift" => builtin_shift(args, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         "test" | "[" => builtin_test(name, args),
@@ -1495,6 +1501,55 @@ fn signal_number_to_name(signum: i32) -> Option<String> {
     crate::traps::name_table().iter().find_map(|(name, n)| {
         if *n == signum { Some(name.to_string()) } else { None }
     })
+}
+
+fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let n: usize = match args.first() {
+        None => 1,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("huck: shift: {s}: numeric argument required");
+                return ExecOutcome::Continue(1);
+            }
+        },
+    };
+    if n > shell.positional_args.len() {
+        eprintln!("huck: shift: shift count out of range");
+        return ExecOutcome::Continue(1);
+    }
+    shell.positional_args.drain(0..n);
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
+        names.sort();
+        for name in &names {
+            if let Some(v) = shell.lookup_var(name) {
+                let _ = writeln!(out, "{}={}", name, set_escape_value(&v));
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let first = &args[0];
+    if first == "--" {
+        shell.positional_args = args[1..].to_vec();
+        return ExecOutcome::Continue(0);
+    }
+    if (first.starts_with('-') || first.starts_with('+')) && first.len() > 1 {
+        eprintln!("huck: set: {first}: options not yet supported in this version");
+        return ExecOutcome::Continue(2);
+    }
+    // No leading -- or option flag — replace positional with all args.
+    shell.positional_args = args.to_vec();
+    ExecOutcome::Continue(0)
+}
+
+fn set_escape_value(v: &str) -> String {
+    format!("'{}'", v.replace('\'', r#"'\''"#))
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
@@ -3516,6 +3571,173 @@ mod alias_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("unalias", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+}
+
+#[cfg(test)]
+mod shift_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn shift_no_args_removes_first() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.positional_args, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn shift_n_removes_n() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec![
+            "a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &["2".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.positional_args, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn shift_default_when_no_args_equals_one() {
+        let mut shell_a = Shell::new();
+        shell_a.positional_args = vec!["x".to_string(), "y".to_string()];
+        let mut shell_b = Shell::new();
+        shell_b.positional_args = vec!["x".to_string(), "y".to_string()];
+
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = run_builtin("shift", &[], &mut buf, &mut shell_a);
+        let _ = run_builtin("shift", &["1".to_string()], &mut buf, &mut shell_b);
+
+        assert_eq!(shell_a.positional_args, shell_b.positional_args);
+        assert_eq!(shell_a.positional_args, vec!["y"]);
+    }
+
+    #[test]
+    fn shift_too_large_errors_status_1() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &["5".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        // Positional unchanged after error.
+        assert_eq!(shell.positional_args, vec!["a"]);
+    }
+
+    #[test]
+    fn shift_zero_is_noop() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &["0".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.positional_args, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn shift_non_numeric_errors_status_1() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &["abc".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert_eq!(shell.positional_args, vec!["a"]);
+    }
+
+    #[test]
+    fn shift_negative_errors_status_1() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        // `-1` fails parse::<usize>() because usize can't be negative.
+        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert_eq!(shell.positional_args, vec!["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod set_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn set_no_args_lists_sorted_vars() {
+        let mut shell = Shell::new();
+        // Use unique names unlikely to collide with environment.
+        shell.set("ZZTEST_C", "three".to_string());
+        shell.set("ZZTEST_A", "one".to_string());
+        shell.set("ZZTEST_B", "two".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("set", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        // Find the three target lines and confirm they appear in
+        // sorted order relative to each other.
+        let a_idx = out.find("ZZTEST_A=").expect("missing A");
+        let b_idx = out.find("ZZTEST_B=").expect("missing B");
+        let c_idx = out.find("ZZTEST_C=").expect("missing C");
+        assert!(a_idx < b_idx, "A should come before B");
+        assert!(b_idx < c_idx, "B should come before C");
+        // Format check: value should be single-quoted.
+        assert!(out.contains("ZZTEST_A='one'"), "expected single-quoted value: {out:?}");
+    }
+
+    #[test]
+    fn set_double_dash_alone_clears_positional() {
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("set", &["--".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(shell.positional_args.is_empty());
+    }
+
+    #[test]
+    fn set_double_dash_with_args_replaces() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "set",
+            &["--".to_string(), "one".to_string(), "two".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.positional_args, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn set_bare_args_replaces_positional() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "set",
+            &["one".to_string(), "two".to_string(), "three".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.positional_args, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn set_dash_e_rejects_with_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("set", &["-e".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_plus_x_rejects_with_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("set", &["+x".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
