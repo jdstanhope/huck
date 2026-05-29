@@ -60,6 +60,7 @@ spec, an implementation plan, and a test suite.
 | v50       | `shift` + `set --` (M-65)                                      |
 | v51       | `source` / `.` (M-66)                                          |
 | v52       | `local` (M-67)                                                 |
+| v53       | `:` (M-68), `true` / `false` (M-69), `command -v`/`-V` (M-70)  |
 
 ## Build and run
 

@@ -27,8 +27,14 @@ fn run(script: &str) -> (String, String) {
 
 #[test]
 fn wait_multiarg_all_succeed() {
-    // Both bg jobs exit 0; wait %1 %2; echo $? → 0
-    let (out, _) = run("(true) &\n(true) &\nwait %1 %2\necho $?\nexit\n");
+    // Both bg jobs exit 0; wait %1 %2; echo $? → 0.
+    // Sleeps keep both jobs alive past huck's between-statement reap+notify
+    // cycle so %1/%2 are still resolvable when `wait` runs. (Without them,
+    // `true` as a builtin (v53) returns instantly and the jobs reap before
+    // `wait` resolves them.)
+    let (out, _) = run(
+        "(sleep 0.1; true) &\n(sleep 0.2; true) &\nwait %1 %2\necho $?\nexit\n",
+    );
     assert!(out.lines().any(|l| l == "0"), "stdout: {:?}", out);
 }
 
