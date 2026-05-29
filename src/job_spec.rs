@@ -2,11 +2,13 @@
 //! doesn't know about them. Builtins call `parse_job_spec` on any
 //! argument starting with `%`.
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum JobSpec {
     Id(u32),
     Current,
     Previous,
+    Prefix(String),
+    Substring(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,7 +42,14 @@ pub fn parse_job_spec(s: &str) -> Result<JobSpec, JobSpecError> {
             .map(JobSpec::Id)
             .map_err(|_| JobSpecError::BadNumber);
     }
-    Err(JobSpecError::BadSymbol)
+    // v47: substring (%?cmd) or prefix (%cmd).
+    if let Some(pattern) = rest.strip_prefix('?') {
+        if pattern.is_empty() {
+            return Err(JobSpecError::BadSymbol);
+        }
+        return Ok(JobSpec::Substring(pattern.to_string()));
+    }
+    Ok(JobSpec::Prefix(rest.to_string()))
 }
 
 #[cfg(test)]
@@ -81,13 +90,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_percent_letters_is_bad_symbol() {
-        assert_eq!(parse_job_spec("%abc"), Err(JobSpecError::BadSymbol));
+    fn parse_percent_letters_is_prefix() {
+        assert_eq!(
+            parse_job_spec("%abc"),
+            Ok(JobSpec::Prefix("abc".to_string()))
+        );
     }
 
     #[test]
-    fn parse_percent_tilde_is_bad_symbol() {
-        assert_eq!(parse_job_spec("%~"), Err(JobSpecError::BadSymbol));
+    fn parse_percent_tilde_is_prefix() {
+        assert_eq!(
+            parse_job_spec("%~"),
+            Ok(JobSpec::Prefix("~".to_string()))
+        );
     }
 
     #[test]
@@ -96,5 +111,34 @@ mod tests {
         // we error rather than panic.
         assert_eq!(parse_job_spec("1"), Err(JobSpecError::BadSymbol));
         assert_eq!(parse_job_spec(""), Err(JobSpecError::BadSymbol));
+    }
+
+    #[test]
+    fn parse_percent_word_is_prefix() {
+        assert_eq!(
+            parse_job_spec("%sleep"),
+            Ok(JobSpec::Prefix("sleep".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_percent_question_word_is_substring() {
+        assert_eq!(
+            parse_job_spec("%?find"),
+            Ok(JobSpec::Substring("find".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_percent_question_alone_is_bad_symbol() {
+        assert_eq!(parse_job_spec("%?"), Err(JobSpecError::BadSymbol));
+    }
+
+    #[test]
+    fn parse_percent_question_with_spaces_in_pattern() {
+        assert_eq!(
+            parse_job_spec("%?ab cd"),
+            Ok(JobSpec::Substring("ab cd".to_string()))
+        );
     }
 }

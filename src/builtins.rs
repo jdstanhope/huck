@@ -901,10 +901,17 @@ fn resolve_spec_or_error(
         eprintln!("huck: {builtin}: {arg}: bad job spec");
         ExecOutcome::Continue(1)
     })?;
-    shell.jobs.resolve(&spec).ok_or_else(|| {
-        eprintln!("huck: {builtin}: {arg}: no such job");
-        ExecOutcome::Continue(1)
-    })
+    match shell.jobs.resolve(&spec) {
+        Ok(id) => Ok(id),
+        Err(crate::jobs::JobSpecResolveError::NotFound) => {
+            eprintln!("huck: {builtin}: {arg}: no such job");
+            Err(ExecOutcome::Continue(1))
+        }
+        Err(crate::jobs::JobSpecResolveError::Ambiguous) => {
+            eprintln!("huck: {builtin}: {arg}: ambiguous job spec");
+            Err(ExecOutcome::Continue(1))
+        }
+    }
 }
 
 fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {

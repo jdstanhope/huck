@@ -15,6 +15,12 @@ pub enum JobState {
     Signaled(i32),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum JobSpecResolveError {
+    NotFound,
+    Ambiguous,
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: u32,
@@ -192,15 +198,50 @@ impl JobTable {
     }
 
     /// Resolves a JobSpec to a job id, if any matching job exists.
-    pub fn resolve(&self, spec: &crate::job_spec::JobSpec) -> Option<u32> {
+    pub fn resolve(
+        &self,
+        spec: &crate::job_spec::JobSpec,
+    ) -> Result<u32, JobSpecResolveError> {
+        use crate::job_spec::JobSpec;
         match spec {
-            crate::job_spec::JobSpec::Id(id) => {
-                self.jobs.iter().find(|j| j.id == *id).map(|j| j.id)
-            }
-            crate::job_spec::JobSpec::Current => self.current_id(),
-            crate::job_spec::JobSpec::Previous => {
+            JobSpec::Id(id) => self
+                .jobs
+                .iter()
+                .find(|j| j.id == *id)
+                .map(|j| j.id)
+                .ok_or(JobSpecResolveError::NotFound),
+            JobSpec::Current => self
+                .current_id()
+                .ok_or(JobSpecResolveError::NotFound),
+            JobSpec::Previous => {
                 let (_, prev) = self.current_and_previous();
-                prev
+                prev.ok_or(JobSpecResolveError::NotFound)
+            }
+            JobSpec::Prefix(p) => {
+                let matches: Vec<u32> = self
+                    .jobs
+                    .iter()
+                    .filter(|j| j.command.starts_with(p.as_str()))
+                    .map(|j| j.id)
+                    .collect();
+                match matches.len() {
+                    0 => Err(JobSpecResolveError::NotFound),
+                    1 => Ok(matches[0]),
+                    _ => Err(JobSpecResolveError::Ambiguous),
+                }
+            }
+            JobSpec::Substring(p) => {
+                let matches: Vec<u32> = self
+                    .jobs
+                    .iter()
+                    .filter(|j| j.command.contains(p.as_str()))
+                    .map(|j| j.id)
+                    .collect();
+                match matches.len() {
+                    0 => Err(JobSpecResolveError::NotFound),
+                    1 => Ok(matches[0]),
+                    _ => Err(JobSpecResolveError::Ambiguous),
+                }
             }
         }
     }
@@ -673,14 +714,14 @@ mod tests {
         let _ = t.add(100, vec![100], "a".to_string());
         let _ = t.add(200, vec![200], "b".to_string());
         let spec = crate::job_spec::JobSpec::Id(2);
-        assert_eq!(t.resolve(&spec), Some(2));
+        assert_eq!(t.resolve(&spec), Ok(2));
     }
 
     #[test]
-    fn resolve_id_missing_returns_none() {
+    fn resolve_id_missing_returns_not_found() {
         let t = JobTable::new();
         let spec = crate::job_spec::JobSpec::Id(99);
-        assert_eq!(t.resolve(&spec), None);
+        assert_eq!(t.resolve(&spec), Err(JobSpecResolveError::NotFound));
     }
 
     #[test]
@@ -688,7 +729,7 @@ mod tests {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "a".to_string());
         let _ = t.add(200, vec![200], "b".to_string());
-        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Current), Some(2));
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Current), Ok(2));
     }
 
     #[test]
@@ -696,14 +737,64 @@ mod tests {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "a".to_string());
         let _ = t.add(200, vec![200], "b".to_string());
-        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), Some(1));
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), Ok(1));
     }
 
     #[test]
-    fn resolve_previous_returns_none_when_only_one_job() {
+    fn resolve_previous_returns_not_found_when_only_one_job() {
         let mut t = JobTable::new();
         let _ = t.add(100, vec![100], "a".to_string());
-        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), None);
+        assert_eq!(t.resolve(&crate::job_spec::JobSpec::Previous), Err(JobSpecResolveError::NotFound));
+    }
+
+    #[test]
+    fn resolve_prefix_unique_match() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "sleep 30".to_string());
+        let spec = crate::job_spec::JobSpec::Prefix("sleep".to_string());
+        assert_eq!(t.resolve(&spec), Ok(1));
+    }
+
+    #[test]
+    fn resolve_prefix_no_match() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "sleep 30".to_string());
+        let spec = crate::job_spec::JobSpec::Prefix("xyz".to_string());
+        assert_eq!(t.resolve(&spec), Err(JobSpecResolveError::NotFound));
+    }
+
+    #[test]
+    fn resolve_prefix_ambiguous() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "sleep 30".to_string());
+        t.add(1235, vec![1235], "sleep 60".to_string());
+        let spec = crate::job_spec::JobSpec::Prefix("sleep".to_string());
+        assert_eq!(t.resolve(&spec), Err(JobSpecResolveError::Ambiguous));
+    }
+
+    #[test]
+    fn resolve_substring_unique_match() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "find . -name foo".to_string());
+        let spec = crate::job_spec::JobSpec::Substring("name".to_string());
+        assert_eq!(t.resolve(&spec), Ok(1));
+    }
+
+    #[test]
+    fn resolve_substring_no_match() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "find . -name foo".to_string());
+        let spec = crate::job_spec::JobSpec::Substring("xyz".to_string());
+        assert_eq!(t.resolve(&spec), Err(JobSpecResolveError::NotFound));
+    }
+
+    #[test]
+    fn resolve_substring_ambiguous() {
+        let mut t = JobTable::new();
+        t.add(1234, vec![1234], "find . -name foo".to_string());
+        t.add(1235, vec![1235], "grep foo bar".to_string());
+        let spec = crate::job_spec::JobSpec::Substring("foo".to_string());
+        assert_eq!(t.resolve(&spec), Err(JobSpecResolveError::Ambiguous));
     }
 
     #[test]
