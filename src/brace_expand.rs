@@ -2,9 +2,11 @@
 //! stage before any other expansion. Operates on a `&str` and
 //! returns the list of expanded strings.
 //!
-//! Sentinels of the form `\u{0001}<idx>\u{0002}` mark positions
-//! occupied by non-Literal WordParts and are preserved verbatim
-//! through expansion.
+//! Sentinels of the form `\u{E000}<idx>\u{E001}` (Unicode Private
+//! Use Area) mark positions occupied by non-Literal WordParts and
+//! are preserved verbatim through expansion. The PUA chars are
+//! reserved by Unicode for internal application use and are not
+//! expected to appear in real shell input.
 
 const MAX_ELEMENTS: usize = 65_536;
 
@@ -23,15 +25,14 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     if out.len() > MAX_ELEMENTS {
         return Err(BraceError::TooManyElements);
     }
-    let bytes = input.as_bytes();
-    let lbrace = match find_top_level_lbrace(bytes) {
+    let lbrace = match find_top_level_lbrace(input) {
         Some(i) => i,
         None => {
             out.push(input.to_string());
             return Ok(());
         }
     };
-    let rbrace = match find_matching_rbrace(bytes, lbrace) {
+    let rbrace = match find_matching_rbrace(input, lbrace) {
         Some(i) => i,
         None => {
             out.push(input.to_string());
@@ -74,51 +75,51 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     Ok(())
 }
 
-fn find_top_level_lbrace(bytes: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x01 {
-            // Skip sentinel block: \u{0001} <idx_bytes> \u{0002}
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != 0x02 {
-                j += 1;
+fn find_top_level_lbrace(s: &str) -> Option<usize> {
+    let mut iter = s.char_indices();
+    while let Some((i, c)) = iter.next() {
+        if c == '\u{E000}' {
+            // Skip sentinel block: \u{E000} <digits> \u{E001}
+            let mut closed = false;
+            for (_, nc) in iter.by_ref() {
+                if nc == '\u{E001}' {
+                    closed = true;
+                    break;
+                }
             }
-            if j < bytes.len() {
-                i = j + 1;
-                continue;
-            } else {
+            if !closed {
                 return None;
             }
+            continue;
         }
-        if b == b'{' {
+        if c == '{' {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
 
-fn find_matching_rbrace(bytes: &[u8], lbrace: usize) -> Option<usize> {
+fn find_matching_rbrace(s: &str, lbrace: usize) -> Option<usize> {
     let mut depth: i32 = 1;
-    let mut i = lbrace + 1;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x01 {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != 0x02 {
-                j += 1;
+    let mut iter = s[lbrace + 1..].char_indices();
+    while let Some((rel_i, c)) = iter.next() {
+        let i = lbrace + 1 + rel_i;
+        if c == '\u{E000}' {
+            let mut closed = false;
+            for (_, nc) in iter.by_ref() {
+                if nc == '\u{E001}' {
+                    closed = true;
+                    break;
+                }
             }
-            if j < bytes.len() {
-                i = j + 1;
-                continue;
-            } else {
+            if !closed {
                 return None;
             }
+            continue;
         }
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
+        match c {
+            '{' => depth += 1,
+            '}' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -126,7 +127,6 @@ fn find_matching_rbrace(bytes: &[u8], lbrace: usize) -> Option<usize> {
             }
             _ => {}
         }
-        i += 1;
     }
     None
 }
@@ -144,35 +144,33 @@ fn parse_body(body: &str) -> Option<Vec<String>> {
 }
 
 fn split_top_level_commas(body: &str) -> Option<Vec<String>> {
-    let bytes = body.as_bytes();
     let mut depth: i32 = 0;
     let mut items: Vec<String> = Vec::new();
     let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x01 {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j] != 0x02 {
-                j += 1;
+    let mut iter = body.char_indices();
+    while let Some((i, c)) = iter.next() {
+        if c == '\u{E000}' {
+            let mut closed = false;
+            for (_, nc) in iter.by_ref() {
+                if nc == '\u{E001}' {
+                    closed = true;
+                    break;
+                }
             }
-            if j < bytes.len() {
-                i = j + 1;
-                continue;
-            } else {
+            if !closed {
                 return None;
             }
+            continue;
         }
-        match b {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            b',' if depth == 0 => {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
                 items.push(body[start..i].to_string());
-                start = i + 1;
+                start = i + c.len_utf8();
             }
             _ => {}
         }
-        i += 1;
     }
     items.push(body[start..].to_string());
     Some(items)
@@ -353,5 +351,21 @@ mod tests {
     fn too_many_elements_errors() {
         let err = expand("{1..70000}").unwrap_err();
         assert_eq!(err, BraceError::TooManyElements);
+    }
+
+    #[test]
+    fn soh_stx_in_input_pass_through_cleanly() {
+        // \u{0001} (SOH) and \u{0002} (STX) used to be our sentinels
+        // and would collide with user input containing them. After
+        // switching to PUA sentinels (\u{E000}/\u{E001}), these
+        // control chars pass through brace expansion unchanged.
+        let result = expand("X\u{0001}Y{a,b}\u{0002}Z").unwrap();
+        assert_eq!(
+            result,
+            vec![
+                "X\u{0001}Ya\u{0002}Z".to_string(),
+                "X\u{0001}Yb\u{0002}Z".to_string(),
+            ]
+        );
     }
 }

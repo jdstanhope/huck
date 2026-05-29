@@ -469,7 +469,7 @@ fn word_contains_unquoted_brace(parts: &[WordPart]) -> bool {
 /// Builds a concat string for brace expansion. Unquoted Literal
 /// text is appended verbatim. Other parts (quoted Literals, Var,
 /// Arith, CommandSub, Tilde, etc.) get a sentinel block
-/// `\u{0001}<idx>\u{0002}` and are recorded in `placeholders`.
+/// `\u{E000}<idx>\u{E001}` and are recorded in `placeholders`.
 fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
     let mut concat = String::new();
     let mut placeholders: Vec<WordPart> = Vec::new();
@@ -481,9 +481,9 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
             other => {
                 let idx = placeholders.len();
                 placeholders.push(other.clone());
-                concat.push('\u{0001}');
+                concat.push('\u{E000}');
                 concat.push_str(&idx.to_string());
-                concat.push('\u{0002}');
+                concat.push('\u{E001}');
             }
         }
     }
@@ -492,20 +492,20 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
 
 /// Walks an expanded brace-expansion string and reconstructs a
 /// `Vec<WordPart>`. Literal runs (no sentinels) become Literals
-/// with `quoted: false`. Each sentinel block `\u{0001}<idx>\u{0002}`
+/// with `quoted: false`. Each sentinel block `\u{E000}<idx>\u{E001}`
 /// is replaced by `placeholders[idx].clone()`.
 fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     let mut out: Vec<WordPart> = Vec::new();
     let mut buf = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{0001}' {
+        if c == '\u{E000}' {
             if !buf.is_empty() {
                 out.push(WordPart::Literal { text: std::mem::take(&mut buf), quoted: false });
             }
             let mut idx_str = String::new();
             while let Some(&nc) = chars.peek() {
-                if nc == '\u{0002}' {
+                if nc == '\u{E001}' {
                     chars.next();
                     break;
                 }
