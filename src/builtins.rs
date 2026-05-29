@@ -21,7 +21,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly",
+    "readonly", "read",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -75,6 +75,7 @@ pub fn run_builtin(
         "false" => builtin_false(args, shell),
         "command" => builtin_command(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
+        "read" => builtin_read(args, out, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -460,6 +461,353 @@ fn builtin_readonly(
             shell.set(name, v);
         }
         shell.mark_readonly(name);
+    }
+    ExecOutcome::Continue(exit)
+}
+
+/// Reads one logical line from `r` honoring the terminator byte `delim`
+/// and POSIX/bash escape handling.
+///
+/// - `raw = true`: no escape processing; backslash is literal.
+/// - `raw = false`: `\X` (X ≠ newline) → X (escape removal);
+///   `\<LF>` (backslash followed by newline) is line continuation —
+///   both bytes are dropped and reading continues onto the next line.
+///
+/// Returns `Ok(None)` when EOF hits BEFORE any byte was read (the
+/// caller treats this as `read` exit status 1). Returns
+/// `Ok(Some(partial))` when EOF hits AFTER at least one byte but
+/// before the delim (caller still assigns and returns status 0).
+fn read_one_line<R: std::io::BufRead>(
+    r: &mut R,
+    raw: bool,
+    delim: u8,
+) -> std::io::Result<Option<String>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut any_byte_read = false;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = r.read(&mut byte)?;
+        if n == 0 {
+            if !any_byte_read {
+                return Ok(None);
+            }
+            break;
+        }
+        any_byte_read = true;
+        let b = byte[0];
+        if b == delim {
+            break;
+        }
+        if !raw && b == b'\\' {
+            let mut nxt = [0u8; 1];
+            let m = r.read(&mut nxt)?;
+            if m == 0 {
+                // Trailing backslash at EOF: keep it.
+                out.push(b'\\');
+                break;
+            }
+            // any_byte_read already true
+            if nxt[0] == b'\n' {
+                continue; // line continuation
+            }
+            out.push(nxt[0]); // escape removal: \X → X
+            continue;
+        }
+        out.push(b);
+    }
+    Ok(Some(String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// POSIX/bash `read`-style field splitting. Assigns fields to
+/// `names` left-to-right; the LAST name gets the remainder of the
+/// line (no further splitting). Trailing IFS-whitespace is stripped
+/// from the last assigned field. For a single name, the line is
+/// assigned whole with leading + trailing IFS-whitespace stripped.
+///
+/// `ifs` is the current value of the IFS variable (caller looks it
+/// up). Empty IFS means "no splitting" — assign whole line to first
+/// name, rest empty.
+fn split_into_names(
+    line: &str,
+    names: &[String],
+    ifs: &str,
+) -> Vec<(String, String)> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+
+    // Classify IFS bytes.
+    let ifs_bytes: Vec<u8> = ifs.bytes().collect();
+    let is_ws = |b: u8| ifs_bytes.contains(&b) && matches!(b, b' ' | b'\t' | b'\n');
+    let is_nonws = |b: u8| ifs_bytes.contains(&b) && !matches!(b, b' ' | b'\t' | b'\n');
+    let is_any_ifs = |b: u8| ifs_bytes.contains(&b);
+
+    let bytes = line.as_bytes();
+
+    // Empty IFS: no splitting at all.
+    if ifs_bytes.is_empty() {
+        let mut out: Vec<(String, String)> = Vec::with_capacity(names.len());
+        out.push((names[0].clone(), line.to_string()));
+        for n in &names[1..] {
+            out.push((n.clone(), String::new()));
+        }
+        return out;
+    }
+
+    // Single-name: strip leading + trailing IFS-whitespace, assign whole.
+    if names.len() == 1 {
+        let mut start = 0;
+        while start < bytes.len() && is_ws(bytes[start]) {
+            start += 1;
+        }
+        let mut end = bytes.len();
+        while end > start && is_ws(bytes[end - 1]) {
+            end -= 1;
+        }
+        let value = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+        return vec![(names[0].clone(), value)];
+    }
+
+    // Multi-name walk.
+    let mut fields: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    // Skip leading IFS-whitespace.
+    while i < bytes.len() && is_ws(bytes[i]) {
+        i += 1;
+    }
+
+    while fields.len() < names.len() - 1 && i < bytes.len() {
+        // Consume one field.
+        let start = i;
+        while i < bytes.len() && !is_any_ifs(bytes[i]) {
+            i += 1;
+        }
+        let field = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+        fields.push(field);
+
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Consume the separator run.
+        // If the separator is a non-ws IFS char, consume EXACTLY one,
+        // then optionally trailing ws-IFS. If it's ws-IFS, consume
+        // all consecutive ws-IFS, then optionally a single non-ws-IFS.
+        if is_nonws(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() && is_nonws(bytes[i]) {
+                i += 1;
+                while i < bytes.len() && is_ws(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Pad missing fields.
+    while fields.len() < names.len() - 1 {
+        fields.push(String::new());
+    }
+
+    // Last field: rest of line from position i, with trailing
+    // ws-IFS stripped.
+    let mut end = bytes.len();
+    while end > i && is_ws(bytes[end - 1]) {
+        end -= 1;
+    }
+    let last = String::from_utf8_lossy(&bytes[i..end]).into_owned();
+    fields.push(last);
+
+    names
+        .iter()
+        .zip(fields)
+        .map(|(n, v)| (n.clone(), v))
+        .collect()
+}
+
+#[cfg(unix)]
+unsafe fn silent_disable_echo() -> Option<libc::termios> {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    if unsafe { libc::isatty(fd) } == 0 {
+        return None;
+    }
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return None;
+    }
+    let saved = t;
+    t.c_lflag &= !libc::ECHO;
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    Some(saved)
+}
+
+#[cfg(unix)]
+unsafe fn silent_restore_echo(saved: libc::termios) {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+}
+
+/// `read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]`. Regular
+/// builtin. Reads one logical line from stdin and assigns fields to
+/// NAME(s) per IFS field-splitting. With no NAME, assigns the whole
+/// line to `REPLY`. `-r` disables backslash processing. `-p` writes
+/// PROMPT to stderr (only when stdin is a tty, matching bash). `-s`
+/// disables ECHO via termios for the duration of the read (when
+/// stdin is a tty). `-d` sets the line-terminator byte (empty DELIM
+/// → NUL). Exit 0 on success; 1 on EOF-before-any-byte or readonly
+/// assignment failure; 2 on bad flag.
+fn builtin_read(
+    args: &[String],
+    _out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut raw = false;
+    let mut silent = false;
+    let mut prompt: Option<String> = None;
+    let mut delim: u8 = b'\n';
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        let bytes = arg.as_bytes();
+        let mut j = 1;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'r' => raw = true,
+                b's' => silent = true,
+                b'p' => {
+                    // -p PROMPT — value is rest-of-arg OR next arg.
+                    if j + 1 < bytes.len() {
+                        prompt = Some(
+                            String::from_utf8_lossy(&bytes[j + 1..]).into_owned(),
+                        );
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: read: -p: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        prompt = Some(args[i].clone());
+                    }
+                    break;
+                }
+                b'd' => {
+                    let d_val: String = if j + 1 < bytes.len() {
+                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: read: -d: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        args[i].clone()
+                    };
+                    // Empty DELIM means NUL byte.
+                    delim = d_val.bytes().next().unwrap_or(0u8);
+                    break;
+                }
+                c => {
+                    eprintln!("huck: read: -{}: invalid option", c as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    let names: Vec<String> = args[i..].to_vec();
+
+    // Validate names BEFORE reading (POSIX ordering).
+    for name in &names {
+        if !is_valid_name(name) {
+            eprintln!("huck: read: `{name}': not a valid identifier");
+            return ExecOutcome::Continue(1);
+        }
+    }
+
+    // Prompt — only when stdin is a tty (matches bash).
+    if let Some(p) = &prompt {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            eprint!("{p}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+    }
+
+    // -s silent: toggle ECHO off on stdin's tty for the duration of
+    // the read, then restore.
+    #[cfg(unix)]
+    let saved_term = if silent {
+        unsafe { silent_disable_echo() }
+    } else {
+        None
+    };
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let line_opt = match read_one_line(&mut handle, raw, delim) {
+        Ok(opt) => opt,
+        Err(e) => {
+            eprintln!("huck: read: {e}");
+            #[cfg(unix)]
+            if let Some(s) = saved_term {
+                unsafe {
+                    silent_restore_echo(s);
+                }
+            }
+            return ExecOutcome::Continue(1);
+        }
+    };
+
+    #[cfg(unix)]
+    if let Some(s) = saved_term {
+        unsafe {
+            silent_restore_echo(s);
+        }
+    }
+    // If we suppressed echo, emit the newline the user expected but
+    // never saw.
+    if silent {
+        eprintln!();
+    }
+
+    let line = match line_opt {
+        Some(l) => l,
+        None => return ExecOutcome::Continue(1), // EOF, nothing read
+    };
+
+    // Assignment.
+    let ifs = shell
+        .lookup_var("IFS")
+        .unwrap_or_else(|| " \t\n".to_string());
+    let assignments: Vec<(String, String)> = if names.is_empty() {
+        vec![("REPLY".to_string(), line)]
+    } else {
+        split_into_names(&line, &names, &ifs)
+    };
+
+    let mut exit = 0;
+    for (name, value) in assignments {
+        if shell.try_set(&name, value).is_err() {
+            eprintln!("huck: read: {name}: readonly variable");
+            exit = 1;
+        }
     }
     ExecOutcome::Continue(exit)
 }
@@ -4676,5 +5024,122 @@ mod readonly_tests {
         shell.export_set("X", "new".to_string());
         // Value updated, but readonly flag must stay set.
         assert!(shell.is_readonly("X"));
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // ── read_one_line ──────────────────────────────────────────
+
+    #[test]
+    fn read_one_line_basic() {
+        let mut c = Cursor::new(b"hello\n".as_slice());
+        let r = read_one_line(&mut c, false, b'\n').unwrap();
+        assert_eq!(r.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn read_one_line_eof_returns_none() {
+        let mut c = Cursor::new(b"".as_slice());
+        let r = read_one_line(&mut c, false, b'\n').unwrap();
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn read_one_line_eof_partial_returns_some() {
+        let mut c = Cursor::new(b"abc".as_slice());
+        let r = read_one_line(&mut c, false, b'\n').unwrap();
+        assert_eq!(r.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn read_one_line_escape_removal() {
+        // "a\\bc\n" — non-raw → "abc" (\\b → b).
+        let mut c = Cursor::new(b"a\\bc\n".as_slice());
+        let r = read_one_line(&mut c, false, b'\n').unwrap();
+        assert_eq!(r.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn read_one_line_line_continuation() {
+        // "a\\\nb\n" — non-raw → "ab".
+        let mut c = Cursor::new(b"a\\\nb\n".as_slice());
+        let r = read_one_line(&mut c, false, b'\n').unwrap();
+        assert_eq!(r.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn read_one_line_raw_preserves_backslash() {
+        // "a\\b\n" — raw → "a\\b".
+        let mut c = Cursor::new(b"a\\b\n".as_slice());
+        let r = read_one_line(&mut c, true, b'\n').unwrap();
+        assert_eq!(r.as_deref(), Some("a\\b"));
+    }
+
+    #[test]
+    fn read_one_line_custom_delim() {
+        let mut c = Cursor::new(b"foo:bar\n".as_slice());
+        let r = read_one_line(&mut c, false, b':').unwrap();
+        assert_eq!(r.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn read_one_line_nul_delim() {
+        let mut c = Cursor::new(b"foo\0bar".as_slice());
+        let r = read_one_line(&mut c, false, 0u8).unwrap();
+        assert_eq!(r.as_deref(), Some("foo"));
+    }
+
+    // ── split_into_names ───────────────────────────────────────
+
+    #[test]
+    fn split_into_names_single_name_strip_ws() {
+        let names = vec!["X".to_string()];
+        let r = split_into_names("  hi  ", &names, " \t\n");
+        assert_eq!(r, vec![("X".to_string(), "hi".to_string())]);
+    }
+
+    #[test]
+    fn split_into_names_multi_simple() {
+        let names = vec!["X".to_string(), "Y".to_string(), "Z".to_string()];
+        let r = split_into_names("a b c d", &names, " \t\n");
+        assert_eq!(
+            r,
+            vec![
+                ("X".to_string(), "a".to_string()),
+                ("Y".to_string(), "b".to_string()),
+                ("Z".to_string(), "c d".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_into_names_more_names_than_fields() {
+        let names = vec!["X".to_string(), "Y".to_string(), "Z".to_string()];
+        let r = split_into_names("a b", &names, " \t\n");
+        assert_eq!(
+            r,
+            vec![
+                ("X".to_string(), "a".to_string()),
+                ("Y".to_string(), "b".to_string()),
+                ("Z".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_into_names_custom_ifs_colon() {
+        let names = vec!["X".to_string(), "Y".to_string()];
+        let r = split_into_names("a:b:c", &names, ":");
+        assert_eq!(
+            r,
+            vec![
+                ("X".to_string(), "a".to_string()),
+                ("Y".to_string(), "b:c".to_string()),
+            ]
+        );
     }
 }
