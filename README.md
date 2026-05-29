@@ -56,7 +56,7 @@ spec, an implementation plan, and a test suite.
 | v46       | Brace expansion `{a,b,c}` / `{1..5}` (M-61)                    |
 | v47       | Extended job specs `%cmd`/`%?cmd` (M-62)                       |
 | v48       | Aliases (M-63)                                                 |
-| v49       | Backgrounded multi-pipeline sequences (M-64)                   |
+| v49       | Backgrounded multi-pipeline sequences (M-52)                   |
 
 ## Build and run
 
