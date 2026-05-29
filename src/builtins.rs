@@ -18,7 +18,7 @@ pub enum ExecOutcome {
 pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
-    "break", "continue", "return", "trap",
+    "break", "continue", "return", "trap", "alias", "unalias",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -58,6 +58,8 @@ pub fn run_builtin(
         "disown" => builtin_disown(args, shell),
         "history" => builtin_history(args, out, shell),
         "trap" => builtin_trap(args, out, shell),
+        "alias" => builtin_alias(args, out, shell),
+        "unalias" => builtin_unalias(args, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -1493,6 +1495,73 @@ fn signal_number_to_name(signum: i32) -> Option<String> {
     crate::traps::name_table().iter().find_map(|(name, n)| {
         if *n == signum { Some(name.to_string()) } else { None }
     })
+}
+
+fn is_valid_alias_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('=')
+        && s.chars().all(|c| !c.is_whitespace() && !"|&;<>()$`\\\"'*?[]#~{}".contains(c))
+}
+
+fn escape_alias_value(v: &str) -> String {
+    // Bash format: alias name='value' with single quotes inside
+    // the value rewritten as '\''.
+    v.replace('\'', r#"'\''"#)
+}
+
+fn builtin_alias(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        let mut names: Vec<&String> = shell.aliases.keys().collect();
+        names.sort();
+        for name in names {
+            let value = &shell.aliases[name];
+            let _ = writeln!(out, "alias {}='{}'", name, escape_alias_value(value));
+        }
+        return ExecOutcome::Continue(0);
+    }
+    let mut any_err = false;
+    for arg in args {
+        if let Some(eq) = arg.find('=') {
+            let name = &arg[..eq];
+            let value = &arg[eq + 1..];
+            if !is_valid_alias_name(name) {
+                eprintln!("huck: alias: `{name}': invalid alias name");
+                any_err = true;
+                continue;
+            }
+            shell.aliases.insert(name.to_string(), value.to_string());
+        } else {
+            match shell.aliases.get(arg) {
+                Some(v) => {
+                    let _ = writeln!(out, "alias {}='{}'", arg, escape_alias_value(v));
+                }
+                None => {
+                    eprintln!("huck: alias: {arg}: not found");
+                    any_err = true;
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(if any_err { 1 } else { 0 })
+}
+
+fn builtin_unalias(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        eprintln!("huck: unalias: usage: unalias [-a] name [name ...]");
+        return ExecOutcome::Continue(2);
+    }
+    if args[0] == "-a" {
+        shell.aliases.clear();
+        return ExecOutcome::Continue(0);
+    }
+    let mut any_err = false;
+    for name in args {
+        if shell.aliases.remove(name).is_none() {
+            eprintln!("huck: unalias: {name}: not found");
+            any_err = true;
+        }
+    }
+    ExecOutcome::Continue(if any_err { 1 } else { 0 })
 }
 
 fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
@@ -3342,5 +3411,111 @@ mod special_builtin_tests {
         assert!(pseudo_lines[1].contains("ERR"), "second line should be ERR: {}", pseudo_lines[1]);
         assert!(pseudo_lines[2].contains("DEBUG"), "third line should be DEBUG: {}", pseudo_lines[2]);
         assert!(pseudo_lines[3].contains("RETURN"), "fourth line should be RETURN: {}", pseudo_lines[3]);
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn alias_no_args_lists_empty() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("alias", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(buf.is_empty(), "expected empty output, got {:?}", String::from_utf8_lossy(&buf));
+    }
+
+    #[test]
+    fn alias_no_args_lists_sorted() {
+        let mut shell = Shell::new();
+        shell.aliases.insert("ll".to_string(), "ls -l".to_string());
+        shell.aliases.insert("la".to_string(), "ls -A".to_string());
+        shell.aliases.insert("l".to_string(), "ls".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("alias", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "alias l='ls'",
+                "alias la='ls -A'",
+                "alias ll='ls -l'",
+            ]
+        );
+    }
+
+    #[test]
+    fn alias_defines_simple() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "alias",
+            &["ll=ls -l".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.aliases.get("ll").map(|s| s.as_str()), Some("ls -l"));
+    }
+
+    #[test]
+    fn alias_lookup_existing_prints() {
+        let mut shell = Shell::new();
+        shell.aliases.insert("ll".to_string(), "ls -l".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("alias", &["ll".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "alias ll='ls -l'\n");
+    }
+
+    #[test]
+    fn alias_lookup_missing_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("alias", &["xyz".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn unalias_removes_existing() {
+        let mut shell = Shell::new();
+        shell.aliases.insert("ll".to_string(), "ls -l".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("unalias", &["ll".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(!shell.aliases.contains_key("ll"));
+    }
+
+    #[test]
+    fn unalias_missing_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("unalias", &["xyz".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn unalias_dash_a_clears_all() {
+        let mut shell = Shell::new();
+        shell.aliases.insert("ll".to_string(), "ls -l".to_string());
+        shell.aliases.insert("la".to_string(), "ls -A".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("unalias", &["-a".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(shell.aliases.is_empty());
+    }
+
+    #[test]
+    fn unalias_no_args_returns_usage_status_2() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("unalias", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }

@@ -67,7 +67,7 @@ pub fn dispatch_pending_traps(shell: &mut Shell) {
             Some(Some(text)) => text.clone(),
             Some(None) | None => continue,
         };
-        let _ = crate::shell::process_line(&action, shell);
+        let _ = crate::shell::process_line(&action, shell, false);
     }
 }
 
@@ -79,7 +79,7 @@ pub fn fire_exit_trap(shell: &mut Shell) {
         Some(Some(text)) => text,
         _ => return,
     };
-    let _ = crate::shell::process_line(&action, shell);
+    let _ = crate::shell::process_line(&action, shell, false);
 }
 
 /// Fires the ERR pseudo-signal trap. Repeatable: the trap entry is
@@ -113,7 +113,7 @@ fn fire_pseudo_trap(shell: &mut Shell, sig: TrapSignal) {
         _ => return,
     };
     let prev = shell.firing_trap.replace(sig);
-    let _ = crate::shell::process_line(&action, shell);
+    let _ = crate::shell::process_line(&action, shell, false);
     shell.firing_trap = prev;
 }
 
