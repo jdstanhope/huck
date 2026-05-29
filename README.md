@@ -56,6 +56,7 @@ spec, an implementation plan, and a test suite.
 | v46       | Brace expansion `{a,b,c}` / `{1..5}` (M-61)                    |
 | v47       | Extended job specs `%cmd`/`%?cmd` (M-62)                       |
 | v48       | Aliases (M-63)                                                 |
+| v49       | Backgrounded multi-pipeline sequences (M-64)                   |
 
 ## Build and run
 
@@ -237,9 +238,6 @@ enclosing loop (matching bash). `local` variable scoping, `set --` /
 `shift`, `$0`, and redirections on a function call (`func > file`) are not implemented. v22 also adds the standalone
 brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
-
-**Not yet implemented:**
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`).
 
 ## Project layout
 
