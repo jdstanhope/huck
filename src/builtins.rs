@@ -20,6 +20,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
+    ":", "true", "false", "command",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -33,7 +34,7 @@ pub fn is_builtin(name: &str) -> bool {
 /// huck adds `eval`/`exec`/`:`/`readonly`.
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
-        "." | "break" | "continue" | "exit" | "export" | "return"
+        ":" | "." | "break" | "continue" | "exit" | "export" | "return"
         | "set" | "shift" | "source" | "trap" | "unset"
     )
 }
@@ -68,6 +69,10 @@ pub fn run_builtin(
         "." | "source" => builtin_source(args, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
+        ":" => builtin_colon(args, shell),
+        "true" => builtin_true(args, shell),
+        "false" => builtin_false(args, shell),
+        "command" => builtin_command(args, out, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -1780,6 +1785,176 @@ fn builtin_unalias(args: &[String], shell: &mut Shell) -> ExecOutcome {
         }
     }
     ExecOutcome::Continue(if any_err { 1 } else { 0 })
+}
+
+fn builtin_colon(_args: &[String], _shell: &mut Shell) -> ExecOutcome {
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_true(_args: &[String], _shell: &mut Shell) -> ExecOutcome {
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_false(_args: &[String], _shell: &mut Shell) -> ExecOutcome {
+    ExecOutcome::Continue(1)
+}
+
+#[derive(Debug)]
+enum CommandResolution {
+    Alias(String),
+    Function,
+    Builtin,
+    Keyword,
+    File(std::path::PathBuf),
+    NotFound,
+}
+
+fn is_shell_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "then" | "elif" | "else" | "fi"
+        | "while" | "until" | "do" | "done"
+        | "for" | "in"
+        | "case" | "esac"
+        | "function"
+        | "!"
+        | "{" | "}"
+        | "[[" | "]]"
+    )
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+fn search_path_for(name: &str, shell: &Shell) -> Option<std::path::PathBuf> {
+    if name.contains('/') {
+        let p = std::path::PathBuf::from(name);
+        if is_executable_file(&p) { Some(p) } else { None }
+    } else {
+        let path_val = shell.lookup_var("PATH").unwrap_or_default();
+        for segment in path_val.split(':') {
+            if segment.is_empty() {
+                continue;
+            }
+            let candidate = std::path::Path::new(segment).join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+fn resolve_command_name(name: &str, shell: &Shell) -> CommandResolution {
+    if let Some(value) = shell.aliases.get(name) {
+        return CommandResolution::Alias(value.clone());
+    }
+    if shell.functions.contains_key(name) {
+        return CommandResolution::Function;
+    }
+    if is_builtin(name) {
+        return CommandResolution::Builtin;
+    }
+    if is_shell_keyword(name) {
+        return CommandResolution::Keyword;
+    }
+    if let Some(path) = search_path_for(name, shell) {
+        return CommandResolution::File(path);
+    }
+    CommandResolution::NotFound
+}
+
+fn builtin_command(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut concise = false;
+    let mut verbose = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" => { concise = true; i += 1; }
+            "-V" => { verbose = true; i += 1; }
+            "--" => { i += 1; break; }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: command: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+    let names = &args[i..];
+
+    if !concise && !verbose {
+        // Bare `command cmd args` (run cmd bypassing function/alias
+        // lookup) is deferred to a later iteration. With no name and
+        // no flag, return 0 — matches bash's silent success.
+        if names.is_empty() {
+            return ExecOutcome::Continue(0);
+        }
+        eprintln!(
+            "huck: command: bare form (without -v/-V) is not supported in this version"
+        );
+        return ExecOutcome::Continue(2);
+    }
+
+    if names.is_empty() {
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut any_not_found = false;
+    for name in names {
+        match resolve_command_name(name, shell) {
+            CommandResolution::Alias(value) => {
+                if concise {
+                    let _ = writeln!(out, "alias {name}='{value}'");
+                } else {
+                    let _ = writeln!(out, "{name} is aliased to `{value}'");
+                }
+            }
+            CommandResolution::Function => {
+                if concise {
+                    let _ = writeln!(out, "{name}");
+                } else {
+                    let _ = writeln!(out, "{name} is a function");
+                }
+            }
+            CommandResolution::Builtin => {
+                if concise {
+                    let _ = writeln!(out, "{name}");
+                } else {
+                    let _ = writeln!(out, "{name} is a shell builtin");
+                }
+            }
+            CommandResolution::Keyword => {
+                if concise {
+                    let _ = writeln!(out, "{name}");
+                } else {
+                    let _ = writeln!(out, "{name} is a shell keyword");
+                }
+            }
+            CommandResolution::File(path) => {
+                if concise {
+                    let _ = writeln!(out, "{}", path.display());
+                } else {
+                    let _ = writeln!(out, "{name} is {}", path.display());
+                }
+            }
+            CommandResolution::NotFound => {
+                any_not_found = true;
+                if verbose {
+                    eprintln!("huck: command: {name}: not found");
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(if any_not_found { 1 } else { 0 })
 }
 
 fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
@@ -4091,5 +4266,145 @@ mod local_tests {
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod colon_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn colon_exits_zero() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(":", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn colon_with_args_exits_zero() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["one".to_string(), "two".to_string()];
+        let outcome = run_builtin(":", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+}
+
+#[cfg(test)]
+mod true_false_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn true_exits_zero() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("true", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn false_exits_one() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("false", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn true_and_false_ignore_args() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["ignored".to_string()];
+        let t = run_builtin("true", &args, &mut buf, &mut shell);
+        let f = run_builtin("false", &args, &mut buf, &mut shell);
+        assert!(matches!(t, ExecOutcome::Continue(0)));
+        assert!(matches!(f, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn command_no_args_exits_zero() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("command", &[], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn command_bare_form_errors() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["echo".to_string(), "hi".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn command_dash_v_builtin_concise() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-v".to_string(), "echo".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), "echo");
+    }
+
+    #[test]
+    fn command_dash_v_notfound_silent_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-v".to_string(), "__no_such_cmd_xyzzy__".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.is_empty(), "expected silent stdout, got: {out:?}");
+    }
+
+    #[test]
+    fn command_dash_v_builtin_verbose() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-V".to_string(), "echo".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), "echo is a shell builtin");
+    }
+
+    #[test]
+    fn command_dash_v_keyword_verbose() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-V".to_string(), "if".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), "if is a shell keyword");
+    }
+
+    #[test]
+    fn command_dash_v_function() {
+        let mut shell = Shell::new();
+        // Register a function directly. The body shape is irrelevant for
+        // resolution; any Command value works. Use a no-op assignment list.
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("myfn".to_string(), body);
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-v".to_string(), "myfn".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), "myfn");
     }
 }
