@@ -1913,7 +1913,7 @@ fn builtin_command(
         match resolve_command_name(name, shell) {
             CommandResolution::Alias(value) => {
                 if concise {
-                    let _ = writeln!(out, "alias {name}='{value}'");
+                    let _ = writeln!(out, "alias {name}='{}'", escape_alias_value(&value));
                 } else {
                     let _ = writeln!(out, "{name} is aliased to `{value}'");
                 }
@@ -4406,5 +4406,19 @@ mod command_tests {
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), "myfn");
+    }
+
+    #[test]
+    fn command_dash_v_alias_with_single_quote_escapes() {
+        let mut shell = Shell::new();
+        shell
+            .aliases
+            .insert("greet".to_string(), "echo it's me".to_string());
+        let mut buf: Vec<u8> = Vec::new();
+        let args = vec!["-v".to_string(), "greet".to_string()];
+        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), r"alias greet='echo it'\''s me'");
     }
 }
