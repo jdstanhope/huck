@@ -237,8 +237,8 @@ function early with status `N` (defaulting to `$?`). A function
 shadows any builtin except the flow-control set (`return`/`exit`/
 `break`/`continue`), so `cd() { … }` works but `return() { … }` is
 unreachable. `break`/`continue` inside a function target the caller's
-enclosing loop (matching bash). `local` variable scoping, `set --` /
-`shift`, `$0`, and redirections on a function call (`func > file`) are not implemented. v22 also adds the standalone
+enclosing loop (matching bash). Redirections on a function call
+(`func > file`) are not implemented. v22 also adds the standalone
 brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
