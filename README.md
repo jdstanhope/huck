@@ -55,6 +55,7 @@ spec, an implementation plan, and a test suite.
 | v45       | `jobs -l`/`-p`/`-n`/`-r`/`-s` (M-45)                           |
 | v46       | Brace expansion `{a,b,c}` / `{1..5}` (M-61)                    |
 | v47       | Extended job specs `%cmd`/`%?cmd` (M-62)                       |
+| v48       | Aliases (M-63)                                                 |
 
 ## Build and run
 
@@ -238,7 +239,7 @@ brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
 
 **Not yet implemented:**
-backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`), aliases.
+backgrounded multi-pipeline sequences (`cmd1 && cmd2 &`).
 
 ## Project layout
 

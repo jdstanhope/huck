@@ -1,3 +1,4 @@
+mod alias_expand;
 mod arith;
 mod brace_expand;
 mod builtins;

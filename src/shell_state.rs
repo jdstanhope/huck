@@ -26,6 +26,10 @@ pub struct Shell {
     /// execution; looked up by `run_exec_single` when dispatching a
     /// simple command.
     pub functions: HashMap<String, Box<crate::command::Command>>,
+    /// User-defined aliases. `name` → expansion text. Populated by
+    /// the `alias` builtin; consumed by `expand_aliases_in_tokens`
+    /// during interactive REPL input.
+    pub aliases: std::collections::HashMap<String, String>,
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
@@ -93,6 +97,7 @@ impl Shell {
             last_status: 0,
             positional_args: Vec::new(),
             functions: HashMap::new(),
+            aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),

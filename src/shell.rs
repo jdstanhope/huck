@@ -68,7 +68,9 @@ pub fn run() -> i32 {
                     shell.history.add(history.clone());
                     let _ = editor.add_history_entry(history.as_str());
                 }
-                match process_line(&buffer, &mut shell) {
+                let do_alias = shell.is_interactive
+                    || std::env::var("HUCK_EXPAND_ALIASES").is_ok();
+                match process_line(&buffer, &mut shell, do_alias) {
                     ExecOutcome::Exit(code) => {
                         crate::traps::fire_exit_trap(&mut shell);
                         shell.hangup_jobs();
@@ -235,13 +237,24 @@ fn install_job_control_signals() {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-pub fn process_line(line: &str, shell: &mut Shell) -> ExecOutcome {
+pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
         Ok(tokens) => tokens,
         Err(e) => {
             eprintln!("huck: syntax error{}", lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
+    };
+    let tokens = if expand_aliases {
+        match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("huck: syntax error{}", lex_error_message(e));
+                return ExecOutcome::Continue(2);
+            }
+        }
+    } else {
+        tokens
     };
 
     match command::parse(tokens) {
