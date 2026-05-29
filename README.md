@@ -51,6 +51,7 @@ spec, an implementation plan, and a test suite.
 | v41       | `kill -l` (M-39) + README cleanup                              |
 | v42       | `kill -s SIGNAME` + `kill -n SIGNUM` (M-40)                    |
 | v43       | `disown -a`/`-r`/`-h` + SIGHUP-on-exit (M-43)                  |
+| v44       | `disown` accepts bare PID (M-44)                               |
 
 ## Build and run
 
