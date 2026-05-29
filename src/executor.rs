@@ -1385,7 +1385,10 @@ fn call_function(
     let saved = std::mem::take(&mut shell.positional_args);
     shell.positional_args = args;
     shell.function_arg0.push(name.to_string());
+    shell.local_scopes.push(std::collections::HashMap::new());
+
     let result = run_command(&body, shell, sink);
+
     // RETURN trap fires with $? set to the function's status AND the
     // function's positional args still in scope. After the action runs,
     // restore the caller's frame.
@@ -1397,6 +1400,16 @@ fn call_function(
     };
     shell.set_last_status(status_for_trap);
     crate::traps::fire_return_trap(shell);
+
+    // Pop local scope and restore each snapshotted variable. Runs
+    // AFTER the RETURN trap so the trap action still sees the
+    // function's locals.
+    if let Some(frame) = shell.local_scopes.pop() {
+        for (var_name, snapshot) in frame {
+            shell.restore_var(&var_name, snapshot);
+        }
+    }
+
     shell.function_arg0.pop();
     shell.positional_args = saved;
     match result {
@@ -3978,6 +3991,33 @@ mod tests {
         assert!(shell.function_arg0.is_empty(),
             "function_arg0 should be empty after function returns, got: {:?}",
             shell.function_arg0);
+    }
+
+    #[test]
+    fn function_with_local_does_not_leak_var() {
+        let mut shell = Shell::new();
+        exec_script("f() { local XYZ_LOCAL_E1=in; }\nf\n", &mut shell);
+        assert!(shell.lookup_var("XYZ_LOCAL_E1").is_none());
+    }
+
+    #[test]
+    fn function_local_restores_outer_var() {
+        let mut shell = Shell::new();
+        shell.set("XYZ_LOCAL_E2", "outer".to_string());
+        exec_script("f() { local XYZ_LOCAL_E2=inner; }\nf\n", &mut shell);
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_E2").as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn nested_function_calls_have_isolated_locals() {
+        let mut shell = Shell::new();
+        shell.set("XYZ_LOCAL_E3", "top".to_string());
+        let script = "outer() { local XYZ_LOCAL_E3=outer_val; inner; }\n\
+                      inner() { local XYZ_LOCAL_E3=inner_val; }\n\
+                      outer\n";
+        exec_script(script, &mut shell);
+        // After both functions return, the outer `top` value is restored.
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_E3").as_deref(), Some("top"));
     }
 
     #[test]
