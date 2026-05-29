@@ -71,6 +71,7 @@ pub fn run() -> i32 {
                 match process_line(&buffer, &mut shell) {
                     ExecOutcome::Exit(code) => {
                         crate::traps::fire_exit_trap(&mut shell);
+                        shell.hangup_jobs();
                         shell.history.save();
                         return code;
                     }
@@ -84,6 +85,7 @@ pub fn run() -> i32 {
                             && !shell.is_interactive
                         {
                             crate::traps::fire_exit_trap(&mut shell);
+                            shell.hangup_jobs();
                             shell.history.save();
                             return fatal_status;
                         }
@@ -97,18 +99,21 @@ pub fn run() -> i32 {
             ReadResult::Interrupted => continue,
             ReadResult::Eof => {
                 crate::traps::fire_exit_trap(&mut shell);
+                shell.hangup_jobs();
                 shell.history.save();
                 return shell.last_status();
             }
             ReadResult::EofMidCommand => {
                 eprintln!("huck: syntax error: unexpected end of input");
                 crate::traps::fire_exit_trap(&mut shell);
+                shell.hangup_jobs();
                 shell.history.save();
                 return 2;
             }
             ReadResult::ReadError(msg) => {
                 eprintln!("huck: input error: {msg}");
                 crate::traps::fire_exit_trap(&mut shell);
+                shell.hangup_jobs();
                 return 1;
             }
         }
