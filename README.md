@@ -52,6 +52,7 @@ spec, an implementation plan, and a test suite.
 | v42       | `kill -s SIGNAME` + `kill -n SIGNUM` (M-40)                    |
 | v43       | `disown -a`/`-r`/`-h` + SIGHUP-on-exit (M-43)                  |
 | v44       | `disown` accepts bare PID (M-44)                               |
+| v45       | `jobs -l`/`-p`/`-n`/`-r`/`-s` (M-45)                           |
 
 ## Build and run
 
