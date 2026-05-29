@@ -1,4 +1,5 @@
 mod arith;
+mod brace_expand;
 mod builtins;
 mod command;
 mod completion;

@@ -323,5 +323,6 @@ fn lex_error_message(error: LexError) -> String {
         LexError::AnsiCInvalidCodepoint(v) => {
             format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)
         }
+        LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
     }
 }
