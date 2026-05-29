@@ -22,12 +22,26 @@ pub enum StdoutSink<'a> {
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
     if seq.background {
-        if let Command::Pipeline(p) = &seq.first {
-            // Parser guarantees rest.is_empty() when background is set.
-            return run_background_sequence(p, shell, &mut sink, source);
-        }
-        if let Command::Subshell { .. } = &seq.first {
-            return run_background_subshell(&seq.first, shell, &mut sink, source);
+        if seq.rest.is_empty() {
+            // Single-pipeline or subshell backgrounded — existing paths.
+            if let Command::Pipeline(p) = &seq.first {
+                return run_background_sequence(p, shell, &mut sink, source);
+            }
+            if let Command::Subshell { .. } = &seq.first {
+                return run_background_subshell(&seq.first, shell, &mut sink, source);
+            }
+        } else {
+            // v49: multi-pipeline sequence backgrounded. Synthesize
+            // (seq) & by wrapping the whole sequence in a Subshell.
+            // The wrapped sequence has background=false because the
+            // child process runs it foreground inside its own pid.
+            let inner = Sequence {
+                first: seq.first.clone(),
+                rest: seq.rest.clone(),
+                background: false,
+            };
+            let subshell = Command::Subshell { body: Box::new(inner) };
+            return run_background_subshell(&subshell, shell, &mut sink, source);
         }
     }
     execute_sequence_body(seq, shell, &mut sink)
@@ -3976,6 +3990,39 @@ mod tests {
         if let Some(pid) = shell.last_bg_pid {
             let mut status: libc::c_int = 0;
             unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG); }
+        }
+    }
+
+    #[test]
+    fn execute_bg_chain_returns_immediately_status_0() {
+        // `true && true &` — parent should return Continue(0) without
+        // waiting for the child.
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        let toks = crate::lexer::tokenize("true && true &").unwrap();
+        let seq = crate::command::parse(toks).unwrap().unwrap();
+        let outcome = execute(&seq, &mut shell, "true && true &");
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        // Cleanup: SIGTERM any bg job so the test doesn't leak.
+        for job in shell.jobs.iter() {
+            unsafe { libc::kill(job.pgid, libc::SIGTERM); }
+        }
+    }
+
+    #[test]
+    fn execute_bg_chain_registers_job() {
+        // After `sleep 30 && true &`, the bg sequence should register
+        // as one job entry. The sleep ensures the child is alive long
+        // enough to observe.
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        let toks = crate::lexer::tokenize("sleep 30 && true &").unwrap();
+        let seq = crate::command::parse(toks).unwrap().unwrap();
+        let _ = execute(&seq, &mut shell, "sleep 30 && true &");
+        assert_eq!(shell.jobs.iter().count(), 1, "expected exactly one job");
+        // Cleanup.
+        for job in shell.jobs.iter() {
+            unsafe { libc::kill(job.pgid, libc::SIGTERM); }
         }
     }
 }

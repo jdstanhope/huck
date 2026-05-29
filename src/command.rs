@@ -429,7 +429,6 @@ pub enum ParseError {
     MissingRedirectTarget,
     RedirectTargetIsOperator,
     UnexpectedBackground,
-    BackgroundedMultiPipelineSequence,
     UnterminatedIf,
     UnexpectedKeyword(String),
     UnterminatedLoop,
@@ -525,9 +524,6 @@ fn parse_sequence<I: Iterator<Item = Token>>(
             Token::Op(Operator::Background) => {
                 if !at_top_level {
                     return Err(ParseError::UnexpectedBackground);
-                }
-                if !rest.is_empty() {
-                    return Err(ParseError::BackgroundedMultiPipelineSequence);
                 }
                 // Skip any trailing Newline tokens that the heredoc body
                 // collector emits at the end of the input (e.g. when the
@@ -2177,37 +2173,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_background_after_andor_is_unsupported() {
+    fn parse_and_then_bg_is_backgrounded_sequence() {
         // cmd1 && cmd2 &
-        assert_eq!(
-            parse(vec![
-                w_tok("cmd1"),
-                Token::Op(Operator::And),
-                w_tok("cmd2"),
-                Token::Op(Operator::Background),
-            ]),
-            Err(ParseError::BackgroundedMultiPipelineSequence)
-        );
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::And),
+            w_tok("cmd2"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(seq.background, "expected background=true");
+        assert_eq!(seq.rest.len(), 1, "expected one connector entry");
     }
 
     #[test]
-    fn parse_background_after_semi_is_unsupported() {
+    fn parse_semi_chain_bg_is_backgrounded_sequence() {
         // cmd1 ; cmd2 &
-        assert_eq!(
-            parse(vec![
-                w_tok("cmd1"),
-                Token::Op(Operator::Semi),
-                w_tok("cmd2"),
-                Token::Op(Operator::Background),
-            ]),
-            Err(ParseError::BackgroundedMultiPipelineSequence)
-        );
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::Semi),
+            w_tok("cmd2"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(seq.background, "expected background=true");
+        assert_eq!(seq.rest.len(), 1);
     }
 
     #[test]
-    fn parse_background_mid_sequence_after_andor_prefers_multipipeline_error() {
-        // cmd1 && cmd2 & cmd3 — both errors apply; the more specific
-        // BackgroundedMultiPipelineSequence wins.
+    fn parse_background_mid_sequence_after_andor_is_unexpected_background() {
+        // cmd1 && cmd2 & cmd3 — the `&` is followed by another token,
+        // which is now the only error (UnexpectedBackground). Previously
+        // BackgroundedMultiPipelineSequence won; with that variant
+        // removed, UnexpectedBackground is the appropriate error.
         assert_eq!(
             parse(vec![
                 w_tok("cmd1"),
@@ -2216,8 +2216,27 @@ mod tests {
                 Token::Op(Operator::Background),
                 w_tok("cmd3"),
             ]),
-            Err(ParseError::BackgroundedMultiPipelineSequence)
+            Err(ParseError::UnexpectedBackground)
         );
+    }
+
+    #[test]
+    fn parse_long_chain_bg() {
+        // cmd1 && cmd2 || cmd3 ; cmd4 &
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::And),
+            w_tok("cmd2"),
+            Token::Op(Operator::Or),
+            w_tok("cmd3"),
+            Token::Op(Operator::Semi),
+            w_tok("cmd4"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(seq.background, "expected background=true");
+        assert_eq!(seq.rest.len(), 3, "expected 3 connector entries");
     }
 
     /// A bare unquoted keyword token (same shape as an ordinary word).
