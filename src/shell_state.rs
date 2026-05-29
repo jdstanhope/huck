@@ -9,6 +9,7 @@ use crate::jobs::JobTable;
 pub struct Variable {
     pub value: String,
     pub exported: bool,
+    pub readonly: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -100,7 +101,7 @@ impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
         for (key, value) in std::env::vars() {
-            vars.insert(key, Variable { value, exported: true });
+            vars.insert(key, Variable { value, exported: true, readonly: false });
         }
         let shell_pid = unsafe { libc::getpid() };
         let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
@@ -177,7 +178,7 @@ impl Shell {
         match self.vars.get_mut(name) {
             Some(existing) => existing.value = value,
             None => {
-                self.vars.insert(name.to_string(), Variable { value, exported: false });
+                self.vars.insert(name.to_string(), Variable { value, exported: false, readonly: false });
             }
         }
     }
@@ -191,6 +192,7 @@ impl Shell {
             .or_insert_with(|| Variable {
                 value: String::new(),
                 exported: true,
+                readonly: false,
             });
     }
 
@@ -198,7 +200,7 @@ impl Shell {
     pub fn export_set(&mut self, name: &str, value: String) {
         self.vars.insert(
             name.to_string(),
-            Variable { value, exported: true },
+            Variable { value, exported: true, readonly: false },
         );
     }
 
@@ -228,6 +230,67 @@ impl Shell {
     /// True if `name` is set and marked exported.
     pub fn is_exported(&self, name: &str) -> bool {
         self.vars.get(name).is_some_and(|v| v.exported)
+    }
+
+    /// True if `name` is set and marked readonly. Unset names are
+    /// trivially not readonly.
+    pub fn is_readonly(&self, name: &str) -> bool {
+        self.vars.get(name).map(|v| v.readonly).unwrap_or(false)
+    }
+
+    /// Checked write: refuses to overwrite a readonly variable. Returns
+    /// `Err(())` if `name` is readonly (caller prints the diagnostic);
+    /// otherwise sets the value and returns `Ok(())`. Consumed by
+    /// executor/expansion write paths in v54 task 2.
+    #[allow(dead_code)]
+    pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
+        if self.is_readonly(name) {
+            return Err(());
+        }
+        self.set(name, value);
+        Ok(())
+    }
+
+    /// Checked unset: refuses to remove a readonly variable. Returns
+    /// `Err(())` if `name` is readonly; otherwise removes and returns
+    /// `Ok(())`. Reserved for future read-only-aware unset call sites.
+    #[allow(dead_code)]
+    pub fn try_unset(&mut self, name: &str) -> Result<(), ()> {
+        if self.is_readonly(name) {
+            return Err(());
+        }
+        self.unset(name);
+        Ok(())
+    }
+
+    /// Marks `name` readonly. If `name` is unset, creates it with an
+    /// empty value (matching bash's behavior for `readonly NAME`
+    /// against an unset name).
+    pub fn mark_readonly(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.readonly = true;
+        } else {
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: String::new(),
+                    exported: false,
+                    readonly: true,
+                },
+            );
+        }
+    }
+
+    /// Sorted list of all variable names currently marked readonly.
+    pub fn readonly_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .vars
+            .iter()
+            .filter(|(_, v)| v.readonly)
+            .map(|(k, _)| k.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     pub fn last_status(&self) -> i32 {
