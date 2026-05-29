@@ -6,9 +6,9 @@ use std::sync::atomic::AtomicBool;
 use crate::jobs::JobTable;
 
 #[derive(Debug, Clone)]
-struct Variable {
-    value: String,
-    exported: bool,
+pub struct Variable {
+    pub value: String,
+    pub exported: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -87,6 +87,13 @@ pub struct Shell {
     /// `builtin_source` to prevent runaway loops. Increment on
     /// enter, decrement on exit.
     pub source_depth: u32,
+
+    /// Stack of `local`-snapshot frames. Pushed in `call_function`
+    /// before the body runs; popped + restored after. Each frame
+    /// maps `var_name` → the pre-`local` snapshot (None if the var
+    /// was unset). Outside any function, this vec is empty —
+    /// `builtin_local` checks for that.
+    pub local_scopes: Vec<std::collections::HashMap<String, Option<Variable>>>,
 }
 
 impl Shell {
@@ -120,6 +127,7 @@ impl Shell {
             firing_trap: None,
             err_suppressed_depth: 0,
             source_depth: 0,
+            local_scopes: Vec::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -196,6 +204,25 @@ impl Shell {
 
     pub fn unset(&mut self, name: &str) {
         self.vars.remove(name);
+    }
+
+    /// Returns a clone of the named variable's current state, or
+    /// None if unset. Used by `local` to snapshot pre-local state.
+    pub fn snapshot_var(&self, name: &str) -> Option<Variable> {
+        self.vars.get(name).cloned()
+    }
+
+    /// Restores `name` to `snapshot`: Some → reinstall; None →
+    /// remove. Used by `call_function` on exit to undo `local`s.
+    pub fn restore_var(&mut self, name: &str, snapshot: Option<Variable>) {
+        match snapshot {
+            Some(v) => {
+                self.vars.insert(name.to_string(), v);
+            }
+            None => {
+                self.vars.remove(name);
+            }
+        }
     }
 
     /// True if `name` is set and marked exported.

@@ -19,7 +19,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
-    "set", "shift", ".", "source",
+    "set", "shift", ".", "source", "local",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -54,6 +54,7 @@ pub fn run_builtin(
         "exit" => builtin_exit(args),
         "export" => builtin_export(args, out, shell),
         "unset" => builtin_unset(args, shell),
+        "local" => builtin_local(args, shell),
         "jobs" => builtin_jobs(args, out, shell),
         "wait" => builtin_wait(args, out, shell),
         "fg" => builtin_fg(args, shell),
@@ -324,6 +325,41 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     } else {
         ExecOutcome::Continue(0)
     }
+}
+
+fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if shell.local_scopes.is_empty() {
+        eprintln!("huck: local: can only be used in a function");
+        return ExecOutcome::Continue(1);
+    }
+    for arg in args {
+        let (name, value): (&str, Option<String>) = match arg.find('=') {
+            Some(eq) => (&arg[..eq], Some(arg[eq + 1..].to_string())),
+            None => (arg.as_str(), None),
+        };
+        if !is_valid_name(name) {
+            eprintln!("huck: local: `{arg}': not a valid identifier");
+            return ExecOutcome::Continue(1);
+        }
+        // Snapshot pre-local state only if NAME is not already saved
+        // in this frame. Compute the snapshot via shell.snapshot_var
+        // BEFORE taking the mutable borrow on local_scopes.
+        let already_saved = shell
+            .local_scopes
+            .last()
+            .map(|f| f.contains_key(name))
+            .unwrap_or(false);
+        if !already_saved {
+            let snap = shell.snapshot_var(name);
+            shell
+                .local_scopes
+                .last_mut()
+                .unwrap()
+                .insert(name.to_string(), snap);
+        }
+        shell.set(name, value.unwrap_or_default());
+    }
+    ExecOutcome::Continue(0)
 }
 
 /// Parsed form of the `jobs` argv after flag and positional separation.
@@ -3924,5 +3960,136 @@ mod source_tests {
     fn is_special_builtin_includes_dot_and_source() {
         assert!(is_special_builtin("."));
         assert!(is_special_builtin("source"));
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn local_outside_function_errors_status_1() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        // local_scopes is empty (we never pushed a frame).
+        let outcome = run_builtin(
+            "local",
+            &["X=hi".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn local_with_value_sets_and_records_snapshot() {
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "local",
+            &["XYZ_LOCAL_T1=hi".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_T1").as_deref(), Some("hi"));
+        // Snapshot recorded: X was unset before, so snapshot is None.
+        let frame = shell.local_scopes.last().unwrap();
+        assert!(frame.contains_key("XYZ_LOCAL_T1"));
+        assert!(frame["XYZ_LOCAL_T1"].is_none());
+    }
+
+    #[test]
+    fn local_without_value_sets_empty() {
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "local",
+            &["XYZ_LOCAL_T2".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_T2").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn local_snapshots_existing_var() {
+        let mut shell = Shell::new();
+        shell.set("XYZ_LOCAL_T3", "outer".to_string());
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "local",
+            &["XYZ_LOCAL_T3=inner".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        // After `local`, the var has the inner value.
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_T3").as_deref(), Some("inner"));
+        // The frame holds the snapshot of the outer value.
+        let snapshot = shell
+            .local_scopes
+            .last()
+            .unwrap()
+            .get("XYZ_LOCAL_T3")
+            .cloned()
+            .unwrap();
+        let v = snapshot.expect("expected Some snapshot for previously-set var");
+        assert_eq!(v.value, "outer");
+    }
+
+    #[test]
+    fn local_idempotent_in_same_frame() {
+        let mut shell = Shell::new();
+        shell.set("XYZ_LOCAL_T4", "outer".to_string());
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        // First `local`: snapshot the outer value.
+        let _ = run_builtin(
+            "local",
+            &["XYZ_LOCAL_T4=first".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        // Second `local` for the same name in the same frame: must NOT
+        // re-snapshot (otherwise it would overwrite the outer snapshot
+        // with "first").
+        let _ = run_builtin(
+            "local",
+            &["XYZ_LOCAL_T4=second".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        // Current value reflects the second assignment.
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_T4").as_deref(), Some("second"));
+        // Snapshot still holds the original outer value.
+        let snapshot = shell
+            .local_scopes
+            .last()
+            .unwrap()
+            .get("XYZ_LOCAL_T4")
+            .cloned()
+            .unwrap();
+        let v = snapshot.expect("expected Some outer snapshot");
+        assert_eq!(v.value, "outer");
+    }
+
+    #[test]
+    fn local_invalid_identifier_errors() {
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin(
+            "local",
+            &["1foo=bar".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 }
