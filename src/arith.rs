@@ -358,6 +358,7 @@ pub enum ArithError {
     NotAnInteger { var: String, value: String },
     NegativeExponent,
     ShiftCountOutOfRange { count: i64 },
+    ReadonlyVar(String),
 }
 
 impl std::fmt::Display for ArithError {
@@ -371,6 +372,7 @@ impl std::fmt::Display for ArithError {
             Self::NegativeExponent => write!(f, "exponentiation with negative exponent"),
             Self::ShiftCountOutOfRange { count } =>
                 write!(f, "shift count out of range: {count}"),
+            Self::ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
         }
     }
 }
@@ -588,8 +590,9 @@ fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
-fn write_var_i64(shell: &mut Shell, name: &str, value: i64) {
-    shell.set(name, value.to_string());
+fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithError> {
+    shell.try_set(name, value.to_string())
+        .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
 }
 
 pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
@@ -713,27 +716,27 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 AssignOp::BitXor => read_var_i64(shell, name)? ^ rhs_val,
                 AssignOp::BitOr  => read_var_i64(shell, name)? | rhs_val,
             };
-            write_var_i64(shell, name, new_val);
+            write_var_i64(shell, name, new_val)?;
             Ok(new_val)
         }
         ArithExpr::PreInc(name) => {
             let new_val = read_var_i64(shell, name)?.wrapping_add(1);
-            write_var_i64(shell, name, new_val);
+            write_var_i64(shell, name, new_val)?;
             Ok(new_val)
         }
         ArithExpr::PreDec(name) => {
             let new_val = read_var_i64(shell, name)?.wrapping_sub(1);
-            write_var_i64(shell, name, new_val);
+            write_var_i64(shell, name, new_val)?;
             Ok(new_val)
         }
         ArithExpr::PostInc(name) => {
             let old_val = read_var_i64(shell, name)?;
-            write_var_i64(shell, name, old_val.wrapping_add(1));
+            write_var_i64(shell, name, old_val.wrapping_add(1))?;
             Ok(old_val)
         }
         ArithExpr::PostDec(name) => {
             let old_val = read_var_i64(shell, name)?;
-            write_var_i64(shell, name, old_val.wrapping_sub(1));
+            write_var_i64(shell, name, old_val.wrapping_sub(1))?;
             Ok(old_val)
         }
     }

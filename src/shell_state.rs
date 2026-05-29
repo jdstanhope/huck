@@ -253,7 +253,6 @@ impl Shell {
     /// `Err(())` if `name` is readonly (caller prints the diagnostic);
     /// otherwise sets the value and returns `Ok(())`. Consumed by
     /// executor/expansion write paths in v54 task 2.
-    #[allow(dead_code)]
     pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
         if self.is_readonly(name) {
             return Err(());
