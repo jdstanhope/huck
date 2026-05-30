@@ -53,7 +53,7 @@ pub fn run_builtin(
         "cd" => builtin_cd(args, shell),
         "pwd" => builtin_pwd(out),
         "echo" => builtin_echo(args, out),
-        "exit" => builtin_exit(args),
+        "exit" => builtin_exit(args, shell),
         "export" => builtin_export(args, out, shell),
         "unset" => builtin_unset(args, shell),
         "local" => builtin_local(args, shell),
@@ -252,9 +252,9 @@ fn process_echo_escapes(s: &str) -> (Vec<u8>, bool) {
     (out, false)
 }
 
-fn builtin_exit(args: &[String]) -> ExecOutcome {
+fn builtin_exit(args: &[String], shell: &Shell) -> ExecOutcome {
     match args.first() {
-        None => ExecOutcome::Exit(0),
+        None => ExecOutcome::Exit(shell.last_status()),
         Some(code_str) => match code_str.parse::<i32>() {
             Ok(code) => ExecOutcome::Exit(code.rem_euclid(256)),
             Err(_) => {
@@ -3055,45 +3055,51 @@ mod tests {
 
     #[test]
     fn exit_with_no_args() {
-        assert!(matches!(builtin_exit(&[]), ExecOutcome::Exit(0)));
+        let shell = crate::shell_state::Shell::new();
+        assert!(matches!(builtin_exit(&[], &shell), ExecOutcome::Exit(0)));
     }
 
     #[test]
     fn exit_with_code() {
+        let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["3".to_string()]),
+            builtin_exit(&["3".to_string()], &shell),
             ExecOutcome::Exit(3)
         ));
     }
 
     #[test]
     fn exit_with_bad_code_continues() {
+        let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["abc".to_string()]),
+            builtin_exit(&["abc".to_string()], &shell),
             ExecOutcome::Continue(_)
         ));
     }
 
     #[test]
     fn exit_masks_value_greater_than_255() {
+        let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["300".to_string()]),
+            builtin_exit(&["300".to_string()], &shell),
             ExecOutcome::Exit(44)
         ));
     }
 
     #[test]
     fn exit_masks_negative_value() {
+        let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["-1".to_string()]),
+            builtin_exit(&["-1".to_string()], &shell),
             ExecOutcome::Exit(255)
         ));
     }
 
     #[test]
     fn exit_masks_exact_256_to_zero() {
+        let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["256".to_string()]),
+            builtin_exit(&["256".to_string()], &shell),
             ExecOutcome::Exit(0)
         ));
     }
@@ -6020,5 +6026,26 @@ mod printf_tests {
         let mut out2 = Vec::new();
         format_one(&spec, "5", &mut out2).unwrap();
         assert_eq!(out2, b"5");
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn exit_no_args_inherits_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(42);
+        let outcome = builtin_exit(&[], &shell);
+        assert!(matches!(outcome, ExecOutcome::Exit(42)));
+    }
+
+    #[test]
+    fn exit_no_args_inherits_zero_when_clean() {
+        let shell = Shell::new();
+        let outcome = builtin_exit(&[], &shell);
+        assert!(matches!(outcome, ExecOutcome::Exit(0)));
     }
 }
