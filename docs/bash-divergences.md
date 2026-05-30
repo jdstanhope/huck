@@ -24,7 +24,7 @@ messages so the doc stays in sync.
 | Bugs (Tier 1) | 11 | Things to fix (all 11 fixed; B-11 fixed 2026-05-26) |
 | Missing features (Tier 2) | 52 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
-| Low-impact (Tier 4) | 11 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation; L-11 added v39: `$'\xHH'` Unicode-vs-byte) |
+| Low-impact (Tier 4) | 12 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation; L-11 added v39: `$'\xHH'` Unicode-vs-byte; L-12 added+fixed v55: builtin stdin redirection) |
 
 ---
 
