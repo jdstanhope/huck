@@ -64,6 +64,7 @@ spec, an implementation plan, and a test suite.
 | v54       | `readonly` (M-71)                                              |
 | v55       | `read` (M-72) + builtin stdin redirections (L-12)              |
 | v56       | `printf` (M-73)                                                |
+| v57       | `exit` inherits `$?` (M-74)                                    |
 
 ## Build and run
 
