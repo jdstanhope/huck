@@ -21,7 +21,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly", "read",
+    "readonly", "read", "printf",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -76,6 +76,7 @@ pub fn run_builtin(
         "command" => builtin_command(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
         "read" => builtin_read(args, out, shell),
+        "printf" => builtin_printf(args, out, shell),
         "test" | "[" => builtin_test(name, args),
         "break" => ExecOutcome::LoopBreak,
         "continue" => ExecOutcome::LoopContinue,
@@ -855,6 +856,567 @@ fn builtin_read(
             eprintln!("huck: read: {name}: readonly variable");
             exit = 1;
         }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// printf builtin (M-73, v56)
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq)]
+enum FormatPart {
+    Literal(Vec<u8>),
+    Conv(ConvSpec),
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ConvFlags {
+    left_align: bool,
+    sign: bool,
+    space_sign: bool,
+    alt: bool,
+    zero_pad: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ConvSpec {
+    flags: ConvFlags,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conv: ConvChar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ConvChar {
+    S,
+    D,
+    I,
+    U,
+    O,
+    X,
+    BigX,
+    C,
+    B,
+    Percent,
+}
+
+/// Decodes a backslash-escape starting at the byte AFTER the `\`.
+/// Returns `(decoded_bytes, advance)` where `advance` is the number
+/// of bytes consumed past the backslash. Unknown escapes are emitted
+/// as the literal backslash + the next char (printf's bash-compatible
+/// behavior); a trailing backslash (empty `rest`) becomes a literal
+/// `\`.
+fn decode_printf_escape(rest: &[u8]) -> (Vec<u8>, usize) {
+    if rest.is_empty() {
+        return (b"\\".to_vec(), 0);
+    }
+    match rest[0] {
+        b'\\' => (b"\\".to_vec(), 1),
+        b'a' => (b"\x07".to_vec(), 1),
+        b'b' => (b"\x08".to_vec(), 1),
+        b'f' => (b"\x0C".to_vec(), 1),
+        b'n' => (b"\n".to_vec(), 1),
+        b'r' => (b"\r".to_vec(), 1),
+        b't' => (b"\t".to_vec(), 1),
+        b'v' => (b"\x0B".to_vec(), 1),
+        b'/' => (b"/".to_vec(), 1),
+        b'"' => (b"\"".to_vec(), 1),
+        b'\'' => (b"'".to_vec(), 1),
+        // \NNN (1-3 octal digits). When the first digit is '0', accept
+        // up to 4 digits (the leading '0' counts toward the budget),
+        // matching bash printf's `\0NNN` form.
+        c if (b'0'..=b'7').contains(&c) => {
+            let max = if c == b'0' { 4 } else { 3 };
+            let mut n = 0usize;
+            let mut v: u32 = 0;
+            while n < max && n < rest.len() && (b'0'..=b'7').contains(&rest[n]) {
+                v = v * 8 + (rest[n] - b'0') as u32;
+                n += 1;
+            }
+            (vec![(v & 0xFF) as u8], n)
+        }
+        b'x' => {
+            // 1-2 hex digits after \x.
+            let mut n = 1;
+            let mut hex = 0u32;
+            let mut count = 0;
+            while count < 2 && n < rest.len() && (rest[n] as char).is_ascii_hexdigit() {
+                hex = hex * 16 + (rest[n] as char).to_digit(16).unwrap();
+                n += 1;
+                count += 1;
+            }
+            if count == 0 {
+                // \x with no hex digit: emit literally.
+                (vec![b'\\', b'x'], 1)
+            } else {
+                (vec![hex as u8], n)
+            }
+        }
+        // \c at format-string level is literal; %b's caller handles
+        // it separately.
+        b'c' => (vec![b'\\', b'c'], 1),
+        // Unknown — emit backslash + the char literally.
+        c => (vec![b'\\', c], 1),
+    }
+}
+
+/// Decodes escape sequences in a `%b` argument. Returns the decoded
+/// bytes and a bool: true if a `\c` was encountered (caller halts
+/// output).
+fn decode_printf_b_arg(arg: &str) -> (Vec<u8>, bool) {
+    let bytes = arg.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            // \c halts.
+            if bytes[i + 1] == b'c' {
+                return (out, true);
+            }
+            let (dec, used) = decode_printf_escape(&bytes[i + 1..]);
+            out.extend_from_slice(&dec);
+            i += 1 + used;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    (out, false)
+}
+
+/// Parses a printf format string into a sequence of `FormatPart`s.
+/// Literals have backslash escapes already decoded; conv specs
+/// capture flags + width + precision + conv-char.
+fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
+    let bytes = fmt.as_bytes();
+    let mut parts: Vec<FormatPart> = Vec::new();
+    let mut lit: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            let (dec, used) = decode_printf_escape(&bytes[i + 1..]);
+            lit.extend_from_slice(&dec);
+            i += 1 + used;
+            continue;
+        }
+        if b != b'%' {
+            lit.push(b);
+            i += 1;
+            continue;
+        }
+        // Flush literal.
+        if !lit.is_empty() {
+            parts.push(FormatPart::Literal(std::mem::take(&mut lit)));
+        }
+        i += 1; // past '%'
+
+        // Parse spec: [flags][width][.precision][conv]
+        let mut flags = ConvFlags::default();
+        loop {
+            if i >= bytes.len() {
+                return Err("missing conversion character".into());
+            }
+            match bytes[i] {
+                b'-' => flags.left_align = true,
+                b'+' => flags.sign = true,
+                b' ' => flags.space_sign = true,
+                b'#' => flags.alt = true,
+                b'0' => flags.zero_pad = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        // Width (decimal digits — no runtime `*` in v56).
+        let mut width: Option<usize> = None;
+        let mut wstr = String::new();
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            wstr.push(bytes[i] as char);
+            i += 1;
+        }
+        if !wstr.is_empty() {
+            width = Some(wstr.parse().unwrap_or(0));
+        }
+        // Precision.
+        let mut precision: Option<usize> = None;
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            let mut pstr = String::new();
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                pstr.push(bytes[i] as char);
+                i += 1;
+            }
+            precision = Some(if pstr.is_empty() {
+                0
+            } else {
+                pstr.parse().unwrap_or(0)
+            });
+        }
+        // Conversion char.
+        if i >= bytes.len() {
+            return Err("missing conversion character".into());
+        }
+        let conv = match bytes[i] {
+            b's' => ConvChar::S,
+            b'd' => ConvChar::D,
+            b'i' => ConvChar::I,
+            b'u' => ConvChar::U,
+            b'o' => ConvChar::O,
+            b'x' => ConvChar::X,
+            b'X' => ConvChar::BigX,
+            b'c' => ConvChar::C,
+            b'b' => ConvChar::B,
+            b'%' => ConvChar::Percent,
+            c => return Err(format!("`%{}': invalid directive", c as char)),
+        };
+        i += 1;
+        parts.push(FormatPart::Conv(ConvSpec {
+            flags,
+            width,
+            precision,
+            conv,
+        }));
+    }
+    if !lit.is_empty() {
+        parts.push(FormatPart::Literal(lit));
+    }
+    Ok(parts)
+}
+
+/// Parses a printf integer argument per POSIX / bash rules.
+/// Returns (value, optional error message). On trailing garbage, the
+/// parsed prefix is returned along with an error string; on empty,
+/// returns 0 with no error.
+fn parse_printf_int(s: &str) -> (i64, Option<String>) {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return (0, None);
+    }
+    let bytes = trimmed.as_bytes();
+    // Char-literal form: leading ' or ".
+    if bytes[0] == b'\'' || bytes[0] == b'"' {
+        if bytes.len() == 1 {
+            return (0, None);
+        }
+        let v = bytes[1] as i64;
+        let extra = if bytes.len() > 2 {
+            Some(format!(
+                "warning: `{s}': character(s) following character constant have been ignored"
+            ))
+        } else {
+            None
+        };
+        return (v, extra);
+    }
+    // Signed prefix.
+    let (sign, rest) = match bytes[0] {
+        b'+' => (1i64, &trimmed[1..]),
+        b'-' => (-1i64, &trimmed[1..]),
+        _ => (1i64, trimmed),
+    };
+    // Hex / octal / decimal.
+    let (radix, digits) = if rest.starts_with("0x") || rest.starts_with("0X") {
+        (16u32, &rest[2..])
+    } else if rest.starts_with('0') && rest.len() > 1 {
+        (8u32, &rest[1..])
+    } else {
+        (10u32, rest)
+    };
+    if digits.is_empty() {
+        return (0, None);
+    }
+    // Consume all valid digits; report trailing garbage.
+    let mut end = 0;
+    for (j, c) in digits.char_indices() {
+        if c.is_digit(radix) {
+            end = j + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        // No valid digits at all.
+        return (0, Some(format!("`{s}': invalid number")));
+    }
+    let parsed = i64::from_str_radix(&digits[..end], radix).unwrap_or(0);
+    let err = if end < digits.len() {
+        Some(format!("`{s}': invalid number"))
+    } else {
+        None
+    };
+    (sign.saturating_mul(parsed), err)
+}
+
+/// Formats a single conv-spec + arg into `out`. Returns Ok(true) for
+/// normal completion, Ok(false) if `\c` halted output (only possible
+/// for `%b`), Err for an invalid integer arg (caller logs + sets
+/// status 1 but does NOT halt).
+fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, String> {
+    let pad_string = |s: &[u8], spec: &ConvSpec| -> Vec<u8> {
+        let truncated: &[u8] = if let Some(p) = spec.precision {
+            &s[..s.len().min(p)]
+        } else {
+            s
+        };
+        let width = spec.width.unwrap_or(0);
+        if truncated.len() >= width {
+            return truncated.to_vec();
+        }
+        let pad_len = width - truncated.len();
+        let mut v = Vec::with_capacity(width);
+        if spec.flags.left_align {
+            v.extend_from_slice(truncated);
+            v.extend(std::iter::repeat_n(b' ', pad_len));
+        } else {
+            v.extend(std::iter::repeat_n(b' ', pad_len));
+            v.extend_from_slice(truncated);
+        }
+        v
+    };
+
+    let pad_number = |digits: &[u8], spec: &ConvSpec, prefix: &[u8]| -> Vec<u8> {
+        // Precision = min digit count (zero-pad to precision).
+        let prec = spec.precision.unwrap_or(1);
+        let digit_part: Vec<u8> = if digits.len() >= prec {
+            digits.to_vec()
+        } else {
+            let mut v = Vec::with_capacity(prec);
+            v.extend(std::iter::repeat_n(b'0', prec - digits.len()));
+            v.extend_from_slice(digits);
+            v
+        };
+        let body_len = prefix.len() + digit_part.len();
+        let width = spec.width.unwrap_or(0);
+        if body_len >= width {
+            let mut v = Vec::with_capacity(body_len);
+            v.extend_from_slice(prefix);
+            v.extend_from_slice(&digit_part);
+            return v;
+        }
+        let pad_len = width - body_len;
+        // Zero-pad only when no precision AND not left-aligned.
+        let use_zero =
+            spec.flags.zero_pad && !spec.flags.left_align && spec.precision.is_none();
+        let pad_char = if use_zero { b'0' } else { b' ' };
+        let mut v = Vec::with_capacity(width);
+        if spec.flags.left_align {
+            v.extend_from_slice(prefix);
+            v.extend_from_slice(&digit_part);
+            v.extend(std::iter::repeat_n(b' ', pad_len));
+        } else if use_zero {
+            // Sign/0x prefix before zeros: prefix then zeros then digits.
+            v.extend_from_slice(prefix);
+            v.extend(std::iter::repeat_n(pad_char, pad_len));
+            v.extend_from_slice(&digit_part);
+        } else {
+            v.extend(std::iter::repeat_n(pad_char, pad_len));
+            v.extend_from_slice(prefix);
+            v.extend_from_slice(&digit_part);
+        }
+        v
+    };
+
+    match spec.conv {
+        ConvChar::S => {
+            out.extend_from_slice(&pad_string(arg.as_bytes(), spec));
+            Ok(true)
+        }
+        ConvChar::C => {
+            // First byte (or empty).
+            let bytes = arg.as_bytes();
+            let body: &[u8] = if bytes.is_empty() { &[] } else { &bytes[..1] };
+            out.extend_from_slice(&pad_string(body, spec));
+            Ok(true)
+        }
+        ConvChar::D | ConvChar::I => {
+            let (val, err) = parse_printf_int(arg);
+            let abs = val.unsigned_abs();
+            let digits = abs.to_string().into_bytes();
+            let mut prefix: Vec<u8> = Vec::new();
+            if val < 0 {
+                prefix.push(b'-');
+            } else if spec.flags.sign {
+                prefix.push(b'+');
+            } else if spec.flags.space_sign {
+                prefix.push(b' ');
+            }
+            out.extend_from_slice(&pad_number(&digits, spec, &prefix));
+            err.map_or(Ok(true), Err)
+        }
+        ConvChar::U => {
+            let (val, err) = parse_printf_int(arg);
+            let unsigned = val as u64;
+            let digits = unsigned.to_string().into_bytes();
+            out.extend_from_slice(&pad_number(&digits, spec, &[]));
+            err.map_or(Ok(true), Err)
+        }
+        ConvChar::O => {
+            let (val, err) = parse_printf_int(arg);
+            let unsigned = val as u64;
+            let s = format!("{unsigned:o}");
+            let prefix: &[u8] = if spec.flags.alt && !s.starts_with('0') {
+                b"0"
+            } else {
+                b""
+            };
+            out.extend_from_slice(&pad_number(s.as_bytes(), spec, prefix));
+            err.map_or(Ok(true), Err)
+        }
+        ConvChar::X => {
+            let (val, err) = parse_printf_int(arg);
+            let unsigned = val as u64;
+            let s = format!("{unsigned:x}");
+            let prefix: &[u8] = if spec.flags.alt && unsigned != 0 {
+                b"0x"
+            } else {
+                b""
+            };
+            out.extend_from_slice(&pad_number(s.as_bytes(), spec, prefix));
+            err.map_or(Ok(true), Err)
+        }
+        ConvChar::BigX => {
+            let (val, err) = parse_printf_int(arg);
+            let unsigned = val as u64;
+            let s = format!("{unsigned:X}");
+            let prefix: &[u8] = if spec.flags.alt && unsigned != 0 {
+                b"0X"
+            } else {
+                b""
+            };
+            out.extend_from_slice(&pad_number(s.as_bytes(), spec, prefix));
+            err.map_or(Ok(true), Err)
+        }
+        ConvChar::B => {
+            let (decoded, halted) = decode_printf_b_arg(arg);
+            out.extend_from_slice(&pad_string(&decoded, spec));
+            Ok(!halted)
+        }
+        ConvChar::Percent => {
+            // Caller treats `%%` specially (no arg consumed); shouldn't
+            // reach here, but emit a `%` defensively.
+            out.push(b'%');
+            Ok(true)
+        }
+    }
+}
+
+fn builtin_printf(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    // Parse leading flags: -v VAR, -- end-of-flags.
+    let mut v_var: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("huck: printf: -v: option requires an argument");
+                    return ExecOutcome::Continue(2);
+                }
+                if !is_valid_name(&args[i]) {
+                    eprintln!("huck: printf: `{}': not a valid identifier", args[i]);
+                    return ExecOutcome::Continue(1);
+                }
+                v_var = Some(args[i].clone());
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            s if s.starts_with('-') && s.len() > 1 && s != "-" => {
+                // Bash's printf rejects unknown flags but accepts a
+                // lone "-" as a format. We do the same.
+                eprintln!("huck: printf: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+
+    if i >= args.len() {
+        eprintln!("huck: printf: usage: printf [-v var] format [arguments]");
+        return ExecOutcome::Continue(2);
+    }
+
+    let format = args[i].clone();
+    let rest_args: &[String] = &args[i + 1..];
+
+    let parts = match parse_format(&format) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("huck: printf: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+
+    // Determine whether the format has any consuming conv (anything
+    // that pops an arg from `rest_args`). %% does NOT consume.
+    let has_consuming_conv = parts.iter().any(|p| match p {
+        FormatPart::Conv(c) => !matches!(c.conv, ConvChar::Percent),
+        _ => false,
+    });
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut exit: i32 = 0;
+    let mut arg_idx = 0;
+    let mut halted = false;
+
+    loop {
+        for part in &parts {
+            if halted {
+                break;
+            }
+            match part {
+                FormatPart::Literal(s) => buf.extend_from_slice(s),
+                FormatPart::Conv(c) if matches!(c.conv, ConvChar::Percent) => {
+                    buf.push(b'%');
+                }
+                FormatPart::Conv(c) => {
+                    let arg = if arg_idx < rest_args.len() {
+                        rest_args[arg_idx].as_str()
+                    } else {
+                        // Missing arg: %s → "", %d → 0.
+                        ""
+                    };
+                    arg_idx += 1;
+                    match format_one(c, arg, &mut buf) {
+                        Ok(true) => {}
+                        Ok(false) => halted = true,
+                        Err(msg) => {
+                            eprintln!("huck: printf: {msg}");
+                            exit = 1;
+                        }
+                    }
+                }
+            }
+        }
+        if halted {
+            break;
+        }
+        // Cycle iff there's at least one consuming conv AND args remain.
+        if !has_consuming_conv {
+            break;
+        }
+        if arg_idx >= rest_args.len() {
+            break;
+        }
+    }
+
+    // Output.
+    if let Some(var) = v_var {
+        let s = String::from_utf8_lossy(&buf).into_owned();
+        if shell.try_set(&var, s).is_err() {
+            eprintln!("huck: printf: {var}: readonly variable");
+            return ExecOutcome::Continue(1);
+        }
+    } else if let Err(e) = out.write_all(&buf) {
+        eprintln!("huck: printf: {e}");
+        return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(exit)
 }
@@ -5188,5 +5750,250 @@ mod read_tests {
                 ("Y".to_string(), "b:c".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod printf_tests {
+    use super::*;
+
+    // ── escape decoder ─────────────────────────────────────────
+
+    #[test]
+    fn escape_basic() {
+        assert_eq!(decode_printf_escape(b"n"), (b"\n".to_vec(), 1));
+        assert_eq!(decode_printf_escape(b"t"), (b"\t".to_vec(), 1));
+        assert_eq!(decode_printf_escape(b"\\"), (b"\\".to_vec(), 1));
+    }
+
+    #[test]
+    fn escape_octal() {
+        // \101 → 'A'
+        assert_eq!(decode_printf_escape(b"101"), (b"A".to_vec(), 3));
+        // \0101 → still 'A' (\0 prefix allows up to 4 digits)
+        let (v, n) = decode_printf_escape(b"0101");
+        assert_eq!(v, b"A".to_vec());
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn escape_hex() {
+        // \x41 → 'A'
+        assert_eq!(decode_printf_escape(b"x41"), (b"A".to_vec(), 3));
+        // \x4 → byte 0x04 (one hex digit consumed)
+        let (v, n) = decode_printf_escape(b"x4");
+        assert_eq!(v, vec![0x04]);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn escape_unknown_preserved() {
+        // \z → literal "\\z"
+        assert_eq!(decode_printf_escape(b"z"), (b"\\z".to_vec(), 1));
+    }
+
+    #[test]
+    fn escape_trailing_backslash() {
+        // Empty rest after `\` → literal "\\"
+        assert_eq!(decode_printf_escape(b""), (b"\\".to_vec(), 0));
+    }
+
+    // ── parse_printf_int ───────────────────────────────────────
+
+    #[test]
+    fn parse_printf_int_decimal() {
+        let (v, e) = parse_printf_int("42");
+        assert_eq!(v, 42);
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn parse_printf_int_negative_hex_octal() {
+        assert_eq!(parse_printf_int("-42").0, -42);
+        assert_eq!(parse_printf_int("0x1F").0, 31);
+        assert_eq!(parse_printf_int("017").0, 15);
+    }
+
+    #[test]
+    fn parse_printf_int_char_literal() {
+        assert_eq!(parse_printf_int("'A").0, 65);
+        assert_eq!(parse_printf_int("\"A").0, 65);
+    }
+
+    #[test]
+    fn parse_printf_int_trailing_garbage() {
+        let (v, e) = parse_printf_int("42abc");
+        assert_eq!(v, 42);
+        assert!(e.is_some(), "expected error message");
+    }
+
+    // ── parse_format ───────────────────────────────────────────
+
+    #[test]
+    fn parse_format_literal_only() {
+        let p = parse_format("hello\\n").unwrap();
+        assert_eq!(p.len(), 1);
+        match &p[0] {
+            FormatPart::Literal(b) => assert_eq!(b, b"hello\n"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_format_simple_conv() {
+        let p = parse_format("%s").unwrap();
+        assert_eq!(p.len(), 1);
+        match &p[0] {
+            FormatPart::Conv(c) => {
+                assert_eq!(c.conv, ConvChar::S);
+                assert_eq!(c.width, None);
+                assert_eq!(c.precision, None);
+                assert_eq!(c.flags, ConvFlags::default());
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_format_flags_width_prec() {
+        let p = parse_format("%-5.3d").unwrap();
+        assert_eq!(p.len(), 1);
+        match &p[0] {
+            FormatPart::Conv(c) => {
+                assert!(c.flags.left_align);
+                assert_eq!(c.width, Some(5));
+                assert_eq!(c.precision, Some(3));
+                assert_eq!(c.conv, ConvChar::D);
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ── format_one ─────────────────────────────────────────────
+
+    #[test]
+    fn format_s_basic() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: None,
+            conv: ConvChar::S,
+        };
+        format_one(&spec, "hi", &mut out).unwrap();
+        assert_eq!(out, b"hi");
+    }
+
+    #[test]
+    fn format_s_width() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: Some(5),
+            precision: None,
+            conv: ConvChar::S,
+        };
+        format_one(&spec, "hi", &mut out).unwrap();
+        assert_eq!(out, b"   hi");
+    }
+
+    #[test]
+    fn format_s_left_align() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags {
+                left_align: true,
+                ..ConvFlags::default()
+            },
+            width: Some(5),
+            precision: None,
+            conv: ConvChar::S,
+        };
+        format_one(&spec, "hi", &mut out).unwrap();
+        assert_eq!(out, b"hi   ");
+    }
+
+    #[test]
+    fn format_s_precision_truncates() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: Some(3),
+            conv: ConvChar::S,
+        };
+        format_one(&spec, "hello", &mut out).unwrap();
+        assert_eq!(out, b"hel");
+    }
+
+    #[test]
+    fn format_d_basic() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: None,
+            conv: ConvChar::D,
+        };
+        format_one(&spec, "42", &mut out).unwrap();
+        assert_eq!(out, b"42");
+    }
+
+    #[test]
+    fn format_d_zero_pad() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags {
+                zero_pad: true,
+                ..ConvFlags::default()
+            },
+            width: Some(5),
+            precision: None,
+            conv: ConvChar::D,
+        };
+        format_one(&spec, "42", &mut out).unwrap();
+        assert_eq!(out, b"00042");
+    }
+
+    #[test]
+    fn format_x_alt_form() {
+        let mut out = Vec::new();
+        let spec_x = ConvSpec {
+            flags: ConvFlags {
+                alt: true,
+                ..ConvFlags::default()
+            },
+            width: None,
+            precision: None,
+            conv: ConvChar::X,
+        };
+        format_one(&spec_x, "255", &mut out).unwrap();
+        assert_eq!(out, b"0xff");
+
+        let mut out2 = Vec::new();
+        let spec_bigx = ConvSpec {
+            flags: ConvFlags {
+                alt: true,
+                ..ConvFlags::default()
+            },
+            width: None,
+            precision: None,
+            conv: ConvChar::BigX,
+        };
+        format_one(&spec_bigx, "255", &mut out2).unwrap();
+        assert_eq!(out2, b"0XFF");
+    }
+
+    #[test]
+    fn format_b_arg_escapes() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: None,
+            conv: ConvChar::B,
+        };
+        format_one(&spec, "a\\tb", &mut out).unwrap();
+        assert_eq!(out, b"a\tb");
     }
 }
