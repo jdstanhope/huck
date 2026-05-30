@@ -1177,15 +1177,20 @@ fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, Str
 
     let pad_number = |digits: &[u8], spec: &ConvSpec, prefix: &[u8]| -> Vec<u8> {
         // Precision = min digit count (zero-pad to precision).
+        // POSIX: when precision is explicitly 0 and the value is 0,
+        // no digits are produced. (`printf '%.0d' 0` → empty string.)
         let prec = spec.precision.unwrap_or(1);
-        let digit_part: Vec<u8> = if digits.len() >= prec {
-            digits.to_vec()
-        } else {
-            let mut v = Vec::with_capacity(prec);
-            v.extend(std::iter::repeat_n(b'0', prec - digits.len()));
-            v.extend_from_slice(digits);
-            v
-        };
+        let digit_part: Vec<u8> =
+            if spec.precision == Some(0) && digits.iter().all(|&b| b == b'0') {
+                Vec::new()
+            } else if digits.len() >= prec {
+                digits.to_vec()
+            } else {
+                let mut v = Vec::with_capacity(prec);
+                v.extend(std::iter::repeat_n(b'0', prec - digits.len()));
+                v.extend_from_slice(digits);
+                v
+            };
         let body_len = prefix.len() + digit_part.len();
         let width = spec.width.unwrap_or(0);
         if body_len >= width {
@@ -5995,5 +6000,25 @@ mod printf_tests {
         };
         format_one(&spec, "a\\tb", &mut out).unwrap();
         assert_eq!(out, b"a\tb");
+    }
+
+    #[test]
+    fn format_d_precision_zero_with_value_zero_emits_empty() {
+        // POSIX: precision 0 + value 0 produces no digits.
+        // Regression for `%.0d` of 0 returning "0" instead of "".
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: Some(0),
+            conv: ConvChar::D,
+        };
+        format_one(&spec, "0", &mut out).unwrap();
+        assert_eq!(out, b"");
+
+        // Sanity: precision 0 with NON-zero value still produces digits.
+        let mut out2 = Vec::new();
+        format_one(&spec, "5", &mut out2).unwrap();
+        assert_eq!(out2, b"5");
     }
 }
