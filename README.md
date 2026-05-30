@@ -62,6 +62,7 @@ spec, an implementation plan, and a test suite.
 | v52       | `local` (M-67)                                                 |
 | v53       | `:` (M-68), `true` / `false` (M-69), `command -v`/`-V` (M-70)  |
 | v54       | `readonly` (M-71)                                              |
+| v55       | `read` (M-72) + builtin stdin redirections (L-12)              |
 
 ## Build and run
 
