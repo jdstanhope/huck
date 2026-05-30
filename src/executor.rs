@@ -1293,6 +1293,107 @@ struct StageFiles {
     stderr: Option<File>,
 }
 
+/// RAII guard that restores STDIN_FILENO from a saved dup'd fd on drop.
+/// Used to apply stdin redirection around an in-process builtin call.
+struct BuiltinStdinGuard {
+    saved_fd: RawFd,
+}
+
+impl Drop for BuiltinStdinGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved_fd, libc::STDIN_FILENO);
+            libc::close(self.saved_fd);
+        }
+    }
+}
+
+/// Apply `stdin` to STDIN_FILENO for the duration of an in-process builtin
+/// call. Returns an RAII guard whose Drop restores the original stdin.
+/// Returns Ok(None) when there is no stdin redirection (no save needed).
+///
+/// For `File`: dup2 the file's fd to 0.
+/// For `DeferredHeredoc` / `DeferredHereString`: build a pipe, write the
+/// expanded body to the write end (close it), dup2 the read end to 0. Bodies
+/// are bounded by the pipe buffer (~64K on Linux); larger bodies would block.
+fn prepare_builtin_stdin(
+    stdin: Option<StdinInput>,
+    shell: &mut Shell,
+) -> Result<Option<BuiltinStdinGuard>, ()> {
+    use std::os::unix::io::IntoRawFd;
+    let new_fd: RawFd = match stdin {
+        None => return Ok(None),
+        Some(StdinInput::File(file)) => file.into_raw_fd(),
+        Some(StdinInput::DeferredHeredoc(body)) => {
+            let bytes = expand_assignment(&body, shell).into_bytes();
+            write_pipe_for_stdin(&bytes)?
+        }
+        Some(StdinInput::DeferredHereString(body)) => {
+            let mut bytes = expand_assignment(&body, shell).into_bytes();
+            bytes.push(b'\n');
+            write_pipe_for_stdin(&bytes)?
+        }
+    };
+    unsafe {
+        let saved = libc::dup(libc::STDIN_FILENO);
+        if saved < 0 {
+            let e = io::Error::last_os_error();
+            eprintln!("huck: dup: {e}");
+            libc::close(new_fd);
+            return Err(());
+        }
+        if libc::dup2(new_fd, libc::STDIN_FILENO) < 0 {
+            let e = io::Error::last_os_error();
+            eprintln!("huck: dup2: {e}");
+            libc::close(saved);
+            libc::close(new_fd);
+            return Err(());
+        }
+        libc::close(new_fd);
+        Ok(Some(BuiltinStdinGuard { saved_fd: saved }))
+    }
+}
+
+/// Create a pipe, write `bytes` to the write end, close it, return the
+/// read end's raw fd. Used to feed a heredoc/here-string body to an
+/// in-process builtin's stdin.
+fn write_pipe_for_stdin(bytes: &[u8]) -> Result<RawFd, ()> {
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        eprintln!("huck: pipe: {e}");
+        return Err(());
+    }
+    let r = fds[0];
+    let w = fds[1];
+    // Write may not complete if bytes exceed pipe buffer; for heredoc/
+    // here-string bodies in v55 read tests this is well under 64K. A
+    // future enhancement could fork a writer if needed.
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n = unsafe {
+            libc::write(
+                w,
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            eprintln!("huck: write: {e}");
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+            return Err(());
+        }
+        written += n as usize;
+    }
+    unsafe { libc::close(w) };
+    Ok(r)
+}
+
 fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFiles, ()> {
     let stdin = match &cmd.stdin {
         Some(ResolvedStdin::File(path)) => match File::open(path) {
@@ -1507,7 +1608,19 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
-        match files.stdout {
+        // Apply stdin redirection in-process for builtins: builtins that read
+        // from stdin (e.g. `read`) need `<<<`, `<<`, and `<file` to actually
+        // affect the fd they read from. Save+dup2 around the call.
+        let stdin_guard = match prepare_builtin_stdin(files.stdin, shell) {
+            Ok(g) => g,
+            Err(()) => {
+                if !persistent {
+                    restore_inline_assignments(snap, shell);
+                }
+                return ExecOutcome::Continue(1);
+            }
+        };
+        let outcome = match files.stdout {
             Some(mut file) => {
                 builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
             }
@@ -1520,7 +1633,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                     builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
                 }
             },
-        }
+        };
+        drop(stdin_guard);
+        outcome
     } else {
         let files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,

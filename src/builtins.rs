@@ -477,7 +477,7 @@ fn builtin_readonly(
 /// caller treats this as `read` exit status 1). Returns
 /// `Ok(Some(partial))` when EOF hits AFTER at least one byte but
 /// before the delim (caller still assigns and returns status 0).
-fn read_one_line<R: std::io::BufRead>(
+fn read_one_line<R: std::io::Read>(
     r: &mut R,
     raw: bool,
     delim: u8,
@@ -657,6 +657,41 @@ unsafe fn silent_restore_echo(saved: libc::termios) {
     let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
 }
 
+/// Reads one byte at a time from STDIN_FILENO via `libc::read`,
+/// bypassing Rust's shared `std::io::stdin()` BufReader. Necessary
+/// because rustyline's non-tty `readline_direct` path fills that same
+/// BufReader with script-ahead bytes; using it here would return
+/// cached script bytes instead of the redirected fd 0.
+struct RawStdinReader;
+
+impl RawStdinReader {
+    fn new() -> Self {
+        RawStdinReader
+    }
+}
+
+impl std::io::Read for RawStdinReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+    }
+}
+
 /// `read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]`. Regular
 /// builtin. Reads one logical line from stdin and assigns fields to
 /// NAME(s) per IFS field-splitting. With no NAME, assigns the whole
@@ -759,8 +794,13 @@ fn builtin_read(
         None
     };
 
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
+    // Read directly from STDIN_FILENO via libc::read, bypassing Rust's
+    // BufReader-backed std::io::stdin(). The static BufReader is shared
+    // with rustyline's non-tty `readline_direct` path, which fills it
+    // with subsequent script lines on a single underlying read; using
+    // BufReader here would return cached script bytes instead of the
+    // redirected fd 0 (e.g. our `<<<` here-string pipe).
+    let mut handle = RawStdinReader::new();
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
