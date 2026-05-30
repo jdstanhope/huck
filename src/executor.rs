@@ -1381,6 +1381,12 @@ fn write_pipe_for_stdin(bytes: &[u8]) -> Result<RawFd, ()> {
         };
         if n < 0 {
             let e = io::Error::last_os_error();
+            // Retry on EINTR — a signal (e.g., SIGCHLD from a
+            // background job completing) during the write must not
+            // surface as "Interrupted system call".
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             eprintln!("huck: write: {e}");
             unsafe {
                 libc::close(r);
