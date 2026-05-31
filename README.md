@@ -70,6 +70,7 @@ spec, an implementation plan, and a test suite.
 | v60       | `PS1`/`PS2` prompt customization (M-76)                        |
 | v61       | `PROMPT_COMMAND` (M-76 cont.)                                  |
 | v62       | rc file: `~/.huckrc` + `--rcfile`/`--norc` (M-77)              |
+| v63       | `pushd`/`popd`/`dirs` (M-78)                                   |
 
 ## Build and run
 
