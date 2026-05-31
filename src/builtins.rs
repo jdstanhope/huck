@@ -2720,7 +2720,7 @@ fn resolve_source_path(
     None
 }
 
-fn run_sourced_contents(
+pub(crate) fn run_sourced_contents(
     contents: &str,
     path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
