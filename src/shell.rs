@@ -695,4 +695,37 @@ mod rc_tests {
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
         let _ = std::fs::remove_file(&p);
     }
+
+    #[test]
+    fn rc_default_missing_silent() {
+        // When --rcfile is unset, $HUCK_RC is unset/empty, and the
+        // default ~/.huckrc doesn't exist (here: HOME unset so
+        // default_rc_path returns None), the loader must silently
+        // return None — no error message, no non-zero status.
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        // Empty HOME → default_rc_path's filter(|s| !s.is_empty())
+        // drops it and the chain returns None. Also clear HUCK_RC
+        // in case the test environment exports one.
+        shell.set("HOME", String::new());
+        shell.set("HUCK_RC", String::new());
+        let opts = CliOptions::default();
+        // Process env may still have HOME set; the shell's local
+        // empty HOME wins per lookup_var precedence, so default_rc_path
+        // gets the empty string and returns None. But std::env::var
+        // is consulted as fallback — guard by also clearing it
+        // for the duration of this test.
+        let saved_home = std::env::var("HOME").ok();
+        let saved_huck_rc = std::env::var("HUCK_RC").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("HUCK_RC");
+        }
+        let result = maybe_source_rc_file(&mut shell, &opts);
+        unsafe {
+            if let Some(h) = saved_home { std::env::set_var("HOME", h); }
+            if let Some(r) = saved_huck_rc { std::env::set_var("HUCK_RC", r); }
+        }
+        assert_eq!(result, None);
+    }
 }
