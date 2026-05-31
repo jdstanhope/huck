@@ -101,6 +101,11 @@ pub struct Shell {
     /// is currently always 0 — no executor integration yet (see
     /// M-34 in docs/bash-divergences.md).
     pub command_hash: std::collections::HashMap<String, (std::path::PathBuf, u32)>,
+
+    /// Directory stack maintained by the `pushd`/`popd`/`dirs`
+    /// builtins. Top is index 0 — always synced with `$PWD` at
+    /// the top of each pushd/popd/dirs call.
+    pub dir_stack: Vec<std::path::PathBuf>,
 }
 
 impl Shell {
@@ -136,6 +141,7 @@ impl Shell {
             source_depth: 0,
             local_scopes: Vec::new(),
             command_hash: std::collections::HashMap::new(),
+            dir_stack: Vec::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.

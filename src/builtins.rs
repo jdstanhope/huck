@@ -22,6 +22,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
     "readonly", "read", "printf", "type", "hash",
+    "pushd", "popd", "dirs",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -76,6 +77,9 @@ pub fn run_builtin(
         "command" => builtin_command(args, out, shell),
         "type" => builtin_type(args, out, shell),
         "hash" => builtin_hash(args, out, shell),
+        "pushd" => builtin_pushd(args, out, shell),
+        "popd" => builtin_popd(args, out, shell),
+        "dirs" => builtin_dirs(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
         "read" => builtin_read(args, out, shell),
         "printf" => builtin_printf(args, out, shell),
@@ -93,7 +97,7 @@ pub fn run_builtin(
     }
 }
 
-fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
+pub(crate) fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
         eprintln!("huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
@@ -3408,6 +3412,293 @@ fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
     }
 }
 
+// ── pushd/popd/dirs (v63) ────────────────────────────────────────────
+
+/// Parses "+N" / "-N" into a left-indexed stack position.
+/// `+N` is index N from left (0 = top); `-N` is index N from right
+/// (0 = bottom). Out-of-range or non-numeric returns Err.
+fn parse_signed_index(s: &str, stack_len: usize) -> Result<usize, String> {
+    let (sign_plus, digits) = if let Some(d) = s.strip_prefix('+') {
+        (true, d)
+    } else if let Some(d) = s.strip_prefix('-') {
+        (false, d)
+    } else {
+        return Err(format!("{s}: not a +N or -N specifier"));
+    };
+    let n: usize = digits
+        .parse()
+        .map_err(|_| format!("{s}: invalid number"))?;
+    if n >= stack_len {
+        return Err(format!("{s}: directory stack index out of range"));
+    }
+    Ok(if sign_plus { n } else { stack_len - 1 - n })
+}
+
+/// Returns the printable form of `path`. When `collapse` is true,
+/// replaces the leading HOME with `~` (exact match → `~`; under
+/// HOME/ → `~/rest`).
+fn dir_display(path: &Path, shell: &Shell, collapse: bool) -> String {
+    let s = path.display().to_string();
+    if !collapse {
+        return s;
+    }
+    let home = shell
+        .lookup_var("HOME")
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_default();
+    if home.is_empty() {
+        return s;
+    }
+    if s == home {
+        return "~".to_string();
+    }
+    let with_slash = format!("{home}/");
+    if let Some(rest) = s.strip_prefix(&with_slash) {
+        return format!("~/{rest}");
+    }
+    s
+}
+
+/// Keep `dir_stack[0]` in sync with the current `$PWD` (or
+/// `current_dir()` fallback). Creates a one-entry stack if empty.
+fn sync_stack_top(shell: &mut Shell) {
+    let cwd_str = shell
+        .lookup_var("PWD")
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        })
+        .unwrap_or_default();
+    let p = std::path::PathBuf::from(cwd_str);
+    if shell.dir_stack.is_empty() {
+        shell.dir_stack.push(p);
+    } else {
+        shell.dir_stack[0] = p;
+    }
+}
+
+/// Print the current stack to `out` per the flag knobs. Default
+/// (per_line=false) emits one space-joined line; `per_line` emits
+/// one entry per line, with optional `numbered` prefix.
+fn print_stack(
+    out: &mut dyn Write,
+    shell: &Shell,
+    collapse: bool,
+    per_line: bool,
+    numbered: bool,
+) -> ExecOutcome {
+    if per_line {
+        for (i, p) in shell.dir_stack.iter().enumerate() {
+            let disp = dir_display(p, shell, collapse);
+            if numbered {
+                let _ = writeln!(out, "{i:>2}  {disp}");
+            } else {
+                let _ = writeln!(out, "{disp}");
+            }
+        }
+    } else {
+        let parts: Vec<String> = shell
+            .dir_stack
+            .iter()
+            .map(|p| dir_display(p, shell, collapse))
+            .collect();
+        let _ = writeln!(out, "{}", parts.join(" "));
+    }
+    ExecOutcome::Continue(0)
+}
+
+/// Detect `+N`/`-N` form: starts with `+`, or starts with `-` and
+/// has a digit immediately after.
+fn is_signed_index_arg(s: &str) -> bool {
+    // Both `+N` and `-N` require a digit immediately after the
+    // sign so a literal directory name like `+foo` or `-bar` is
+    // treated as a path, not a misformatted index spec.
+    (s.starts_with('+') || s.starts_with('-'))
+        && s.len() > 1
+        && s.as_bytes()[1].is_ascii_digit()
+}
+
+fn builtin_pushd(
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    sync_stack_top(shell);
+
+    if args.is_empty() {
+        // Swap top two.
+        if shell.dir_stack.len() < 2 {
+            eprintln!("huck: pushd: no other directory");
+            return ExecOutcome::Continue(1);
+        }
+        shell.dir_stack.swap(0, 1);
+        let target = shell.dir_stack[0].clone();
+        let cd_args = vec![target.display().to_string()];
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+            && c != 0
+        {
+            // Undo the swap on failure.
+            shell.dir_stack.swap(0, 1);
+            return ExecOutcome::Continue(c);
+        }
+        return print_stack(out, shell, true, false, false);
+    }
+
+    let arg = &args[0];
+    if is_signed_index_arg(arg) {
+        let idx = match parse_signed_index(arg, shell.dir_stack.len()) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("huck: pushd: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        };
+        if idx == 0 {
+            return print_stack(out, shell, true, false, false);
+        }
+        shell.dir_stack.rotate_left(idx);
+        let target = shell.dir_stack[0].clone();
+        let cd_args = vec![target.display().to_string()];
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+            && c != 0
+        {
+            // Undo rotation on cd failure.
+            shell.dir_stack.rotate_right(idx);
+            return ExecOutcome::Continue(c);
+        }
+        return print_stack(out, shell, true, false, false);
+    }
+
+    // pushd DIR
+    let cd_args = vec![arg.clone()];
+    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+        && c != 0
+    {
+        return ExecOutcome::Continue(c);
+    }
+    let new_cwd = shell
+        .lookup_var("PWD")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(arg));
+    shell.dir_stack.insert(0, new_cwd);
+    print_stack(out, shell, true, false, false)
+}
+
+fn builtin_popd(
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    sync_stack_top(shell);
+    if shell.dir_stack.len() <= 1 {
+        eprintln!("huck: popd: directory stack empty");
+        return ExecOutcome::Continue(1);
+    }
+
+    let idx = if args.is_empty() {
+        0
+    } else {
+        let arg = &args[0];
+        if !is_signed_index_arg(arg) {
+            eprintln!("huck: popd: {arg}: invalid argument");
+            return ExecOutcome::Continue(1);
+        }
+        match parse_signed_index(arg, shell.dir_stack.len()) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("huck: popd: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    };
+
+    // Save the entry being removed so we can restore on cd failure
+    // (only matters when idx == 0, where popd does a cd to the new
+    // top). Matches bash: popd leaves the stack unchanged when the
+    // resulting cd fails.
+    let saved = shell.dir_stack[idx].clone();
+    shell.dir_stack.remove(idx);
+    if idx == 0 {
+        let target = shell.dir_stack[0].clone();
+        let cd_args = vec![target.display().to_string()];
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+            && c != 0
+        {
+            // Restore the entry we just popped so the stack is
+            // exactly as it was before the failing popd.
+            shell.dir_stack.insert(0, saved);
+            return ExecOutcome::Continue(c);
+        }
+    }
+    print_stack(out, shell, true, false, false)
+}
+
+fn builtin_dirs(
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    sync_stack_top(shell);
+
+    let mut collapse = true;
+    let mut per_line = false;
+    let mut numbered = false;
+    let mut clear = false;
+    let mut index: Option<usize> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-c" => {
+                clear = true;
+                i += 1;
+            }
+            "-l" => {
+                collapse = false;
+                i += 1;
+            }
+            "-p" => {
+                per_line = true;
+                i += 1;
+            }
+            "-v" => {
+                per_line = true;
+                numbered = true;
+                i += 1;
+            }
+            s if is_signed_index_arg(s) => {
+                match parse_signed_index(s, shell.dir_stack.len()) {
+                    Ok(idx) => index = Some(idx),
+                    Err(e) => {
+                        eprintln!("huck: dirs: {e}");
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+                i += 1;
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: dirs: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+
+    if clear {
+        shell.dir_stack.truncate(1);
+        return ExecOutcome::Continue(0);
+    }
+    if let Some(idx) = index {
+        let entry = &shell.dir_stack[idx];
+        let _ = writeln!(out, "{}", dir_display(entry, shell, collapse));
+        return ExecOutcome::Continue(0);
+    }
+    print_stack(out, shell, collapse, per_line, numbered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6697,5 +6988,132 @@ mod hash_tests {
         let mut shell = Shell::new();
         let (oc, _) = run(&["-p"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+}
+
+#[cfg(test)]
+mod dirstack_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+    use std::path::PathBuf;
+
+    // ── parse_signed_index ────────────────────────────────────
+
+    #[test]
+    fn parse_signed_index_plus() {
+        assert_eq!(parse_signed_index("+0", 10).unwrap(), 0);
+        assert_eq!(parse_signed_index("+2", 10).unwrap(), 2);
+        assert_eq!(parse_signed_index("+5", 10).unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_signed_index_minus() {
+        // length 10: -0 = last (9); -1 = 8; -9 = 0.
+        assert_eq!(parse_signed_index("-0", 10).unwrap(), 9);
+        assert_eq!(parse_signed_index("-1", 10).unwrap(), 8);
+        assert_eq!(parse_signed_index("-9", 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_signed_index_out_of_range() {
+        assert!(parse_signed_index("+10", 10).is_err());
+        assert!(parse_signed_index("-10", 10).is_err());
+    }
+
+    #[test]
+    fn parse_signed_index_invalid() {
+        assert!(parse_signed_index("+abc", 10).is_err());
+    }
+
+    #[test]
+    fn parse_signed_index_no_sign() {
+        assert!(parse_signed_index("2", 10).is_err());
+    }
+
+    // ── dir_display ───────────────────────────────────────────
+
+    #[test]
+    fn dir_display_no_home_unchanged() {
+        let mut shell = Shell::new();
+        shell.set("HOME", String::new());
+        // Also clear process env to be safe.
+        let saved = std::env::var("HOME").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        let out = dir_display(&PathBuf::from("/etc"), &shell, true);
+        unsafe {
+            if let Some(h) = saved {
+                std::env::set_var("HOME", h);
+            }
+        }
+        assert_eq!(out, "/etc");
+    }
+
+    #[test]
+    fn dir_display_home_match_collapses() {
+        let mut shell = Shell::new();
+        shell.set("HOME", "/h/me".to_string());
+        assert_eq!(dir_display(&PathBuf::from("/h/me"), &shell, true), "~",);
+    }
+
+    #[test]
+    fn dir_display_home_subdir_collapses() {
+        let mut shell = Shell::new();
+        shell.set("HOME", "/h/me".to_string());
+        assert_eq!(
+            dir_display(&PathBuf::from("/h/me/x"), &shell, true),
+            "~/x",
+        );
+    }
+
+    #[test]
+    fn dir_display_no_collapse_flag() {
+        let mut shell = Shell::new();
+        shell.set("HOME", "/h/me".to_string());
+        assert_eq!(
+            dir_display(&PathBuf::from("/h/me/x"), &shell, false),
+            "/h/me/x",
+        );
+    }
+
+    #[test]
+    fn dir_display_unrelated_path_passes_through() {
+        let mut shell = Shell::new();
+        shell.set("HOME", "/h/me".to_string());
+        assert_eq!(
+            dir_display(&PathBuf::from("/etc/foo"), &shell, true),
+            "/etc/foo",
+        );
+    }
+
+    // ── is_signed_index_arg ───────────────────────────────────
+
+    #[test]
+    fn is_signed_index_arg_recognizes_numeric_forms() {
+        assert!(is_signed_index_arg("+0"));
+        assert!(is_signed_index_arg("+12"));
+        assert!(is_signed_index_arg("-0"));
+        assert!(is_signed_index_arg("-5"));
+    }
+
+    #[test]
+    fn is_signed_index_arg_rejects_alpha_after_sign() {
+        // Regression: previously the `+` branch had no digit guard,
+        // so `+foo` (a literal directory name) was misclassified
+        // as an index specifier. Match the symmetric `-foo` rule.
+        assert!(!is_signed_index_arg("+foo"));
+        assert!(!is_signed_index_arg("+bar"));
+        assert!(!is_signed_index_arg("-foo"));
+        assert!(!is_signed_index_arg("-bar"));
+    }
+
+    #[test]
+    fn is_signed_index_arg_rejects_bare_signs_and_paths() {
+        assert!(!is_signed_index_arg("+"));
+        assert!(!is_signed_index_arg("-"));
+        assert!(!is_signed_index_arg("/tmp"));
+        assert!(!is_signed_index_arg("relative"));
+        assert!(!is_signed_index_arg(""));
     }
 }
