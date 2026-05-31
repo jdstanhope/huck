@@ -3151,7 +3151,6 @@ fn builtin_hash(
         // Walk the cluster. -p takes a value (rest-of-arg OR next arg).
         let bytes = arg.as_bytes();
         let mut j = 1;
-        let mut consumed_value = false;
         while j < bytes.len() {
             match bytes[j] {
                 b'r' => reset = true,
@@ -3161,11 +3160,11 @@ fn builtin_hash(
                 b'p' => {
                     set_path = true;
                     if j + 1 < bytes.len() {
-                        // -p inline: "-pPATH"
+                        // -p inline: "-pPATH" (matches bash; any
+                        // characters following -p are the value).
                         explicit_path = Some(
                             String::from_utf8_lossy(&bytes[j + 1..]).into_owned(),
                         );
-                        consumed_value = true;
                         break;
                     } else {
                         // -p separate: next arg
@@ -3175,7 +3174,6 @@ fn builtin_hash(
                             return ExecOutcome::Continue(2);
                         }
                         explicit_path = Some(args[i].clone());
-                        consumed_value = true;
                         break;
                     }
                 }
@@ -3186,7 +3184,6 @@ fn builtin_hash(
             }
             j += 1;
         }
-        let _ = consumed_value;
         i += 1;
     }
     let names = &args[i..];
@@ -3268,7 +3265,7 @@ fn builtin_hash(
     // Default: with names → resolve+add; without → list.
     if names.is_empty() {
         if shell.command_hash.is_empty() {
-            let _ = writeln!(out, "hash table empty");
+            let _ = writeln!(out, "hash: hash table empty");
             return ExecOutcome::Continue(0);
         }
         let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
@@ -6604,7 +6601,7 @@ mod hash_tests {
         let mut shell = Shell::new();
         let (oc, out) = run(&[], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
-        assert_eq!(out, "hash table empty\n");
+        assert_eq!(out, "hash: hash table empty\n");
     }
 
     #[test]
