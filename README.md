@@ -67,6 +67,7 @@ spec, an implementation plan, and a test suite.
 | v57       | `exit` inherits `$?` (M-74)                                    |
 | v58       | `type` (M-75)                                                  |
 | v59       | `hash` (M-34 partial)                                          |
+| v60       | `PS1`/`PS2` prompt customization (M-76)                        |
 
 ## Build and run
 
