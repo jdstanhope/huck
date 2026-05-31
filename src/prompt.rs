@@ -152,7 +152,10 @@ fn host_full() -> String {
             return String::new();
         }
     }
-    // Find the NUL terminator.
+    // Force a sentinel at the last byte in case the OS filled the
+    // buffer without a NUL terminator (POSIX allows that when the
+    // hostname is longer than buf.len()).
+    buf[255] = 0;
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
@@ -206,9 +209,16 @@ fn cwd_basename(shell: &Shell) -> String {
     if !home.is_empty() && cwd == home {
         return "~".to_string();
     }
-    match cwd.rsplit_once('/') {
+    // Strip trailing slashes (except the root `/` itself) so
+    // `PWD=/foo/` produces `foo`, matching bash.
+    let trimmed: &str = if cwd.len() > 1 && cwd.ends_with('/') {
+        cwd.trim_end_matches('/')
+    } else {
+        &cwd
+    };
+    match trimmed.rsplit_once('/') {
         Some((_, base)) if !base.is_empty() => base.to_string(),
-        _ => cwd,
+        _ => trimmed.to_string(),
     }
 }
 
@@ -263,6 +273,23 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("PWD", "/a/b/c".to_string());
         assert_eq!(expand_prompt("\\W", &shell), "c");
+    }
+
+    #[test]
+    fn expand_cwd_basename_trailing_slash() {
+        // Regression: bash strips trailing slashes from PWD before
+        // taking the basename. `PWD=/foo/` → `\W` = `foo`.
+        let mut shell = Shell::new();
+        shell.set("PWD", "/foo/".to_string());
+        assert_eq!(expand_prompt("\\W", &shell), "foo");
+    }
+
+    #[test]
+    fn expand_cwd_basename_root_is_slash() {
+        // PWD=/ → \W is `/` (the root itself; no basename).
+        let mut shell = Shell::new();
+        shell.set("PWD", "/".to_string());
+        assert_eq!(expand_prompt("\\W", &shell), "/");
     }
 
     #[test]
