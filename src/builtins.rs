@@ -21,7 +21,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly", "read", "printf", "type",
+    "readonly", "read", "printf", "type", "hash",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -75,6 +75,7 @@ pub fn run_builtin(
         "false" => builtin_false(args, shell),
         "command" => builtin_command(args, out, shell),
         "type" => builtin_type(args, out, shell),
+        "hash" => builtin_hash(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
         "read" => builtin_read(args, out, shell),
         "printf" => builtin_printf(args, out, shell),
@@ -3118,6 +3119,180 @@ fn builtin_type(
         }
         for res in &resolutions {
             emit_type_entry(name, res, type_only, path_only, out);
+        }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+fn builtin_hash(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    // Mode-selector flags. Priority when multiple set:
+    // reset > delete > set_path > list > type_only > default.
+    let mut reset = false;
+    let mut delete = false;
+    let mut set_path = false;
+    let mut list = false;
+    let mut type_only = false;
+    let mut explicit_path: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        // Walk the cluster. -p takes a value (rest-of-arg OR next arg).
+        let bytes = arg.as_bytes();
+        let mut j = 1;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'r' => reset = true,
+                b'd' => delete = true,
+                b'l' => list = true,
+                b't' => type_only = true,
+                b'p' => {
+                    set_path = true;
+                    if j + 1 < bytes.len() {
+                        // -p inline: "-pPATH" (matches bash; any
+                        // characters following -p are the value).
+                        explicit_path = Some(
+                            String::from_utf8_lossy(&bytes[j + 1..]).into_owned(),
+                        );
+                        break;
+                    } else {
+                        // -p separate: next arg
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: hash: -p: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        explicit_path = Some(args[i].clone());
+                        break;
+                    }
+                }
+                c => {
+                    eprintln!("huck: hash: -{}: invalid option", c as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+
+    if reset {
+        shell.command_hash.clear();
+        return ExecOutcome::Continue(0);
+    }
+
+    if delete {
+        if names.is_empty() {
+            eprintln!("huck: hash: -d: at least one name required");
+            return ExecOutcome::Continue(2);
+        }
+        let mut exit: i32 = 0;
+        for name in names {
+            if shell.command_hash.remove(name).is_none() {
+                eprintln!("huck: hash: {name}: not found");
+                exit = 1;
+            }
+        }
+        return ExecOutcome::Continue(exit);
+    }
+
+    if set_path {
+        // Exactly one name required.
+        if names.len() != 1 {
+            eprintln!("huck: hash: -p: exactly one name required");
+            return ExecOutcome::Continue(2);
+        }
+        let name = &names[0];
+        if name.contains('/') {
+            eprintln!("huck: hash: {name}: must not contain `/'");
+            return ExecOutcome::Continue(1);
+        }
+        let path = explicit_path.unwrap(); // safe: set_path implies Some
+        shell.command_hash.insert(
+            name.clone(),
+            (std::path::PathBuf::from(path), 0u32),
+        );
+        return ExecOutcome::Continue(0);
+    }
+
+    if list {
+        // re-input form: `builtin hash -p PATH NAME`
+        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
+            shell.command_hash.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, (path, _)) in entries {
+            let _ = writeln!(out, "builtin hash -p {} {}", path.display(), name);
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if type_only {
+        if names.is_empty() {
+            eprintln!("huck: hash: -t: at least one name required");
+            return ExecOutcome::Continue(2);
+        }
+        let mut exit: i32 = 0;
+        for name in names {
+            match shell.command_hash.get(name) {
+                Some((path, _)) => {
+                    if names.len() == 1 {
+                        let _ = writeln!(out, "{}", path.display());
+                    } else {
+                        let _ = writeln!(out, "{}\t{}", name, path.display());
+                    }
+                }
+                None => {
+                    eprintln!("huck: hash: {name}: not found");
+                    exit = 1;
+                }
+            }
+        }
+        return ExecOutcome::Continue(exit);
+    }
+
+    // Default: with names → resolve+add; without → list.
+    if names.is_empty() {
+        if shell.command_hash.is_empty() {
+            let _ = writeln!(out, "hash: hash table empty");
+            return ExecOutcome::Continue(0);
+        }
+        let mut entries: Vec<(&String, &(std::path::PathBuf, u32))> =
+            shell.command_hash.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let _ = writeln!(out, "hits\tcommand");
+        for (_name, (path, hits)) in entries {
+            let _ = writeln!(out, "{:>4}\t{}", hits, path.display());
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut exit: i32 = 0;
+    for name in names {
+        if name.contains('/') {
+            eprintln!("huck: hash: {name}: must not contain `/'");
+            exit = 1;
+            continue;
+        }
+        match search_path_for(name, shell) {
+            Some(path) => {
+                shell.command_hash.insert(name.clone(), (path, 0u32));
+            }
+            None => {
+                eprintln!("huck: hash: {name}: not found");
+                exit = 1;
+            }
         }
     }
     ExecOutcome::Continue(exit)
@@ -6405,6 +6580,122 @@ mod type_tests {
     fn type_invalid_option_status_2() {
         let mut shell = Shell::new();
         let (oc, _out) = run(&["-X", "echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("hash", &args_owned, &mut buf, shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn hash_empty_lists_empty() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&[], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "hash: hash table empty\n");
+    }
+
+    #[test]
+    fn hash_p_adds_direct() {
+        let mut shell = Shell::new();
+        let (oc, _out) = run(&["-p", "/custom", "mycmd"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let entry = shell.command_hash.get("mycmd");
+        assert!(entry.is_some());
+        let (path, hits) = entry.unwrap();
+        assert_eq!(path, &std::path::PathBuf::from("/custom"));
+        assert_eq!(*hits, 0);
+    }
+
+    #[test]
+    fn hash_r_clears() {
+        let mut shell = Shell::new();
+        run(&["-p", "/custom", "mycmd"], &mut shell);
+        let (oc, _) = run(&["-r"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.command_hash.is_empty());
+    }
+
+    #[test]
+    fn hash_d_removes() {
+        let mut shell = Shell::new();
+        run(&["-p", "/custom", "mycmd"], &mut shell);
+        let (oc, _) = run(&["-d", "mycmd"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.command_hash.is_empty());
+    }
+
+    #[test]
+    fn hash_d_missing_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-d", "mycmd"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn hash_l_re_input_form() {
+        let mut shell = Shell::new();
+        run(&["-p", "/foo", "a"], &mut shell);
+        let (oc, out) = run(&["-l"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "builtin hash -p /foo a\n");
+    }
+
+    #[test]
+    fn hash_t_single_name() {
+        let mut shell = Shell::new();
+        run(&["-p", "/foo", "a"], &mut shell);
+        let (oc, out) = run(&["-t", "a"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "/foo\n");
+    }
+
+    #[test]
+    fn hash_t_multi_name_tabs() {
+        let mut shell = Shell::new();
+        run(&["-p", "/foo", "a"], &mut shell);
+        run(&["-p", "/bar", "b"], &mut shell);
+        let (oc, out) = run(&["-t", "a", "b"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Order matches the input args, not HashMap order.
+        assert_eq!(out, "a\t/foo\nb\t/bar\n");
+    }
+
+    #[test]
+    fn hash_t_missing_errors_status_1() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-t", "a"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn hash_path_like_name_rejected() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["a/b"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(shell.command_hash.is_empty());
+    }
+
+    #[test]
+    fn hash_invalid_option_status_2() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-X"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn hash_p_no_arg_status_2() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-p"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
     }
 }
