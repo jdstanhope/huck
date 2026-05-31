@@ -68,6 +68,7 @@ spec, an implementation plan, and a test suite.
 | v58       | `type` (M-75)                                                  |
 | v59       | `hash` (M-34 partial)                                          |
 | v60       | `PS1`/`PS2` prompt customization (M-76)                        |
+| v61       | `PROMPT_COMMAND` (M-76 cont.)                                  |
 
 ## Build and run
 
