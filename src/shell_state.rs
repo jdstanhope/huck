@@ -95,6 +95,12 @@ pub struct Shell {
     /// was unset). Outside any function, this vec is empty —
     /// `builtin_local` checks for that.
     pub local_scopes: Vec<std::collections::HashMap<String, Option<Variable>>>,
+
+    /// Command-name hash table populated by the `hash` builtin.
+    /// Maps a bare name to (resolved path, hit count). Hit count
+    /// is currently always 0 — no executor integration yet (see
+    /// M-34 in docs/bash-divergences.md).
+    pub command_hash: std::collections::HashMap<String, (std::path::PathBuf, u32)>,
 }
 
 impl Shell {
@@ -129,6 +135,7 @@ impl Shell {
             err_suppressed_depth: 0,
             source_depth: 0,
             local_scopes: Vec::new(),
+            command_hash: std::collections::HashMap::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
