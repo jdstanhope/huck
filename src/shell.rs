@@ -62,6 +62,12 @@ pub fn run() -> i32 {
         if let Some(helper) = editor.helper_mut() {
             helper.refresh(&shell);
         }
+        if let Some(exit_code) = fire_prompt_command(&mut shell) {
+            crate::traps::fire_exit_trap(&mut shell);
+            shell.hangup_jobs();
+            shell.history.save();
+            return exit_code;
+        }
         match read_logical_command(&mut editor, &mut shell) {
             ReadResult::Ready { buffer, history } => {
                 if !history.trim().is_empty() {
@@ -244,6 +250,32 @@ fn install_job_control_signals() {
     }
 }
 
+/// Fires `$PROMPT_COMMAND` if set, non-empty, and the shell is
+/// interactive. Returns `Some(exit_code)` when PROMPT_COMMAND
+/// returns `ExecOutcome::Exit` (e.g. `PROMPT_COMMAND='exit 7'`) —
+/// the outer REPL handles the shell-exit cleanup. Returns `None`
+/// otherwise; on `Continue`, updates `shell.last_status` so PS1's
+/// `\?` and the next user command's `$?` both reflect
+/// PROMPT_COMMAND's exit code (matches bash). Non-interactive
+/// shells skip entirely.
+pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
+    if !shell.is_interactive {
+        return None;
+    }
+    let pc = match shell.lookup_var("PROMPT_COMMAND") {
+        Some(s) if !s.is_empty() => s,
+        _ => return None,
+    };
+    match process_line(&pc, shell, true) {
+        ExecOutcome::Exit(code) => Some(code),
+        ExecOutcome::Continue(status) => {
+            shell.set_last_status(status);
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Tokenizes, parses, and executes a single input line.
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let tokens = match lexer::tokenize(line) {
@@ -342,5 +374,68 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
             format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)
         }
         LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod prompt_command_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn interactive_shell() -> Shell {
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        shell
+    }
+
+    #[test]
+    fn fires_when_set() {
+        let mut shell = interactive_shell();
+        shell.set("PROMPT_COMMAND", "true".to_string());
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.last_status(), 0);
+    }
+
+    #[test]
+    fn last_status_reflects_pc() {
+        let mut shell = interactive_shell();
+        shell.set("PROMPT_COMMAND", "false".to_string());
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.last_status(), 1);
+    }
+
+    #[test]
+    fn no_op_when_unset() {
+        let mut shell = interactive_shell();
+        shell.set_last_status(42);
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.last_status(), 42);
+    }
+
+    #[test]
+    fn no_op_when_empty() {
+        let mut shell = interactive_shell();
+        shell.set("PROMPT_COMMAND", String::new());
+        shell.set_last_status(42);
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.last_status(), 42);
+    }
+
+    #[test]
+    fn propagates_exit() {
+        let mut shell = interactive_shell();
+        shell.set("PROMPT_COMMAND", "exit 7".to_string());
+        assert_eq!(fire_prompt_command(&mut shell), Some(7));
+    }
+
+    #[test]
+    fn silent_when_non_interactive() {
+        let mut shell = Shell::new();
+        shell.is_interactive = false;
+        shell.set("PROMPT_COMMAND", "false".to_string());
+        shell.set_last_status(42);
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        // last_status unchanged since PC didn't run.
+        assert_eq!(shell.last_status(), 42);
     }
 }
