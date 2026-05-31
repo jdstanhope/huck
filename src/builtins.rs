@@ -3511,8 +3511,12 @@ fn print_stack(
 /// Detect `+N`/`-N` form: starts with `+`, or starts with `-` and
 /// has a digit immediately after.
 fn is_signed_index_arg(s: &str) -> bool {
-    s.starts_with('+')
-        || (s.starts_with('-') && s.len() > 1 && s.as_bytes()[1].is_ascii_digit())
+    // Both `+N` and `-N` require a digit immediately after the
+    // sign so a literal directory name like `+foo` or `-bar` is
+    // treated as a path, not a misformatted index spec.
+    (s.starts_with('+') || s.starts_with('-'))
+        && s.len() > 1
+        && s.as_bytes()[1].is_ascii_digit()
 }
 
 fn builtin_pushd(
@@ -3610,6 +3614,11 @@ fn builtin_popd(
         }
     };
 
+    // Save the entry being removed so we can restore on cd failure
+    // (only matters when idx == 0, where popd does a cd to the new
+    // top). Matches bash: popd leaves the stack unchanged when the
+    // resulting cd fails.
+    let saved = shell.dir_stack[idx].clone();
     shell.dir_stack.remove(idx);
     if idx == 0 {
         let target = shell.dir_stack[0].clone();
@@ -3617,6 +3626,9 @@ fn builtin_popd(
         if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
             && c != 0
         {
+            // Restore the entry we just popped so the stack is
+            // exactly as it was before the failing popd.
+            shell.dir_stack.insert(0, saved);
             return ExecOutcome::Continue(c);
         }
     }
@@ -7073,5 +7085,35 @@ mod dirstack_tests {
             dir_display(&PathBuf::from("/etc/foo"), &shell, true),
             "/etc/foo",
         );
+    }
+
+    // ── is_signed_index_arg ───────────────────────────────────
+
+    #[test]
+    fn is_signed_index_arg_recognizes_numeric_forms() {
+        assert!(is_signed_index_arg("+0"));
+        assert!(is_signed_index_arg("+12"));
+        assert!(is_signed_index_arg("-0"));
+        assert!(is_signed_index_arg("-5"));
+    }
+
+    #[test]
+    fn is_signed_index_arg_rejects_alpha_after_sign() {
+        // Regression: previously the `+` branch had no digit guard,
+        // so `+foo` (a literal directory name) was misclassified
+        // as an index specifier. Match the symmetric `-foo` rule.
+        assert!(!is_signed_index_arg("+foo"));
+        assert!(!is_signed_index_arg("+bar"));
+        assert!(!is_signed_index_arg("-foo"));
+        assert!(!is_signed_index_arg("-bar"));
+    }
+
+    #[test]
+    fn is_signed_index_arg_rejects_bare_signs_and_paths() {
+        assert!(!is_signed_index_arg("+"));
+        assert!(!is_signed_index_arg("-"));
+        assert!(!is_signed_index_arg("/tmp"));
+        assert!(!is_signed_index_arg("relative"));
+        assert!(!is_signed_index_arg(""));
     }
 }
