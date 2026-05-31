@@ -21,7 +21,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shift", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly", "read", "printf",
+    "readonly", "read", "printf", "type",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -74,6 +74,7 @@ pub fn run_builtin(
         "true" => builtin_true(args, shell),
         "false" => builtin_false(args, shell),
         "command" => builtin_command(args, out, shell),
+        "type" => builtin_type(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
         "read" => builtin_read(args, out, shell),
         "printf" => builtin_printf(args, out, shell),
@@ -2926,6 +2927,200 @@ fn resolve_command_name(name: &str, shell: &Shell) -> CommandResolution {
         return CommandResolution::File(path);
     }
     CommandResolution::NotFound
+}
+
+/// Like `search_path_for` but returns ALL PATH entries whose
+/// concatenation with `name` is an executable file. Preserves
+/// PATH order. Empty Vec = not found. If `name` contains `/`,
+/// returns the literal path iff it's executable (single match).
+fn search_path_all(name: &str, shell: &Shell) -> Vec<std::path::PathBuf> {
+    if name.contains('/') {
+        let p = std::path::PathBuf::from(name);
+        return if is_executable_file(&p) { vec![p] } else { vec![] };
+    }
+    let path_val = shell.lookup_var("PATH").unwrap_or_default();
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for segment in path_val.split(':') {
+        if segment.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(segment).join(name);
+        if is_executable_file(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Like `resolve_command_name` but skips the function-table
+/// lookup when `skip_func` is true (for `type -f`). All other
+/// resolution order is unchanged.
+fn resolve_command_name_with(
+    name: &str,
+    shell: &Shell,
+    skip_func: bool,
+) -> CommandResolution {
+    if let Some(v) = shell.aliases.get(name) {
+        return CommandResolution::Alias(v.clone());
+    }
+    if !skip_func && shell.functions.contains_key(name) {
+        return CommandResolution::Function;
+    }
+    if is_builtin(name) {
+        return CommandResolution::Builtin;
+    }
+    if is_shell_keyword(name) {
+        return CommandResolution::Keyword;
+    }
+    if let Some(p) = search_path_for(name, shell) {
+        return CommandResolution::File(p);
+    }
+    CommandResolution::NotFound
+}
+
+/// Returns ALL matches for `name` in bash's `type -a` order:
+/// alias, function (unless skip_func), builtin, keyword, every
+/// PATH entry containing an executable `name`.
+fn resolve_command_name_all(
+    name: &str,
+    shell: &Shell,
+    skip_func: bool,
+) -> Vec<CommandResolution> {
+    let mut out: Vec<CommandResolution> = Vec::new();
+    if let Some(v) = shell.aliases.get(name) {
+        out.push(CommandResolution::Alias(v.clone()));
+    }
+    if !skip_func && shell.functions.contains_key(name) {
+        out.push(CommandResolution::Function);
+    }
+    if is_builtin(name) {
+        out.push(CommandResolution::Builtin);
+    }
+    if is_shell_keyword(name) {
+        out.push(CommandResolution::Keyword);
+    }
+    for p in search_path_all(name, shell) {
+        out.push(CommandResolution::File(p));
+    }
+    out
+}
+
+fn emit_type_entry(
+    name: &str,
+    res: &CommandResolution,
+    type_only: bool,
+    path_only: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if type_only {
+        let word: &str = match res {
+            CommandResolution::Alias(_) => "alias",
+            CommandResolution::Function => "function",
+            CommandResolution::Builtin => "builtin",
+            CommandResolution::Keyword => "keyword",
+            CommandResolution::File(_) => "file",
+            CommandResolution::NotFound => return,
+        };
+        let _ = writeln!(out, "{word}");
+        return;
+    }
+    if path_only {
+        if let CommandResolution::File(p) = res {
+            let _ = writeln!(out, "{}", p.display());
+        }
+        return;
+    }
+    match res {
+        CommandResolution::Alias(value) => {
+            let _ = writeln!(out, "{name} is aliased to `{value}'");
+        }
+        CommandResolution::Function => {
+            let _ = writeln!(out, "{name} is a function");
+        }
+        CommandResolution::Builtin => {
+            let _ = writeln!(out, "{name} is a shell builtin");
+        }
+        CommandResolution::Keyword => {
+            let _ = writeln!(out, "{name} is a shell keyword");
+        }
+        CommandResolution::File(p) => {
+            let _ = writeln!(out, "{name} is {}", p.display());
+        }
+        CommandResolution::NotFound => {}
+    }
+}
+
+fn builtin_type(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut all = false;
+    let mut type_only = false;
+    let mut path_only = false;
+    let mut force_path = false;
+    let mut skip_func = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        for &c in &arg.as_bytes()[1..] {
+            match c {
+                b'a' => all = true,
+                b't' => type_only = true,
+                b'p' => path_only = true,
+                b'P' => {
+                    path_only = true;
+                    force_path = true;
+                }
+                b'f' => skip_func = true,
+                other => {
+                    eprintln!("huck: type: -{}: invalid option", other as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+    if names.is_empty() {
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut exit: i32 = 0;
+    for name in names {
+        let resolutions: Vec<CommandResolution> = if force_path {
+            search_path_all(name, shell)
+                .into_iter()
+                .map(CommandResolution::File)
+                .collect()
+        } else if all {
+            resolve_command_name_all(name, shell, skip_func)
+        } else {
+            match resolve_command_name_with(name, shell, skip_func) {
+                CommandResolution::NotFound => Vec::new(),
+                other => vec![other],
+            }
+        };
+
+        if resolutions.is_empty() {
+            if !type_only && !path_only {
+                eprintln!("huck: type: {name}: not found");
+            }
+            exit = 1;
+            continue;
+        }
+        for res in &resolutions {
+            emit_type_entry(name, res, type_only, path_only, out);
+        }
+    }
+    ExecOutcome::Continue(exit)
 }
 
 fn builtin_command(
@@ -6047,5 +6242,169 @@ mod exit_tests {
         let shell = Shell::new();
         let outcome = builtin_exit(&[], &shell);
         assert!(matches!(outcome, ExecOutcome::Exit(0)));
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("type", &args_owned, &mut buf, shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn type_default_builtin() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "echo is a shell builtin");
+    }
+
+    #[test]
+    fn type_default_keyword() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["if"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "if is a shell keyword");
+    }
+
+    #[test]
+    fn type_default_function() {
+        let mut shell = Shell::new();
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("myfn".to_string(), body);
+        let (oc, out) = run(&["myfn"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "myfn is a function");
+    }
+
+    #[test]
+    fn type_default_alias() {
+        let mut shell = Shell::new();
+        shell.aliases.insert("ll".to_string(), "ls -l".to_string());
+        let (oc, out) = run(&["ll"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "ll is aliased to `ls -l'");
+    }
+
+    #[test]
+    fn type_default_not_found() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["__xyz_no_such_cmd__"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(out.is_empty(), "stdout should be empty, got: {out:?}");
+    }
+
+    #[test]
+    fn type_t_builtin() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-t", "echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "builtin");
+    }
+
+    #[test]
+    fn type_t_keyword() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-t", "if"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "keyword");
+    }
+
+    #[test]
+    fn type_t_function() {
+        let mut shell = Shell::new();
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("myfn".to_string(), body);
+        let (oc, out) = run(&["-t", "myfn"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out.trim_end(), "function");
+    }
+
+    #[test]
+    fn type_t_not_found_silent() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-t", "__xyz_no_such_cmd__"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(out.is_empty(), "stdout should be empty, got: {out:?}");
+    }
+
+    #[test]
+    fn type_p_builtin_silent() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-p", "echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(out.is_empty(), "stdout should be empty, got: {out:?}");
+    }
+
+    #[test]
+    fn type_a_alias_and_builtin() {
+        // alias "echo=foo" + builtin "echo": -a should list both.
+        let mut shell = Shell::new();
+        shell.aliases.insert("echo".to_string(), "foo".to_string());
+        let (oc, out) = run(&["-a", "echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("aliased to `foo'")),
+            "expected alias line; got: {lines:?}",
+        );
+        assert!(
+            lines.contains(&"echo is a shell builtin"),
+            "expected builtin line; got: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn type_f_skips_function() {
+        let mut shell = Shell::new();
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("myfn".to_string(), body);
+        // Without -f: would find the function.
+        let (oc, _) = run(&["-f", "myfn"], &mut shell);
+        // With -f: function ignored, no other match → not found.
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn type_capital_p_force_path() {
+        // type -P sh: skip builtin precedence, look up sh in PATH.
+        // Test environment is expected to have /bin/sh or /usr/bin/sh.
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-P", "sh"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(
+            out.lines().any(|l| l.ends_with("/sh")),
+            "expected a path ending in /sh; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn type_multi_name_first_found_second_missing() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["echo", "__xyz_no_such_cmd__"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(
+            out.lines().any(|l| l == "echo is a shell builtin"),
+            "stdout should have echo line; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn type_invalid_option_status_2() {
+        let mut shell = Shell::new();
+        let (oc, _out) = run(&["-X", "echo"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
     }
 }
