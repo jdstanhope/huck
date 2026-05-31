@@ -13,8 +13,8 @@ use crate::executor;
 use crate::lexer::{self, LexError};
 use crate::shell_state::Shell;
 
-const PROMPT: &str = "huck> ";
-const CONT_PROMPT: &str = "> ";
+const DEFAULT_PS1: &str = "huck> ";
+const DEFAULT_PS2: &str = "> ";
 
 /// The outcome of reading one logical (possibly multi-line) command.
 enum ReadResult {
@@ -137,8 +137,16 @@ fn read_logical_command(
     let mut pending: Option<(crate::continuation::ContinuationReason, String)> = None;
 
     loop {
-        let prompt = if pending.is_none() { PROMPT } else { CONT_PROMPT };
-        match editor.readline(prompt) {
+        let (var_name, default) = if pending.is_none() {
+            ("PS1", DEFAULT_PS1)
+        } else {
+            ("PS2", DEFAULT_PS2)
+        };
+        let template = shell
+            .lookup_var(var_name)
+            .unwrap_or_else(|| default.to_string());
+        let expanded = crate::prompt::expand_prompt(&template, shell);
+        match editor.readline(&expanded) {
             Ok(raw) => {
                 // History expansion runs per physical line, as before.
                 let line = match crate::history::expand(&raw, &shell.history) {
