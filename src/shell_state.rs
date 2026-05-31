@@ -228,6 +228,20 @@ impl Shell {
         }
     }
 
+    /// Flips the `exported` flag off on an existing variable. No-op
+    /// if the variable doesn't exist. Used by `declare +x NAME`.
+    pub fn unexport(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.exported = false;
+        }
+    }
+
+    /// Iterator over all variable entries (name, Variable). Used by
+    /// `declare` to list every variable in sorted form.
+    pub fn iter_vars(&self) -> impl Iterator<Item = (&String, &Variable)> {
+        self.vars.iter()
+    }
+
     pub fn unset(&mut self, name: &str) {
         self.vars.remove(name);
     }
