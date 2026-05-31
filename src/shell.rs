@@ -31,8 +31,118 @@ enum ReadResult {
     ReadError(String),
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct CliOptions {
+    rcfile_path: Option<std::path::PathBuf>,
+    norc: bool,
+}
+
+fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
+    let mut opts = CliOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--norc" => {
+                opts.norc = true;
+                i += 1;
+            }
+            "--rcfile" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--rcfile: requires an argument".to_string());
+                }
+                opts.rcfile_path = Some(std::path::PathBuf::from(&args[i]));
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            s if s.starts_with("--rcfile=") => {
+                opts.rcfile_path = Some(std::path::PathBuf::from(&s["--rcfile=".len()..]));
+                i += 1;
+            }
+            unknown => {
+                return Err(format!("unrecognized option: {unknown}"));
+            }
+        }
+    }
+    if i < args.len() {
+        return Err(format!(
+            "positional arguments not supported: {}",
+            args[i..].join(" ")
+        ));
+    }
+    Ok(opts)
+}
+
+fn default_rc_path(shell: &Shell) -> Option<std::path::PathBuf> {
+    let home = shell
+        .lookup_var("HOME")
+        .or_else(|| std::env::var("HOME").ok())
+        .filter(|s| !s.is_empty())?;
+    Some(std::path::PathBuf::from(home).join(".huckrc"))
+}
+
+fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32> {
+    if opts.norc {
+        return None;
+    }
+    if !shell.is_interactive {
+        return None;
+    }
+    // Precedence: --rcfile > $HUCK_RC > ~/.huckrc.
+    // Missing-file: explicit (--rcfile) → status 1 error;
+    // implicit (env or default) → silent skip.
+    let (path, explicit) = match &opts.rcfile_path {
+        Some(p) => (p.clone(), true),
+        None => {
+            let from_env = shell
+                .lookup_var("HUCK_RC")
+                .or_else(|| std::env::var("HUCK_RC").ok())
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from);
+            match from_env.or_else(|| default_rc_path(shell)) {
+                Some(p) => (p, false),
+                None => return None,
+            }
+        }
+    };
+    if !path.exists() {
+        if explicit {
+            eprintln!("huck: {}: No such file or directory", path.display());
+            return Some(1);
+        }
+        return None;
+    }
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("huck: {}: {}", path.display(), e);
+            return Some(1);
+        }
+    };
+    match crate::builtins::run_sourced_contents(&contents, &path, shell) {
+        crate::builtins::ExecOutcome::Exit(code) => Some(code),
+        crate::builtins::ExecOutcome::Continue(status) => {
+            shell.set_last_status(status);
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Runs the interactive shell loop. Returns the process exit code.
-pub fn run() -> i32 {
+pub fn run(args: &[String]) -> i32 {
+    let opts = match parse_cli(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("huck: {e}");
+            return 2;
+        }
+    };
+
     install_job_control_signals();
 
     let config = Config::builder()
@@ -54,6 +164,13 @@ pub fn run() -> i32 {
     shell.history.load();
     for (_, command) in shell.history.entries() {
         let _ = editor.add_history_entry(command);
+    }
+
+    if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
+        crate::traps::fire_exit_trap(&mut shell);
+        shell.hangup_jobs();
+        shell.history.save();
+        return exit_code;
     }
 
     loop {
@@ -437,5 +554,178 @@ mod prompt_command_tests {
         assert_eq!(fire_prompt_command(&mut shell), None);
         // last_status unchanged since PC didn't run.
         assert_eq!(shell.last_status(), 42);
+    }
+}
+
+#[cfg(test)]
+mod rc_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    // ── CLI parser ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_cli_empty() {
+        let opts = parse_cli(&[]).unwrap();
+        assert_eq!(opts, CliOptions::default());
+    }
+
+    #[test]
+    fn parse_cli_norc() {
+        let opts = parse_cli(&["--norc".to_string()]).unwrap();
+        assert!(opts.norc);
+        assert!(opts.rcfile_path.is_none());
+    }
+
+    #[test]
+    fn parse_cli_rcfile_separate() {
+        let opts = parse_cli(&[
+            "--rcfile".to_string(),
+            "/x".to_string(),
+        ]).unwrap();
+        assert_eq!(opts.rcfile_path, Some(std::path::PathBuf::from("/x")));
+        assert!(!opts.norc);
+    }
+
+    #[test]
+    fn parse_cli_rcfile_joined() {
+        let opts = parse_cli(&["--rcfile=/x".to_string()]).unwrap();
+        assert_eq!(opts.rcfile_path, Some(std::path::PathBuf::from("/x")));
+    }
+
+    #[test]
+    fn parse_cli_unknown_errors() {
+        assert!(parse_cli(&["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_cli_rcfile_no_arg_errors() {
+        assert!(parse_cli(&["--rcfile".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_cli_positional_errors() {
+        // Positional args not yet supported.
+        assert!(parse_cli(&["positional".to_string()]).is_err());
+    }
+
+    // ── rc loader ──────────────────────────────────────────────
+
+    fn write_tempfile(contents: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nonce = format!(
+            "huck-rc-test-{}-{}",
+            std::process::id(),
+            // Use the test's address as a pseudo-random discriminator
+            // without relying on rand/time.
+            contents.as_ptr() as usize,
+        );
+        path.push(nonce);
+        std::fs::write(&path, contents).expect("write tempfile");
+        path
+    }
+
+    #[test]
+    fn rc_skips_when_norc() {
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        let p = write_tempfile("export HUCK_RC_TEST_ABC=hello\n");
+        let opts = CliOptions {
+            rcfile_path: Some(p.clone()),
+            norc: true,
+        };
+        assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
+        assert!(shell.lookup_var("HUCK_RC_TEST_ABC").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rc_skips_when_non_interactive() {
+        let mut shell = Shell::new();
+        shell.is_interactive = false;
+        let p = write_tempfile("export HUCK_RC_TEST_DEF=hello\n");
+        let opts = CliOptions {
+            rcfile_path: Some(p.clone()),
+            norc: false,
+        };
+        assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
+        assert!(shell.lookup_var("HUCK_RC_TEST_DEF").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rc_sources_explicit_path() {
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        let p = write_tempfile("export HUCK_RC_TEST_GHI=hello\n");
+        let opts = CliOptions {
+            rcfile_path: Some(p.clone()),
+            norc: false,
+        };
+        assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
+        assert_eq!(
+            shell.lookup_var("HUCK_RC_TEST_GHI").as_deref(),
+            Some("hello"),
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rc_explicit_missing_errors() {
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        let opts = CliOptions {
+            rcfile_path: Some(std::path::PathBuf::from(
+                "/no/such/file/huck_rc_does_not_exist",
+            )),
+            norc: false,
+        };
+        assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
+    }
+
+    #[test]
+    fn rc_explicit_exit_propagates() {
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        let p = write_tempfile("exit 42\n");
+        let opts = CliOptions {
+            rcfile_path: Some(p.clone()),
+            norc: false,
+        };
+        assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rc_default_missing_silent() {
+        // When --rcfile is unset, $HUCK_RC is unset/empty, and the
+        // default ~/.huckrc doesn't exist (here: HOME unset so
+        // default_rc_path returns None), the loader must silently
+        // return None — no error message, no non-zero status.
+        let mut shell = Shell::new();
+        shell.is_interactive = true;
+        // Empty HOME → default_rc_path's filter(|s| !s.is_empty())
+        // drops it and the chain returns None. Also clear HUCK_RC
+        // in case the test environment exports one.
+        shell.set("HOME", String::new());
+        shell.set("HUCK_RC", String::new());
+        let opts = CliOptions::default();
+        // Process env may still have HOME set; the shell's local
+        // empty HOME wins per lookup_var precedence, so default_rc_path
+        // gets the empty string and returns None. But std::env::var
+        // is consulted as fallback — guard by also clearing it
+        // for the duration of this test.
+        let saved_home = std::env::var("HOME").ok();
+        let saved_huck_rc = std::env::var("HUCK_RC").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::remove_var("HUCK_RC");
+        }
+        let result = maybe_source_rc_file(&mut shell, &opts);
+        unsafe {
+            if let Some(h) = saved_home { std::env::set_var("HOME", h); }
+            if let Some(r) = saved_huck_rc { std::env::set_var("HUCK_RC", r); }
+        }
+        assert_eq!(result, None);
     }
 }

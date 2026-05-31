@@ -69,6 +69,7 @@ spec, an implementation plan, and a test suite.
 | v59       | `hash` (M-34 partial)                                          |
 | v60       | `PS1`/`PS2` prompt customization (M-76)                        |
 | v61       | `PROMPT_COMMAND` (M-76 cont.)                                  |
+| v62       | rc file: `~/.huckrc` + `--rcfile`/`--norc` (M-77)              |
 
 ## Build and run
 
