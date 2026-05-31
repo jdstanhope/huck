@@ -23,6 +23,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     ":", "true", "false", "command",
     "readonly", "read", "printf", "type", "hash",
     "pushd", "popd", "dirs",
+    "declare", "typeset",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -81,6 +82,7 @@ pub fn run_builtin(
         "popd" => builtin_popd(args, out, shell),
         "dirs" => builtin_dirs(args, out, shell),
         "readonly" => builtin_readonly(args, out, shell),
+        "declare" | "typeset" => builtin_declare(args, out, shell),
         "read" => builtin_read(args, out, shell),
         "printf" => builtin_printf(args, out, shell),
         "test" | "[" => builtin_test(name, args),
@@ -468,6 +470,287 @@ fn builtin_readonly(
             shell.set(name, v);
         }
         shell.mark_readonly(name);
+    }
+    ExecOutcome::Continue(exit)
+}
+
+// ─────────────────────────────────────────────────────────────
+// declare / typeset (v64) — see spec
+// `docs/superpowers/specs/2026-05-31-huck-declare-design.md`.
+// ─────────────────────────────────────────────────────────────
+
+/// Backslash-escape `"`, `\`, `$`, and backtick for safe embedding
+/// inside a double-quoted value (used by `format_declare_line`).
+fn escape_double_quote_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' | '\\' | '$' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
+/// `declare --`; with `r` and/or `x` attributes set, the flag string
+/// is e.g. `-r`, `-x`, `-rx`.
+fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+    let mut attrs = String::new();
+    if var.readonly {
+        attrs.push('r');
+    }
+    if var.exported {
+        attrs.push('x');
+    }
+    let flag_str = if attrs.is_empty() {
+        "--".to_string()
+    } else {
+        let mut s = String::with_capacity(1 + attrs.len());
+        s.push('-');
+        s.push_str(&attrs);
+        s
+    };
+    let escaped = escape_double_quote_value(&var.value);
+    format!("declare {flag_str} {name}=\"{escaped}\"")
+}
+
+/// If we're inside a function call AND `name` hasn't been snapshotted
+/// in the current local frame yet, snapshot the current Variable (or
+/// None if unset). The unwinding in `call_function` will restore it on
+/// function exit. No-op when the local-scopes stack is empty (outside
+/// any function). Mirrors the per-frame idempotency pattern used by
+/// `builtin_local` (v52).
+fn snapshot_for_local_scope(shell: &mut Shell, name: &str) {
+    if shell.local_scopes.is_empty() {
+        return;
+    }
+    let already_saved = shell
+        .local_scopes
+        .last()
+        .map(|f| f.contains_key(name))
+        .unwrap_or(false);
+    if already_saved {
+        return;
+    }
+    let snap = shell.snapshot_var(name);
+    shell
+        .local_scopes
+        .last_mut()
+        .unwrap()
+        .insert(name.to_string(), snap);
+}
+
+/// Emit every variable in `shell` (sorted by name) as a
+/// `declare ATTR NAME="value"` line.
+fn declare_list_all_vars(
+    out: &mut dyn std::io::Write,
+    shell: &Shell,
+) -> ExecOutcome {
+    let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
+        shell.iter_vars().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, var) in entries {
+        let _ = writeln!(out, "{}", format_declare_line(name, var));
+    }
+    ExecOutcome::Continue(0)
+}
+
+/// Emit `declare -f NAME` lines for each named function (or every
+/// function, sorted, when `names` is empty). For v64 the function
+/// body is NOT printed — `-f` and `-F` produce identical output.
+fn declare_list_functions(
+    names: &[String],
+    _names_only: bool,
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    if names.is_empty() {
+        let mut fnames: Vec<&String> = shell.functions.keys().collect();
+        fnames.sort();
+        for n in fnames {
+            let _ = writeln!(out, "declare -f {n}");
+        }
+        return ExecOutcome::Continue(0);
+    }
+    let mut exit: i32 = 0;
+    for name in names {
+        if shell.functions.contains_key(name) {
+            let _ = writeln!(out, "declare -f {name}");
+        } else {
+            eprintln!("huck: declare: {name}: not found");
+            exit = 1;
+        }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+/// `declare`/`typeset` — variable-attribute builtin (Tier A: wires to
+/// huck's existing primitives). See spec for the full behavior table.
+fn builtin_declare(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut want_readonly = false;
+    let mut want_export = false;
+    let mut want_remove_export = false;
+    let mut function_mode = false;
+    let mut function_names_only = false;
+    let mut print_mode = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        let plus = arg.starts_with('+');
+        let minus = arg.starts_with('-');
+        if !(plus || minus) || arg.len() < 2 {
+            break;
+        }
+        for &c in &arg.as_bytes()[1..] {
+            match c {
+                b'r' if minus => want_readonly = true,
+                b'r' if plus => {
+                    eprintln!(
+                        "huck: declare: +r: readonly attribute cannot be removed"
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                b'x' if minus => want_export = true,
+                b'x' if plus => want_remove_export = true,
+                b'f' if minus => function_mode = true,
+                b'F' if minus => {
+                    function_mode = true;
+                    function_names_only = true;
+                }
+                b'p' if minus => print_mode = true,
+                b'i' | b'l' | b'u' | b'a' | b'A' | b'n' | b'g' if minus => {
+                    eprintln!(
+                        "huck: declare: -{}: not yet implemented in this version",
+                        c as char
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                other => {
+                    let sign = if plus { '+' } else { '-' };
+                    eprintln!(
+                        "huck: declare: {sign}{}: invalid option",
+                        other as char
+                    );
+                    return ExecOutcome::Continue(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+
+    // Function-mode listing.
+    if function_mode {
+        return declare_list_functions(names, function_names_only, out, shell);
+    }
+
+    // Bare or -p with no names: list everything.
+    if names.is_empty() {
+        return declare_list_all_vars(out, shell);
+    }
+
+    // Per-name processing.
+    let mut exit: i32 = 0;
+    for arg in names {
+        let (name, value): (&str, Option<String>) = match arg.find('=') {
+            Some(eq) => (&arg[..eq], Some(arg[eq + 1..].to_string())),
+            None => (arg.as_str(), None),
+        };
+        if !is_valid_name(name) {
+            eprintln!("huck: declare: `{arg}': not a valid identifier");
+            exit = 1;
+            continue;
+        }
+
+        if print_mode {
+            match shell.snapshot_var(name) {
+                Some(var) => {
+                    let _ = writeln!(out, "{}", format_declare_line(name, &var));
+                }
+                None => {
+                    eprintln!("huck: declare: {name}: not found");
+                    exit = 1;
+                }
+            }
+            continue;
+        }
+
+        // For any mutation form, record the pre-state into the current
+        // local frame BEFORE mutating — so attribute changes unwind on
+        // function exit. No-op outside a function.
+        snapshot_for_local_scope(shell, name);
+
+        if want_readonly {
+            if let Some(v) = value.as_ref() {
+                if shell.is_readonly(name) {
+                    eprintln!("huck: declare: {name}: readonly variable");
+                    exit = 1;
+                    continue;
+                }
+                shell.set(name, v.clone());
+            }
+            shell.mark_readonly(name);
+            // -r and -x can combine. Fall through to handle -x too
+            // if requested.
+        }
+
+        if want_export {
+            // -x with value: error if name is readonly (matches
+            // v54's `export` builtin). Skip the check when -r was also
+            // requested: in that case we just marked it readonly and
+            // already set the value above.
+            if value.is_some() && shell.is_readonly(name) && !want_readonly {
+                eprintln!("huck: declare: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
+            match (&value, want_readonly) {
+                (Some(v), false) => shell.export_set(name, v.clone()),
+                (_, true) => {
+                    // Already set via the -r branch; just flip the
+                    // export bit without further value mutation.
+                    shell.export(name);
+                }
+                (None, false) => shell.export(name),
+            }
+            continue;
+        }
+
+        if want_readonly {
+            // Already handled above; nothing else to do for this name.
+            continue;
+        }
+
+        if want_remove_export {
+            shell.unexport(name);
+            continue;
+        }
+
+        // Bare `declare NAME=val` (or just `declare NAME`).
+        // `declare NAME` (no value): inside a function the snapshot
+        // above is enough — when the function exits the variable is
+        // restored (or unset). Outside, bash just declares the name
+        // but doesn't create it: X stays unset, exit 0. No action
+        // needed beyond the snapshot.
+        if let Some(v) = value
+            && shell.try_set(name, v).is_err()
+        {
+            eprintln!("huck: declare: {name}: readonly variable");
+            exit = 1;
+        }
     }
     ExecOutcome::Continue(exit)
 }
@@ -7115,5 +7398,155 @@ mod dirstack_tests {
         assert!(!is_signed_index_arg("/tmp"));
         assert!(!is_signed_index_arg("relative"));
         assert!(!is_signed_index_arg(""));
+    }
+}
+
+#[cfg(test)]
+mod declare_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    fn run_typeset(args: &[&str], shell: &mut Shell) -> ExecOutcome {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        run_builtin("typeset", &args_owned, &mut buf, shell)
+    }
+
+    #[test]
+    fn declare_bare_sets_var() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["X_DECL=hi"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_DECL").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn declare_r_sets_and_locks() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-r", "X_DECL_R=hi"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_DECL_R").as_deref(), Some("hi"));
+        assert!(shell.is_readonly("X_DECL_R"));
+    }
+
+    #[test]
+    fn declare_x_sets_and_exports() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-x", "X_DECL_X=hi"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_DECL_X").as_deref(), Some("hi"));
+        assert!(shell.is_exported("X_DECL_X"));
+    }
+
+    #[test]
+    fn declare_rx_combines() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-rx", "X_DECL_RX=hi"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_readonly("X_DECL_RX"));
+        assert!(shell.is_exported("X_DECL_RX"));
+    }
+
+    #[test]
+    fn declare_plus_x_unexports() {
+        let mut shell = Shell::new();
+        shell.export_set("X_DECL_UNEX", "v".to_string());
+        assert!(shell.is_exported("X_DECL_UNEX"));
+        let (oc, _) = run(&["+x", "X_DECL_UNEX"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_DECL_UNEX").as_deref(), Some("v"));
+        assert!(!shell.is_exported("X_DECL_UNEX"));
+    }
+
+    #[test]
+    fn declare_plus_r_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["+r", "X_FOO"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_p_prints_known_var() {
+        let mut shell = Shell::new();
+        shell.set("X_DECL_P", "hi".to_string());
+        let (oc, out) = run(&["-p", "X_DECL_P"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "declare -- X_DECL_P=\"hi\"\n");
+    }
+
+    #[test]
+    fn declare_p_missing_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-p", "X_DECL_MISSING"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_f_lists_functions() {
+        let mut shell = Shell::new();
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("fn1".to_string(), body.clone());
+        shell.functions.insert("fn2".to_string(), body);
+        let (oc, out) = run(&["-f"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Sorted; both present.
+        assert!(out.contains("declare -f fn1"));
+        assert!(out.contains("declare -f fn2"));
+        assert!(
+            out.find("fn1").unwrap() < out.find("fn2").unwrap(),
+            "expected sorted; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn declare_f_named_function_found() {
+        let mut shell = Shell::new();
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        shell.functions.insert("fn1".to_string(), body);
+        let (oc, out) = run(&["-F", "fn1"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "declare -f fn1\n");
+    }
+
+    #[test]
+    fn declare_f_named_function_missing() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-F", "fn_none"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_invalid_identifier() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["1foo=bar"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(shell.lookup_var("1foo").is_none());
+    }
+
+    #[test]
+    fn declare_typeset_alias() {
+        let mut shell = Shell::new();
+        let oc = run_typeset(&["-r", "X_TS=hi"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_TS").as_deref(), Some("hi"));
+        assert!(shell.is_readonly("X_TS"));
+    }
+
+    #[test]
+    fn declare_deferred_flag_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-i", "X=5"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
     }
 }
