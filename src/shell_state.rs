@@ -259,10 +259,13 @@ impl Shell {
     }
 
     /// Sets a variable's value, preserving its existing `exported` flag (or
-    /// creating it as unexported if it didn't exist).
+    /// creating it as unexported if it didn't exist). When the existing
+    /// value is an `Indexed` array, only element 0 is overwritten — the
+    /// rest of the map is preserved (matches bash: `a=v` on an indexed
+    /// array overwrites a[0]).
     pub fn set(&mut self, name: &str, value: String) {
         match self.vars.get_mut(name) {
-            Some(existing) => existing.value = VarValue::Scalar(value),
+            Some(existing) => install_scalar_value(existing, value),
             None => {
                 self.vars.insert(name.to_string(), Variable::scalar(value));
             }
@@ -290,7 +293,7 @@ impl Shell {
     pub fn export_set(&mut self, name: &str, value: String) {
         match self.vars.get_mut(name) {
             Some(existing) => {
-                existing.value = VarValue::Scalar(value);
+                install_scalar_value(existing, value);
                 existing.exported = true;
             }
             None => {
@@ -390,14 +393,7 @@ impl Shell {
         // overwritten rather than the whole array being replaced
         // (matches bash: `a=v` on an indexed array overwrites a[0]).
         if let Some(existing) = self.vars.get_mut(name) {
-            match &mut existing.value {
-                VarValue::Indexed(m) => {
-                    m.insert(0, value);
-                }
-                VarValue::Scalar(_) => {
-                    existing.value = VarValue::Scalar(value);
-                }
-            }
+            install_scalar_value(existing, value);
             Ok(())
         } else {
             self.vars.insert(name.to_string(), Variable::scalar(value));
@@ -549,6 +545,23 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
         crate::jobs::JobState::Running | crate::jobs::JobState::Stopped(_)
     );
     live && !job.marked_for_nohup
+}
+
+/// Installs `value` as the scalar value of `existing`, preserving the
+/// rest of an `Indexed` map (writing only element 0). Shared by
+/// `Shell::set`, `Shell::export_set`, and `Shell::try_set`'s non-
+/// integer path so the three callers stay in lockstep on the
+/// "scalar assignment to an array overwrites a[0]" rule (matches
+/// bash: `a=v` on an indexed array overwrites a[0]).
+fn install_scalar_value(existing: &mut Variable, value: String) {
+    match &mut existing.value {
+        VarValue::Indexed(m) => {
+            m.insert(0, value);
+        }
+        VarValue::Scalar(_) => {
+            existing.value = VarValue::Scalar(value);
+        }
+    }
 }
 
 impl Default for Shell {
@@ -800,5 +813,83 @@ mod array_value_tests {
         assert!(!v.readonly);
         assert!(!v.integer);
         assert_eq!(v.value.scalar_view(), "x");
+    }
+
+    #[test]
+    fn try_set_on_indexed_overwrites_element_zero_only() {
+        let mut shell = Shell::new();
+        let mut m = BTreeMap::new();
+        m.insert(0, "old".to_string());
+        m.insert(1, "x".to_string());
+        shell.vars.insert(
+            "a".to_string(),
+            Variable {
+                value: VarValue::Indexed(m),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
+        let result = shell.try_set("a", "new".to_string());
+        assert!(result.is_ok());
+        match &shell.vars.get("a").unwrap().value {
+            VarValue::Indexed(m) => {
+                assert_eq!(m.get(&0).map(String::as_str), Some("new"));
+                assert_eq!(m.get(&1).map(String::as_str), Some("x"));
+            }
+            _ => panic!("expected Indexed"),
+        }
+    }
+
+    #[test]
+    fn set_on_indexed_overwrites_element_zero_only() {
+        let mut shell = Shell::new();
+        let mut m = BTreeMap::new();
+        m.insert(0, "old".to_string());
+        m.insert(1, "x".to_string());
+        shell.vars.insert(
+            "a".to_string(),
+            Variable {
+                value: VarValue::Indexed(m),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
+        shell.set("a", "new".to_string());
+        match &shell.vars.get("a").unwrap().value {
+            VarValue::Indexed(m) => {
+                assert_eq!(m.get(&0).map(String::as_str), Some("new"));
+                assert_eq!(m.get(&1).map(String::as_str), Some("x"));
+            }
+            _ => panic!("expected Indexed"),
+        }
+    }
+
+    #[test]
+    fn export_set_on_indexed_overwrites_element_zero_only_and_marks_exported() {
+        let mut shell = Shell::new();
+        let mut m = BTreeMap::new();
+        m.insert(0, "old".to_string());
+        m.insert(1, "x".to_string());
+        shell.vars.insert(
+            "a".to_string(),
+            Variable {
+                value: VarValue::Indexed(m),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
+        shell.export_set("a", "new".to_string());
+        let v = shell.vars.get("a").unwrap();
+        assert!(v.exported);
+        match &v.value {
+            VarValue::Indexed(m) => {
+                assert_eq!(m.get(&0).map(String::as_str), Some("new"));
+                assert_eq!(m.get(&1).map(String::as_str), Some("x"));
+            }
+            _ => panic!("expected Indexed"),
+        }
     }
 }
