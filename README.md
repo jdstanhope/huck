@@ -73,6 +73,7 @@ spec, an implementation plan, and a test suite.
 | v63       | `pushd`/`popd`/`dirs` (M-78)                                   |
 | v64       | `declare` / `typeset` (M-79 partial)                           |
 | v65       | `declare -i` integer attribute (M-79 cont.)                    |
+| v66       | `eval` (M-80)                                                  |
 
 ## Build and run
 
