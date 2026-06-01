@@ -1499,6 +1499,11 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
             for a in items {
+                let name = a.target.name();
+                if shell.is_readonly(name) {
+                    eprintln!("huck: {name}: readonly variable");
+                    return ExecOutcome::Continue(1);
+                }
                 if apply_one_assignment(a, shell).is_err() {
                     return ExecOutcome::Continue(1);
                 }
@@ -2793,15 +2798,11 @@ fn apply_one_assignment(
                         .map_err(|_| ()),
                     None => {
                         let existing = shell.get(name).map(str::to_string).unwrap_or_default();
-                        shell.try_set(name, existing + &s).map_err(|_| {
-                            eprintln!("huck: {name}: readonly variable");
-                        })
+                        shell.try_set(name, existing + &s).map_err(|_| ())
                     }
                 }
             } else {
-                shell.try_set(name, s).map_err(|_| {
-                    eprintln!("huck: {name}: readonly variable");
-                })
+                shell.try_set(name, s).map_err(|_| ())
             }
         }
         // Subscripted lvalue + scalar RHS.
@@ -4604,5 +4605,16 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a[0]=(x y)");
         assert!(s.get_array("a").is_none());
+    }
+
+    #[test]
+    fn unset_with_empty_subscript_errors() {
+        // bash treats `unset a[]` as a syntax error
+        // ("bad array subscript") and leaves `a` untouched.
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a[]");
+        let m = s.get_array("a").expect("a should still exist");
+        assert_eq!(m.len(), 3);
     }
 }
