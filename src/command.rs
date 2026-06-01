@@ -84,7 +84,7 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
 /// returns the structured `Assignment`. The value is moved (not cloned)
 /// from the input parts. Otherwise returns `Err(word)` handing the
 /// original back unchanged.
-fn try_split_assignment(
+pub(crate) fn try_split_assignment(
     word: crate::lexer::Word,
 ) -> Result<Assignment, crate::lexer::Word> {
     use crate::lexer::WordPart;
@@ -158,7 +158,7 @@ fn try_split_assignment(
 /// so the caller can decide whether to take ownership before calling the
 /// real splitter. Detects both the structured `AssignPrefix` form and the
 /// legacy bare `Literal("NAME=…")` form.
-fn is_assignment_word(w: &crate::lexer::Word) -> bool {
+pub(crate) fn is_assignment_word(w: &crate::lexer::Word) -> bool {
     use crate::lexer::WordPart;
     if matches!(w.0.first(), Some(WordPart::AssignPrefix { .. })) {
         return true;
@@ -290,6 +290,21 @@ pub struct Assignment {
     pub target: AssignTarget,
     pub value: Word,
     pub append: bool,
+}
+
+/// Argument shape for declaration commands (`declare`, `typeset`, `local`,
+/// `readonly`, `export`). Each surface argument is either a plain string
+/// (flags like `-a`, bare names, or post-expansion `name=value`) or an
+/// `Assignment` parsed from a compound-RHS word like `name=(x y z)`. The
+/// executor populates the variant in `resolve()` so the builtins can route
+/// compound-RHS assignments through the same Task-4 path used by ordinary
+/// assignment commands. Non-declaration commands never see `DeclArg`.
+#[derive(Debug, Clone)]
+pub enum DeclArg {
+    /// A post-expansion string — flag, bare name, or scalar `name=value`.
+    Plain(String),
+    /// A compound-RHS assignment (e.g. `name=(x y z)` or `name[i]+=v`).
+    Assign(Assignment),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

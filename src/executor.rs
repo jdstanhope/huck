@@ -1165,6 +1165,12 @@ enum ResolvedStdin {
 struct ResolvedCommand {
     program: String,
     args: Vec<String>,
+    /// Populated only when `program` is a declaration command
+    /// (`declare`, `typeset`, `local`, `readonly`, `export`). Carries
+    /// the per-arg `DeclArg` shape so the builtin can route compound-RHS
+    /// assignments through `apply_one_assignment` while still handling
+    /// flags and scalar names. `args` is left empty in that case.
+    decl_args: Option<Vec<crate::command::DeclArg>>,
     stdin: Option<ResolvedStdin>,
     stdout: Option<ResolvedRedirect>,
     stderr: Option<ResolvedRedirect>,
@@ -1210,10 +1216,47 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let mut iter = prog_fields.into_iter();
     let program = iter.next().unwrap();
     let mut args: Vec<String> = iter.collect();
+
+    // Declaration commands (`declare` / `typeset` / `local` / `readonly` /
+    // `export`) need a side-channel for assignment-shaped args so compound
+    // RHS (`a=(x y z)`) doesn't crash through `expand()` — the lexer leaves
+    // an `ArrayLiteral` WordPart that's unreachable! in expansion. For
+    // those programs, split each arg Word: assignment-shaped → parsed
+    // Assignment (via `try_split_assignment`); other → expanded String.
+    let is_decl = builtins::is_declaration_command(&program);
+    let mut decl_args: Option<Vec<crate::command::DeclArg>> = if is_decl {
+        // Migrate any tail of `prog_fields` (post-split) into decl_args as
+        // Plain, then drain `args` since the builtin won't read it.
+        let mut v: Vec<crate::command::DeclArg> = Vec::with_capacity(args.len() + cmd.args.len());
+        for s in args.drain(..) {
+            v.push(crate::command::DeclArg::Plain(s));
+        }
+        Some(v)
+    } else {
+        None
+    };
     for word in &cmd.args {
-        args.extend(glob_expand_fields(expand(word, shell)));
+        if let Some(da) = decl_args.as_mut()
+            && crate::command::is_assignment_word(word)
+        {
+            match crate::command::try_split_assignment(word.clone()) {
+                Ok(a) => da.push(crate::command::DeclArg::Assign(a)),
+                Err(_) => unreachable!(
+                    "is_assignment_word confirmed shape but try_split_assignment refused"
+                ),
+            }
+            continue;
+        }
+        let fields = glob_expand_fields(expand(word, shell));
         if let Some(status) = shell.pending_fatal_pe_error {
             return Err(status);
+        }
+        if let Some(da) = decl_args.as_mut() {
+            for s in fields {
+                da.push(crate::command::DeclArg::Plain(s));
+            }
+        } else {
+            args.extend(fields);
         }
     }
     let stdin = match &cmd.stdin {
@@ -1289,7 +1332,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         }
         None => None,
     };
-    Ok(ResolvedCommand { program, args, stdin, stdout, stderr })
+    Ok(ResolvedCommand { program, args, decl_args, stdin, stdout, stderr })
 }
 
 // ----- redirect file handling -----------------------------------------------
@@ -1652,15 +1695,27 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         };
         let outcome = match files.stdout {
             Some(mut file) => {
-                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+                if let Some(da) = resolved.decl_args.as_deref() {
+                    builtins::run_declaration_builtin(&resolved.program, da, &mut file, shell)
+                } else {
+                    builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+                }
             }
             None => match sink {
                 StdoutSink::Terminal => {
                     let mut out = io::stdout();
-                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                    if let Some(da) = resolved.decl_args.as_deref() {
+                        builtins::run_declaration_builtin(&resolved.program, da, &mut out, shell)
+                    } else {
+                        builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                    }
                 }
                 StdoutSink::Capture(buf) => {
-                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                    if let Some(da) = resolved.decl_args.as_deref() {
+                        builtins::run_declaration_builtin(&resolved.program, da, *buf, shell)
+                    } else {
+                        builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                    }
                 }
             },
         };
@@ -2755,7 +2810,7 @@ fn is_array_value_word(word: &crate::lexer::Word) -> bool {
 ///
 /// Returns `Err(())` on readonly violation or other write failure
 /// (diagnostic printed by the mutator). On success returns `Ok(())`.
-fn apply_one_assignment(
+pub(crate) fn apply_one_assignment(
     a: &crate::command::Assignment,
     shell: &mut Shell,
 ) -> Result<(), ()> {
