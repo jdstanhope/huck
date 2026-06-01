@@ -669,9 +669,12 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
-    // Order matches bash's `declare -p` output: a, i, r, x.
+    // Order matches bash's `declare -p` output: a/A, i, r, x.
     if matches!(var.value, VarValue::Indexed(_)) {
         attrs.push('a');
+    }
+    if matches!(var.value, VarValue::Associative(_)) {
+        attrs.push('A');
     }
     if var.integer {
         attrs.push('i');
@@ -700,6 +703,15 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
             for (k, v) in m {
                 let escaped = escape_double_quote_value(v);
                 parts.push(format!("[{k}]=\"{escaped}\""));
+            }
+            format!("=({})", parts.join(" "))
+        }
+        VarValue::Associative(pairs) => {
+            let mut parts: Vec<String> = Vec::new();
+            for (k, v) in pairs {
+                let key_escaped = escape_double_quote_value(k);
+                let val_escaped = escape_double_quote_value(v);
+                parts.push(format!("[\"{key_escaped}\"]=\"{val_escaped}\""));
             }
             format!("=({})", parts.join(" "))
         }
