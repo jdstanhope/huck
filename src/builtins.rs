@@ -3050,11 +3050,26 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             continue;
         }
         if arg.starts_with('-') && arg.len() >= 2 {
-            // Short-flag cluster like `-e`, `-u`, `-eu`.
+            // Short-flag cluster like `-e`, `-u`, `-eu`, or `-eo NAME`
+            // where `o` inside the cluster consumes the NEXT arg as
+            // the long-form option name (matches bash).
             for &c in &arg.as_bytes()[1..] {
                 match c {
                     b'e' => shell.shell_options.errexit = true,
                     b'u' => shell.shell_options.nounset = true,
+                    b'o' => {
+                        i += 1;
+                        if i >= args.len() {
+                            return print_options_table(out, shell);
+                        }
+                        if option_set(shell, &args[i], true).is_err() {
+                            eprintln!(
+                                "huck: set: -o: invalid option name: {}",
+                                args[i]
+                            );
+                            return ExecOutcome::Continue(2);
+                        }
+                    }
                     other => {
                         eprintln!(
                             "huck: set: -{}: not yet supported in this version",
@@ -3072,6 +3087,19 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                 match c {
                     b'e' => shell.shell_options.errexit = false,
                     b'u' => shell.shell_options.nounset = false,
+                    b'o' => {
+                        i += 1;
+                        if i >= args.len() {
+                            return print_options_reinput(out, shell);
+                        }
+                        if option_set(shell, &args[i], false).is_err() {
+                            eprintln!(
+                                "huck: set: +o: invalid option name: {}",
+                                args[i]
+                            );
+                            return ExecOutcome::Continue(2);
+                        }
+                    }
                     other => {
                         eprintln!(
                             "huck: set: +{}: not yet supported in this version",
@@ -8673,5 +8701,30 @@ mod set_options_tests {
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.shell_options.errexit);
         assert_eq!(shell.positional_args, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn set_dash_eo_cluster_consumes_next_arg_as_name() {
+        // Regression: bash treats `-eo NAME` as enabling -e then
+        // -o NAME (the o-in-cluster consumes the next arg as the
+        // option name). Previously huck rejected the o-in-cluster
+        // as "not yet supported".
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-eo", "nounset"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit, "expected errexit on");
+        assert!(shell.shell_options.nounset, "expected nounset on");
+    }
+
+    #[test]
+    fn set_plus_eo_cluster_consumes_next_arg_as_name() {
+        // Symmetric: `+eo NAME` disables -e then -o NAME.
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        shell.shell_options.nounset = true;
+        let (oc, _) = run(&["+eo", "nounset"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.errexit, "expected errexit off");
+        assert!(!shell.shell_options.nounset, "expected nounset off");
     }
 }
