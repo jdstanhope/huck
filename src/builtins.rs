@@ -450,21 +450,30 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
         match parse_subscripted_arg(arg) {
             Ok(Some((name, sub_text))) => {
                 // `unset a[i]`: remove a single element. The subscript is
-                // parsed as a synthetic literal `Word` so `eval_subscript`
-                // arith-evaluates it identically to a real expansion.
+                // parsed as a synthetic literal `Word` so subscript
+                // evaluation matches a real expansion. When `a` is
+                // associative, the subscript is the string key directly;
+                // otherwise it's arith-evaluated as an index.
                 let sub_word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
                     text: sub_text.to_string(),
                     quoted: false,
                 }]);
-                match crate::expand::eval_subscript(&sub_word, shell, name) {
-                    Ok(idx) => {
-                        if shell.unset_array_element(name, idx).is_err() {
+                if shell.get_associative(name).is_some() {
+                    let key = crate::expand::eval_subscript_key(&sub_word, shell);
+                    if shell.unset_associative_element(name, &key).is_err() {
+                        any_error = true;
+                    }
+                } else {
+                    match crate::expand::eval_subscript(&sub_word, shell, name) {
+                        Ok(idx) => {
+                            if shell.unset_array_element(name, idx).is_err() {
+                                any_error = true;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("huck: unset: {e}");
                             any_error = true;
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("huck: unset: {e}");
-                        any_error = true;
                     }
                 }
                 continue;

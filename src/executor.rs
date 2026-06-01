@@ -2825,6 +2825,57 @@ pub(crate) fn apply_one_assignment(
             }
         });
 
+    // ───── Associative variant dispatch ─────
+    // If the target name is currently bound as an associative array,
+    // subscripts are string-evaluated and writes route through the
+    // associative mutators. Positional-list `m=(x y z)` and scalar
+    // `m=v` are rejected (bash type-mismatch).
+    let target_name = a.target.name();
+    if shell.get_associative(target_name).is_some() {
+        match (&a.target, trailing_array_literal) {
+            (AssignTarget::Bare(name), Some(elements)) => {
+                if a.append {
+                    let new_pairs = build_associative_map(elements, shell)?;
+                    for (k, v) in new_pairs {
+                        shell
+                            .set_associative_element(name, k, v)
+                            .map_err(|_| ())?;
+                    }
+                    return Ok(());
+                } else {
+                    let pairs = build_associative_map(elements, shell)?;
+                    return shell.replace_associative(name, pairs).map_err(|_| ());
+                }
+            }
+            (AssignTarget::Bare(name), None) => {
+                eprintln!(
+                    "huck: {name}: {} on associative array",
+                    if a.append { "+=value" } else { "=value" }
+                );
+                return Err(());
+            }
+            (AssignTarget::Indexed { name, subscript }, None) => {
+                let key = crate::expand::eval_subscript_key(subscript, shell);
+                let val = crate::param_expansion::expand_word_to_string(&a.value, shell);
+                if a.append {
+                    return shell
+                        .append_associative_element(name, &key, &val)
+                        .map_err(|_| ());
+                } else {
+                    return shell
+                        .set_associative_element(name, key, val)
+                        .map_err(|_| ());
+                }
+            }
+            (AssignTarget::Indexed { name, .. }, Some(_)) => {
+                eprintln!(
+                    "huck: {name}: cannot assign array literal to associative array element"
+                );
+                return Err(());
+            }
+        }
+    }
+
     match (&a.target, trailing_array_literal) {
         // Bare name + compound array RHS.
         (AssignTarget::Bare(name), Some(elements)) => {
@@ -2882,6 +2933,32 @@ pub(crate) fn apply_one_assignment(
             Err(())
         }
     }
+}
+
+/// Builds an associative-array initializer from the compound literal's
+/// elements. Each element MUST have an explicit subscript ([key]=value);
+/// positional elements (no subscript) are an error.
+fn build_associative_map(
+    elements: &[crate::lexer::ArrayLiteralElement],
+    shell: &mut Shell,
+) -> Result<Vec<(String, String)>, ()> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for e in elements {
+        let key = match &e.subscript {
+            Some(sw) => crate::expand::eval_subscript_key(sw, shell),
+            None => {
+                eprintln!("huck: associative array initializer requires [key]=value form");
+                return Err(());
+            }
+        };
+        let val = crate::param_expansion::expand_word_to_string(&e.value, shell);
+        if let Some(slot) = out.iter_mut().find(|(k, _)| k == &key) {
+            slot.1 = val;
+        } else {
+            out.push((key, val));
+        }
+    }
+    Ok(out)
 }
 
 /// Builds the `BTreeMap<usize, String>` for a compound `name=(...)`
@@ -4671,5 +4748,126 @@ mod array_assign_tests {
         run_line(&mut s, "unset a[]");
         let m = s.get_array("a").expect("a should still exist");
         assert_eq!(m.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod assoc_assign_tests {
+    use crate::shell_state::Shell;
+
+    fn run(shell: &mut Shell, line: &str) {
+        crate::shell::process_line(line, shell, false);
+    }
+
+    #[test]
+    fn element_assign_on_declared_associative_uses_string_key() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m[foo]=bar");
+        assert_eq!(s.lookup_associative_element("m", "foo"), Some("bar".into()));
+    }
+
+    #[test]
+    fn element_assign_without_declare_creates_indexed() {
+        // Bash gotcha: `m[foo]=v` on unset `m` creates indexed (foo→0).
+        let mut s = Shell::new();
+        run(&mut s, "m[foo]=bar");
+        assert!(s.get_array("m").is_some());
+        assert!(s.get_associative("m").is_none());
+        assert_eq!(s.lookup_array_element("m", 0), Some("bar".into()));
+    }
+
+    #[test]
+    fn compound_literal_on_associative_uses_keys() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m=([a]=1 [b]=2)");
+        assert_eq!(s.lookup_associative_element("m", "a"), Some("1".into()));
+        assert_eq!(s.lookup_associative_element("m", "b"), Some("2".into()));
+    }
+
+    #[test]
+    fn append_compound_on_associative_merges() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m=([a]=1 [b]=2)");
+        run(&mut s, "m+=([c]=3 [a]=99)");
+        let pairs = s.get_associative("m").unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(s.lookup_associative_element("m", "a"), Some("99".into()));
+        assert_eq!(s.lookup_associative_element("m", "c"), Some("3".into()));
+    }
+
+    #[test]
+    fn append_element_on_associative_concatenates() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m[k]=hello");
+        run(&mut s, "m[k]+=_world");
+        assert_eq!(
+            s.lookup_associative_element("m", "k"),
+            Some("hello_world".into())
+        );
+    }
+
+    #[test]
+    fn positional_literal_on_associative_rejects() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "preexisting".into(), "x".into())
+            .unwrap();
+        run(&mut s, "m=(a b c)");
+        // associative `m` should be unchanged; positional literal is rejected.
+        assert_eq!(
+            s.lookup_associative_element("m", "preexisting"),
+            Some("x".into())
+        );
+    }
+
+    #[test]
+    fn scalar_rhs_on_associative_rejects() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "k".into(), "v".into())
+            .unwrap();
+        run(&mut s, "m=newscalar");
+        // associative `m` should be unchanged.
+        assert_eq!(s.lookup_associative_element("m", "k"), Some("v".into()));
+    }
+
+    #[test]
+    fn unset_associative_element_removes_one_key() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m[a]=1");
+        run(&mut s, "m[b]=2");
+        run(&mut s, "m[c]=3");
+        run(&mut s, "unset m[b]");
+        let pairs = s.get_associative("m").unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(s.lookup_associative_element("m", "b").is_none());
+        assert_eq!(s.lookup_associative_element("m", "a"), Some("1".into()));
+        assert_eq!(s.lookup_associative_element("m", "c"), Some("3".into()));
+    }
+
+    #[test]
+    fn unset_whole_associative_removes_variable() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        run(&mut s, "m[a]=1");
+        run(&mut s, "unset m");
+        assert!(s.get_associative("m").is_none());
+        assert!(s.get("m").is_none());
+    }
+
+    #[test]
+    fn readonly_blocks_element_write_on_associative() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "a".into(), "1".into())
+            .unwrap();
+        s.mark_readonly("m");
+        run(&mut s, "m[b]=2");
+        assert!(s.lookup_associative_element("m", "b").is_none());
     }
 }
