@@ -234,14 +234,16 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => {
-                // Array-syntax WordParts only appear in assignment
-                // Words consumed by the parser's assignment path;
-                // they are never expanded as regular command words.
-                // Tasks 3+ may rewire some paths; this fence catches
-                // mistakes early.
+            WordPart::AssignPrefix { .. } => {
                 unreachable!(
-                    "array-syntax WordPart leaked into normal expand() — see v71 Task 4"
+                    "WordPart::AssignPrefix is parser-internal and must not reach expand(); \
+                     try_split_assignment is supposed to consume it"
+                );
+            }
+            WordPart::ArrayLiteral(_) => {
+                unreachable!(
+                    "WordPart::ArrayLiteral is parser-internal and must not reach expand(); \
+                     try_split_assignment is supposed to consume it"
                 );
             }
         }
@@ -317,11 +319,16 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 let joined = shell.positional_args.join(" ");
                 result.push_str(&joined);
             }
-            WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => {
-                // See expand(): these only ever live inside the
-                // assignment-recognition path consumed by the parser.
+            WordPart::AssignPrefix { .. } => {
                 unreachable!(
-                    "array-syntax WordPart leaked into expand_assignment() — see v71 Task 4"
+                    "WordPart::AssignPrefix is parser-internal and must not reach expand_assignment(); \
+                     try_split_assignment is supposed to consume it"
+                );
+            }
+            WordPart::ArrayLiteral(_) => {
+                unreachable!(
+                    "WordPart::ArrayLiteral is parser-internal and must not reach expand_assignment(); \
+                     try_split_assignment is supposed to consume it"
                 );
             }
         }

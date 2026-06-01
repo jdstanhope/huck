@@ -69,6 +69,12 @@ pub enum CaseDirection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamModifier {
+    /// No scalar-style modifier — bare `${a[i]}`, `${a[@]}`, `${a[*]}`.
+    /// Expansion path treats this as a pure lookup (and, for subscripted
+    /// forms, defers to the `subscript` field on `ParamExpansion`).
+    /// Distinct from `UseDefault { word: empty }`, which would silently
+    /// substitute "" on unset and trigger unwanted modifier semantics.
+    None,
     Length,
     UseDefault    { word: Word, colon: bool },
     AssignDefault { word: Word, colon: bool },
@@ -1819,15 +1825,15 @@ fn dispatch_braced_modifier(
         Some('}') => {
             if subscript.is_some() {
                 // `${a[i]}` / `${a[@]}` / `${a[*]}` — no scalar-style
-                // modifier. We piggy-back on UseDefault with an empty
-                // operand, which is the identity for present values; the
-                // expansion path (Task 3) keys off `subscript` directly.
+                // modifier. Emit `ParamModifier::None`, a no-op marker.
+                // (We can't reuse `UseDefault { word: empty }`: that
+                // would be semantically `${a[i]-}` — silently substitute
+                // "" on unset — which suppresses the array-expansion
+                // path's ability to distinguish unset elements.) Task 3
+                // dispatches the array lookup via the `subscript` field.
                 parts.push(WordPart::ParamExpansion {
                     name,
-                    modifier: ParamModifier::UseDefault {
-                        word: Word(Vec::new()),
-                        colon: false,
-                    },
+                    modifier: ParamModifier::None,
                     quoted,
                     subscript,
                 });
@@ -5234,6 +5240,28 @@ mod array_parse_tests {
             matches!(result, Err(LexError::UnterminatedArrayLiteral)),
             "expected UnterminatedArrayLiteral, got {result:?}"
         );
+    }
+
+    #[test]
+    fn array_literal_subscript_missing_equals_errors() {
+        let result = crate::lexer::tokenize("a=([3] x)");
+        assert!(
+            matches!(result, Err(LexError::ArrayLiteralMissingEquals)),
+            "expected ArrayLiteralMissingEquals, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn bare_subscripted_ref_has_none_modifier() {
+        let pe = find_param_expansion("echo ${a[3]}", "a");
+        if let WordPart::ParamExpansion { modifier, .. } = pe {
+            assert!(
+                matches!(modifier, ParamModifier::None),
+                "expected ParamModifier::None, got {modifier:?}"
+            );
+        } else {
+            panic!("expected ParamExpansion");
+        }
     }
 }
 

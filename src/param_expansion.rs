@@ -23,6 +23,9 @@ pub fn expand_modifier(
         return ExpansionResult::Empty;
     }
     match modifier {
+        ParamModifier::None => {
+            ExpansionResult::Value(shell.get(name).unwrap_or_default().to_string())
+        }
         ParamModifier::Length => {
             let n = match name {
                 "@" | "*" => shell.positional_args.len(),
