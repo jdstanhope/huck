@@ -3011,6 +3011,12 @@ struct HelpEntry {
 
 static HELP_ENTRIES: &[HelpEntry] = &[
     HelpEntry {
+        name: "!",
+        synopsis: "! PIPELINE",
+        description: "Negate the exit status of the following pipeline.\n\
+                      If PIPELINE exits 0, the negated result is 1; otherwise 0.",
+    },
+    HelpEntry {
         name: ".",
         synopsis: ". FILENAME [ARGUMENTS]",
         description: "Execute commands from a file in the current shell.\n\
@@ -3033,6 +3039,20 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       Returns 0 if EXPRESSION is true, 1 if false, 2 on usage error.",
     },
     HelpEntry {
+        name: "[[",
+        synopsis: "[[ EXPRESSION ]]",
+        description: "Evaluate an extended conditional expression (shell keyword).\n\
+                      Like `test` plus pattern matching (`==`/`!=` with glob RHS), regex\n\
+                      matching (`=~`), lexicographic `<`/`>`, and short-circuit `&&`/`||`\n\
+                      combinators. No word-splitting or pathname expansion on operands.",
+    },
+    HelpEntry {
+        name: "]]",
+        synopsis: "]]",
+        description: "Closes a `[[ ... ]]` extended conditional expression.\n\
+                      Always paired with a matching `[[`.",
+    },
+    HelpEntry {
         name: "alias",
         synopsis: "alias [-p] [NAME[=VALUE] ...]",
         description: "Define or display aliases.\n\
@@ -3052,6 +3072,15 @@ static HELP_ENTRIES: &[HelpEntry] = &[
         synopsis: "break [N]",
         description: "Exit from a for, while, or until loop.\n\
                       With argument N (default 1), break out of N enclosing loops.",
+    },
+    HelpEntry {
+        name: "case",
+        synopsis: "case WORD in [PATTERN [| PATTERN]...) COMMANDS ;; ]... esac",
+        description: "Pattern-based multi-way branch (shell keyword).\n\
+                      WORD is matched against each PATTERN in order; the first matching\n\
+                      block's COMMANDS run. Patterns use glob syntax (*, ?, [abc]).\n\
+                      Each block ends with `;;`, `;&` (fall through), or `;;&` (continue\n\
+                      matching). `esac` ends the case.",
     },
     HelpEntry {
         name: "cd",
@@ -3101,10 +3130,41 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       job from the table.",
     },
     HelpEntry {
+        name: "do",
+        synopsis: "do COMMANDS; done",
+        description: "Begin the body of a for/while/until loop (shell keyword).\n\
+                      Paired with `done`. The body executes once per iteration.",
+    },
+    HelpEntry {
+        name: "done",
+        synopsis: "done",
+        description: "End the body of a for/while/until loop (shell keyword).\n\
+                      Paired with the corresponding `do`.",
+    },
+    HelpEntry {
         name: "echo",
         synopsis: "echo [arg ...]",
         description: "Write arguments to standard output joined by spaces, followed by a\n\
                       newline.",
+    },
+    HelpEntry {
+        name: "elif",
+        synopsis: "elif COMMANDS; then COMMANDS",
+        description: "\"else if\" branch in an `if` statement (shell keyword).\n\
+                      Evaluates its own condition; the first matching branch's body runs.\n\
+                      Multiple `elif` branches can chain.",
+    },
+    HelpEntry {
+        name: "else",
+        synopsis: "else COMMANDS",
+        description: "Default branch of an `if` statement (shell keyword).\n\
+                      Runs when no preceding `if`/`elif` condition succeeded.",
+    },
+    HelpEntry {
+        name: "esac",
+        synopsis: "esac",
+        description: "End a `case` statement (shell keyword).\n\
+                      Paired with the corresponding `case`.",
     },
     HelpEntry {
         name: "eval",
@@ -3140,6 +3200,26 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       it to finish or stop.",
     },
     HelpEntry {
+        name: "fi",
+        synopsis: "fi",
+        description: "End an `if` statement (shell keyword).\n\
+                      Paired with the corresponding `if`.",
+    },
+    HelpEntry {
+        name: "for",
+        synopsis: "for NAME [in WORDS ...]; do COMMANDS; done",
+        description: "Iterate a loop variable over a word list (shell keyword).\n\
+                      Without `in WORDS`, iterates over the positional parameters.\n\
+                      The body runs once per word with NAME set to the current word.",
+    },
+    HelpEntry {
+        name: "function",
+        synopsis: "function NAME { COMMANDS ; }",
+        description: "Define a shell function (shell keyword).\n\
+                      Alternative to the `NAME() { ... }` form. The body runs each time\n\
+                      NAME is invoked, with positional parameters set from the call.",
+    },
+    HelpEntry {
         name: "hash",
         synopsis: "hash [-r] [-d NAME] [-p PATH NAME] [-lt] [NAME ...]",
         description: "Manage the command path cache.\n\
@@ -3163,6 +3243,20 @@ static HELP_ENTRIES: &[HelpEntry] = &[
         synopsis: "history [N]",
         description: "Display the command history.\n\
                       With argument N, show the last N entries. With no arg, show all.",
+    },
+    HelpEntry {
+        name: "if",
+        synopsis: "if COMMANDS; then COMMANDS; [elif ...] [else COMMANDS;] fi",
+        description: "Conditional execution (shell keyword).\n\
+                      Evaluates the `if` condition; if its exit status is 0, runs the\n\
+                      `then` branch. Otherwise tries each `elif` branch in order; if\n\
+                      none match, runs the `else` branch (if present).",
+    },
+    HelpEntry {
+        name: "in",
+        synopsis: "in",
+        description: "Reserved word used in `for NAME in WORDS` and `case WORD in`.\n\
+                      Has no standalone meaning outside those contexts.",
     },
     HelpEntry {
         name: "jobs",
@@ -3274,6 +3368,12 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       Synonym: `[` (with closing `]`).",
     },
     HelpEntry {
+        name: "then",
+        synopsis: "then COMMANDS",
+        description: "Begin the body of an `if` or `elif` branch (shell keyword).\n\
+                      Paired with the corresponding `if`/`elif` condition.",
+    },
+    HelpEntry {
         name: "trap",
         synopsis: "trap [-lp] [ACTION] [SIGSPEC ...]",
         description: "Install signal/event handlers.\n\
@@ -3316,12 +3416,40 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       if NAME is readonly.",
     },
     HelpEntry {
+        name: "until",
+        synopsis: "until COMMANDS; do COMMANDS; done",
+        description: "Loop until a condition becomes true (shell keyword).\n\
+                      Runs the body while the `until` condition exits non-zero. The\n\
+                      mirror of `while`.",
+    },
+    HelpEntry {
         name: "wait",
         synopsis: "wait [-n] [-p VAR] [PID|JOB_SPEC ...]",
         description: "Wait for processes to complete.\n\
                       With no args, wait for all known jobs. With PID/JOB_SPEC, wait for\n\
                       each. -n waits for any one to finish (returns its status). -p VAR\n\
                       stores the finishing job's PID in VAR.",
+    },
+    HelpEntry {
+        name: "while",
+        synopsis: "while COMMANDS; do COMMANDS; done",
+        description: "Loop while a condition is true (shell keyword).\n\
+                      Runs the body while the `while` condition exits 0. The mirror of\n\
+                      `until`.",
+    },
+    HelpEntry {
+        name: "{",
+        synopsis: "{ COMMANDS ; }",
+        description: "Begin a brace group (shell keyword).\n\
+                      Groups COMMANDS into a single compound command that runs in the\n\
+                      current shell (no subshell). Closing `}` is a separate token; the\n\
+                      semicolon (or newline) before `}` is required.",
+    },
+    HelpEntry {
+        name: "}",
+        synopsis: "}",
+        description: "End a brace group (shell keyword).\n\
+                      Paired with the corresponding `{`.",
     },
 ];
 
@@ -8302,5 +8430,23 @@ mod help_tests {
         // Overall exit 1 because of the miss; cd's content still in stdout.
         assert!(matches!(oc, ExecOutcome::Continue(1)));
         assert!(out.lines().any(|l| l.starts_with("cd:")));
+    }
+
+    #[test]
+    fn help_keyword_lookup_works() {
+        // Shell keywords (if/for/while/etc.) have their own HelpEntry
+        // alongside builtins, so `help if` resolves rather than
+        // erroring with "no help topics match".
+        for kw in ["if", "for", "while", "case", "function", "[[", "{"] {
+            let (oc, out) = run(&[kw]);
+            assert!(
+                matches!(oc, ExecOutcome::Continue(0)),
+                "expected exit 0 for `help {kw}`",
+            );
+            assert!(
+                out.lines().any(|l| l.starts_with(&format!("{kw}:"))),
+                "expected `{kw}:` line in stdout for `help {kw}`; got: {out:?}",
+            );
+        }
     }
 }
