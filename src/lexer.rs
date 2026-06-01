@@ -14,6 +14,12 @@ pub enum LexError {
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
+    /// `${a[3` or `a[3=v` — missing `]` closing a subscript.
+    UnterminatedSubscript,
+    /// `a=(x y` — missing `)` closing a compound array RHS.
+    UnterminatedArrayLiteral,
+    /// `a=([3] x)` — `[3]` not followed by `=`.
+    ArrayLiteralMissingEquals,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -87,6 +93,26 @@ pub enum ParamModifier {
     },
 }
 
+/// Subscript form attached to `${a[…]}` / `${a[@]}` / `${a[*]}`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum SubscriptKind {
+    /// `${a[@]}` — produces a word list, one element per array entry,
+    /// no IFS splitting when quoted.
+    All,
+    /// `${a[*]}` — joined-by-IFS scalar when quoted; word-split when not.
+    Star,
+    /// `${a[expr]}` — `expr` arith-evaluates to a usize subscript.
+    Index(Word),
+}
+
+/// One element inside a compound array RHS `name=(elem [idx]=elem …)`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ArrayLiteralElement {
+    /// `Some(word)` for explicit `[expr]=value`; `None` for positional.
+    pub subscript: Option<Word>,
+    pub value: Word,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
@@ -95,10 +121,32 @@ pub enum WordPart {
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
     Arith { expr: crate::arith::ArithExpr, quoted: bool },
-    ParamExpansion { name: String, modifier: ParamModifier, quoted: bool },
+    ParamExpansion {
+        name: String,
+        modifier: ParamModifier,
+        quoted: bool,
+        /// `Some(...)` for `${a[i]}` / `${a[@]}` / `${a[*]}`;
+        /// `None` for `${a}`.
+        subscript: Option<SubscriptKind>,
+    },
     /// `$@` (joined=false) or `$*` (joined=true). `quoted` reflects whether
     /// this was inside double quotes.
     AllArgs { quoted: bool, joined: bool },
+    /// Synthetic prefix marker emitted by the lexer at the head of an
+    /// assignment Word whose LHS isn't expressible as a leading
+    /// `Literal { text: "name=" }`. Specifically: `name+=…`,
+    /// `name[expr]=…`, and `name[expr]+=…`. The parser
+    /// (`try_split_assignment`) consumes this prefix to produce an
+    /// `Assignment` with the parsed target + append flag; the remaining
+    /// parts form the value.
+    AssignPrefix {
+        target: crate::command::AssignTarget,
+        append: bool,
+    },
+    /// Compound array RHS `(elem elem [idx]=elem …)`. Only appears
+    /// as the sole trailing `WordPart` in a `Word` used as the RHS of
+    /// an array-assignment in `SimpleCommand::Assign` / inline prefix.
+    ArrayLiteral(Vec<ArrayLiteralElement>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -439,6 +487,131 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 in_assignment_value = true;
                 has_token = true;
                 current.push('=');
+                // Compound RHS: `name=(...)`. Scan the array literal as
+                // a single WordPart that becomes the value.
+                if chars.peek() == Some(&'(') {
+                    chars.next(); // consume '('
+                    flush_literal(&mut parts, &mut current, false);
+                    let elements = read_array_literal(&mut chars)?;
+                    parts.push(WordPart::ArrayLiteral(elements));
+                }
+            }
+            // `+=`: scalar-or-array append assignment when the prefix is
+            // identifier-shaped. Emits an AssignPrefix(Bare, append=true)
+            // prefix Word.
+            '+' if !in_assignment_value
+                && chars.peek() == Some(&'=')
+                && word_is_identifier_so_far(&current, &parts) =>
+            {
+                chars.next(); // consume '='
+                in_assignment_value = true;
+                has_token = true;
+                // Bake the accumulated identifier text into the target.
+                let name = std::mem::take(&mut current);
+                debug_assert!(
+                    parts.is_empty(),
+                    "word_is_identifier_so_far guarantees no prior parts"
+                );
+                parts.push(WordPart::AssignPrefix {
+                    target: crate::command::AssignTarget::Bare(name),
+                    append: true,
+                });
+                // Compound RHS: `name+=(...)`.
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let elements = read_array_literal(&mut chars)?;
+                    parts.push(WordPart::ArrayLiteral(elements));
+                }
+            }
+            // Subscripted lvalue: `name[expr]=…` or `name[expr]+=…`.
+            // Only fires before the assignment value has started AND
+            // when the accumulated text is identifier-shaped. We
+            // speculatively scan the `[…]` and the optional `+`; if
+            // an `=` follows, this is an indexed assignment. Otherwise
+            // (e.g. `cmd[[foo]]`, glob-style `[abc]*`), we fall back
+            // to treating the `[` and everything we scanned as literal
+            // text so existing word semantics are preserved.
+            '[' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
+                let mut raw_subscript = String::new();
+                let mut depth: usize = 1;
+                let mut closed_subscript = false;
+                while let Some(&c) = chars.peek() {
+                    if c == '[' {
+                        depth += 1;
+                        raw_subscript.push(c);
+                        chars.next();
+                    } else if c == ']' {
+                        chars.next();
+                        depth -= 1;
+                        if depth == 0 {
+                            closed_subscript = true;
+                            break;
+                        }
+                        raw_subscript.push(c);
+                    } else {
+                        raw_subscript.push(c);
+                        chars.next();
+                    }
+                }
+                // Decide: is this an assignment? Peek for `=` or `+=`.
+                let assign_op: Option<bool> = if closed_subscript {
+                    match chars.peek().copied() {
+                        Some('=') => {
+                            chars.next();
+                            Some(false)
+                        }
+                        Some('+') => {
+                            // Need to peek two chars; clone iter for lookahead.
+                            let mut peeker = chars.clone();
+                            peeker.next();
+                            if peeker.peek() == Some(&'=') {
+                                chars.next(); // consume '+'
+                                chars.next(); // consume '='
+                                Some(true)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match assign_op {
+                    Some(append) => {
+                        let name = std::mem::take(&mut current);
+                        debug_assert!(
+                            parts.is_empty(),
+                            "word_is_identifier_so_far guarantees no prior parts"
+                        );
+                        let subscript = parse_subscript_body(&raw_subscript)?;
+                        in_assignment_value = true;
+                        has_token = true;
+                        parts.push(WordPart::AssignPrefix {
+                            target: crate::command::AssignTarget::Indexed { name, subscript },
+                            append,
+                        });
+                        // Compound RHS: `name[i]=(...)`.
+                        if chars.peek() == Some(&'(') {
+                            chars.next();
+                            let elements = read_array_literal(&mut chars)?;
+                            parts.push(WordPart::ArrayLiteral(elements));
+                        }
+                    }
+                    None => {
+                        // Not an indexed assignment. Fall back: append
+                        // the `[`, the scanned subscript text, and the
+                        // closing `]` (if any) back into the current
+                        // literal so the word behaves the same as
+                        // before this arm existed.
+                        has_token = true;
+                        current.push('[');
+                        current.push_str(&raw_subscript);
+                        if closed_subscript {
+                            current.push(']');
+                        }
+                    }
+                }
             }
             other => {
                 has_token = true;
@@ -1303,6 +1476,7 @@ fn read_braced_param_expansion(
             name,
             modifier: ParamModifier::Length,
             quoted,
+            subscript: None,
         });
         return Ok(());
     }
@@ -1318,14 +1492,295 @@ fn read_braced_param_expansion(
                 break;
             }
         }
-        return dispatch_braced_modifier(name, quoted, chars, parts);
+        // Positional parameters cannot be subscripted.
+        return dispatch_braced_modifier(name, quoted, None, chars, parts);
     }
 
     let name = read_braced_name(chars)?;
     if name.is_empty() {
         return Err(LexError::EmptyParamName);
     }
-    dispatch_braced_modifier(name, quoted, chars, parts)
+    // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
+    let subscript = scan_param_subscript(chars)?;
+    dispatch_braced_modifier(name, quoted, subscript, chars, parts)
+}
+
+/// Scans an optional `[…]` subscript immediately after the parameter name
+/// inside a `${…}` form. Returns `None` if the next char isn't `[`.
+/// Special sigils `@` and `*` produce `SubscriptKind::All` / `Star`;
+/// any other expression is parsed via `read_subscript` into
+/// `SubscriptKind::Index`.
+fn scan_param_subscript(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Option<SubscriptKind>, LexError> {
+    if chars.peek() != Some(&'[') {
+        return Ok(None);
+    }
+    chars.next(); // consume '['
+    match chars.peek().copied() {
+        Some('@') | Some('*') => {
+            let sigil = chars.next().unwrap();
+            if chars.next() != Some(']') {
+                return Err(LexError::UnterminatedSubscript);
+            }
+            Ok(Some(if sigil == '@' {
+                SubscriptKind::All
+            } else {
+                SubscriptKind::Star
+            }))
+        }
+        _ => {
+            let inner = read_subscript(chars)?;
+            Ok(Some(SubscriptKind::Index(inner)))
+        }
+    }
+}
+
+/// Scans `expr]` and returns the Word inside the brackets. Caller has
+/// already consumed the leading `[`. Balanced over nested `[…]` (for
+/// arith-style expressions like `a[$((i+1))]`).
+fn read_subscript(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Word, LexError> {
+    let mut depth: usize = 1;
+    let mut buf = String::new();
+    while let Some(&c) = chars.peek() {
+        match c {
+            '[' => {
+                depth += 1;
+                buf.push(c);
+                chars.next();
+            }
+            ']' => {
+                chars.next();
+                depth -= 1;
+                if depth == 0 {
+                    // Re-tokenize the subscript body so embedded
+                    // expansions (`$i`, `${j}`, `$((n))`) are honoured.
+                    return parse_subscript_body(&buf);
+                }
+                buf.push(c);
+            }
+            _ => {
+                buf.push(c);
+                chars.next();
+            }
+        }
+    }
+    Err(LexError::UnterminatedSubscript)
+}
+
+/// Re-tokenizes the inside of a `[…]` subscript as a single Word. If
+/// `tokenize` returns more or fewer than one Word token, falls back to
+/// a single unquoted Literal containing the raw text (which is exactly
+/// what arithmetic evaluation will see).
+fn parse_subscript_body(src: &str) -> Result<Word, LexError> {
+    let toks = tokenize(src)?;
+    let mut words: Vec<Word> = Vec::new();
+    for t in toks {
+        if let Token::Word(w) = t {
+            words.push(w);
+        }
+    }
+    if words.len() == 1 {
+        return Ok(words.pop().unwrap());
+    }
+    // Multi-word or empty: collapse into a single Literal containing
+    // the raw text. Arithmetic evaluation tolerates spaces in numeric
+    // expressions; literal-name lookups still see the joined text.
+    Ok(Word(vec![WordPart::Literal {
+        text: src.to_string(),
+        quoted: false,
+    }]))
+}
+
+/// Scans a compound array RHS `elem elem [idx]=elem … )`. The caller has
+/// already consumed the leading `(`. Whitespace and newlines separate
+/// elements; quoting, command substitution `$(…)`, and `${…}` interiors
+/// are all preserved verbatim and re-tokenized into a single Word per
+/// element. Subscripted elements `[expr]=value` carry an explicit
+/// `subscript` Word.
+fn read_array_literal(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Vec<ArrayLiteralElement>, LexError> {
+    let mut elements: Vec<ArrayLiteralElement> = Vec::new();
+    loop {
+        // Skip whitespace AND newlines (array literals span lines in bash).
+        skip_array_literal_whitespace(chars);
+        match chars.peek() {
+            Some(&')') => {
+                chars.next();
+                return Ok(elements);
+            }
+            None => return Err(LexError::UnterminatedArrayLiteral),
+            _ => {}
+        }
+        // Optional explicit `[expr]=`.
+        let subscript = if chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            let sub = read_subscript(chars)?;
+            if chars.next() != Some('=') {
+                return Err(LexError::ArrayLiteralMissingEquals);
+            }
+            Some(sub)
+        } else {
+            None
+        };
+        let value = read_array_element_word(chars)?;
+        elements.push(ArrayLiteralElement { subscript, value });
+    }
+}
+
+/// Skips whitespace AND newlines inside an array literal.
+fn skip_array_literal_whitespace(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) {
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Scans a single array-element word (terminated by unquoted whitespace
+/// or unquoted `)`). Honours `"…"`, `'…'`, `$'…'`, `$(…)`, `\…`, and
+/// nested `${…}` so closing `)` inside command substitutions doesn't
+/// end the array literal prematurely. The collected raw text is then
+/// re-tokenized via `tokenize` to produce a `Word`.
+fn read_array_element_word(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Word, LexError> {
+    let mut buf = String::new();
+    loop {
+        let c = match chars.peek().copied() {
+            Some(c) => c,
+            None => return Err(LexError::UnterminatedArrayLiteral),
+        };
+        match c {
+            ')' => break,
+            c if c.is_whitespace() => break,
+            '\'' => {
+                buf.push(c);
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            buf.push('\'');
+                            break;
+                        }
+                        Some(ch) => buf.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+            }
+            '"' => {
+                buf.push(c);
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('"') => {
+                            buf.push('"');
+                            break;
+                        }
+                        Some('\\') => {
+                            buf.push('\\');
+                            match chars.next() {
+                                Some(esc) => buf.push(esc),
+                                None => return Err(LexError::UnterminatedQuote),
+                            }
+                        }
+                        Some(ch) => buf.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+            }
+            '\\' => {
+                buf.push(c);
+                chars.next();
+                if let Some(next) = chars.next() {
+                    buf.push(next);
+                }
+            }
+            '$' => {
+                buf.push('$');
+                chars.next();
+                match chars.peek().copied() {
+                    Some('(') => {
+                        buf.push('(');
+                        chars.next();
+                        let mut depth: usize = 1;
+                        for ch in chars.by_ref() {
+                            buf.push(ch);
+                            match ch {
+                                '(' => depth += 1,
+                                ')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if depth != 0 {
+                            return Err(LexError::UnterminatedSubstitution);
+                        }
+                    }
+                    Some('{') => {
+                        buf.push('{');
+                        chars.next();
+                        let mut depth: usize = 1;
+                        for ch in chars.by_ref() {
+                            buf.push(ch);
+                            match ch {
+                                '{' => depth += 1,
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if depth != 0 {
+                            return Err(LexError::UnterminatedBrace);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                buf.push(c);
+                chars.next();
+            }
+        }
+    }
+    // Re-tokenize the collected text as a single Word.
+    let toks = tokenize(&buf)?;
+    let mut words: Vec<Word> = Vec::new();
+    for t in toks {
+        if let Token::Word(w) = t {
+            words.push(w);
+        }
+    }
+    if words.len() == 1 {
+        Ok(words.pop().unwrap())
+    } else if words.is_empty() {
+        Ok(Word(vec![WordPart::Literal {
+            text: String::new(),
+            quoted: false,
+        }]))
+    } else {
+        // Multi-word: collapse into a single Literal (rare; would mean
+        // unquoted brace expansion or similar inside the element).
+        Ok(Word(vec![WordPart::Literal {
+            text: buf,
+            quoted: false,
+        }]))
+    }
 }
 
 /// Reads identifier chars (the parameter name) inside a `${...}` until it
@@ -1350,16 +1805,34 @@ fn read_braced_name(
 
 /// Dispatches a `${name<modifier>...}` form once `name` has been read. The
 /// next char to read from `chars` is whatever follows the name (typically
-/// `}`, `:`, `-`, `=`, `?`, `+`, `#`, `%`, or `/`). Pushes a single
-/// `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
+/// `}`, `:`, `-`, `=`, `?`, `+`, `#`, `%`, or `/`). `subscript` is
+/// `Some(...)` when the name was followed by `[...]` (already scanned).
+/// Pushes a single `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
 fn dispatch_braced_modifier(
     name: String,
     quoted: bool,
+    subscript: Option<SubscriptKind>,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     parts: &mut Vec<WordPart>,
 ) -> Result<(), LexError> {
     match chars.next() {
         Some('}') => {
+            if subscript.is_some() {
+                // `${a[i]}` / `${a[@]}` / `${a[*]}` — no scalar-style
+                // modifier. We piggy-back on UseDefault with an empty
+                // operand, which is the identity for present values; the
+                // expansion path (Task 3) keys off `subscript` directly.
+                parts.push(WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::UseDefault {
+                        word: Word(Vec::new()),
+                        colon: false,
+                    },
+                    quoted,
+                    subscript,
+                });
+                return Ok(());
+            }
             parts.push(WordPart::Var { name, quoted });
             Ok(())
         }
@@ -1368,25 +1841,25 @@ fn dispatch_braced_modifier(
                 Some('-') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
                     Ok(())
                 }
                 Some('=') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
                     Ok(())
                 }
                 Some('?') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
                     Ok(())
                 }
                 Some('+') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
                     Ok(())
                 }
                 Some('}') => Err(LexError::InvalidBraceModifier(":".to_string())),
@@ -1396,6 +1869,7 @@ fn dispatch_braced_modifier(
                         name,
                         modifier: ParamModifier::Substring { offset, length },
                         quoted,
+                        subscript,
                     });
                     Ok(())
                 }
@@ -1404,36 +1878,36 @@ fn dispatch_braced_modifier(
         }
         Some('-') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('=') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('?') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('+') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('#') => {
             let longest = chars.peek() == Some(&'#');
             if longest { chars.next(); }
             let modifier = modifier_with_operand(chars, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('%') => {
             let longest = chars.peek() == Some(&'%');
             if longest { chars.next(); }
             let modifier = modifier_with_operand(chars, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
             Ok(())
         }
         Some('/') => {
@@ -1449,6 +1923,7 @@ fn dispatch_braced_modifier(
                 name,
                 modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
                 quoted,
+                subscript,
             });
             Ok(())
         }
@@ -1460,6 +1935,7 @@ fn dispatch_braced_modifier(
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
                 quoted,
+                subscript,
             });
             Ok(())
         }
@@ -1471,6 +1947,7 @@ fn dispatch_braced_modifier(
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
                 quoted,
+                subscript,
             });
             Ok(())
         }
@@ -3160,7 +3637,7 @@ mod tests {
         let tokens = tokenize("${#foo}").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts.len(), 1);
-        let WordPart::ParamExpansion { name, modifier, quoted } = &parts[0] else {
+        let WordPart::ParamExpansion { name, modifier, quoted, .. } = &parts[0] else {
             panic!("expected ParamExpansion, got {:?}", parts[0]);
         };
         assert_eq!(name, "foo");
@@ -3262,7 +3739,7 @@ mod tests {
         let mut t = tokenize_words("\"${name/foo/bar}\"").unwrap();
         let part = single_param_expansion(&mut t);
         match part {
-            WordPart::ParamExpansion { name, modifier, quoted } => {
+            WordPart::ParamExpansion { name, modifier, quoted, .. } => {
                 assert_eq!(name, "name");
                 assert!(quoted);
                 match modifier {
@@ -4128,7 +4605,7 @@ mod tests {
     fn brace_substring_simple() {
         let mut t = tokenize_words("${name:1}").unwrap();
         let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, quoted } = part {
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Substring { offset, length }, quoted, .. } = part {
             assert_eq!(name, "name");
             assert!(!quoted);
             assert_eq!(word_to_literal(&offset), "1");
@@ -4223,7 +4700,7 @@ mod tests {
     fn brace_case_upper_all() {
         let mut t = tokenize_words("${name^^}").unwrap();
         let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { direction, all, pattern }, quoted } = part {
+        if let WordPart::ParamExpansion { name, modifier: ParamModifier::Case { direction, all, pattern }, quoted, .. } = part {
             assert_eq!(name, "name");
             assert!(!quoted);
             assert_eq!(direction, CaseDirection::Upper);
@@ -4300,7 +4777,7 @@ mod tests {
     fn brace_length_positional() {
         let mut t = tokenize_words("${#1}").unwrap();
         let part = single_param_expansion(&mut t);
-        if let WordPart::ParamExpansion { name, modifier, quoted } = part {
+        if let WordPart::ParamExpansion { name, modifier, quoted, .. } = part {
             assert_eq!(name, "1");
             assert!(!quoted);
             assert!(matches!(modifier, ParamModifier::Length));
@@ -4567,3 +5044,196 @@ mod tests {
         assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
     }
 }
+
+#[cfg(test)]
+mod array_parse_tests {
+    use super::*;
+    use crate::command::{AssignTarget, Assignment, Command, SimpleCommand};
+
+    /// Parse a single line and return its first SimpleCommand's
+    /// assignments. Works for both `name=value` standalone and
+    /// `name=value cmd args` inline-prefix shapes.
+    fn parse_assignments(input: &str) -> Vec<Assignment> {
+        let tokens = crate::lexer::tokenize(input).expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            other => panic!("expected Pipeline, got {other:?}"),
+        };
+        match &pipeline.commands[0] {
+            Command::Simple(SimpleCommand::Assign(items)) => items.clone(),
+            Command::Simple(SimpleCommand::Exec(e)) => e.inline_assignments.clone(),
+            other => panic!("expected SimpleCommand, got {other:?}"),
+        }
+    }
+
+    /// Walk a Word looking for the first WordPart::ParamExpansion whose
+    /// name matches.
+    fn find_param_expansion(input: &str, name: &str) -> WordPart {
+        let tokens = crate::lexer::tokenize(input).expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            other => panic!("expected Pipeline, got {other:?}"),
+        };
+        for cmd in &pipeline.commands {
+            if let Command::Simple(SimpleCommand::Exec(e)) = cmd {
+                for w in std::iter::once(&e.program).chain(e.args.iter()) {
+                    for part in &w.0 {
+                        if let WordPart::ParamExpansion { name: n, .. } = part
+                            && n == name
+                        {
+                            return part.clone();
+                        }
+                    }
+                }
+            }
+        }
+        panic!("ParamExpansion for {name} not found");
+    }
+
+    #[test]
+    fn compound_rhs_is_array_literal() {
+        let assigns = parse_assignments("a=(x y z)");
+        assert_eq!(assigns.len(), 1);
+        assert_eq!(assigns[0].target.name(), "a");
+        assert!(!assigns[0].append);
+        // Value: [Literal(""), ArrayLiteral([x, y, z])].
+        // (Bare `name=` keeps the existing Literal-`name=` prefix shape;
+        // the rest-of-first-Literal is the empty string before the open
+        // paren, then ArrayLiteral follows.)
+        let parts = &assigns[0].value.0;
+        let array_part = parts.iter().find_map(|p| match p {
+            WordPart::ArrayLiteral(els) => Some(els),
+            _ => None,
+        });
+        let els = array_part.expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 3);
+        assert!(els.iter().all(|e| e.subscript.is_none()));
+    }
+
+    #[test]
+    fn sparse_compound_rhs_carries_subscripts() {
+        let assigns = parse_assignments("a=([5]=x [2]=y)");
+        let array_part = assigns[0].value.0.iter().find_map(|p| match p {
+            WordPart::ArrayLiteral(els) => Some(els),
+            _ => None,
+        });
+        let els = array_part.expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 2);
+        assert!(els[0].subscript.is_some());
+        assert!(els[1].subscript.is_some());
+    }
+
+    #[test]
+    fn subscripted_lvalue_parses() {
+        let assigns = parse_assignments("a[5]=v");
+        assert_eq!(assigns.len(), 1);
+        match &assigns[0].target {
+            AssignTarget::Indexed { name, .. } => assert_eq!(name, "a"),
+            other => panic!("expected Indexed, got {other:?}"),
+        }
+        assert!(!assigns[0].append);
+    }
+
+    #[test]
+    fn subscripted_lvalue_append_parses() {
+        let assigns = parse_assignments("a[5]+=v");
+        match &assigns[0].target {
+            AssignTarget::Indexed { name, .. } => assert_eq!(name, "a"),
+            other => panic!("expected Indexed, got {other:?}"),
+        }
+        assert!(assigns[0].append);
+    }
+
+    #[test]
+    fn compound_append_parses() {
+        let assigns = parse_assignments("a+=(x y)");
+        match &assigns[0].target {
+            AssignTarget::Bare(n) => assert_eq!(n, "a"),
+            other => panic!("expected Bare, got {other:?}"),
+        }
+        assert!(assigns[0].append);
+        let array_part = assigns[0].value.0.iter().find_map(|p| match p {
+            WordPart::ArrayLiteral(els) => Some(els),
+            _ => None,
+        });
+        assert!(array_part.is_some(), "expected ArrayLiteral part");
+    }
+
+    #[test]
+    fn subscripted_ref_at_all() {
+        let pe = find_param_expansion(r#"echo "${a[@]}""#, "a");
+        match pe {
+            WordPart::ParamExpansion { subscript, .. } => {
+                assert!(matches!(subscript, Some(SubscriptKind::All)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn subscripted_ref_at_star() {
+        let pe = find_param_expansion(r#"echo "${a[*]}""#, "a");
+        match pe {
+            WordPart::ParamExpansion { subscript, .. } => {
+                assert!(matches!(subscript, Some(SubscriptKind::Star)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn subscripted_ref_index_carries_word() {
+        let pe = find_param_expansion("echo ${a[3]}", "a");
+        match pe {
+            WordPart::ParamExpansion { subscript, .. } => {
+                assert!(matches!(subscript, Some(SubscriptKind::Index(_))));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn bare_param_expansion_has_no_subscript() {
+        // `${a}` (no subscript) is emitted as WordPart::Var, NOT
+        // ParamExpansion. Verify by checking that no ParamExpansion
+        // appears at all.
+        let tokens = crate::lexer::tokenize("echo ${a}").expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            _ => panic!(),
+        };
+        for cmd in &pipeline.commands {
+            if let Command::Simple(SimpleCommand::Exec(e)) = cmd {
+                for w in std::iter::once(&e.program).chain(e.args.iter()) {
+                    for part in &w.0 {
+                        if matches!(part, WordPart::ParamExpansion { .. }) {
+                            panic!("expected Var, got ParamExpansion for ${{a}}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_subscript_errors() {
+        let result = crate::lexer::tokenize("echo ${a[3");
+        assert!(
+            matches!(result, Err(LexError::UnterminatedSubscript)),
+            "expected UnterminatedSubscript, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unterminated_array_literal_errors() {
+        let result = crate::lexer::tokenize("a=(x y");
+        assert!(
+            matches!(result, Err(LexError::UnterminatedArrayLiteral)),
+            "expected UnterminatedArrayLiteral, got {result:?}"
+        );
+    }
+}
+

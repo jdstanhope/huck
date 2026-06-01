@@ -491,6 +491,15 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
             format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)
         }
         LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
+        LexError::UnterminatedSubscript => {
+            ": missing ']' in subscript".to_string()
+        }
+        LexError::UnterminatedArrayLiteral => {
+            ": unterminated array literal '('".to_string()
+        }
+        LexError::ArrayLiteralMissingEquals => {
+            ": array element subscript requires '=' after ']'".to_string()
+        }
     }
 }
 

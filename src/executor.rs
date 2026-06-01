@@ -440,7 +440,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
 
 fn run_double_bracket(
     expr: &TestExpr,
-    inline_assignments: &[(String, crate::lexer::Word)],
+    inline_assignments: &[crate::command::Assignment],
     shell: &mut Shell,
 ) -> ExecOutcome {
     let snap = match apply_inline_assignments(inline_assignments, shell) {
@@ -712,7 +712,7 @@ fn run_background_sequence(
         }
 
         // ---- Inline assignments (v23 scoping) ---------------------------------
-        let inline_assignments: &[(String, crate::lexer::Word)] =
+        let inline_assignments: &[crate::command::Assignment] =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 &exec.inline_assignments
             } else {
@@ -1495,11 +1495,25 @@ fn status_code(status: &ExitStatus) -> i32 {
 // ----- single command -------------------------------------------------------
 
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    use crate::command::AssignTarget;
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
-            for (name, value) in items {
-                let v = expand_assignment(value, shell);
+            for a in items {
+                let name = match &a.target {
+                    AssignTarget::Bare(n) => n,
+                    AssignTarget::Indexed { name, .. } => {
+                        unreachable!(
+                            "array elements not yet supported in run_single — see v71 Task 4: {name}"
+                        );
+                    }
+                };
+                if a.append {
+                    unreachable!(
+                        "+= not yet supported in run_single — see v71 Task 4: {name}"
+                    );
+                }
+                let v = expand_assignment(&a.value, shell);
                 if shell.try_set(name, v).is_err() {
                     eprintln!("huck: {name}: readonly variable");
                     return ExecOutcome::Continue(1);
@@ -2044,7 +2058,7 @@ fn run_multi_stage(
         }
 
         // ---- Apply inline assignments (v23 per-stage scoping) ---------------
-        let inline_assignments: &[(String, crate::lexer::Word)] =
+        let inline_assignments: &[crate::command::Assignment] =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 &exec.inline_assignments
             } else {
@@ -2691,18 +2705,32 @@ type AssignmentSnapshot = Vec<(String, Option<String>, bool)>;
 /// returns a snapshot the caller can pass to `restore_inline_assignments`
 /// (for temporary-scope targets) or discard (for persistent-scope targets).
 fn apply_inline_assignments(
-    assignments: &[(String, crate::lexer::Word)],
+    assignments: &[crate::command::Assignment],
     shell: &mut Shell,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
+    use crate::command::AssignTarget;
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
-    for (name, rhs) in assignments {
+    for a in assignments {
+        let name = match &a.target {
+            AssignTarget::Bare(n) => n,
+            AssignTarget::Indexed { name, .. } => {
+                unreachable!(
+                    "array elements not yet supported in apply_inline_assignments — see v71 Task 4: {name}"
+                );
+            }
+        };
+        if a.append {
+            unreachable!(
+                "+= not yet supported in apply_inline_assignments — see v71 Task 4: {name}"
+            );
+        }
         let prior_value = shell.get(name).map(str::to_string);
         let prior_exported = shell.is_exported(name);
         if shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(snap);
         }
-        let value = expand_assignment(rhs, shell);
+        let value = expand_assignment(&a.value, shell);
         shell.export_set(name, value);
         snap.push((name.clone(), prior_value, prior_exported));
     }
@@ -3115,6 +3143,14 @@ mod tests {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
+    fn bare_assign(name: &str, value: Word) -> crate::command::Assignment {
+        crate::command::Assignment {
+            target: crate::command::AssignTarget::Bare(name.to_string()),
+            value,
+            append: false,
+        }
+    }
+
     fn exec(program: &str, args: &[&str]) -> SimpleCommand {
         SimpleCommand::Exec(ExecCommand {
             inline_assignments: Vec::new(),
@@ -3270,7 +3306,7 @@ mod tests {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
+                    bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
                 ]))],
             }),
             rest: vec![],
@@ -3339,7 +3375,7 @@ mod tests {
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    ("BG_X".to_string(), Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
+                    bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
                 ]))],
             }),
             rest: vec![],
@@ -3742,8 +3778,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/home/test".to_string());
         let assigns = vec![
-            ("A".to_string(), lit_word("1")),
-            ("B".to_string(), Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
+            bare_assign("A", lit_word("1")),
+            bare_assign("B", Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("A"), Some("1"));
@@ -3756,7 +3792,7 @@ mod tests {
     #[test]
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
-        let assigns = vec![("FOO".to_string(), lit_word("bar"))];
+        let assigns = vec![bare_assign("FOO", lit_word("bar"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
@@ -3768,7 +3804,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
-        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
+        let assigns = vec![bare_assign("FOO", lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
@@ -3781,7 +3817,7 @@ mod tests {
     fn restore_inline_assignments_restores_prior_value_exported() {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
-        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
+        let assigns = vec![bare_assign("FOO", lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -3793,8 +3829,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let assigns = vec![
-            ("FOO".to_string(), lit_word("a")),
-            ("FOO".to_string(), lit_word("b")),
+            bare_assign("FOO", lit_word("a")),
+            bare_assign("FOO", lit_word("b")),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("b"));
@@ -3810,7 +3846,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("inner"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("inner"))],
             program: lit_word("true"),
             args: vec![],
             stdin: None,
@@ -3834,7 +3870,7 @@ mod tests {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("myfunc"),
             args: vec![],
             stdin: None,
@@ -3851,7 +3887,7 @@ mod tests {
     fn run_exec_single_special_builtin_inline_assignment_persists() {
         let mut shell = Shell::new();
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("export"),
             args: vec![lit_word("FOO")],
             stdin: None,
@@ -4016,7 +4052,7 @@ mod tests {
         // Assignment-only stage (SimpleCommand::Assign) → InProcess.
         let shell = Shell::new();
         let cmd = Command::Simple(SimpleCommand::Assign(vec![
-            ("FOO".to_string(), lit_word("bar")),
+            bare_assign("FOO", lit_word("bar")),
         ]));
         assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
     }

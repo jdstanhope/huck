@@ -215,7 +215,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted } => {
+            WordPart::ParamExpansion { name, modifier, quoted, .. } => {
                 match crate::param_expansion::expand_modifier(name, modifier, shell) {
                     crate::param_expansion::ExpansionResult::Value(v) => {
                         if *quoted {
@@ -233,6 +233,16 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         return result;
                     }
                 }
+            }
+            WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => {
+                // Array-syntax WordParts only appear in assignment
+                // Words consumed by the parser's assignment path;
+                // they are never expanded as regular command words.
+                // Tasks 3+ may rewire some paths; this fence catches
+                // mistakes early.
+                unreachable!(
+                    "array-syntax WordPart leaked into normal expand() — see v71 Task 4"
+                );
             }
         }
     }
@@ -307,6 +317,13 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 let joined = shell.positional_args.join(" ");
                 result.push_str(&joined);
             }
+            WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => {
+                // See expand(): these only ever live inside the
+                // assignment-recognition path consumed by the parser.
+                unreachable!(
+                    "array-syntax WordPart leaked into expand_assignment() — see v71 Task 4"
+                );
+            }
         }
     }
     result
@@ -324,6 +341,7 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::ParamExpansion { quoted, .. } => *quoted,
         WordPart::AllArgs { quoted, .. } => *quoted,
         WordPart::Tilde(_) => false,
+        WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => false,
     }
 }
 
@@ -1256,6 +1274,7 @@ mod tests {
                 colon: true,
             },
             quoted: false,
+            subscript: None,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1273,6 +1292,7 @@ mod tests {
                 colon: true,
             },
             quoted: true,
+            subscript: None,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1291,6 +1311,7 @@ mod tests {
                 colon: true,
             },
             quoted: false,
+            subscript: None,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1308,6 +1329,7 @@ mod tests {
                 colon: true,
             },
             quoted: false,
+            subscript: None,
         }]);
         let value = expand_assignment(&word, &mut shell);
         assert_eq!(value, "a b c");
@@ -1324,6 +1346,7 @@ mod tests {
                 colon: true,
             },
             quoted: false,
+            subscript: None,
         }]);
         let fields = expand(&word, &mut shell);
         // v34 (Task 4): expand() now bails early on Fatal, stashing status on
