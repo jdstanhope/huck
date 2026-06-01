@@ -24,6 +24,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "readonly", "read", "printf", "type", "hash",
     "pushd", "popd", "dirs",
     "declare", "typeset",
+    "eval",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -34,10 +35,10 @@ pub fn is_builtin(name: &str) -> bool {
 /// special builtin persist in the shell; assignments preceding a regular
 /// builtin or external command are scoped to the command. The set is huck's
 /// existing builtins intersected with the POSIX special list; expand here as
-/// huck adds `eval`/`exec`/`:`/`readonly`.
+/// huck adds `exec`.
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
-        ":" | "." | "break" | "continue" | "exit" | "export" | "readonly" | "return"
+        ":" | "." | "break" | "continue" | "eval" | "exit" | "export" | "readonly" | "return"
         | "set" | "shift" | "source" | "trap" | "unset"
     )
 }
@@ -70,6 +71,7 @@ pub fn run_builtin(
         "set" => builtin_set(args, out, shell),
         "shift" => builtin_shift(args, shell),
         "." | "source" => builtin_source(args, shell),
+        "eval" => builtin_eval(args, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         ":" => builtin_colon(args, shell),
@@ -2980,6 +2982,23 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
 
 fn set_escape_value(v: &str) -> String {
     format!("'{}'", v.replace('\'', r#"'\''"#))
+}
+
+/// POSIX `eval`: joins args with spaces, re-parses the result,
+/// and executes it in the current shell context via the same
+/// `process_line` path that trap actions and `source` use.
+/// Returns the exit status of the last command in the re-parsed
+/// line. `exit N` / function-return / etc. propagate via the
+/// returned ExecOutcome.
+fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        return ExecOutcome::Continue(0);
+    }
+    let joined = args.join(" ");
+    if joined.trim().is_empty() {
+        return ExecOutcome::Continue(0);
+    }
+    crate::shell::process_line(&joined, shell, true)
 }
 
 fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -7721,5 +7740,61 @@ mod integer_attr_tests {
         // Integer flag must NOT be set; value unchanged.
         assert!(!shell.is_integer("X_INT_D5"));
         assert_eq!(shell.lookup_var("X_INT_D5").as_deref(), Some("outer"));
+    }
+}
+
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str], shell: &mut Shell) -> ExecOutcome {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        run_builtin("eval", &args_owned, &mut buf, shell)
+    }
+
+    #[test]
+    fn eval_no_args_exits_zero() {
+        let mut shell = Shell::new();
+        assert!(matches!(run(&[], &mut shell), ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn eval_empty_arg_exits_zero() {
+        let mut shell = Shell::new();
+        assert!(matches!(run(&[""], &mut shell), ExecOutcome::Continue(0)));
+    }
+
+    #[test]
+    fn eval_simple_command_runs() {
+        let mut shell = Shell::new();
+        // process_line writes to process stdout (not the builtin's
+        // `out` writer), so assert the side effect on shell state.
+        let oc = run(&["X_EVAL_T3=hello"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_EVAL_T3").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn eval_assignment_persists() {
+        let mut shell = Shell::new();
+        let oc = run(&["X_EVAL_T4=42"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_EVAL_T4").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn eval_false_returns_one() {
+        let mut shell = Shell::new();
+        let oc = run(&["false"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn eval_exit_propagates() {
+        let mut shell = Shell::new();
+        let oc = run(&["exit", "7"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Exit(7)));
     }
 }
