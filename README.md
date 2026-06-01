@@ -76,6 +76,7 @@ spec, an implementation plan, and a test suite.
 | v66       | `eval` (M-80)                                                  |
 | v67       | `help` (M-81)                                                  |
 | v68       | doc cleanup (M-06/M-07/M-35 marked fixed; M-08 narrowed)       |
+| v69       | `set -e`/`-u`/`-o` long-form + `$-` (M-08 cont.)               |
 
 ## Build and run
 
