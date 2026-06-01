@@ -10,6 +10,7 @@ pub struct Variable {
     pub value: String,
     pub exported: bool,
     pub readonly: bool,
+    pub integer: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -112,7 +113,7 @@ impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
         for (key, value) in std::env::vars() {
-            vars.insert(key, Variable { value, exported: true, readonly: false });
+            vars.insert(key, Variable { value, exported: true, readonly: false, integer: false });
         }
         let shell_pid = unsafe { libc::getpid() };
         let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
@@ -191,7 +192,7 @@ impl Shell {
         match self.vars.get_mut(name) {
             Some(existing) => existing.value = value,
             None => {
-                self.vars.insert(name.to_string(), Variable { value, exported: false, readonly: false });
+                self.vars.insert(name.to_string(), Variable { value, exported: false, readonly: false, integer: false });
             }
         }
     }
@@ -206,6 +207,7 @@ impl Shell {
                 value: String::new(),
                 exported: true,
                 readonly: false,
+                integer: false,
             });
     }
 
@@ -222,7 +224,7 @@ impl Shell {
             None => {
                 self.vars.insert(
                     name.to_string(),
-                    Variable { value, exported: true, readonly: false },
+                    Variable { value, exported: true, readonly: false, integer: false },
                 );
             }
         }
@@ -280,11 +282,21 @@ impl Shell {
     /// `Err(())` if `name` is readonly (caller prints the diagnostic);
     /// otherwise sets the value and returns `Ok(())`. Consumed by
     /// executor/expansion write paths in v54 task 2.
+    ///
+    /// When `name` is integer-flagged (v65), the RHS is routed through
+    /// `arith::parse` + `arith::eval` and stored as the decimal string.
+    /// Parse/eval failures silently coerce to `"0"` (matches bash for
+    /// non-`declare` integer write paths).
     pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
         if self.is_readonly(name) {
             return Err(());
         }
-        self.set(name, value);
+        let final_value = if self.is_integer(name) {
+            eval_integer_coerce(self, &value)
+        } else {
+            value
+        };
+        self.set(name, final_value);
         Ok(())
     }
 
@@ -313,8 +325,41 @@ impl Shell {
                     value: String::new(),
                     exported: false,
                     readonly: true,
+                    integer: false,
                 },
             );
+        }
+    }
+
+    /// True if `name` is set and marked integer (v65). Unset names are
+    /// trivially not integer.
+    pub fn is_integer(&self, name: &str) -> bool {
+        self.vars.get(name).map(|v| v.integer).unwrap_or(false)
+    }
+
+    /// Marks `name` integer. If `name` is unset, creates it with an
+    /// empty value (mirrors `mark_readonly`). Used by `declare -i`.
+    pub fn mark_integer(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.integer = true;
+        } else {
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: String::new(),
+                    exported: false,
+                    readonly: false,
+                    integer: true,
+                },
+            );
+        }
+    }
+
+    /// Flips the `integer` flag off on an existing variable. No-op
+    /// if the variable doesn't exist. Used by `declare +i NAME`.
+    pub fn unmark_integer(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.integer = false;
         }
     }
 
@@ -372,6 +417,21 @@ impl Shell {
                 libc::killpg(job.pgid, libc::SIGHUP);
             }
         }
+    }
+}
+
+/// Evaluate `value` as a bash arithmetic expression and return the
+/// decimal-string result, or `"0"` on parse/eval failure (bash's
+/// silent-coerce-to-zero semantics for integer-flagged variable
+/// writes). Module-scope so `Shell::try_set` can call it while
+/// holding `&mut Shell` (the function takes `&mut Shell` itself).
+fn eval_integer_coerce(shell: &mut Shell, value: &str) -> String {
+    match crate::arith::parse(value) {
+        Ok(expr) => match crate::arith::eval(&expr, shell) {
+            Ok(n) => n.to_string(),
+            Err(_) => "0".to_string(),
+        },
+        Err(_) => "0".to_string(),
     }
 }
 
