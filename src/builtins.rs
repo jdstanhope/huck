@@ -359,6 +359,27 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut any_error = false;
     for arg in args {
+        if let Some((name, sub_text)) = parse_subscripted_arg(arg) {
+            // `unset a[i]`: remove a single element. The subscript is
+            // parsed as a synthetic literal `Word` so `eval_subscript`
+            // arith-evaluates it identically to a real expansion.
+            let sub_word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+                text: sub_text.to_string(),
+                quoted: false,
+            }]);
+            match crate::expand::eval_subscript(&sub_word, shell, name) {
+                Ok(idx) => {
+                    if shell.unset_array_element(name, idx).is_err() {
+                        any_error = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("huck: unset: {e}");
+                    any_error = true;
+                }
+            }
+            continue;
+        }
         if !is_valid_name(arg) {
             eprintln!("huck: unset: '{arg}': not a valid identifier");
             any_error = true;
@@ -376,6 +397,23 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     } else {
         ExecOutcome::Continue(0)
     }
+}
+
+/// If `s` has the form `NAME[SUB]` where NAME is a valid identifier
+/// and the string ends with `]`, returns `(NAME, SUB)`. Otherwise
+/// returns `None` so the caller falls through to the whole-variable
+/// unset path.
+fn parse_subscripted_arg(s: &str) -> Option<(&str, &str)> {
+    let bracket = s.find('[')?;
+    if !s.ends_with(']') {
+        return None;
+    }
+    let name = &s[..bracket];
+    if !is_valid_name(name) {
+        return None;
+    }
+    let sub = &s[bracket + 1..s.len() - 1];
+    Some((name, sub))
 }
 
 fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {

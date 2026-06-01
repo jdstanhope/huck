@@ -91,7 +91,7 @@ impl Default for Field {
 /// the subscript fails to parse/eval, or if the wrap-around still
 /// yields a negative index. The caller decides whether to print the
 /// diagnostic and set `pending_fatal_pe_error`.
-fn eval_subscript(
+pub(crate) fn eval_subscript(
     subscript: &Word,
     shell: &mut Shell,
     name: &str,

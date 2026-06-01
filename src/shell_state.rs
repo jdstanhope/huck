@@ -53,6 +53,18 @@ impl Variable {
     }
 }
 
+/// Error kind returned by the readonly-aware array mutator helpers
+/// (`replace_array`, `set_array_element`, `append_array`,
+/// `append_array_element`, `unset_array_element`). The mutator prints
+/// the user-facing diagnostic itself; callers translate this into the
+/// appropriate exit status.
+#[derive(Debug)]
+pub enum AssignErr {
+    Readonly,
+    #[allow(dead_code)] // reserved for future bad-subscript paths
+    BadSubscript,
+}
+
 /// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
 /// Extend the struct AND the option-name table in `src/builtins.rs`
 /// together when adding a new option.
@@ -348,6 +360,7 @@ impl Shell {
     }
 
     /// True if `name` is set and marked exported.
+    #[allow(dead_code)] // public introspection used by integration tests
     pub fn is_exported(&self, name: &str) -> bool {
         self.vars.get(name).is_some_and(|v| v.exported)
     }
@@ -508,6 +521,159 @@ impl Shell {
     pub fn array_max_index(&self, name: &str) -> Option<usize> {
         self.get_array(name)
             .and_then(|m| m.keys().next_back().copied())
+    }
+
+    /// Replaces (or creates) `name` as an indexed array with the given
+    /// elements. Honors readonly. Preserves the existing `exported` and
+    /// `integer` flags if the variable already exists.
+    pub fn replace_array(
+        &mut self,
+        name: &str,
+        elements: BTreeMap<usize, String>,
+    ) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        let (exported, integer) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.integer),
+            None => (false, false),
+        };
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Indexed(elements),
+                exported,
+                readonly: false,
+                integer,
+            },
+        );
+        Ok(())
+    }
+
+    /// Sets a single element. Promotes a scalar variable to indexed
+    /// (the existing scalar value becomes element 0, unless `idx == 0`
+    /// in which case it is overwritten). Honors readonly.
+    pub fn set_array_element(
+        &mut self,
+        name: &str,
+        idx: usize,
+        value: String,
+    ) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Indexed(m) => {
+                    m.insert(idx, value);
+                }
+                VarValue::Scalar(s) => {
+                    let mut m = BTreeMap::new();
+                    if idx == 0 {
+                        m.insert(0, value);
+                    } else {
+                        m.insert(0, std::mem::take(s));
+                        m.insert(idx, value);
+                    }
+                    v.value = VarValue::Indexed(m);
+                }
+            },
+            None => {
+                let mut m = BTreeMap::new();
+                m.insert(idx, value);
+                self.vars.insert(
+                    name.to_string(),
+                    Variable {
+                        value: VarValue::Indexed(m),
+                        exported: false,
+                        readonly: false,
+                        integer: false,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends elements to the array. New keys start at `max_index+1`
+    /// (or 0 for empty/missing). Promotes a scalar variable to an
+    /// indexed array (scalar becomes element 0; new elements start at
+    /// index 1). Honors readonly.
+    pub fn append_array(&mut self, name: &str, elements: &[String]) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        // Promote scalar to indexed if needed.
+        if matches!(
+            self.vars.get(name).map(|v| &v.value),
+            Some(VarValue::Scalar(_))
+        ) && let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Scalar(s) = &mut v.value
+        {
+            let mut m = BTreeMap::new();
+            m.insert(0, std::mem::take(s));
+            v.value = VarValue::Indexed(m);
+        }
+        let start = self.array_max_index(name).map_or(0, |m| m + 1);
+        if !self.vars.contains_key(name) {
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: VarValue::Indexed(BTreeMap::new()),
+                    exported: false,
+                    readonly: false,
+                    integer: false,
+                },
+            );
+        }
+        if let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Indexed(m) = &mut v.value
+        {
+            for (i, val) in elements.iter().enumerate() {
+                m.insert(start + i, val.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends `value` to the existing element at `idx` (concatenation).
+    /// Used by `a[i]+=v`. If the element doesn't exist, treats prior
+    /// value as empty.
+    pub fn append_array_element(
+        &mut self,
+        name: &str,
+        idx: usize,
+        value: &str,
+    ) -> Result<(), AssignErr> {
+        let existing = self.lookup_array_element(name, idx).unwrap_or_default();
+        self.set_array_element(name, idx, existing + value)
+    }
+
+    /// Removes a single element from an indexed array. No-op if the
+    /// variable is missing, scalar, or doesn't contain that subscript.
+    /// Honors readonly.
+    pub fn unset_array_element(&mut self, name: &str, idx: usize) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        if let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Indexed(m) = &mut v.value
+        {
+            m.remove(&idx);
+        }
+        Ok(())
     }
 
     pub fn last_status(&self) -> i32 {

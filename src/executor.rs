@@ -1495,27 +1495,11 @@ fn status_code(status: &ExitStatus) -> i32 {
 // ----- single command -------------------------------------------------------
 
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    use crate::command::AssignTarget;
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
             for a in items {
-                let name = match &a.target {
-                    AssignTarget::Bare(n) => n,
-                    AssignTarget::Indexed { name, .. } => {
-                        unreachable!(
-                            "array elements not yet supported in run_single — see v71 Task 4: {name}"
-                        );
-                    }
-                };
-                if a.append {
-                    unreachable!(
-                        "+= not yet supported in run_single — see v71 Task 4: {name}"
-                    );
-                }
-                let v = expand_assignment(&a.value, shell);
-                if shell.try_set(name, v).is_err() {
-                    eprintln!("huck: {name}: readonly variable");
+                if apply_one_assignment(a, shell).is_err() {
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -2697,9 +2681,12 @@ fn wait_pipeline_raw(
 
 // ----- inline-assignment apply/restore helpers ------------------------------
 
-/// Snapshot entry for one applied inline assignment: name, prior value
-/// (None if the var was unset), prior export flag.
-type AssignmentSnapshot = Vec<(String, Option<String>, bool)>;
+/// Snapshot entry for one applied inline assignment: name + the full
+/// prior `Variable` (or `None` if the var was unset before apply).
+/// Cloning the entire `Variable` (rather than just its scalar value
+/// and export flag) is what lets v71 array-valued inline prefixes
+/// round-trip correctly through restore.
+type AssignmentSnapshot = Vec<(String, Option<crate::shell_state::Variable>)>;
 
 /// Expands and applies `assignments` left-to-right, exporting each, and
 /// returns a snapshot the caller can pass to `restore_inline_assignments`
@@ -2708,31 +2695,31 @@ fn apply_inline_assignments(
     assignments: &[crate::command::Assignment],
     shell: &mut Shell,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
-    use crate::command::AssignTarget;
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
     for a in assignments {
-        let name = match &a.target {
-            AssignTarget::Bare(n) => n,
-            AssignTarget::Indexed { name, .. } => {
-                unreachable!(
-                    "array elements not yet supported in apply_inline_assignments — see v71 Task 4: {name}"
-                );
-            }
-        };
-        if a.append {
-            unreachable!(
-                "+= not yet supported in apply_inline_assignments — see v71 Task 4: {name}"
-            );
-        }
-        let prior_value = shell.get(name).map(str::to_string);
-        let prior_exported = shell.is_exported(name);
+        let name = a.target.name();
+        let prior = shell.snapshot_var(name);
         if shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(snap);
         }
-        let value = expand_assignment(&a.value, shell);
-        shell.export_set(name, value);
-        snap.push((name.clone(), prior_value, prior_exported));
+        if apply_one_assignment(a, shell).is_err() {
+            return Err(snap);
+        }
+        // Bash semantics: inline-prefix assignments are exported for the
+        // duration of the command. Only scalar bare-name assignments to
+        // a scalar (or new) variable carry the export flag — array
+        // variables aren't placed in the child environment, but the
+        // export flag still flips during the temporary scope so that a
+        // later `a=val cmd` (scalar reassignment of the same name) sees
+        // the expected state. Match the pre-v71 behavior by toggling the
+        // export bit only when the value is a bare scalar.
+        if matches!(&a.target, crate::command::AssignTarget::Bare(_))
+            && !is_array_value_word(&a.value)
+        {
+            shell.export(name);
+        }
+        snap.push((name.to_string(), prior));
     }
     Ok(snap)
 }
@@ -2740,19 +2727,133 @@ fn apply_inline_assignments(
 /// Restores each snapshot entry in reverse order, so repeated names
 /// unwind LIFO and end up at their pre-prefix value.
 fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
-    for (name, prior_value, prior_exported) in snap.into_iter().rev() {
-        match (prior_value, prior_exported) {
-            (Some(v), true) => shell.export_set(&name, v),
-            (Some(v), false) => {
-                // `shell.set` preserves the existing export flag; we just
-                // wrote with export=true via export_set during apply, so
-                // we have to unset-then-set to land at unexported.
-                shell.unset(&name);
-                shell.set(&name, v);
+    for (name, prior) in snap.into_iter().rev() {
+        shell.restore_var(&name, prior);
+    }
+}
+
+/// True iff `word` has a trailing `ArrayLiteral` WordPart (the lexer
+/// shape produced for `name=(...)` / `name+=(...)`).
+fn is_array_value_word(word: &crate::lexer::Word) -> bool {
+    matches!(
+        word.0.last(),
+        Some(crate::lexer::WordPart::ArrayLiteral(_))
+    )
+}
+
+/// Applies one `Assignment` to `shell`. Dispatches on the four
+/// combinations of (target kind, value kind):
+///   1. Bare + compound array RHS  →  `replace_array` / `append_array`
+///   2. Bare + scalar RHS          →  `try_set` / scalar+=value
+///   3. Indexed + scalar RHS       →  `set_array_element` / `append_array_element`
+///   4. Indexed + compound array   →  rejected (matches bash)
+///
+/// Returns `Err(())` on readonly violation or other write failure
+/// (diagnostic printed by the mutator). On success returns `Ok(())`.
+fn apply_one_assignment(
+    a: &crate::command::Assignment,
+    shell: &mut Shell,
+) -> Result<(), ()> {
+    use crate::command::AssignTarget;
+
+    let trailing_array_literal: Option<&Vec<crate::lexer::ArrayLiteralElement>> =
+        a.value.0.last().and_then(|wp| {
+            if let crate::lexer::WordPart::ArrayLiteral(els) = wp {
+                Some(els)
+            } else {
+                None
             }
-            (None, _) => shell.unset(&name),
+        });
+
+    match (&a.target, trailing_array_literal) {
+        // Bare name + compound array RHS.
+        (AssignTarget::Bare(name), Some(elements)) => {
+            if a.append {
+                // a+=(elements): append new keys after max_index.
+                let values: Vec<String> = elements
+                    .iter()
+                    .map(|e| expand_assignment(&e.value, shell))
+                    .collect();
+                shell.append_array(name, &values).map_err(|_| ())
+            } else {
+                // a=(elements): replace whole array.
+                let map = build_array_map(elements, name, shell)?;
+                shell.replace_array(name, map).map_err(|_| ())
+            }
+        }
+        // Bare name + scalar RHS.
+        (AssignTarget::Bare(name), None) => {
+            let s = expand_assignment(&a.value, shell);
+            if a.append {
+                // a+=v: on a scalar, concatenate; on an array, append to element 0
+                // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
+                match shell.get_array(name) {
+                    Some(_) => shell
+                        .append_array_element(name, 0, &s)
+                        .map_err(|_| ()),
+                    None => {
+                        let existing = shell.get(name).map(str::to_string).unwrap_or_default();
+                        shell.try_set(name, existing + &s).map_err(|_| {
+                            eprintln!("huck: {name}: readonly variable");
+                        })
+                    }
+                }
+            } else {
+                shell.try_set(name, s).map_err(|_| {
+                    eprintln!("huck: {name}: readonly variable");
+                })
+            }
+        }
+        // Subscripted lvalue + scalar RHS.
+        (AssignTarget::Indexed { name, subscript }, None) => {
+            let idx = match crate::expand::eval_subscript(subscript, shell, name) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("huck: {e}");
+                    return Err(());
+                }
+            };
+            let v = expand_assignment(&a.value, shell);
+            if a.append {
+                shell.append_array_element(name, idx, &v).map_err(|_| ())
+            } else {
+                shell.set_array_element(name, idx, v).map_err(|_| ())
+            }
+        }
+        // Subscripted lvalue + compound array RHS: bash rejects this.
+        (AssignTarget::Indexed { name, .. }, Some(_)) => {
+            eprintln!("huck: {name}: cannot assign array literal to array element");
+            Err(())
         }
     }
+}
+
+/// Builds the `BTreeMap<usize, String>` for a compound `name=(...)`
+/// RHS. Implicit subscripts continue from the highest explicit
+/// subscript seen so far (bash's rule for sparse mixed-form literals).
+fn build_array_map(
+    elements: &[crate::lexer::ArrayLiteralElement],
+    name: &str,
+    shell: &mut Shell,
+) -> Result<std::collections::BTreeMap<usize, String>, ()> {
+    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut implicit: usize = 0;
+    for e in elements {
+        let val = expand_assignment(&e.value, shell);
+        let idx = match &e.subscript {
+            Some(sw) => match crate::expand::eval_subscript(sw, shell, name) {
+                Ok(i) => i,
+                Err(msg) => {
+                    eprintln!("huck: {msg}");
+                    return Err(());
+                }
+            },
+            None => implicit,
+        };
+        map.insert(idx, val);
+        implicit = idx + 1;
+    }
+    Ok(map)
 }
 
 // ----- job-control helpers -------------------------------------------------
@@ -4359,5 +4460,149 @@ mod tests {
         // local should have errored; X unchanged.
         assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
         assert_eq!(shell.last_status(), 1);
+    }
+}
+
+#[cfg(test)]
+mod array_assign_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    /// Drive a fragment through the same execute path the REPL uses.
+    fn run_line(shell: &mut Shell, line: &str) {
+        let mut src = String::from(line);
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+        let tokens = crate::lexer::tokenize(&src).expect("tokenize");
+        let seq = crate::command::parse(tokens)
+            .expect("parse ok")
+            .expect("non-empty parse");
+        execute(&seq, shell, &src);
+    }
+
+    #[test]
+    fn compound_assign_creates_array() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("z"));
+    }
+
+    #[test]
+    fn sparse_compound_assign_respects_explicit_subscripts() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=([5]=x [2]=y)");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&5).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn element_assign_creates_array() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a[3]=hello");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.get(&3).map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn element_assign_promotes_scalar() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=old");
+        run_line(&mut s, "a[2]=new");
+        let m = s.get_array("a").expect("scalar should promote to array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("old"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn append_array_extends() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y)");
+        run_line(&mut s, "a+=(z w)");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(
+            m.values().cloned().collect::<Vec<_>>(),
+            vec![
+                "x".to_string(),
+                "y".to_string(),
+                "z".to_string(),
+                "w".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn append_element_concatenates() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a[0]=hello");
+        run_line(&mut s, "a[0]+=_world");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("hello_world"));
+    }
+
+    #[test]
+    fn readonly_blocks_compound_assign() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(initial)");
+        s.mark_readonly("a");
+        run_line(&mut s, "a=(changed)");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("initial"));
+    }
+
+    #[test]
+    fn readonly_blocks_element_assign() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(initial)");
+        s.mark_readonly("a");
+        run_line(&mut s, "a[5]=new");
+        let m = s.get_array("a").unwrap();
+        assert!(m.get(&5).is_none());
+    }
+
+    #[test]
+    fn unset_element_removes_one_key() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a[1]");
+        let m = s.get_array("a").unwrap();
+        assert!(m.get(&1).is_none());
+        assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("z"));
+    }
+
+    #[test]
+    fn unset_whole_array_removes_variable() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a");
+        assert!(s.get_array("a").is_none());
+        assert!(s.get("a").is_none());
+    }
+
+    #[test]
+    fn scalar_append_to_existing_array_writes_element_zero() {
+        // `a=(x y); a+=z` in bash appends to element 0 (i.e. concatenates
+        // with a[0]), yielding a[0]="xz".
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y)");
+        run_line(&mut s, "a+=z");
+        let m = s.get_array("a").expect("still an array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("xz"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn indexed_lvalue_compound_rhs_rejected() {
+        // `a[i]=(...)` is a syntax-level error in bash; huck rejects
+        // it with a diagnostic and leaves `a` empty.
+        let mut s = Shell::new();
+        run_line(&mut s, "a[0]=(x y)");
+        assert!(s.get_array("a").is_none());
     }
 }
