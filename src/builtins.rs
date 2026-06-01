@@ -538,7 +538,7 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
         s.push_str(&attrs);
         s
     };
-    let escaped = escape_double_quote_value(&var.value);
+    let escaped = escape_double_quote_value(var.value.scalar_view());
     format!("declare {flag_str} {name}=\"{escaped}\"")
 }
 
@@ -7052,7 +7052,7 @@ mod local_tests {
             .cloned()
             .unwrap();
         let v = snapshot.expect("expected Some snapshot for previously-set var");
-        assert_eq!(v.value, "outer");
+        assert!(matches!(&v.value, crate::shell_state::VarValue::Scalar(s) if s == "outer"));
     }
 
     #[test]
@@ -7088,7 +7088,7 @@ mod local_tests {
             .cloned()
             .unwrap();
         let v = snapshot.expect("expected Some outer snapshot");
-        assert_eq!(v.value, "outer");
+        assert!(matches!(&v.value, crate::shell_state::VarValue::Scalar(s) if s == "outer"));
     }
 
     #[test]

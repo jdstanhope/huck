@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -5,12 +6,51 @@ use std::sync::atomic::AtomicBool;
 
 use crate::jobs::JobTable;
 
+/// Storage for a shell variable. Scalar covers ordinary strings;
+/// Indexed is a sparse map of usize subscripts to element values
+/// (sorted by key — BTreeMap so `${a[@]}` and `${!a[@]}` walk in
+/// ascending subscript order).
+#[derive(Debug, Clone)]
+pub enum VarValue {
+    Scalar(String),
+    // Constructed starting in v71 task 2; the foundation refactor
+    // (task 1) only adds the variant and its scalar_view fall-through.
+    #[allow(dead_code)]
+    Indexed(BTreeMap<usize, String>),
+}
+
+impl VarValue {
+    /// Returns the "scalar view" of this value: the string itself
+    /// for `Scalar`, or the element at subscript 0 (or "" if no such
+    /// element) for `Indexed`. This is the bash rule that `$a` and
+    /// `${a}` on an indexed array mean `${a[0]}`.
+    pub fn scalar_view(&self) -> &str {
+        match self {
+            VarValue::Scalar(s) => s.as_str(),
+            VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Variable {
-    pub value: String,
+    pub value: VarValue,
     pub exported: bool,
     pub readonly: bool,
     pub integer: bool,
+}
+
+impl Variable {
+    /// Convenience constructor for the common case: an unexported,
+    /// non-readonly, non-integer scalar.
+    pub fn scalar(value: String) -> Self {
+        Variable {
+            value: VarValue::Scalar(value),
+            exported: false,
+            readonly: false,
+            integer: false,
+        }
+    }
 }
 
 /// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
@@ -126,7 +166,12 @@ impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
         for (key, value) in std::env::vars() {
-            vars.insert(key, Variable { value, exported: true, readonly: false, integer: false });
+            vars.insert(key, Variable {
+                value: VarValue::Scalar(value),
+                exported: true,
+                readonly: false,
+                integer: false,
+            });
         }
         let shell_pid = unsafe { libc::getpid() };
         let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
@@ -165,7 +210,7 @@ impl Shell {
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.vars.get(name).map(|v| v.value.as_str())
+        self.vars.get(name).map(|v| v.value.scalar_view())
     }
 
     /// Returns the value of `$-` — alphabetical concatenation of
@@ -210,16 +255,16 @@ impl Shell {
             }
             return self.positional_args.get(n - 1).cloned();
         }
-        self.vars.get(name).map(|v| v.value.clone())
+        self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
     /// Sets a variable's value, preserving its existing `exported` flag (or
     /// creating it as unexported if it didn't exist).
     pub fn set(&mut self, name: &str, value: String) {
         match self.vars.get_mut(name) {
-            Some(existing) => existing.value = value,
+            Some(existing) => existing.value = VarValue::Scalar(value),
             None => {
-                self.vars.insert(name.to_string(), Variable { value, exported: false, readonly: false, integer: false });
+                self.vars.insert(name.to_string(), Variable::scalar(value));
             }
         }
     }
@@ -231,7 +276,7 @@ impl Shell {
             .entry(name.to_string())
             .and_modify(|v| v.exported = true)
             .or_insert_with(|| Variable {
-                value: String::new(),
+                value: VarValue::Scalar(String::new()),
                 exported: true,
                 readonly: false,
                 integer: false,
@@ -245,13 +290,18 @@ impl Shell {
     pub fn export_set(&mut self, name: &str, value: String) {
         match self.vars.get_mut(name) {
             Some(existing) => {
-                existing.value = value;
+                existing.value = VarValue::Scalar(value);
                 existing.exported = true;
             }
             None => {
                 self.vars.insert(
                     name.to_string(),
-                    Variable { value, exported: true, readonly: false, integer: false },
+                    Variable {
+                        value: VarValue::Scalar(value),
+                        exported: true,
+                        readonly: false,
+                        integer: false,
+                    },
                 );
             }
         }
@@ -318,13 +368,41 @@ impl Shell {
         if self.is_readonly(name) {
             return Err(());
         }
-        let final_value = if self.is_integer(name) {
-            eval_integer_coerce(self, &value)
+        // Determine whether the integer-coerce path applies: only on
+        // an existing integer-flagged Scalar. Indexed variables (even
+        // if integer-flagged) take the array-element-0 overwrite path
+        // instead.
+        let do_integer_coerce = self.is_integer(name)
+            && self
+                .vars
+                .get(name)
+                .is_some_and(|v| matches!(v.value, VarValue::Scalar(_)));
+        if do_integer_coerce {
+            // Compute the coerced value BEFORE taking the &mut borrow.
+            let coerced = eval_integer_coerce(self, &value);
+            if let Some(existing) = self.vars.get_mut(name) {
+                existing.value = VarValue::Scalar(coerced);
+            }
+            return Ok(());
+        }
+        // Non-integer (or no existing entry) path: route through `set`,
+        // except that an existing Indexed variable has element 0
+        // overwritten rather than the whole array being replaced
+        // (matches bash: `a=v` on an indexed array overwrites a[0]).
+        if let Some(existing) = self.vars.get_mut(name) {
+            match &mut existing.value {
+                VarValue::Indexed(m) => {
+                    m.insert(0, value);
+                }
+                VarValue::Scalar(_) => {
+                    existing.value = VarValue::Scalar(value);
+                }
+            }
+            Ok(())
         } else {
-            value
-        };
-        self.set(name, final_value);
-        Ok(())
+            self.vars.insert(name.to_string(), Variable::scalar(value));
+            Ok(())
+        }
     }
 
     /// Checked unset: refuses to remove a readonly variable. Returns
@@ -349,7 +427,7 @@ impl Shell {
             self.vars.insert(
                 name.to_string(),
                 Variable {
-                    value: String::new(),
+                    value: VarValue::Scalar(String::new()),
                     exported: false,
                     readonly: true,
                     integer: false,
@@ -373,7 +451,7 @@ impl Shell {
             self.vars.insert(
                 name.to_string(),
                 Variable {
-                    value: String::new(),
+                    value: VarValue::Scalar(String::new()),
                     exported: false,
                     readonly: false,
                     integer: true,
@@ -421,7 +499,7 @@ impl Shell {
         self.vars
             .iter()
             .filter(|(_, v)| v.exported)
-            .map(|(k, v)| (k.as_str(), v.value.as_str()))
+            .map(|(k, v)| (k.as_str(), v.value.scalar_view()))
     }
 
     /// Iterates the names of all variables (exported or not).
@@ -679,5 +757,48 @@ mod tests {
         t.jobs_mut()[0].state = JobState::Stopped(::libc::SIGTSTP);
         let job = t.iter().find(|j| j.id == id).unwrap();
         assert!(super::should_hangup(job));
+    }
+}
+
+#[cfg(test)]
+mod array_value_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_view_returns_string_for_scalar() {
+        let v = VarValue::Scalar("hello".to_string());
+        assert_eq!(v.scalar_view(), "hello");
+    }
+
+    #[test]
+    fn scalar_view_returns_element_zero_for_indexed() {
+        let mut m = BTreeMap::new();
+        m.insert(0, "first".to_string());
+        m.insert(1, "second".to_string());
+        let v = VarValue::Indexed(m);
+        assert_eq!(v.scalar_view(), "first");
+    }
+
+    #[test]
+    fn scalar_view_empty_for_indexed_without_zero() {
+        let mut m = BTreeMap::new();
+        m.insert(5, "x".to_string());
+        let v = VarValue::Indexed(m);
+        assert_eq!(v.scalar_view(), "");
+    }
+
+    #[test]
+    fn scalar_view_empty_for_empty_indexed() {
+        let v = VarValue::Indexed(BTreeMap::new());
+        assert_eq!(v.scalar_view(), "");
+    }
+
+    #[test]
+    fn variable_scalar_constructor_sets_defaults() {
+        let v = Variable::scalar("x".to_string());
+        assert!(!v.exported);
+        assert!(!v.readonly);
+        assert!(!v.integer);
+        assert_eq!(v.value.scalar_view(), "x");
     }
 }
