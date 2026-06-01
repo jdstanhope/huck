@@ -64,6 +64,17 @@ pub fn run_builtin(
     out: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // Declaration commands (`declare`, `typeset`, `local`, `readonly`,
+    // `export`) must flow through `run_declaration_builtin` so that
+    // compound-RHS assignments (`a=(x y z)`, `a[i]+=v`) reach
+    // `apply_one_assignment`. The executor's `is_declaration_command`
+    // predicate routes them there; this debug_assert is a tripwire so a
+    // future refactor that bypasses the predicate doesn't silently end
+    // up here, where the legacy paths are array-unaware.
+    debug_assert!(
+        !is_declaration_command(name),
+        "declaration command `{name}` reached run_builtin; should have been routed to run_declaration_builtin",
+    );
     match name {
         "cd" => builtin_cd(args, out, shell),
         "pwd" => builtin_pwd(out),
@@ -112,6 +123,51 @@ pub fn run_builtin(
         }
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
+}
+
+/// Test-only convenience: call `run_declaration_builtin` from string
+/// args. Strings shaped like `NAME=value` (valid identifier on the
+/// left) are wrapped as `DeclArg::Assign` with a single-Literal value
+/// — mirroring what the executor produces from a parsed assignment
+/// word. Everything else (flags, bare names, invalid identifiers)
+/// becomes `DeclArg::Plain`. Compound-RHS coverage (`a=(x y)`,
+/// `a[i]+=v`) lives in integration tests where the lexer can build
+/// the actual `ArrayLiteral` / `AssignPrefix` parts.
+#[cfg(test)]
+pub(crate) fn run_declaration_builtin_strs(
+    name: &str,
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    use crate::command::{Assignment, AssignTarget};
+    use crate::lexer::{Word, WordPart};
+
+    fn is_valid_ident(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    }
+
+    let decl_args: Vec<DeclArg> = args
+        .iter()
+        .map(|s| match s.find('=') {
+            Some(eq) if is_valid_ident(&s[..eq]) => {
+                let name = s[..eq].to_string();
+                let val = s[eq + 1..].to_string();
+                DeclArg::Assign(Assignment {
+                    target: AssignTarget::Bare(name),
+                    value: Word(vec![WordPart::Literal { text: val, quoted: false }]),
+                    append: false,
+                })
+            }
+            _ => DeclArg::Plain(s.clone()),
+        })
+        .collect();
+    run_declaration_builtin(name, &decl_args, out, shell)
 }
 
 /// Entry point for declaration commands (`declare` / `typeset` / `local` /
@@ -7611,7 +7667,7 @@ mod local_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         // local_scopes is empty (we never pushed a frame).
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["X=hi".to_string()],
             &mut buf,
@@ -7625,7 +7681,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T1=hi".to_string()],
             &mut buf,
@@ -7644,7 +7700,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T2".to_string()],
             &mut buf,
@@ -7660,7 +7716,7 @@ mod local_tests {
         shell.set("XYZ_LOCAL_T3", "outer".to_string());
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T3=inner".to_string()],
             &mut buf,
@@ -7688,7 +7744,7 @@ mod local_tests {
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
         // First `local`: snapshot the outer value.
-        let _ = run_builtin(
+        let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=first".to_string()],
             &mut buf,
@@ -7697,7 +7753,7 @@ mod local_tests {
         // Second `local` for the same name in the same frame: must NOT
         // re-snapshot (otherwise it would overwrite the outer snapshot
         // with "first").
-        let _ = run_builtin(
+        let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=second".to_string()],
             &mut buf,
@@ -7722,7 +7778,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["1foo=bar".to_string()],
             &mut buf,
@@ -7896,7 +7952,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X=hi".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("hi"));
         assert!(shell.is_readonly("X"));
@@ -7907,7 +7963,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
         assert!(shell.is_readonly("X"));
@@ -7919,7 +7975,7 @@ mod readonly_tests {
         shell.set("X", "prev".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("prev"));
         assert!(shell.is_readonly("X"));
@@ -7931,7 +7987,7 @@ mod readonly_tests {
         shell.set("B", "had".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["A=1".to_string(), "B".to_string(), "C=3".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("A").as_deref(), Some("1"));
         assert_eq!(shell.lookup_var("B").as_deref(), Some("had"));
@@ -7946,7 +8002,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["1foo=bar".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert!(shell.lookup_var("1foo").is_none());
     }
@@ -7959,7 +8015,7 @@ mod readonly_tests {
         shell.set("Y", "w".to_string());
         shell.mark_readonly("Y");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("readonly", &[], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &[], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         // declare -p style listing; scalars render with `-r` attrs.
@@ -7974,7 +8030,7 @@ mod readonly_tests {
         shell.set("X", "v".to_string());
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("readonly", &["-p".to_string()], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &["-p".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.lines().any(|l| l == r#"declare -r X="v""#));
@@ -7984,8 +8040,8 @@ mod readonly_tests {
     fn readonly_overwrite_existing_readonly_errors() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        run_builtin("readonly", &["X=first".to_string()], &mut buf, &mut shell);
-        let outcome = run_builtin(
+        run_declaration_builtin_strs("readonly", &["X=first".to_string()], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs(
             "readonly",
             &["X=second".to_string()],
             &mut buf,
@@ -8014,7 +8070,7 @@ mod readonly_tests {
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
         // `export X=newval` should error and not overwrite.
-        let bad = run_builtin(
+        let bad = run_declaration_builtin_strs(
             "export",
             &["X=newval".to_string()],
             &mut buf,
@@ -8023,7 +8079,7 @@ mod readonly_tests {
         assert!(matches!(bad, ExecOutcome::Continue(1)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         // `export X` (bare) should succeed and flip the export flag.
-        let bare = run_builtin("export", &["X".to_string()], &mut buf, &mut shell);
+        let bare = run_declaration_builtin_strs("export", &["X".to_string()], &mut buf, &mut shell);
         assert!(matches!(bare, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         assert!(shell.is_readonly("X"));
@@ -8863,14 +8919,14 @@ mod declare_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
     fn run_typeset(args: &[&str], shell: &mut Shell) -> ExecOutcome {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        run_builtin("typeset", &args_owned, &mut buf, shell)
+        run_declaration_builtin_strs("typeset", &args_owned, &mut buf, shell)
     }
 
     #[test]
@@ -9072,7 +9128,7 @@ mod integer_attr_tests {
     fn run_declare(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 

@@ -13,9 +13,6 @@ use crate::jobs::JobTable;
 #[derive(Debug, Clone)]
 pub enum VarValue {
     Scalar(String),
-    // Constructed starting in v71 task 2; the foundation refactor
-    // (task 1) only adds the variant and its scalar_view fall-through.
-    #[allow(dead_code)]
     Indexed(BTreeMap<usize, String>),
 }
 

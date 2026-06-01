@@ -133,3 +133,40 @@ fn nounset_on_unset_element_is_fatal() {
     );
     assert_ne!(rc, 0, "expected non-zero exit under set -u");
 }
+
+/// Inline-prefix scalar assignment in front of an array-valued name
+/// must snapshot the full array (via `Variable::clone()` — the
+/// BTreeMap of elements), apply the scalar override for the
+/// command's duration, then restore the array intact. This guards
+/// the v23 snapshot machinery against a future refactor that
+/// snapshots only the scalar view and silently drops array elements
+/// on restore.
+///
+/// The test uses an external command (`/bin/bash -c …`) so the
+/// scalar override is observable in a child environment (where it
+/// arrives as the exported scalar `FOO=inner`) while the parent's
+/// pre-existing FOO array is verified intact after the command
+/// returns. Bash itself behaves the same way: inline-prefix
+/// array literals are not array assignments, and the parent's
+/// array must survive the temporary scalar shadow.
+#[test]
+fn inline_prefix_with_array_rhs_restores_after_command() {
+    let (out, _, _) = run_capture(
+        "FOO=(outer data more)\n\
+         FOO=inner /bin/bash -c 'echo during: $FOO'\n\
+         echo \"after: ${FOO[*]}\"\n\
+         echo \"after_count: ${#FOO[@]}\"\n\
+         exit\n",
+    );
+    let relevant: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            l.starts_with("during:") || l.starts_with("after:") || l.starts_with("after_count:")
+        })
+        .collect();
+    assert_eq!(
+        relevant,
+        vec!["during: inner", "after: outer data more", "after_count: 3"],
+        "got: {out:?}"
+    );
+}
