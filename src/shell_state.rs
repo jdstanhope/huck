@@ -94,7 +94,7 @@ pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
             format!("huck: {cmd}: {name}: cannot convert indexed to associative array")
         }
         DeclareErr::ScalarExists => {
-            format!("huck: {cmd}: {name}: cannot convert scalar to associative")
+            format!("huck: {cmd}: {name}: cannot convert scalar to associative array")
         }
     }
 }
@@ -1370,11 +1370,11 @@ mod assoc_value_tests {
         );
         assert_eq!(
             declare_err_message("local", "s", &DeclareErr::ScalarExists),
-            "huck: local: s: cannot convert scalar to associative",
+            "huck: local: s: cannot convert scalar to associative array",
         );
         assert_eq!(
             declare_err_message("readonly", "s", &DeclareErr::ScalarExists),
-            "huck: readonly: s: cannot convert scalar to associative",
+            "huck: readonly: s: cannot convert scalar to associative array",
         );
     }
 
