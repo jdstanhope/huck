@@ -25,6 +25,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "pushd", "popd", "dirs",
     "declare", "typeset",
     "eval",
+    "help",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -72,6 +73,7 @@ pub fn run_builtin(
         "shift" => builtin_shift(args, shell),
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
+        "help" => builtin_help(args, out, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         ":" => builtin_colon(args, shell),
@@ -2999,6 +3001,556 @@ fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
         return ExecOutcome::Continue(0);
     }
     crate::shell::process_line(&joined, shell, true)
+}
+
+struct HelpEntry {
+    name: &'static str,
+    synopsis: &'static str,
+    description: &'static str,
+}
+
+static HELP_ENTRIES: &[HelpEntry] = &[
+    HelpEntry {
+        name: "!",
+        synopsis: "! PIPELINE",
+        description: "Negate the exit status of the following pipeline.\n\
+                      If PIPELINE exits 0, the negated result is 1; otherwise 0.",
+    },
+    HelpEntry {
+        name: ".",
+        synopsis: ". FILENAME [ARGUMENTS]",
+        description: "Execute commands from a file in the current shell.\n\
+                      Reads and executes commands from FILENAME in the current shell\n\
+                      context. If FILENAME does not contain a slash, $PATH is searched.\n\
+                      Synonym: source.",
+    },
+    HelpEntry {
+        name: ":",
+        synopsis: ":",
+        description: "Null command. Always exits 0.\n\
+                      Arguments are expanded normally; useful for parameter-expansion\n\
+                      side effects like `: ${VAR:=default}`.",
+    },
+    HelpEntry {
+        name: "[",
+        synopsis: "[ EXPRESSION ]",
+        description: "Evaluate a conditional expression.\n\
+                      Synonym for `test`; the closing `]` is required as the last argument.\n\
+                      Returns 0 if EXPRESSION is true, 1 if false, 2 on usage error.",
+    },
+    HelpEntry {
+        name: "[[",
+        synopsis: "[[ EXPRESSION ]]",
+        description: "Evaluate an extended conditional expression (shell keyword).\n\
+                      Like `test` plus pattern matching (`==`/`!=` with glob RHS), regex\n\
+                      matching (`=~`), lexicographic `<`/`>`, and short-circuit `&&`/`||`\n\
+                      combinators. No word-splitting or pathname expansion on operands.",
+    },
+    HelpEntry {
+        name: "]]",
+        synopsis: "]]",
+        description: "Closes a `[[ ... ]]` extended conditional expression.\n\
+                      Always paired with a matching `[[`.",
+    },
+    HelpEntry {
+        name: "alias",
+        synopsis: "alias [-p] [NAME[=VALUE] ...]",
+        description: "Define or display aliases.\n\
+                      With no arguments, print all defined aliases. With NAME but no value,\n\
+                      print that alias's value. With NAME=VALUE, define the alias.\n\
+                      Aliases expand at command-name position in interactive input.",
+    },
+    HelpEntry {
+        name: "bg",
+        synopsis: "bg [JOB_SPEC ...]",
+        description: "Resume jobs in the background.\n\
+                      Each JOB_SPEC names a stopped job to resume without bringing it to\n\
+                      the foreground. With no args, the current job (%+) is resumed.",
+    },
+    HelpEntry {
+        name: "break",
+        synopsis: "break [N]",
+        description: "Exit from a for, while, or until loop.\n\
+                      With argument N (default 1), break out of N enclosing loops.",
+    },
+    HelpEntry {
+        name: "case",
+        synopsis: "case WORD in [PATTERN [| PATTERN]...) COMMANDS ;; ]... esac",
+        description: "Pattern-based multi-way branch (shell keyword).\n\
+                      WORD is matched against each PATTERN in order; the first matching\n\
+                      block's COMMANDS run. Patterns use glob syntax (*, ?, [abc]).\n\
+                      Each block ends with `;;`, `;&` (fall through), or `;;&` (continue\n\
+                      matching). `esac` ends the case.",
+    },
+    HelpEntry {
+        name: "cd",
+        synopsis: "cd [DIR]",
+        description: "Change the shell working directory.\n\
+                      With no argument, cd to $HOME. Updates $PWD and $OLDPWD.\n\
+                      `cd -` cd's to $OLDPWD and prints the new PWD.",
+    },
+    HelpEntry {
+        name: "command",
+        synopsis: "command [-v|-V] NAME [ARGS ...]",
+        description: "Print resolution of a command name.\n\
+                      -v prints the path (or 'NAME' for builtins/keywords/aliases/functions).\n\
+                      -V prints a human-readable description.\n\
+                      Status 0 if all names resolve, 1 if any missing.\n\
+                      Bare `command NAME ARGS` (bypass functions/aliases) is deferred.",
+    },
+    HelpEntry {
+        name: "continue",
+        synopsis: "continue [N]",
+        description: "Resume the next iteration of a for/while/until loop.\n\
+                      With argument N (default 1), continue at the Nth enclosing loop.",
+    },
+    HelpEntry {
+        name: "declare",
+        synopsis: "declare [-rxifFp] [+rxi] [NAME[=VALUE] ...]",
+        description: "Declare variables and set attributes.\n\
+                      -r readonly; -x export; -i integer (RHS arith-evaluated); -f list\n\
+                      function names; -F same as -f; -p print declarations.\n\
+                      +x un-export; +i unmark integer; +r errors (readonly cannot be removed).\n\
+                      Inside a function (and without -g, which is deferred), declarations\n\
+                      are local-scoped. Synonym: typeset.",
+    },
+    HelpEntry {
+        name: "dirs",
+        synopsis: "dirs [-clpv] [+N] [-N]",
+        description: "List the directory stack.\n\
+                      -c clear; -l no ~ collapse; -p one per line; -v numbered.\n\
+                      +N / -N print the Nth entry (left/right indexed; 0-based).",
+    },
+    HelpEntry {
+        name: "disown",
+        synopsis: "disown [-ahr] [JOB_SPEC ...]",
+        description: "Remove jobs from the active jobs table.\n\
+                      -a all jobs; -r only running; -h mark for no SIGHUP on exit (the job\n\
+                      stays in the table). Without flags, removes the named (or current)\n\
+                      job from the table.",
+    },
+    HelpEntry {
+        name: "do",
+        synopsis: "do COMMANDS; done",
+        description: "Begin the body of a for/while/until loop (shell keyword).\n\
+                      Paired with `done`. The body executes once per iteration.",
+    },
+    HelpEntry {
+        name: "done",
+        synopsis: "done",
+        description: "End the body of a for/while/until loop (shell keyword).\n\
+                      Paired with the corresponding `do`.",
+    },
+    HelpEntry {
+        name: "echo",
+        synopsis: "echo [arg ...]",
+        description: "Write arguments to standard output joined by spaces, followed by a\n\
+                      newline.",
+    },
+    HelpEntry {
+        name: "elif",
+        synopsis: "elif COMMANDS; then COMMANDS",
+        description: "\"else if\" branch in an `if` statement (shell keyword).\n\
+                      Evaluates its own condition; the first matching branch's body runs.\n\
+                      Multiple `elif` branches can chain.",
+    },
+    HelpEntry {
+        name: "else",
+        synopsis: "else COMMANDS",
+        description: "Default branch of an `if` statement (shell keyword).\n\
+                      Runs when no preceding `if`/`elif` condition succeeded.",
+    },
+    HelpEntry {
+        name: "esac",
+        synopsis: "esac",
+        description: "End a `case` statement (shell keyword).\n\
+                      Paired with the corresponding `case`.",
+    },
+    HelpEntry {
+        name: "eval",
+        synopsis: "eval [ARG ...]",
+        description: "Re-parse and execute arguments as a shell command.\n\
+                      Joins ARGS with spaces and runs the result in the current shell.\n\
+                      Returns the exit status of the last command executed.",
+    },
+    HelpEntry {
+        name: "exit",
+        synopsis: "exit [N]",
+        description: "Exit the shell with status N.\n\
+                      With no argument, exit with the status of the last command.\n\
+                      N is truncated to a byte (mod 256).",
+    },
+    HelpEntry {
+        name: "export",
+        synopsis: "export [-n] [NAME[=VALUE] ...]",
+        description: "Mark variables for export to subsequent commands' environments.\n\
+                      With NAME=VALUE, set + export. With NAME alone, set the export flag\n\
+                      on an existing variable. -n removes the export attribute.",
+    },
+    HelpEntry {
+        name: "false",
+        synopsis: "false",
+        description: "Always exits 1. Arguments ignored.",
+    },
+    HelpEntry {
+        name: "fg",
+        synopsis: "fg [JOB_SPEC]",
+        description: "Resume a job in the foreground.\n\
+                      Brings the named (or current) job into the foreground and waits for\n\
+                      it to finish or stop.",
+    },
+    HelpEntry {
+        name: "fi",
+        synopsis: "fi",
+        description: "End an `if` statement (shell keyword).\n\
+                      Paired with the corresponding `if`.",
+    },
+    HelpEntry {
+        name: "for",
+        synopsis: "for NAME [in WORDS ...]; do COMMANDS; done",
+        description: "Iterate a loop variable over a word list (shell keyword).\n\
+                      Without `in WORDS`, iterates over the positional parameters.\n\
+                      The body runs once per word with NAME set to the current word.",
+    },
+    HelpEntry {
+        name: "function",
+        synopsis: "function NAME { COMMANDS ; }",
+        description: "Define a shell function (shell keyword).\n\
+                      Alternative to the `NAME() { ... }` form. The body runs each time\n\
+                      NAME is invoked, with positional parameters set from the call.",
+    },
+    HelpEntry {
+        name: "hash",
+        synopsis: "hash [-r] [-d NAME] [-p PATH NAME] [-lt] [NAME ...]",
+        description: "Manage the command path cache.\n\
+                      With no args, list cached entries. NAME alone resolves NAME via $PATH\n\
+                      and caches the result. -r clears the table; -d NAME removes one entry;\n\
+                      -p PATH NAME associates NAME with PATH directly; -l prints entries\n\
+                      in re-input form; -t NAME prints the cached path.\n\
+                      Note: huck's executor does not yet auto-populate the table.",
+    },
+    HelpEntry {
+        name: "help",
+        synopsis: "help [-sdm] [NAME ...]",
+        description: "Display help on huck's builtins.\n\
+                      With no args, list all builtins as `name: synopsis`. With NAME, print\n\
+                      synopsis + description. -s shows just the synopsis line; -d shows just\n\
+                      the description; -m formats the output as NAME/SYNOPSIS/DESCRIPTION\n\
+                      sections.",
+    },
+    HelpEntry {
+        name: "history",
+        synopsis: "history [N]",
+        description: "Display the command history.\n\
+                      With argument N, show the last N entries. With no arg, show all.",
+    },
+    HelpEntry {
+        name: "if",
+        synopsis: "if COMMANDS; then COMMANDS; [elif ...] [else COMMANDS;] fi",
+        description: "Conditional execution (shell keyword).\n\
+                      Evaluates the `if` condition; if its exit status is 0, runs the\n\
+                      `then` branch. Otherwise tries each `elif` branch in order; if\n\
+                      none match, runs the `else` branch (if present).",
+    },
+    HelpEntry {
+        name: "in",
+        synopsis: "in",
+        description: "Reserved word used in `for NAME in WORDS` and `case WORD in`.\n\
+                      Has no standalone meaning outside those contexts.",
+    },
+    HelpEntry {
+        name: "jobs",
+        synopsis: "jobs [-lpnrs] [JOB_SPEC ...]",
+        description: "List active jobs.\n\
+                      -l include PIDs; -p PIDs only; -n only changed jobs; -r running;\n\
+                      -s stopped. Without flags, lists all known jobs.",
+    },
+    HelpEntry {
+        name: "kill",
+        synopsis: "kill [-s SIGSPEC | -n SIGNUM | -SIGSPEC] PID|JOB ... | -l [SIGNUM]",
+        description: "Send a signal to a process or job.\n\
+                      SIGSPEC may be a number or a name (with or without SIG prefix).\n\
+                      With -l, list signal names (or the name for a numeric signal).",
+    },
+    HelpEntry {
+        name: "local",
+        synopsis: "local NAME[=VALUE] ...",
+        description: "Declare function-scoped variables.\n\
+                      Each NAME is created in the current function's local scope; its\n\
+                      pre-call state is snapshotted and restored when the function returns.\n\
+                      Errors with status 1 when used outside a function.",
+    },
+    HelpEntry {
+        name: "popd",
+        synopsis: "popd [+N | -N]",
+        description: "Pop a directory from the directory stack.\n\
+                      With no args, remove the top entry and cd to the new top.\n\
+                      With +N / -N, remove the Nth entry without cd (cd only if N == 0).",
+    },
+    HelpEntry {
+        name: "printf",
+        synopsis: "printf [-v VAR] FORMAT [ARGUMENTS]",
+        description: "Format and print ARGUMENTS under control of FORMAT.\n\
+                      Supports %s %d %i %u %o %x %X %c %% %b conversions; flags -+space#0;\n\
+                      width and .N precision; standard backslash escapes; format cycling.\n\
+                      With -v VAR, store the result in VAR instead of writing to stdout.\n\
+                      Float conversions and %q are deferred.",
+    },
+    HelpEntry {
+        name: "pushd",
+        synopsis: "pushd [DIR | +N | -N]",
+        description: "Push a directory onto the directory stack.\n\
+                      pushd DIR pushes DIR and cd's to it. Bare `pushd` swaps the top two\n\
+                      entries. pushd +N / -N rotates the stack so the Nth entry becomes top.",
+    },
+    HelpEntry {
+        name: "pwd",
+        synopsis: "pwd",
+        description: "Print the current working directory.",
+    },
+    HelpEntry {
+        name: "read",
+        synopsis: "read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]",
+        description: "Read a line from standard input.\n\
+                      With no NAME, store the line in REPLY. With one NAME, strip leading\n\
+                      and trailing IFS-whitespace and assign. With multiple NAMES, IFS-split;\n\
+                      the last NAME gets the unsplit remainder.\n\
+                      -r raw (no backslash escape processing). -p PROMPT writes a prompt\n\
+                      to stderr (tty only). -s suppresses echo (passwords). -d DELIM uses\n\
+                      DELIM as the line terminator.",
+    },
+    HelpEntry {
+        name: "readonly",
+        synopsis: "readonly [-p] [NAME[=VALUE] ...]",
+        description: "Mark variables as readonly.\n\
+                      Once readonly, the variable's value cannot change and the variable\n\
+                      cannot be unset. With NAME=VALUE, sets + locks. With NAME alone,\n\
+                      locks an existing variable (or creates an empty readonly variable).\n\
+                      -p (or no names) lists all readonly vars.",
+    },
+    HelpEntry {
+        name: "return",
+        synopsis: "return [N]",
+        description: "Return from a shell function.\n\
+                      With argument N, return that status; otherwise use $? from the last\n\
+                      command. Errors if used outside a function or sourced file.",
+    },
+    HelpEntry {
+        name: "set",
+        synopsis: "set [-- ARGUMENTS ...]",
+        description: "Set or replace positional parameters; or list all variables.\n\
+                      `set` (no args) lists all shell variables sorted. `set --` replaces\n\
+                      $1..$N with empty. `set -- A B C` replaces with A, B, C.\n\
+                      Option flags (-e, -u, -x, -o) are not yet supported.",
+    },
+    HelpEntry {
+        name: "shift",
+        synopsis: "shift [N]",
+        description: "Shift positional parameters.\n\
+                      Removes the first N positional parameters (default 1). Errors if N\n\
+                      exceeds the current count or is negative.",
+    },
+    HelpEntry {
+        name: "source",
+        synopsis: "source FILENAME [ARGUMENTS]",
+        description: "Execute commands from a file in the current shell.\n\
+                      Reads and executes commands from FILENAME in the current shell\n\
+                      context. If FILENAME does not contain a slash, $PATH is searched.\n\
+                      Synonym for `.`.",
+    },
+    HelpEntry {
+        name: "test",
+        synopsis: "test EXPRESSION",
+        description: "Evaluate a conditional expression.\n\
+                      Returns 0 if EXPRESSION is true, 1 if false, 2 on usage error.\n\
+                      Supports file (-f -d -r -w -x -e -s -L), string (-n -z =, !=), and\n\
+                      integer (-eq -ne -lt -gt -le -ge) tests; combinators (! && ||).\n\
+                      Synonym: `[` (with closing `]`).",
+    },
+    HelpEntry {
+        name: "then",
+        synopsis: "then COMMANDS",
+        description: "Begin the body of an `if` or `elif` branch (shell keyword).\n\
+                      Paired with the corresponding `if`/`elif` condition.",
+    },
+    HelpEntry {
+        name: "trap",
+        synopsis: "trap [-lp] [ACTION] [SIGSPEC ...]",
+        description: "Install signal/event handlers.\n\
+                      `trap ACTION SIGSPEC` runs ACTION when SIGSPEC fires (re-parses\n\
+                      ACTION at fire time). `trap - SIGSPEC` removes the handler.\n\
+                      `trap '' SIGSPEC` ignores the signal. -p prints current traps;\n\
+                      -l lists signal names. Pseudo-signals: EXIT, ERR, DEBUG, RETURN.",
+    },
+    HelpEntry {
+        name: "true",
+        synopsis: "true",
+        description: "Always exits 0. Arguments ignored.",
+    },
+    HelpEntry {
+        name: "type",
+        synopsis: "type [-aftpP] NAME ...",
+        description: "Describe how each NAME would be interpreted as a command.\n\
+                      Default: print 'NAME is a shell builtin/keyword/function/alias' or\n\
+                      'NAME is /path/to/exec'. -t prints just the type word.\n\
+                      -a lists all matches (alias, function, builtin, keyword, every $PATH\n\
+                      hit). -p prints the path only (silent for non-files). -P forces\n\
+                      $PATH search. -f skips function lookup.",
+    },
+    HelpEntry {
+        name: "typeset",
+        synopsis: "typeset [-rxifFp] [+rxi] [NAME[=VALUE] ...]",
+        description: "Synonym for `declare`. See `help declare`.",
+    },
+    HelpEntry {
+        name: "unalias",
+        synopsis: "unalias [-a] NAME ...",
+        description: "Remove aliases.\n\
+                      With -a, remove all aliases. Otherwise, remove each named alias.",
+    },
+    HelpEntry {
+        name: "unset",
+        synopsis: "unset NAME ...",
+        description: "Unset variables.\n\
+                      Each NAME is removed from the variable table. Errors with status 1\n\
+                      if NAME is readonly.",
+    },
+    HelpEntry {
+        name: "until",
+        synopsis: "until COMMANDS; do COMMANDS; done",
+        description: "Loop until a condition becomes true (shell keyword).\n\
+                      Runs the body while the `until` condition exits non-zero. The\n\
+                      mirror of `while`.",
+    },
+    HelpEntry {
+        name: "wait",
+        synopsis: "wait [-n] [-p VAR] [PID|JOB_SPEC ...]",
+        description: "Wait for processes to complete.\n\
+                      With no args, wait for all known jobs. With PID/JOB_SPEC, wait for\n\
+                      each. -n waits for any one to finish (returns its status). -p VAR\n\
+                      stores the finishing job's PID in VAR.",
+    },
+    HelpEntry {
+        name: "while",
+        synopsis: "while COMMANDS; do COMMANDS; done",
+        description: "Loop while a condition is true (shell keyword).\n\
+                      Runs the body while the `while` condition exits 0. The mirror of\n\
+                      `until`.",
+    },
+    HelpEntry {
+        name: "{",
+        synopsis: "{ COMMANDS ; }",
+        description: "Begin a brace group (shell keyword).\n\
+                      Groups COMMANDS into a single compound command that runs in the\n\
+                      current shell (no subshell). Closing `}` is a separate token; the\n\
+                      semicolon (or newline) before `}` is required.",
+    },
+    HelpEntry {
+        name: "}",
+        synopsis: "}",
+        description: "End a brace group (shell keyword).\n\
+                      Paired with the corresponding `{`.",
+    },
+];
+
+fn find_help(name: &str) -> Option<&'static HelpEntry> {
+    HELP_ENTRIES.iter().find(|e| e.name == name)
+}
+
+fn emit_help_entry(
+    entry: &HelpEntry,
+    out: &mut dyn std::io::Write,
+    want_synopsis: bool,
+    want_description: bool,
+    want_man: bool,
+) {
+    if want_man {
+        let _ = writeln!(out, "NAME");
+        let _ = writeln!(out, "    {}", entry.name);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "SYNOPSIS");
+        let _ = writeln!(out, "    {}", entry.synopsis);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "DESCRIPTION");
+        for line in entry.description.lines() {
+            let _ = writeln!(out, "    {}", line);
+        }
+        return;
+    }
+    if want_synopsis && !want_description {
+        let _ = writeln!(out, "{}: {}", entry.name, entry.synopsis);
+        return;
+    }
+    if want_description && !want_synopsis {
+        for line in entry.description.lines() {
+            let _ = writeln!(out, "{}", line);
+        }
+        return;
+    }
+    // Default (or -sd combined): synopsis + indented description.
+    let _ = writeln!(out, "{}: {}", entry.name, entry.synopsis);
+    for line in entry.description.lines() {
+        let _ = writeln!(out, "    {}", line);
+    }
+}
+
+fn builtin_help(
+    args: &[String],
+    out: &mut dyn std::io::Write,
+    _shell: &mut Shell,
+) -> ExecOutcome {
+    let mut want_synopsis = false;
+    let mut want_description = false;
+    let mut want_man = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        for &c in &arg.as_bytes()[1..] {
+            match c {
+                b's' => want_synopsis = true,
+                b'd' => want_description = true,
+                b'm' => want_man = true,
+                other => {
+                    eprintln!("huck: help: -{}: invalid option", other as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+        }
+        i += 1;
+    }
+    let names = &args[i..];
+
+    if names.is_empty() {
+        for entry in HELP_ENTRIES {
+            let _ = writeln!(out, "{}: {}", entry.name, entry.synopsis);
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut exit: i32 = 0;
+    for name in names {
+        match find_help(name) {
+            Some(entry) => emit_help_entry(
+                entry,
+                out,
+                want_synopsis,
+                want_description,
+                want_man,
+            ),
+            None => {
+                eprintln!("huck: help: no help topics match `{name}'");
+                exit = 1;
+            }
+        }
+    }
+    ExecOutcome::Continue(exit)
 }
 
 fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -7796,5 +8348,105 @@ mod eval_tests {
         let mut shell = Shell::new();
         let oc = run(&["exit", "7"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Exit(7)));
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str]) -> (ExecOutcome, String) {
+        let mut shell = Shell::new();
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("help", &args_owned, &mut buf, &mut shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn help_no_args_lists_all() {
+        let (oc, out) = run(&[]);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Sample a few we know exist.
+        assert!(out.lines().any(|l| l.starts_with("cd:")));
+        assert!(out.lines().any(|l| l.starts_with("echo:")));
+        assert!(out.lines().any(|l| l.starts_with("eval:")));
+    }
+
+    #[test]
+    fn help_named_builtin_default_form() {
+        let (oc, out) = run(&["cd"]);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(out.lines().any(|l| l.starts_with("cd:")));
+        // At least one indented continuation line.
+        assert!(out.lines().any(|l| l.starts_with("    ")));
+    }
+
+    #[test]
+    fn help_synopsis_only() {
+        let (oc, out) = run(&["-s", "echo"]);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Exactly one line starting with "echo:"; no indentation.
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("echo:"));
+    }
+
+    #[test]
+    fn help_description_only() {
+        let (oc, out) = run(&["-d", "echo"]);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // No line starts with "echo:".
+        assert!(out.lines().all(|l| !l.starts_with("echo:")));
+        // Has actual description text.
+        assert!(!out.trim().is_empty());
+    }
+
+    #[test]
+    fn help_man_format() {
+        let (oc, out) = run(&["-m", "echo"]);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(out.lines().any(|l| l == "NAME"));
+        assert!(out.lines().any(|l| l == "SYNOPSIS"));
+        assert!(out.lines().any(|l| l == "DESCRIPTION"));
+    }
+
+    #[test]
+    fn help_invalid_option() {
+        let (oc, _) = run(&["-X"]);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn help_not_found() {
+        let (oc, _) = run(&["__no_such_builtin__"]);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn help_multi_name_partial_miss() {
+        let (oc, out) = run(&["cd", "__no_such_builtin__"]);
+        // Overall exit 1 because of the miss; cd's content still in stdout.
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert!(out.lines().any(|l| l.starts_with("cd:")));
+    }
+
+    #[test]
+    fn help_keyword_lookup_works() {
+        // Shell keywords (if/for/while/etc.) have their own HelpEntry
+        // alongside builtins, so `help if` resolves rather than
+        // erroring with "no help topics match".
+        for kw in ["if", "for", "while", "case", "function", "[[", "{"] {
+            let (oc, out) = run(&[kw]);
+            assert!(
+                matches!(oc, ExecOutcome::Continue(0)),
+                "expected exit 0 for `help {kw}`",
+            );
+            assert!(
+                out.lines().any(|l| l.starts_with(&format!("{kw}:"))),
+                "expected `{kw}:` line in stdout for `help {kw}`; got: {out:?}",
+            );
+        }
     }
 }
