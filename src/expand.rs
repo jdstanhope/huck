@@ -487,6 +487,7 @@ fn expand_array_param(
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("huck: {name}: {e}");
+                    shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -2323,6 +2324,13 @@ mod assoc_expansion_tests {
         let mut s = shell_with_m();
         let words = expand_to_word_list_for_test(&mut s, r#""${!m[@]}""#);
         assert_eq!(words, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn quoted_star_keys_joins_by_ifs() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, r#""${!m[*]}""#);
+        assert_eq!(out, "first second third");
     }
 
     #[test]
