@@ -508,12 +508,13 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
 }
 
 /// `readonly [-p] [NAME[=VALUE] ...]`. POSIX special builtin. With no
-/// names (or with `-p`), lists every readonly variable in
-/// `readonly NAME='value'` form (using the existing single-quote
-/// escape). For each NAME=VALUE arg, sets the value and marks readonly;
-/// for each bare NAME arg, marks readonly (creating an empty var if
-/// unset). Refuses to overwrite an already-readonly variable. Invalid
-/// identifiers → status 1 (other args still processed).
+/// names (or with `-p`), lists every readonly variable in `declare -p`
+/// form (`declare -r NAME="value"` for scalars, `declare -ar NAME=(...)`
+/// for arrays) via `format_declare_line`. For each NAME=VALUE arg, sets
+/// the value and marks readonly; for each bare NAME arg, marks readonly
+/// (creating an empty var if unset). Refuses to overwrite an
+/// already-readonly variable. Invalid identifiers → status 1 (other
+/// args still processed).
 fn builtin_readonly(
     args: &[String],
     out: &mut dyn std::io::Write,
@@ -542,12 +543,14 @@ fn builtin_readonly(
 
     if names.is_empty() || want_list {
         for name in shell.readonly_names() {
-            let value = shell.lookup_var(&name).unwrap_or_default();
-            if let Err(e) = writeln!(
-                out,
-                "readonly {name}='{}'",
-                escape_alias_value(&value)
-            ) {
+            // Mirror `builtin_readonly_decl`: arrays must render via
+            // `format_declare_line` so a readonly array prints its full
+            // element list rather than collapsing to element 0.
+            let line = match shell.snapshot_var(&name) {
+                Some(var) => format_declare_line(&name, &var),
+                None => format!("declare -r {name}"),
+            };
+            if let Err(e) = writeln!(out, "{line}") {
                 eprintln!("huck: readonly: {e}");
                 return ExecOutcome::Continue(1);
             }
@@ -1157,12 +1160,19 @@ fn builtin_readonly_decl(
 
     if rest.is_empty() || want_list {
         for name in shell.readonly_names() {
-            let value = shell.lookup_var(&name).unwrap_or_default();
-            if let Err(e) = writeln!(
-                out,
-                "readonly {name}='{}'",
-                escape_alias_value(&value)
-            ) {
+            // Route through snapshot_var/format_declare_line so arrays
+            // render as `declare -ar a=([0]="x" [1]="y")` instead of
+            // collapsing to element 0 via scalar_view().
+            let line = match shell.snapshot_var(&name) {
+                Some(var) => format_declare_line(&name, &var),
+                None => {
+                    // Marked readonly but never assigned: emit just the
+                    // bare attribute form, mirroring `declare -p` for
+                    // attribute-only variables.
+                    format!("declare -r {name}")
+                }
+            };
+            if let Err(e) = writeln!(out, "{line}") {
                 eprintln!("huck: readonly: {e}");
                 return ExecOutcome::Continue(1);
             }
@@ -7952,10 +7962,10 @@ mod readonly_tests {
         let outcome = run_builtin("readonly", &[], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
-        // Sorted; POSIX-escape format.
+        // declare -p style listing; scalars render with `-r` attrs.
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.contains(&"readonly X='v'"));
-        assert!(lines.contains(&"readonly Y='w'"));
+        assert!(lines.contains(&r#"declare -r X="v""#));
+        assert!(lines.contains(&r#"declare -r Y="w""#));
     }
 
     #[test]
@@ -7967,7 +7977,7 @@ mod readonly_tests {
         let outcome = run_builtin("readonly", &["-p".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.lines().any(|l| l == "readonly X='v'"));
+        assert!(out.lines().any(|l| l == r#"declare -r X="v""#));
     }
 
     #[test]
@@ -9480,5 +9490,37 @@ mod array_declare_tests {
             ExecOutcome::Continue(1) | ExecOutcome::Exit(1)
         ));
         assert!(s.get_array("a").is_none());
+    }
+
+    #[test]
+    fn readonly_p_lists_array_with_full_elements() {
+        // Regression: `readonly -p` used to route through scalar_view and
+        // collapse arrays to element 0. The fix routes through
+        // format_declare_line so all elements survive.
+        let mut s = Shell::new();
+        let _ = run(&mut s, "readonly a=(x y z)");
+        let (_, v) = s
+            .iter_vars()
+            .find(|(n, _)| n.as_str() == "a")
+            .expect("a is set");
+        let line = format_declare_line("a", v);
+        assert_eq!(line, r#"declare -ar a=([0]="x" [1]="y" [2]="z")"#);
+
+        // Also exercise the dispatched listing path end-to-end so we
+        // don't drift on the writeln formatting.
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin(
+            "readonly",
+            &[DeclArg::Plain("-p".to_string())],
+            &mut buf,
+            &mut s,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.lines()
+                .any(|l| l == r#"declare -ar a=([0]="x" [1]="y" [2]="z")"#),
+            "stdout: {out:?}",
+        );
     }
 }

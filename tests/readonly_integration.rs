@@ -42,7 +42,7 @@ fn readonly_basic_blocks_reassignment() {
 fn readonly_lists_in_posix_format() {
     let (out, _) = run_capture("readonly X='a b'\nreadonly\nexit\n");
     assert!(
-        out.lines().any(|l| l == "readonly X='a b'"),
+        out.lines().any(|l| l == r#"declare -r X="a b""#),
         "stdout: {out:?}",
     );
 }
@@ -87,8 +87,10 @@ fn readonly_with_single_quote_listing_escapes() {
     let (out, _) = run_capture(
         "readonly X=\"a'b\"\nreadonly\nexit\n",
     );
+    // declare -p style; the embedded single quote needs no escaping inside
+    // a double-quoted value.
     assert!(
-        out.lines().any(|l| l == r"readonly X='a'\''b'"),
+        out.lines().any(|l| l == r#"declare -r X="a'b""#),
         "stdout: {out:?}",
     );
 }
