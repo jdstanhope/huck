@@ -116,12 +116,13 @@ fn eval_subscript(
     }
 }
 
-/// Bash-style word-list slicing per `${a[@]:off:len}` / `${@:off:len}`.
-/// A negative `offset` counts from the end of the present-element
-/// list; a negative `length` selects `total + length - start` items
-/// (clamped to `>= start`). Returns `Err(msg)` if the operand arith
-/// fails. Shared by the array path and the positional-param path
-/// (closes v33's `${@:o:l}` / `${*:o:l}` deferral).
+/// Slices a word list per `${a[@]:off:len}` semantics. Negative offset
+/// counts from the end of the value list; negative length means "index
+/// from end". Used by the array `[@]`/`[*]` slicing path. Note: the
+/// positional-param path (`${@:o:l}` / `${*:o:l}`) is `expand_positional_substring`,
+/// which duplicates this arithmetic to handle bash's `$0`-prepend
+/// semantics for offset 0 — they intentionally do not share an
+/// implementation.
 pub(crate) fn slice_word_list(
     values: &[String],
     offset: &Word,
@@ -316,7 +317,14 @@ fn expand_array_param(
         }
         // ${#a[i]} — char count of the element at `i`.
         (PM::Length, SK::Index(w)) => {
-            let idx = eval_subscript(w, shell, name).unwrap_or_default();
+            let idx = match eval_subscript(w, shell, name) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("huck: {e}");
+                    shell.pending_fatal_pe_error = Some(1);
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+            };
             let val = shell.lookup_array_element(name, idx).unwrap_or_default();
             ExpansionResult::Value(val.chars().count().to_string())
         }
@@ -1992,6 +2000,25 @@ mod array_expansion_tests {
         let _ = expand_for_test(&mut s, "${a[99]}");
         assert!(s.pending_fatal_pe_error.is_some());
     }
+
+    #[test]
+    fn slicing_negative_length_indexes_from_end() {
+        let mut s = shell_with_a();
+        let words = expand_to_word_list_for_test(&mut s, r#""${a[@]:1:-1}""#);
+        // Bash: ${a[@]:1:-1} starts at index 1, ends one-before-last. Returns ["y"].
+        assert_eq!(words, vec!["y"]);
+    }
+
+    #[test]
+    fn length_of_element_at_bad_subscript_errors() {
+        // ${#nonexistent[-1]} — negative subscript on an unset array
+        // cannot wrap (no max index), so eval_subscript returns Err.
+        // The fix to (PM::Length, SK::Index) must propagate that error
+        // rather than silently using idx 0.
+        let mut s = Shell::new();
+        let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
+        assert!(s.pending_fatal_pe_error.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -2055,5 +2082,22 @@ mod positional_slicing_tests {
         let mut s = shell_with_posargs();
         let out = expand_for_test(&mut s, r#""${*:1:3}""#);
         assert_eq!(out, "a b c");
+    }
+
+    #[test]
+    fn at_slice_offset_zero_includes_dollar_zero() {
+        let mut s = shell_with_posargs();
+        s.shell_argv0 = "huck".to_string();
+        let words = expand_to_word_list_for_test(&mut s, r#""${@:0:2}""#);
+        // Bash returns "huck a" for ${@:0:2} when $0 is "huck" and positionals are [a,b,c,d].
+        assert_eq!(words, vec!["huck", "a"]);
+    }
+
+    #[test]
+    fn at_slice_negative_length_indexes_from_end() {
+        let mut s = shell_with_posargs();
+        let words = expand_to_word_list_for_test(&mut s, r#""${@:1:-1}""#);
+        // Bash: ${@:1:-1} starts at $1, ends one-before-last. Returns ["a", "b", "c"].
+        assert_eq!(words, vec!["a", "b", "c"]);
     }
 }
