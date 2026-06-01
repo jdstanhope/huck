@@ -19,6 +19,21 @@ pub enum StdoutSink<'a> {
     Capture(&'a mut Vec<u8>),
 }
 
+/// Called after a simple command's status is set. If errexit is on, the
+/// status is non-zero, and we're not in an err-suppressed context (matches
+/// v36's ERR-trap gate), returns the Exit outcome to terminate the shell
+/// with that status. Caller propagates the outcome with an early return.
+fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
+    if shell.shell_options.errexit
+        && shell.err_suppressed_depth == 0
+        && status != 0
+    {
+        Some(ExecOutcome::Exit(status))
+    } else {
+        None
+    }
+}
+
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
     if seq.background {
@@ -90,6 +105,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         let next_is_or = matches!(seq.rest.first(), Some((Connector::Or, _)));
         if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
             crate::traps::fire_err_trap(shell);
+            if let Some(out) = maybe_errexit(shell, c) {
+                return out;
+            }
         }
     }
     for i in 0..seq.rest.len() {
@@ -120,6 +138,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 let next_is_or = matches!(seq.rest.get(i + 1), Some((Connector::Or, _)));
                 if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
                     crate::traps::fire_err_trap(shell);
+                    if let Some(out) = maybe_errexit(shell, c) {
+                        return out;
+                    }
                 }
             }
         }

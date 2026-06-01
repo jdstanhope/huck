@@ -823,6 +823,10 @@ fn read_dollar_expansion(
             chars.next();
             parts.push(WordPart::Var { name: "!".to_string(), quoted });
         }
+        Some('-') => {
+            chars.next();
+            parts.push(WordPart::Var { name: "-".to_string(), quoted });
+        }
         Some(c) if c.is_ascii_digit() => {
             let d = chars.next().unwrap();
             parts.push(WordPart::Var { name: d.to_string(), quoted });

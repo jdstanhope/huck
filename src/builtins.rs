@@ -2956,6 +2956,50 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
     ExecOutcome::Continue(0)
 }
 
+struct OptionInfo {
+    name: &'static str,
+    #[allow(dead_code)]
+    short: Option<char>,
+}
+
+const SHELL_OPTIONS: &[OptionInfo] = &[
+    OptionInfo { name: "errexit", short: Some('e') },
+    OptionInfo { name: "nounset", short: Some('u') },
+];
+
+fn option_get(shell: &Shell, name: &str) -> Option<bool> {
+    match name {
+        "errexit" => Some(shell.shell_options.errexit),
+        "nounset" => Some(shell.shell_options.nounset),
+        _ => None,
+    }
+}
+
+fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), ()> {
+    match name {
+        "errexit" => { shell.shell_options.errexit = value; Ok(()) }
+        "nounset" => { shell.shell_options.nounset = value; Ok(()) }
+        _ => Err(()),
+    }
+}
+
+fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+    for opt in SHELL_OPTIONS {
+        let val = option_get(shell, opt.name).unwrap_or(false);
+        let _ = writeln!(out, "{:<16}{}", opt.name, if val { "on" } else { "off" });
+    }
+    ExecOutcome::Continue(0)
+}
+
+fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+    for opt in SHELL_OPTIONS {
+        let val = option_get(shell, opt.name).unwrap_or(false);
+        let sign = if val { '-' } else { '+' };
+        let _ = writeln!(out, "set {sign}o {}", opt.name);
+    }
+    ExecOutcome::Continue(0)
+}
+
 fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
@@ -2968,17 +3012,117 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
         return ExecOutcome::Continue(0);
     }
 
-    let first = &args[0];
-    if first == "--" {
-        shell.positional_args = args[1..].to_vec();
-        return ExecOutcome::Continue(0);
+    // Parse leading flags. After flags (or `--`), remaining args replace
+    // positional parameters. Reaching the end of args without seeing a non-
+    // flag arg means flag-only invocation — positional args UNCHANGED.
+    let mut i = 0;
+    let mut saw_terminator = false;
+    let mut saw_non_flag = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            saw_terminator = true;
+            i += 1;
+            break;
+        }
+        if arg == "-o" {
+            i += 1;
+            if i >= args.len() {
+                return print_options_table(out, shell);
+            }
+            if option_set(shell, &args[i], true).is_err() {
+                eprintln!("huck: set: -o: invalid option name: {}", args[i]);
+                return ExecOutcome::Continue(2);
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "+o" {
+            i += 1;
+            if i >= args.len() {
+                return print_options_reinput(out, shell);
+            }
+            if option_set(shell, &args[i], false).is_err() {
+                eprintln!("huck: set: +o: invalid option name: {}", args[i]);
+                return ExecOutcome::Continue(2);
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() >= 2 {
+            // Short-flag cluster like `-e`, `-u`, `-eu`, or `-eo NAME`
+            // where `o` inside the cluster consumes the NEXT arg as
+            // the long-form option name (matches bash).
+            for &c in &arg.as_bytes()[1..] {
+                match c {
+                    b'e' => shell.shell_options.errexit = true,
+                    b'u' => shell.shell_options.nounset = true,
+                    b'o' => {
+                        i += 1;
+                        if i >= args.len() {
+                            return print_options_table(out, shell);
+                        }
+                        if option_set(shell, &args[i], true).is_err() {
+                            eprintln!(
+                                "huck: set: -o: invalid option name: {}",
+                                args[i]
+                            );
+                            return ExecOutcome::Continue(2);
+                        }
+                    }
+                    other => {
+                        eprintln!(
+                            "huck: set: -{}: not yet supported in this version",
+                            other as char
+                        );
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('+') && arg.len() >= 2 {
+            for &c in &arg.as_bytes()[1..] {
+                match c {
+                    b'e' => shell.shell_options.errexit = false,
+                    b'u' => shell.shell_options.nounset = false,
+                    b'o' => {
+                        i += 1;
+                        if i >= args.len() {
+                            return print_options_reinput(out, shell);
+                        }
+                        if option_set(shell, &args[i], false).is_err() {
+                            eprintln!(
+                                "huck: set: +o: invalid option name: {}",
+                                args[i]
+                            );
+                            return ExecOutcome::Continue(2);
+                        }
+                    }
+                    other => {
+                        eprintln!(
+                            "huck: set: +{}: not yet supported in this version",
+                            other as char
+                        );
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Non-flag arg — break out to positional-replacement.
+        saw_non_flag = true;
+        break;
     }
-    if (first.starts_with('-') || first.starts_with('+')) && first.len() > 1 {
-        eprintln!("huck: set: {first}: options not yet supported in this version");
-        return ExecOutcome::Continue(2);
+
+    // Positional-args replacement: triggered by an explicit `--` terminator
+    // or by encountering a non-flag arg. Pure flag-only invocations leave
+    // positional args alone.
+    if saw_terminator || saw_non_flag {
+        shell.positional_args = args[i..].to_vec();
     }
-    // No leading -- or option flag — replace positional with all args.
-    shell.positional_args = args.to_vec();
     ExecOutcome::Continue(0)
 }
 
@@ -6684,10 +6828,11 @@ mod set_tests {
     }
 
     #[test]
-    fn set_dash_e_rejects_with_status_2() {
+    fn set_dash_x_rejects_with_status_2() {
+        // -x (xtrace) remains deferred per v69 scope.
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &["-e".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("set", &["-x".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8448,5 +8593,138 @@ mod help_tests {
                 "expected `{kw}:` line in stdout for `help {kw}`; got: {out:?}",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod set_options_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("set", &args_owned, &mut buf, shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn set_e_enables_errexit() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-e"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit);
+    }
+
+    #[test]
+    fn set_plus_e_disables() {
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        let (oc, _) = run(&["+e"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.errexit);
+    }
+
+    #[test]
+    fn set_o_errexit_long_form() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "errexit"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit);
+    }
+
+    #[test]
+    fn set_plus_o_errexit_disables() {
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        let (oc, _) = run(&["+o", "errexit"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.errexit);
+    }
+
+    #[test]
+    fn set_dollar_dash_reflects_flags() {
+        let mut shell = Shell::new();
+        // No flags set, not interactive by default in tests.
+        let dash = shell.lookup_var("-").unwrap_or_default();
+        assert!(dash.is_empty() || dash == "i");
+        // Enable errexit.
+        run(&["-e"], &mut shell);
+        let dash = shell.lookup_var("-").unwrap_or_default();
+        assert!(dash.contains('e'));
+        // Enable nounset.
+        run(&["-u"], &mut shell);
+        let dash = shell.lookup_var("-").unwrap_or_default();
+        assert!(dash.contains('e'));
+        assert!(dash.contains('u'));
+    }
+
+    #[test]
+    fn set_invalid_o_name_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_o_listing_shows_state() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-o"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(out.lines().any(|l| l.starts_with("errexit")));
+        assert!(out.lines().any(|l| l.starts_with("nounset")));
+    }
+
+    #[test]
+    fn set_plus_o_listing_reinput_form() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["+o"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Both off by default.
+        assert!(out.lines().any(|l| l == "set +o errexit"));
+        assert!(out.lines().any(|l| l == "set +o nounset"));
+    }
+
+    #[test]
+    fn set_eu_cluster() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-eu"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit);
+        assert!(shell.shell_options.nounset);
+    }
+
+    #[test]
+    fn set_dash_dash_resets_positional() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-e", "--", "a", "b", "c"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit);
+        assert_eq!(shell.positional_args, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn set_dash_eo_cluster_consumes_next_arg_as_name() {
+        // Regression: bash treats `-eo NAME` as enabling -e then
+        // -o NAME (the o-in-cluster consumes the next arg as the
+        // option name). Previously huck rejected the o-in-cluster
+        // as "not yet supported".
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-eo", "nounset"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.errexit, "expected errexit on");
+        assert!(shell.shell_options.nounset, "expected nounset on");
+    }
+
+    #[test]
+    fn set_plus_eo_cluster_consumes_next_arg_as_name() {
+        // Symmetric: `+eo NAME` disables -e then -o NAME.
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        shell.shell_options.nounset = true;
+        let (oc, _) = run(&["+eo", "nounset"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.errexit, "expected errexit off");
+        assert!(!shell.shell_options.nounset, "expected nounset off");
     }
 }

@@ -13,6 +13,15 @@ pub struct Variable {
     pub integer: bool,
 }
 
+/// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
+/// Extend the struct AND the option-name table in `src/builtins.rs`
+/// together when adding a new option.
+#[derive(Debug, Clone, Default)]
+pub struct ShellOptions {
+    pub errexit: bool,
+    pub nounset: bool,
+}
+
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
 /// the process environment huck inherited at startup, every one marked
@@ -56,6 +65,10 @@ pub struct Shell {
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
+
+    /// Persistent shell-option flags toggled by `set -e`/`-u`/`-o NAME`.
+    /// See `ShellOptions` for the field list.
+    pub shell_options: ShellOptions,
 
     /// Registered trap handlers. `None` value = ignore that signal
     /// (corresponds to `trap "" SIGNAL`); `Some(text)` = action to
@@ -134,6 +147,7 @@ impl Shell {
             function_arg0: Vec::new(),
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
+            shell_options: ShellOptions::default(),
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             trap_sigids: std::collections::HashMap::new(),
@@ -154,6 +168,18 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.as_str())
     }
 
+    /// Returns the value of `$-` — alphabetical concatenation of
+    /// short-flag letters reflecting current shell-options state
+    /// and the interactive flag. Order: `e` (errexit), `i`
+    /// (interactive), `u` (nounset).
+    pub fn dollar_dash_value(&self) -> String {
+        let mut out = String::new();
+        if self.shell_options.errexit { out.push('e'); }
+        if self.is_interactive { out.push('i'); }
+        if self.shell_options.nounset { out.push('u'); }
+        out
+    }
+
     /// Variable lookup for expansion. Recognises positional names
     /// (`"1"`-`"9"`/`"10"`/..., and `"#"`) before falling back to the
     /// regular variable HashMap. Returns an owned `String` because
@@ -170,6 +196,7 @@ impl Shell {
                 // any background has happened (v26 spec §lookup_var changes).
                 self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default()
             ),
+            "-" => return Some(self.dollar_dash_value()),
             _ => {}
         }
         if name == "#" {
