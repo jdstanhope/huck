@@ -85,6 +85,302 @@ impl Default for Field {
     }
 }
 
+/// Arith-evaluates an array subscript `Word` to a `usize`, honouring
+/// bash's bash-4.3+ rule that a negative result counts from the end:
+/// `${a[-1]}` is the highest-subscript element. Returns `Err(msg)` if
+/// the subscript fails to parse/eval, or if the wrap-around still
+/// yields a negative index. The caller decides whether to print the
+/// diagnostic and set `pending_fatal_pe_error`.
+fn eval_subscript(
+    subscript: &Word,
+    shell: &mut Shell,
+    name: &str,
+) -> Result<usize, String> {
+    let s = crate::param_expansion::expand_word_to_string(subscript, shell);
+    let expr = crate::arith::parse(&s)
+        .map_err(|_| format!("{name}: bad array subscript"))?;
+    let n = crate::arith::eval(&expr, shell)
+        .map_err(|_| format!("{name}: bad array subscript"))?;
+    if n >= 0 {
+        Ok(n as usize)
+    } else {
+        let max = shell
+            .array_max_index(name)
+            .ok_or_else(|| format!("{name}: bad array subscript"))?;
+        let wrapped = max as i64 + 1 + n;
+        if wrapped < 0 {
+            Err(format!("{name}: bad array subscript"))
+        } else {
+            Ok(wrapped as usize)
+        }
+    }
+}
+
+/// Bash-style word-list slicing per `${a[@]:off:len}` / `${@:off:len}`.
+/// A negative `offset` counts from the end of the present-element
+/// list; a negative `length` selects `total + length - start` items
+/// (clamped to `>= start`). Returns `Err(msg)` if the operand arith
+/// fails. Shared by the array path and the positional-param path
+/// (closes v33's `${@:o:l}` / `${*:o:l}` deferral).
+pub(crate) fn slice_word_list(
+    values: &[String],
+    offset: &Word,
+    length: Option<&Word>,
+    shell: &mut Shell,
+) -> Result<Vec<String>, String> {
+    let off_s = crate::param_expansion::expand_word_to_string(offset, shell);
+    let off_n = crate::arith::parse(&off_s)
+        .and_then(|e| crate::arith::eval(&e, shell))
+        .map_err(|_| "bad slice offset".to_string())?;
+    let total = values.len() as i64;
+    let start = if off_n >= 0 {
+        (off_n as usize).min(values.len())
+    } else {
+        ((total + off_n).max(0) as usize).min(values.len())
+    };
+    let end = match length {
+        Some(lw) => {
+            let len_s = crate::param_expansion::expand_word_to_string(lw, shell);
+            let len_n = crate::arith::parse(&len_s)
+                .and_then(|e| crate::arith::eval(&e, shell))
+                .map_err(|_| "bad slice length".to_string())?;
+            if len_n < 0 {
+                (((total + len_n).max(start as i64)) as usize).min(values.len())
+            } else {
+                ((start as i64 + len_n) as usize).min(values.len())
+            }
+        }
+        None => values.len(),
+    };
+    Ok(values[start..end].to_vec())
+}
+
+/// Handles `${@:o:l}` / `${*:o:l}` — the positional-param slicing
+/// case (v33 deferral). Bash's `${@:o:l}` uses 1-based indexing when
+/// off >= 1 (since `$0` is the script name, not in `$@`); we follow
+/// that convention: positive offsets are relative to `${1}`, negative
+/// offsets count from the end.
+fn expand_positional_substring(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    quoted: bool,
+    shell: &mut Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::lexer::ParamModifier as PM;
+    use crate::param_expansion::ExpansionResult;
+    let (offset, length) = match modifier {
+        PM::Substring { offset, length } => (offset, length.as_ref()),
+        _ => unreachable!("caller checks ParamModifier::Substring"),
+    };
+    // Bash: `${@:0}` includes `$0`; `${@:1}` is the regular positional list.
+    // We model this as: prepend `$0` then take slice with the user's offset.
+    let mut values: Vec<String> = Vec::with_capacity(shell.positional_args.len() + 1);
+    values.push(
+        shell
+            .function_arg0
+            .last()
+            .cloned()
+            .unwrap_or_else(|| shell.shell_argv0.clone()),
+    );
+    values.extend(shell.positional_args.iter().cloned());
+    // Evaluate user offset; if it's >= 0, do NOT auto-shift (matches bash:
+    // `${@:0}` is the whole list including $0; `${@:1}` starts at $1).
+    let off_s = crate::param_expansion::expand_word_to_string(offset, shell);
+    let off_n = match crate::arith::parse(&off_s).and_then(|e| crate::arith::eval(&e, shell)) {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("huck: {name}: bad slice offset");
+            return ExpansionResult::Fatal { status: 1 };
+        }
+    };
+    // For the negative case, bash counts from the end of the present
+    // positional list (i.e. excluding `$0`). We have prepended `$0`, so
+    // adjust: `${@: -k}` means "last k positionals" not "last k of $0+positionals".
+    let posargs_len = shell.positional_args.len() as i64;
+    let start = if off_n >= 0 {
+        (off_n as usize).min(values.len())
+    } else {
+        // negative: count from end of positionals; $0 is at index 0 in
+        // `values` so the positional region is `1..=posargs_len`.
+        // start = 1 + (posargs_len + off_n), clamped to [1, len].
+        let raw = 1 + (posargs_len + off_n);
+        if raw < 1 {
+            1usize
+        } else {
+            (raw as usize).min(values.len())
+        }
+    };
+    let end = match length {
+        Some(lw) => {
+            let len_s = crate::param_expansion::expand_word_to_string(lw, shell);
+            let len_n = match crate::arith::parse(&len_s).and_then(|e| crate::arith::eval(&e, shell)) {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("huck: {name}: bad slice length");
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+            };
+            if len_n < 0 {
+                let total = values.len() as i64;
+                (((total + len_n).max(start as i64)) as usize).min(values.len())
+            } else {
+                ((start as i64 + len_n) as usize).min(values.len())
+            }
+        }
+        None => values.len(),
+    };
+    let sliced = values[start..end].to_vec();
+    // Result shape: quoted `@` produces separate fields (WordList); all
+    // other forms produce a single IFS-joined value.
+    if name == "@" && quoted {
+        ExpansionResult::WordList(sliced)
+    } else {
+        let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+        let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+        ExpansionResult::Value(sliced.join(&sep))
+    }
+}
+
+/// Dispatches `${a[...]}` forms. The `subscript` field of
+/// `WordPart::ParamExpansion` distinguishes `[@]`, `[*]`, and
+/// `[<expr>]`; the `modifier` is the scalar-style suffix (or
+/// `ParamModifier::None` for bare `${a[i]}`).
+fn expand_array_param(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    subscript: &crate::lexer::SubscriptKind,
+    quoted: bool,
+    shell: &mut Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::lexer::{ParamModifier as PM, SubscriptKind as SK};
+    use crate::param_expansion::ExpansionResult;
+
+    if shell.pending_fatal_pe_error.is_some() {
+        return ExpansionResult::Empty;
+    }
+
+    // Snapshot the array's values / keys in subscript-ascending order.
+    let collect_values = |sh: &Shell| -> Vec<String> {
+        match sh.get_array(name) {
+            Some(m) => m.values().cloned().collect(),
+            None => match sh.get(name) {
+                Some(s) => vec![s.to_string()],
+                None => Vec::new(),
+            },
+        }
+    };
+    let collect_keys = |sh: &Shell| -> Vec<usize> {
+        match sh.get_array(name) {
+            Some(m) => m.keys().copied().collect(),
+            None => match sh.get(name) {
+                Some(_) => vec![0],
+                None => Vec::new(),
+            },
+        }
+    };
+
+    match (modifier, subscript) {
+        // ${a[@]} / ${a[*]} — pure expansion, no scalar modifier.
+        (PM::None, SK::All) => ExpansionResult::WordList(collect_values(shell)),
+        (PM::None, SK::Star) => {
+            // Quoted `${a[*]}` joins with first IFS char; unquoted is
+            // also joined-then-split (we hand back Value and let the
+            // consumer's split path do the rest, so emitting a single
+            // joined string here matches both quoted and unquoted
+            // semantics modulo the consumer's split step).
+            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            ExpansionResult::Value(collect_values(shell).join(&sep))
+        }
+        // ${a[i]} — read a specific element.
+        (PM::None, SK::Index(w)) => {
+            let idx = match eval_subscript(w, shell, name) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("huck: {e}");
+                    shell.pending_fatal_pe_error = Some(1);
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+            };
+            let val = shell.lookup_array_element(name, idx);
+            if val.is_none() && shell.shell_options.nounset {
+                eprintln!("huck: {name}[{idx}]: unbound variable");
+                shell.pending_fatal_pe_error = Some(1);
+                return ExpansionResult::Fatal { status: 1 };
+            }
+            ExpansionResult::Value(val.unwrap_or_default())
+        }
+        // ${#a[@]} / ${#a[*]} — element count (NOT max index).
+        (PM::Length, SK::All) | (PM::Length, SK::Star) => {
+            ExpansionResult::Value(collect_keys(shell).len().to_string())
+        }
+        // ${#a[i]} — char count of the element at `i`.
+        (PM::Length, SK::Index(w)) => {
+            let idx = eval_subscript(w, shell, name).unwrap_or_default();
+            let val = shell.lookup_array_element(name, idx).unwrap_or_default();
+            ExpansionResult::Value(val.chars().count().to_string())
+        }
+        // ${!a[@]} / ${!a[*]} — list of subscripts.
+        (PM::IndirectKeys, SK::All) | (PM::IndirectKeys, SK::Star) => {
+            let keys: Vec<String> = collect_keys(shell)
+                .iter()
+                .map(usize::to_string)
+                .collect();
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(keys)
+            } else {
+                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                ExpansionResult::Value(keys.join(&sep))
+            }
+        }
+        // `${!a[i]}` — not supported in v71 (would be "indirect ref
+        // through array element"); produce empty.
+        (PM::IndirectKeys, SK::Index(_)) => ExpansionResult::Value(String::new()),
+        // ${a[@]:o:l} / ${a[*]:o:l} — slicing.
+        (PM::Substring { offset, length }, SK::All) | (PM::Substring { offset, length }, SK::Star) => {
+            let values = collect_values(shell);
+            let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("huck: {name}: {e}");
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+            };
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(sliced)
+            } else {
+                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                ExpansionResult::Value(sliced.join(&sep))
+            }
+        }
+        // ${a[i]:...} — scalar-style modifier on a single element.
+        // Delegate to the scalar path with an override value.
+        (modif, SK::Index(w)) => {
+            let idx = match eval_subscript(w, shell, name) {
+                Ok(i) => i,
+                Err(_) => return ExpansionResult::Value(String::new()),
+            };
+            let val = shell.lookup_array_element(name, idx);
+            crate::param_expansion::expand_modifier_with_value(
+                name,
+                modif,
+                val.as_deref(),
+                shell,
+            )
+        }
+        // Other scalar modifiers on @/* — explicit error for v71 scope.
+        (other, SK::All | SK::Star) => {
+            eprintln!(
+                "huck: ${{{name}[…]}}: modifier {:?} not supported on array in v71",
+                other
+            );
+            ExpansionResult::Value(String::new())
+        }
+    }
+}
+
 /// Expands a `Word` against the current `Shell` state into 0 or more
 /// `Field`s. Quoted variable references append their value verbatim;
 /// unquoted references split on ASCII whitespace and can yield multiple
@@ -215,8 +511,21 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, .. } => {
-                match crate::param_expansion::expand_modifier(name, modifier, shell) {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
+                // Substring on `$@` / `$*` is array-shaped (closes v33's
+                // `${@:o:l}` deferral) — route through the shared
+                // word-list path even though there's no `subscript`.
+                let result_pe = if let Some(sub) = subscript {
+                    expand_array_param(name, modifier, sub, *quoted, shell)
+                } else if matches!(
+                    (name.as_str(), modifier),
+                    ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
+                ) {
+                    expand_positional_substring(name, modifier, *quoted, shell)
+                } else {
+                    crate::param_expansion::expand_modifier(name, modifier, shell)
+                };
+                match result_pe {
                     crate::param_expansion::ExpansionResult::Value(v) => {
                         if *quoted {
                             current.push_str(&v, true);
@@ -227,6 +536,31 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                     crate::param_expansion::ExpansionResult::Empty => {
                         has_emitted = true;
+                    }
+                    crate::param_expansion::ExpansionResult::WordList(words) => {
+                        if *quoted {
+                            // Quoted `@`-style: each element is its own
+                            // field, no IFS-splitting. Mirrors the
+                            // `"$@"` path above.
+                            if !words.is_empty() {
+                                for (i, w) in words.iter().enumerate() {
+                                    if i > 0 {
+                                        result.push(std::mem::take(&mut current));
+                                    }
+                                    current.push_str(w, true);
+                                    has_emitted = true;
+                                }
+                            }
+                        } else {
+                            // Unquoted: join with first IFS char then
+                            // let word-splitting do the rest.
+                            let ifs = shell
+                                .lookup_var("IFS")
+                                .unwrap_or_else(|| " \t\n".to_string());
+                            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                            let joined = words.join(&sep);
+                            emit_split_fields(&joined, &mut current, &mut result, &mut has_emitted);
+                        }
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
                         shell.pending_fatal_pe_error = Some(status);
@@ -304,10 +638,30 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, .. } => {
-                match crate::param_expansion::expand_modifier(name, modifier, shell) {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
+                let result_pe = if let Some(sub) = subscript {
+                    expand_array_param(name, modifier, sub, *quoted, shell)
+                } else if matches!(
+                    (name.as_str(), modifier),
+                    ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
+                ) {
+                    expand_positional_substring(name, modifier, *quoted, shell)
+                } else {
+                    crate::param_expansion::expand_modifier(name, modifier, shell)
+                };
+                match result_pe {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
                     crate::param_expansion::ExpansionResult::Empty => {}
+                    crate::param_expansion::ExpansionResult::WordList(words) => {
+                        // Assignment context: no field splitting. Join
+                        // with first IFS char (matches `${a[*]}` and the
+                        // existing `WordPart::AllArgs` assignment path).
+                        let ifs = shell
+                            .lookup_var("IFS")
+                            .unwrap_or_else(|| " \t\n".to_string());
+                        let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                        result.push_str(&words.join(&sep));
+                    }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
                         shell.pending_fatal_pe_error = Some(status);
                         return result;
@@ -1493,5 +1847,213 @@ mod tests {
         assert_eq!(fields[0].chars, "hello");
         assert_eq!(fields[1].chars, "world");
         assert_eq!(fields[2].chars, "x");
+    }
+}
+
+#[cfg(test)]
+mod array_expansion_tests {
+    //! Task 3 (v71) end-to-end array expansion + positional slicing.
+    //!
+    //! Tests drive the full lex→Word→expand pipeline so the lexer's
+    //! subscript handling and the new `expand_array_param` /
+    //! `slice_word_list` paths are exercised together.
+
+    use super::*;
+    use crate::command::{Command, SimpleCommand};
+    use crate::shell_state::Shell;
+
+    /// Lex the input as `echo <input>` and return the first argument
+    /// Word. Avoids constructing `WordPart::ParamExpansion` literals by
+    /// hand and keeps the tests aligned with what the lexer actually
+    /// produces (matters for the lexer-touching `${!a[@]}` shape).
+    fn first_arg_word(input: &str) -> Word {
+        let src = format!("echo {input}");
+        let tokens = crate::lexer::tokenize(&src).expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            other => panic!("expected Pipeline, got {other:?}"),
+        };
+        match &pipeline.commands[0] {
+            Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
+            other => panic!("expected SimpleCommand::Exec, got {other:?}"),
+        }
+    }
+
+    /// Run `expand` on the lexed input and return a single string
+    /// formed by joining the resulting fields with a space. Used for
+    /// tests that expect a single conceptual "string" result (e.g.
+    /// `${a[i]}` reads, `${#a[@]}` counts, `${!a[@]}` keys, `${a[*]}`).
+    fn expand_for_test(shell: &mut Shell, input: &str) -> String {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        let parts: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        parts.join(" ")
+    }
+
+    /// Run `expand` and return the field list directly (each field's
+    /// `chars` value as a Vec<String>). Used for tests that expect
+    /// multiple separate words from a quoted `${a[@]}` form.
+    fn expand_to_word_list_for_test(shell: &mut Shell, input: &str) -> Vec<String> {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        fields.into_iter().map(|f| f.chars).collect()
+    }
+
+    fn shell_with_a() -> Shell {
+        let mut s = Shell::new();
+        s.seed_array_for_tests("a", &[(0, "x"), (1, "y"), (2, "z")]);
+        s
+    }
+
+    #[test]
+    fn read_element_returns_value() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[1]}");
+        assert_eq!(out, "y");
+    }
+
+    #[test]
+    fn out_of_range_element_is_empty() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[99]}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn quoted_at_yields_separate_words() {
+        let mut s = shell_with_a();
+        let words = expand_to_word_list_for_test(&mut s, r#""${a[@]}""#);
+        assert_eq!(words, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn quoted_star_joins_by_ifs() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, r#""${a[*]}""#);
+        assert_eq!(out, "x y z");
+    }
+
+    #[test]
+    fn count_returns_element_count_not_max_index() {
+        let mut s = Shell::new();
+        s.seed_array_for_tests("a", &[(2, "x"), (5, "y")]);
+        let out = expand_for_test(&mut s, "${#a[@]}");
+        assert_eq!(out, "2");
+    }
+
+    #[test]
+    fn keys_list_returns_subscripts() {
+        let mut s = Shell::new();
+        s.seed_array_for_tests("a", &[(2, "x"), (5, "y")]);
+        let out = expand_for_test(&mut s, "${!a[@]}");
+        assert_eq!(out, "2 5");
+    }
+
+    #[test]
+    fn element_length() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${#a[0]}");
+        assert_eq!(out, "1");
+    }
+
+    #[test]
+    fn slicing_positive_offset_and_length() {
+        let mut s = shell_with_a();
+        let words = expand_to_word_list_for_test(&mut s, r#""${a[@]:1:1}""#);
+        assert_eq!(words, vec!["y"]);
+    }
+
+    #[test]
+    fn slicing_negative_offset_counts_from_end() {
+        let mut s = shell_with_a();
+        let words = expand_to_word_list_for_test(&mut s, r#""${a[@]: -1}""#);
+        assert_eq!(words, vec!["z"]);
+    }
+
+    #[test]
+    fn bare_name_returns_element_zero() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a}");
+        assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn negative_subscript_wraps() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[-1]}");
+        assert_eq!(out, "z");
+    }
+
+    #[test]
+    fn nounset_on_unset_element_fires_pe_error() {
+        let mut s = shell_with_a();
+        s.shell_options.nounset = true;
+        let _ = expand_for_test(&mut s, "${a[99]}");
+        assert!(s.pending_fatal_pe_error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod positional_slicing_tests {
+    //! Task 3 closes v33's `${@:o:l}` / `${*:o:l}` deferral. These
+    //! tests drive the slice helper through the lex→expand pipeline.
+
+    use super::*;
+    use crate::command::{Command, SimpleCommand};
+    use crate::shell_state::Shell;
+
+    fn first_arg_word(input: &str) -> Word {
+        let src = format!("echo {input}");
+        let tokens = crate::lexer::tokenize(&src).expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            other => panic!("expected Pipeline, got {other:?}"),
+        };
+        match &pipeline.commands[0] {
+            Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
+            other => panic!("expected SimpleCommand::Exec, got {other:?}"),
+        }
+    }
+
+    fn expand_for_test(shell: &mut Shell, input: &str) -> String {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        let parts: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        parts.join(" ")
+    }
+
+    fn expand_to_word_list_for_test(shell: &mut Shell, input: &str) -> Vec<String> {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        fields.into_iter().map(|f| f.chars).collect()
+    }
+
+    fn shell_with_posargs() -> Shell {
+        let mut s = Shell::new();
+        s.positional_args = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        s
+    }
+
+    #[test]
+    fn at_slice_positive() {
+        let mut s = shell_with_posargs();
+        let words = expand_to_word_list_for_test(&mut s, r#""${@:2:2}""#);
+        assert_eq!(words, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn at_slice_negative_offset() {
+        let mut s = shell_with_posargs();
+        let words = expand_to_word_list_for_test(&mut s, r#""${@: -2}""#);
+        assert_eq!(words, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn star_slice_joins_by_ifs() {
+        let mut s = shell_with_posargs();
+        let out = expand_for_test(&mut s, r#""${*:1:3}""#);
+        assert_eq!(out, "a b c");
     }
 }

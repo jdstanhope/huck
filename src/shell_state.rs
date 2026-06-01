@@ -476,6 +476,40 @@ impl Shell {
         names
     }
 
+    /// Returns a reference to the indexed array stored under `name`,
+    /// or `None` if the variable is unset or a scalar.
+    pub fn get_array(&self, name: &str) -> Option<&BTreeMap<usize, String>> {
+        match self.vars.get(name) {
+            Some(v) => match &v.value {
+                VarValue::Indexed(m) => Some(m),
+                VarValue::Scalar(_) => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Returns the value at subscript `idx` for the indexed array named
+    /// `name`. For scalar variables, idx=0 returns the scalar string —
+    /// matches bash's `$a ≡ ${a[0]}` rule.
+    pub fn lookup_array_element(&self, name: &str, idx: usize) -> Option<String> {
+        match self.vars.get(name) {
+            Some(v) => match &v.value {
+                VarValue::Indexed(m) => m.get(&idx).cloned(),
+                VarValue::Scalar(s) if idx == 0 => Some(s.clone()),
+                VarValue::Scalar(_) => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Returns the maximum subscript present in the named array, or
+    /// `None` if no elements / not an array. Used for negative-subscript
+    /// wrapping in `${a[-n]}`.
+    pub fn array_max_index(&self, name: &str) -> Option<usize> {
+        self.get_array(name)
+            .and_then(|m| m.keys().next_back().copied())
+    }
+
     pub fn last_status(&self) -> i32 {
         self.last_status
     }
@@ -567,6 +601,28 @@ fn install_scalar_value(existing: &mut Variable, value: String) {
 impl Default for Shell {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl Shell {
+    /// Test-only helper: install an indexed-array variable directly.
+    /// Used by Task 3 expansion tests before Task 4 wires the executor
+    /// path that would otherwise create arrays via syntax.
+    pub fn seed_array_for_tests(&mut self, name: &str, elements: &[(usize, &str)]) {
+        let mut m: BTreeMap<usize, String> = BTreeMap::new();
+        for (k, v) in elements {
+            m.insert(*k, (*v).to_string());
+        }
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Indexed(m),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
     }
 }
 

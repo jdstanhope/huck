@@ -76,6 +76,11 @@ pub enum ParamModifier {
     /// substitute "" on unset and trigger unwanted modifier semantics.
     None,
     Length,
+    /// `${!name[@]}` / `${!name[*]}` — list of subscripts present in
+    /// the named indexed array (bash's "array keys" form). For v71
+    /// the bare indirect form `${!name}` is not yet supported; the
+    /// lexer only emits this on a subscripted reference.
+    IndirectKeys,
     UseDefault    { word: Word, colon: bool },
     AssignDefault { word: Word, colon: bool },
     ErrorIfUnset  { word: Word, colon: bool },
@@ -1425,22 +1430,29 @@ fn read_braced_param_expansion(
 ) -> Result<(), LexError> {
     // Special single-char forms: ${@}, ${*}, ${#} (arg count).
     // These must be checked before the Length form (${#name}) disambiguation.
+    // `${@}` and `${*}` produce `AllArgs`; `${@:...}` / `${*:...}` route
+    // through `dispatch_braced_modifier` so the substring modifier
+    // (v71 task 3: closes v33's slicing deferral) is parseable.
     match chars.peek().copied() {
         Some('@') => {
             chars.next();
-            if chars.next() != Some('}') {
-                return Err(LexError::UnterminatedBrace);
+            if chars.peek() == Some(&'}') {
+                chars.next();
+                parts.push(WordPart::AllArgs { joined: false, quoted });
+                return Ok(());
             }
-            parts.push(WordPart::AllArgs { joined: false, quoted });
-            return Ok(());
+            // `${@<mod>...}` — fall through to the modifier dispatcher
+            // with name="@" and no subscript.
+            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts);
         }
         Some('*') => {
             chars.next();
-            if chars.next() != Some('}') {
-                return Err(LexError::UnterminatedBrace);
+            if chars.peek() == Some(&'}') {
+                chars.next();
+                parts.push(WordPart::AllArgs { joined: true, quoted });
+                return Ok(());
             }
-            parts.push(WordPart::AllArgs { joined: true, quoted });
-            return Ok(());
+            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts);
         }
         _ => {}
     }
@@ -1475,6 +1487,17 @@ fn read_braced_param_expansion(
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
         }
+        // Optional subscript for the Length form: `${#a[i]}`, `${#a[@]}`.
+        // The named regular-identifier path is the only one that takes
+        // a subscript — positional names (`${#1}`) and the `@`/`*`
+        // forms (which already are pseudo-subscripts) do not.
+        let subscript = if name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
+        {
+            scan_param_subscript(chars)?
+        } else {
+            None
+        };
         if chars.next() != Some('}') {
             return Err(LexError::UnterminatedBrace);
         }
@@ -1482,7 +1505,7 @@ fn read_braced_param_expansion(
             name,
             modifier: ParamModifier::Length,
             quoted,
-            subscript: None,
+            subscript,
         });
         return Ok(());
     }
@@ -1500,6 +1523,38 @@ fn read_braced_param_expansion(
         }
         // Positional parameters cannot be subscripted.
         return dispatch_braced_modifier(name, quoted, None, chars, parts);
+    }
+
+    // `${!NAME[@]}` / `${!NAME[*]}` — array-keys form (v71). The bare
+    // `${!NAME}` indirect form is NOT yet supported and is rejected
+    // here by requiring the `[@]` / `[*]` subscript immediately after
+    // the name.
+    if chars.peek() == Some(&'!') {
+        chars.next(); // consume '!'
+        let name = read_braced_name(chars)?;
+        if name.is_empty() {
+            return Err(LexError::EmptyParamName);
+        }
+        let subscript = scan_param_subscript(chars)?;
+        match subscript {
+            Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
+                if chars.next() != Some('}') {
+                    return Err(LexError::UnterminatedBrace);
+                }
+                parts.push(WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::IndirectKeys,
+                    quoted,
+                    subscript,
+                });
+                return Ok(());
+            }
+            _ => {
+                // `${!NAME}` or `${!NAME[i]}` — neither shape is
+                // supported in v71.
+                return Err(LexError::InvalidBraceModifier("!".to_string()));
+            }
+        }
     }
 
     let name = read_braced_name(chars)?;
