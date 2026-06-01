@@ -75,6 +75,7 @@ spec, an implementation plan, and a test suite.
 | v65       | `declare -i` integer attribute (M-79 cont.)                    |
 | v66       | `eval` (M-80)                                                  |
 | v67       | `help` (M-81)                                                  |
+| v68       | doc cleanup (M-06/M-07/M-35 marked fixed; M-08 narrowed)       |
 
 ## Build and run
 
