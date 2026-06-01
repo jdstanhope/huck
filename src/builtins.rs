@@ -496,10 +496,13 @@ fn escape_double_quote_value(s: &str) -> String {
 }
 
 /// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
-/// `declare --`; with `r` and/or `x` attributes set, the flag string
-/// is e.g. `-r`, `-x`, `-rx`.
+/// `declare --`; otherwise the attribute order is `irx` to match
+/// bash's display (e.g. `-i`, `-ir`, `-irx`, `-rx`).
 fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
     let mut attrs = String::new();
+    if var.integer {
+        attrs.push('i');
+    }
     if var.readonly {
         attrs.push('r');
     }
@@ -598,6 +601,8 @@ fn builtin_declare(
     let mut want_readonly = false;
     let mut want_export = false;
     let mut want_remove_export = false;
+    let mut want_integer = false;
+    let mut want_remove_integer = false;
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
@@ -625,13 +630,15 @@ fn builtin_declare(
                 }
                 b'x' if minus => want_export = true,
                 b'x' if plus => want_remove_export = true,
+                b'i' if minus => want_integer = true,
+                b'i' if plus => want_remove_integer = true,
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'i' | b'l' | b'u' | b'a' | b'A' | b'n' | b'g' if minus => {
+                b'l' | b'u' | b'a' | b'A' | b'n' | b'g' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -693,6 +700,28 @@ fn builtin_declare(
         // function exit. No-op outside a function.
         snapshot_for_local_scope(shell, name);
 
+        // Reject integer-attribute transitions on a readonly variable
+        // (bash-compat: bash leaves attributes unchanged when the
+        // declare fails). This guard fires BEFORE mark_integer /
+        // unmark_integer so the integer flag is never flipped on a
+        // readonly var, even when `-r` was also requested. Bash's
+        // behavior for `declare -ri X=5` on already-readonly X:
+        // errors out, integer flag stays false, value unchanged.
+        if (want_integer || want_remove_integer) && shell.is_readonly(name) {
+            eprintln!("huck: declare: {name}: readonly variable");
+            exit = 1;
+            continue;
+        }
+
+        // Apply integer-flag flips BEFORE any value-set path so the
+        // subsequent `try_set` routes through the integer-coerce.
+        if want_integer {
+            shell.mark_integer(name);
+        }
+        if want_remove_integer {
+            shell.unmark_integer(name);
+        }
+
         if want_readonly {
             if let Some(v) = value.as_ref() {
                 if shell.is_readonly(name) {
@@ -700,7 +729,11 @@ fn builtin_declare(
                     exit = 1;
                     continue;
                 }
-                shell.set(name, v.clone());
+                // Use `try_set` here (not `shell.set`) so the integer
+                // flag flipped above is honoured for `-ir NAME=expr`.
+                // The readonly check just succeeded, so `try_set`
+                // cannot return Err.
+                let _ = shell.try_set(name, v.clone());
             }
             shell.mark_readonly(name);
             // -r and -x can combine. Fall through to handle -x too
@@ -718,7 +751,14 @@ fn builtin_declare(
                 continue;
             }
             match (&value, want_readonly) {
-                (Some(v), false) => shell.export_set(name, v.clone()),
+                (Some(v), false) => {
+                    // Route through try_set so the integer flag (if
+                    // any) coerces the RHS, then flip the export bit.
+                    // try_set cannot fail here: the is_readonly check
+                    // above already filtered that case.
+                    let _ = shell.try_set(name, v.clone());
+                    shell.export(name);
+                }
                 (_, true) => {
                     // Already set via the -r branch; just flip the
                     // export bit without further value mutation.
@@ -7546,7 +7586,140 @@ mod declare_tests {
     #[test]
     fn declare_deferred_flag_errors() {
         let mut shell = Shell::new();
-        let (oc, _) = run(&["-i", "X=5"], &mut shell);
+        // -i was deferred in v64; v65 ships it. Pick another still-
+        // deferred flag (-l = lowercase) to keep the deferred-list arm
+        // under coverage.
+        let (oc, _) = run(&["-l", "X=5"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+}
+
+#[cfg(test)]
+mod integer_attr_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    // ── try_set integer-eval ────────────────────────────────
+
+    #[test]
+    fn try_set_non_integer_passes_through() {
+        let mut shell = Shell::new();
+        assert!(shell.try_set("X_INT_T1", "2+3".to_string()).is_ok());
+        assert_eq!(shell.lookup_var("X_INT_T1").as_deref(), Some("2+3"));
+    }
+
+    #[test]
+    fn try_set_integer_simple_arith() {
+        let mut shell = Shell::new();
+        shell.mark_integer("X_INT_T2");
+        assert!(shell.try_set("X_INT_T2", "2+3".to_string()).is_ok());
+        assert_eq!(shell.lookup_var("X_INT_T2").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn try_set_integer_negative_result() {
+        let mut shell = Shell::new();
+        shell.mark_integer("X_INT_T3");
+        assert!(shell.try_set("X_INT_T3", "0-5".to_string()).is_ok());
+        assert_eq!(shell.lookup_var("X_INT_T3").as_deref(), Some("-5"));
+    }
+
+    #[test]
+    fn try_set_integer_invalid_silently_zero() {
+        let mut shell = Shell::new();
+        shell.mark_integer("X_INT_T4");
+        assert!(shell.try_set("X_INT_T4", "abc".to_string()).is_ok());
+        assert_eq!(shell.lookup_var("X_INT_T4").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn try_set_integer_with_var_ref() {
+        let mut shell = Shell::new();
+        shell.set("Y_INT_T5", "10".to_string());
+        shell.mark_integer("X_INT_T5");
+        assert!(shell.try_set("X_INT_T5", "Y_INT_T5*2".to_string()).is_ok());
+        assert_eq!(shell.lookup_var("X_INT_T5").as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn try_set_readonly_checked_before_integer() {
+        let mut shell = Shell::new();
+        shell.set("X_INT_T6", "outer".to_string());
+        shell.mark_readonly("X_INT_T6");
+        shell.mark_integer("X_INT_T6");
+        // try_set must return Err on readonly; value should NOT
+        // change to "5".
+        assert!(shell.try_set("X_INT_T6", "5".to_string()).is_err());
+        assert_eq!(shell.lookup_var("X_INT_T6").as_deref(), Some("outer"));
+    }
+
+    // ── builtin_declare wiring ──────────────────────────────
+
+    fn run_declare(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
+        let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        (outcome, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn declare_i_marks_and_evals() {
+        let mut shell = Shell::new();
+        let (oc, _) = run_declare(&["-i", "X_INT_D1=2+3"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_INT_D1").as_deref(), Some("5"));
+        assert!(shell.is_integer("X_INT_D1"));
+    }
+
+    #[test]
+    fn declare_plus_i_unmarks() {
+        let mut shell = Shell::new();
+        run_declare(&["-i", "X_INT_D2=5"], &mut shell);
+        assert!(shell.is_integer("X_INT_D2"));
+        let (oc, _) = run_declare(&["+i", "X_INT_D2"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.is_integer("X_INT_D2"));
+        // Value preserved.
+        assert_eq!(shell.lookup_var("X_INT_D2").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn declare_i_existing_var_no_reeval() {
+        let mut shell = Shell::new();
+        shell.set("X_INT_D3", "2+3".to_string());
+        let (oc, _) = run_declare(&["-i", "X_INT_D3"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        // Value preserved; no re-eval on flag set without =.
+        assert_eq!(shell.lookup_var("X_INT_D3").as_deref(), Some("2+3"));
+        assert!(shell.is_integer("X_INT_D3"));
+    }
+
+    #[test]
+    fn declare_i_on_readonly_errors() {
+        let mut shell = Shell::new();
+        shell.set("X_INT_D4", "outer".to_string());
+        shell.mark_readonly("X_INT_D4");
+        let (oc, _) = run_declare(&["-i", "X_INT_D4"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        // Integer flag NOT set on a readonly var.
+        assert!(!shell.is_integer("X_INT_D4"));
+    }
+
+    #[test]
+    fn declare_ri_on_readonly_errors_without_corrupting_attrs() {
+        // Regression: previously `declare -ri X=5` on already-readonly X
+        // skipped the integer-readonly guard because want_readonly was
+        // also true, then mark_integer ran before the inner -r readonly
+        // check fired. Result: the variable's integer flag was set even
+        // though the command errored. Bash leaves attributes unchanged
+        // when the declare fails.
+        let mut shell = Shell::new();
+        shell.set("X_INT_D5", "outer".to_string());
+        shell.mark_readonly("X_INT_D5");
+        let (oc, _) = run_declare(&["-ri", "X_INT_D5=5"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        // Integer flag must NOT be set; value unchanged.
+        assert!(!shell.is_integer("X_INT_D5"));
+        assert_eq!(shell.lookup_var("X_INT_D5").as_deref(), Some("outer"));
     }
 }

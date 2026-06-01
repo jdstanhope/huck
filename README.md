@@ -72,6 +72,7 @@ spec, an implementation plan, and a test suite.
 | v62       | rc file: `~/.huckrc` + `--rcfile`/`--norc` (M-77)              |
 | v63       | `pushd`/`popd`/`dirs` (M-78)                                   |
 | v64       | `declare` / `typeset` (M-79 partial)                           |
+| v65       | `declare -i` integer attribute (M-79 cont.)                    |
 
 ## Build and run
 
