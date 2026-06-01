@@ -120,8 +120,15 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: true } => {
-                if let Some(value) = shell.lookup_var(name) {
-                    current.push_str(&value, true);
+                match shell.lookup_var(name) {
+                    Some(value) => current.push_str(&value, true),
+                    None => {
+                        if shell.shell_options.nounset {
+                            eprintln!("huck: {name}: unbound variable");
+                            shell.pending_fatal_pe_error = Some(1);
+                            return result;
+                        }
+                    }
                 }
                 // Unset quoted var: relies on `has_emitted` so end-of-word
                 // still produces a (possibly empty) Field.
@@ -132,7 +139,17 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 has_emitted = true;
             }
             WordPart::Var { name, quoted: false } => {
-                let value = shell.lookup_var(name).unwrap_or_default();
+                let value = match shell.lookup_var(name) {
+                    Some(v) => v,
+                    None => {
+                        if shell.shell_options.nounset {
+                            eprintln!("huck: {name}: unbound variable");
+                            shell.pending_fatal_pe_error = Some(1);
+                            return result;
+                        }
+                        String::new()
+                    }
+                };
                 emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::AllArgs { quoted: false, joined: _ } => {
@@ -248,8 +265,15 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 result.push_str(&text);
             }
             WordPart::Var { name, .. } => {
-                if let Some(value) = shell.lookup_var(name) {
-                    result.push_str(&value);
+                match shell.lookup_var(name) {
+                    Some(value) => result.push_str(&value),
+                    None => {
+                        if shell.shell_options.nounset {
+                            eprintln!("huck: {name}: unbound variable");
+                            shell.pending_fatal_pe_error = Some(1);
+                            return result;
+                        }
+                    }
                 }
             }
             WordPart::LastStatus { .. } => {
