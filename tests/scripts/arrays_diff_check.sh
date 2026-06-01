@@ -10,6 +10,11 @@ if [ ! -x "$HUCK" ]; then
     exit 1
 fi
 
+if ! command -v bash >/dev/null 2>&1; then
+    echo "bash not found on PATH; this differential harness requires bash" >&2
+    exit 1
+fi
+
 fragments=(
     'a=(x y z); echo "${a[@]}"; echo "${#a[@]}"; echo "${!a[@]}"'
     'a=([5]=x [2]=y); echo "${#a[@]}"; echo "${!a[@]}"'

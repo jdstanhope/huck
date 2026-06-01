@@ -32,9 +32,16 @@ fn literal_then_for_loop_iterates_in_order() {
         "a=(red green blue)\nfor c in \"${a[@]}\"; do echo \"$c\"; done\nexit\n",
     );
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.contains(&"red"));
-    assert!(lines.contains(&"green"));
-    assert!(lines.contains(&"blue"));
+    let color_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| ["red", "green", "blue"].contains(l))
+        .copied()
+        .collect();
+    assert_eq!(
+        color_lines,
+        vec!["red", "green", "blue"],
+        "expected ordered output, got: {out:?}"
+    );
 }
 
 #[test]
@@ -97,9 +104,15 @@ fn local_array_scoped_to_function() {
     let (out, _, _) = run_capture(
         "a=(outer)\nf() { local a=(inner); echo \"${a[0]}\"; }\nf\necho \"${a[0]}\"\nexit\n",
     );
-    let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.contains(&"inner"));
-    assert!(lines.contains(&"outer"));
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| *l == "inner" || *l == "outer")
+        .collect();
+    assert_eq!(
+        scope_lines,
+        vec!["inner", "outer"],
+        "expected inner-then-outer order, got: {out:?}"
+    );
 }
 
 #[test]
