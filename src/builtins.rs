@@ -701,12 +701,13 @@ fn builtin_declare(
         snapshot_for_local_scope(shell, name);
 
         // Reject integer-attribute transitions on a readonly variable
-        // (bash-compat). Skip the check when -r was also requested: the
-        // -r path below handles the readonly diagnostic for value writes.
-        if (want_integer || want_remove_integer)
-            && shell.is_readonly(name)
-            && !want_readonly
-        {
+        // (bash-compat: bash leaves attributes unchanged when the
+        // declare fails). This guard fires BEFORE mark_integer /
+        // unmark_integer so the integer flag is never flipped on a
+        // readonly var, even when `-r` was also requested. Bash's
+        // behavior for `declare -ri X=5` on already-readonly X:
+        // errors out, integer flag stays false, value unchanged.
+        if (want_integer || want_remove_integer) && shell.is_readonly(name) {
             eprintln!("huck: declare: {name}: readonly variable");
             exit = 1;
             continue;
@@ -7702,5 +7703,23 @@ mod integer_attr_tests {
         assert!(matches!(oc, ExecOutcome::Continue(1)));
         // Integer flag NOT set on a readonly var.
         assert!(!shell.is_integer("X_INT_D4"));
+    }
+
+    #[test]
+    fn declare_ri_on_readonly_errors_without_corrupting_attrs() {
+        // Regression: previously `declare -ri X=5` on already-readonly X
+        // skipped the integer-readonly guard because want_readonly was
+        // also true, then mark_integer ran before the inner -r readonly
+        // check fired. Result: the variable's integer flag was set even
+        // though the command errored. Bash leaves attributes unchanged
+        // when the declare fails.
+        let mut shell = Shell::new();
+        shell.set("X_INT_D5", "outer".to_string());
+        shell.mark_readonly("X_INT_D5");
+        let (oc, _) = run_declare(&["-ri", "X_INT_D5=5"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        // Integer flag must NOT be set; value unchanged.
+        assert!(!shell.is_integer("X_INT_D5"));
+        assert_eq!(shell.lookup_var("X_INT_D5").as_deref(), Some("outer"));
     }
 }
