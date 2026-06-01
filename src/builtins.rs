@@ -54,7 +54,7 @@ pub fn run_builtin(
     shell: &mut Shell,
 ) -> ExecOutcome {
     match name {
-        "cd" => builtin_cd(args, shell),
+        "cd" => builtin_cd(args, out, shell),
         "pwd" => builtin_pwd(out),
         "echo" => builtin_echo(args, out),
         "exit" => builtin_exit(args, shell),
@@ -103,12 +103,23 @@ pub fn run_builtin(
     }
 }
 
-pub(crate) fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
+pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
         eprintln!("huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
+    let mut print_new_pwd = false;
     let target = match args.first() {
+        Some(dir) if dir == "-" => match shell.get("OLDPWD") {
+            Some(oldpwd) if !oldpwd.is_empty() => {
+                print_new_pwd = true;
+                oldpwd.to_string()
+            }
+            _ => {
+                eprintln!("huck: cd: OLDPWD not set");
+                return ExecOutcome::Continue(1);
+            }
+        },
         Some(dir) => dir.clone(),
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
@@ -130,6 +141,12 @@ pub(crate) fn builtin_cd(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 shell.export_set("OLDPWD", prev);
             }
             shell.export_set("PWD", new_pwd.to_string_lossy().to_string());
+            if print_new_pwd
+                && let Err(e) = writeln!(out, "{}", new_pwd.display())
+            {
+                eprintln!("huck: cd: {e}");
+                return ExecOutcome::Continue(1);
+            }
         }
         Err(e) => {
             // chdir succeeded but we can't read it back — warn but
@@ -4573,7 +4590,7 @@ fn builtin_pushd(
         shell.dir_stack.swap(0, 1);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
             && c != 0
         {
             // Undo the swap on failure.
@@ -4598,7 +4615,7 @@ fn builtin_pushd(
         shell.dir_stack.rotate_left(idx);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
             && c != 0
         {
             // Undo rotation on cd failure.
@@ -4610,7 +4627,7 @@ fn builtin_pushd(
 
     // pushd DIR
     let cd_args = vec![arg.clone()];
-    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
         && c != 0
     {
         return ExecOutcome::Continue(c);
@@ -4661,7 +4678,7 @@ fn builtin_popd(
     if idx == 0 {
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
             && c != 0
         {
             // Restore the entry we just popped so the stack is
@@ -6148,21 +6165,24 @@ mod cd_pwd_tests {
     #[test]
     fn cd_sets_pwd_to_target_directory() {
         let mut shell = Shell::new();
+        let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
         // Restore for any other tests.
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("PWD"), Some("/tmp"));
         assert!(shell.exported_env().any(|(k, _)| k == "PWD"));
+        assert!(out.is_empty());
     }
 
     #[test]
     fn cd_sets_oldpwd_to_previous_pwd() {
         let mut shell = Shell::new();
         shell.export_set("PWD", "/var".to_string());
+        let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), Some("/var"));
@@ -6174,12 +6194,64 @@ mod cd_pwd_tests {
         let mut shell = Shell::new();
         shell.unset("PWD");
         shell.unset("OLDPWD");
+        let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), None);
         assert_eq!(shell.get("PWD"), Some("/tmp"));
+    }
+
+    #[test]
+    fn cd_dash_uses_oldpwd_as_target() {
+        let mut shell = Shell::new();
+        shell.export_set("OLDPWD", "/tmp".to_string());
+        shell.export_set("PWD", "/var".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
+        assert_eq!(shell.get("OLDPWD"), Some("/var"));
+    }
+
+    #[test]
+    fn cd_dash_prints_new_pwd_on_stdout() {
+        let mut shell = Shell::new();
+        shell.export_set("OLDPWD", "/tmp".to_string());
+        shell.export_set("PWD", "/var".to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(String::from_utf8(out).unwrap(), "/tmp\n");
+    }
+
+    #[test]
+    fn cd_dash_errors_when_oldpwd_unset() {
+        let mut shell = Shell::new();
+        shell.unset("OLDPWD");
+        let mut out: Vec<u8> = Vec::new();
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cd_dash_errors_when_oldpwd_empty() {
+        let mut shell = Shell::new();
+        shell.export_set("OLDPWD", String::new());
+        let mut out: Vec<u8> = Vec::new();
+        let prev = std::env::current_dir().unwrap();
+        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let _ = std::env::set_current_dir(&prev);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(out.is_empty());
     }
 }
 
