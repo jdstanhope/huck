@@ -65,6 +65,14 @@ pub enum AssignErr {
     Readonly,
     #[allow(dead_code)] // reserved for future bad-subscript paths
     BadSubscript,
+    /// Variable exists but its current shape disagrees with the
+    /// requested operation (e.g., set_associative_element called on
+    /// an indexed variable). Caller should have routed to the
+    /// correct shape-specific mutator. Defensive only — the executor
+    /// must check variants before calling and surface a user-facing
+    /// diagnostic.
+    #[allow(dead_code)] // wired up by tasks 3-4
+    TypeMismatch,
 }
 
 /// Errors specific to declaration-builtin paths (declare -A on existing
@@ -598,7 +606,7 @@ impl Shell {
                     eprintln!(
                         "huck: {name}: set_array_element on associative variable"
                     );
-                    return Err(AssignErr::Readonly);
+                    return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
@@ -745,12 +753,12 @@ impl Shell {
                 }
                 _ => {
                     eprintln!("huck: {name}: set_associative_element on non-associative variable");
-                    return Err(AssignErr::Readonly);
+                    return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
                 eprintln!("huck: {name}: set_associative_element on unset variable");
-                return Err(AssignErr::Readonly);
+                return Err(AssignErr::TypeMismatch);
             }
         }
         Ok(())
@@ -813,6 +821,7 @@ impl Shell {
                 value: VarValue::Associative(pairs),
                 exported,
                 readonly: false,
+                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
             },
         );
@@ -1385,6 +1394,24 @@ mod assoc_value_tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "a");
         assert_eq!(pairs[1].0, "c");
+    }
+
+    #[test]
+    fn unset_associative_element_on_missing_key_is_noop() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
+        assert!(shell.unset_associative_element("m", "nope").is_ok());
+        assert_eq!(shell.lookup_associative_element("m", "a"), Some("1".into()));
+    }
+
+    #[test]
+    fn unset_associative_element_on_non_associative_is_noop() {
+        let mut shell = Shell::new();
+        shell.set("s", "hello".into());
+        // Non-associative variable — should NOT modify it and NOT error.
+        assert!(shell.unset_associative_element("s", "anything").is_ok());
+        assert_eq!(shell.get("s"), Some("hello"));
     }
 
     #[test]
