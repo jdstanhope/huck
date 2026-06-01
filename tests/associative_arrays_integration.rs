@@ -104,8 +104,15 @@ fn local_associative_scoped_to_function() {
          echo \"out: ${!m[@]}\"\n\
          exit\n",
     );
-    assert!(out.lines().any(|l| l == "in: inner"), "got: {out:?}");
-    assert!(out.lines().any(|l| l == "out: outer"), "got: {out:?}");
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("in: ") || l.starts_with("out: "))
+        .collect();
+    assert_eq!(
+        scope_lines,
+        vec!["in: inner", "out: outer"],
+        "expected inner-then-outer ordering, got: {out:?}"
+    );
 }
 
 #[test]
