@@ -1120,6 +1120,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
         return ExecOutcome::Continue(1);
     }
     let mut want_array = false;
+    let mut want_associative = false;
     let mut idx = 0;
     // Parse leading flags from Plain args.
     while idx < args.len() {
@@ -1127,6 +1128,11 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
             DeclArg::Plain(s) => {
                 if s == "-a" {
                     want_array = true;
+                    idx += 1;
+                    continue;
+                }
+                if s == "-A" {
+                    want_associative = true;
                     idx += 1;
                     continue;
                 }
@@ -1142,6 +1148,10 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
             }
             DeclArg::Assign(_) => break,
         }
+    }
+    if want_array && want_associative {
+        eprintln!("huck: local: cannot specify both -a and -A");
+        return ExecOutcome::Continue(1);
     }
     let mut exit: i32 = 0;
     for arg in &args[idx..] {
@@ -1175,6 +1185,16 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                             exit = 1;
                         }
                     }
+                } else if want_associative {
+                    // local -A NAME: ensure name is an associative array.
+                    // declare_associative errors if name is already indexed
+                    // or scalar; the snapshot above lets call_function
+                    // restore the prior value on function exit.
+                    if shell.get_associative(name).is_none()
+                        && shell.declare_associative(name).is_err()
+                    {
+                        exit = 1;
+                    }
                 } else {
                     // Bare `local NAME` with no value: set empty scalar,
                     // matching the legacy builtin_local behavior.
@@ -1196,6 +1216,18 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     continue;
                 }
                 snapshot_for_local_scope(shell, &name);
+                // For `local -A NAME=([k]=v)`: ensure NAME is associative
+                // BEFORE apply_one_assignment so the executor routes the
+                // compound RHS through the associative path. Without this,
+                // apply_one_assignment would see an absent (or indexed)
+                // variable and dispatch to the indexed-array path.
+                if want_associative
+                    && shell.get_associative(&name).is_none()
+                    && shell.declare_associative(&name).is_err()
+                {
+                    exit = 1;
+                    continue;
+                }
                 if crate::executor::apply_one_assignment(a, shell).is_err() {
                     exit = 1;
                 }
@@ -1212,14 +1244,19 @@ fn builtin_readonly_decl(
     out: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    // Parse leading flags (-p only). `--` terminates option processing.
+    // Parse leading flags (-p, -A). `--` terminates option processing.
     let mut want_list = false;
+    let mut want_associative = false;
     let mut idx = 0;
     while idx < args.len() {
         let DeclArg::Plain(s) = &args[idx] else { break };
         match s.as_str() {
             "-p" => {
                 want_list = true;
+                idx += 1;
+            }
+            "-A" => {
+                want_associative = true;
                 idx += 1;
             }
             "--" => {
@@ -1269,6 +1306,15 @@ fn builtin_readonly_decl(
                     exit = 1;
                     continue;
                 }
+                // `readonly -A NAME` (no value): ensure name is associative
+                // before marking readonly.
+                if want_associative
+                    && shell.get_associative(name).is_none()
+                    && shell.declare_associative(name).is_err()
+                {
+                    exit = 1;
+                    continue;
+                }
                 shell.mark_readonly(name);
             }
             DeclArg::Assign(a) => match &a.target {
@@ -1277,6 +1323,16 @@ fn builtin_readonly_decl(
                         eprintln!(
                             "huck: readonly: {name}: readonly variable"
                         );
+                        exit = 1;
+                        continue;
+                    }
+                    // `readonly -A NAME=([k]=v)`: ensure NAME is associative
+                    // BEFORE apply_one_assignment so the compound RHS routes
+                    // through the associative executor path.
+                    if want_associative
+                        && shell.get_associative(name).is_none()
+                        && shell.declare_associative(name).is_err()
+                    {
                         exit = 1;
                         continue;
                     }
@@ -1310,6 +1366,7 @@ fn builtin_declare_decl(
     let mut want_integer = false;
     let mut want_remove_integer = false;
     let mut want_array = false;
+    let mut want_associative = false;
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
@@ -1348,13 +1405,20 @@ fn builtin_declare_decl(
                     );
                     return ExecOutcome::Continue(1);
                 }
+                b'A' if minus => want_associative = true,
+                b'A' if plus => {
+                    eprintln!(
+                        "huck: declare: +A: associative attribute cannot be removed"
+                    );
+                    return ExecOutcome::Continue(1);
+                }
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'l' | b'u' | b'A' | b'n' | b'g' if minus => {
+                b'l' | b'u' | b'n' | b'g' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1380,6 +1444,14 @@ fn builtin_declare_decl(
         eprintln!("huck: declare: integer arrays not yet supported");
         return ExecOutcome::Continue(1);
     }
+    if want_array && want_associative {
+        eprintln!("huck: declare: cannot specify both -a and -A");
+        return ExecOutcome::Continue(1);
+    }
+    if want_associative && want_integer {
+        eprintln!("huck: declare: integer associative arrays not yet supported");
+        return ExecOutcome::Continue(1);
+    }
 
     // Function-mode listing: only Plain names accepted.
     if function_mode {
@@ -1394,13 +1466,26 @@ fn builtin_declare_decl(
     }
 
     // Bare `declare` (or `declare -p`) with no names: list everything.
-    // `declare -a` with no names: list arrays only.
+    // `declare -a` with no names: list indexed arrays only.
+    // `declare -A` with no names: list associative arrays only.
     if names.is_empty() {
         if want_array {
             use crate::shell_state::VarValue;
             let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
                 .iter_vars()
                 .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, var) in entries {
+                let _ = writeln!(out, "{}", format_declare_line(name, var));
+            }
+            return ExecOutcome::Continue(0);
+        }
+        if want_associative {
+            use crate::shell_state::VarValue;
+            let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
+                .iter_vars()
+                .filter(|(_, v)| matches!(v.value, VarValue::Associative(_)))
                 .collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
             for (name, var) in entries {
@@ -1470,6 +1555,18 @@ fn builtin_declare_decl(
                 exit = 1;
                 continue;
             }
+        }
+
+        // Associative-attribute handling. `declare -A NAME` ensures an
+        // empty associative; `declare -A NAME=([k]=v)` ensures associative
+        // BEFORE apply_one_assignment so the executor routes the compound
+        // RHS through the associative path (not the indexed-array path).
+        if want_associative
+            && shell.get_associative(name).is_none()
+            && shell.declare_associative(name).is_err()
+        {
+            exit = 1;
+            continue;
         }
 
         // Compound assignment path: a parsed Assignment (scalar or array).
@@ -9599,5 +9696,92 @@ mod array_declare_tests {
                 .any(|l| l == r#"declare -ar a=([0]="x" [1]="y" [2]="z")"#),
             "stdout: {out:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod assoc_declare_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(shell: &mut Shell, line: &str) -> ExecOutcome {
+        crate::shell::process_line(line, shell, false)
+    }
+
+    #[test]
+    fn declare_dash_cap_a_creates_empty_associative() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "declare -A m");
+        assert!(s.get_associative("m").is_some());
+        assert_eq!(s.get_associative("m").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn declare_dash_cap_a_with_value() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "declare -A m=([foo]=bar [baz]=qux)");
+        assert_eq!(s.lookup_associative_element("m", "foo"), Some("bar".into()));
+        assert_eq!(s.lookup_associative_element("m", "baz"), Some("qux".into()));
+    }
+
+    #[test]
+    fn declare_p_formats_associative() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "k1".into(), "v1".into()).unwrap();
+        s.set_associative_element("m", "k2".into(), "v2".into()).unwrap();
+        let v = s.iter_vars().find(|(n, _)| n.as_str() == "m").unwrap().1;
+        let line = format_declare_line("m", v);
+        assert_eq!(line, r#"declare -A m=(["k1"]="v1" ["k2"]="v2")"#);
+    }
+
+    #[test]
+    fn declare_dash_cap_a_i_errors() {
+        let mut s = Shell::new();
+        let outcome = run(&mut s, "declare -Ai m");
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(s.get_associative("m").is_none());
+    }
+
+    #[test]
+    fn declare_dash_a_cap_a_errors() {
+        let mut s = Shell::new();
+        let outcome = run(&mut s, "declare -aA m");
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_dash_cap_a_on_existing_indexed_errors() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "a=(x y z)");
+        let outcome = run(&mut s, "declare -A a");
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(s.get_array("a").is_some());
+        assert!(s.get_associative("a").is_none());
+    }
+
+    #[test]
+    fn declare_dash_cap_a_on_existing_scalar_errors() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "s=hello");
+        let outcome = run(&mut s, "declare -A s");
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn readonly_dash_cap_a_creates_readonly_associative() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "readonly -A m=([k]=v)");
+        assert!(s.get_associative("m").is_some());
+        let _ = run(&mut s, "m[k2]=v2");
+        assert!(s.lookup_associative_element("m", "k2").is_none());
+    }
+
+    #[test]
+    fn export_associative_rejects() {
+        let mut s = Shell::new();
+        let outcome = run(&mut s, "export m=([k]=v)");
+        assert!(matches!(outcome, ExecOutcome::Continue(1) | ExecOutcome::Exit(1)));
+        assert!(s.get_associative("m").is_none());
     }
 }

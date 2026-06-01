@@ -14,7 +14,6 @@ use crate::jobs::JobTable;
 pub enum VarValue {
     Scalar(String),
     Indexed(BTreeMap<usize, String>),
-    #[allow(dead_code)] // wired up by tasks 2-4 (declare -A, expansion, executor)
     Associative(Vec<(String, String)>),
 }
 
@@ -71,13 +70,11 @@ pub enum AssignErr {
     /// correct shape-specific mutator. Defensive only — the executor
     /// must check variants before calling and surface a user-facing
     /// diagnostic.
-    #[allow(dead_code)] // wired up by tasks 3-4
     TypeMismatch,
 }
 
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
-#[allow(dead_code)] // wired up by task 4 (declare -A builtin)
 #[derive(Debug)]
 pub enum DeclareErr {
     TypeMismatch,
@@ -703,7 +700,6 @@ impl Shell {
 
     /// Returns a reference to the associative array stored under `name`,
     /// or `None` if the variable is unset, scalar, or indexed.
-    #[allow(dead_code)] // wired up by tasks 2-4
     pub fn get_associative(&self, name: &str) -> Option<&Vec<(String, String)>> {
         match self.vars.get(name) {
             Some(v) => match &v.value {
@@ -716,7 +712,6 @@ impl Shell {
 
     /// Returns the value at string key `key` for the associative array `name`.
     /// `None` if the variable is unset, not associative, or has no such key.
-    #[allow(dead_code)] // wired up by tasks 2-4
     pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
         self.get_associative(name).and_then(|pairs| {
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
@@ -729,7 +724,6 @@ impl Shell {
     /// (used as a generic "could not set" signal) if the variable exists
     /// and is NOT associative — callers (the executor) must check the
     /// variant before calling this.
-    #[allow(dead_code)] // wired up by tasks 3-4
     pub fn set_associative_element(
         &mut self,
         name: &str,
@@ -766,7 +760,6 @@ impl Shell {
 
     /// `m[k]+=v` — concatenate `value` to the existing element at `key`,
     /// or set to `value` if no such key. Honors readonly.
-    #[allow(dead_code)] // wired up by tasks 3-4
     pub fn append_associative_element(
         &mut self,
         name: &str,
@@ -779,7 +772,7 @@ impl Shell {
 
     /// Removes the entry at `key` from the associative array `name`.
     /// No-op if missing/not-associative/no-such-key. Honors readonly.
-    #[allow(dead_code)] // wired up by task 4 (unset builtin)
+    #[allow(dead_code)] // wired up by future unset builtin work
     pub fn unset_associative_element(
         &mut self,
         name: &str,
@@ -802,7 +795,6 @@ impl Shell {
     /// Replaces (or creates) `name` as an associative array with the given
     /// pairs in insertion order. Honors readonly. Preserves exported flag
     /// if the variable exists.
-    #[allow(dead_code)] // wired up by task 3 (executor compound assignment)
     pub fn replace_associative(
         &mut self,
         name: &str,
@@ -833,7 +825,6 @@ impl Shell {
     /// - Already associative → no-op.
     /// - Indexed → error: "cannot convert indexed to associative array".
     /// - Scalar → error: "cannot convert scalar to associative".
-    #[allow(dead_code)] // wired up by task 4 (declare -A builtin)
     pub fn declare_associative(&mut self, name: &str) -> Result<(), DeclareErr> {
         match self.vars.get(name).map(|v| &v.value) {
             None => {
