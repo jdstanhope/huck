@@ -440,7 +440,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
 
 fn run_double_bracket(
     expr: &TestExpr,
-    inline_assignments: &[(String, crate::lexer::Word)],
+    inline_assignments: &[crate::command::Assignment],
     shell: &mut Shell,
 ) -> ExecOutcome {
     let snap = match apply_inline_assignments(inline_assignments, shell) {
@@ -712,7 +712,7 @@ fn run_background_sequence(
         }
 
         // ---- Inline assignments (v23 scoping) ---------------------------------
-        let inline_assignments: &[(String, crate::lexer::Word)] =
+        let inline_assignments: &[crate::command::Assignment] =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 &exec.inline_assignments
             } else {
@@ -1165,6 +1165,12 @@ enum ResolvedStdin {
 struct ResolvedCommand {
     program: String,
     args: Vec<String>,
+    /// Populated only when `program` is a declaration command
+    /// (`declare`, `typeset`, `local`, `readonly`, `export`). Carries
+    /// the per-arg `DeclArg` shape so the builtin can route compound-RHS
+    /// assignments through `apply_one_assignment` while still handling
+    /// flags and scalar names. `args` is left empty in that case.
+    decl_args: Option<Vec<crate::command::DeclArg>>,
     stdin: Option<ResolvedStdin>,
     stdout: Option<ResolvedRedirect>,
     stderr: Option<ResolvedRedirect>,
@@ -1210,10 +1216,47 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     let mut iter = prog_fields.into_iter();
     let program = iter.next().unwrap();
     let mut args: Vec<String> = iter.collect();
+
+    // Declaration commands (`declare` / `typeset` / `local` / `readonly` /
+    // `export`) need a side-channel for assignment-shaped args so compound
+    // RHS (`a=(x y z)`) doesn't crash through `expand()` — the lexer leaves
+    // an `ArrayLiteral` WordPart that's unreachable! in expansion. For
+    // those programs, split each arg Word: assignment-shaped → parsed
+    // Assignment (via `try_split_assignment`); other → expanded String.
+    let is_decl = builtins::is_declaration_command(&program);
+    let mut decl_args: Option<Vec<crate::command::DeclArg>> = if is_decl {
+        // Migrate any tail of `prog_fields` (post-split) into decl_args as
+        // Plain, then drain `args` since the builtin won't read it.
+        let mut v: Vec<crate::command::DeclArg> = Vec::with_capacity(args.len() + cmd.args.len());
+        for s in args.drain(..) {
+            v.push(crate::command::DeclArg::Plain(s));
+        }
+        Some(v)
+    } else {
+        None
+    };
     for word in &cmd.args {
-        args.extend(glob_expand_fields(expand(word, shell)));
+        if let Some(da) = decl_args.as_mut()
+            && crate::command::is_assignment_word(word)
+        {
+            match crate::command::try_split_assignment(word.clone()) {
+                Ok(a) => da.push(crate::command::DeclArg::Assign(a)),
+                Err(_) => unreachable!(
+                    "is_assignment_word confirmed shape but try_split_assignment refused"
+                ),
+            }
+            continue;
+        }
+        let fields = glob_expand_fields(expand(word, shell));
         if let Some(status) = shell.pending_fatal_pe_error {
             return Err(status);
+        }
+        if let Some(da) = decl_args.as_mut() {
+            for s in fields {
+                da.push(crate::command::DeclArg::Plain(s));
+            }
+        } else {
+            args.extend(fields);
         }
     }
     let stdin = match &cmd.stdin {
@@ -1289,7 +1332,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         }
         None => None,
     };
-    Ok(ResolvedCommand { program, args, stdin, stdout, stderr })
+    Ok(ResolvedCommand { program, args, decl_args, stdin, stdout, stderr })
 }
 
 // ----- redirect file handling -----------------------------------------------
@@ -1498,10 +1541,13 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
     match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
-            for (name, value) in items {
-                let v = expand_assignment(value, shell);
-                if shell.try_set(name, v).is_err() {
+            for a in items {
+                let name = a.target.name();
+                if shell.is_readonly(name) {
                     eprintln!("huck: {name}: readonly variable");
+                    return ExecOutcome::Continue(1);
+                }
+                if apply_one_assignment(a, shell).is_err() {
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -1649,15 +1695,27 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         };
         let outcome = match files.stdout {
             Some(mut file) => {
-                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+                if let Some(da) = resolved.decl_args.as_deref() {
+                    builtins::run_declaration_builtin(&resolved.program, da, &mut file, shell)
+                } else {
+                    builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
+                }
             }
             None => match sink {
                 StdoutSink::Terminal => {
                     let mut out = io::stdout();
-                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                    if let Some(da) = resolved.decl_args.as_deref() {
+                        builtins::run_declaration_builtin(&resolved.program, da, &mut out, shell)
+                    } else {
+                        builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
+                    }
                 }
                 StdoutSink::Capture(buf) => {
-                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                    if let Some(da) = resolved.decl_args.as_deref() {
+                        builtins::run_declaration_builtin(&resolved.program, da, *buf, shell)
+                    } else {
+                        builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
+                    }
                 }
             },
         };
@@ -2044,7 +2102,7 @@ fn run_multi_stage(
         }
 
         // ---- Apply inline assignments (v23 per-stage scoping) ---------------
-        let inline_assignments: &[(String, crate::lexer::Word)] =
+        let inline_assignments: &[crate::command::Assignment] =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 &exec.inline_assignments
             } else {
@@ -2683,28 +2741,45 @@ fn wait_pipeline_raw(
 
 // ----- inline-assignment apply/restore helpers ------------------------------
 
-/// Snapshot entry for one applied inline assignment: name, prior value
-/// (None if the var was unset), prior export flag.
-type AssignmentSnapshot = Vec<(String, Option<String>, bool)>;
+/// Snapshot entry for one applied inline assignment: name + the full
+/// prior `Variable` (or `None` if the var was unset before apply).
+/// Cloning the entire `Variable` (rather than just its scalar value
+/// and export flag) is what lets v71 array-valued inline prefixes
+/// round-trip correctly through restore.
+type AssignmentSnapshot = Vec<(String, Option<crate::shell_state::Variable>)>;
 
 /// Expands and applies `assignments` left-to-right, exporting each, and
 /// returns a snapshot the caller can pass to `restore_inline_assignments`
 /// (for temporary-scope targets) or discard (for persistent-scope targets).
 fn apply_inline_assignments(
-    assignments: &[(String, crate::lexer::Word)],
+    assignments: &[crate::command::Assignment],
     shell: &mut Shell,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
-    for (name, rhs) in assignments {
-        let prior_value = shell.get(name).map(str::to_string);
-        let prior_exported = shell.is_exported(name);
+    for a in assignments {
+        let name = a.target.name();
+        let prior = shell.snapshot_var(name);
         if shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(snap);
         }
-        let value = expand_assignment(rhs, shell);
-        shell.export_set(name, value);
-        snap.push((name.clone(), prior_value, prior_exported));
+        if apply_one_assignment(a, shell).is_err() {
+            return Err(snap);
+        }
+        // Bash semantics: inline-prefix assignments are exported for the
+        // duration of the command. Only scalar bare-name assignments to
+        // a scalar (or new) variable carry the export flag — array
+        // variables aren't placed in the child environment, but the
+        // export flag still flips during the temporary scope so that a
+        // later `a=val cmd` (scalar reassignment of the same name) sees
+        // the expected state. Match the pre-v71 behavior by toggling the
+        // export bit only when the value is a bare scalar.
+        if matches!(&a.target, crate::command::AssignTarget::Bare(_))
+            && !is_array_value_word(&a.value)
+        {
+            shell.export(name);
+        }
+        snap.push((name.to_string(), prior));
     }
     Ok(snap)
 }
@@ -2712,19 +2787,129 @@ fn apply_inline_assignments(
 /// Restores each snapshot entry in reverse order, so repeated names
 /// unwind LIFO and end up at their pre-prefix value.
 fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
-    for (name, prior_value, prior_exported) in snap.into_iter().rev() {
-        match (prior_value, prior_exported) {
-            (Some(v), true) => shell.export_set(&name, v),
-            (Some(v), false) => {
-                // `shell.set` preserves the existing export flag; we just
-                // wrote with export=true via export_set during apply, so
-                // we have to unset-then-set to land at unexported.
-                shell.unset(&name);
-                shell.set(&name, v);
+    for (name, prior) in snap.into_iter().rev() {
+        shell.restore_var(&name, prior);
+    }
+}
+
+/// True iff `word` has a trailing `ArrayLiteral` WordPart (the lexer
+/// shape produced for `name=(...)` / `name+=(...)`).
+fn is_array_value_word(word: &crate::lexer::Word) -> bool {
+    matches!(
+        word.0.last(),
+        Some(crate::lexer::WordPart::ArrayLiteral(_))
+    )
+}
+
+/// Applies one `Assignment` to `shell`. Dispatches on the four
+/// combinations of (target kind, value kind):
+///   1. Bare + compound array RHS  →  `replace_array` / `append_array`
+///   2. Bare + scalar RHS          →  `try_set` / scalar+=value
+///   3. Indexed + scalar RHS       →  `set_array_element` / `append_array_element`
+///   4. Indexed + compound array   →  rejected (matches bash)
+///
+/// Returns `Err(())` on readonly violation or other write failure
+/// (diagnostic printed by the mutator). On success returns `Ok(())`.
+pub(crate) fn apply_one_assignment(
+    a: &crate::command::Assignment,
+    shell: &mut Shell,
+) -> Result<(), ()> {
+    use crate::command::AssignTarget;
+
+    let trailing_array_literal: Option<&Vec<crate::lexer::ArrayLiteralElement>> =
+        a.value.0.last().and_then(|wp| {
+            if let crate::lexer::WordPart::ArrayLiteral(els) = wp {
+                Some(els)
+            } else {
+                None
             }
-            (None, _) => shell.unset(&name),
+        });
+
+    match (&a.target, trailing_array_literal) {
+        // Bare name + compound array RHS.
+        (AssignTarget::Bare(name), Some(elements)) => {
+            if a.append {
+                // a+=(elements): append new keys after max_index.
+                let values: Vec<String> = elements
+                    .iter()
+                    .map(|e| expand_assignment(&e.value, shell))
+                    .collect();
+                shell.append_array(name, &values).map_err(|_| ())
+            } else {
+                // a=(elements): replace whole array.
+                let map = build_array_map(elements, name, shell)?;
+                shell.replace_array(name, map).map_err(|_| ())
+            }
+        }
+        // Bare name + scalar RHS.
+        (AssignTarget::Bare(name), None) => {
+            let s = expand_assignment(&a.value, shell);
+            if a.append {
+                // a+=v: on a scalar, concatenate; on an array, append to element 0
+                // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
+                match shell.get_array(name) {
+                    Some(_) => shell
+                        .append_array_element(name, 0, &s)
+                        .map_err(|_| ()),
+                    None => {
+                        let existing = shell.get(name).map(str::to_string).unwrap_or_default();
+                        shell.try_set(name, existing + &s).map_err(|_| ())
+                    }
+                }
+            } else {
+                shell.try_set(name, s).map_err(|_| ())
+            }
+        }
+        // Subscripted lvalue + scalar RHS.
+        (AssignTarget::Indexed { name, subscript }, None) => {
+            let idx = match crate::expand::eval_subscript(subscript, shell, name) {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("huck: {e}");
+                    return Err(());
+                }
+            };
+            let v = expand_assignment(&a.value, shell);
+            if a.append {
+                shell.append_array_element(name, idx, &v).map_err(|_| ())
+            } else {
+                shell.set_array_element(name, idx, v).map_err(|_| ())
+            }
+        }
+        // Subscripted lvalue + compound array RHS: bash rejects this.
+        (AssignTarget::Indexed { name, .. }, Some(_)) => {
+            eprintln!("huck: {name}: cannot assign array literal to array element");
+            Err(())
         }
     }
+}
+
+/// Builds the `BTreeMap<usize, String>` for a compound `name=(...)`
+/// RHS. Implicit subscripts continue from the highest explicit
+/// subscript seen so far (bash's rule for sparse mixed-form literals).
+fn build_array_map(
+    elements: &[crate::lexer::ArrayLiteralElement],
+    name: &str,
+    shell: &mut Shell,
+) -> Result<std::collections::BTreeMap<usize, String>, ()> {
+    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut implicit: usize = 0;
+    for e in elements {
+        let val = expand_assignment(&e.value, shell);
+        let idx = match &e.subscript {
+            Some(sw) => match crate::expand::eval_subscript(sw, shell, name) {
+                Ok(i) => i,
+                Err(msg) => {
+                    eprintln!("huck: {msg}");
+                    return Err(());
+                }
+            },
+            None => implicit,
+        };
+        map.insert(idx, val);
+        implicit = idx + 1;
+    }
+    Ok(map)
 }
 
 // ----- job-control helpers -------------------------------------------------
@@ -3115,6 +3300,14 @@ mod tests {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
+    fn bare_assign(name: &str, value: Word) -> crate::command::Assignment {
+        crate::command::Assignment {
+            target: crate::command::AssignTarget::Bare(name.to_string()),
+            value,
+            append: false,
+        }
+    }
+
     fn exec(program: &str, args: &[&str]) -> SimpleCommand {
         SimpleCommand::Exec(ExecCommand {
             inline_assignments: Vec::new(),
@@ -3270,7 +3463,7 @@ mod tests {
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    ("HUCK_TEST_BG_ASSIGN".to_string(), lit_word("v")),
+                    bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
                 ]))],
             }),
             rest: vec![],
@@ -3339,7 +3532,7 @@ mod tests {
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
-                    ("BG_X".to_string(), Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
+                    bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
                 ]))],
             }),
             rest: vec![],
@@ -3742,8 +3935,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("HOME", "/home/test".to_string());
         let assigns = vec![
-            ("A".to_string(), lit_word("1")),
-            ("B".to_string(), Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
+            bare_assign("A", lit_word("1")),
+            bare_assign("B", Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("A"), Some("1"));
@@ -3756,7 +3949,7 @@ mod tests {
     #[test]
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
-        let assigns = vec![("FOO".to_string(), lit_word("bar"))];
+        let assigns = vec![bare_assign("FOO", lit_word("bar"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
@@ -3768,7 +3961,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
-        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
+        let assigns = vec![bare_assign("FOO", lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
@@ -3781,7 +3974,7 @@ mod tests {
     fn restore_inline_assignments_restores_prior_value_exported() {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
-        let assigns = vec![("FOO".to_string(), lit_word("inner"))];
+        let assigns = vec![bare_assign("FOO", lit_word("inner"))];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -3793,8 +3986,8 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let assigns = vec![
-            ("FOO".to_string(), lit_word("a")),
-            ("FOO".to_string(), lit_word("b")),
+            bare_assign("FOO", lit_word("a")),
+            bare_assign("FOO", lit_word("b")),
         ];
         let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
         assert_eq!(shell.get("FOO"), Some("b"));
@@ -3810,7 +4003,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("FOO", "outer".to_string());
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("inner"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("inner"))],
             program: lit_word("true"),
             args: vec![],
             stdin: None,
@@ -3834,7 +4027,7 @@ mod tests {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("myfunc"),
             args: vec![],
             stdin: None,
@@ -3851,7 +4044,7 @@ mod tests {
     fn run_exec_single_special_builtin_inline_assignment_persists() {
         let mut shell = Shell::new();
         let cmd = SimpleCommand::Exec(ExecCommand {
-            inline_assignments: vec![("FOO".to_string(), lit_word("val"))],
+            inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("export"),
             args: vec![lit_word("FOO")],
             stdin: None,
@@ -4016,7 +4209,7 @@ mod tests {
         // Assignment-only stage (SimpleCommand::Assign) → InProcess.
         let shell = Shell::new();
         let cmd = Command::Simple(SimpleCommand::Assign(vec![
-            ("FOO".to_string(), lit_word("bar")),
+            bare_assign("FOO", lit_word("bar")),
         ]));
         assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
     }
@@ -4323,5 +4516,160 @@ mod tests {
         // local should have errored; X unchanged.
         assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
         assert_eq!(shell.last_status(), 1);
+    }
+}
+
+#[cfg(test)]
+mod array_assign_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    /// Drive a fragment through the same execute path the REPL uses.
+    fn run_line(shell: &mut Shell, line: &str) {
+        let mut src = String::from(line);
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+        let tokens = crate::lexer::tokenize(&src).expect("tokenize");
+        let seq = crate::command::parse(tokens)
+            .expect("parse ok")
+            .expect("non-empty parse");
+        execute(&seq, shell, &src);
+    }
+
+    #[test]
+    fn compound_assign_creates_array() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("z"));
+    }
+
+    #[test]
+    fn sparse_compound_assign_respects_explicit_subscripts() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=([5]=x [2]=y)");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&5).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn element_assign_creates_array() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a[3]=hello");
+        let m = s.get_array("a").expect("a should be an array");
+        assert_eq!(m.get(&3).map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn element_assign_promotes_scalar() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=old");
+        run_line(&mut s, "a[2]=new");
+        let m = s.get_array("a").expect("scalar should promote to array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("old"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn append_array_extends() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y)");
+        run_line(&mut s, "a+=(z w)");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(
+            m.values().cloned().collect::<Vec<_>>(),
+            vec![
+                "x".to_string(),
+                "y".to_string(),
+                "z".to_string(),
+                "w".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn append_element_concatenates() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a[0]=hello");
+        run_line(&mut s, "a[0]+=_world");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("hello_world"));
+    }
+
+    #[test]
+    fn readonly_blocks_compound_assign() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(initial)");
+        s.mark_readonly("a");
+        run_line(&mut s, "a=(changed)");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("initial"));
+    }
+
+    #[test]
+    fn readonly_blocks_element_assign() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(initial)");
+        s.mark_readonly("a");
+        run_line(&mut s, "a[5]=new");
+        let m = s.get_array("a").unwrap();
+        assert!(m.get(&5).is_none());
+    }
+
+    #[test]
+    fn unset_element_removes_one_key() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a[1]");
+        let m = s.get_array("a").unwrap();
+        assert!(m.get(&1).is_none());
+        assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("z"));
+    }
+
+    #[test]
+    fn unset_whole_array_removes_variable() {
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a");
+        assert!(s.get_array("a").is_none());
+        assert!(s.get("a").is_none());
+    }
+
+    #[test]
+    fn scalar_append_to_existing_array_writes_element_zero() {
+        // `a=(x y); a+=z` in bash appends to element 0 (i.e. concatenates
+        // with a[0]), yielding a[0]="xz".
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y)");
+        run_line(&mut s, "a+=z");
+        let m = s.get_array("a").expect("still an array");
+        assert_eq!(m.get(&0).map(String::as_str), Some("xz"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn indexed_lvalue_compound_rhs_rejected() {
+        // `a[i]=(...)` is a syntax-level error in bash; huck rejects
+        // it with a diagnostic and leaves `a` empty.
+        let mut s = Shell::new();
+        run_line(&mut s, "a[0]=(x y)");
+        assert!(s.get_array("a").is_none());
+    }
+
+    #[test]
+    fn unset_with_empty_subscript_errors() {
+        // bash treats `unset a[]` as a syntax error
+        // ("bad array subscript") and leaves `a` untouched.
+        let mut s = Shell::new();
+        run_line(&mut s, "a=(x y z)");
+        run_line(&mut s, "unset a[]");
+        let m = s.get_array("a").expect("a should still exist");
+        assert_eq!(m.len(), 3);
     }
 }

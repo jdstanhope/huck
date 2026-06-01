@@ -78,15 +78,31 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
     }
 }
 
-/// If `word` looks like `NAME=value` (a leading `Literal` whose text begins
-/// with a valid identifier followed by `=`), returns `Ok((name, value))`
-/// where `value` is a `Word` containing the rest of the prefix Literal
-/// followed by the remaining original parts (moved, not cloned). Otherwise
-/// returns `Err(word)` handing the original back unchanged.
-fn try_split_assignment(
+/// If `word` is an assignment-shaped Word (either an `AssignPrefix`-led
+/// structured form for `name+=…` / `name[…]=…` / `name[…]+=…`, or a
+/// leading `Literal` of the form `NAME=…` for bare scalar `name=…`),
+/// returns the structured `Assignment`. The value is moved (not cloned)
+/// from the input parts. Otherwise returns `Err(word)` handing the
+/// original back unchanged.
+pub(crate) fn try_split_assignment(
     word: crate::lexer::Word,
-) -> Result<(String, crate::lexer::Word), crate::lexer::Word> {
+) -> Result<Assignment, crate::lexer::Word> {
     use crate::lexer::WordPart;
+    // 1. AssignPrefix-led: the lexer has already parsed the target.
+    if matches!(word.0.first(), Some(WordPart::AssignPrefix { .. })) {
+        let crate::lexer::Word(mut parts) = word;
+        let prefix = parts.remove(0);
+        let WordPart::AssignPrefix { target, append } = prefix else {
+            unreachable!("checked above");
+        };
+        return Ok(Assignment {
+            target,
+            value: crate::lexer::Word(parts),
+            append,
+        });
+    }
+    // 2. Bare `name=value` shape: leading Literal whose text begins
+    //    with an identifier followed by `=`.
     let first = match word.0.first() {
         Some(p) => p,
         None => return Err(word),
@@ -130,15 +146,23 @@ fn try_split_assignment(
     let mut value_parts: Vec<WordPart> = Vec::with_capacity(parts.len() + 1);
     value_parts.push(WordPart::Literal { text: rest_of_first, quoted: false });
     value_parts.extend(parts);
-    Ok((name, crate::lexer::Word(value_parts)))
+    Ok(Assignment {
+        target: AssignTarget::Bare(name),
+        value: crate::lexer::Word(value_parts),
+        append: false,
+    })
 }
 
-/// Returns `true` if `w` looks like a `NAME=value` assignment word without
+/// Returns `true` if `w` looks like an assignment word without
 /// consuming or cloning it. Mirrors the shape check in `try_split_assignment`
 /// so the caller can decide whether to take ownership before calling the
-/// real splitter.
-fn is_assignment_word(w: &crate::lexer::Word) -> bool {
+/// real splitter. Detects both the structured `AssignPrefix` form and the
+/// legacy bare `Literal("NAME=…")` form.
+pub(crate) fn is_assignment_word(w: &crate::lexer::Word) -> bool {
     use crate::lexer::WordPart;
+    if matches!(w.0.first(), Some(WordPart::AssignPrefix { .. })) {
+        return true;
+    }
     let text = match w.0.first() {
         Some(WordPart::Literal { text, quoted: false }) => text,
         _ => return false,
@@ -174,7 +198,7 @@ fn finalize_stage(
     // We peek by reference first (cheap) and only take ownership when the
     // word is confirmed to be assignment-shaped, avoiding a deep clone on
     // every non-assignment first word.
-    let mut inline: Vec<(String, Word)> = Vec::new();
+    let mut inline: Vec<Assignment> = Vec::new();
     let mut iter = std::iter::once(program).chain(args).peekable();
     while let Some(w) = iter.peek() {
         if !is_assignment_word(w) {
@@ -182,7 +206,7 @@ fn finalize_stage(
         }
         let owned = iter.next().expect("just peeked Some");
         match try_split_assignment(owned) {
-            Ok((name, value)) => inline.push((name, value)),
+            Ok(a) => inline.push(a),
             Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
         }
     }
@@ -239,11 +263,55 @@ pub enum Redirect {
     Dup { fd: i32, source: Word },
 }
 
+/// Left-hand side of an assignment. Bare `name=v` is `Bare`;
+/// subscripted `name[expr]=v` is `Indexed`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AssignTarget {
+    Bare(String),
+    Indexed { name: String, subscript: Word },
+}
+
+impl AssignTarget {
+    /// Returns the underlying variable name regardless of whether the
+    /// target is bare or subscripted.
+    #[allow(dead_code)] // used by tests + by Tasks 3/4 array execution
+    pub fn name(&self) -> &str {
+        match self {
+            AssignTarget::Bare(n) => n,
+            AssignTarget::Indexed { name, .. } => name,
+        }
+    }
+}
+
+/// One assignment record: `name=value`, `name=(…)`, `name[i]=value`,
+/// `name+=value`, `name+=(…)`, or `name[i]+=value`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Assignment {
+    pub target: AssignTarget,
+    pub value: Word,
+    pub append: bool,
+}
+
+/// Argument shape for declaration commands (`declare`, `typeset`, `local`,
+/// `readonly`, `export`). Each surface argument is either a plain string
+/// (flags like `-a`, bare names, or post-expansion `name=value`) or an
+/// `Assignment` parsed from a compound-RHS word like `name=(x y z)`. The
+/// executor populates the variant in `resolve()` so the builtins can route
+/// compound-RHS assignments through the same Task-4 path used by ordinary
+/// assignment commands. Non-declaration commands never see `DeclArg`.
+#[derive(Debug, Clone)]
+pub enum DeclArg {
+    /// A post-expansion string — flag, bare name, or scalar `name=value`.
+    Plain(String),
+    /// A compound-RHS assignment (e.g. `name=(x y z)` or `name[i]+=v`).
+    Assign(Assignment),
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExecCommand {
-    /// Leading `NAME=value` words preceding the command word. Empty
-    /// when the user wrote `cmd args` with no assignment prefix.
-    pub inline_assignments: Vec<(String, Word)>,
+    /// Leading assignments preceding the command word (`A=1 B=2 cmd`).
+    /// Empty when the user wrote `cmd args` with no assignment prefix.
+    pub inline_assignments: Vec<Assignment>,
     pub program: Word,
     pub args: Vec<Word>,
     // BREAKING CHANGE (v24): was Option<Word>; now Option<Redirect> so
@@ -279,7 +347,7 @@ pub enum SimpleCommand {
     /// `A=1 B=2 …` with no following command — every assignment
     /// persists in the shell. Single-element vec is the v22-style
     /// single-assignment case.
-    Assign(Vec<(String, Word)>),
+    Assign(Vec<Assignment>),
     Exec(ExecCommand),
 }
 
@@ -357,7 +425,7 @@ pub enum Command {
     /// `inline_assignments` holds any `NAME=value` prefixes (e.g. `FOO=hi [[ … ]]`).
     DoubleBracket {
         expr: Box<TestExpr>,
-        inline_assignments: Vec<(String, Word)>,
+        inline_assignments: Vec<Assignment>,
     },
 }
 
@@ -616,9 +684,9 @@ fn parse_command<I: Iterator<Item = Token>>(
                 // words — we must NOT drain `iter` in the fallback path.
                 if is_assignment_word(&w) {
                     let w_clone = w.clone();
-                    let mut assigns: Vec<(String, Word)> = Vec::new();
+                    let mut assigns: Vec<Assignment> = Vec::new();
                     match try_split_assignment(w) {
-                        Ok(pair) => assigns.push(pair),
+                        Ok(a) => assigns.push(a),
                         Err(_) => unreachable!("is_assignment_word confirmed"),
                     }
                     let mut extra_clones: Vec<Word> = Vec::new();
@@ -630,7 +698,7 @@ fn parse_command<I: Iterator<Item = Token>>(
                         let Some(Token::Word(nw)) = iter.next() else { unreachable!() };
                         let nw_clone = nw.clone();
                         match try_split_assignment(nw) {
-                            Ok(pair) => assigns.push(pair),
+                            Ok(a) => assigns.push(a),
                             Err(_) => unreachable!("is_assignment_word confirmed"),
                         }
                         extra_clones.push(nw_clone);
@@ -1666,7 +1734,7 @@ fn parse_double_bracket<I: Iterator<Item = Token>>(
 
 fn parse_double_bracket_with_assigns<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
-    inline_assignments: Vec<(String, Word)>,
+    inline_assignments: Vec<Assignment>,
 ) -> Result<Command, ParseError> {
     // Consume `[[`.
     iter.next();
@@ -1984,7 +2052,11 @@ mod tests {
     }
 
     fn assignment(name: &str, value: Word) -> SimpleCommand {
-        SimpleCommand::Assign(vec![(name.to_string(), value)])
+        SimpleCommand::Assign(vec![Assignment {
+            target: AssignTarget::Bare(name.to_string()),
+            value,
+            append: false,
+        }])
     }
 
     #[test]
@@ -2027,7 +2099,7 @@ mod tests {
         match &first_pipeline(&seq).commands[0] {
             Command::Simple(SimpleCommand::Exec(e)) => {
                 assert_eq!(e.inline_assignments.len(), 1);
-                assert_eq!(e.inline_assignments[0].0, "FOO");
+                assert_eq!(e.inline_assignments[0].target.name(), "FOO");
                 assert_eq!(e.program, ww("baz"));
                 assert!(e.args.is_empty());
             }
@@ -2048,7 +2120,7 @@ mod tests {
         match &first_pipeline(&seq).commands[0] {
             Command::Simple(SimpleCommand::Exec(e)) => {
                 assert_eq!(e.inline_assignments.len(), 1);
-                assert_eq!(e.inline_assignments[0].0, "FOO");
+                assert_eq!(e.inline_assignments[0].target.name(), "FOO");
                 assert_eq!(e.program, Word(Vec::new()));
                 assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
             }
@@ -2101,14 +2173,15 @@ mod tests {
         match &first_pipeline(&seq).commands[0] {
             Command::Simple(SimpleCommand::Assign(items)) => {
                 assert_eq!(items.len(), 1);
-                let (name, value) = &items[0];
-                assert_eq!(name, "FOO");
-                assert_eq!(value.0.len(), 2);
-                match &value.0[0] {
+                let a = &items[0];
+                assert_eq!(a.target.name(), "FOO");
+                assert!(!a.append);
+                assert_eq!(a.value.0.len(), 2);
+                match &a.value.0[0] {
                     WordPart::Literal { text, .. } => assert_eq!(text, ""),
                     other => panic!("expected Literal(\"\"), got {other:?}"),
                 }
-                assert!(matches!(&value.0[1], WordPart::CommandSub { .. }));
+                assert!(matches!(&a.value.0[1], WordPart::CommandSub { .. }));
             }
             other => panic!("expected Simple(Assign), got {other:?}"),
         }
@@ -3189,8 +3262,8 @@ mod tests {
             panic!("expected Simple(Exec), got {:?}", p.commands[0])
         };
         assert_eq!(e.inline_assignments.len(), 2);
-        assert_eq!(e.inline_assignments[0].0, "A");
-        assert_eq!(e.inline_assignments[1].0, "B");
+        assert_eq!(e.inline_assignments[0].target.name(), "A");
+        assert_eq!(e.inline_assignments[1].target.name(), "B");
         assert_eq!(e.program, ww("cmd"));
         assert_eq!(e.args, vec![ww("arg")]);
     }
@@ -3205,8 +3278,8 @@ mod tests {
             panic!("expected Simple(Assign(Vec)), got {:?}", p.commands[0])
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].0, "A");
-        assert_eq!(items[1].0, "B");
+        assert_eq!(items[0].target.name(), "A");
+        assert_eq!(items[1].target.name(), "B");
     }
 
     #[test]
@@ -3216,7 +3289,7 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Assign(items)) = &p.commands[0] else { panic!() };
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].0, "FOO");
+        assert_eq!(items[0].target.name(), "FOO");
     }
 
     #[test]
@@ -3837,7 +3910,7 @@ mod tests {
             panic!("expected DoubleBracket, got {:?}", parsed.first)
         };
         assert_eq!(inline_assignments.len(), 1);
-        assert_eq!(inline_assignments[0].0, "FOO");
+        assert_eq!(inline_assignments[0].target.name(), "FOO");
     }
 
     // -----------------------------------------------------------------------
@@ -3867,8 +3940,8 @@ mod tests {
             panic!("expected Simple(Exec), got {:?}", p.commands[0])
         };
         assert_eq!(e.inline_assignments.len(), 2);
-        assert_eq!(e.inline_assignments[0].0, "A");
-        assert_eq!(e.inline_assignments[1].0, "B");
+        assert_eq!(e.inline_assignments[0].target.name(), "A");
+        assert_eq!(e.inline_assignments[1].target.name(), "B");
     }
 
     #[test]

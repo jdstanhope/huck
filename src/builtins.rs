@@ -2,6 +2,7 @@ use std::env;
 use std::io::Write;
 use std::path::Path;
 
+use crate::command::DeclArg;
 use crate::shell_state::Shell;
 
 /// The result of running a command — either the shell continues (carrying the
@@ -32,6 +33,16 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+/// True for "declaration commands" (bash terminology). Their
+/// assignment-shaped args (`a=(x y)`, `a[i]+=v`) are parsed as
+/// `Assignment`s and routed through `apply_one_assignment`, NOT
+/// expanded as ordinary Words. Non-assignment args (flags like
+/// `-a`, bare names) flow through normal expansion. See `resolve()`
+/// in src/executor.rs for the split logic.
+pub fn is_declaration_command(name: &str) -> bool {
+    matches!(name, "declare" | "typeset" | "local" | "readonly" | "export")
+}
+
 /// True for POSIX "special builtins" (2.14). Inline assignments preceding a
 /// special builtin persist in the shell; assignments preceding a regular
 /// builtin or external command are scoped to the command. The set is huck's
@@ -53,6 +64,17 @@ pub fn run_builtin(
     out: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
+    // Declaration commands (`declare`, `typeset`, `local`, `readonly`,
+    // `export`) must flow through `run_declaration_builtin` so that
+    // compound-RHS assignments (`a=(x y z)`, `a[i]+=v`) reach
+    // `apply_one_assignment`. The executor's `is_declaration_command`
+    // predicate routes them there; this debug_assert is a tripwire so a
+    // future refactor that bypasses the predicate doesn't silently end
+    // up here, where the legacy paths are array-unaware.
+    debug_assert!(
+        !is_declaration_command(name),
+        "declaration command `{name}` reached run_builtin; should have been routed to run_declaration_builtin",
+    );
     match name {
         "cd" => builtin_cd(args, out, shell),
         "pwd" => builtin_pwd(out),
@@ -100,6 +122,72 @@ pub fn run_builtin(
             ExecOutcome::FunctionReturn(code)
         }
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
+    }
+}
+
+/// Test-only convenience: call `run_declaration_builtin` from string
+/// args. Strings shaped like `NAME=value` (valid identifier on the
+/// left) are wrapped as `DeclArg::Assign` with a single-Literal value
+/// — mirroring what the executor produces from a parsed assignment
+/// word. Everything else (flags, bare names, invalid identifiers)
+/// becomes `DeclArg::Plain`. Compound-RHS coverage (`a=(x y)`,
+/// `a[i]+=v`) lives in integration tests where the lexer can build
+/// the actual `ArrayLiteral` / `AssignPrefix` parts.
+#[cfg(test)]
+pub(crate) fn run_declaration_builtin_strs(
+    name: &str,
+    args: &[String],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    use crate::command::{Assignment, AssignTarget};
+    use crate::lexer::{Word, WordPart};
+
+    fn is_valid_ident(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    }
+
+    let decl_args: Vec<DeclArg> = args
+        .iter()
+        .map(|s| match s.find('=') {
+            Some(eq) if is_valid_ident(&s[..eq]) => {
+                let name = s[..eq].to_string();
+                let val = s[eq + 1..].to_string();
+                DeclArg::Assign(Assignment {
+                    target: AssignTarget::Bare(name),
+                    value: Word(vec![WordPart::Literal { text: val, quoted: false }]),
+                    append: false,
+                })
+            }
+            _ => DeclArg::Plain(s.clone()),
+        })
+        .collect();
+    run_declaration_builtin(name, &decl_args, out, shell)
+}
+
+/// Entry point for declaration commands (`declare` / `typeset` / `local` /
+/// `readonly` / `export`). Differs from `run_builtin` by passing `DeclArg`s
+/// instead of pre-expanded `String`s: assignment-shaped args arrive as
+/// parsed `Assignment` records so compound-RHS (`a=(x y z)`) flows through
+/// `apply_one_assignment`, mirroring the path used by ordinary assignment
+/// commands. Caller must ensure `is_declaration_command(name)` is true.
+pub fn run_declaration_builtin(
+    name: &str,
+    decl_args: &[DeclArg],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    match name {
+        "declare" | "typeset" => builtin_declare_decl(decl_args, out, shell),
+        "local" => builtin_local_decl(decl_args, shell),
+        "readonly" => builtin_readonly_decl(decl_args, out, shell),
+        "export" => builtin_export_decl(decl_args, out, shell),
+        _ => unreachable!("run_declaration_builtin called with non-declaration: {name}"),
     }
 }
 
@@ -359,6 +447,35 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut any_error = false;
     for arg in args {
+        match parse_subscripted_arg(arg) {
+            Ok(Some((name, sub_text))) => {
+                // `unset a[i]`: remove a single element. The subscript is
+                // parsed as a synthetic literal `Word` so `eval_subscript`
+                // arith-evaluates it identically to a real expansion.
+                let sub_word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+                    text: sub_text.to_string(),
+                    quoted: false,
+                }]);
+                match crate::expand::eval_subscript(&sub_word, shell, name) {
+                    Ok(idx) => {
+                        if shell.unset_array_element(name, idx).is_err() {
+                            any_error = true;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("huck: unset: {e}");
+                        any_error = true;
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("huck: unset: {e}");
+                any_error = true;
+                continue;
+            }
+        }
         if !is_valid_name(arg) {
             eprintln!("huck: unset: '{arg}': not a valid identifier");
             any_error = true;
@@ -376,6 +493,30 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     } else {
         ExecOutcome::Continue(0)
     }
+}
+
+/// If `s` has the form `NAME[SUB]` where NAME is a valid identifier
+/// and `SUB` is non-empty, returns `Ok(Some((NAME, SUB)))`. If `s` has
+/// no `[` at all, returns `Ok(None)` so the caller falls through to the
+/// whole-variable unset path. Otherwise returns `Err(diagnostic)` —
+/// e.g. `a[`, `a[]`, or `1foo[i]` — matching bash's "bad array subscript"
+/// / "not a valid identifier" diagnostics for `unset`.
+fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, String> {
+    let Some(bracket) = s.find('[') else {
+        return Ok(None);
+    };
+    if !s.ends_with(']') {
+        return Err(format!("`{s}': bad array subscript"));
+    }
+    let name = &s[..bracket];
+    if !is_valid_name(name) {
+        return Err(format!("`{s}': not a valid identifier"));
+    }
+    let sub = &s[bracket + 1..s.len() - 1];
+    if sub.is_empty() {
+        return Err(format!("`{s}': bad array subscript"));
+    }
+    Ok(Some((name, sub)))
 }
 
 fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -423,12 +564,13 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
 }
 
 /// `readonly [-p] [NAME[=VALUE] ...]`. POSIX special builtin. With no
-/// names (or with `-p`), lists every readonly variable in
-/// `readonly NAME='value'` form (using the existing single-quote
-/// escape). For each NAME=VALUE arg, sets the value and marks readonly;
-/// for each bare NAME arg, marks readonly (creating an empty var if
-/// unset). Refuses to overwrite an already-readonly variable. Invalid
-/// identifiers → status 1 (other args still processed).
+/// names (or with `-p`), lists every readonly variable in `declare -p`
+/// form (`declare -r NAME="value"` for scalars, `declare -ar NAME=(...)`
+/// for arrays) via `format_declare_line`. For each NAME=VALUE arg, sets
+/// the value and marks readonly; for each bare NAME arg, marks readonly
+/// (creating an empty var if unset). Refuses to overwrite an
+/// already-readonly variable. Invalid identifiers → status 1 (other
+/// args still processed).
 fn builtin_readonly(
     args: &[String],
     out: &mut dyn std::io::Write,
@@ -457,12 +599,14 @@ fn builtin_readonly(
 
     if names.is_empty() || want_list {
         for name in shell.readonly_names() {
-            let value = shell.lookup_var(&name).unwrap_or_default();
-            if let Err(e) = writeln!(
-                out,
-                "readonly {name}='{}'",
-                escape_alias_value(&value)
-            ) {
+            // Mirror `builtin_readonly_decl`: arrays must render via
+            // `format_declare_line` so a readonly array prints its full
+            // element list rather than collapsing to element 0.
+            let line = match shell.snapshot_var(&name) {
+                Some(var) => format_declare_line(&name, &var),
+                None => format!("declare -r {name}"),
+            };
+            if let Err(e) = writeln!(out, "{line}") {
                 eprintln!("huck: readonly: {e}");
                 return ExecOutcome::Continue(1);
             }
@@ -517,10 +661,18 @@ fn escape_double_quote_value(s: &str) -> String {
 }
 
 /// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
-/// `declare --`; otherwise the attribute order is `irx` to match
-/// bash's display (e.g. `-i`, `-ir`, `-irx`, `-rx`).
+/// `declare --`; otherwise the attribute order is `airx` to match
+/// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
+/// For indexed-array variables, the value is rendered as
+/// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
 fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+    use crate::shell_state::VarValue;
+
     let mut attrs = String::new();
+    // Order matches bash's `declare -p` output: a, i, r, x.
+    if matches!(var.value, VarValue::Indexed(_)) {
+        attrs.push('a');
+    }
     if var.integer {
         attrs.push('i');
     }
@@ -538,8 +690,21 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
         s.push_str(&attrs);
         s
     };
-    let escaped = escape_double_quote_value(&var.value);
-    format!("declare {flag_str} {name}=\"{escaped}\"")
+    let value_part = match &var.value {
+        VarValue::Scalar(s) => {
+            let escaped = escape_double_quote_value(s);
+            format!("=\"{escaped}\"")
+        }
+        VarValue::Indexed(m) => {
+            let mut parts: Vec<String> = Vec::new();
+            for (k, v) in m {
+                let escaped = escape_double_quote_value(v);
+                parts.push(format!("[{k}]=\"{escaped}\""));
+            }
+            format!("=({})", parts.join(" "))
+        }
+    };
+    format!("declare {flag_str} {name}{value_part}")
 }
 
 /// If we're inside a function call AND `name` hasn't been snapshotted
@@ -812,6 +977,523 @@ fn builtin_declare(
             eprintln!("huck: declare: {name}: readonly variable");
             exit = 1;
         }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Declaration-builtin entry points (DeclArg-aware) — v71 Task 5
+// ─────────────────────────────────────────────────────────────
+//
+// These accept `&[DeclArg]` from `run_declaration_builtin`. Plain args
+// (flags, bare names, scalar `name=val` produced by string expansion) come
+// through as `Plain`. Compound-RHS or subscripted assignments (`a=(x y)`,
+// `a[i]+=v`) come through as parsed `Assignment` records and are applied
+// via `executor::apply_one_assignment` — the same path used by ordinary
+// assignment commands.
+
+/// True iff the `Word` value of an Assignment carries a trailing
+/// `ArrayLiteral` (i.e. it's a compound-RHS form like `name=(x y)`).
+fn assign_value_is_array(a: &crate::command::Assignment) -> bool {
+    matches!(
+        a.value.0.last(),
+        Some(crate::lexer::WordPart::ArrayLiteral(_))
+    )
+}
+
+/// `export` entry point with DeclArg input. Rejects array compound-RHS;
+/// otherwise mirrors the legacy `builtin_export` behavior (scalar `=`
+/// assigns + exports; bare `NAME` flips the export bit without checking
+/// readonly).
+fn builtin_export_decl(
+    args: &[DeclArg],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    if args.is_empty() {
+        let mut entries: Vec<(String, String)> = shell
+            .exported_env()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        entries.sort();
+        for (name, value) in entries {
+            if let Err(e) = writeln!(out, "export {name}={value}") {
+                eprintln!("huck: export: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+    let mut any_error = false;
+    for arg in args {
+        match arg {
+            DeclArg::Plain(s) => match s.find('=') {
+                Some(idx) => {
+                    let name = &s[..idx];
+                    let value = &s[idx + 1..];
+                    if !is_valid_name(name) {
+                        eprintln!("huck: export: '{s}': not a valid identifier");
+                        any_error = true;
+                        continue;
+                    }
+                    if shell.is_readonly(name) {
+                        eprintln!("huck: export: {name}: readonly variable");
+                        any_error = true;
+                        continue;
+                    }
+                    shell.export_set(name, value.to_string());
+                }
+                None => {
+                    if !is_valid_name(s) {
+                        eprintln!("huck: export: '{s}': not a valid identifier");
+                        any_error = true;
+                        continue;
+                    }
+                    shell.export(s);
+                }
+            },
+            DeclArg::Assign(a) => {
+                if assign_value_is_array(a) {
+                    eprintln!("huck: export: cannot export arrays");
+                    any_error = true;
+                    continue;
+                }
+                // Subscripted assignment in `export` is unusual; bash
+                // rejects element-write through export. Mirror that.
+                if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
+                    let name = a.target.name();
+                    eprintln!(
+                        "huck: export: `{name}': not a valid identifier"
+                    );
+                    any_error = true;
+                    continue;
+                }
+                let name = a.target.name().to_string();
+                if shell.is_readonly(&name) {
+                    eprintln!("huck: export: {name}: readonly variable");
+                    any_error = true;
+                    continue;
+                }
+                if crate::executor::apply_one_assignment(a, shell).is_err() {
+                    any_error = true;
+                    continue;
+                }
+                shell.export(&name);
+            }
+        }
+    }
+    if any_error {
+        ExecOutcome::Continue(1)
+    } else {
+        ExecOutcome::Continue(0)
+    }
+}
+
+/// `local` entry point with DeclArg input. Supports `-a` flag for array
+/// declaration; routes compound-RHS through `apply_one_assignment` while
+/// re-using the existing per-frame snapshot machinery for unwind on
+/// function return.
+fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
+    if shell.local_scopes.is_empty() {
+        eprintln!("huck: local: can only be used in a function");
+        return ExecOutcome::Continue(1);
+    }
+    let mut want_array = false;
+    let mut idx = 0;
+    // Parse leading flags from Plain args.
+    while idx < args.len() {
+        match &args[idx] {
+            DeclArg::Plain(s) => {
+                if s == "-a" {
+                    want_array = true;
+                    idx += 1;
+                    continue;
+                }
+                if s == "--" {
+                    idx += 1;
+                    break;
+                }
+                if s.starts_with('-') && s.len() > 1 {
+                    eprintln!("huck: local: {s}: invalid option");
+                    return ExecOutcome::Continue(1);
+                }
+                break;
+            }
+            DeclArg::Assign(_) => break,
+        }
+    }
+    let mut exit: i32 = 0;
+    for arg in &args[idx..] {
+        match arg {
+            DeclArg::Plain(s) => {
+                // Bare NAME (no value). The lexer would have given us an
+                // Assign for "NAME=VAL", so a Plain here that contains `=`
+                // came from expansion (e.g. `local "$x"`); bash treats that
+                // as an invalid identifier.
+                let name = s.as_str();
+                if !is_valid_name(name) {
+                    eprintln!("huck: local: `{s}': not a valid identifier");
+                    exit = 1;
+                    continue;
+                }
+                if shell.is_readonly(name) {
+                    eprintln!("huck: local: {name}: readonly variable");
+                    exit = 1;
+                    continue;
+                }
+                snapshot_for_local_scope(shell, name);
+                if want_array {
+                    // Promote existing scalar to element 0 (bash semantics)
+                    // or create an empty indexed array.
+                    if shell.get_array(name).is_none() {
+                        let mut empty = std::collections::BTreeMap::new();
+                        if let Some(scalar) = shell.get(name) {
+                            empty.insert(0, scalar.to_string());
+                        }
+                        if shell.replace_array(name, empty).is_err() {
+                            exit = 1;
+                        }
+                    }
+                } else {
+                    // Bare `local NAME` with no value: set empty scalar,
+                    // matching the legacy builtin_local behavior.
+                    shell.set(name, String::new());
+                }
+            }
+            DeclArg::Assign(a) => {
+                let name = a.target.name().to_string();
+                if !is_valid_name(&name) {
+                    eprintln!(
+                        "huck: local: `{name}': not a valid identifier"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                if shell.is_readonly(&name) {
+                    eprintln!("huck: local: {name}: readonly variable");
+                    exit = 1;
+                    continue;
+                }
+                snapshot_for_local_scope(shell, &name);
+                if crate::executor::apply_one_assignment(a, shell).is_err() {
+                    exit = 1;
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+/// `readonly` entry point with DeclArg input. Routes compound-RHS through
+/// `apply_one_assignment`; rejects subscripted-target assignments.
+fn builtin_readonly_decl(
+    args: &[DeclArg],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    // Parse leading flags (-p only). `--` terminates option processing.
+    let mut want_list = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let DeclArg::Plain(s) = &args[idx] else { break };
+        match s.as_str() {
+            "-p" => {
+                want_list = true;
+                idx += 1;
+            }
+            "--" => {
+                idx += 1;
+                break;
+            }
+            o if o.starts_with('-') && o.len() > 1 => {
+                eprintln!("huck: readonly: {o}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+    let rest = &args[idx..];
+
+    if rest.is_empty() || want_list {
+        for name in shell.readonly_names() {
+            // Route through snapshot_var/format_declare_line so arrays
+            // render as `declare -ar a=([0]="x" [1]="y")` instead of
+            // collapsing to element 0 via scalar_view().
+            let line = match shell.snapshot_var(&name) {
+                Some(var) => format_declare_line(&name, &var),
+                None => {
+                    // Marked readonly but never assigned: emit just the
+                    // bare attribute form, mirroring `declare -p` for
+                    // attribute-only variables.
+                    format!("declare -r {name}")
+                }
+            };
+            if let Err(e) = writeln!(out, "{line}") {
+                eprintln!("huck: readonly: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut exit = 0;
+    for arg in rest {
+        match arg {
+            DeclArg::Plain(s) => {
+                let name = s.as_str();
+                if !is_valid_name(name) {
+                    eprintln!(
+                        "huck: readonly: `{s}': not a valid identifier"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                shell.mark_readonly(name);
+            }
+            DeclArg::Assign(a) => match &a.target {
+                crate::command::AssignTarget::Bare(name) => {
+                    if shell.is_readonly(name) {
+                        eprintln!(
+                            "huck: readonly: {name}: readonly variable"
+                        );
+                        exit = 1;
+                        continue;
+                    }
+                    if crate::executor::apply_one_assignment(a, shell).is_err() {
+                        exit = 1;
+                        continue;
+                    }
+                    shell.mark_readonly(name);
+                }
+                crate::command::AssignTarget::Indexed { name, .. } => {
+                    eprintln!(
+                        "huck: readonly: `{name}': cannot make subscripted-assignment target readonly"
+                    );
+                    exit = 1;
+                }
+            },
+        }
+    }
+    ExecOutcome::Continue(exit)
+}
+
+/// `declare`/`typeset` entry point with DeclArg input.
+fn builtin_declare_decl(
+    args: &[DeclArg],
+    out: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let mut want_readonly = false;
+    let mut want_export = false;
+    let mut want_remove_export = false;
+    let mut want_integer = false;
+    let mut want_remove_integer = false;
+    let mut want_array = false;
+    let mut function_mode = false;
+    let mut function_names_only = false;
+    let mut print_mode = false;
+
+    // Parse leading flags from Plain args. As soon as we hit a non-flag
+    // Plain or any Assign, switch into the per-name phase.
+    let mut idx = 0;
+    while idx < args.len() {
+        let DeclArg::Plain(arg) = &args[idx] else { break };
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        let plus = arg.starts_with('+');
+        let minus = arg.starts_with('-');
+        if !(plus || minus) || arg.len() < 2 {
+            break;
+        }
+        for &c in &arg.as_bytes()[1..] {
+            match c {
+                b'r' if minus => want_readonly = true,
+                b'r' if plus => {
+                    eprintln!(
+                        "huck: declare: +r: readonly attribute cannot be removed"
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                b'x' if minus => want_export = true,
+                b'x' if plus => want_remove_export = true,
+                b'i' if minus => want_integer = true,
+                b'i' if plus => want_remove_integer = true,
+                b'a' if minus => want_array = true,
+                b'a' if plus => {
+                    eprintln!(
+                        "huck: declare: +a: array attribute cannot be removed"
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                b'f' if minus => function_mode = true,
+                b'F' if minus => {
+                    function_mode = true;
+                    function_names_only = true;
+                }
+                b'p' if minus => print_mode = true,
+                b'l' | b'u' | b'A' | b'n' | b'g' if minus => {
+                    eprintln!(
+                        "huck: declare: -{}: not yet implemented in this version",
+                        c as char
+                    );
+                    return ExecOutcome::Continue(1);
+                }
+                other => {
+                    let sign = if plus { '+' } else { '-' };
+                    eprintln!(
+                        "huck: declare: {sign}{}: invalid option",
+                        other as char
+                    );
+                    return ExecOutcome::Continue(2);
+                }
+            }
+        }
+        idx += 1;
+    }
+    let names = &args[idx..];
+
+    // Reject the combinations we haven't implemented yet.
+    if want_array && want_integer {
+        eprintln!("huck: declare: integer arrays not yet supported");
+        return ExecOutcome::Continue(1);
+    }
+
+    // Function-mode listing: only Plain names accepted.
+    if function_mode {
+        let plain_names: Vec<String> = names
+            .iter()
+            .filter_map(|a| match a {
+                DeclArg::Plain(s) => Some(s.clone()),
+                DeclArg::Assign(_) => None,
+            })
+            .collect();
+        return declare_list_functions(&plain_names, function_names_only, out, shell);
+    }
+
+    // Bare `declare` (or `declare -p`) with no names: list everything.
+    // `declare -a` with no names: list arrays only.
+    if names.is_empty() {
+        if want_array {
+            use crate::shell_state::VarValue;
+            let mut entries: Vec<(&String, &crate::shell_state::Variable)> = shell
+                .iter_vars()
+                .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_)))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, var) in entries {
+                let _ = writeln!(out, "{}", format_declare_line(name, var));
+            }
+            return ExecOutcome::Continue(0);
+        }
+        return declare_list_all_vars(out, shell);
+    }
+
+    let mut exit: i32 = 0;
+    for arg in names {
+        // Validate name. For Plain, treat the whole string as the
+        // candidate; for Assign, use the target's name.
+        let (name, assign_opt): (&str, Option<&crate::command::Assignment>) = match arg {
+            DeclArg::Plain(s) => (s.as_str(), None),
+            DeclArg::Assign(a) => (a.target.name(), Some(a)),
+        };
+        if !is_valid_name(name) {
+            eprintln!("huck: declare: `{name}': not a valid identifier");
+            exit = 1;
+            continue;
+        }
+
+        if print_mode {
+            match shell.snapshot_var(name) {
+                Some(var) => {
+                    let _ = writeln!(out, "{}", format_declare_line(name, &var));
+                }
+                None => {
+                    eprintln!("huck: declare: {name}: not found");
+                    exit = 1;
+                }
+            }
+            continue;
+        }
+
+        // Snapshot for local-scope unwind BEFORE mutating.
+        snapshot_for_local_scope(shell, name);
+
+        // Integer-attribute changes on readonly variable are rejected.
+        if (want_integer || want_remove_integer) && shell.is_readonly(name) {
+            eprintln!("huck: declare: {name}: readonly variable");
+            exit = 1;
+            continue;
+        }
+
+        // Apply integer-flag flips before any value-set path.
+        if want_integer {
+            shell.mark_integer(name);
+        }
+        if want_remove_integer {
+            shell.unmark_integer(name);
+        }
+
+        // Array-attribute handling. `-a NAME` with no value: promote
+        // scalar to element 0 (or create empty array). With a value,
+        // fall through into the assignment path below — it always
+        // routes compound RHS through apply_one_assignment.
+        if want_array && assign_opt.is_none() && shell.get_array(name).is_none() {
+            let mut empty = std::collections::BTreeMap::new();
+            if let Some(scalar) = shell.get(name) {
+                empty.insert(0, scalar.to_string());
+            }
+            if shell.replace_array(name, empty).is_err() {
+                eprintln!("huck: declare: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
+        }
+
+        // Compound assignment path: a parsed Assignment (scalar or array).
+        if let Some(a) = assign_opt {
+            // -r combined with =VALUE: must not clobber an existing
+            // readonly. Other =VALUE assignments rely on
+            // apply_one_assignment's internal readonly check.
+            if want_readonly && shell.is_readonly(name) {
+                eprintln!("huck: declare: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
+            if shell.is_readonly(name) {
+                eprintln!("huck: {name}: readonly variable");
+                exit = 1;
+                continue;
+            }
+            if crate::executor::apply_one_assignment(a, shell).is_err() {
+                exit = 1;
+                continue;
+            }
+            if want_readonly {
+                shell.mark_readonly(name);
+            }
+            if want_export {
+                shell.export(name);
+            } else if want_remove_export {
+                shell.unexport(name);
+            }
+            continue;
+        }
+
+        // No value supplied. Apply attribute-only changes.
+        if want_readonly {
+            shell.mark_readonly(name);
+        }
+        if want_export {
+            shell.export(name);
+        }
+        if want_remove_export {
+            shell.unexport(name);
+        }
+        // Bare `declare NAME` (no flag, no value): inside a function,
+        // the snapshot is enough. Outside, no-op. Match the legacy
+        // builtin_declare behavior.
     }
     ExecOutcome::Continue(exit)
 }
@@ -6985,7 +7667,7 @@ mod local_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         // local_scopes is empty (we never pushed a frame).
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["X=hi".to_string()],
             &mut buf,
@@ -6999,7 +7681,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T1=hi".to_string()],
             &mut buf,
@@ -7018,7 +7700,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T2".to_string()],
             &mut buf,
@@ -7034,7 +7716,7 @@ mod local_tests {
         shell.set("XYZ_LOCAL_T3", "outer".to_string());
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T3=inner".to_string()],
             &mut buf,
@@ -7052,7 +7734,7 @@ mod local_tests {
             .cloned()
             .unwrap();
         let v = snapshot.expect("expected Some snapshot for previously-set var");
-        assert_eq!(v.value, "outer");
+        assert!(matches!(&v.value, crate::shell_state::VarValue::Scalar(s) if s == "outer"));
     }
 
     #[test]
@@ -7062,7 +7744,7 @@ mod local_tests {
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
         // First `local`: snapshot the outer value.
-        let _ = run_builtin(
+        let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=first".to_string()],
             &mut buf,
@@ -7071,7 +7753,7 @@ mod local_tests {
         // Second `local` for the same name in the same frame: must NOT
         // re-snapshot (otherwise it would overwrite the outer snapshot
         // with "first").
-        let _ = run_builtin(
+        let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=second".to_string()],
             &mut buf,
@@ -7088,7 +7770,7 @@ mod local_tests {
             .cloned()
             .unwrap();
         let v = snapshot.expect("expected Some outer snapshot");
-        assert_eq!(v.value, "outer");
+        assert!(matches!(&v.value, crate::shell_state::VarValue::Scalar(s) if s == "outer"));
     }
 
     #[test]
@@ -7096,7 +7778,7 @@ mod local_tests {
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(
+        let outcome = run_declaration_builtin_strs(
             "local",
             &["1foo=bar".to_string()],
             &mut buf,
@@ -7270,7 +7952,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X=hi".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("hi"));
         assert!(shell.is_readonly("X"));
@@ -7281,7 +7963,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
         assert!(shell.is_readonly("X"));
@@ -7293,7 +7975,7 @@ mod readonly_tests {
         shell.set("X", "prev".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("prev"));
         assert!(shell.is_readonly("X"));
@@ -7305,7 +7987,7 @@ mod readonly_tests {
         shell.set("B", "had".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["A=1".to_string(), "B".to_string(), "C=3".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("A").as_deref(), Some("1"));
         assert_eq!(shell.lookup_var("B").as_deref(), Some("had"));
@@ -7320,7 +8002,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["1foo=bar".to_string()];
-        let outcome = run_builtin("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert!(shell.lookup_var("1foo").is_none());
     }
@@ -7333,13 +8015,13 @@ mod readonly_tests {
         shell.set("Y", "w".to_string());
         shell.mark_readonly("Y");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("readonly", &[], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &[], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
-        // Sorted; POSIX-escape format.
+        // declare -p style listing; scalars render with `-r` attrs.
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines.contains(&"readonly X='v'"));
-        assert!(lines.contains(&"readonly Y='w'"));
+        assert!(lines.contains(&r#"declare -r X="v""#));
+        assert!(lines.contains(&r#"declare -r Y="w""#));
     }
 
     #[test]
@@ -7348,18 +8030,18 @@ mod readonly_tests {
         shell.set("X", "v".to_string());
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("readonly", &["-p".to_string()], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &["-p".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.lines().any(|l| l == "readonly X='v'"));
+        assert!(out.lines().any(|l| l == r#"declare -r X="v""#));
     }
 
     #[test]
     fn readonly_overwrite_existing_readonly_errors() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        run_builtin("readonly", &["X=first".to_string()], &mut buf, &mut shell);
-        let outcome = run_builtin(
+        run_declaration_builtin_strs("readonly", &["X=first".to_string()], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs(
             "readonly",
             &["X=second".to_string()],
             &mut buf,
@@ -7388,7 +8070,7 @@ mod readonly_tests {
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
         // `export X=newval` should error and not overwrite.
-        let bad = run_builtin(
+        let bad = run_declaration_builtin_strs(
             "export",
             &["X=newval".to_string()],
             &mut buf,
@@ -7397,7 +8079,7 @@ mod readonly_tests {
         assert!(matches!(bad, ExecOutcome::Continue(1)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         // `export X` (bare) should succeed and flip the export flag.
-        let bare = run_builtin("export", &["X".to_string()], &mut buf, &mut shell);
+        let bare = run_declaration_builtin_strs("export", &["X".to_string()], &mut buf, &mut shell);
         assert!(matches!(bare, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         assert!(shell.is_readonly("X"));
@@ -8237,14 +8919,14 @@ mod declare_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
     fn run_typeset(args: &[&str], shell: &mut Shell) -> ExecOutcome {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        run_builtin("typeset", &args_owned, &mut buf, shell)
+        run_declaration_builtin_strs("typeset", &args_owned, &mut buf, shell)
     }
 
     #[test]
@@ -8446,7 +9128,7 @@ mod integer_attr_tests {
     fn run_declare(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -8798,5 +9480,103 @@ mod set_options_tests {
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(!shell.shell_options.errexit, "expected errexit off");
         assert!(!shell.shell_options.nounset, "expected nounset off");
+    }
+}
+
+#[cfg(test)]
+mod array_declare_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn run(shell: &mut Shell, line: &str) -> ExecOutcome {
+        crate::shell::process_line(line, shell, false)
+    }
+
+    #[test]
+    fn declare_dash_a_creates_empty_array() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "declare -a a");
+        assert!(s.get_array("a").is_some());
+        assert_eq!(s.get_array("a").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn declare_dash_a_with_value() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "declare -a a=(x y)");
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("x"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn declare_p_formats_array() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "a=(x y)");
+        let (_, v) = s
+            .iter_vars()
+            .find(|(n, _)| n.as_str() == "a")
+            .expect("a is set");
+        let line = format_declare_line("a", v);
+        assert_eq!(line, r#"declare -a a=([0]="x" [1]="y")"#);
+    }
+
+    #[test]
+    fn declare_dash_ai_errors() {
+        let mut s = Shell::new();
+        let outcome = run(&mut s, "declare -ai a");
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn readonly_array_blocks_element_write() {
+        let mut s = Shell::new();
+        let _ = run(&mut s, "readonly a=(x y)");
+        let _ = run(&mut s, "a[2]=z");
+        let m = s.get_array("a").unwrap();
+        assert!(m.get(&2).is_none());
+    }
+
+    #[test]
+    fn export_array_rejects() {
+        let mut s = Shell::new();
+        let outcome = run(&mut s, "export a=(x y)");
+        assert!(matches!(
+            outcome,
+            ExecOutcome::Continue(1) | ExecOutcome::Exit(1)
+        ));
+        assert!(s.get_array("a").is_none());
+    }
+
+    #[test]
+    fn readonly_p_lists_array_with_full_elements() {
+        // Regression: `readonly -p` used to route through scalar_view and
+        // collapse arrays to element 0. The fix routes through
+        // format_declare_line so all elements survive.
+        let mut s = Shell::new();
+        let _ = run(&mut s, "readonly a=(x y z)");
+        let (_, v) = s
+            .iter_vars()
+            .find(|(n, _)| n.as_str() == "a")
+            .expect("a is set");
+        let line = format_declare_line("a", v);
+        assert_eq!(line, r#"declare -ar a=([0]="x" [1]="y" [2]="z")"#);
+
+        // Also exercise the dispatched listing path end-to-end so we
+        // don't drift on the writeln formatting.
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin(
+            "readonly",
+            &[DeclArg::Plain("-p".to_string())],
+            &mut buf,
+            &mut s,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.lines()
+                .any(|l| l == r#"declare -ar a=([0]="x" [1]="y" [2]="z")"#),
+            "stdout: {out:?}",
+        );
     }
 }

@@ -12,6 +12,12 @@ pub enum ExpansionResult {
     /// the shell. The message has already been printed by the arm that
     /// produced this; `status` is the exit code.
     Fatal { status: i32 },
+    /// Word-list result for array-aware forms (`${a[@]}`, `${!a[@]}`,
+    /// `${a[@]:o:l}`, and `${@:o:l}` / `${*:o:l}`). Consumers in the
+    /// expansion pipeline decide how to materialise this: in a quoted
+    /// `@`-style context, each word becomes its own field; in an
+    /// unquoted context it's joined and word-split.
+    WordList(Vec<String>),
 }
 
 pub fn expand_modifier(
@@ -19,19 +25,61 @@ pub fn expand_modifier(
     modifier: &ParamModifier,
     shell: &mut Shell,
 ) -> ExpansionResult {
+    expand_modifier_with_value(name, modifier, None, shell)
+}
+
+/// Same as `expand_modifier`, except the caller may supply an
+/// `override_value` to be used in place of `shell.get(name)` /
+/// `shell.lookup_var(name)`. When `Some`, the override is treated as
+/// the variable's value (and `Some("")` is "set but null", distinct
+/// from `None` which means "unset"). Used by the array-element path
+/// (`${a[i]:-default}` etc.) to apply scalar-style modifiers to a
+/// specific array element while keeping the diagnostic `name`
+/// (e.g. `"arr"` rather than `"arr[2]"`).
+pub fn expand_modifier_with_value(
+    name: &str,
+    modifier: &ParamModifier,
+    override_value: Option<&str>,
+    shell: &mut Shell,
+) -> ExpansionResult {
     if shell.pending_fatal_pe_error.is_some() {
         return ExpansionResult::Empty;
     }
+    // `get_raw` returns the caller-supplied override when present;
+    // otherwise it falls back to the normal scalar-view lookup. Used
+    // wherever the scalar path consulted `shell.get(name)`.
+    let get_raw = |sh: &Shell| -> Option<String> {
+        match override_value {
+            Some(s) => Some(s.to_string()),
+            None => sh.get(name).map(|s| s.to_string()),
+        }
+    };
+    let lookup_v = |sh: &Shell| -> String {
+        match override_value {
+            Some(s) => s.to_string(),
+            None => sh.lookup_var(name).unwrap_or_default(),
+        }
+    };
     match modifier {
+        ParamModifier::None => {
+            ExpansionResult::Value(get_raw(shell).unwrap_or_default())
+        }
         ParamModifier::Length => {
-            let n = match name {
-                "@" | "*" => shell.positional_args.len(),
-                _ => shell.lookup_var(name).unwrap_or_default().chars().count(),
+            let n = match (override_value, name) {
+                (None, "@") | (None, "*") => shell.positional_args.len(),
+                _ => lookup_v(shell).chars().count(),
             };
             ExpansionResult::Value(n.to_string())
         }
+        ParamModifier::IndirectKeys => {
+            // The scalar (no-subscript) path is rejected at the lexer
+            // (a bare `${!NAME}` returns InvalidBraceModifier). This
+            // arm is reached only via the array dispatcher's fall-
+            // through; emit empty so it stays a no-op.
+            ExpansionResult::Value(String::new())
+        }
         ParamModifier::UseDefault { word, colon } => {
-            let raw = shell.get(name).map(|s| s.to_string());
+            let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
                 ExpansionResult::Value(expand_word_to_string(word, shell))
             } else {
@@ -39,10 +87,16 @@ pub fn expand_modifier(
             }
         }
         ParamModifier::AssignDefault { word, colon } => {
-            let raw = shell.get(name).map(|s| s.to_string());
+            let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
                 let v = expand_word_to_string(word, shell);
-                if shell.try_set(name, v.clone()).is_err() {
+                // When operating on an array element, we do NOT mutate
+                // the array via `try_set` (that would write the scalar
+                // path). The caller (`expand_array_param`) handles
+                // any element-write semantics; here we just return the
+                // default value. For the scalar (override_value=None)
+                // path, behave exactly as before.
+                if override_value.is_none() && shell.try_set(name, v.clone()).is_err() {
                     eprintln!("huck: {name}: readonly variable");
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -52,7 +106,7 @@ pub fn expand_modifier(
             }
         }
         ParamModifier::ErrorIfUnset { word, colon } => {
-            let raw = shell.get(name).map(|s| s.to_string());
+            let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
                 let msg = expand_word_to_string(word, shell);
                 if msg.is_empty() {
@@ -71,31 +125,31 @@ pub fn expand_modifier(
             }
         }
         ParamModifier::UseAlternate { word, colon } => {
-            let raw = shell.get(name);
-            if condition_is_null(raw, *colon) {
+            let raw = get_raw(shell);
+            if condition_is_null(raw.as_deref(), *colon) {
                 ExpansionResult::Empty
             } else {
                 ExpansionResult::Value(expand_word_to_string(word, shell))
             }
         }
         ParamModifier::RemovePrefix { pattern, longest } => {
-            let v = shell.get(name).unwrap_or("").to_string();
+            let v = get_raw(shell).unwrap_or_default();
             let p = expand_word_to_string(pattern, shell);
             ExpansionResult::Value(remove_prefix(&v, &p, *longest))
         }
         ParamModifier::RemoveSuffix { pattern, longest } => {
-            let v = shell.get(name).unwrap_or("").to_string();
+            let v = get_raw(shell).unwrap_or_default();
             let p = expand_word_to_string(pattern, shell);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest))
         }
         ParamModifier::Substitute { pattern, replacement, anchor, all } => {
-            let v = shell.get(name).unwrap_or("").to_string();
+            let v = get_raw(shell).unwrap_or_default();
             let pat = expand_word_to_string(pattern, shell);
             let rep = expand_word_to_string(replacement, shell);
             ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
         }
         ParamModifier::Substring { offset, length } => {
-            let value = shell.lookup_var(name).unwrap_or_default();
+            let value = lookup_v(shell);
             let off_n = match eval_arith_word(offset, shell) {
                 Ok(n) => n,
                 Err(()) => return ExpansionResult::Empty,
@@ -116,7 +170,7 @@ pub fn expand_modifier(
             }
         }
         ParamModifier::Case { direction, all, pattern } => {
-            let v = shell.lookup_var(name).unwrap_or_default();
+            let v = lookup_v(shell);
             let pat_string = pattern.as_ref().map(|w| expand_word_to_string(w, shell));
             ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref()))
         }

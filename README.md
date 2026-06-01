@@ -78,6 +78,7 @@ spec, an implementation plan, and a test suite.
 | v68       | doc cleanup (M-06/M-07/M-35 marked fixed; M-08 narrowed)       |
 | v69       | `set -e`/`-u`/`-o` long-form + `$-` (M-08 cont.)               |
 | v70       | `cd -` (M-31)                                                  |
+| v71       | indexed arrays (M-82)                                          |
 
 ## Build and run
 

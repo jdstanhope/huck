@@ -46,6 +46,28 @@ fn local_scopes_to_function() {
 }
 
 #[test]
+fn local_array_scoped_to_function_restores_outer_after_return() {
+    // Outer scope: a=(x y z). Inner scope: local -a a=(p q). After return,
+    // the outer a should be intact — same snapshot/restore plumbing as
+    // scalar `local`, but exercised through an indexed-array value.
+    let (out, _err) = run_capture(
+        "a=(x y z)\n\
+         f() { local -a a=(p q); echo \"inner: ${a[@]}\"; }\n\
+         f\n\
+         echo \"outer: ${a[@]}\"\n\
+         exit\n",
+    );
+    assert!(
+        out.lines().any(|l| l == "inner: p q"),
+        "stdout: {out:?}",
+    );
+    assert!(
+        out.lines().any(|l| l == "outer: x y z"),
+        "stdout: {out:?}",
+    );
+}
+
+#[test]
 fn local_outside_function_errors() {
     let script = "local X=1\nrc=$?\necho rc=$rc\nexit\n";
     let (out, err) = run_capture(script);
