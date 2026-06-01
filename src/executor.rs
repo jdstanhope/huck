@@ -2835,6 +2835,11 @@ pub(crate) fn apply_one_assignment(
         match (&a.target, trailing_array_literal) {
             (AssignTarget::Bare(name), Some(elements)) => {
                 if a.append {
+                    // Pre-validate readonly so the loop below cannot partial-write.
+                    if shell.is_readonly(target_name) {
+                        eprintln!("huck: {target_name}: readonly variable");
+                        return Err(());
+                    }
                     let new_pairs = build_associative_map(elements, shell)?;
                     for (k, v) in new_pairs {
                         shell
@@ -2849,8 +2854,8 @@ pub(crate) fn apply_one_assignment(
             }
             (AssignTarget::Bare(name), None) => {
                 eprintln!(
-                    "huck: {name}: {} on associative array",
-                    if a.append { "+=value" } else { "=value" }
+                    "huck: {name}: {} not valid on associative array",
+                    if a.append { "scalar append" } else { "scalar assignment" }
                 );
                 return Err(());
             }
@@ -4869,5 +4874,24 @@ mod assoc_assign_tests {
         s.mark_readonly("m");
         run(&mut s, "m[b]=2");
         assert!(s.lookup_associative_element("m", "b").is_none());
+    }
+
+    #[test]
+    fn unset_name_with_separate_assoc_still_creates_indexed() {
+        // The gotcha is name-specific: having declared `foo` as associative
+        // should not influence routing for an UNSET `bar`. `bar[baz]=v`
+        // should still create indexed `bar[0]=v`.
+        let mut s = Shell::new();
+        s.declare_associative("foo").unwrap();
+        s.set_associative_element("foo", "k".into(), "v".into())
+            .unwrap();
+        run(&mut s, "bar[baz]=value");
+        assert!(s.get_array("bar").is_some(), "bar should be indexed");
+        assert!(
+            s.get_associative("bar").is_none(),
+            "bar should NOT be associative"
+        );
+        // foo should be unaffected.
+        assert_eq!(s.lookup_associative_element("foo", "k"), Some("v".into()));
     }
 }
