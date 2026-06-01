@@ -1191,8 +1191,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     // or scalar; the snapshot above lets call_function
                     // restore the prior value on function exit.
                     if shell.get_associative(name).is_none()
-                        && shell.declare_associative(name).is_err()
+                        && let Err(e) = shell.declare_associative(name)
                     {
+                        eprintln!(
+                            "{}",
+                            crate::shell_state::declare_err_message("local", name, &e)
+                        );
                         exit = 1;
                     }
                 } else {
@@ -1223,8 +1227,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 // variable and dispatch to the indexed-array path.
                 if want_associative
                     && shell.get_associative(&name).is_none()
-                    && shell.declare_associative(&name).is_err()
+                    && let Err(e) = shell.declare_associative(&name)
                 {
+                    eprintln!(
+                        "{}",
+                        crate::shell_state::declare_err_message("local", &name, &e)
+                    );
                     exit = 1;
                     continue;
                 }
@@ -1310,8 +1318,12 @@ fn builtin_readonly_decl(
                 // before marking readonly.
                 if want_associative
                     && shell.get_associative(name).is_none()
-                    && shell.declare_associative(name).is_err()
+                    && let Err(e) = shell.declare_associative(name)
                 {
+                    eprintln!(
+                        "{}",
+                        crate::shell_state::declare_err_message("readonly", name, &e)
+                    );
                     exit = 1;
                     continue;
                 }
@@ -1331,8 +1343,12 @@ fn builtin_readonly_decl(
                     // through the associative executor path.
                     if want_associative
                         && shell.get_associative(name).is_none()
-                        && shell.declare_associative(name).is_err()
+                        && let Err(e) = shell.declare_associative(name)
                     {
+                        eprintln!(
+                            "{}",
+                            crate::shell_state::declare_err_message("readonly", name, &e)
+                        );
                         exit = 1;
                         continue;
                     }
@@ -1407,6 +1423,11 @@ fn builtin_declare_decl(
                 }
                 b'A' if minus => want_associative = true,
                 b'A' if plus => {
+                    // TODO: bash compat — bash silently ignores `+A` on
+                    // existing associatives (the attribute can't be
+                    // removed once set). We mirror `+a`'s conservative
+                    // rejection for now; revisit if real scripts need
+                    // silent-ignore behavior.
                     eprintln!(
                         "huck: declare: +A: associative attribute cannot be removed"
                     );
@@ -1563,8 +1584,12 @@ fn builtin_declare_decl(
         // RHS through the associative path (not the indexed-array path).
         if want_associative
             && shell.get_associative(name).is_none()
-            && shell.declare_associative(name).is_err()
+            && let Err(e) = shell.declare_associative(name)
         {
+            eprintln!(
+                "{}",
+                crate::shell_state::declare_err_message("declare", name, &e)
+            );
             exit = 1;
             continue;
         }

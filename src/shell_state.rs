@@ -75,9 +75,28 @@ pub enum AssignErr {
 
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
+/// Callers translate these into a "huck: {cmd}: ..." diagnostic via
+/// [`declare_err_message`] so that `local -A` and `readonly -A` print the
+/// correct command name (not a misleading "declare" prefix).
 #[derive(Debug)]
 pub enum DeclareErr {
-    TypeMismatch,
+    /// `declare -A NAME` where NAME is already an indexed array.
+    IndexedExists,
+    /// `declare -A NAME` where NAME is already a scalar.
+    ScalarExists,
+}
+
+/// Formats a user-facing diagnostic for a [`DeclareErr`] using the given
+/// command name (e.g., "declare", "local", "readonly") and variable name.
+pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
+    match err {
+        DeclareErr::IndexedExists => {
+            format!("huck: {cmd}: {name}: cannot convert indexed to associative array")
+        }
+        DeclareErr::ScalarExists => {
+            format!("huck: {cmd}: {name}: cannot convert scalar to associative")
+        }
+    }
 }
 
 /// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
@@ -772,7 +791,9 @@ impl Shell {
 
     /// Removes the entry at `key` from the associative array `name`.
     /// No-op if missing/not-associative/no-such-key. Honors readonly.
-    #[allow(dead_code)] // wired up by future unset builtin work
+    /// Reached from `builtin_unset` when the target is an associative
+    /// array (see `src/builtins.rs`, the `get_associative(name).is_some()`
+    /// branch).
     pub fn unset_associative_element(
         &mut self,
         name: &str,
@@ -823,8 +844,12 @@ impl Shell {
     /// Creates an empty associative array under `name`. Enforces bash rules:
     /// - Unset → create empty associative.
     /// - Already associative → no-op.
-    /// - Indexed → error: "cannot convert indexed to associative array".
-    /// - Scalar → error: "cannot convert scalar to associative".
+    /// - Indexed → error: `DeclareErr::IndexedExists`.
+    /// - Scalar → error: `DeclareErr::ScalarExists`.
+    ///
+    /// Does NOT print any diagnostic; callers should format via
+    /// [`declare_err_message`] so the correct command name (declare,
+    /// local, readonly) appears in the message.
     pub fn declare_associative(&mut self, name: &str) -> Result<(), DeclareErr> {
         match self.vars.get(name).map(|v| &v.value) {
             None => {
@@ -840,14 +865,8 @@ impl Shell {
                 Ok(())
             }
             Some(VarValue::Associative(_)) => Ok(()),
-            Some(VarValue::Indexed(_)) => {
-                eprintln!("huck: declare: {name}: cannot convert indexed to associative array");
-                Err(DeclareErr::TypeMismatch)
-            }
-            Some(VarValue::Scalar(_)) => {
-                eprintln!("huck: declare: {name}: cannot convert scalar to associative");
-                Err(DeclareErr::TypeMismatch)
-            }
+            Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
+            Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
         }
     }
 
@@ -1332,14 +1351,31 @@ mod assoc_value_tests {
             value: VarValue::Indexed(m),
             exported: false, readonly: false, integer: false,
         });
-        assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::TypeMismatch)));
+        assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
     }
 
     #[test]
     fn declare_associative_on_scalar_errors() {
         let mut shell = Shell::new();
         shell.set("s", "hello".into());
-        assert!(matches!(shell.declare_associative("s"), Err(DeclareErr::TypeMismatch)));
+        assert!(matches!(shell.declare_associative("s"), Err(DeclareErr::ScalarExists)));
+    }
+
+    #[test]
+    fn declare_err_message_uses_command_name() {
+        use super::declare_err_message;
+        assert_eq!(
+            declare_err_message("declare", "a", &DeclareErr::IndexedExists),
+            "huck: declare: a: cannot convert indexed to associative array",
+        );
+        assert_eq!(
+            declare_err_message("local", "s", &DeclareErr::ScalarExists),
+            "huck: local: s: cannot convert scalar to associative",
+        );
+        assert_eq!(
+            declare_err_message("readonly", "s", &DeclareErr::ScalarExists),
+            "huck: readonly: s: cannot convert scalar to associative",
+        );
     }
 
     #[test]
