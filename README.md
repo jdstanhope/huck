@@ -79,6 +79,7 @@ spec, an implementation plan, and a test suite.
 | v69       | `set -e`/`-u`/`-o` long-form + `$-` (M-08 cont.)               |
 | v70       | `cd -` (M-31)                                                  |
 | v71       | indexed arrays (M-82)                                          |
+| v72       | associative arrays (M-83)                                      |
 
 ## Build and run
 

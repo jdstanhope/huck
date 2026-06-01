@@ -23,6 +23,11 @@ fragments=(
     'a[0]=hi; a[0]+=_bye; echo "${a[0]}"'
     'a=(a b c d); echo "${a[@]:1:2}"'
     'set -- one two three four; echo "${@:2:2}"'
+    'declare -A m=([foo]=bar [baz]=qux); echo "${m[foo]}"; echo "${#m[@]}"'
+    'declare -A m; m[a]=1; m[b]=2; echo "${m[a]} ${m[b]} ${#m[@]}"'
+    'declare -A m; m[k]=hi; m[k]+=_bye; echo "${m[k]}"'
+    'declare -A m=([x]=1 [y]=2); unset m[x]; echo "${m[y]} ${#m[@]}"'
+    'declare -A m=([z]=1 [a]=2); m[k]=3; echo "${m[a]} ${m[z]} ${m[k]} ${#m[@]}"'
 )
 
 fail=0
