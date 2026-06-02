@@ -187,15 +187,80 @@ pub fn resolve_spec(
     out
 }
 
-/// Placeholder. Task 4 replaces this with the real -F invocation that
-/// sets COMP_*, calls the function via the executor, and reads COMPREPLY.
+/// Invokes a -F completion function. Sets COMP_*, positional params,
+/// calls the function via the executor, reads COMPREPLY, then restores
+/// COMPREPLY and $?. The live spec is stashed in
+/// `shell.current_completion_spec` so a `compopt` inside the function
+/// (Task 6) can mutate it; dispatch (Task 5) `.take()`s it back out.
+/// `COMP_*` shell vars are LEFT SET after return (matches bash —
+/// they're meant to remain readable until next completion).
+///
+/// Known divergence from bash: `exit` inside a completion function
+/// does NOT terminate the shell. rustyline's `complete()` returns
+/// `rustyline::Result<...>` and has no graceful way to propagate
+/// `ExecOutcome::Exit`. The function instead returns immediately with
+/// the COMPREPLY-so-far.
 pub fn call_completion_function(
-    _func_name: &str,
-    _spec: &CompletionSpec,
-    _ctx: &CompletionCtx,
-    _shell: &mut Shell,
+    func_name: &str,
+    spec: &CompletionSpec,
+    ctx: &CompletionCtx,
+    shell: &mut Shell,
 ) -> Vec<String> {
-    Vec::new()
+    // 1. Snapshot variables we'll mutate so we can restore on return.
+    //    (Positional args are saved by call_function internally.)
+    let saved_last_status = shell.last_status();
+    let saved_reply = shell.snapshot_var("COMPREPLY");
+
+    // 2. Set COMP_* shell vars.
+    shell.set("COMP_LINE", ctx.comp_line.clone());
+    shell.set("COMP_POINT", ctx.comp_point.to_string());
+    shell.set("COMP_CWORD", ctx.comp_cword.to_string());
+
+    // COMP_WORDS as indexed array.
+    let mut words_map: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    for (i, w) in ctx.comp_words.iter().enumerate() {
+        words_map.insert(i, w.clone());
+    }
+    let _ = shell.replace_array("COMP_WORDS", words_map);
+
+    // Clear COMPREPLY so the function can detect "not set yet" if it
+    // wants — and so an empty result is unambiguous.
+    shell.unset("COMPREPLY");
+
+    // 3. Stash the spec for compopt-in-function mutation (Task 6 reads
+    //    this). Dispatch (Task 5) `.take()`s it back out — we
+    //    intentionally LEAVE it set after the function returns.
+    shell.current_completion_spec = Some(spec.clone());
+
+    // 4. Build positional args [cmd_name, cur_word, prev_word].
+    let pos_args = vec![
+        ctx.cmd_name.clone(),
+        ctx.cur_word.clone(),
+        ctx.prev_word.clone(),
+    ];
+
+    // 5. Invoke. Exit/Continue/Return all treated as "function finished"
+    //    — see header comment about the rustyline-propagation divergence.
+    let _outcome = crate::executor::call_function_body(func_name, pos_args, shell);
+
+    // 6. Read COMPREPLY (values in index order).
+    let reply_values: Vec<String> = match shell.get_array("COMPREPLY") {
+        Some(map) => map.values().cloned().collect(),
+        None => Vec::new(),
+    };
+
+    // 7. Restore COMPREPLY (compgen / next completion expects a clean slot).
+    shell.restore_var("COMPREPLY", saved_reply);
+
+    // 8. Restore $?. Completion functions do NOT pollute the user's $?.
+    shell.set_last_status(saved_last_status);
+
+    // 9. Drain any pending fatal PE error from inside the function so
+    //    the next prompt is clean.
+    let _ = shell.take_pending_fatal_pe_error();
+
+    reply_values
 }
 
 /// Splits a -W wordlist on the IFS bytes. Whitespace IFS bytes (space,
@@ -504,14 +569,102 @@ mod tests {
     }
 
     #[test]
-    fn function_generator_returns_empty_for_now() {
-        // Task 2: -F is reserved but not wired; placeholder returns empty.
-        // Task 4 replaces call_completion_function.
+    fn function_invocation_reads_compreply() {
+        let mut sh = Shell::new();
+        // Define a function whose body sets COMPREPLY=(alpha beta).
+        // Building the AST by hand is painful; route through process_line.
+        let outcome = crate::shell::process_line(
+            "_myf() { COMPREPLY=(alpha beta); }",
+            &mut sh,
+            false,
+        );
+        assert!(matches!(outcome, crate::builtins::ExecOutcome::Continue(_)));
+        assert!(sh.functions.contains_key("_myf"));
+
         let spec = CompletionSpec {
-            function: Some("_nonexistent".to_string()),
+            function: Some("_myf".to_string()),
             ..Default::default()
         };
+        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn function_invocation_sets_comp_words() {
         let mut sh = Shell::new();
+        // Function copies COMP_WORDS[1] into COMPREPLY[0].
+        let _ = crate::shell::process_line(
+            "_myf() { COMPREPLY=(\"${COMP_WORDS[1]}\"); }",
+            &mut sh,
+            false,
+        );
+
+        let spec = CompletionSpec {
+            function: Some("_myf".to_string()),
+            ..Default::default()
+        };
+        let mut c = ctx("");
+        c.comp_words = vec!["cmd".to_string(), "expected_word".to_string()];
+        c.comp_cword = 1;
+        let got = resolve_spec(&spec, &c, &mut sh);
+        assert_eq!(got, vec!["expected_word"]);
+    }
+
+    #[test]
+    fn function_invocation_positional_params() {
+        let mut sh = Shell::new();
+        // Function copies $1, $2, $3 into COMPREPLY (three elements).
+        let _ = crate::shell::process_line(
+            "_myf() { COMPREPLY=(\"$1\" \"$2\" \"$3\"); }",
+            &mut sh,
+            false,
+        );
+
+        let spec = CompletionSpec {
+            function: Some("_myf".to_string()),
+            ..Default::default()
+        };
+        let c = CompletionCtx {
+            cmd_name: "git".to_string(),
+            cur_word: "che".to_string(),
+            prev_word: "checkout".to_string(),
+            comp_words: vec!["git".to_string(), "checkout".to_string(), "che".to_string()],
+            comp_cword: 2,
+            comp_line: "git checkout che".to_string(),
+            comp_point: 16,
+        };
+        let got = resolve_spec(&spec, &c, &mut sh);
+        assert_eq!(got, vec!["git", "che", "checkout"]);
+    }
+
+    #[test]
+    fn function_invocation_preserves_last_status() {
+        let mut sh = Shell::new();
+        // Function exits with 17.
+        let _ = crate::shell::process_line(
+            "_myf() { COMPREPLY=(x); return 17; }",
+            &mut sh,
+            false,
+        );
+        // Set $? AFTER process_line (which itself zeroes $? on success).
+        sh.set_last_status(42);
+
+        let spec = CompletionSpec {
+            function: Some("_myf".to_string()),
+            ..Default::default()
+        };
+        let _ = resolve_spec(&spec, &ctx(""), &mut sh);
+        // Completion functions must NOT pollute $?.
+        assert_eq!(sh.last_status(), 42);
+    }
+
+    #[test]
+    fn function_missing_returns_empty() {
+        let mut sh = Shell::new();
+        let spec = CompletionSpec {
+            function: Some("_does_not_exist".to_string()),
+            ..Default::default()
+        };
         let got = resolve_spec(&spec, &ctx(""), &mut sh);
         assert!(got.is_empty());
     }
