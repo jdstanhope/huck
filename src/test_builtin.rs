@@ -15,10 +15,20 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
         _ => {}
     }
     // For 2-4 args, try the POSIX short-form first. It handles every
-    // backward-compatible case (existing tests). Task 2 wires the
-    // grammar parser as a fall-through for forms the short-form
+    // backward-compatible case (existing tests). On Err, fall through
+    // to the grammar parser, which handles forms the short-form
     // rejects (e.g. `[ ( -n a ) ]`).
-    evaluate_short_form(args)
+    if args.len() <= 4
+        && let Ok(b) = evaluate_short_form(args)
+    {
+        return Ok(b);
+    }
+    let mut p = Parser { args, pos: 0 };
+    let result = p.parse_expr()?;
+    if p.pos != args.len() {
+        return Err(format!("{}: unexpected argument", args[p.pos]));
+    }
+    Ok(result)
 }
 
 fn evaluate_short_form(args: &[String]) -> Result<bool, String> {
@@ -139,6 +149,123 @@ fn apply_binary(op: &str, lhs: &str, rhs: &str) -> Result<bool, String> {
 fn parse_int(s: &str) -> Result<i64, String> {
     s.parse::<i64>()
         .map_err(|_| "integer expression expected".to_string())
+}
+
+/// Recursive-descent parser for the `test` grammar:
+///
+/// ```text
+/// EXPR    ::= EXPR -o ANDEXPR | ANDEXPR
+/// ANDEXPR ::= ANDEXPR -a UNEXPR | UNEXPR
+/// UNEXPR  ::= ! UNEXPR | PRIMARY
+/// PRIMARY ::= ( EXPR ) | <unary> <word> | <word> <binop> <word> | <word>
+/// ```
+///
+/// Used for 5+ argument calls and for 2-4 argument calls that the
+/// POSIX short-form algorithm rejects (e.g. `[ ( -n a ) ]`).
+struct Parser<'a> {
+    args: &'a [String],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&str> {
+        self.args.get(self.pos).map(String::as_str)
+    }
+
+    fn take(&mut self) -> Option<&str> {
+        let s = self.args.get(self.pos).map(String::as_str);
+        if s.is_some() {
+            self.pos += 1;
+        }
+        s
+    }
+
+    /// EXPR ::= ANDEXPR ( -o ANDEXPR )*
+    fn parse_expr(&mut self) -> Result<bool, String> {
+        let mut result = self.parse_and()?;
+        while self.peek() == Some("-o") {
+            self.pos += 1; // consume -o
+            let rhs = self.parse_and()?;
+            result = result || rhs;
+        }
+        Ok(result)
+    }
+
+    /// ANDEXPR ::= UNEXPR ( -a UNEXPR )*
+    fn parse_and(&mut self) -> Result<bool, String> {
+        let mut result = self.parse_unary()?;
+        while self.peek() == Some("-a") {
+            self.pos += 1; // consume -a
+            let rhs = self.parse_unary()?;
+            result = result && rhs;
+        }
+        Ok(result)
+    }
+
+    /// UNEXPR ::= ! UNEXPR | PRIMARY
+    fn parse_unary(&mut self) -> Result<bool, String> {
+        if self.peek() == Some("!") {
+            self.pos += 1;
+            let inner = self.parse_unary()?;
+            Ok(!inner)
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    /// PRIMARY ::= ( EXPR ) | <unary> <word> | <word> <binop> <word> | <word>
+    fn parse_primary(&mut self) -> Result<bool, String> {
+        // Empty input where a primary is expected.
+        if self.peek().is_none() {
+            return Err("expression expected".to_string());
+        }
+        // Closing paren / combinator where a primary is expected.
+        match self.peek() {
+            Some(")") | Some("-a") | Some("-o") => {
+                return Err("expression expected".to_string());
+            }
+            _ => {}
+        }
+        // Parenthesized group.
+        if self.peek() == Some("(") {
+            self.pos += 1; // consume (
+            let inner = self.parse_expr()?;
+            match self.peek() {
+                Some(")") => {
+                    self.pos += 1;
+                    return Ok(inner);
+                }
+                _ => return Err("missing ')'".to_string()),
+            }
+        }
+        // <unary> <word> — recognize a known unary op followed by a word.
+        if let (Some(op), Some(_operand)) = (
+            self.args.get(self.pos).map(String::as_str),
+            self.args.get(self.pos + 1).map(String::as_str),
+        ) && is_unary_op(op)
+        {
+            let op = op.to_string();
+            let operand = self.args[self.pos + 1].clone();
+            self.pos += 2;
+            return apply_unary(&op, &operand);
+        }
+        // <word> <binop> <word> — three-token binary form.
+        if let (Some(_lhs), Some(op), Some(_rhs)) = (
+            self.args.get(self.pos).map(String::as_str),
+            self.args.get(self.pos + 1).map(String::as_str),
+            self.args.get(self.pos + 2).map(String::as_str),
+        ) && is_binary_op(op)
+        {
+            let lhs = self.args[self.pos].clone();
+            let op = op.to_string();
+            let rhs = self.args[self.pos + 2].clone();
+            self.pos += 3;
+            return apply_binary(&op, &lhs, &rhs);
+        }
+        // Bare word — truthiness of the string.
+        let word = self.take().unwrap_or("");
+        Ok(!word.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -355,5 +482,152 @@ mod tests {
         // file-exists, not the AND combinator (which requires 3+ args
         // and operand on each side).
         assert_eq!(evaluate(&args(&["-a", "/"])), Ok(true));
+    }
+
+    #[test]
+    fn combinator_and_both_true() {
+        // [ -n a -a -n b ] → true
+        assert_eq!(evaluate(&args(&["-n", "a", "-a", "-n", "b"])), Ok(true));
+    }
+
+    #[test]
+    fn combinator_and_one_false() {
+        // [ -z a -a -n b ] → false (left is false)
+        assert_eq!(evaluate(&args(&["-z", "a", "-a", "-n", "b"])), Ok(false));
+    }
+
+    #[test]
+    fn combinator_or_first_true() {
+        // [ -n a -o -z b ] → true
+        assert_eq!(evaluate(&args(&["-n", "a", "-o", "-z", "b"])), Ok(true));
+    }
+
+    #[test]
+    fn combinator_or_both_false() {
+        // [ -z a -o -z b ] → false
+        assert_eq!(evaluate(&args(&["-z", "a", "-o", "-z", "b"])), Ok(false));
+    }
+
+    #[test]
+    fn parens_simple_wrapping() {
+        // [ ( -n a ) ] → true (falls through from 4-arg short-form)
+        assert_eq!(evaluate(&args(&["(", "-n", "a", ")"])), Ok(true));
+    }
+
+    #[test]
+    fn nested_parens() {
+        // [ ( ( -n a ) ) ] → true
+        assert_eq!(
+            evaluate(&args(&["(", "(", "-n", "a", ")", ")"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn parens_group_changes_precedence() {
+        // Without parens: [ -z a -o -n b -a -n c ] is `-z a -o (-n b -a -n c)`
+        // = false OR (true AND true) = true.
+        // With parens around the OR: [ ( -z a -o -n b ) -a -n c ]
+        // = (false OR true) AND true = true.
+        assert_eq!(
+            evaluate(&args(&["(", "-z", "a", "-o", "-n", "b", ")", "-a", "-n", "c"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn precedence_and_higher_than_or() {
+        // [ -z a -o -n b -a -n c ] = false OR (true AND true) = true.
+        assert_eq!(
+            evaluate(&args(&["-z", "a", "-o", "-n", "b", "-a", "-n", "c"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn negation_of_combinator_lhs() {
+        // [ ! -n a -a -n b ] = (NOT (-n a)) AND (-n b) = false AND true = false.
+        assert_eq!(evaluate(&args(&["!", "-n", "a", "-a", "-n", "b"])), Ok(false));
+    }
+
+    #[test]
+    fn double_negation() {
+        // [ ! ! -n a ] = NOT NOT true = true.
+        assert_eq!(evaluate(&args(&["!", "!", "-n", "a"])), Ok(true));
+    }
+
+    #[test]
+    fn empty_parens_error() {
+        let r = evaluate(&args(&["(", ")"]));
+        assert!(r.is_err(), "expected error, got {r:?}");
+        assert!(
+            r.unwrap_err().contains("expression"),
+            "expected 'expression' in error"
+        );
+    }
+
+    #[test]
+    fn unbalanced_open_paren_error() {
+        let r = evaluate(&args(&["(", "-n", "a"]));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains(")"), "expected ')' in error");
+    }
+
+    #[test]
+    fn unbalanced_close_paren_error() {
+        // [ -n a ) ] — `)` at position 2 is an unexpected token; falls
+        // through short-form to grammar, which rejects.
+        let r = evaluate(&args(&["-n", "a", ")"]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn dangling_combinator_at_end_error() {
+        // [ -n a -a ] — falls through short-form (4 args, not !-prefixed),
+        // parser consumes `-n a -a`, then `parse_unary` runs out of input.
+        let r = evaluate(&args(&["-n", "a", "-a"]));
+        assert!(r.is_err());
+        assert!(
+            r.unwrap_err().contains("expression"),
+            "expected 'expression' in error"
+        );
+    }
+
+    #[test]
+    fn combinator_with_binary_operands() {
+        // [ a = a -a 1 -lt 2 ] = (a == a) AND (1 < 2) = true.
+        assert_eq!(
+            evaluate(&args(&["a", "=", "a", "-a", "1", "-lt", "2"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn mixed_unary_and_binary() {
+        // [ -e /tmp -a 1 -lt 2 ] = true AND true = true.
+        assert_eq!(
+            evaluate(&args(&["-e", "/tmp", "-a", "1", "-lt", "2"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn long_and_chain_left_associative() {
+        // [ -n a -a -n b -a -n c -a -n d ] = all true.
+        assert_eq!(
+            evaluate(&args(&[
+                "-n", "a", "-a", "-n", "b", "-a", "-n", "c", "-a", "-n", "d"
+            ])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn or_chain_left_associative() {
+        // [ -z a -o -z b -o -n c ] = false OR false OR true = true.
+        assert_eq!(
+            evaluate(&args(&["-z", "a", "-o", "-z", "b", "-o", "-n", "c"])),
+            Ok(true)
+        );
     }
 }
