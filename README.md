@@ -84,6 +84,7 @@ spec, an implementation plan, and a test suite.
 | v74       | configurable IFS (M-05)                                        |
 | v75       | test combinators (M-25)                                        |
 | v76       | programmable completion: `complete` / `compgen` / `compopt` (M-36 partial) |
+| v77       | `function NAME { ... }` keyword form (M-09)                    |
 
 ## Build and run
 
