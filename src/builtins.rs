@@ -27,7 +27,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "declare", "typeset",
     "eval",
     "help",
-    "complete", "compgen",
+    "complete", "compgen", "compopt",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -99,6 +99,7 @@ pub fn run_builtin(
         "help" => builtin_help(args, out, shell),
         "complete" => crate::completion_builtins::builtin_complete(args, out, shell),
         "compgen" => crate::completion_builtins::builtin_compgen(args, out, shell),
+        "compopt" => crate::completion_builtins::builtin_compopt(args, out, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         ":" => builtin_colon(args, shell),

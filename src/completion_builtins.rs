@@ -403,6 +403,131 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
     ExecOutcome::Continue(if any { 0 } else { 1 })
 }
 
+/// `compopt` builtin. Two modes:
+///
+/// * In-function (no names): mutates the live spec via
+///   `shell.current_completion_spec`, which the Task-5 dispatch path
+///   takes back out after the `-F` function returns. Errors with status
+///   1 when called outside a `-F` function with no names.
+///
+/// * Named (with names): mutates `shell.completion_specs.by_command[name]`
+///   directly. `-o` sets, `+o` clears. Status 1 if any name is missing.
+///
+/// `-D` / `-E` (mutate default/empty specs from within a function) are
+/// recognized as flags but rejected with status 1 "not yet supported".
+pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let mut i = 0;
+    let mut option_set: Vec<(String, bool)> = Vec::new();
+    let mut is_default = false;
+    let mut is_empty = false;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') && !arg.starts_with('+') {
+            break;
+        }
+        if arg == "-" || arg == "+" {
+            eprintln!("huck: compopt: bad option: {arg}");
+            return ExecOutcome::Continue(2);
+        }
+        let leading = arg.chars().next().unwrap();
+        let chars: Vec<char> = arg[1..].chars().collect();
+        let mut ci = 0;
+        while ci < chars.len() {
+            let c = chars[ci];
+            match c {
+                'o' => {
+                    let arg_value: String = if ci + 1 < chars.len() {
+                        let v: String = chars[ci + 1..].iter().collect();
+                        ci = chars.len();
+                        v
+                    } else if i + 1 < args.len() {
+                        i += 1;
+                        ci = chars.len();
+                        args[i].clone()
+                    } else {
+                        eprintln!("huck: compopt: -o: option requires an argument");
+                        return ExecOutcome::Continue(2);
+                    };
+                    let off = leading == '+';
+                    if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
+                        .contains(&arg_value.as_str())
+                    {
+                        eprintln!("huck: compopt: {arg_value}: invalid completion option");
+                        return ExecOutcome::Continue(2);
+                    }
+                    option_set.push((arg_value, off));
+                }
+                'D' => {
+                    is_default = true;
+                }
+                'E' => {
+                    is_empty = true;
+                }
+                other => {
+                    eprintln!("huck: compopt: -{other}: invalid option");
+                    return ExecOutcome::Continue(2);
+                }
+            }
+            ci += 1;
+        }
+        i += 1;
+    }
+    let names: Vec<String> = args[i..].to_vec();
+
+    if is_default || is_empty {
+        eprintln!("huck: compopt: -D/-E not yet supported");
+        return ExecOutcome::Continue(1);
+    }
+
+    if names.is_empty() {
+        // In-function mutation. The dispatch path stashes the live spec
+        // in shell.current_completion_spec before invoking -F; we take
+        // it out, mutate, and put it back so dispatch's later .take()
+        // observes the change.
+        let Some(mut live) = shell.current_completion_spec.take() else {
+            eprintln!("huck: compopt: not currently executing completion function");
+            return ExecOutcome::Continue(1);
+        };
+        apply_compopt_options(&mut live.options, &option_set);
+        shell.current_completion_spec = Some(live);
+        return ExecOutcome::Continue(0);
+    }
+
+    // Named: mutate registry.
+    let mut status = 0;
+    for n in &names {
+        match shell.completion_specs.by_command.get_mut(n) {
+            Some(spec) => apply_compopt_options(&mut spec.options, &option_set),
+            None => {
+                eprintln!("huck: compopt: {n}: no completion specification");
+                status = 1;
+            }
+        }
+    }
+    ExecOutcome::Continue(status)
+}
+
+/// Applies a list of (name, off) compopt option mutations to a CompOptions.
+/// The option names have already been validated against the whitelist.
+fn apply_compopt_options(opts: &mut CompOptions, sets: &[(String, bool)]) {
+    for (name, off) in sets {
+        let v = !*off;
+        match name.as_str() {
+            "default" => opts.default = v,
+            "nospace" => opts.nospace = v,
+            "filenames" => opts.filenames = v,
+            "bashdefault" => opts.bashdefault = v,
+            "dirnames" => opts.dirnames = v,
+            _ => unreachable!("name pre-validated by builtin_compopt"),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -429,6 +554,18 @@ mod tests {
         let code = match outcome {
             ExecOutcome::Continue(n) => n,
             _ => panic!("compgen should not return non-Continue"),
+        };
+        (s, code)
+    }
+
+    fn run_compopt(args: &[&str], shell: &mut Shell) -> (String, i32) {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::<u8>::new();
+        let outcome = builtin_compopt(&argv, &mut out, shell);
+        let s = String::from_utf8(out).unwrap();
+        let code = match outcome {
+            ExecOutcome::Continue(n) => n,
+            _ => panic!("compopt should not return non-Continue"),
         };
         (s, code)
     }
@@ -660,6 +797,84 @@ mod tests {
         let (_, code) = run_complete(&["+o", "nospace", "--", "foo"], &mut sh);
         assert_eq!(code, 0, "complete +o should be accepted");
         assert!(!sh.completion_specs.by_command["foo"].options.nospace);
+    }
+
+    #[test]
+    fn compopt_outside_function_with_no_name_errors() {
+        let mut sh = Shell::new();
+        let (_, code) = run_compopt(&["-o", "nospace"], &mut sh);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn compopt_named_mutates_registry() {
+        let mut sh = Shell::new();
+        let _ = run_complete(&["-W", "x", "--", "foo"], &mut sh);
+        let (_, code) = run_compopt(&["-o", "nospace", "foo"], &mut sh);
+        assert_eq!(code, 0);
+        assert!(sh.completion_specs.by_command["foo"].options.nospace);
+    }
+
+    #[test]
+    fn compopt_named_plus_o_unsets() {
+        let mut sh = Shell::new();
+        let _ = run_complete(&["-W", "x", "-o", "nospace", "--", "foo"], &mut sh);
+        assert!(sh.completion_specs.by_command["foo"].options.nospace);
+        let (_, code) = run_compopt(&["+o", "nospace", "foo"], &mut sh);
+        assert_eq!(code, 0);
+        assert!(!sh.completion_specs.by_command["foo"].options.nospace);
+    }
+
+    #[test]
+    fn compopt_named_missing_returns_1() {
+        let mut sh = Shell::new();
+        let (_, code) = run_compopt(&["-o", "nospace", "ghost"], &mut sh);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    fn compopt_invalid_option_errors() {
+        let mut sh = Shell::new();
+        let _ = run_complete(&["-W", "x", "--", "foo"], &mut sh);
+        let (_, code) = run_compopt(&["-o", "nosort", "foo"], &mut sh);
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn compopt_in_function_mutates_live_spec() {
+        let mut sh = Shell::new();
+        // Function calls `compopt -o nospace` then sets COMPREPLY.
+        let _ = crate::shell::process_line(
+            "_myf() { compopt -o nospace; COMPREPLY=(alpha); }",
+            &mut sh,
+            false,
+        );
+
+        let spec = crate::completion_spec::CompletionSpec {
+            function: Some("_myf".to_string()),
+            ..Default::default()
+        };
+        let ctx = crate::completion_spec::CompletionCtx {
+            cmd_name: "myc".to_string(),
+            cur_word: String::new(),
+            prev_word: String::new(),
+            comp_words: vec!["myc".to_string(), String::new()],
+            comp_cword: 1,
+            comp_line: "myc ".to_string(),
+            comp_point: 4,
+        };
+        let _ = crate::completion_spec::resolve_spec(&spec, &ctx, &mut sh);
+        // After resolve_spec, dispatch reads current_completion_spec —
+        // but for this unit test we read it directly to verify the
+        // function's compopt call mutated it.
+        let mutated = sh
+            .current_completion_spec
+            .as_ref()
+            .expect("spec still stashed after -F returns");
+        assert!(
+            mutated.options.nospace,
+            "compopt -o nospace inside -F did not take effect"
+        );
     }
 
     #[test]
