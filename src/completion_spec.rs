@@ -264,15 +264,17 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
 
 fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
     match action {
-        Action::File => list_dir_filtered(".", prefix, false),
-        Action::Directory => list_dir_filtered(".", prefix, true),
+        Action::File => list_dir_with_path_prefix(prefix, false),
+        Action::Directory => list_dir_with_path_prefix(prefix, true),
         Action::Command => {
             // Reuse src/completion.rs::complete_command which already
-            // walks PATH + builtins. Return just the replacement strings.
+            // walks PATH + builtins. Use `display` (raw name); the
+            // `replacement` field is escape_filename()'d for rustyline
+            // and is not what compgen / -A command consumers expect.
             let path = shell.get("PATH").unwrap_or("").to_string();
             crate::completion::complete_command(prefix, &path)
                 .into_iter()
-                .map(|c| c.replacement)
+                .map(|c| c.display)
                 .collect()
         }
         Action::Function => {
@@ -349,6 +351,26 @@ fn list_dir_filtered(dir: &str, prefix: &str, dirs_only: bool) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// Splits `prefix` at the last `/` into a directory portion and a
+/// basename portion, scans the directory for entries whose basename
+/// starts with the basename portion, then re-prepends the directory
+/// portion to each result so the final string round-trips with the
+/// caller's input. This is what bash's `compgen -A file` /
+/// `compgen -A directory` does: a prefix of `src/comp` reads `src/`
+/// and prefix-matches basenames against `comp`.
+fn list_dir_with_path_prefix(prefix: &str, dirs_only: bool) -> Vec<String> {
+    let (dir, base) = match prefix.rfind('/') {
+        Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+        None => ("", prefix),
+    };
+    let scan_dir = if dir.is_empty() { "." } else { dir };
+    let bare_results = list_dir_filtered(scan_dir, base, dirs_only);
+    bare_results
+        .into_iter()
+        .map(|name| format!("{dir}{name}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -519,5 +541,55 @@ mod tests {
         // "a::b" → ["a", "", "b"].
         let got = split_wordlist("a::b", ":");
         assert_eq!(got, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn action_command_returns_raw_names_not_escaped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Create an executable with a metachar-free name; the point is
+        // to verify the `display` (raw) form is returned, not the
+        // backslash-escaped form. Confirm by checking the name has no
+        // backslash.
+        let exe = dir.path().join("myrawcmd");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut sh = Shell::new();
+        sh.set("PATH", dir.path().to_str().unwrap().to_string());
+        let spec = CompletionSpec {
+            actions: vec![Action::Command],
+            ..Default::default()
+        };
+        let got = resolve_spec(&spec, &ctx("myraw"), &mut sh);
+        assert!(got.iter().any(|s| s == "myrawcmd"), "{got:?}");
+        // No backslash anywhere in the results.
+        assert!(got.iter().all(|s| !s.contains('\\')), "{got:?}");
+    }
+
+    #[test]
+    fn action_file_handles_dir_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("alpha.txt"), b"").unwrap();
+        std::fs::write(subdir.join("beta.txt"), b"").unwrap();
+
+        // CD into the tempdir so "." resolution and relative prefixes work.
+        let prior = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let mut sh = Shell::new();
+        let spec = CompletionSpec {
+            actions: vec![Action::File],
+            ..Default::default()
+        };
+        let got = resolve_spec(&spec, &ctx("subdir/al"), &mut sh);
+        std::env::set_current_dir(prior).unwrap();
+
+        // Result must round-trip with the "subdir/" prefix included.
+        assert!(got.iter().any(|s| s == "subdir/alpha.txt"), "{got:?}");
+        // And NOT match unrelated files (no bare "alpha.txt" without prefix).
+        assert!(got.iter().all(|s| s.starts_with("subdir/")), "{got:?}");
     }
 }
