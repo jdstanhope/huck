@@ -629,8 +629,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 // Empty args: zero fields — do nothing.
             }
             WordPart::AllArgs { quoted: true, joined: true } => {
-                // "$*" — single field, args joined by " " (first IFS char).
-                let joined = shell.positional_args.join(" ");
+                // "$*" — single field, args joined by the first IFS char.
+                // Empty IFS concatenates without a separator (POSIX § 2.5.2).
+                let sep = ifs_join_sep(&shell.ifs());
+                let joined = shell.positional_args.join(&sep);
                 current.push_str(&joined, true);
                 has_emitted = true;
             }
@@ -708,7 +710,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                             // Unquoted: join with first IFS char then
                             // let word-splitting do the rest.
                             let ifs = shell.ifs();
-                            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                            let sep = ifs_join_sep(&ifs);
                             let joined = words.join(&sep);
                             emit_split_fields(&joined, &ifs, &mut current, &mut result, &mut has_emitted);
                         }
@@ -2058,6 +2060,19 @@ mod tests {
         let fields = expand(&w, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "a b c");
+    }
+
+    #[test]
+    fn expand_dollar_star_quoted_joins_with_first_ifs_char() {
+        // POSIX § 2.5.2: "$*" joins positional args with the first
+        // character of IFS. With IFS=":" and args a b c → "a:b:c".
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        shell.set("IFS", ":".to_string());
+        let w = Word(vec![WordPart::AllArgs { joined: true, quoted: true }]);
+        let fields = expand(&w, &mut shell);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].chars, "a:b:c");
     }
 
     #[test]
