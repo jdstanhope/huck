@@ -19,6 +19,7 @@ enum Keyword {
     RBrace,
     DoubleBracketOpen,   // [[
     DoubleBracketClose,  // ]]
+    Function,
 }
 
 impl Keyword {
@@ -41,6 +42,7 @@ impl Keyword {
             Keyword::RBrace => "}",
             Keyword::DoubleBracketOpen => "[[",
             Keyword::DoubleBracketClose => "]]",
+            Keyword::Function => "function",
         }
     }
 }
@@ -74,6 +76,7 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "}" => Some(Keyword::RBrace),
         "[[" => Some(Keyword::DoubleBracketOpen),
         "]]" => Some(Keyword::DoubleBracketClose),
+        "function" => Some(Keyword::Function),
         _ => None,
     }
 }
@@ -657,6 +660,7 @@ fn parse_command<I: Iterator<Item = Token>>(
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(Keyword::DoubleBracketOpen) => parse_double_bracket(iter),
+        Some(Keyword::Function) => parse_function_keyword_def(iter),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Check for bare `(` at command-start → subshell `(list)`.
@@ -739,6 +743,22 @@ fn parse_command<I: Iterator<Item = Token>>(
     }
 }
 
+/// True if `body` is one of the compound-command shapes that's
+/// allowed as a function body in both POSIX `name() body` form and
+/// the bash `function NAME body` form.
+fn is_function_body_shape(body: &Command) -> bool {
+    matches!(
+        body,
+        Command::If(_)
+            | Command::While(_)
+            | Command::For(_)
+            | Command::Case(_)
+            | Command::BraceGroup(_)
+            | Command::Subshell { .. }
+            | Command::DoubleBracket { .. }
+    )
+}
+
 /// Parses `name() compound-command`. The caller has consumed the name
 /// (`name_word`) and verified the next token is `(`.
 fn parse_function_def<I: Iterator<Item = Token>>(
@@ -758,12 +778,47 @@ fn parse_function_def<I: Iterator<Item = Token>>(
         return Err(ParseError::UnterminatedFunction);
     }
     let body = parse_command(iter)?;
-    if !matches!(
-        body,
-        Command::If(_) | Command::While(_) | Command::For(_)
-            | Command::Case(_) | Command::BraceGroup(_)
-            | Command::Subshell { .. }
-    ) {
+    if !is_function_body_shape(&body) {
+        return Err(ParseError::FunctionBody);
+    }
+    Ok(Command::FunctionDef { name, body: Box::new(body) })
+}
+
+/// Parses `function NAME [()] compound-command`. The caller has
+/// verified the next token is the `function` keyword (still in the
+/// iterator). Consumes the keyword, the name, optional `()`, and
+/// the compound body.
+fn parse_function_keyword_def<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    // Consume `function` keyword.
+    iter.next();
+
+    // Read the name. Must be a Word that's a valid POSIX identifier
+    // and not a reserved keyword.
+    let name_word = match iter.next() {
+        Some(Token::Word(w)) => w,
+        _ => return Err(ParseError::FunctionName),
+    };
+    let name = valid_identifier_text(&name_word).ok_or(ParseError::FunctionName)?;
+
+    // Optionally consume `()`.
+    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+        iter.next(); // consume `(`
+        match iter.next() {
+            Some(Token::Op(Operator::RParen)) => {}
+            _ => return Err(ParseError::FunctionBody),
+        }
+    }
+
+    // Allow newlines between name (or `()`) and the body.
+    skip_newlines(iter);
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedFunction);
+    }
+
+    let body = parse_command(iter)?;
+    if !is_function_body_shape(&body) {
         return Err(ParseError::FunctionBody);
     }
     Ok(Command::FunctionDef { name, body: Box::new(body) })
@@ -3953,6 +4008,179 @@ mod tests {
         assert_eq!(
             parsed.rest.len(), 1,
             "expected `&& other` to survive parse; got {:?}", parsed
+        );
+    }
+
+    #[test]
+    fn function_keyword_form_brace_body() {
+        let tokens = crate::lexer::tokenize("function f { echo hi; }").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::BraceGroup(_)),
+                        "expected brace body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_keyword_form_with_parens() {
+        let tokens = crate::lexer::tokenize("function f() { :; }").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::FunctionDef { ref name, .. } if name == "f"),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn function_keyword_form_with_parens_and_spaces() {
+        let tokens = crate::lexer::tokenize("function f  (  )  { :; }").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::FunctionDef { ref name, .. } if name == "f"),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn function_keyword_form_subshell_body() {
+        let tokens = crate::lexer::tokenize("function f() ( echo nested )").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::Subshell { .. }),
+                        "expected subshell body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_keyword_form_compound_body_no_braces() {
+        // `function f if true; then :; fi` — no braces; if-statement body.
+        let tokens = crate::lexer::tokenize("function f if true; then :; fi").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::If(_)),
+                        "expected if body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_keyword_form_newline_before_body() {
+        let tokens = crate::lexer::tokenize("function f\n{\n:;\n}").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::FunctionDef { ref name, .. } if name == "f"),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn function_keyword_no_name_errors() {
+        let tokens = crate::lexer::tokenize("function { :; }").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::FunctionName), "got {err:?}");
+    }
+
+    #[test]
+    fn function_keyword_keyword_name_errors() {
+        // Names that are themselves reserved keywords are rejected.
+        let tokens = crate::lexer::tokenize("function if { :; }").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::FunctionName), "got {err:?}");
+    }
+
+    #[test]
+    fn function_keyword_missing_body_errors() {
+        let tokens = crate::lexer::tokenize("function f").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::UnterminatedFunction), "got {err:?}");
+    }
+
+    #[test]
+    fn function_keyword_bad_body_errors() {
+        // `function f echo hi` — body is a pipeline, not a compound.
+        let tokens = crate::lexer::tokenize("function f echo hi").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::FunctionBody), "got {err:?}");
+    }
+
+    #[test]
+    fn function_keyword_unbalanced_parens_errors() {
+        let tokens = crate::lexer::tokenize("function f ( { :; }").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::FunctionBody), "got {err:?}");
+    }
+
+    #[test]
+    fn function_posix_form_double_bracket_body() {
+        // Regression: POSIX form should ALSO accept [[ ]] body
+        // (closes a pre-existing gap; was rejected pre-v77).
+        let tokens = crate::lexer::tokenize("f() [[ -e /dev/null ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::DoubleBracket { .. }),
+                        "expected DoubleBracket body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_keyword_form_double_bracket_body() {
+        // Wrapped in a brace group: the body IS BraceGroup; inside the
+        // brace group is a DoubleBracket. Verify the function parses.
+        let tokens = crate::lexer::tokenize("function f { [[ -e /dev/null ]]; }").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::FunctionDef { ref name, .. } if name == "f"),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn function_as_assignment_var_still_works() {
+        // `function=value` must still parse as a normal assignment,
+        // NOT trigger the function-keyword path. The lexer's
+        // assignment-prefix detection fires before keyword
+        // classification, so the token reaches the parser as a
+        // Word with an AssignPrefix part.
+        let tokens = crate::lexer::tokenize("function=value").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        // At minimum it must NOT parse as a FunctionDef.
+        assert!(
+            !matches!(parsed.first, Command::FunctionDef { .. }),
+            "function=value must not parse as a FunctionDef: {:?}",
+            parsed.first,
+        );
+        // Specifically, it should parse as a Pipeline → Simple →
+        // Assign with target Bare("function").
+        let Command::Pipeline(p) = &parsed.first else {
+            panic!("expected Pipeline, got {:?}", parsed.first);
+        };
+        let Command::Simple(SimpleCommand::Assign(assigns)) = &p.commands[0] else {
+            panic!("expected Simple/Assign, got {:?}", p.commands[0]);
+        };
+        assert_eq!(assigns.len(), 1);
+        match &assigns[0].target {
+            AssignTarget::Bare(name) => assert_eq!(name, "function"),
+            other => panic!("expected Bare target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_in_arg_position_still_works() {
+        // `echo function` — `function` is in argument position, not
+        // command position, so it must NOT trigger the keyword arm.
+        let tokens = crate::lexer::tokenize("echo function").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(
+            !matches!(parsed.first, Command::FunctionDef { .. }),
+            "echo function must not parse as a FunctionDef: {:?}",
+            parsed.first,
         );
     }
 }
