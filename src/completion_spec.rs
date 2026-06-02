@@ -201,7 +201,7 @@ pub fn resolve_spec(
 /// `rustyline::Result<...>` and has no graceful way to propagate
 /// `ExecOutcome::Exit`. The function instead returns immediately with
 /// the COMPREPLY-so-far.
-pub fn call_completion_function(
+fn call_completion_function(
     func_name: &str,
     spec: &CompletionSpec,
     ctx: &CompletionCtx,

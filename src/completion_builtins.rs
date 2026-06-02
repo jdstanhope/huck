@@ -395,7 +395,20 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
         comp_line: word.clone(),
         comp_point: word.len(),
     };
+    // Save+restore shell.current_completion_spec around resolve_spec.
+    // resolve_spec with a -F function calls call_completion_function,
+    // which INTENTIONALLY leaves the synthetic compgen spec stashed in
+    // current_completion_spec (so Task-5 dispatch can read compopt-applied
+    // mutations). For `compgen` from script context we have no consumer,
+    // so leaving it set would leak: the NEXT tab dispatch on an unrelated
+    // spec would .take() the leftover compgen spec (with all-default
+    // options) and silently override the real spec's options. Snapshotting
+    // around the call keeps the slot's contents unchanged for callers
+    // (e.g., a -F dispatcher that internally calls `compgen -F _other`
+    // must see ITS spec on return, not _other's).
+    let saved = shell.current_completion_spec.take();
     let results = crate::completion_spec::resolve_spec(&parsed.spec, &ctx, shell);
+    shell.current_completion_spec = saved;
     let any = !results.is_empty();
     for r in results {
         let _ = writeln!(out, "{r}");
@@ -905,6 +918,26 @@ mod tests {
         let mut sh = Shell::new();
         let (_, code) = run_compopt(&["-E", "-o", "nospace"], &mut sh);
         assert_eq!(code, 2, "compopt -E is a parse-time rejection, should be exit 2");
+    }
+
+    #[test]
+    fn compgen_F_does_not_leak_current_completion_spec() {
+        let mut sh = Shell::new();
+        // Define a function and run compgen -F. After it returns,
+        // shell.current_completion_spec MUST be None — otherwise the
+        // next tab dispatch on an unrelated spec gets the wrong options.
+        let _ = crate::shell::process_line(
+            "_myf() { COMPREPLY=(a b); }",
+            &mut sh,
+            false,
+        );
+        let _ = run_compgen(&["-F", "_myf"], &mut sh);
+        assert!(
+            sh.current_completion_spec.is_none(),
+            "compgen -F leaked current_completion_spec across the call: \
+             {:?}",
+            sh.current_completion_spec,
+        );
     }
 
     #[test]

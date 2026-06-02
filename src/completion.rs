@@ -373,6 +373,12 @@ pub(crate) mod dispatch {
 
     /// Entry point. Returns (start_offset, candidates) for rustyline.
     pub fn resolve(line: &str, pos: usize, shell: &mut Shell) -> (usize, Vec<Candidate>) {
+        // Defensive clear: any leftover spec from a prior `compgen -F` call
+        // (run from script context, not via tab dispatch) would otherwise
+        // corrupt this dispatch's spec options via the take() at the end of
+        // run_spec_with_empty_fallback. Belt-and-suspenders alongside
+        // builtin_compgen's own save/restore.
+        shell.current_completion_spec = None;
         let (start, context) = analyze(line, pos);
 
         // Path 1: variable context — always wins, no spec lookup.
@@ -618,14 +624,31 @@ pub(crate) mod dispatch {
             if next_end == 0 {
                 return None;
             }
-            return Some(after[..next_end].to_string());
+            return Some(unquote_command(&after[..next_end]).to_string());
         }
 
         if candidate.is_empty() {
             None
         } else {
-            Some(candidate.to_string())
+            Some(unquote_command(candidate).to_string())
         }
+    }
+
+    /// Strips a matching pair of leading/trailing single or double quotes
+    /// from the command word so a registered spec for `git` is found when
+    /// the user types `"git" arg<TAB>`. Bash performs full quote removal
+    /// on the command word before lookup; we approximate by stripping one
+    /// outer pair, which covers the common case.
+    fn unquote_command(s: &str) -> &str {
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2 {
+            let first = bytes[0];
+            let last = bytes[bytes.len() - 1];
+            if (first == b'\'' || first == b'"') && first == last {
+                return &s[1..s.len() - 1];
+            }
+        }
+        s
     }
 
     /// Tokenizes a line into COMP_WORDS per the wordbreaks set.
@@ -1125,5 +1148,79 @@ mod tests {
         let (words, cword) = dispatch::tokenize_comp_words("cmd ", " \t\n");
         assert_eq!(words, vec!["cmd", ""]);
         assert_eq!(cword, 1);
+    }
+
+    #[test]
+    fn dispatch_resolve_starts_with_clean_current_spec() {
+        // Simulate a leaked spec from a prior compgen -F (without going
+        // through the actual compgen path). Without the defensive clear
+        // at the top of dispatch::resolve, the .take() inside
+        // run_spec_with_empty_fallback would observe this leaked spec
+        // (all-default options) and use it to override the registered
+        // spec's real options.
+        let mut shell = Shell::new();
+        shell.current_completion_spec = Some(
+            crate::completion_spec::CompletionSpec::default(),
+        );
+        // Register a spec whose -o filenames would be silently lost if
+        // the leaked all-default spec replaced it. We exercise filenames
+        // rendering by completing a real directory.
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tempdir.path().join("subd")).unwrap();
+        let prior = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tempdir.path()).unwrap();
+
+        shell.completion_specs.by_command.insert(
+            "mycmd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("subd".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    filenames: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let (_, cands) = dispatch::resolve("mycmd su", 8, &mut shell);
+        std::env::set_current_dir(prior).unwrap();
+
+        // After dispatch returned, the leaked slot must have been cleared
+        // up front and remain cleared (no -F ran here, so nothing put
+        // anything back).
+        assert!(
+            shell.current_completion_spec.is_none(),
+            "dispatch should leave the slot clean when no -F ran",
+        );
+        // Filenames rendering should add a trailing / to the directory —
+        // proving the registered spec's options.filenames was used, not
+        // the leaked default-options spec.
+        let displays: Vec<&str> = cands.iter().map(|c| c.display.as_str()).collect();
+        assert!(
+            displays.contains(&"subd/"),
+            "filenames-mode trailing / not applied; leaked spec must have \
+             overridden the registered spec's options: {displays:?}",
+        );
+    }
+
+    #[test]
+    fn extract_command_name_strips_outer_quotes() {
+        // Quoted command name like "git" or 'git' should reach its
+        // registered spec — the registry is keyed by the unquoted name.
+        let mut shell = Shell::new();
+        shell.completion_specs.by_command.insert(
+            "mycmd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("alpha".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_, cands) = dispatch::resolve("\"mycmd\" al", 10, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha"],
+            "quoted command name should map to its registered spec",
+        );
     }
 }
