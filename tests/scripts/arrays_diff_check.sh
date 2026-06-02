@@ -28,6 +28,11 @@ fragments=(
     'declare -A m; m[k]=hi; m[k]+=_bye; echo "${m[k]}"'
     'declare -A m=([x]=1 [y]=2); unset m[x]; echo "${m[y]} ${#m[@]}"'
     'declare -A m=([z]=1 [a]=2); m[k]=3; echo "${m[a]} ${m[z]} ${m[k]} ${#m[@]}"'
+    # v73: element-default modifier on missing index/key. Pre-v73 these
+    # silently fell through to scalar_view; bash substitutes the default.
+    'a=(x y z); echo "${a[99]:-fallback}"; echo "${a[99]-fallback}"'
+    'declare -A m=([foo]=bar); echo "${m[nope]:-FB}"; echo "${m[nope]-FB}"'
+    'a=(x y z); echo "${a[1]:-other}"; echo "${a[1]:+set}"'
 )
 
 fail=0
