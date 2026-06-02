@@ -2016,9 +2016,7 @@ fn builtin_read(
     };
 
     // Assignment.
-    let ifs = shell
-        .lookup_var("IFS")
-        .unwrap_or_else(|| " \t\n".to_string());
+    let ifs = shell.ifs();
     let assignments: Vec<(String, String)> = if names.is_empty() {
         vec![("REPLY".to_string(), line)]
     } else {

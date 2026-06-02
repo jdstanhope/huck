@@ -304,6 +304,20 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
+    /// Returns the current value of `$IFS`.
+    ///
+    /// - Unset → POSIX default `" \t\n"`.
+    /// - Empty string → empty (caller's word-splitter must short-circuit
+    ///   "no splitting" semantics; the `${*}` join treats empty IFS as
+    ///   "concatenate without separator").
+    /// - Otherwise → the literal IFS value.
+    ///
+    /// Centralized so the unset-vs-empty boundary is explicit at every
+    /// expansion-site call.
+    pub fn ifs(&self) -> String {
+        self.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string())
+    }
+
     /// Sets a variable's value, preserving its existing `exported` flag (or
     /// creating it as unexported if it didn't exist). When the existing
     /// value is an `Indexed` array, only element 0 is overwritten — the
@@ -1467,5 +1481,30 @@ mod assoc_value_tests {
             Err(AssignErr::Readonly)
         ));
         assert!(shell.lookup_associative_element("m", "k2").is_none());
+    }
+}
+
+#[cfg(test)]
+mod ifs_helper_tests {
+    use super::*;
+
+    #[test]
+    fn ifs_default_when_unset() {
+        let s = Shell::new();
+        assert_eq!(s.ifs(), " \t\n");
+    }
+
+    #[test]
+    fn ifs_returns_set_value() {
+        let mut s = Shell::new();
+        s.set("IFS", ":".to_string());
+        assert_eq!(s.ifs(), ":");
+    }
+
+    #[test]
+    fn ifs_returns_empty_when_set_to_empty() {
+        let mut s = Shell::new();
+        s.set("IFS", "".to_string());
+        assert_eq!(s.ifs(), "");
     }
 }
