@@ -85,6 +85,17 @@ impl Default for Field {
     }
 }
 
+/// Expands a subscript `Word` to a string key. Variable expansion and
+/// command substitution apply, but no arith. Used for associative
+/// array subscripts. The caller decides string vs arith based on the
+/// variable's current `VarValue` variant.
+pub(crate) fn eval_subscript_key(
+    subscript: &Word,
+    shell: &mut Shell,
+) -> String {
+    crate::param_expansion::expand_word_to_string(subscript, shell)
+}
+
 /// Arith-evaluates an array subscript `Word` to a `usize`, honouring
 /// bash's bash-4.3+ rule that a negative result counts from the end:
 /// `${a[-1]}` is the highest-subscript element. Returns `Err(msg)` if
@@ -242,6 +253,122 @@ fn expand_positional_substring(
     }
 }
 
+/// Dispatches `${m[...]}` forms when `m` is an associative array.
+/// String-key subscripts (no arith), insertion-order iteration for
+/// `@`/`*`, and string keys for `${!m[@]}`. Routed from
+/// `expand_array_param` based on the variable's current `VarValue`
+/// variant.
+fn expand_assoc_param(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    subscript: &crate::lexer::SubscriptKind,
+    quoted: bool,
+    shell: &mut Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::lexer::{ParamModifier as PM, SubscriptKind as SK};
+    use crate::param_expansion::ExpansionResult;
+
+    // Snapshot the pairs once up-front so the rest of the function can
+    // borrow `shell` mutably for sub-expansions (e.g., modifier word
+    // evaluation, subscript-as-Word expansion).
+    let pairs: Vec<(String, String)> = shell
+        .get_associative(name)
+        .cloned()
+        .unwrap_or_default();
+    let values: Vec<String> = pairs.iter().map(|(_, v)| v.clone()).collect();
+    let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+
+    match (modifier, subscript) {
+        // ${m[@]} / ${m[*]} — pure expansion, no scalar modifier.
+        (PM::None, SK::All) => ExpansionResult::WordList(values),
+        (PM::None, SK::Star) => {
+            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            ExpansionResult::Value(values.join(&sep))
+        }
+        // ${m[k]} — string-key lookup (no arith on `k`).
+        (PM::None, SK::Index(w)) => {
+            let key = eval_subscript_key(w, shell);
+            let val = shell.lookup_associative_element(name, &key);
+            if val.is_none() && shell.shell_options.nounset {
+                eprintln!("huck: {name}[{key}]: unbound variable");
+                shell.pending_fatal_pe_error = Some(1);
+                return ExpansionResult::Fatal { status: 1 };
+            }
+            ExpansionResult::Value(val.unwrap_or_default())
+        }
+        // ${#m[@]} / ${#m[*]} — pair count.
+        (PM::Length, SK::All) | (PM::Length, SK::Star) => {
+            ExpansionResult::Value(pairs.len().to_string())
+        }
+        // ${#m[k]} — char count of the value at string key `k`.
+        (PM::Length, SK::Index(w)) => {
+            let key = eval_subscript_key(w, shell);
+            let val = shell.lookup_associative_element(name, &key).unwrap_or_default();
+            ExpansionResult::Value(val.chars().count().to_string())
+        }
+        // ${!m[@]} / ${!m[*]} — list of string keys in insertion order.
+        (PM::IndirectKeys, SK::All) => {
+            if quoted {
+                ExpansionResult::WordList(keys)
+            } else {
+                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                ExpansionResult::Value(keys.join(&sep))
+            }
+        }
+        (PM::IndirectKeys, SK::Star) => {
+            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            ExpansionResult::Value(keys.join(&sep))
+        }
+        // `${!m[k]}` — indirect ref through a specific element; not
+        // supported in v72 (would require resolving the value as a
+        // variable name). Produce empty for parity with the indexed path.
+        (PM::IndirectKeys, SK::Index(_)) => ExpansionResult::Value(String::new()),
+        // ${m[@]:o:l} / ${m[*]:o:l} — slicing in insertion order.
+        (PM::Substring { offset, length }, SK::All)
+        | (PM::Substring { offset, length }, SK::Star) => {
+            let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("huck: {name}: {e}");
+                    shell.pending_fatal_pe_error = Some(1);
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+            };
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(sliced)
+            } else {
+                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                ExpansionResult::Value(sliced.join(&sep))
+            }
+        }
+        // ${m[k]:...} — scalar-style modifier on a specific element.
+        // Delegate to the scalar path with an override value.
+        (modif, SK::Index(w)) => {
+            let key = eval_subscript_key(w, shell);
+            let val = shell.lookup_associative_element(name, &key);
+            crate::param_expansion::expand_modifier_with_value(
+                name,
+                modif,
+                val.as_deref(),
+                shell,
+            )
+        }
+        // Other scalar modifiers on @/* — explicit error for v72 scope
+        // (per-element modifiers across the whole array are deferred).
+        (other, SK::All | SK::Star) => {
+            eprintln!(
+                "huck: ${{{name}[…]}}: modifier {:?} not supported on associative array in v72",
+                other
+            );
+            ExpansionResult::Value(String::new())
+        }
+    }
+}
+
 /// Dispatches `${a[...]}` forms. The `subscript` field of
 /// `WordPart::ParamExpansion` distinguishes `[@]`, `[*]`, and
 /// `[<expr>]`; the `modifier` is the scalar-style suffix (or
@@ -258,6 +385,14 @@ fn expand_array_param(
 
     if shell.pending_fatal_pe_error.is_some() {
         return ExpansionResult::Empty;
+    }
+
+    // Type-aware dispatch: associative arrays get string-key semantics.
+    // Must come before the indexed/scalar/unset path below, so a
+    // declared `${m[k]}` is not arith-evaluated like an indexed
+    // subscript.
+    if shell.get_associative(name).is_some() {
+        return expand_assoc_param(name, modifier, subscript, quoted, shell);
     }
 
     // Snapshot the array's values / keys in subscript-ascending order.
@@ -352,6 +487,7 @@ fn expand_array_param(
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("huck: {name}: {e}");
+                    shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -2099,5 +2235,147 @@ mod positional_slicing_tests {
         let words = expand_to_word_list_for_test(&mut s, r#""${@:1:-1}""#);
         // Bash: ${@:1:-1} starts at $1, ends one-before-last. Returns ["a", "b", "c"].
         assert_eq!(words, vec!["a", "b", "c"]);
+    }
+}
+
+#[cfg(test)]
+mod assoc_expansion_tests {
+    //! v72 task 2: read paths for associative arrays. Mirrors the
+    //! indexed-array test module but exercises string-key semantics
+    //! and insertion-order iteration.
+
+    use super::*;
+    use crate::command::{Command, SimpleCommand};
+    use crate::shell_state::Shell;
+
+    fn first_arg_word(input: &str) -> Word {
+        let src = format!("echo {input}");
+        let tokens = crate::lexer::tokenize(&src).expect("lex");
+        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let pipeline = match seq.first {
+            Command::Pipeline(p) => p,
+            other => panic!("expected Pipeline, got {other:?}"),
+        };
+        match &pipeline.commands[0] {
+            Command::Simple(SimpleCommand::Exec(e)) => e.args[0].clone(),
+            other => panic!("expected SimpleCommand::Exec, got {other:?}"),
+        }
+    }
+
+    fn expand_for_test(shell: &mut Shell, input: &str) -> String {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        let parts: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
+        parts.join(" ")
+    }
+
+    fn expand_to_word_list_for_test(shell: &mut Shell, input: &str) -> Vec<String> {
+        let w = first_arg_word(input);
+        let fields = expand(&w, shell);
+        fields.into_iter().map(|f| f.chars).collect()
+    }
+
+    fn shell_with_m() -> Shell {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "first".into(), "x".into()).unwrap();
+        s.set_associative_element("m", "second".into(), "y".into()).unwrap();
+        s.set_associative_element("m", "third".into(), "z".into()).unwrap();
+        s
+    }
+
+    #[test]
+    fn read_element_by_string_key() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m[second]}");
+        assert_eq!(out, "y");
+    }
+
+    #[test]
+    fn missing_key_is_empty() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m[nope]}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn quoted_at_yields_values_in_insertion_order() {
+        let mut s = shell_with_m();
+        let words = expand_to_word_list_for_test(&mut s, r#""${m[@]}""#);
+        assert_eq!(words, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn quoted_star_joins_values_in_insertion_order() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, r#""${m[*]}""#);
+        assert_eq!(out, "x y z");
+    }
+
+    #[test]
+    fn count_returns_pair_count() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${#m[@]}");
+        assert_eq!(out, "3");
+    }
+
+    #[test]
+    fn keys_list_returns_string_keys_in_insertion_order() {
+        let mut s = shell_with_m();
+        let words = expand_to_word_list_for_test(&mut s, r#""${!m[@]}""#);
+        assert_eq!(words, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn quoted_star_keys_joins_by_ifs() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, r#""${!m[*]}""#);
+        assert_eq!(out, "first second third");
+    }
+
+    #[test]
+    fn element_length_for_associative() {
+        let mut s = Shell::new();
+        s.declare_associative("m").unwrap();
+        s.set_associative_element("m", "k".into(), "hello".into()).unwrap();
+        let out = expand_for_test(&mut s, "${#m[k]}");
+        assert_eq!(out, "5");
+    }
+
+    #[test]
+    fn slicing_returns_values_in_insertion_order() {
+        let mut s = shell_with_m();
+        let words = expand_to_word_list_for_test(&mut s, r#""${m[@]:1:1}""#);
+        assert_eq!(words, vec!["y"]);
+    }
+
+    #[test]
+    fn bare_name_returns_empty_for_associative() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn variable_subscript_expands_as_string() {
+        let mut s = shell_with_m();
+        s.set("k", "second".into());
+        let out = expand_for_test(&mut s, "${m[$k]}");
+        assert_eq!(out, "y");
+    }
+
+    #[test]
+    fn nounset_on_missing_key_fires_pe_error() {
+        let mut s = shell_with_m();
+        s.shell_options.nounset = true;
+        let _ = expand_for_test(&mut s, "${m[nope]}");
+        assert!(s.pending_fatal_pe_error.is_some());
+    }
+
+    #[test]
+    fn modifier_on_missing_key_uses_default() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m[nope]:-fallback}");
+        assert_eq!(out, "fallback");
     }
 }

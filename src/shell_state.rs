@@ -14,17 +14,21 @@ use crate::jobs::JobTable;
 pub enum VarValue {
     Scalar(String),
     Indexed(BTreeMap<usize, String>),
+    Associative(Vec<(String, String)>),
 }
 
 impl VarValue {
     /// Returns the "scalar view" of this value: the string itself
     /// for `Scalar`, or the element at subscript 0 (or "" if no such
     /// element) for `Indexed`. This is the bash rule that `$a` and
-    /// `${a}` on an indexed array mean `${a[0]}`.
+    /// `${a}` on an indexed array mean `${a[0]}`. For `Associative`
+    /// returns "" (bash: `$m` on an associative array is empty,
+    /// not the first value).
     pub fn scalar_view(&self) -> &str {
         match self {
             VarValue::Scalar(s) => s.as_str(),
             VarValue::Indexed(m) => m.get(&0).map(String::as_str).unwrap_or(""),
+            VarValue::Associative(_) => "",
         }
     }
 }
@@ -60,6 +64,39 @@ pub enum AssignErr {
     Readonly,
     #[allow(dead_code)] // reserved for future bad-subscript paths
     BadSubscript,
+    /// Variable exists but its current shape disagrees with the
+    /// requested operation (e.g., set_associative_element called on
+    /// an indexed variable). Caller should have routed to the
+    /// correct shape-specific mutator. Defensive only — the executor
+    /// must check variants before calling and surface a user-facing
+    /// diagnostic.
+    TypeMismatch,
+}
+
+/// Errors specific to declaration-builtin paths (declare -A on existing
+/// indexed/scalar, etc.) that distinguish themselves from assignment errors.
+/// Callers translate these into a "huck: {cmd}: ..." diagnostic via
+/// [`declare_err_message`] so that `local -A` and `readonly -A` print the
+/// correct command name (not a misleading "declare" prefix).
+#[derive(Debug)]
+pub enum DeclareErr {
+    /// `declare -A NAME` where NAME is already an indexed array.
+    IndexedExists,
+    /// `declare -A NAME` where NAME is already a scalar.
+    ScalarExists,
+}
+
+/// Formats a user-facing diagnostic for a [`DeclareErr`] using the given
+/// command name (e.g., "declare", "local", "readonly") and variable name.
+pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
+    match err {
+        DeclareErr::IndexedExists => {
+            format!("huck: {cmd}: {name}: cannot convert indexed to associative array")
+        }
+        DeclareErr::ScalarExists => {
+            format!("huck: {cmd}: {name}: cannot convert scalar to associative array")
+        }
+    }
 }
 
 /// Persistent shell-option state controlled by `set -X` / `set -o NAME`.
@@ -492,7 +529,7 @@ impl Shell {
         match self.vars.get(name) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => Some(m),
-                VarValue::Scalar(_) => None,
+                VarValue::Scalar(_) | VarValue::Associative(_) => None,
             },
             None => None,
         }
@@ -507,6 +544,7 @@ impl Shell {
                 VarValue::Indexed(m) => m.get(&idx).cloned(),
                 VarValue::Scalar(s) if idx == 0 => Some(s.clone()),
                 VarValue::Scalar(_) => None,
+                VarValue::Associative(_) => None,
             },
             None => None,
         }
@@ -579,6 +617,12 @@ impl Shell {
                         m.insert(idx, value);
                     }
                     v.value = VarValue::Indexed(m);
+                }
+                VarValue::Associative(_) => {
+                    eprintln!(
+                        "huck: {name}: set_array_element on associative variable"
+                    );
+                    return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
@@ -673,6 +717,159 @@ impl Shell {
         Ok(())
     }
 
+    /// Returns a reference to the associative array stored under `name`,
+    /// or `None` if the variable is unset, scalar, or indexed.
+    pub fn get_associative(&self, name: &str) -> Option<&Vec<(String, String)>> {
+        match self.vars.get(name) {
+            Some(v) => match &v.value {
+                VarValue::Associative(pairs) => Some(pairs),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Returns the value at string key `key` for the associative array `name`.
+    /// `None` if the variable is unset, not associative, or has no such key.
+    pub fn lookup_associative_element(&self, name: &str, key: &str) -> Option<String> {
+        self.get_associative(name).and_then(|pairs| {
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        })
+    }
+
+    /// Sets `key` to `value` in the associative array `name`. Preserves
+    /// insertion order on update (existing key keeps its position; new
+    /// keys are appended). Honors readonly. Errors with AssignErr::Readonly
+    /// (used as a generic "could not set" signal) if the variable exists
+    /// and is NOT associative — callers (the executor) must check the
+    /// variant before calling this.
+    pub fn set_associative_element(
+        &mut self,
+        name: &str,
+        key: String,
+        value: String,
+    ) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Associative(pairs) => {
+                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
+                        slot.1 = value;
+                    } else {
+                        pairs.push((key, value));
+                    }
+                }
+                _ => {
+                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
+                    return Err(AssignErr::TypeMismatch);
+                }
+            },
+            None => {
+                eprintln!("huck: {name}: set_associative_element on unset variable");
+                return Err(AssignErr::TypeMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// `m[k]+=v` — concatenate `value` to the existing element at `key`,
+    /// or set to `value` if no such key. Honors readonly.
+    pub fn append_associative_element(
+        &mut self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), AssignErr> {
+        let existing = self.lookup_associative_element(name, key).unwrap_or_default();
+        self.set_associative_element(name, key.to_string(), existing + value)
+    }
+
+    /// Removes the entry at `key` from the associative array `name`.
+    /// No-op if missing/not-associative/no-such-key. Honors readonly.
+    /// Reached from `builtin_unset` when the target is an associative
+    /// array (see `src/builtins.rs`, the `get_associative(name).is_some()`
+    /// branch).
+    pub fn unset_associative_element(
+        &mut self,
+        name: &str,
+        key: &str,
+    ) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        if let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Associative(pairs) = &mut v.value
+        {
+            pairs.retain(|(k, _)| k != key);
+        }
+        Ok(())
+    }
+
+    /// Replaces (or creates) `name` as an associative array with the given
+    /// pairs in insertion order. Honors readonly. Preserves exported flag
+    /// if the variable exists.
+    pub fn replace_associative(
+        &mut self,
+        name: &str,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(), AssignErr> {
+        if let Some(existing) = self.vars.get(name)
+            && existing.readonly
+        {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+        let exported = self.vars.get(name).map(|v| v.exported).unwrap_or(false);
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Associative(pairs),
+                exported,
+                readonly: false,
+                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
+                integer: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Creates an empty associative array under `name`. Enforces bash rules:
+    /// - Unset → create empty associative.
+    /// - Already associative → no-op.
+    /// - Indexed → error: `DeclareErr::IndexedExists`.
+    /// - Scalar → error: `DeclareErr::ScalarExists`.
+    ///
+    /// Does NOT print any diagnostic; callers should format via
+    /// [`declare_err_message`] so the correct command name (declare,
+    /// local, readonly) appears in the message.
+    pub fn declare_associative(&mut self, name: &str) -> Result<(), DeclareErr> {
+        match self.vars.get(name).map(|v| &v.value) {
+            None => {
+                self.vars.insert(
+                    name.to_string(),
+                    Variable {
+                        value: VarValue::Associative(Vec::new()),
+                        exported: false,
+                        readonly: false,
+                        integer: false,
+                    },
+                );
+                Ok(())
+            }
+            Some(VarValue::Associative(_)) => Ok(()),
+            Some(VarValue::Indexed(_)) => Err(DeclareErr::IndexedExists),
+            Some(VarValue::Scalar(_)) => Err(DeclareErr::ScalarExists),
+        }
+    }
+
     pub fn last_status(&self) -> i32 {
         self.last_status
     }
@@ -757,6 +954,9 @@ fn install_scalar_value(existing: &mut Variable, value: String) {
         }
         VarValue::Scalar(_) => {
             existing.value = VarValue::Scalar(value);
+        }
+        VarValue::Associative(_) => {
+            eprintln!("huck: internal: install_scalar_value on associative array");
         }
     }
 }
@@ -1110,5 +1310,162 @@ mod array_value_tests {
             }
             _ => panic!("expected Indexed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod assoc_value_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_view_returns_empty_for_associative() {
+        let v = VarValue::Associative(vec![
+            ("k1".to_string(), "v1".to_string()),
+            ("k2".to_string(), "v2".to_string()),
+        ]);
+        assert_eq!(v.scalar_view(), "");
+    }
+
+    #[test]
+    fn declare_associative_on_unset_creates_empty() {
+        let mut shell = Shell::new();
+        assert!(shell.declare_associative("m").is_ok());
+        assert_eq!(shell.get_associative("m").map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn declare_associative_on_existing_associative_is_noop() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".into(), "v".into()).unwrap();
+        assert!(shell.declare_associative("m").is_ok());
+        assert_eq!(shell.lookup_associative_element("m", "k"), Some("v".into()));
+    }
+
+    #[test]
+    fn declare_associative_on_indexed_errors() {
+        let mut shell = Shell::new();
+        let mut m = BTreeMap::new();
+        m.insert(0, "x".into());
+        shell.vars.insert("a".into(), Variable {
+            value: VarValue::Indexed(m),
+            exported: false, readonly: false, integer: false,
+        });
+        assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
+    }
+
+    #[test]
+    fn declare_associative_on_scalar_errors() {
+        let mut shell = Shell::new();
+        shell.set("s", "hello".into());
+        assert!(matches!(shell.declare_associative("s"), Err(DeclareErr::ScalarExists)));
+    }
+
+    #[test]
+    fn declare_err_message_uses_command_name() {
+        use super::declare_err_message;
+        assert_eq!(
+            declare_err_message("declare", "a", &DeclareErr::IndexedExists),
+            "huck: declare: a: cannot convert indexed to associative array",
+        );
+        assert_eq!(
+            declare_err_message("local", "s", &DeclareErr::ScalarExists),
+            "huck: local: s: cannot convert scalar to associative array",
+        );
+        assert_eq!(
+            declare_err_message("readonly", "s", &DeclareErr::ScalarExists),
+            "huck: readonly: s: cannot convert scalar to associative array",
+        );
+    }
+
+    #[test]
+    fn set_associative_element_preserves_insertion_order_on_update() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
+        shell.set_associative_element("m", "b".into(), "2".into()).unwrap();
+        shell.set_associative_element("m", "c".into(), "3".into()).unwrap();
+        shell.set_associative_element("m", "a".into(), "999".into()).unwrap();
+        let pairs = shell.get_associative("m").unwrap();
+        assert_eq!(pairs[0], ("a".into(), "999".into()));
+        assert_eq!(pairs[1], ("b".into(), "2".into()));
+        assert_eq!(pairs[2], ("c".into(), "3".into()));
+    }
+
+    #[test]
+    fn append_associative_element_concatenates() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".into(), "hello".into()).unwrap();
+        shell.append_associative_element("m", "k", "_world").unwrap();
+        assert_eq!(shell.lookup_associative_element("m", "k"), Some("hello_world".into()));
+    }
+
+    #[test]
+    fn append_associative_element_creates_when_missing() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.append_associative_element("m", "new", "value").unwrap();
+        assert_eq!(shell.lookup_associative_element("m", "new"), Some("value".into()));
+    }
+
+    #[test]
+    fn unset_associative_element_removes_one_key() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
+        shell.set_associative_element("m", "b".into(), "2".into()).unwrap();
+        shell.set_associative_element("m", "c".into(), "3".into()).unwrap();
+        shell.unset_associative_element("m", "b").unwrap();
+        let pairs = shell.get_associative("m").unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "a");
+        assert_eq!(pairs[1].0, "c");
+    }
+
+    #[test]
+    fn unset_associative_element_on_missing_key_is_noop() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "a".into(), "1".into()).unwrap();
+        assert!(shell.unset_associative_element("m", "nope").is_ok());
+        assert_eq!(shell.lookup_associative_element("m", "a"), Some("1".into()));
+    }
+
+    #[test]
+    fn unset_associative_element_on_non_associative_is_noop() {
+        let mut shell = Shell::new();
+        shell.set("s", "hello".into());
+        // Non-associative variable — should NOT modify it and NOT error.
+        assert!(shell.unset_associative_element("s", "anything").is_ok());
+        assert_eq!(shell.get("s"), Some("hello"));
+    }
+
+    #[test]
+    fn replace_associative_overwrites() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "old".into(), "1".into()).unwrap();
+        let new_pairs = vec![
+            ("x".to_string(), "10".to_string()),
+            ("y".to_string(), "20".to_string()),
+        ];
+        shell.replace_associative("m", new_pairs).unwrap();
+        assert!(shell.lookup_associative_element("m", "old").is_none());
+        assert_eq!(shell.lookup_associative_element("m", "x"), Some("10".into()));
+        assert_eq!(shell.lookup_associative_element("m", "y"), Some("20".into()));
+    }
+
+    #[test]
+    fn readonly_blocks_set_associative_element() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".into(), "v".into()).unwrap();
+        shell.mark_readonly("m");
+        assert!(matches!(
+            shell.set_associative_element("m", "k2".into(), "v2".into()),
+            Err(AssignErr::Readonly)
+        ));
+        assert!(shell.lookup_associative_element("m", "k2").is_none());
     }
 }
