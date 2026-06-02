@@ -414,7 +414,8 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
 ///   directly. `-o` sets, `+o` clears. Status 1 if any name is missing.
 ///
 /// `-D` / `-E` (mutate default/empty specs from within a function) are
-/// recognized as flags but rejected with status 1 "not yet supported".
+/// recognized as flags but rejected with status 2 (parse-time error,
+/// like any other unsupported flag) — "not yet supported".
 pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut i = 0;
     let mut option_set: Vec<(String, bool)> = Vec::new();
@@ -481,7 +482,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
 
     if is_default || is_empty {
         eprintln!("huck: compopt: -D/-E not yet supported");
-        return ExecOutcome::Continue(1);
+        return ExecOutcome::Continue(2);
     }
 
     if names.is_empty() {
@@ -890,5 +891,28 @@ mod tests {
         assert!(out.contains("_default_func"), "{out:?}");
         // Should NOT contain the by_command entry's name "foo".
         assert!(!out.contains(" -- foo"), "should not print foo's spec: {out:?}");
+    }
+
+    #[test]
+    fn compopt_D_rejected_with_exit_2() {
+        let mut sh = Shell::new();
+        let (_, code) = run_compopt(&["-D", "-o", "nospace"], &mut sh);
+        assert_eq!(code, 2, "compopt -D is a parse-time rejection, should be exit 2");
+    }
+
+    #[test]
+    fn compopt_E_rejected_with_exit_2() {
+        let mut sh = Shell::new();
+        let (_, code) = run_compopt(&["-E", "-o", "nospace"], &mut sh);
+        assert_eq!(code, 2, "compopt -E is a parse-time rejection, should be exit 2");
+    }
+
+    #[test]
+    fn compopt_double_dash_ends_flags() {
+        let mut sh = Shell::new();
+        // After --, "foo" should be a name (not a flag). With no registered
+        // spec for "foo", this errors with exit 1 (missing name).
+        let (_, code) = run_compopt(&["-o", "nospace", "--", "foo"], &mut sh);
+        assert_eq!(code, 1, "-- should end flags so 'foo' is a name; no spec → exit 1");
     }
 }
