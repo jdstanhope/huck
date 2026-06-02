@@ -1,0 +1,523 @@
+//! Completion-spec data and the `resolve_spec()` candidate generator.
+//!
+//! A `CompletionSpec` is what the `complete` builtin builds and stores
+//! per command name. `resolve_spec()` is the pure-ish function that
+//! turns a spec plus a completion context into a list of candidate
+//! strings. It is reused by tab-time dispatch (`completion.rs`) AND by
+//! the `compgen` builtin.
+
+use std::collections::HashMap;
+
+use crate::shell_state::Shell;
+
+/// Per-command + default + empty completion specs.
+#[derive(Debug, Default, Clone)]
+pub struct CompletionSpecs {
+    pub by_command: HashMap<String, CompletionSpec>,
+    pub default_spec: Option<CompletionSpec>,
+    pub empty_spec: Option<CompletionSpec>,
+}
+
+/// A single completion spec. Multiple content generators (`-F`, `-W`,
+/// `-G`, `-A`) may be set simultaneously; their results are concatenated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionSpec {
+    pub function: Option<String>,
+    pub wordlist: Option<String>,
+    pub glob: Option<String>,
+    pub actions: Vec<Action>,
+
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub filter: Option<String>,
+
+    pub options: CompOptions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompOptions {
+    pub default: bool,
+    pub nospace: bool,
+    pub filenames: bool,
+    pub bashdefault: bool,
+    pub dirnames: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    File,
+    Directory,
+    Command,
+    Function,
+    Variable,
+    Alias,
+    Builtin,
+    Keyword,
+}
+
+impl Action {
+    /// Parses the short-form name accepted by `complete -A` / `compgen -A`.
+    /// Returns `None` for unsupported actions (caller surfaces the diag).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "file" => Some(Action::File),
+            "directory" => Some(Action::Directory),
+            "command" => Some(Action::Command),
+            "function" => Some(Action::Function),
+            "variable" => Some(Action::Variable),
+            "alias" => Some(Action::Alias),
+            "builtin" => Some(Action::Builtin),
+            "keyword" => Some(Action::Keyword),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::File => "file",
+            Action::Directory => "directory",
+            Action::Command => "command",
+            Action::Function => "function",
+            Action::Variable => "variable",
+            Action::Alias => "alias",
+            Action::Builtin => "builtin",
+            Action::Keyword => "keyword",
+        }
+    }
+}
+
+/// The set of bash shell keywords huck recognizes. Used by `-A keyword`.
+const SHELL_KEYWORDS: &[&str] = &[
+    "!", "[[", "]]", "case", "do", "done", "elif", "else", "esac",
+    "fi", "for", "function", "if", "in", "then", "until", "while", "{", "}",
+];
+
+/// Completion context for a single `resolve_spec` call.
+#[derive(Debug, Clone)]
+pub struct CompletionCtx {
+    /// The command name (word 0 of the simple command).
+    pub cmd_name: String,
+    /// The word the cursor is on (possibly empty).
+    pub cur_word: String,
+    /// The word at index COMP_CWORD - 1, or "" if cursor is on word 0.
+    pub prev_word: String,
+    /// Full COMP_WORDS list including separator-words from COMP_WORDBREAKS.
+    pub comp_words: Vec<String>,
+    /// Index of the cursor word in `comp_words`.
+    pub comp_cword: usize,
+    /// The full input line.
+    pub comp_line: String,
+    /// Byte offset of the cursor in the line.
+    pub comp_point: usize,
+}
+
+/// Runs every generator in the spec, decorates, filters, and returns
+/// the resulting candidate strings. `-F` invocation is delegated to
+/// `call_completion_function` (filled in by Task 4); for now it returns
+/// an empty vec.
+///
+/// Note: this does NOT apply `-o filenames` rendering or `-o default`/
+/// `bashdefault` empty-fallback. Those are the caller's responsibility
+/// (Task 5) because they depend on rustyline / dispatch-ladder state.
+pub fn resolve_spec(
+    spec: &CompletionSpec,
+    ctx: &CompletionCtx,
+    shell: &mut Shell,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // -F func: deferred to Task 4. For now this stays empty.
+    if let Some(func_name) = &spec.function {
+        let mut from_func = call_completion_function(func_name, spec, ctx, shell);
+        out.append(&mut from_func);
+    }
+
+    // -W wordlist: IFS-split the raw wordlist string AT USE TIME and
+    // keep entries whose prefix matches cur_word.
+    if let Some(wordlist) = &spec.wordlist {
+        let ifs = shell.ifs();
+        let words = split_wordlist(wordlist, &ifs);
+        for w in words {
+            if w.starts_with(&ctx.cur_word) {
+                out.push(w);
+            }
+        }
+    }
+
+    // -G glob: shell-glob expansion against CWD; keep matches whose
+    // basename starts with cur_word.
+    if let Some(glob_pat) = &spec.glob {
+        for matched in expand_glob(glob_pat) {
+            if filename_matches_prefix(&matched, &ctx.cur_word) {
+                out.push(matched);
+            }
+        }
+    }
+
+    // -A action: enumerate predefined sources, filtered by cur_word.
+    for action in &spec.actions {
+        let mut from_action = enumerate_action(*action, &ctx.cur_word, shell);
+        out.append(&mut from_action);
+    }
+
+    // -X pattern filter. `pat` removes matches; `!pat` keeps only matches.
+    if let Some(filter) = &spec.filter {
+        let (pattern, invert) = match filter.strip_prefix('!') {
+            Some(rest) => (rest, true),
+            None => (filter.as_str(), false),
+        };
+        out.retain(|s| {
+            let matches = glob_match(pattern, s);
+            if invert { matches } else { !matches }
+        });
+    }
+
+    // -P prefix / -S suffix decoration.
+    if let Some(prefix) = &spec.prefix {
+        for s in out.iter_mut() {
+            *s = format!("{prefix}{s}");
+        }
+    }
+    if let Some(suffix) = &spec.suffix {
+        for s in out.iter_mut() {
+            *s = format!("{s}{suffix}");
+        }
+    }
+
+    out
+}
+
+/// Placeholder. Task 4 replaces this with the real -F invocation that
+/// sets COMP_*, calls the function via the executor, and reads COMPREPLY.
+pub fn call_completion_function(
+    _func_name: &str,
+    _spec: &CompletionSpec,
+    _ctx: &CompletionCtx,
+    _shell: &mut Shell,
+) -> Vec<String> {
+    Vec::new()
+}
+
+/// Splits a -W wordlist on the IFS bytes. Whitespace IFS bytes (space,
+/// tab, newline) collapse runs and strip leading/trailing; non-whitespace
+/// IFS bytes each delimit a single field.
+fn split_wordlist(wordlist: &str, ifs: &str) -> Vec<String> {
+    if ifs.is_empty() {
+        return vec![wordlist.to_string()];
+    }
+    let ws: Vec<char> = ifs.chars().filter(|c| c.is_ascii_whitespace()).collect();
+    let non_ws: Vec<char> = ifs.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = wordlist.chars().peekable();
+    // Strip leading whitespace-IFS.
+    while let Some(&c) = chars.peek() {
+        if ws.contains(&c) { chars.next(); } else { break; }
+    }
+    while let Some(c) = chars.next() {
+        if ws.contains(&c) {
+            // Collapse run of whitespace-IFS.
+            while let Some(&n) = chars.peek() {
+                if ws.contains(&n) { chars.next(); } else { break; }
+            }
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else if non_ws.contains(&c) {
+            // Each non-ws IFS byte ends a field.
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn expand_glob(pattern: &str) -> Vec<String> {
+    match glob::glob(pattern) {
+        Ok(paths) => paths
+            .filter_map(|p| p.ok())
+            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn filename_matches_prefix(path: &str, prefix: &str) -> bool {
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    basename.starts_with(prefix)
+}
+
+fn glob_match(pattern: &str, candidate: &str) -> bool {
+    match glob::Pattern::new(pattern) {
+        Ok(p) => p.matches(candidate),
+        Err(_) => false,
+    }
+}
+
+fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
+    match action {
+        Action::File => list_dir_filtered(".", prefix, false),
+        Action::Directory => list_dir_filtered(".", prefix, true),
+        Action::Command => {
+            // Reuse src/completion.rs::complete_command which already
+            // walks PATH + builtins. Return just the replacement strings.
+            let path = shell.get("PATH").unwrap_or("").to_string();
+            crate::completion::complete_command(prefix, &path)
+                .into_iter()
+                .map(|c| c.replacement)
+                .collect()
+        }
+        Action::Function => {
+            let mut names: Vec<String> = shell
+                .functions
+                .keys()
+                .filter(|n| n.starts_with(prefix))
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        }
+        Action::Variable => {
+            let mut names: Vec<String> = shell
+                .var_names()
+                .filter(|n| n.starts_with(prefix))
+                .map(|s| s.to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        }
+        Action::Alias => {
+            let mut names: Vec<String> = shell
+                .aliases
+                .keys()
+                .filter(|n| n.starts_with(prefix))
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        }
+        Action::Builtin => {
+            let mut names: Vec<String> = crate::builtins::BUILTIN_NAMES
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|s| s.to_string())
+                .collect();
+            names.sort();
+            names
+        }
+        Action::Keyword => SHELL_KEYWORDS
+            .iter()
+            .filter(|n| n.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+fn list_dir_filtered(dir: &str, prefix: &str, dirs_only: bool) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let show_hidden = prefix.starts_with('.');
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else { continue };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if name.starts_with('.') && !show_hidden {
+            continue;
+        }
+        if dirs_only {
+            let is_dir = std::fs::metadata(entry.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+        }
+        out.push(name.to_string());
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    fn ctx(cur: &str) -> CompletionCtx {
+        CompletionCtx {
+            cmd_name: "cmd".to_string(),
+            cur_word: cur.to_string(),
+            prev_word: String::new(),
+            comp_words: vec!["cmd".to_string(), cur.to_string()],
+            comp_cword: 1,
+            comp_line: format!("cmd {cur}"),
+            comp_point: 4 + cur.len(),
+        }
+    }
+
+    #[test]
+    fn wordlist_filters_by_prefix() {
+        let spec = CompletionSpec {
+            wordlist: Some("alpha alpine beta".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx("al"), &mut sh);
+        assert_eq!(got, vec!["alpha", "alpine"]);
+    }
+
+    #[test]
+    fn wordlist_with_no_match_is_empty() {
+        let spec = CompletionSpec {
+            wordlist: Some("alpha beta".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx("z"), &mut sh);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn wordlist_respects_ifs() {
+        let spec = CompletionSpec {
+            wordlist: Some("alpha:apple:banana".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        sh.set("IFS", ":".to_string());
+        let got = resolve_spec(&spec, &ctx("a"), &mut sh);
+        assert_eq!(got, vec!["alpha", "apple"]);
+    }
+
+    #[test]
+    fn action_function_enumerates_functions() {
+        let mut sh = Shell::new();
+        // Use a minimal valid empty function body — Simple(Assign(vec![])).
+        let body: Box<crate::command::Command> = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        sh.functions.insert("alpha".to_string(), body.clone());
+        sh.functions.insert("alpine".to_string(), body.clone());
+        sh.functions.insert("beta".to_string(), body);
+
+        let spec = CompletionSpec {
+            actions: vec![Action::Function],
+            ..Default::default()
+        };
+        let got = resolve_spec(&spec, &ctx("al"), &mut sh);
+        assert_eq!(got, vec!["alpha", "alpine"]);
+    }
+
+    #[test]
+    fn action_builtin_enumerates_builtins() {
+        let spec = CompletionSpec {
+            actions: vec![Action::Builtin],
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx("ec"), &mut sh);
+        assert!(got.contains(&"echo".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn action_keyword_enumerates_keywords() {
+        let spec = CompletionSpec {
+            actions: vec![Action::Keyword],
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx("fo"), &mut sh);
+        assert_eq!(got, vec!["for"]);
+    }
+
+    #[test]
+    fn filter_removes_matches() {
+        let spec = CompletionSpec {
+            wordlist: Some("alpha apple banana cherry".to_string()),
+            filter: Some("a*".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        // "a*" removes alpha and apple; banana and cherry remain.
+        assert_eq!(got, vec!["banana", "cherry"]);
+    }
+
+    #[test]
+    fn filter_bang_keeps_only_matches() {
+        let spec = CompletionSpec {
+            wordlist: Some("alpha apple banana cherry".to_string()),
+            filter: Some("!a*".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["alpha", "apple"]);
+    }
+
+    #[test]
+    fn prefix_suffix_decorate_results() {
+        let spec = CompletionSpec {
+            wordlist: Some("a b".to_string()),
+            prefix: Some("x:".to_string()),
+            suffix: Some(":y".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        assert_eq!(got, vec!["x:a:y", "x:b:y"]);
+    }
+
+    #[test]
+    fn function_generator_returns_empty_for_now() {
+        // Task 2: -F is reserved but not wired; placeholder returns empty.
+        // Task 4 replaces call_completion_function.
+        let spec = CompletionSpec {
+            function: Some("_nonexistent".to_string()),
+            ..Default::default()
+        };
+        let mut sh = Shell::new();
+        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn action_parse_recognizes_known() {
+        assert_eq!(Action::parse("file"), Some(Action::File));
+        assert_eq!(Action::parse("directory"), Some(Action::Directory));
+        assert_eq!(Action::parse("keyword"), Some(Action::Keyword));
+    }
+
+    #[test]
+    fn action_parse_rejects_unknown() {
+        assert_eq!(Action::parse("hostname"), None);
+        assert_eq!(Action::parse("signal"), None);
+    }
+
+    #[test]
+    fn split_wordlist_default_ifs_collapses_runs() {
+        let got = split_wordlist("  a   b  c ", " \t\n");
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_wordlist_non_ws_each_delimits() {
+        // With IFS=":" (single non-ws byte), each ":" ends a field.
+        // "a::b" → ["a", "", "b"].
+        let got = split_wordlist("a::b", ":");
+        assert_eq!(got, vec!["a", "", "b"]);
+    }
+}
