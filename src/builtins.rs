@@ -27,6 +27,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "declare", "typeset",
     "eval",
     "help",
+    "complete", "compgen", "compopt",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -96,6 +97,9 @@ pub fn run_builtin(
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
         "help" => builtin_help(args, out, shell),
+        "complete" => crate::completion_builtins::builtin_complete(args, out, shell),
+        "compgen" => crate::completion_builtins::builtin_compgen(args, out, shell),
+        "compopt" => crate::completion_builtins::builtin_compopt(args, out, shell),
         "alias" => builtin_alias(args, out, shell),
         "unalias" => builtin_unalias(args, shell),
         ":" => builtin_colon(args, shell),
@@ -4669,7 +4673,7 @@ fn is_valid_alias_name(s: &str) -> bool {
         && s.chars().all(|c| !c.is_whitespace() && !"|&;<>()$`\\\"'*?[]#~{}".contains(c))
 }
 
-fn escape_alias_value(v: &str) -> String {
+pub(crate) fn escape_alias_value(v: &str) -> String {
     // Bash format: alias name='value' with single quotes inside
     // the value rewritten as '\''.
     v.replace('\'', r#"'\''"#)

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -155,52 +157,77 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    editor.set_helper(Some(HuckHelper::new()));
+    let shell_cell = Rc::new(RefCell::new(Shell::new()));
 
-    let mut shell = Shell::new();
-    install_sigint_handler(Arc::clone(&shell.sigint_flag));
-    install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
-
-    shell.history.load();
-    for (_, command) in shell.history.entries() {
-        let _ = editor.add_history_entry(command);
+    {
+        let shell = shell_cell.borrow();
+        install_sigint_handler(Arc::clone(&shell.sigint_flag));
+        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
     }
 
-    if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
-        crate::traps::fire_exit_trap(&mut shell);
-        shell.hangup_jobs();
-        shell.history.save();
-        return exit_code;
-    }
-
-    loop {
-        crate::jobs::reap_and_notify(&mut shell);
-        crate::traps::dispatch_pending_traps(&mut shell);
-        if let Some(helper) = editor.helper_mut() {
-            helper.refresh(&shell);
+    {
+        let mut shell = shell_cell.borrow_mut();
+        shell.history.load();
+        for (_, command) in shell.history.entries() {
+            let _ = editor.add_history_entry(command);
         }
-        if let Some(exit_code) = fire_prompt_command(&mut shell) {
+    }
+
+    editor.set_helper(Some(HuckHelper::new(Rc::clone(&shell_cell))));
+
+    {
+        let mut shell = shell_cell.borrow_mut();
+        if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
             crate::traps::fire_exit_trap(&mut shell);
             shell.hangup_jobs();
             shell.history.save();
             return exit_code;
         }
-        match read_logical_command(&mut editor, &mut shell) {
+    }
+
+    loop {
+        {
+            let mut shell = shell_cell.borrow_mut();
+            crate::jobs::reap_and_notify(&mut shell);
+            crate::traps::dispatch_pending_traps(&mut shell);
+        }
+        {
+            let mut shell = shell_cell.borrow_mut();
+            if let Some(exit_code) = fire_prompt_command(&mut shell) {
+                crate::traps::fire_exit_trap(&mut shell);
+                shell.hangup_jobs();
+                shell.history.save();
+                return exit_code;
+            }
+        }
+        match read_logical_command(&mut editor, &shell_cell) {
             ReadResult::Ready { buffer, history } => {
-                if !history.trim().is_empty() {
-                    shell.history.add(history.clone());
-                    let _ = editor.add_history_entry(history.as_str());
+                {
+                    let mut shell = shell_cell.borrow_mut();
+                    if !history.trim().is_empty() {
+                        shell.history.add(history.clone());
+                        let _ = editor.add_history_entry(history.as_str());
+                    }
                 }
-                let do_alias = shell.is_interactive
-                    || std::env::var("HUCK_EXPAND_ALIASES").is_ok();
-                match process_line(&buffer, &mut shell, do_alias) {
+                let do_alias = {
+                    let shell = shell_cell.borrow();
+                    shell.is_interactive
+                        || std::env::var("HUCK_EXPAND_ALIASES").is_ok()
+                };
+                let outcome = {
+                    let mut shell = shell_cell.borrow_mut();
+                    process_line(&buffer, &mut shell, do_alias)
+                };
+                match outcome {
                     ExecOutcome::Exit(code) => {
+                        let mut shell = shell_cell.borrow_mut();
                         crate::traps::fire_exit_trap(&mut shell);
                         shell.hangup_jobs();
                         shell.history.save();
                         return code;
                     }
                     ExecOutcome::Continue(status) => {
+                        let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(status);
                         // Drain any fatal PE error. In non-interactive mode
                         // (stdin not a TTY), exit immediately with the fatal
@@ -217,12 +244,14 @@ pub fn run(args: &[String]) -> i32 {
                     }
                     ExecOutcome::LoopBreak | ExecOutcome::LoopContinue
                     | ExecOutcome::FunctionReturn(_) => {
+                        let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
                     }
                 }
             }
             ReadResult::Interrupted => continue,
             ReadResult::Eof => {
+                let mut shell = shell_cell.borrow_mut();
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
                 shell.history.save();
@@ -230,6 +259,7 @@ pub fn run(args: &[String]) -> i32 {
             }
             ReadResult::EofMidCommand => {
                 eprintln!("huck: syntax error: unexpected end of input");
+                let mut shell = shell_cell.borrow_mut();
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
                 shell.history.save();
@@ -237,6 +267,7 @@ pub fn run(args: &[String]) -> i32 {
             }
             ReadResult::ReadError(msg) => {
                 eprintln!("huck: input error: {msg}");
+                let mut shell = shell_cell.borrow_mut();
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
                 return 1;
@@ -249,7 +280,7 @@ pub fn run(args: &[String]) -> i32 {
 /// accumulated buffer classifies as `Complete` or a genuine `Error`.
 fn read_logical_command(
     editor: &mut Editor<HuckHelper, FileHistory>,
-    shell: &mut Shell,
+    cell: &RefCell<Shell>,
 ) -> ReadResult {
     use crate::continuation::{classify, joiner_for, Completeness};
 
@@ -260,28 +291,35 @@ fn read_logical_command(
     let mut pending: Option<(crate::continuation::ContinuationReason, String)> = None;
 
     loop {
-        let (var_name, default) = if pending.is_none() {
-            ("PS1", DEFAULT_PS1)
-        } else {
-            ("PS2", DEFAULT_PS2)
+        let expanded = {
+            let shell = cell.borrow();
+            let (var_name, default) = if pending.is_none() {
+                ("PS1", DEFAULT_PS1)
+            } else {
+                ("PS2", DEFAULT_PS2)
+            };
+            let template = shell
+                .lookup_var(var_name)
+                .unwrap_or_else(|| default.to_string());
+            crate::prompt::expand_prompt(&template, &shell)
         };
-        let template = shell
-            .lookup_var(var_name)
-            .unwrap_or_else(|| default.to_string());
-        let expanded = crate::prompt::expand_prompt(&template, shell);
+
         match editor.readline(&expanded) {
             Ok(raw) => {
                 // History expansion runs per physical line, as before.
-                let line = match crate::history::expand(&raw, &shell.history) {
-                    Ok(None) => raw,
-                    Ok(Some(expanded)) => {
-                        println!("{expanded}");
-                        expanded
-                    }
-                    Err(e) => {
-                        eprintln!("huck: {e}");
-                        shell.set_last_status(1);
-                        return ReadResult::Interrupted;
+                let line = {
+                    let mut shell = cell.borrow_mut();
+                    match crate::history::expand(&raw, &shell.history) {
+                        Ok(None) => raw,
+                        Ok(Some(expanded)) => {
+                            println!("{expanded}");
+                            expanded
+                        }
+                        Err(e) => {
+                            eprintln!("huck: {e}");
+                            shell.set_last_status(1);
+                            return ReadResult::Interrupted;
+                        }
                     }
                 };
 

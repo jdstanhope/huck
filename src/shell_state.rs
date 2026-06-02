@@ -4,6 +4,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use crate::completion_spec::{CompletionSpec, CompletionSpecs};
 use crate::jobs::JobTable;
 
 /// Storage for a shell variable. Scalar covers ordinary strings;
@@ -206,6 +207,13 @@ pub struct Shell {
     /// builtins. Top is index 0 — always synced with `$PWD` at
     /// the top of each pushd/popd/dirs call.
     pub dir_stack: Vec<std::path::PathBuf>,
+
+    /// Programmable-completion registry (filled by the `complete` builtin).
+    pub completion_specs: CompletionSpecs,
+    /// Ephemeral slot used by `compopt` inside a `-F` function to mutate
+    /// the live spec. Set by `dispatch::resolve` before invoking `-F`;
+    /// taken back out afterward.
+    pub current_completion_spec: Option<CompletionSpec>,
 }
 
 impl Shell {
@@ -248,6 +256,8 @@ impl Shell {
             local_scopes: Vec::new(),
             command_hash: std::collections::HashMap::new(),
             dir_stack: Vec::new(),
+            completion_specs: CompletionSpecs::default(),
+            current_completion_spec: None,
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.

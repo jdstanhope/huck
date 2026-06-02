@@ -311,31 +311,22 @@ fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
 }
 
 use crate::shell_state::Shell;
+use std::cell::RefCell;
+use std::rc::Rc;
 
-/// rustyline completion helper. Holds a snapshot of shell state
-/// (variable names, `$PATH`, `$HOME`) refreshed before each readline.
+/// rustyline completion helper. Holds an `Rc<RefCell<Shell>>` so the
+/// completion callback can read AND mutate shell state (required by
+/// `-F func` execution during Tab). The Rust-borrow discipline is:
+/// `complete()` acquires `borrow_mut()` for the duration of the call
+/// and releases on return. The main loop must hold NO borrow across
+/// `editor.readline()` so this acquisition succeeds.
 pub struct HuckHelper {
-    var_names: Vec<String>,
-    path: String,
-    home: String,
+    shell: Rc<RefCell<Shell>>,
 }
 
 impl HuckHelper {
-    pub fn new() -> Self {
-        Self { var_names: Vec::new(), path: String::new(), home: String::new() }
-    }
-
-    /// Refreshes the cached snapshot from live shell state.
-    pub fn refresh(&mut self, shell: &Shell) {
-        self.var_names = shell.var_names().map(|s| s.to_string()).collect();
-        self.path = shell.get("PATH").unwrap_or("").to_string();
-        self.home = shell.get("HOME").unwrap_or("").to_string();
-    }
-}
-
-impl Default for HuckHelper {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(shell: Rc<RefCell<Shell>>) -> Self {
+        Self { shell }
     }
 }
 
@@ -348,18 +339,8 @@ impl rustyline::completion::Completer for HuckHelper {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let (start, context) = analyze(line, pos);
-        let candidates = match context {
-            CompletionContext::Command { prefix } => {
-                complete_command(&prefix, &self.path)
-            }
-            CompletionContext::Variable { prefix } => {
-                complete_variable(&prefix, &self.var_names)
-            }
-            CompletionContext::File { dir, prefix } => {
-                complete_file(&dir, &prefix, &self.home)
-            }
-        };
+        let mut shell = self.shell.borrow_mut();
+        let (start, candidates) = dispatch::resolve(line, pos, &mut shell);
         let pairs = candidates
             .into_iter()
             .map(|c| rustyline::completion::Pair {
@@ -380,6 +361,343 @@ impl rustyline::highlight::Highlighter for HuckHelper {}
 impl rustyline::validate::Validator for HuckHelper {}
 
 impl rustyline::Helper for HuckHelper {}
+
+pub(crate) mod dispatch {
+    //! Tab-time dispatch ladder. Decides which completion source
+    //! handles the cursor position: variable, command-pos commands,
+    //! a registered -F spec, default-spec fallback, or file completion.
+
+    use super::*;
+    use crate::completion_spec::{resolve_spec, CompletionCtx, CompletionSpec};
+    use crate::shell_state::Shell;
+
+    /// Entry point. Returns (start_offset, candidates) for rustyline.
+    pub fn resolve(line: &str, pos: usize, shell: &mut Shell) -> (usize, Vec<Candidate>) {
+        // Defensive clear: any leftover spec from a prior `compgen -F` call
+        // (run from script context, not via tab dispatch) would otherwise
+        // corrupt this dispatch's spec options via the take() at the end of
+        // run_spec_with_empty_fallback. Belt-and-suspenders alongside
+        // builtin_compgen's own save/restore.
+        shell.current_completion_spec = None;
+        let (start, context) = analyze(line, pos);
+
+        // Path 1: variable context — always wins, no spec lookup.
+        if let CompletionContext::Variable { prefix } = &context {
+            let var_names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
+            return (start, complete_variable(prefix, &var_names));
+        }
+
+        // Path 2: command position.
+        if let CompletionContext::Command { prefix } = &context {
+            // -E: empty command line + an -E spec.
+            if prefix.is_empty()
+                && line[..pos].trim().is_empty()
+                && let Some(spec) = shell.completion_specs.empty_spec.clone()
+            {
+                let cands = run_spec_with_empty_fallback(&spec, line, pos, "", shell);
+                return (start, cands);
+            }
+            let path = shell.get("PATH").unwrap_or("").to_string();
+            return (start, complete_command(prefix, &path));
+        }
+
+        // Path 3: file/argument position.
+        let CompletionContext::File { dir, prefix } = &context else {
+            // analyze() returns one of three; unreachable.
+            return (start, Vec::new());
+        };
+
+        let cmd_name = extract_command_name(&line[..pos]).unwrap_or_default();
+
+        let spec_opt: Option<CompletionSpec> = shell
+            .completion_specs
+            .by_command
+            .get(&cmd_name)
+            .cloned()
+            .or_else(|| shell.completion_specs.default_spec.clone());
+
+        match spec_opt {
+            Some(spec) => {
+                let cands = run_spec_with_empty_fallback(&spec, line, pos, &cmd_name, shell);
+                if cands.is_empty() {
+                    // No spec hit AND no fallback flag set → empty result.
+                    return (start, Vec::new());
+                }
+                (start, cands)
+            }
+            None => {
+                // No spec at all → existing file completion.
+                let home = shell.get("HOME").unwrap_or("").to_string();
+                (start, complete_file(dir, prefix, &home))
+            }
+        }
+    }
+
+    /// Runs `resolve_spec` on the spec, applies `-o filenames` rendering
+    /// and the empty-fallback (`-o default` / `-o bashdefault`).
+    fn run_spec_with_empty_fallback(
+        spec: &CompletionSpec,
+        line: &str,
+        pos: usize,
+        cmd_name: &str,
+        shell: &mut Shell,
+    ) -> Vec<Candidate> {
+        let wordbreaks = shell
+            .get("COMP_WORDBREAKS")
+            .unwrap_or(" \t\n")
+            .to_string();
+        let (comp_words, comp_cword) = tokenize_comp_words(&line[..pos], &wordbreaks);
+        let cur_word = comp_words.get(comp_cword).cloned().unwrap_or_default();
+        let prev_word = if comp_cword > 0 {
+            comp_words.get(comp_cword - 1).cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let ctx = CompletionCtx {
+            cmd_name: cmd_name.to_string(),
+            cur_word: cur_word.clone(),
+            prev_word,
+            comp_words,
+            comp_cword,
+            comp_line: line.to_string(),
+            comp_point: pos,
+        };
+
+        let raw_results = resolve_spec(spec, &ctx, shell);
+
+        // Take the (possibly mutated) options from current_completion_spec
+        // back if Task 6's compopt has touched them. If -F never ran,
+        // current_completion_spec stays None and we use the original options.
+        let effective_options = shell
+            .current_completion_spec
+            .take()
+            .map(|s| s.options)
+            .unwrap_or(spec.options);
+
+        // Empty-fallback.
+        let after_fallback: Vec<String> = if raw_results.is_empty() {
+            if effective_options.default {
+                file_completion_strings(&ctx.cur_word, shell)
+            } else if effective_options.bashdefault {
+                bashdefault_strings(line, pos, shell)
+            } else {
+                Vec::new()
+            }
+        } else {
+            raw_results
+        };
+
+        // Filename rendering.
+        let candidates: Vec<Candidate> = if effective_options.filenames {
+            after_fallback
+                .into_iter()
+                .map(|name| {
+                    let is_dir = std::fs::metadata(&name)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    let display = if is_dir {
+                        format!("{name}/")
+                    } else {
+                        name.clone()
+                    };
+                    let mut replacement = escape_filename(&name);
+                    if is_dir {
+                        replacement.push('/');
+                    }
+                    Candidate { display, replacement }
+                })
+                .collect()
+        } else {
+            after_fallback
+                .into_iter()
+                .map(|s| Candidate { display: s.clone(), replacement: s })
+                .collect()
+        };
+
+        // Sort + dedupe by replacement (stable).
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped: Vec<Candidate> = candidates
+            .into_iter()
+            .filter(|c| seen.insert(c.replacement.clone()))
+            .collect();
+        deduped.sort_by(|a, b| a.display.cmp(&b.display));
+        deduped
+    }
+
+    fn file_completion_strings(prefix: &str, shell: &Shell) -> Vec<String> {
+        let home = shell.get("HOME").unwrap_or("").to_string();
+        complete_file("", prefix, &home)
+            .into_iter()
+            .map(|c| c.replacement)
+            .collect()
+    }
+
+    fn bashdefault_strings(line: &str, pos: usize, shell: &Shell) -> Vec<String> {
+        let (_, ctx) = analyze(line, pos);
+        match ctx {
+            CompletionContext::Variable { prefix } => {
+                let names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
+                complete_variable(&prefix, &names)
+                    .into_iter()
+                    .map(|c| c.replacement)
+                    .collect()
+            }
+            CompletionContext::Command { prefix } => {
+                let path = shell.get("PATH").unwrap_or("").to_string();
+                complete_command(&prefix, &path)
+                    .into_iter()
+                    .map(|c| c.replacement)
+                    .collect()
+            }
+            CompletionContext::File { dir, prefix } => {
+                let home = shell.get("HOME").unwrap_or("").to_string();
+                complete_file(&dir, &prefix, &home)
+                    .into_iter()
+                    .map(|c| c.replacement)
+                    .collect()
+            }
+        }
+    }
+
+    /// Extracts the command word (word 0) of the simple command that
+    /// the cursor is in. Returns None if the cursor is before any
+    /// command word (e.g., empty line). Skips assignment prefixes.
+    fn extract_command_name(head: &str) -> Option<String> {
+        // Walk forward through `head` tracking quoting; the most recent
+        // separator (`;`, `|`, `&`, `\n`, `(`, `{`) bumps `start` past it.
+        let mut start = 0usize;
+        let bytes = head.as_bytes();
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if !in_single && c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if in_single {
+                if c == b'\'' {
+                    in_single = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_double {
+                if c == b'"' {
+                    in_double = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b';' | b'|' | b'&' | b'\n' | b'(' | b'{' => start = i + 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        // Skip leading whitespace, then take the first whitespace-delimited word.
+        let region = &head[start..];
+        let mut chars = region.char_indices().peekable();
+        while let Some(&(_, c)) = chars.peek() {
+            if c == ' ' || c == '\t' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let word_start = chars.peek().map(|(i, _)| *i).unwrap_or(region.len());
+        let rest = &region[word_start..];
+        let word_end = rest
+            .find([' ', '\t'])
+            .unwrap_or(rest.len());
+        let candidate = &rest[..word_end];
+
+        // If it looks like an assignment prefix, the command is the NEXT word.
+        if is_assignment(candidate) {
+            let after = rest[word_end..].trim_start();
+            let next_end = after
+                .find([' ', '\t'])
+                .unwrap_or(after.len());
+            if next_end == 0 {
+                return None;
+            }
+            return Some(unquote_command(&after[..next_end]).to_string());
+        }
+
+        if candidate.is_empty() {
+            None
+        } else {
+            Some(unquote_command(candidate).to_string())
+        }
+    }
+
+    /// Strips a matching pair of leading/trailing single or double quotes
+    /// from the command word so a registered spec for `git` is found when
+    /// the user types `"git" arg<TAB>`. Bash performs full quote removal
+    /// on the command word before lookup; we approximate by stripping one
+    /// outer pair, which covers the common case.
+    fn unquote_command(s: &str) -> &str {
+        let bytes = s.as_bytes();
+        if bytes.len() >= 2 {
+            let first = bytes[0];
+            let last = bytes[bytes.len() - 1];
+            if (first == b'\'' || first == b'"') && first == last {
+                return &s[1..s.len() - 1];
+            }
+        }
+        s
+    }
+
+    /// Tokenizes a line into COMP_WORDS per the wordbreaks set.
+    /// Whitespace bytes in `wordbreaks` act as plain separators;
+    /// non-whitespace bytes EACH produce their own single-char word.
+    /// Returns (words, cword) where cword is the index of the word the
+    /// cursor is in.
+    pub(crate) fn tokenize_comp_words(line: &str, wordbreaks: &str) -> (Vec<String>, usize) {
+        let ws: Vec<char> = wordbreaks
+            .chars()
+            .filter(|c| c.is_ascii_whitespace())
+            .collect();
+        let non_ws: Vec<char> = wordbreaks
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let mut words: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for c in line.chars() {
+            if ws.contains(&c) {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            } else if non_ws.contains(&c) {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+                words.push(c.to_string());
+            } else {
+                cur.push(c);
+            }
+        }
+        // If the line ends mid-word, that word IS the cursor word.
+        // If the line ends with a separator (or is empty), the cursor word
+        // is "" and it occupies a new slot.
+        let ends_with_sep = line
+            .chars()
+            .last()
+            .map(|c| ws.contains(&c) || non_ws.contains(&c))
+            .unwrap_or(true);
+        if !cur.is_empty() {
+            words.push(cur);
+        } else if ends_with_sep || words.is_empty() {
+            words.push(String::new());
+        }
+        let cword = words.len().saturating_sub(1);
+        (words, cword)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -660,62 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn helper_complete_command_context() {
-        let helper = HuckHelper {
-            var_names: Vec::new(),
-            path: String::new(),
-            home: String::new(),
-        };
-        let history = rustyline::history::FileHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (start, pairs) = rustyline::completion::Completer::complete(
-            &helper, "ec", 2, &ctx,
-        ).unwrap();
-        assert_eq!(start, 0);
-        assert!(pairs.iter().any(|p| p.replacement == "echo"));
-    }
-
-    #[test]
-    fn helper_complete_variable_context() {
-        let helper = HuckHelper {
-            var_names: vec!["HOME".to_string(), "PATH".to_string()],
-            path: String::new(),
-            home: String::new(),
-        };
-        let history = rustyline::history::FileHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (start, pairs) = rustyline::completion::Completer::complete(
-            &helper, "echo $HO", 8, &ctx,
-        ).unwrap();
-        assert_eq!(start, 6);
-        assert!(pairs.iter().any(|p| p.replacement == "HOME"));
-    }
-
-    #[test]
-    fn helper_complete_file_context() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(dir.path(), "targetfile");
-        let helper = HuckHelper {
-            var_names: Vec::new(),
-            path: String::new(),
-            home: String::new(),
-        };
-        let history = rustyline::history::FileHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let line = format!("echo {}/targ", dir.path().to_str().unwrap());
-        let pos = line.len();
-        let (_, pairs) = rustyline::completion::Completer::complete(
-            &helper, &line, pos, &ctx,
-        ).unwrap();
-        let replacements: Vec<&str> =
-            pairs.iter().map(|p| p.replacement.as_str()).collect();
-        assert!(
-            pairs.iter().any(|p| p.replacement == "targetfile"),
-            "{replacements:?}",
-        );
-    }
-
-    #[test]
     fn complete_command_finds_symlinked_executable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -753,5 +1015,212 @@ mod tests {
         // not a command.
         let (_, ctx) = analyze("echo > lo", 9);
         assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "lo".to_string() });
+    }
+
+    #[test]
+    fn helper_holds_rc_refcell_shell() {
+        use std::rc::Rc;
+        use std::cell::RefCell;
+        let shell = Rc::new(RefCell::new(Shell::new()));
+        let helper = HuckHelper::new(Rc::clone(&shell));
+        // Mutate shell through the cell; helper must see the change live.
+        shell.borrow_mut().set("MY_VAR", "hello".to_string());
+        let history = rustyline::history::FileHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        let (start, pairs) = rustyline::completion::Completer::complete(
+            &helper, "echo $MY_V", 10, &ctx,
+        ).unwrap();
+        assert_eq!(start, 6);
+        let replacements: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert!(pairs.iter().any(|p| p.replacement == "MY_VAR"),
+                "live var not visible to helper: {replacements:?}");
+    }
+
+    #[test]
+    fn dispatch_variable_context_bypasses_spec() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let shell = Rc::new(RefCell::new(Shell::new()));
+        shell.borrow_mut().set("MY_VAR", "x".to_string());
+        // Register a spec for some command — it should NOT fire on $var.
+        shell.borrow_mut().completion_specs.by_command.insert(
+            "echo".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("should_not_appear".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut s = shell.borrow_mut();
+        let (start, cands) = dispatch::resolve("echo $MY_V", 10, &mut s);
+        assert_eq!(start, 6);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"MY_VAR"), "{names:?}");
+        assert!(!names.contains(&"should_not_appear"), "spec fired on var: {names:?}");
+    }
+
+    #[test]
+    fn dispatch_command_position_uses_command_completion() {
+        let mut shell = Shell::new();
+        let (_, cands) = dispatch::resolve("ec", 2, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"echo"), "{names:?}");
+    }
+
+    #[test]
+    fn dispatch_arg_position_uses_spec() {
+        let mut shell = Shell::new();
+        shell.completion_specs.by_command.insert(
+            "myc".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("alpha alpine beta".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_, cands) = dispatch::resolve("myc al", 6, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "alpine"]);
+    }
+
+    #[test]
+    fn dispatch_falls_back_to_file_when_no_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("targetfile"), b"").unwrap();
+        let mut shell = Shell::new();
+        let line = format!("ls {}/targ", dir.path().to_str().unwrap());
+        let pos = line.len();
+        let (_, cands) = dispatch::resolve(&line, pos, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"targetfile"), "{names:?}");
+    }
+
+    #[test]
+    fn dispatch_o_default_falls_back_on_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alphafile"), b"").unwrap();
+        let prior_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let mut shell = Shell::new();
+        let spec = crate::completion_spec::CompletionSpec {
+            wordlist: Some("nothing_matches".to_string()),
+            options: crate::completion_spec::CompOptions {
+                default: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        shell.completion_specs.by_command.insert("mycmd".to_string(), spec);
+
+        let (_, cands) = dispatch::resolve("mycmd alpha", 11, &mut shell);
+        std::env::set_current_dir(prior_cwd).unwrap();
+
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"alphafile"), "fallback didn't fire: {names:?}");
+    }
+
+    #[test]
+    fn dispatch_d_default_spec_applies_when_no_match() {
+        let mut shell = Shell::new();
+        shell.completion_specs.default_spec = Some(crate::completion_spec::CompletionSpec {
+            wordlist: Some("dfault".to_string()),
+            ..Default::default()
+        });
+        let (_, cands) = dispatch::resolve("randomcmd df", 12, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(names, vec!["dfault"]);
+    }
+
+    #[test]
+    fn tokenize_default_wordbreaks_is_whitespace() {
+        let (words, cword) = dispatch::tokenize_comp_words("git checkout main", " \t\n");
+        assert_eq!(words, vec!["git", "checkout", "main"]);
+        assert_eq!(cword, 2);
+    }
+
+    #[test]
+    fn tokenize_custom_wordbreaks_splits_on_colon() {
+        let (words, _cword) = dispatch::tokenize_comp_words("user:pass", " \t\n:");
+        assert_eq!(words, vec!["user", ":", "pass"]);
+    }
+
+    #[test]
+    fn tokenize_trailing_separator_means_empty_cursor_word() {
+        let (words, cword) = dispatch::tokenize_comp_words("cmd ", " \t\n");
+        assert_eq!(words, vec!["cmd", ""]);
+        assert_eq!(cword, 1);
+    }
+
+    #[test]
+    fn dispatch_resolve_starts_with_clean_current_spec() {
+        // Simulate a leaked spec from a prior compgen -F (without going
+        // through the actual compgen path). Without the defensive clear
+        // at the top of dispatch::resolve, the .take() inside
+        // run_spec_with_empty_fallback would observe this leaked spec
+        // (all-default options) and use it to override the registered
+        // spec's real options.
+        let mut shell = Shell::new();
+        shell.current_completion_spec = Some(
+            crate::completion_spec::CompletionSpec::default(),
+        );
+        // Register a spec whose -o filenames would be silently lost if
+        // the leaked all-default spec replaced it. We exercise filenames
+        // rendering by completing a real directory.
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tempdir.path().join("subd")).unwrap();
+        let prior = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tempdir.path()).unwrap();
+
+        shell.completion_specs.by_command.insert(
+            "mycmd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("subd".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    filenames: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let (_, cands) = dispatch::resolve("mycmd su", 8, &mut shell);
+        std::env::set_current_dir(prior).unwrap();
+
+        // After dispatch returned, the leaked slot must have been cleared
+        // up front and remain cleared (no -F ran here, so nothing put
+        // anything back).
+        assert!(
+            shell.current_completion_spec.is_none(),
+            "dispatch should leave the slot clean when no -F ran",
+        );
+        // Filenames rendering should add a trailing / to the directory —
+        // proving the registered spec's options.filenames was used, not
+        // the leaked default-options spec.
+        let displays: Vec<&str> = cands.iter().map(|c| c.display.as_str()).collect();
+        assert!(
+            displays.contains(&"subd/"),
+            "filenames-mode trailing / not applied; leaked spec must have \
+             overridden the registered spec's options: {displays:?}",
+        );
+    }
+
+    #[test]
+    fn extract_command_name_strips_outer_quotes() {
+        // Quoted command name like "git" or 'git' should reach its
+        // registered spec — the registry is keyed by the unquoted name.
+        let mut shell = Shell::new();
+        shell.completion_specs.by_command.insert(
+            "mycmd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("alpha".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_, cands) = dispatch::resolve("\"mycmd\" al", 10, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha"],
+            "quoted command name should map to its registered spec",
+        );
     }
 }

@@ -4,6 +4,8 @@ mod brace_expand;
 mod builtins;
 mod command;
 mod completion;
+mod completion_builtins;
+mod completion_spec;
 mod continuation;
 mod executor;
 mod expand;

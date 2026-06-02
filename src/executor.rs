@@ -1569,7 +1569,7 @@ fn is_control_builtin(name: &str) -> bool {
 /// converts to a normal `Continue(n)`; `Exit`/`LoopBreak`/`LoopContinue`
 /// propagate unchanged so `break` inside a function targets the
 /// caller's enclosing loop (matching bash).
-fn call_function(
+pub(crate) fn call_function(
     name: &str,
     body: Box<crate::command::Command>,
     args: Vec<String>,
@@ -1610,6 +1610,24 @@ fn call_function(
         ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
         other => other,
     }
+}
+
+/// Invokes a function by name with the given args. Looks up the body
+/// from `shell.functions`. Returns `ExecOutcome::Continue(1)` if the
+/// function doesn't exist. Stdout from the function goes to the real
+/// stdout (matches bash's behavior where completion functions that
+/// print produce visible output).
+pub(crate) fn call_function_body(
+    name: &str,
+    args: Vec<String>,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let body = match shell.functions.get(name) {
+        Some(b) => b.clone(),
+        None => return ExecOutcome::Continue(1),
+    };
+    let mut sink = StdoutSink::Terminal;
+    call_function(name, body, args, shell, &mut sink)
 }
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
