@@ -1,6 +1,6 @@
 # huck vs bash 5.x — Divergence Reference
 
-**Last updated:** 2026-05-26 (after v28 subshells).
+**Last updated:** 2026-06-02 (after v77 function keyword form).
 
 This is the running audit of where huck differs from bash 5.x. Update each
 entry's **Status** as fixes land. Reference an ID (e.g. `B-01`) in commit
@@ -22,7 +22,7 @@ messages so the doc stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 11 | Things to fix (all 11 fixed; B-11 fixed 2026-05-26) |
-| Missing features (Tier 2) | 52 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30) |
+| Missing features (Tier 2) | 54 | Bash-compat backlog (M-10 fixed by v25; M-01/02/03 fixed by v26; M-13 fixed by v27; M-11 fixed by v28; M-18/19 fixed by v29; M-14 fixed by v30; M-09 fixed by v77, with M-09a/M-09b added as new low-priority follow-ons) |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping (I-16 fixed by v25) |
 | Low-impact (Tier 4) | 14 | Edge cases, cosmetic (L-08 added v29: redirect source-order divergence; L-09 added v30: regex-engine divergence; L-10 added v33: split-scanner limitation; L-11 added v39: `$'\xHH'` Unicode-vs-byte; L-12 added+fixed v55: builtin stdin redirection; L-13/L-14 added v76: `complete -p` flag ordering and `compgen -F` warning/COMP_CWORD sentinel) |
 
