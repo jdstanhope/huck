@@ -20,6 +20,12 @@ struct ParsedFlags {
     print: bool,
     /// -r: remove mode.
     remove: bool,
+    /// True if `-o`/`+o` was used. Tracked separately from `spec` because
+    /// `+o NAME` may set an option to its default value (false) — leaving
+    /// `spec == CompletionSpec::default()` — yet still represent an
+    /// intentional mutation that should bypass the "nothing to complete"
+    /// guard in register mode.
+    options_touched: bool,
     /// Trailing positional args (command names for `complete`, optional
     /// word arg for `compgen`).
     positional: Vec<String>,
@@ -84,7 +90,9 @@ fn parse_flags(args: &[String], allow_d_e: bool) -> Result<ParsedFlags, FlagErro
             let c = chars[ci];
             match c {
                 'F' | 'W' | 'G' | 'A' | 'P' | 'S' | 'X' | 'o' => {
-                    if leading == '+' {
+                    // Only F/W/G/A/P/S/X reject `+`. `'o'` accepts `+` so
+                    // `complete +o NAME` can clear a previously-set option.
+                    if leading == '+' && c != 'o' {
                         return Err(FlagError::Usage(format!("+{c}: not supported")));
                     }
                     // Argument is either the rest of this word or the next word.
@@ -111,7 +119,10 @@ fn parse_flags(args: &[String], allow_d_e: bool) -> Result<ParsedFlags, FlagErro
                         'P' => out.spec.prefix = Some(arg_value),
                         'S' => out.spec.suffix = Some(arg_value),
                         'X' => out.spec.filter = Some(arg_value),
-                        'o' => apply_option(&mut out.spec.options, &arg_value, leading == '+')?,
+                        'o' => {
+                            apply_option(&mut out.spec.options, &arg_value, leading == '+')?;
+                            out.options_touched = true;
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -160,7 +171,13 @@ pub fn builtin_complete(args: &[String], out: &mut dyn Write, shell: &mut Shell)
 
     // Mode: print
     if parsed.print || is_bare(&parsed) {
-        return print_complete(&parsed.positional, out, shell);
+        return print_complete(
+            &parsed.positional,
+            parsed.is_default,
+            parsed.is_empty,
+            out,
+            shell,
+        );
     }
     // Mode: remove
     if parsed.remove {
@@ -179,9 +196,43 @@ fn is_bare(parsed: &ParsedFlags) -> bool {
         && parsed.positional.is_empty()
 }
 
-fn print_complete(names: &[String], out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn print_complete(
+    names: &[String],
+    is_default: bool,
+    is_empty: bool,
+    out: &mut dyn Write,
+    shell: &Shell,
+) -> ExecOutcome {
     let specs = &shell.completion_specs;
     let mut status: i32 = 0;
+
+    // -D / -E narrow the print to just the matching slot.
+    if is_default {
+        match &specs.default_spec {
+            Some(d) => {
+                let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
+            }
+            None => {
+                eprintln!("huck: complete: no completion specification for -D");
+                status = 1;
+            }
+        }
+    }
+    if is_empty {
+        match &specs.empty_spec {
+            Some(e) => {
+                let _ = writeln!(out, "{}", format_spec_for_print(e, None, Some("-E")));
+            }
+            None => {
+                eprintln!("huck: complete: no completion specification for -E");
+                status = 1;
+            }
+        }
+    }
+    if is_default || is_empty {
+        return ExecOutcome::Continue(status);
+    }
+
     if names.is_empty() {
         // Print all in sorted order: by_command first, then -D, then -E.
         let mut keys: Vec<&String> = specs.by_command.keys().collect();
@@ -242,7 +293,10 @@ fn register_complete(parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
         eprintln!("huck: complete: cannot use -D or -E with command names");
         return ExecOutcome::Continue(2);
     }
-    if !parsed.positional.is_empty() && parsed.spec == CompletionSpec::default() {
+    if !parsed.positional.is_empty()
+        && parsed.spec == CompletionSpec::default()
+        && !parsed.options_touched
+    {
         eprintln!("huck: complete: nothing to complete");
         return ExecOutcome::Continue(1);
     }
@@ -515,12 +569,111 @@ mod tests {
     #[test]
     fn complete_print_form_round_trips_wordlist() {
         let mut sh = Shell::new();
-        let _ = run_complete(&["-W", "a b c", "--", "myc"], &mut sh);
+        let _ = run_complete(
+            &["-W", "alpha apple banana", "-P", "x:", "--", "myc"],
+            &mut sh,
+        );
         let (out, _) = run_complete(&["-p", "myc"], &mut sh);
-        // The output should be a complete-form line that, if re-parsed,
-        // produces the same spec.
-        assert!(out.starts_with("complete "));
-        assert!(out.contains("-W 'a b c'") || out.contains("-W \"a b c\""));
-        assert!(out.contains("-- myc"));
+
+        // Tokenize the print output. Output is one line like:
+        // `complete -W 'alpha apple banana' -P 'x:' -- myc`
+        let tokens = tokenize_posix_line(out.trim_end());
+        assert_eq!(tokens[0], "complete");
+
+        let parsed = super::parse_flags(&tokens[1..], true).expect("re-parse");
+        let original = &sh.completion_specs.by_command["myc"];
+        assert_eq!(&parsed.spec, original, "round-trip mismatch");
+        assert_eq!(parsed.positional, vec!["myc".to_string()]);
+    }
+
+    /// Splits a string into POSIX-style tokens, honoring single-quote
+    /// strings. Outside single quotes, whitespace separates tokens. Inside
+    /// single quotes, every character (including spaces) is literal; a
+    /// closing single quote ends the quoted segment. POSIX `'\''` is the
+    /// way to embed a single quote, but `format_spec_for_print` does not
+    /// emit literal single quotes (it relies on `escape_alias_value` which
+    /// is fine for the round-trip cases we test here).
+    fn tokenize_posix_line(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_single = false;
+        let mut started = false; // current token has begun (allows empty '')
+        for c in line.chars() {
+            if in_single {
+                if c == '\'' {
+                    in_single = false;
+                } else {
+                    cur.push(c);
+                }
+                continue;
+            }
+            if c == '\'' {
+                in_single = true;
+                started = true;
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+                continue;
+            }
+            cur.push(c);
+            started = true;
+        }
+        if started {
+            out.push(cur);
+        }
+        out
+    }
+
+    #[test]
+    fn complete_multi_name_registration() {
+        let mut sh = Shell::new();
+        let (_, code) = run_complete(&["-W", "x y z", "--", "foo", "bar", "baz"], &mut sh);
+        assert_eq!(code, 0);
+        assert!(sh.completion_specs.by_command.contains_key("foo"));
+        assert!(sh.completion_specs.by_command.contains_key("bar"));
+        assert!(sh.completion_specs.by_command.contains_key("baz"));
+        // All three specs should be equal (the same spec was cloned per name).
+        assert_eq!(
+            sh.completion_specs.by_command["foo"],
+            sh.completion_specs.by_command["bar"]
+        );
+        assert_eq!(
+            sh.completion_specs.by_command["foo"],
+            sh.completion_specs.by_command["baz"]
+        );
+    }
+
+    #[test]
+    fn complete_plus_o_clears_option() {
+        let mut sh = Shell::new();
+        let (_, code) = run_complete(
+            &["-W", "x", "-o", "nospace", "--", "foo"],
+            &mut sh,
+        );
+        assert_eq!(code, 0);
+        assert!(sh.completion_specs.by_command["foo"].options.nospace);
+
+        let (_, code) = run_complete(&["+o", "nospace", "--", "foo"], &mut sh);
+        assert_eq!(code, 0, "complete +o should be accepted");
+        assert!(!sh.completion_specs.by_command["foo"].options.nospace);
+    }
+
+    #[test]
+    fn complete_p_with_D_prints_only_default() {
+        let mut sh = Shell::new();
+        let _ = run_complete(&["-W", "x", "--", "foo"], &mut sh);
+        let _ = run_complete(&["-D", "-F", "_default_func"], &mut sh);
+
+        let (out, code) = run_complete(&["-p", "-D"], &mut sh);
+        assert_eq!(code, 0);
+        // -D output should mention -D and _default_func.
+        assert!(out.contains("-D"), "{out:?}");
+        assert!(out.contains("_default_func"), "{out:?}");
+        // Should NOT contain the by_command entry's name "foo".
+        assert!(!out.contains(" -- foo"), "should not print foo's spec: {out:?}");
     }
 }
