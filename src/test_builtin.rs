@@ -23,7 +23,11 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
     {
         return Ok(b);
     }
-    let mut p = Parser { args, pos: 0 };
+    let mut p = Parser {
+        args,
+        pos: 0,
+        dry_run: false,
+    };
     let result = p.parse_expr()?;
     if p.pos != args.len() {
         return Err(format!("{}: unexpected argument", args[p.pos]));
@@ -165,6 +169,14 @@ fn parse_int(s: &str) -> Result<i64, String> {
 struct Parser<'a> {
     args: &'a [String],
     pos: usize,
+    /// When true, `parse_primary` skips operator application (file
+    /// syscalls, binary-op evaluation, bare-word truthiness) and
+    /// returns a placeholder `false`. Tokens are still consumed so
+    /// `pos` advances correctly, and token-structure errors (empty
+    /// parens, missing `)`, expression-expected) still fire. Used to
+    /// implement bash-style short-circuit evaluation of `-a` / `-o`
+    /// without duplicating the grammar walker.
+    dry_run: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -181,23 +193,47 @@ impl<'a> Parser<'a> {
     }
 
     /// EXPR ::= ANDEXPR ( -o ANDEXPR )*
+    ///
+    /// Short-circuits: when the accumulated LHS is already `true`,
+    /// the RHS is parsed in dry-run mode (tokens consumed, but no
+    /// operator side effects). Matches bash `[ … ]` semantics.
     fn parse_expr(&mut self) -> Result<bool, String> {
         let mut result = self.parse_and()?;
         while self.peek() == Some("-o") {
             self.pos += 1; // consume -o
+            let saved_dry = self.dry_run;
+            // If we're already in dry-run from an outer short-circuit,
+            // stay that way. Otherwise short-circuit if LHS is true.
+            if result {
+                self.dry_run = true;
+            }
             let rhs = self.parse_and()?;
-            result = result || rhs;
+            self.dry_run = saved_dry;
+            if !result {
+                result = rhs;
+            }
         }
         Ok(result)
     }
 
     /// ANDEXPR ::= UNEXPR ( -a UNEXPR )*
+    ///
+    /// Short-circuits: when the accumulated LHS is already `false`,
+    /// the RHS is parsed in dry-run mode. Matches bash `[ … ]`
+    /// semantics — e.g. `[ -n "" -a -f /no/path ]` does not syscall.
     fn parse_and(&mut self) -> Result<bool, String> {
         let mut result = self.parse_unary()?;
         while self.peek() == Some("-a") {
             self.pos += 1; // consume -a
+            let saved_dry = self.dry_run;
+            if !result {
+                self.dry_run = true;
+            }
             let rhs = self.parse_unary()?;
-            result = result && rhs;
+            self.dry_run = saved_dry;
+            if result {
+                result = rhs;
+            }
         }
         Ok(result)
     }
@@ -247,6 +283,10 @@ impl<'a> Parser<'a> {
             let op = op.to_string();
             let operand = self.args[self.pos + 1].clone();
             self.pos += 2;
+            // Dry-run: tokens consumed, but no syscall.
+            if self.dry_run {
+                return Ok(false);
+            }
             return apply_unary(&op, &operand);
         }
         // <word> <binop> <word> — three-token binary form.
@@ -260,10 +300,19 @@ impl<'a> Parser<'a> {
             let op = op.to_string();
             let rhs = self.args[self.pos + 2].clone();
             self.pos += 3;
+            // Dry-run: tokens consumed, but no comparison / parse_int
+            // (which would otherwise turn a syscall-free short-circuit
+            // into a spurious "integer expression expected" error).
+            if self.dry_run {
+                return Ok(false);
+            }
             return apply_binary(&op, &lhs, &rhs);
         }
         // Bare word — truthiness of the string.
-        let word = self.take().unwrap_or("");
+        let word = self.take().unwrap_or("").to_string();
+        if self.dry_run {
+            return Ok(false);
+        }
         Ok(!word.is_empty())
     }
 }
@@ -628,6 +677,57 @@ mod tests {
         assert_eq!(
             evaluate(&args(&["-z", "a", "-o", "-z", "b", "-o", "-n", "c"])),
             Ok(true)
+        );
+    }
+
+    #[test]
+    fn short_circuit_and_skips_rhs_file_check() {
+        // [ -z "" -a -f /no/such/path/that/does/not/exist ]
+        // LHS is true (-z "" → true), so -a evaluates the RHS.
+        // Verify the result is false (RHS file doesn't exist).
+        assert_eq!(
+            evaluate(&args(&["-z", "", "-a", "-f", "/no/such/path/that/does/not/exist"])),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn short_circuit_and_lhs_false_skips_rhs() {
+        // [ -n "" -a -f /no/such/path ]
+        // LHS is false (-n "" → false), so -a short-circuits; RHS is
+        // NOT evaluated (no syscall on the non-existent path). Result
+        // is false either way, but a future test could assert the
+        // syscall count is 0 if we add instrumentation. For now,
+        // just verify the result is false.
+        assert_eq!(
+            evaluate(&args(&["-n", "", "-a", "-f", "/no/such/path"])),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn short_circuit_or_lhs_true_skips_rhs() {
+        // [ -z "" -o -f /no/such/path ]
+        // LHS is true (-z "" → true), so -o short-circuits; RHS NOT
+        // evaluated. Result is true.
+        assert_eq!(
+            evaluate(&args(&["-z", "", "-o", "-f", "/no/such/path"])),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn negation_wrapping_paren_group() {
+        // [ ! ( -n a ) ] = NOT (true) = false.
+        assert_eq!(evaluate(&args(&["!", "(", "-n", "a", ")"])), Ok(false));
+    }
+
+    #[test]
+    fn negation_inside_parens() {
+        // [ ( ! -n a ) -a -n b ] = (NOT true) AND true = false.
+        assert_eq!(
+            evaluate(&args(&["(", "!", "-n", "a", ")", "-a", "-n", "b"])),
+            Ok(false)
         );
     }
 }
