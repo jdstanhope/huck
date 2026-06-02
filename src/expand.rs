@@ -247,8 +247,8 @@ fn expand_positional_substring(
     if name == "@" && quoted {
         ExpansionResult::WordList(sliced)
     } else {
-        let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-        let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+        let ifs = shell.ifs();
+        let sep = ifs_join_sep(&ifs);
         ExpansionResult::Value(sliced.join(&sep))
     }
 }
@@ -282,8 +282,8 @@ fn expand_assoc_param(
         // ${m[@]} / ${m[*]} — pure expansion, no scalar modifier.
         (PM::None, SK::All) => ExpansionResult::WordList(values),
         (PM::None, SK::Star) => {
-            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            let ifs = shell.ifs();
+            let sep = ifs_join_sep(&ifs);
             ExpansionResult::Value(values.join(&sep))
         }
         // ${m[k]} — string-key lookup (no arith on `k`).
@@ -312,14 +312,14 @@ fn expand_assoc_param(
             if quoted {
                 ExpansionResult::WordList(keys)
             } else {
-                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(keys.join(&sep))
             }
         }
         (PM::IndirectKeys, SK::Star) => {
-            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            let ifs = shell.ifs();
+            let sep = ifs_join_sep(&ifs);
             ExpansionResult::Value(keys.join(&sep))
         }
         // `${!m[k]}` — indirect ref through a specific element; not
@@ -340,8 +340,8 @@ fn expand_assoc_param(
             if matches!(subscript, SK::All) && quoted {
                 ExpansionResult::WordList(sliced)
             } else {
-                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(sliced.join(&sep))
             }
         }
@@ -426,8 +426,8 @@ fn expand_array_param(
             // consumer's split path do the rest, so emitting a single
             // joined string here matches both quoted and unquoted
             // semantics modulo the consumer's split step).
-            let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-            let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+            let ifs = shell.ifs();
+            let sep = ifs_join_sep(&ifs);
             ExpansionResult::Value(collect_values(shell).join(&sep))
         }
         // ${a[i]} — read a specific element.
@@ -474,8 +474,8 @@ fn expand_array_param(
             if matches!(subscript, SK::All) && quoted {
                 ExpansionResult::WordList(keys)
             } else {
-                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(keys.join(&sep))
             }
         }
@@ -496,8 +496,8 @@ fn expand_array_param(
             if matches!(subscript, SK::All) && quoted {
                 ExpansionResult::WordList(sliced)
             } else {
-                let ifs = shell.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-                let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(sliced.join(&sep))
             }
         }
@@ -809,10 +809,8 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // Assignment context: no field splitting. Join
                         // with first IFS char (matches `${a[*]}` and the
                         // existing `WordPart::AllArgs` assignment path).
-                        let ifs = shell
-                            .lookup_var("IFS")
-                            .unwrap_or_else(|| " \t\n".to_string());
-                        let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                        let ifs = shell.ifs();
+                        let sep = ifs_join_sep(&ifs);
                         result.push_str(&words.join(&sep));
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
@@ -906,7 +904,6 @@ fn strip_trailing_newlines(s: &str) -> String {
 /// Empty IFS → empty separator (concatenate). Otherwise → first char of
 /// IFS. Matches bash § 3.5.5 ("If IFS is null, the parameters are joined
 /// without intervening separators").
-#[allow(dead_code)]
 pub(crate) fn ifs_join_sep(ifs: &str) -> String {
     ifs.chars().next().map(|c| c.to_string()).unwrap_or_default()
 }
