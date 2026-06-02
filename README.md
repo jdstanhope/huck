@@ -80,6 +80,7 @@ spec, an implementation plan, and a test suite.
 | v70       | `cd -` (M-31)                                                  |
 | v71       | indexed arrays (M-82)                                          |
 | v72       | associative arrays (M-83)                                      |
+| v73       | fix `${a[i]:-W}` on missing element (M-82 follow-up)           |
 
 ## Build and run
 

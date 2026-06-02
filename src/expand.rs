@@ -346,14 +346,16 @@ fn expand_assoc_param(
             }
         }
         // ${m[k]:...} — scalar-style modifier on a specific element.
-        // Delegate to the scalar path with an override value.
+        // Pass the element as ParamLookup::Element so missing keys
+        // correctly trigger default/error modifiers instead of falling
+        // through to the array's scalar view.
         (modif, SK::Index(w)) => {
             let key = eval_subscript_key(w, shell);
             let val = shell.lookup_associative_element(name, &key);
             crate::param_expansion::expand_modifier_with_value(
                 name,
                 modif,
-                val.as_deref(),
+                crate::param_expansion::ParamLookup::Element(val.as_deref()),
                 shell,
             )
         }
@@ -500,7 +502,9 @@ fn expand_array_param(
             }
         }
         // ${a[i]:...} — scalar-style modifier on a single element.
-        // Delegate to the scalar path with an override value.
+        // Pass the element as ParamLookup::Element so missing keys
+        // correctly trigger default/error modifiers instead of falling
+        // through to the array's scalar view.
         (modif, SK::Index(w)) => {
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
@@ -510,7 +514,7 @@ fn expand_array_param(
             crate::param_expansion::expand_modifier_with_value(
                 name,
                 modif,
-                val.as_deref(),
+                crate::param_expansion::ParamLookup::Element(val.as_deref()),
                 shell,
             )
         }
@@ -2155,6 +2159,53 @@ mod array_expansion_tests {
         let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
         assert!(s.pending_fatal_pe_error.is_some());
     }
+
+    // v73 regression: ${a[i]:-default} on a missing index must substitute
+    // the default, not fall through to scalar_view (element 0). Pre-v73
+    // bug: get_raw saw override_value=None and consulted shell.get(name)
+    // which returned a[0] — so ${a[99]:-X} returned "x" (a[0]) instead of "X".
+    #[test]
+    fn modifier_on_missing_index_uses_default() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[99]:-fallback}");
+        assert_eq!(out, "fallback");
+    }
+
+    // v73 regression: ${a[i]-default} (no colon) on a missing index also
+    // substitutes the default.
+    #[test]
+    fn modifier_no_colon_on_missing_index_uses_default() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[99]-fallback}");
+        assert_eq!(out, "fallback");
+    }
+
+    // v73 regression: ${a[i]:?msg} on a missing index fires the fatal error
+    // rather than silently returning a[0].
+    #[test]
+    fn error_if_unset_on_missing_index_fires() {
+        let mut s = shell_with_a();
+        let _ = expand_for_test(&mut s, "${a[99]:?missing}");
+        assert!(s.pending_fatal_pe_error.is_some());
+    }
+
+    // v73 regression: ${a[i]:+alt} on a missing index returns empty (the
+    // alternative branch only fires when the value is set+non-null).
+    #[test]
+    fn alternative_value_on_missing_index_is_empty() {
+        let mut s = shell_with_a();
+        let out = expand_for_test(&mut s, "${a[99]:+ALT}");
+        assert_eq!(out, "");
+    }
+
+    // v73 regression: ${a[i]:-default} on an existing element returns the
+    // element (not the default). Pin the happy path.
+    #[test]
+    fn modifier_on_existing_index_returns_element() {
+        let mut s = shell_with_a();  // a=[(0,"x"),(1,"y"),(2,"z")]
+        let out = expand_for_test(&mut s, "${a[1]:-fallback}");
+        assert_eq!(out, "y");
+    }
 }
 
 #[cfg(test)]
@@ -2377,5 +2428,34 @@ mod assoc_expansion_tests {
         let mut s = shell_with_m();
         let out = expand_for_test(&mut s, "${m[nope]:-fallback}");
         assert_eq!(out, "fallback");
+    }
+
+    // v73 regression: ${m[nope]-fallback} (no colon) MUST also substitute
+    // the default when the key is missing — previously fell through to
+    // scalar_view (which for associative is "" → tested non-null only
+    // for colon variant → returned "" instead of fallback).
+    #[test]
+    fn modifier_no_colon_on_missing_key_uses_default() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m[nope]-fallback}");
+        assert_eq!(out, "fallback");
+    }
+
+    // v73 regression: ${m[k]:?msg} on a missing key should fire the error,
+    // not fall through to scalar_view.
+    #[test]
+    fn error_if_unset_on_missing_associative_key_fires() {
+        let mut s = shell_with_m();
+        let _ = expand_for_test(&mut s, "${m[nope]:?missing}");
+        assert!(s.pending_fatal_pe_error.is_some());
+    }
+
+    // v73 regression: ${m[k]:+alt} on a missing key returns empty (the
+    // alternative branch only fires when the value is set+non-null).
+    #[test]
+    fn alternative_value_on_missing_key_is_empty() {
+        let mut s = shell_with_m();
+        let out = expand_for_test(&mut s, "${m[nope]:+ALT}");
+        assert_eq!(out, "");
     }
 }

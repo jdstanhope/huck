@@ -25,39 +25,53 @@ pub fn expand_modifier(
     modifier: &ParamModifier,
     shell: &mut Shell,
 ) -> ExpansionResult {
-    expand_modifier_with_value(name, modifier, None, shell)
+    expand_modifier_with_value(name, modifier, ParamLookup::Scalar, shell)
 }
 
-/// Same as `expand_modifier`, except the caller may supply an
-/// `override_value` to be used in place of `shell.get(name)` /
-/// `shell.lookup_var(name)`. When `Some`, the override is treated as
-/// the variable's value (and `Some("")` is "set but null", distinct
-/// from `None` which means "unset"). Used by the array-element path
-/// (`${a[i]:-default}` etc.) to apply scalar-style modifiers to a
-/// specific array element while keeping the diagnostic `name`
-/// (e.g. `"arr"` rather than `"arr[2]"`).
+/// Source of the parameter value for `expand_modifier_with_value`.
+/// Distinguishes between "scalar lookup" (consult `shell.get(name)`) and
+/// "explicit array element" (the caller already resolved the element
+/// and we must NOT fall back to the scalar view). The array-element
+/// case carries an `Option`: `Some(v)` is "element exists with this
+/// value" and `None` is "element is missing" (truly unset for modifier
+/// purposes — `${a[i]:-W}` and `${a[i]-W}` both substitute the default).
+#[derive(Debug, Clone, Copy)]
+pub enum ParamLookup<'a> {
+    Scalar,
+    Element(Option<&'a str>),
+}
+
+/// Same as `expand_modifier`, except the caller may supply a
+/// `ParamLookup::Element(...)` to evaluate the modifier against a
+/// specific array element rather than the scalar view of `name`. Used
+/// by the array-element path (`${a[i]:-default}` etc.) — `Element(None)`
+/// represents a missing key, so `${a[unset]:-W}` correctly substitutes
+/// the default instead of falling through to `a[0]`'s value (the bug
+/// pattern logged on M-82 during v72 and fixed here).
 pub fn expand_modifier_with_value(
     name: &str,
     modifier: &ParamModifier,
-    override_value: Option<&str>,
+    source: ParamLookup,
     shell: &mut Shell,
 ) -> ExpansionResult {
     if shell.pending_fatal_pe_error.is_some() {
         return ExpansionResult::Empty;
     }
-    // `get_raw` returns the caller-supplied override when present;
-    // otherwise it falls back to the normal scalar-view lookup. Used
-    // wherever the scalar path consulted `shell.get(name)`.
+    // `get_raw` returns the value to test against null/unset. For
+    // Scalar lookup it consults `shell.get(name)`; for Element it uses
+    // the caller-supplied value verbatim (Some=set, None=unset).
     let get_raw = |sh: &Shell| -> Option<String> {
-        match override_value {
-            Some(s) => Some(s.to_string()),
-            None => sh.get(name).map(|s| s.to_string()),
+        match source {
+            ParamLookup::Scalar => sh.get(name).map(|s| s.to_string()),
+            ParamLookup::Element(Some(s)) => Some(s.to_string()),
+            ParamLookup::Element(None) => None,
         }
     };
     let lookup_v = |sh: &Shell| -> String {
-        match override_value {
-            Some(s) => s.to_string(),
-            None => sh.lookup_var(name).unwrap_or_default(),
+        match source {
+            ParamLookup::Scalar => sh.lookup_var(name).unwrap_or_default(),
+            ParamLookup::Element(Some(s)) => s.to_string(),
+            ParamLookup::Element(None) => String::new(),
         }
     };
     match modifier {
@@ -65,8 +79,10 @@ pub fn expand_modifier_with_value(
             ExpansionResult::Value(get_raw(shell).unwrap_or_default())
         }
         ParamModifier::Length => {
-            let n = match (override_value, name) {
-                (None, "@") | (None, "*") => shell.positional_args.len(),
+            let n = match (source, name) {
+                (ParamLookup::Scalar, "@") | (ParamLookup::Scalar, "*") => {
+                    shell.positional_args.len()
+                }
                 _ => lookup_v(shell).chars().count(),
             };
             ExpansionResult::Value(n.to_string())
@@ -94,9 +110,10 @@ pub fn expand_modifier_with_value(
                 // the array via `try_set` (that would write the scalar
                 // path). The caller (`expand_array_param`) handles
                 // any element-write semantics; here we just return the
-                // default value. For the scalar (override_value=None)
-                // path, behave exactly as before.
-                if override_value.is_none() && shell.try_set(name, v.clone()).is_err() {
+                // default value. For the scalar path behave as before.
+                if matches!(source, ParamLookup::Scalar)
+                    && shell.try_set(name, v.clone()).is_err()
+                {
                     eprintln!("huck: {name}: readonly variable");
                     return ExpansionResult::Fatal { status: 1 };
                 }
