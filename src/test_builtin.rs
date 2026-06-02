@@ -6,9 +6,23 @@
 /// Evaluates a `test` expression. `Ok(true)` / `Ok(false)` are the
 /// result; `Err(message)` is a usage error.
 pub fn evaluate(args: &[String]) -> Result<bool, String> {
+    // POSIX § 4.62 short-form for 0-1 args: required for correctness
+    // (e.g. `[ -a ]` is true — a 1-arg call returns truthiness of the
+    // string, not a unary-op application).
     match args.len() {
-        0 => Ok(false),
-        1 => Ok(!args[0].is_empty()),
+        0 => return Ok(false),
+        1 => return Ok(!args[0].is_empty()),
+        _ => {}
+    }
+    // For 2-4 args, try the POSIX short-form first. It handles every
+    // backward-compatible case (existing tests). Task 2 wires the
+    // grammar parser as a fall-through for forms the short-form
+    // rejects (e.g. `[ ( -n a ) ]`).
+    evaluate_short_form(args)
+}
+
+fn evaluate_short_form(args: &[String]) -> Result<bool, String> {
+    match args.len() {
         2 => {
             if args[0] == "!" {
                 negate(evaluate(&args[1..2]))
@@ -47,7 +61,10 @@ fn negate(r: Result<bool, String>) -> Result<bool, String> {
 fn is_unary_op(s: &str) -> bool {
     matches!(
         s,
-        "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n"
+        // `-a` is bash's deprecated unary alias for `-e` (file exists).
+        // It also serves as the binary AND combinator in operator
+        // position; the grammar parser (v75) disambiguates by context.
+        "-a" | "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n"
     )
 }
 
@@ -64,7 +81,9 @@ fn apply_unary(op: &str, operand: &str) -> Result<bool, String> {
     match op {
         "-z" => Ok(operand.is_empty()),
         "-n" => Ok(!operand.is_empty()),
-        "-e" => Ok(std::fs::metadata(operand).is_ok()),
+        // `-a` and `-e` both test for file existence. POSIX prefers
+        // `-e`; bash retains `-a` as a deprecated alias.
+        "-a" | "-e" => Ok(std::fs::metadata(operand).is_ok()),
         "-f" => Ok(std::fs::metadata(operand)
             .map(|m| m.is_file())
             .unwrap_or(false)),
@@ -313,5 +332,28 @@ mod tests {
     fn binary_integer_plus_signed_operand() {
         // A leading `+` is accepted on integer operands.
         assert_eq!(evaluate(&args(&["+5", "-eq", "5"])), Ok(true));
+    }
+
+    #[test]
+    fn unary_dash_a_is_file_exists_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("present");
+        std::fs::write(&file, b"data").unwrap();
+        let file_s = file.to_str().unwrap();
+        let missing = dir.path().join("absent");
+        let missing_s = missing.to_str().unwrap();
+
+        // 2-arg short-form: `[ -a present ]` → true.
+        assert_eq!(evaluate(&args(&["-a", file_s])), Ok(true));
+        // 2-arg short-form: `[ -a absent ]` → false (file does not exist).
+        assert_eq!(evaluate(&args(&["-a", missing_s])), Ok(false));
+    }
+
+    #[test]
+    fn dash_a_in_two_arg_position_is_unary_not_and() {
+        // Sanity: `-a` in the unary-op position of a 2-arg call is
+        // file-exists, not the AND combinator (which requires 3+ args
+        // and operand on each side).
+        assert_eq!(evaluate(&args(&["-a", "/"])), Ok(true));
     }
 }
