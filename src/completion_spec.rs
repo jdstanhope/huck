@@ -126,7 +126,8 @@ pub fn resolve_spec(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    // -F func: deferred to Task 4. For now this stays empty.
+    // -F func: invoke the completion function. Sets COMP_*, runs body,
+    // reads COMPREPLY back. See call_completion_function below.
     if let Some(func_name) = &spec.function {
         let mut from_func = call_completion_function(func_name, spec, ctx, shell);
         out.append(&mut from_func);
@@ -656,6 +657,21 @@ mod tests {
         let _ = resolve_spec(&spec, &ctx(""), &mut sh);
         // Completion functions must NOT pollute $?.
         assert_eq!(sh.last_status(), 42);
+    }
+
+    #[test]
+    fn function_invocation_leaves_current_spec_set() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line("_myf() { COMPREPLY=(a); }", &mut sh, false);
+        let spec = CompletionSpec {
+            function: Some("_myf".to_string()),
+            ..Default::default()
+        };
+        let _ = resolve_spec(&spec, &ctx(""), &mut sh);
+        assert!(
+            sh.current_completion_spec.is_some(),
+            "Task 5/6 depend on current_completion_spec being left set",
+        );
     }
 
     #[test]
