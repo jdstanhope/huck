@@ -594,7 +594,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         String::new()
                     }
                 };
-                emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
+                let ifs = shell.ifs();
+                emit_split_fields(&value, &ifs, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::AllArgs { quoted: false, joined: _ } => {
                 // Unquoted $@ and $* are identical: each arg becomes its
@@ -602,11 +603,12 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 // last IFS-fragment of arg N must NOT merge with the
                 // first of arg N+1, so we flush current between args.
                 let args = shell.positional_args.clone();
+                let ifs = shell.ifs();
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 && !current.is_empty() {
                         result.push(std::mem::take(&mut current));
                     }
-                    emit_split_fields(arg, &mut current, &mut result, &mut has_emitted);
+                    emit_split_fields(arg, &ifs, &mut current, &mut result, &mut has_emitted);
                 }
             }
             WordPart::AllArgs { quoted: true, joined: false } => {
@@ -634,7 +636,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             }
             WordPart::LastStatus { quoted: false } => {
                 let value = snapshot_status.to_string();
-                emit_split_fields(&value, &mut current, &mut result, &mut has_emitted);
+                let ifs = shell.ifs();
+                emit_split_fields(&value, &ifs, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::CommandSub { sequence, quoted: true } => {
                 let output = run_substitution(sequence, shell);
@@ -643,7 +646,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
             }
             WordPart::CommandSub { sequence, quoted: false } => {
                 let output = run_substitution(sequence, shell);
-                emit_split_fields(&output, &mut current, &mut result, &mut has_emitted);
+                let ifs = shell.ifs();
+                emit_split_fields(&output, &ifs, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::Arith { expr, quoted: _ } => {
                 match crate::arith::eval(expr, shell) {
@@ -679,7 +683,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                             current.push_str(&v, true);
                             has_emitted = true;
                         } else {
-                            emit_split_fields(&v, &mut current, &mut result, &mut has_emitted);
+                            let ifs = shell.ifs();
+                            emit_split_fields(&v, &ifs, &mut current, &mut result, &mut has_emitted);
                         }
                     }
                     crate::param_expansion::ExpansionResult::Empty => {
@@ -702,12 +707,10 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         } else {
                             // Unquoted: join with first IFS char then
                             // let word-splitting do the rest.
-                            let ifs = shell
-                                .lookup_var("IFS")
-                                .unwrap_or_else(|| " \t\n".to_string());
+                            let ifs = shell.ifs();
                             let sep = ifs.chars().next().map(|c| c.to_string()).unwrap_or_default();
                             let joined = words.join(&sep);
-                            emit_split_fields(&joined, &mut current, &mut result, &mut has_emitted);
+                            emit_split_fields(&joined, &ifs, &mut current, &mut result, &mut has_emitted);
                         }
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
@@ -897,24 +900,108 @@ fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches('\n').to_string()
 }
 
+/// Returns the separator for `"$*"` / `"${a[*]}"` joins.
+/// Empty IFS → empty separator (concatenate). Otherwise → first char of
+/// IFS. Matches bash § 3.5.5 ("If IFS is null, the parameters are joined
+/// without intervening separators").
+#[allow(dead_code)]
+pub(crate) fn ifs_join_sep(ifs: &str) -> String {
+    ifs.chars().next().map(|c| c.to_string()).unwrap_or_default()
+}
+
 fn emit_split_fields(
     value: &str,
+    ifs: &str,
     current: &mut Field,
     result: &mut Vec<Field>,
     has_emitted: &mut bool,
 ) {
-    let fragments: Vec<&str> = value.split_ascii_whitespace().collect();
-    if fragments.is_empty() {
+    // POSIX § 2.6.5 field splitting. Two IFS classes:
+    //   - whitespace IFS: subset of IFS bytes that are ' ' / '\t' / '\n'.
+    //   - non-whitespace IFS: any other IFS byte.
+    // Empty IFS → no splitting; value joins the in-progress field.
+    if ifs.is_empty() {
+        if !value.is_empty() {
+            current.push_str(value, false);
+            *has_emitted = true;
+        }
         return;
     }
-    // First fragment continues the in-progress field.
-    current.push_str(fragments[0], false);
-    *has_emitted = true;
-    // Each subsequent fragment closes the field and starts a new one.
-    for frag in &fragments[1..] {
-        let finished = std::mem::take(current);
-        result.push(finished);
-        current.push_str(frag, false);
+
+    let ifs_bytes = ifs.as_bytes();
+    let is_ws = |b: u8| ifs_bytes.contains(&b) && matches!(b, b' ' | b'\t' | b'\n');
+    let is_nonws = |b: u8| ifs_bytes.contains(&b) && !matches!(b, b' ' | b'\t' | b'\n');
+    let is_any_ifs = |b: u8| ifs_bytes.contains(&b);
+
+    let bytes = value.as_bytes();
+    let mut i = 0usize;
+
+    // Skip leading IFS-whitespace.
+    while i < bytes.len() && is_ws(bytes[i]) {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return;
+    }
+
+    let mut first_field = true;
+
+    while i < bytes.len() {
+        // Read one field (non-IFS bytes).
+        let field_start = i;
+        while i < bytes.len() && !is_any_ifs(bytes[i]) {
+            i += 1;
+        }
+        let field_end = i;
+        let field_str = std::str::from_utf8(&bytes[field_start..field_end]).unwrap_or("");
+
+        if first_field {
+            current.push_str(field_str, false);
+            *has_emitted = true;
+            first_field = false;
+        } else {
+            let finished = std::mem::take(current);
+            result.push(finished);
+            current.push_str(field_str, false);
+        }
+
+        if i >= bytes.len() {
+            break;
+        }
+
+        // We're now sitting on an IFS byte. Classify the separator run.
+        //   - If the FIRST IFS byte is non-whitespace, consume EXACTLY one
+        //     non-ws byte plus any trailing whitespace-IFS. This produces
+        //     one separator. Continue (empty field next if another non-ws
+        //     follows immediately).
+        //   - If the first IFS byte is whitespace, consume the whole
+        //     whitespace run. Then OPTIONALLY consume one non-whitespace
+        //     IFS byte plus its trailing whitespace-IFS run.
+        if is_nonws(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            // Whitespace IFS run.
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() && is_nonws(bytes[i]) {
+                i += 1;
+                while i < bytes.len() && is_ws(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+
+        // If we consumed all remaining input as a separator, do NOT emit
+        // a trailing empty field. POSIX: "If the input string ends with a
+        // non-whitespace IFS character, that delimiter does not produce
+        // an empty field." (Bash: `IFS=:; v="a:"; echo $v` → `a`.)
+        if i >= bytes.len() {
+            break;
+        }
     }
 }
 
@@ -2459,3 +2546,113 @@ mod assoc_expansion_tests {
         assert_eq!(out, "");
     }
 }
+
+#[cfg(test)]
+mod ifs_splitter_tests {
+    //! POSIX § 2.6.5 field-splitting unit tests for `emit_split_fields`.
+    //! These tests drive the splitter directly, not the lex→expand
+    //! pipeline, so they isolate the IFS classification logic.
+
+    use super::*;
+
+    fn run(value: &str, ifs: &str) -> Vec<String> {
+        let mut current = Field::default();
+        let mut result: Vec<Field> = Vec::new();
+        let mut has_emitted = false;
+        emit_split_fields(value, ifs, &mut current, &mut result, &mut has_emitted);
+        if has_emitted {
+            result.push(current);
+        }
+        result.into_iter().map(|f| f.chars).collect()
+    }
+
+    #[test]
+    fn default_ifs_collapses_whitespace_runs() {
+        assert_eq!(run("a  b\tc", " \t\n"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn colon_ifs_preserves_empty_between() {
+        assert_eq!(run("a::b", ":"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn colon_ifs_leading_produces_empty() {
+        assert_eq!(run(":a", ":"), vec!["", "a"]);
+    }
+
+    #[test]
+    fn colon_ifs_trailing_no_empty() {
+        // POSIX: trailing non-ws IFS does NOT add a trailing empty field.
+        assert_eq!(run("a:", ":"), vec!["a"]);
+    }
+
+    #[test]
+    fn mixed_ifs_ws_collapses_around_nonws() {
+        // IFS=" :", value "a : b" → 2 fields (colon plus adjacent
+        // spaces collapse to one separator).
+        assert_eq!(run("a : b", " :"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn empty_ifs_no_split() {
+        assert_eq!(run("a b c", ""), vec!["a b c"]);
+    }
+
+    #[test]
+    fn whitespace_only_value_yields_no_fields() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(run("   ", " \t\n"), empty);
+    }
+
+    #[test]
+    fn mixed_consecutive_nonws_yields_empty_field() {
+        // IFS=":,", value "a:,b" → a/""/"b"
+        assert_eq!(run("a:,b", ":,"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn single_nonws_only_yields_empty_field() {
+        // IFS=":", value ":" → 1 empty field
+        assert_eq!(run(":", ":"), vec![""]);
+    }
+
+    #[test]
+    fn leading_nonws_then_value() {
+        assert_eq!(run(":x", ":"), vec!["", "x"]);
+    }
+
+    #[test]
+    fn ws_only_ifs_pure_whitespace_collapses() {
+        assert_eq!(run(" a b ", " "), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn nonws_ifs_with_ws_value_no_split() {
+        // IFS=":" (no whitespace), value "a b" → 1 field "a b".
+        assert_eq!(run("a b", ":"), vec!["a b"]);
+    }
+
+    #[test]
+    fn empty_value_emits_nothing() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(run("", ":"), empty);
+        assert_eq!(run("", " \t\n"), empty);
+    }
+
+    #[test]
+    fn current_field_continuation() {
+        // If `current` already has text, the first split fragment
+        // continues it rather than starting a new field.
+        let mut current = Field::default();
+        current.push_str("prefix-", false);
+        let mut result: Vec<Field> = Vec::new();
+        let mut has_emitted = true;
+        emit_split_fields("a b c", " \t\n", &mut current, &mut result,
+                          &mut has_emitted);
+        result.push(current);
+        let words: Vec<String> = result.into_iter().map(|f| f.chars).collect();
+        assert_eq!(words, vec!["prefix-a", "b", "c"]);
+    }
+}
+
