@@ -83,6 +83,7 @@ spec, an implementation plan, and a test suite.
 | v73       | fix `${a[i]:-W}` on missing element (M-82 follow-up)           |
 | v74       | configurable IFS (M-05)                                        |
 | v75       | test combinators (M-25)                                        |
+| v76       | programmable completion: `complete` / `compgen` / `compopt` (M-36 partial) |
 
 ## Build and run
 
