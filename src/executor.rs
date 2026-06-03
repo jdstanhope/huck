@@ -3738,9 +3738,10 @@ mod tests {
     }
 
     #[test]
-    fn stray_break_at_top_level_errors_with_status_1() {
+    fn stray_break_at_top_level_errors_with_status_0() {
         // `break` with no enclosing loop (loop_depth==0): emits diagnostic
-        // to stderr and returns status 1 (matches bash 5.2 behavior).
+        // to stderr and returns status 0 (matches bash 5.2 behavior —
+        // bash returns 0, not 1, for break/continue outside a loop).
         use crate::command::{ExecCommand, Pipeline};
         use crate::lexer::{Word, WordPart};
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
@@ -3760,7 +3761,7 @@ mod tests {
         };
         let mut shell = Shell::new();
         let (_out, status) = execute_capturing(&seq, &mut shell);
-        assert_eq!(status, 1);
+        assert_eq!(status, 0);
     }
 
     #[test]

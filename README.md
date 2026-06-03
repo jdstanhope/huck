@@ -86,6 +86,7 @@ spec, an implementation plan, and a test suite.
 | v76       | programmable completion: `complete` / `compgen` / `compopt` (M-36 partial) |
 | v77       | `function NAME { ... }` keyword form (M-09)                    |
 | v78       | C-style `for ((init;cond;step))` + standalone `((expr))` (M-23) |
+| v79       | `break N` / `continue N` loop levels (M-30)                     |
 
 ## Build and run
 
@@ -210,7 +211,8 @@ status is 0; `until` runs it while the condition is non-zero. `break`
 exits the innermost loop and `continue` skips to its next iteration.
 An infinite `while true; do …; done` is interruptible with Ctrl-C.
 Loops are sequence-level compound commands — they compose with `;`,
-`&&`, `||` and nest. `break N` / `continue N` are not implemented.
+`&&`, `||` and nest. `break N` / `continue N` exit or continue the Nth
+enclosing loop (v79).
 
 **Multi-line input (v19):**
 A command can span several input lines. The REPL reads continuation
@@ -232,8 +234,8 @@ all apply, exactly as for command arguments (`for f in *.txt`, `for x
 in $list`, `for n in $(seq 3)`). `break`/`continue` and multi-line form
 work as for `while`. The no-`in` form (`for NAME; do … done`) runs the
 body zero times — huck has no positional parameters for it to iterate.
-After the loop `NAME` keeps its last value. C-style `for ((;;))` is not
-implemented.
+After the loop `NAME` keeps its last value. C-style `for ((init;cond;step))`
+is also supported (v78).
 
 **`case` statements (v21):**
 `case WORD in PATTERN) LIST ;; … esac` matches the expanded subject
@@ -262,8 +264,9 @@ count. `${10}` and higher use the braced form. `return [N]` exits a
 function early with status `N` (defaulting to `$?`). A function
 shadows any builtin except the flow-control set (`return`/`exit`/
 `break`/`continue`), so `cd() { … }` works but `return() { … }` is
-unreachable. `break`/`continue` inside a function target the caller's
-enclosing loop (matching bash). Redirections on a function call
+unreachable. `break`/`continue` inside a function correctly error as
+"only meaningful in a loop" — the function boundary resets loop depth (v79,
+matching bash). Redirections on a function call
 (`func > file`) are not implemented. v22 also adds the standalone
 brace group `{ list; }` (runs in the current shell — no subshell
 isolation).
