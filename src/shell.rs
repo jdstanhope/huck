@@ -713,8 +713,9 @@ mod rc_tests {
     // ── RunMode resolution (new in v82) ────────────────────────
 
     #[test]
-    fn cli_no_args_is_interactive() {
-        let o = parse_cli(&[]).unwrap();
+    fn cli_bare_double_dash_is_interactive() {
+        // `--` with no following operand ends options and leaves Interactive.
+        let o = parse_cli(&["--".into()]).unwrap();
         assert_eq!(o.mode, RunMode::Interactive);
     }
 
