@@ -4720,7 +4720,20 @@ pub(crate) fn run_sourced_contents(
                 let outcome = crate::executor::execute(&seq, shell, &buf);
                 buf.clear();
                 match outcome {
-                    ExecOutcome::Continue(c) => last_status = c,
+                    ExecOutcome::Continue(c) => {
+                        last_status = c;
+                        // In a non-interactive shell, a fatal parameter-
+                        // expansion error (set -u unbound var, ${x:?}, etc.)
+                        // must abort the rest of the program like bash. Drain
+                        // it mid-loop rather than only at the end. Gated on
+                        // !is_interactive so interactive source/. and the rc
+                        // path keep continuing past the error.
+                        if !shell.is_interactive
+                            && let Some(st) = shell.take_pending_fatal_pe_error()
+                        {
+                            return ExecOutcome::Exit(st);
+                        }
+                    }
                     ExecOutcome::Exit(n) => return ExecOutcome::Exit(n),
                     ExecOutcome::FunctionReturn(n) => {
                         return ExecOutcome::Continue(n);

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -33,20 +34,45 @@ enum ReadResult {
     ReadError(String),
 }
 
-#[derive(Debug, Default, PartialEq)]
+/// How the shell was invoked — resolved by `parse_cli` from argv.
+#[derive(Debug, PartialEq, Eq)]
+enum RunMode {
+    /// REPL (tty) or piped-stdin command reading — current behavior.
+    Interactive,
+    /// `-c COMMAND [NAME [ARG...]]`: argv0 = NAME (None → keep the shell's
+    /// default $0), args = the rest.
+    Command { command: String, argv0: Option<String>, args: Vec<String> },
+    /// `SCRIPT [ARG...]`: $0 = path, args = the rest.
+    File { path: PathBuf, args: Vec<String> },
+}
+
 struct CliOptions {
-    rcfile_path: Option<std::path::PathBuf>,
+    rcfile_path: Option<PathBuf>,
     norc: bool,
+    mode: RunMode,
+}
+
+impl Default for CliOptions {
+    fn default() -> Self {
+        CliOptions {
+            rcfile_path: None,
+            norc: false,
+            mode: RunMode::Interactive,
+        }
+    }
 }
 
 fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
-    let mut opts = CliOptions::default();
+    let mut rcfile_path: Option<PathBuf> = None;
+    let mut norc = false;
+    let mut command: Option<String> = None;
     let mut i = 0;
+
+    // Scan leading options until the first operand, `--`, or `-c`.
     while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
+        match args[i].as_str() {
             "--norc" => {
-                opts.norc = true;
+                norc = true;
                 i += 1;
             }
             "--rcfile" => {
@@ -54,29 +80,50 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                 if i >= args.len() {
                     return Err("--rcfile: requires an argument".to_string());
                 }
-                opts.rcfile_path = Some(std::path::PathBuf::from(&args[i]));
+                rcfile_path = Some(PathBuf::from(&args[i]));
                 i += 1;
+            }
+            s if s.starts_with("--rcfile=") => {
+                rcfile_path = Some(PathBuf::from(&s["--rcfile=".len()..]));
+                i += 1;
+            }
+            "-c" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("-c: option requires an argument".to_string());
+                }
+                command = Some(args[i].clone());
+                i += 1;
+                break; // remaining args are operands, taken verbatim
             }
             "--" => {
                 i += 1;
                 break;
             }
-            s if s.starts_with("--rcfile=") => {
-                opts.rcfile_path = Some(std::path::PathBuf::from(&s["--rcfile=".len()..]));
-                i += 1;
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("unrecognized option: {s}"));
             }
-            unknown => {
-                return Err(format!("unrecognized option: {unknown}"));
-            }
+            _ => break, // first operand (script path)
         }
     }
-    if i < args.len() {
-        return Err(format!(
-            "positional arguments not supported: {}",
-            args[i..].join(" ")
-        ));
-    }
-    Ok(opts)
+
+    let rest = &args[i..];
+    let mode = if let Some(command) = command {
+        RunMode::Command {
+            command,
+            argv0: rest.first().cloned(),
+            args: rest.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
+        }
+    } else if let Some(path) = rest.first() {
+        RunMode::File {
+            path: PathBuf::from(path),
+            args: rest[1..].to_vec(),
+        }
+    } else {
+        RunMode::Interactive
+    };
+
+    Ok(CliOptions { rcfile_path, norc, mode })
 }
 
 fn default_rc_path(shell: &Shell) -> Option<std::path::PathBuf> {
@@ -135,6 +182,44 @@ fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32> {
     }
 }
 
+/// Executes a non-interactive program (a `-c` string or a script file's
+/// contents) and returns the process exit code. Sets $0 and the positional
+/// parameters, marks the shell non-interactive (so the rc file is skipped),
+/// runs the program through the shared `run_sourced_contents` engine, fires the
+/// EXIT trap, and hangs up jobs. Does NOT touch interactive history or the
+/// line editor.
+fn run_program(
+    contents: &str,
+    argv0: Option<String>,
+    args: Vec<String>,
+    label: &str,
+    shell_cell: &Rc<RefCell<Shell>>,
+) -> i32 {
+    let mut shell = shell_cell.borrow_mut();
+    shell.is_interactive = false;
+    if let Some(a0) = argv0 {
+        shell.shell_argv0 = a0;
+    }
+    shell.positional_args = args;
+
+    let outcome = crate::builtins::run_sourced_contents(
+        contents,
+        std::path::Path::new(label),
+        &mut shell,
+    );
+    let code = match outcome {
+        ExecOutcome::Exit(n) => n,
+        // run_sourced_contents normalizes FunctionReturn -> Continue, so this arm is
+        // defensive; treat a stray top-level return code as the exit status.
+        ExecOutcome::FunctionReturn(n) => n,
+        ExecOutcome::Continue(s) => shell.take_pending_fatal_pe_error().unwrap_or(s),
+        ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
+    };
+    crate::traps::fire_exit_trap(&mut shell);
+    shell.hangup_jobs();
+    code
+}
+
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse_cli(args) {
@@ -147,6 +232,42 @@ pub fn run(args: &[String]) -> i32 {
 
     install_job_control_signals();
 
+    let shell_cell = Rc::new(RefCell::new(Shell::new()));
+
+    {
+        let shell = shell_cell.borrow();
+        install_sigint_handler(Arc::clone(&shell.sigint_flag));
+        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
+    }
+
+    // Non-interactive program modes bypass the REPL entirely.
+    match opts.mode {
+        RunMode::Command { command, argv0, args } => {
+            let label = argv0
+                .clone()
+                .unwrap_or_else(|| shell_cell.borrow().shell_argv0.clone());
+            return run_program(&command, argv0, args, &label, &shell_cell);
+        }
+        RunMode::File { path, args } => {
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    let (msg, code) = if e.kind() == std::io::ErrorKind::NotFound {
+                        ("No such file or directory".to_string(), 127)
+                    } else {
+                        (e.to_string(), 126)
+                    };
+                    eprintln!("huck: {}: {msg}", path.display());
+                    return code;
+                }
+            };
+            let label = path.display().to_string();
+            return run_program(&contents, Some(label.clone()), args, &label, &shell_cell);
+        }
+        RunMode::Interactive => {}
+    }
+
+    // ----- interactive / piped-stdin REPL (unchanged below this line) -----
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .build();
@@ -157,13 +278,6 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let shell_cell = Rc::new(RefCell::new(Shell::new()));
-
-    {
-        let shell = shell_cell.borrow();
-        install_sigint_handler(Arc::clone(&shell.sigint_flag));
-        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
-    }
 
     {
         let mut shell = shell_cell.borrow_mut();
@@ -623,7 +737,9 @@ mod rc_tests {
     #[test]
     fn parse_cli_empty() {
         let opts = parse_cli(&[]).unwrap();
-        assert_eq!(opts, CliOptions::default());
+        assert!(!opts.norc);
+        assert!(opts.rcfile_path.is_none());
+        assert_eq!(opts.mode, RunMode::Interactive);
     }
 
     #[test]
@@ -659,10 +775,75 @@ mod rc_tests {
         assert!(parse_cli(&["--rcfile".to_string()]).is_err());
     }
 
+    // ── RunMode resolution (new in v82) ────────────────────────
+
     #[test]
-    fn parse_cli_positional_errors() {
-        // Positional args not yet supported.
-        assert!(parse_cli(&["positional".to_string()]).is_err());
+    fn cli_bare_double_dash_is_interactive() {
+        // `--` with no following operand ends options and leaves Interactive.
+        let o = parse_cli(&["--".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::Interactive);
+    }
+
+    #[test]
+    fn cli_file_mode_sets_path_and_args() {
+        let o = parse_cli(&["s.sh".into(), "a".into(), "b".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec!["a".into(), "b".into()] });
+    }
+
+    #[test]
+    fn cli_dash_c_first_operand_is_argv0() {
+        let o = parse_cli(&["-c".into(), "echo hi".into(), "name".into(), "x".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::Command {
+            command: "echo hi".into(),
+            argv0: Some("name".into()),
+            args: vec!["x".into()],
+        });
+    }
+
+    #[test]
+    fn cli_dash_c_no_operands_argv0_none() {
+        let o = parse_cli(&["-c".into(), "echo hi".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::Command { command: "echo hi".into(), argv0: None, args: vec![] });
+    }
+
+    #[test]
+    fn cli_dash_c_requires_argument() {
+        assert!(parse_cli(&["-c".into()]).is_err());
+    }
+
+    #[test]
+    fn cli_double_dash_ends_options_for_file() {
+        // `--` lets a dash-leading name be the script path.
+        let o = parse_cli(&["--".into(), "-weird".into(), "a".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::File { path: "-weird".into(), args: vec!["a".into()] });
+    }
+
+    #[test]
+    fn cli_operands_after_c_are_verbatim_including_dashdash() {
+        // After `-c CMD`, operands are taken verbatim: `--` becomes $0, `-x` becomes $1.
+        let o = parse_cli(&["-c".into(), "cmd".into(), "--".into(), "-x".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::Command {
+            command: "cmd".into(), argv0: Some("--".into()), args: vec!["-x".into()],
+        });
+    }
+
+    #[test]
+    fn cli_unknown_leading_flag_errors() {
+        assert!(parse_cli(&["-x".into()]).is_err());
+    }
+
+    #[test]
+    fn cli_dash_c_precedence_over_file() {
+        // `-c` wins; the operand is $0, not a script path.
+        let o = parse_cli(&["-c".into(), "cmd".into(), "file.sh".into()]).unwrap();
+        assert_eq!(o.mode, RunMode::Command { command: "cmd".into(), argv0: Some("file.sh".into()), args: vec![] });
+    }
+
+    #[test]
+    fn cli_norc_then_file_still_parses() {
+        let o = parse_cli(&["--norc".into(), "s.sh".into()]).unwrap();
+        assert!(o.norc);
+        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec![] });
     }
 
     // ── rc loader ──────────────────────────────────────────────
@@ -689,6 +870,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: true,
+            mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
         assert!(shell.lookup_var("HUCK_RC_TEST_ABC").is_none());
@@ -703,6 +885,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
         assert!(shell.lookup_var("HUCK_RC_TEST_DEF").is_none());
@@ -717,6 +900,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
         assert_eq!(
@@ -735,6 +919,7 @@ mod rc_tests {
                 "/no/such/file/huck_rc_does_not_exist",
             )),
             norc: false,
+            mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
     }
@@ -747,6 +932,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
         let _ = std::fs::remove_file(&p);
