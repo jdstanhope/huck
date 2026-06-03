@@ -11,7 +11,7 @@ use crate::shell_state::Shell;
 pub enum ExecOutcome {
     Continue(i32),
     Exit(i32),
-    LoopBreak(u32),         // level: 1-based, capped to loop_depth by builtin
+    LoopBreak(u32, i32),    // (level: 1-based capped to loop_depth, terminal $?: 0 normal / 1 malformed-arg)
     LoopContinue(u32),
     FunctionReturn(i32),
 }
@@ -128,22 +128,38 @@ pub fn run_builtin(
 /// `Err(outcome)` is the `ExecOutcome` to return immediately, after the
 /// diagnostic has already been printed.
 ///
-/// Bash 5.2 semantics:
+/// Bash 5.2 semantics for the (already-in-a-loop) argument:
+/// - Too many args (`break 1 2 3`): prints "too many arguments", breaks ALL
+///   enclosing loops with terminal $?=1; script continues (`BreakAll`).
 /// - Non-numeric arg (e.g. `break abc`): prints "numeric argument required",
-///   exits the shell with status 128 (`ExecOutcome::Exit(128)`).
+///   aborts the whole script with status 128 (`Fatal`).
 /// - Numeric but out-of-range (e.g. `break 0`, `break -1`): prints "loop count
-///   out of range", continues with status 1 (`ExecOutcome::Continue(1)`).
-fn parse_loop_level(args: &[String], cmd: &str) -> Result<u32, ExecOutcome> {
-    let Some(arg) = args.first() else { return Ok(1) };
+///   out of range", breaks ALL enclosing loops with terminal $?=1; script
+///   continues (`BreakAll`).
+/// - Valid N>=1: `Level(N)` (not yet capped to loop_depth).
+enum LoopArg {
+    Level(u32),
+    BreakAll,
+    Fatal,
+}
+
+/// Classifies break/continue args per bash 5.2, printing the matching
+/// diagnostic. Caller has already verified loop_depth > 0.
+fn classify_loop_arg(args: &[String], cmd: &str) -> LoopArg {
+    if args.len() > 1 {
+        eprintln!("huck: {cmd}: too many arguments");
+        return LoopArg::BreakAll;
+    }
+    let Some(arg) = args.first() else { return LoopArg::Level(1) };
     match arg.parse::<i64>() {
-        Ok(n) if n >= 1 => Ok(n.min(u32::MAX as i64) as u32),
+        Ok(n) if n >= 1 => LoopArg::Level(n.min(u32::MAX as i64) as u32),
         Ok(_) => {
             eprintln!("huck: {cmd}: {arg}: loop count out of range");
-            Err(ExecOutcome::Continue(1))
+            LoopArg::BreakAll
         }
         Err(_) => {
             eprintln!("huck: {cmd}: {arg}: numeric argument required");
-            Err(ExecOutcome::Exit(128))
+            LoopArg::Fatal
         }
     }
 }
@@ -153,12 +169,11 @@ fn builtin_break(args: &[String], shell: &Shell) -> ExecOutcome {
         eprintln!("huck: break: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    let level = match parse_loop_level(args, "break") {
-        Ok(n) => n,
-        Err(outcome) => return outcome,
-    };
-    let capped = level.min(shell.loop_depth);
-    ExecOutcome::LoopBreak(capped)
+    match classify_loop_arg(args, "break") {
+        LoopArg::Level(n) => ExecOutcome::LoopBreak(n.min(shell.loop_depth), 0),
+        LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
+        LoopArg::Fatal => ExecOutcome::Exit(128),
+    }
 }
 
 fn builtin_continue(args: &[String], shell: &Shell) -> ExecOutcome {
@@ -166,12 +181,12 @@ fn builtin_continue(args: &[String], shell: &Shell) -> ExecOutcome {
         eprintln!("huck: continue: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    let level = match parse_loop_level(args, "continue") {
-        Ok(n) => n,
-        Err(outcome) => return outcome,
-    };
-    let capped = level.min(shell.loop_depth);
-    ExecOutcome::LoopContinue(capped)
+    match classify_loop_arg(args, "continue") {
+        LoopArg::Level(n) => ExecOutcome::LoopContinue(n.min(shell.loop_depth)),
+        // out-of-range/too-many continue breaks all loops, like bash
+        LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
+        LoopArg::Fatal => ExecOutcome::Exit(128),
+    }
 }
 
 /// `return [N]` builtin. Sets the exit status to N (or `$?` if N is
@@ -4705,7 +4720,7 @@ pub(crate) fn run_sourced_contents(
                     ExecOutcome::FunctionReturn(n) => {
                         return ExecOutcome::Continue(n);
                     }
-                    ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_) => {
+                    ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
                         last_status = 0;
                     }
                 }
@@ -6161,7 +6176,7 @@ mod tests {
         shell.loop_depth = 1;
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("break", &[], &mut out, &mut shell);
-        assert_eq!(outcome, ExecOutcome::LoopBreak(1));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(1, 0));
     }
 
     #[test]
@@ -9878,12 +9893,14 @@ mod loop_levels_tests {
     use super::*;
     use crate::shell_state::Shell;
 
+    // ----- break: valid levels (terminal $? = 0) -----
+
     #[test]
-    fn break_no_args_emits_level_1() {
+    fn break_no_args_emits_level_1_status_0() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
         let outcome = builtin_break(&[], &sh);
-        assert_eq!(outcome, ExecOutcome::LoopBreak(1));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(1, 0));
     }
 
     #[test]
@@ -9891,7 +9908,7 @@ mod loop_levels_tests {
         let mut sh = Shell::new();
         sh.loop_depth = 3;
         let outcome = builtin_break(&["2".to_string()], &sh);
-        assert_eq!(outcome, ExecOutcome::LoopBreak(2));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 0));
     }
 
     #[test]
@@ -9899,45 +9916,66 @@ mod loop_levels_tests {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
         let outcome = builtin_break(&["999".to_string()], &sh);
-        assert_eq!(outcome, ExecOutcome::LoopBreak(2));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 0));
     }
+
+    // ----- break: outside a loop → exit status 0, no break -----
 
     #[test]
     fn break_outside_loop_errors_with_status_0() {
         let sh = Shell::new();
         // sh.loop_depth = 0 by default.
-        // Bash 5.2 returns exit status 0 for break/continue outside a loop
-        // (the diagnostic is printed to stderr but $? stays 0).
-        let outcome = builtin_break(&[], &sh);
-        assert_eq!(outcome, ExecOutcome::Continue(0));
+        // Bash 5.2: break/continue outside a loop prints the diagnostic to
+        // stderr but returns $? = 0 and does NOT break anything. Arg
+        // validation is skipped entirely.
+        assert_eq!(builtin_break(&[], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_break(&["abc".to_string()], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_break(&["0".to_string()], &sh), ExecOutcome::Continue(0));
+        assert_eq!(
+            builtin_break(&["1".to_string(), "2".to_string(), "3".to_string()], &sh),
+            ExecOutcome::Continue(0)
+        );
     }
 
+    // ----- break: malformed N<=0 → break ALL loops, terminal $? = 1 -----
+
     #[test]
-    fn break_zero_errors_with_status_1() {
+    fn break_zero_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
-        sh.loop_depth = 1;
-        // Bash 5.2: numeric but out-of-range → Continue(1) (script continues).
+        sh.loop_depth = 2;
         let outcome = builtin_break(&["0".to_string()], &sh);
-        assert_eq!(outcome, ExecOutcome::Continue(1));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
     }
 
     #[test]
-    fn break_negative_errors_with_status_1() {
+    fn break_negative_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        // Bash 5.2: numeric but out-of-range → Continue(1) (script continues).
         let outcome = builtin_break(&["-1".to_string()], &sh);
-        assert_eq!(outcome, ExecOutcome::Continue(1));
+        assert_eq!(outcome, ExecOutcome::LoopBreak(1, 1));
     }
+
+    // ----- break: too many args → break ALL loops, terminal $? = 1 -----
+
+    #[test]
+    fn break_too_many_args_breaks_all_loops_status_1() {
+        let mut sh = Shell::new();
+        sh.loop_depth = 2;
+        let outcome = builtin_break(&["1".to_string(), "2".to_string()], &sh);
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
+    }
+
+    // ----- break: non-numeric → abort script with exit 128 -----
 
     #[test]
     fn break_non_numeric_exits_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        // Bash 5.2: non-numeric arg → Exit(128) (script aborts).
         let outcome = builtin_break(&["abc".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::Exit(128));
     }
+
+    // ----- continue: valid levels (LoopContinue) -----
 
     #[test]
     fn continue_no_args_emits_level_1() {
@@ -9948,18 +9986,56 @@ mod loop_levels_tests {
     }
 
     #[test]
-    fn continue_outside_loop_errors_with_status_0() {
-        let sh = Shell::new();
-        // Bash 5.2 returns exit status 0 for continue outside a loop.
-        let outcome = builtin_continue(&[], &sh);
-        assert_eq!(outcome, ExecOutcome::Continue(0));
-    }
-
-    #[test]
     fn continue_caps_to_loop_depth() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
         let outcome = builtin_continue(&["5".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
+    }
+
+    // ----- continue: outside a loop → exit status 0, no continue -----
+
+    #[test]
+    fn continue_outside_loop_errors_with_status_0() {
+        let sh = Shell::new();
+        assert_eq!(builtin_continue(&[], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_continue(&["abc".to_string()], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_continue(&["0".to_string()], &sh), ExecOutcome::Continue(0));
+    }
+
+    // ----- continue: malformed N<=0 / too-many → break ALL loops, $? = 1 -----
+
+    #[test]
+    fn continue_zero_breaks_all_loops_status_1() {
+        let mut sh = Shell::new();
+        sh.loop_depth = 2;
+        let outcome = builtin_continue(&["0".to_string()], &sh);
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
+    }
+
+    #[test]
+    fn continue_negative_breaks_all_loops_status_1() {
+        let mut sh = Shell::new();
+        sh.loop_depth = 3;
+        let outcome = builtin_continue(&["-5".to_string()], &sh);
+        assert_eq!(outcome, ExecOutcome::LoopBreak(3, 1));
+    }
+
+    #[test]
+    fn continue_too_many_args_breaks_all_loops_status_1() {
+        let mut sh = Shell::new();
+        sh.loop_depth = 2;
+        let outcome = builtin_continue(&["1".to_string(), "2".to_string()], &sh);
+        assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
+    }
+
+    // ----- continue: non-numeric → abort script with exit 128 -----
+
+    #[test]
+    fn continue_non_numeric_exits_with_status_128() {
+        let mut sh = Shell::new();
+        sh.loop_depth = 1;
+        let outcome = builtin_continue(&["abc".to_string()], &sh);
+        assert_eq!(outcome, ExecOutcome::Exit(128));
     }
 }

@@ -75,7 +75,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
-        ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_) => 0,
+        ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
@@ -85,7 +85,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     let mut status = run_command(&seq.first, shell, sink);
     if matches!(
         status,
-        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
             | ExecOutcome::FunctionReturn(_)
     ) {
         return status;
@@ -121,7 +121,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             status = run_command(command, shell, sink);
             if matches!(
                 status,
-                ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+                ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_)
             ) {
                 return status;
@@ -265,7 +265,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
         let cond = execute_sequence_body(&clause.condition, shell, sink);
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
                 | ExecOutcome::FunctionReturn(_) => {
                 return cond;
             }
@@ -278,12 +278,12 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
         }
         match execute_sequence_body(&clause.body, shell, sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1) => {
-                last = ExecOutcome::Continue(0);
+            ExecOutcome::LoopBreak(1, st) => {
+                last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n) => {
-                return ExecOutcome::LoopBreak(n - 1);
+            ExecOutcome::LoopBreak(n, st) => {
+                return ExecOutcome::LoopBreak(n - 1, st);
             }
             ExecOutcome::LoopContinue(1) => {
                 last = ExecOutcome::Continue(0);
@@ -337,12 +337,12 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
         }
         match execute_sequence_body(&clause.body, shell, sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1) => {
-                last = ExecOutcome::Continue(0);
+            ExecOutcome::LoopBreak(1, st) => {
+                last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n) => {
-                return ExecOutcome::LoopBreak(n - 1);
+            ExecOutcome::LoopBreak(n, st) => {
+                return ExecOutcome::LoopBreak(n - 1, st);
             }
             ExecOutcome::LoopContinue(1) => {
                 last = ExecOutcome::Continue(0);
@@ -433,12 +433,12 @@ fn run_arith_for_inner(
         // 3. Execute body.
         match execute_sequence_body(&clause.body, shell, sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-            ExecOutcome::LoopBreak(1) => {
-                last = ExecOutcome::Continue(0);
+            ExecOutcome::LoopBreak(1, st) => {
+                last = ExecOutcome::Continue(st);
                 break;
             }
-            ExecOutcome::LoopBreak(n) => {
-                return ExecOutcome::LoopBreak(n - 1);
+            ExecOutcome::LoopBreak(n, st) => {
+                return ExecOutcome::LoopBreak(n - 1, st);
             }
             ExecOutcome::LoopContinue(1) => {
                 last = ExecOutcome::Continue(0);
@@ -508,7 +508,7 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
             None => last = ExecOutcome::Continue(0),
             Some(body) => match execute_sequence_body(body, shell, sink) {
                 ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
-                ExecOutcome::LoopBreak(n) => return ExecOutcome::LoopBreak(n),
+                ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
                 ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
@@ -538,7 +538,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
     shell.err_suppressed_depth -= 1;
     if matches!(
         cond,
-        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+        ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
             | ExecOutcome::FunctionReturn(_)
     ) {
         return cond;
@@ -552,7 +552,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         shell.err_suppressed_depth -= 1;
         if matches!(
             elif_cond,
-            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+            ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
                 | ExecOutcome::FunctionReturn(_)
         ) {
             return elif_cond;
@@ -3285,7 +3285,7 @@ pub fn fork_and_run_in_subshell(
         // 9. Translate outcome to an 8-bit exit status.
         let status: i32 = match outcome {
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
-            ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_) => 0,
+            ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
             ExecOutcome::FunctionReturn(n) => n,
         };
         let status = status.rem_euclid(256);
@@ -5217,5 +5217,62 @@ mod loop_levels_executor_tests {
         // Both outer for-loop (depth +1) and inner function-then-for
         // should leave loop_depth at 0.
         assert_eq!(sh.loop_depth, 0);
+    }
+
+    // ----- malformed-arg break/continue: break ALL loops, terminal $? = 1 -----
+
+    #[test]
+    fn break_zero_breaks_all_loops_and_status_1() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "x=0; o=0; for i in 1 2; do for j in a b; do break 0; x=$((x+1)); done; o=$((o+1)); done",
+            &mut sh,
+            false,
+        );
+        // break 0 breaks ALL loops: neither the inner body after it (x) nor the
+        // outer body after the inner loop (o) runs again.
+        assert_eq!(sh.lookup_var("x").as_deref(), Some("0"), "inner body must not run after break 0");
+        assert_eq!(sh.lookup_var("o").as_deref(), Some("0"), "outer body must not run after break 0");
+        // The loop nest leaves $? = 1.
+        assert_eq!(sh.last_status(), 1, "break 0 leaves $? = 1");
+    }
+
+    #[test]
+    fn continue_zero_breaks_all_loops_and_status_1() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "x=0; o=0; for i in 1 2; do for j in a b; do continue 0; x=$((x+1)); done; o=$((o+1)); done",
+            &mut sh,
+            false,
+        );
+        // continue 0 behaves like break-all (out-of-range), same as bash.
+        assert_eq!(sh.lookup_var("x").as_deref(), Some("0"));
+        assert_eq!(sh.lookup_var("o").as_deref(), Some("0"));
+        assert_eq!(sh.last_status(), 1, "continue 0 leaves $? = 1");
+    }
+
+    #[test]
+    fn break_too_many_args_breaks_all_loops_and_status_1() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "x=0; o=0; for i in 1 2; do for j in a b; do break 1 2 3; x=$((x+1)); done; o=$((o+1)); done",
+            &mut sh,
+            false,
+        );
+        assert_eq!(sh.lookup_var("x").as_deref(), Some("0"));
+        assert_eq!(sh.lookup_var("o").as_deref(), Some("0"));
+        assert_eq!(sh.last_status(), 1, "break with too many args leaves $? = 1");
+    }
+
+    #[test]
+    fn normal_break_leaves_status_0() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "for i in 1 2; do break; done",
+            &mut sh,
+            false,
+        );
+        // Normal break leaves $? = 0 (no regression from the status-carrying change).
+        assert_eq!(sh.last_status(), 0);
     }
 }

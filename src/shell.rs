@@ -242,7 +242,7 @@ pub fn run(args: &[String]) -> i32 {
                             return fatal_status;
                         }
                     }
-                    ExecOutcome::LoopBreak(_) | ExecOutcome::LoopContinue(_)
+                    ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
