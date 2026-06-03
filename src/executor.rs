@@ -5123,11 +5123,12 @@ mod loop_levels_executor_tests {
     fn break_in_inner_loop_exits_inner_only() {
         let mut sh = Shell::new();
         let _ = crate::shell::process_line(
-            "for i in 1 2; do for j in a b; do if [ \"$j\" = \"b\" ]; then break; fi; done; done",
+            "x=0; for i in 1 2; do for j in a b; do if [ \"$j\" = \"b\" ]; then break; fi; done; x=$((x+1)); done",
             &mut sh,
             false,
         );
-        // After: outer iterates both 1 and 2; loop_depth should be 0 after exit.
+        // Outer loop ran both i=1 and i=2 (inner break only exits inner).
+        assert_eq!(sh.lookup_var("x").as_deref(), Some("2"), "outer loop should run twice");
         assert_eq!(sh.loop_depth, 0, "loop_depth not restored after nested-for break");
     }
 

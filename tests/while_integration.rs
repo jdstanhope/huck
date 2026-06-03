@@ -73,9 +73,10 @@ fn nested_while() {
 }
 
 #[test]
-fn stray_break_is_harmless() {
-    let (out, _) = run("break\necho alive\nexit\n");
+fn stray_break_continues_script() {
+    let (out, err) = run("break\necho alive\nexit\n");
     assert!(out.lines().any(|l| l == "alive"), "stdout: {out}");
+    assert!(err.contains("only meaningful"), "expected diagnostic: {err:?}");
 }
 
 #[test]

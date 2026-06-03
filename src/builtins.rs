@@ -142,7 +142,7 @@ fn parse_loop_level(args: &[String], cmd: &str) -> Result<u32, i32> {
     }
 }
 
-fn builtin_break(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_break(args: &[String], shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
         eprintln!("huck: break: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(1);
@@ -155,7 +155,7 @@ fn builtin_break(args: &[String], shell: &mut Shell) -> ExecOutcome {
     ExecOutcome::LoopBreak(capped)
 }
 
-fn builtin_continue(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_continue(args: &[String], shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
         eprintln!("huck: continue: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(1);
@@ -9876,7 +9876,7 @@ mod loop_levels_tests {
     fn break_no_args_emits_level_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&[], &mut sh);
+        let outcome = builtin_break(&[], &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(1));
     }
 
@@ -9884,7 +9884,7 @@ mod loop_levels_tests {
     fn break_with_arg_n_emits_level_n_when_in_loop() {
         let mut sh = Shell::new();
         sh.loop_depth = 3;
-        let outcome = builtin_break(&["2".to_string()], &mut sh);
+        let outcome = builtin_break(&["2".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2));
     }
 
@@ -9892,15 +9892,15 @@ mod loop_levels_tests {
     fn break_caps_to_loop_depth() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_break(&["999".to_string()], &mut sh);
+        let outcome = builtin_break(&["999".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2));
     }
 
     #[test]
     fn break_outside_loop_errors_with_status_1() {
-        let mut sh = Shell::new();
+        let sh = Shell::new();
         // sh.loop_depth = 0 by default.
-        let outcome = builtin_break(&[], &mut sh);
+        let outcome = builtin_break(&[], &sh);
         assert_eq!(outcome, ExecOutcome::Continue(1));
     }
 
@@ -9908,7 +9908,7 @@ mod loop_levels_tests {
     fn break_zero_errors_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&["0".to_string()], &mut sh);
+        let outcome = builtin_break(&["0".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::Continue(128));
     }
 
@@ -9916,7 +9916,7 @@ mod loop_levels_tests {
     fn break_negative_errors_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&["-1".to_string()], &mut sh);
+        let outcome = builtin_break(&["-1".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::Continue(128));
     }
 
@@ -9924,7 +9924,7 @@ mod loop_levels_tests {
     fn break_non_numeric_errors_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&["abc".to_string()], &mut sh);
+        let outcome = builtin_break(&["abc".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::Continue(128));
     }
 
@@ -9932,14 +9932,14 @@ mod loop_levels_tests {
     fn continue_no_args_emits_level_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_continue(&[], &mut sh);
+        let outcome = builtin_continue(&[], &sh);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
     }
 
     #[test]
     fn continue_outside_loop_errors_with_status_1() {
-        let mut sh = Shell::new();
-        let outcome = builtin_continue(&[], &mut sh);
+        let sh = Shell::new();
+        let outcome = builtin_continue(&[], &sh);
         assert_eq!(outcome, ExecOutcome::Continue(1));
     }
 
@@ -9947,7 +9947,7 @@ mod loop_levels_tests {
     fn continue_caps_to_loop_depth() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_continue(&["5".to_string()], &mut sh);
+        let outcome = builtin_continue(&["5".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
     }
 }
