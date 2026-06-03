@@ -430,6 +430,10 @@ pub enum Command {
         expr: Box<TestExpr>,
         inline_assignments: Vec<Assignment>,
     },
+    /// NEW (v78): standalone `((expr))` command. Exit 0 if non-zero, 1 if zero.
+    Arith(crate::arith::ArithExpr),
+    /// NEW (v78): C-style `for ((init; cond; step)) do BODY done`.
+    ArithFor(Box<ArithForClause>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -454,6 +458,16 @@ pub struct ForClause {
     /// The unexpanded `in` word list. Empty for the no-`in` form.
     pub words: Vec<Word>,
     /// The do…done body.
+    pub body: Sequence,
+}
+
+/// NEW (v78): a C-style `for ((init; cond; step)) do BODY done` clause.
+/// Each header section is optional; an empty cond is treated as always-true.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ArithForClause {
+    pub init: Option<crate::arith::ArithExpr>,
+    pub cond: Option<crate::arith::ArithExpr>,
+    pub step: Option<crate::arith::ArithExpr>,
     pub body: Sequence,
 }
 
@@ -516,6 +530,12 @@ pub enum ParseError {
     UnterminatedDoubleBracket,  // NEW (v30): `[[ x == y` — missing `]]`
     TestExprBadOperator(String),// NEW (v30): unrecognised operator inside `[[ ]]`
     TestExprMissingOperand,     // NEW (v30): e.g. `[[ -f ]]` or `[[ x == ]]`
+    /// NEW (v78): `crate::arith::parse` failed on the body of a `((...))`
+    /// block or a for-loop header section. Carries the inner error message.
+    ArithBlock(String),
+    /// NEW (v78): `for ((header))` header did not split into exactly 3
+    /// `;`-separated sections.
+    ArithForHeader(String),
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
@@ -651,12 +671,23 @@ fn parse_command<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Command, ParseError> {
     skip_newlines(iter);
+
+    // Standalone arith block: `((expr))` at command position.
+    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
+        let Some(Token::ArithBlock(text)) = iter.next() else {
+            unreachable!("matches! guard above guarantees ArithBlock")
+        };
+        let expr = crate::arith::parse(&text)
+            .map_err(|e| ParseError::ArithBlock(e.to_string()))?;
+        return Ok(Command::Arith(expr));
+    }
+
     match iter.peek().and_then(keyword_of) {
         Some(Keyword::If) => Ok(Command::If(Box::new(parse_if(iter)?))),
         Some(Keyword::While) | Some(Keyword::Until) => {
             Ok(Command::While(Box::new(parse_while(iter)?)))
         }
-        Some(Keyword::For) => Ok(Command::For(Box::new(parse_for(iter)?))),
+        Some(Keyword::For) => parse_for_command(iter),
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(Keyword::DoubleBracketOpen) => parse_double_bracket(iter),
@@ -756,6 +787,8 @@ fn is_function_body_shape(body: &Command) -> bool {
             | Command::BraceGroup(_)
             | Command::Subshell { .. }
             | Command::DoubleBracket { .. }
+            | Command::Arith(_)
+            | Command::ArithFor(_)
     )
 }
 
@@ -942,13 +975,120 @@ fn for_variable_name(token: &Token) -> Option<String> {
     valid_identifier_text(w)
 }
 
-/// Parses `for NAME [in WORD...] sep do LIST done`. The caller has
-/// peeked the leading `for`.
-fn parse_for<I: Iterator<Item = Token>>(
+/// Splits `text` on `;` at paren depth 0. Useful for arith-for headers
+/// where the body of `for ((init; cond; step))` may contain
+/// parenthesized sub-expressions that should not split.
+fn split_top_level_semi(text: &str) -> Vec<String> {
+    let mut sections: Vec<String> = vec![String::new()];
+    let mut depth: i32 = 0;
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                sections.last_mut().unwrap().push(c);
+            }
+            ')' => {
+                depth -= 1;
+                sections.last_mut().unwrap().push(c);
+            }
+            ';' if depth == 0 => sections.push(String::new()),
+            _ => sections.last_mut().unwrap().push(c),
+        }
+    }
+    sections
+}
+
+/// Triple of optional arith expressions — the three sections of an
+/// arith-for header `((init; cond; step))`. Each may be `None`.
+type ArithForHeaderTriple = (
+    Option<crate::arith::ArithExpr>,
+    Option<crate::arith::ArithExpr>,
+    Option<crate::arith::ArithExpr>,
+);
+
+/// Splits an arith-for header into three optional arith expressions.
+/// Empty sections (e.g., the cond in `((;;))`) yield `None`. Returns
+/// `ArithForHeader` if the header doesn't split into exactly 3 sections.
+fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError> {
+    let sections = split_top_level_semi(text);
+    if sections.len() != 3 {
+        return Err(ParseError::ArithForHeader(format!(
+            "expected 3 sections separated by `;`, got {}",
+            sections.len()
+        )));
+    }
+    let parse_section = |s: &str| -> Result<Option<crate::arith::ArithExpr>, ParseError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            crate::arith::parse(trimmed)
+                .map(Some)
+                .map_err(|e| ParseError::ArithBlock(e.to_string()))
+        }
+    };
+    Ok((
+        parse_section(&sections[0])?,
+        parse_section(&sections[1])?,
+        parse_section(&sections[2])?,
+    ))
+}
+
+/// Parses the body of `for ((header)) [;|newline]* do BODY done`. The
+/// caller has consumed `for` and verified the next token is
+/// `Token::ArithBlock`. This function consumes the ArithBlock, the
+/// separators before `do`, the `do` keyword, the body, and the `done`
+/// keyword.
+fn parse_arith_for_clause<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
-) -> Result<ForClause, ParseError> {
+) -> Result<ArithForClause, ParseError> {
+    let header_text = match iter.next() {
+        Some(Token::ArithBlock(text)) => text,
+        _ => unreachable!("caller verified peek"),
+    };
+    let (init, cond, step) = parse_arith_for_header(&header_text)?;
+
+    // Skip `;` and newline separators between the header and `do`.
+    while matches!(
+        iter.peek(),
+        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+    ) {
+        iter.next();
+    }
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+
+    Ok(ArithForClause { init, cond, step, body })
+}
+
+/// Dispatches `for` to either the POSIX form (`for VAR in WORDS; do ...`)
+/// or the bash arith form (`for ((init;cond;step)) do ...`). Consumes
+/// the `for` keyword itself.
+fn parse_for_command<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
 
+    // Peek the next token to choose the variant. Skip newlines first so
+    // `for\n((...))` works the same as `for ((...))`.
+    while matches!(iter.peek(), Some(Token::Newline)) {
+        iter.next();
+    }
+
+    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
+        return Ok(Command::ArithFor(Box::new(parse_arith_for_clause(iter)?)));
+    }
+
+    Ok(Command::For(Box::new(parse_for_after_keyword(iter)?)))
+}
+
+/// Parses `for NAME [in WORD...] sep do LIST done` AFTER the `for`
+/// keyword has already been consumed by the caller.
+fn parse_for_after_keyword<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<ForClause, ParseError> {
     // Loop variable. End-of-input means the command is incomplete (the
     // v19 classifier maps UnterminatedLoop to "read more"); a present
     // but invalid token is a genuine error.
@@ -1372,6 +1512,12 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                 // before parse_simple_stage is called.
                 return Err(ParseError::UnexpectedToken);
             }
+            Token::ArithBlock(_) => {
+                // `((...))` mid-argument (e.g. `cmd ((1+2))`) is a syntax
+                // error. The standalone arith block at command-start is
+                // dispatched by parse_command before parse_simple_stage runs.
+                return Err(ParseError::UnexpectedToken);
+            }
             Token::Op(Operator::RParen) => {
                 // Unreachable: the peek-break above stops on RParen.
                 unreachable!("RParen terminates the stage via the peek-break above");
@@ -1387,6 +1533,7 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                     Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                     Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(Token::ArithBlock(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 };
                 match op {
                     Operator::RedirIn => stdin = Some(Redirect::Read(target)),
@@ -1446,12 +1593,23 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
 fn parse_next_stage<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<(Command, bool), ParseError> {
+    // Standalone arith block: `((expr))` at pipeline-stage position
+    // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
+    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
+        let Some(Token::ArithBlock(text)) = iter.next() else {
+            unreachable!("matches! guard above guarantees ArithBlock")
+        };
+        let expr = crate::arith::parse(&text)
+            .map_err(|e| ParseError::ArithBlock(e.to_string()))?;
+        return Ok((Command::Arith(expr), false));
+    }
+
     match iter.peek().and_then(keyword_of) {
         Some(Keyword::If) => Ok((Command::If(Box::new(parse_if(iter)?)), false)),
         Some(Keyword::While) | Some(Keyword::Until) => {
             Ok((Command::While(Box::new(parse_while(iter)?)), false))
         }
-        Some(Keyword::For) => Ok((Command::For(Box::new(parse_for(iter)?)), false)),
+        Some(Keyword::For) => Ok((parse_for_command(iter)?, false)),
         Some(Keyword::Case) => Ok((Command::Case(Box::new(parse_case(iter)?)), false)),
         Some(Keyword::LBrace) => {
             Ok((Command::BraceGroup(Box::new(parse_brace_group(iter)?)), false))
@@ -1870,6 +2028,8 @@ mod tests {
             Command::Subshell { .. } => panic!("expected a pipeline, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected a pipeline, got a function def"),
             Command::DoubleBracket { .. } => panic!("expected a pipeline, got a double bracket"),
+            Command::Arith(_) => panic!("expected a pipeline, got an arith command"),
+            Command::ArithFor(_) => panic!("expected a pipeline, got an arith for"),
         }
     }
 
@@ -2385,6 +2545,8 @@ mod tests {
             Command::Subshell { .. } => panic!("expected an if, got a subshell"),
             Command::FunctionDef { .. } => panic!("expected an if, got a function def"),
             Command::DoubleBracket { .. } => panic!("expected an if, got a double bracket"),
+            Command::Arith(_) => panic!("expected an if, got an arith command"),
+            Command::ArithFor(_) => panic!("expected an if, got an arith for"),
         }
     }
 
@@ -3648,7 +3810,10 @@ mod tests {
 
     #[test]
     fn parse_subshell_nested() {
-        let tokens = crate::lexer::tokenize("((echo hi))").unwrap();
+        // v78: `((cmd))` (no whitespace) now lexes as `Token::ArithBlock`,
+        // matching bash. Use `( (cmd) )` with whitespace between the
+        // outer and inner `(` to keep the nested-subshell semantics.
+        let tokens = crate::lexer::tokenize("( (echo hi) )").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Subshell { body: outer } = parsed.first else { panic!() };
         let Command::Subshell { .. } = outer.first else {
@@ -4132,6 +4297,34 @@ mod tests {
     }
 
     #[test]
+    fn function_body_can_be_standalone_arith() {
+        let tokens = crate::lexer::tokenize("f() ((1+2))").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::Arith(_)),
+                        "expected arith body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_body_can_be_arith_for_loop() {
+        let tokens = crate::lexer::tokenize("f() for ((i=0;i<3;i++)) do :; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::ArithFor(_)),
+                        "expected arith-for body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn function_keyword_form_double_bracket_body() {
         // Wrapped in a brace group: the body IS BraceGroup; inside the
         // brace group is a DoubleBracket. Verify the function parses.
@@ -4182,5 +4375,131 @@ mod tests {
             "echo function must not parse as a FunctionDef: {:?}",
             parsed.first,
         );
+    }
+
+    // ----- v78: arith block + C-style for-loop parser tests -----
+
+    #[test]
+    fn parse_standalone_arith_command() {
+        let tokens = crate::lexer::tokenize("((1+2))").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::Arith(_)),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn parse_arith_for_full_header() {
+        let tokens = crate::lexer::tokenize("for ((i=0;i<10;i++)) do :; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::ArithFor(clause) => {
+                assert!(clause.init.is_some());
+                assert!(clause.cond.is_some());
+                assert!(clause.step.is_some());
+            }
+            other => panic!("expected ArithFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_for_all_empty_sections() {
+        let tokens = crate::lexer::tokenize("for ((;;)) do break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::ArithFor(clause) => {
+                assert!(clause.init.is_none());
+                assert!(clause.cond.is_none());
+                assert!(clause.step.is_none());
+            }
+            other => panic!("expected ArithFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_for_only_init() {
+        let tokens = crate::lexer::tokenize("for ((i=0;;)) do break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::ArithFor(clause) => {
+                assert!(clause.init.is_some());
+                assert!(clause.cond.is_none());
+                assert!(clause.step.is_none());
+            }
+            other => panic!("expected ArithFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_for_only_cond() {
+        let tokens = crate::lexer::tokenize("for ((;i<10;)) do break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::ArithFor(clause) => {
+                assert!(clause.init.is_none());
+                assert!(clause.cond.is_some());
+                assert!(clause.step.is_none());
+            }
+            other => panic!("expected ArithFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_for_only_step() {
+        let tokens = crate::lexer::tokenize("for ((;;i++)) do break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::ArithFor(clause) => {
+                assert!(clause.init.is_none());
+                assert!(clause.cond.is_none());
+                assert!(clause.step.is_some());
+            }
+            other => panic!("expected ArithFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_for_newline_before_do() {
+        let tokens = crate::lexer::tokenize("for ((;;))\ndo break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::ArithFor(_)),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn parse_arith_for_semicolon_before_do() {
+        let tokens = crate::lexer::tokenize("for ((;;)); do break; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        assert!(matches!(parsed.first, Command::ArithFor(_)),
+                "got {:?}", parsed.first);
+    }
+
+    #[test]
+    fn parse_arith_for_two_sections_errors() {
+        // `for ((i=0;i<10))` — only one `;`, two sections.
+        let tokens = crate::lexer::tokenize("for ((i=0;i<10)) do :; done").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::ArithForHeader(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_arith_for_bad_arith_in_section_errors() {
+        // `for ((i=+;;))` — `i=+` is not a valid arith expression.
+        let tokens = crate::lexer::tokenize("for ((i=+;;)) do :; done").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::ArithBlock(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_arith_for_missing_do_errors() {
+        let tokens = crate::lexer::tokenize("for ((;;)) :; done").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::UnterminatedLoop), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_standalone_arith_with_bad_expr_errors() {
+        let tokens = crate::lexer::tokenize("((1++))").unwrap();
+        let err = parse(tokens).expect_err("should error");
+        assert!(matches!(err, ParseError::ArithBlock(_)), "got {err:?}");
     }
 }

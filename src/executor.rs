@@ -234,6 +234,8 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::DoubleBracket { expr, inline_assignments } => {
             run_double_bracket(expr, inline_assignments, shell)
         }
+        Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
+        Command::Arith(expr) => run_arith(expr, shell),
     }
 }
 
@@ -327,6 +329,93 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
+        }
+    }
+    last
+}
+
+/// Runs a standalone `((expr))` arith command. Per bash semantics, the
+/// command exits 0 if the expression's value is non-zero, 1 if zero;
+/// arith errors emit a diagnostic to stderr and exit 1.
+fn run_arith(expr: &crate::arith::ArithExpr, shell: &mut Shell) -> ExecOutcome {
+    match crate::arith::eval(expr, shell) {
+        Ok(0) => ExecOutcome::Continue(1),
+        Ok(_) => ExecOutcome::Continue(0),
+        Err(e) => {
+            eprintln!("huck: ((: {e}");
+            ExecOutcome::Continue(1)
+        }
+    }
+}
+
+/// Runs a C-style `for ((init; cond; step)) do BODY done` arith
+/// for-loop. Evaluates `init` once, then loops while `cond` is non-zero
+/// (None = always true). Evaluates `step` after each iteration body.
+/// Mirrors `run_for`'s break/continue/return/exit/SIGINT handling.
+fn run_arith_for(
+    clause: &crate::command::ArithForClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    use std::sync::atomic::Ordering;
+
+    // 1. Eval init once (if present).
+    if let Some(init) = &clause.init
+        && let Err(e) = crate::arith::eval(init, shell)
+    {
+        eprintln!("huck: ((: {e}");
+        return ExecOutcome::Continue(1);
+    }
+
+    let mut last = ExecOutcome::Continue(0);
+    loop {
+        // SIGINT check (mirrors run_for).
+        if shell
+            .sigint_flag
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return ExecOutcome::Continue(130);
+        }
+
+        // 2. Eval cond. Empty cond = always true (matches bash).
+        let cond_value = match &clause.cond {
+            None => 1,
+            Some(c) => match crate::arith::eval(c, shell) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("huck: ((: {e}");
+                    return ExecOutcome::Continue(1);
+                }
+            },
+        };
+        if cond_value == 0 {
+            break;
+        }
+
+        // 3. Execute body.
+        match execute_sequence_body(&clause.body, shell, sink) {
+            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
+            ExecOutcome::LoopBreak => {
+                last = ExecOutcome::Continue(0);
+                break;
+            }
+            ExecOutcome::LoopContinue => {
+                last = ExecOutcome::Continue(0);
+                // fall through to step
+            }
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Continue(c) => {
+                last = ExecOutcome::Continue(c);
+            }
+        }
+
+        // 4. Eval step (if present).
+        if let Some(step) = &clause.step
+            && let Err(e) = crate::arith::eval(step, shell)
+        {
+            eprintln!("huck: ((: {e}");
+            return ExecOutcome::Continue(1);
         }
     }
     last
@@ -4911,5 +5000,68 @@ mod assoc_assign_tests {
         );
         // foo should be unaffected.
         assert_eq!(s.lookup_associative_element("foo", "k"), Some("v".into()));
+    }
+}
+
+#[cfg(test)]
+mod arith_for_tests {
+    use crate::builtins::ExecOutcome;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn arith_command_nonzero_exits_0() {
+        let mut sh = Shell::new();
+        let outcome = crate::shell::process_line("((1+2))", &mut sh, false);
+        assert!(matches!(outcome, ExecOutcome::Continue(0)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn arith_command_zero_exits_1() {
+        let mut sh = Shell::new();
+        let outcome = crate::shell::process_line("((0))", &mut sh, false);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn arith_command_division_by_zero_exits_1() {
+        let mut sh = Shell::new();
+        let outcome = crate::shell::process_line("((1/0))", &mut sh, false);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn arith_for_counter_loop_sets_var() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "for ((i=0;i<3;i++)) do :; done",
+            &mut sh,
+            false,
+        );
+        // After the loop, i should be 3 (the value at which cond failed).
+        assert_eq!(sh.lookup_var("i").as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn arith_for_break_stops_at_value() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "for ((i=0;i<10;i++)) do if [ $i -eq 5 ]; then break; fi; done",
+            &mut sh,
+            false,
+        );
+        // i was 5 when break fired; step does NOT run after break.
+        assert_eq!(sh.lookup_var("i").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn arith_for_continue_evaluates_step() {
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "for ((i=0;i<5;i++)) do continue; done",
+            &mut sh,
+            false,
+        );
+        // i should reach 5 (cond fails) — step runs after continue.
+        assert_eq!(sh.lookup_var("i").as_deref(), Some("5"));
     }
 }

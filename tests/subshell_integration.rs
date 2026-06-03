@@ -89,7 +89,10 @@ fn subshell_in_pipeline_last_stage() {
 
 #[test]
 fn subshell_nested_double_fork() {
-    let (out, _) = run("((echo nested))\nexit\n");
+    // v78: `((cmd))` (no whitespace) now lexes as `Token::ArithBlock`,
+    // matching bash. Use `( (cmd) )` with whitespace between the outer
+    // and inner `(` to preserve the nested-subshell semantics under test.
+    let (out, _) = run("( (echo nested) )\nexit\n");
     assert!(out.lines().any(|l| l.trim() == "nested"), "got: {out}");
 }
 

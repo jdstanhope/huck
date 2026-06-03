@@ -85,6 +85,7 @@ spec, an implementation plan, and a test suite.
 | v75       | test combinators (M-25)                                        |
 | v76       | programmable completion: `complete` / `compgen` / `compopt` (M-36 partial) |
 | v77       | `function NAME { ... }` keyword form (M-09)                    |
+| v78       | C-style `for ((init;cond;step))` + standalone `((expr))` (M-23) |
 
 ## Build and run
 

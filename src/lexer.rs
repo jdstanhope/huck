@@ -20,6 +20,8 @@ pub enum LexError {
     UnterminatedArrayLiteral,
     /// `a=([3] x)` — `[3]` not followed by `=`.
     ArrayLiteralMissingEquals,
+    /// `((1+2` — EOF before matching `))`.
+    UnterminatedArithBlock,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -174,6 +176,10 @@ pub enum Token {
     /// resulting Token::Heredoc occupies the position where `<<DELIM`
     /// appeared (the delim word itself is not emitted).
     Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    /// Raw text inside a `(( ... ))` block (the outer `((` and `))`
+    /// already consumed). Parsed by `crate::arith::parse` downstream.
+    /// Captured verbatim including embedded `;` separators.
+    ArithBlock(String),
 }
 
 /// State for a heredoc whose body hasn't been collected yet.
@@ -399,7 +405,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                     has_token = false;
                 }
-                tokens.push(Token::Op(Operator::LParen));
+                // Detect `((` (contiguous, no whitespace). The peek/next
+                // sequence below consumes the second `(` only when present.
+                // Whitespace between the two `(` is already consumed by the
+                // outer loop's whitespace handling — so by the time we get
+                // here, a second `(` means they were truly adjacent.
+                if chars.peek() == Some(&'(') {
+                    chars.next(); // consume the second `(`
+                    let body = scan_arith_block(&mut chars)?;
+                    tokens.push(Token::ArithBlock(body));
+                } else {
+                    tokens.push(Token::Op(Operator::LParen));
+                }
                 in_assignment_value = false;
             }
             ')' => {
@@ -1156,6 +1173,36 @@ fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
     }
 }
 
+/// Scans the body of a `(( ... ))` block. The caller has already
+/// consumed both opening `(` characters; this function consumes the
+/// body and the matching `))`. Returns the raw body text. Tracks
+/// nested paren depth so `(((a+b)*c))` correctly captures `((a+b)*c)`
+/// as the body.
+fn scan_arith_block(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut collected = String::new();
+    let mut depth: i32 = 0;
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => {
+                depth += 1;
+                collected.push('(');
+            }
+            ')' => {
+                if depth == 0 && chars.peek() == Some(&')') {
+                    chars.next(); // consume the second `)`
+                    return Ok(collected);
+                }
+                depth -= 1;
+                collected.push(')');
+            }
+            _ => collected.push(c),
+        }
+    }
+    Err(LexError::UnterminatedArithBlock)
+}
+
 /// Reads the inner text of a `$((...))` arithmetic expansion. The opening
 /// `$((` has already been consumed; this function scans forward until the
 /// matching `))` at depth 0. Returns the inner text (without the closing
@@ -1267,7 +1314,10 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
                 parts.extend(ps);
                 first = false;
             }
-            Token::Op(_) | Token::Newline | Token::Heredoc { .. } => return Err(LexError::InvalidBraceOperand),
+            Token::Op(_)
+            | Token::Newline
+            | Token::Heredoc { .. }
+            | Token::ArithBlock(_) => return Err(LexError::InvalidBraceOperand),
         }
     }
     Ok(Word(parts))
@@ -5103,6 +5153,91 @@ mod tests {
         let toks = tokenize("echo \\{a,b\\}").expect("lex");
         let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
         assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
+    }
+
+    #[test]
+    fn arith_block_simple() {
+        let tokens = tokenize("((1+2))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::ArithBlock(s) => assert_eq!(s, "1+2"),
+            other => panic!("expected ArithBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_block_with_semicolons() {
+        let tokens = tokenize("((a;b;c))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::ArithBlock(s) => assert_eq!(s, "a;b;c"),
+            other => panic!("expected ArithBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_block_nested_parens() {
+        // Outer `((` / `))` is the delimiter; inner parens belong to the body.
+        // Body has TWO layers of inner parens — the matching `))` close
+        // is the final two `)` of the input.
+        let tokens = tokenize("((((a+b)*c)))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::ArithBlock(s) => assert_eq!(s, "((a+b)*c)"),
+            other => panic!("expected ArithBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_block_with_internal_whitespace() {
+        let tokens = tokenize("((  1 + 2  ))").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::ArithBlock(s) => assert_eq!(s, "  1 + 2  "),
+            other => panic!("expected ArithBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_block_empty_body() {
+        let tokens = tokenize("(())").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::ArithBlock(s) => assert_eq!(s, ""),
+            other => panic!("expected ArithBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arith_block_unclosed_errors() {
+        let err = tokenize("((1+2").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedArithBlock);
+    }
+
+    #[test]
+    fn arith_block_single_paren_at_end_errors() {
+        // `((1+2)` — one closing paren, not two. Body consumed; depth goes
+        // to -1; then EOF → UnterminatedArithBlock.
+        let err = tokenize("((1+2)").unwrap_err();
+        assert_eq!(err, LexError::UnterminatedArithBlock);
+    }
+
+    #[test]
+    fn space_between_parens_is_not_arith_block() {
+        // `( (cmd) )` — whitespace between the two `(`s. Should tokenize
+        // as two LParen ops, a Word, and two RParen ops (nested-subshell
+        // path per M-11). The arith-block detector must NOT fire.
+        let tokens = tokenize("( (cmd) )").unwrap();
+        let lparen_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Token::Op(Operator::LParen)))
+            .count();
+        let arith_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Token::ArithBlock(_)))
+            .count();
+        assert_eq!(lparen_count, 2, "expected two LParen tokens: {tokens:?}");
+        assert_eq!(arith_count, 0, "did not expect ArithBlock: {tokens:?}");
     }
 }
 
