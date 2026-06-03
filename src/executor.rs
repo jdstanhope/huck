@@ -360,6 +360,96 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
     last
 }
 
+/// Default screen width when $COLUMNS is unset/invalid (bash uses 80).
+#[allow(dead_code)]
+const SELECT_DEFAULT_COLS: usize = 80;
+const SELECT_TABSIZE: usize = 8;
+
+/// Decimal digit count of `n` (bash NUMBER_LEN). n>=1 in practice.
+#[allow(dead_code)]
+fn number_len(n: usize) -> usize {
+    let mut len = 1;
+    let mut v = n;
+    while v >= 10 {
+        v /= 10;
+        len += 1;
+    }
+    len
+}
+
+/// Display width of a menu item. ASCII-exact (codepoint count); wide-char
+/// width is a documented sub-divergence (see spec).
+#[allow(dead_code)]
+fn select_displen(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Pad column position `from` up to `to` exactly as bash's `indent()`:
+/// emit a tab when crossing an 8-column tab stop, else a space.
+#[allow(dead_code)]
+fn select_indent(out: &mut String, mut from: usize, to: usize) {
+    while from < to {
+        if to / SELECT_TABSIZE > from / SELECT_TABSIZE {
+            out.push('\t');
+            from += SELECT_TABSIZE - (from % SELECT_TABSIZE);
+        } else {
+            out.push(' ');
+            from += 1;
+        }
+    }
+}
+
+/// Render the numbered `select` menu byte-for-byte like bash 5.2's
+/// `print_select_list`. `cols_width` is the screen width (COLS). The returned
+/// string (with a trailing newline per row) is written to stderr by the caller.
+#[allow(dead_code)]
+fn format_select_menu(items: &[String], cols_width: usize) -> String {
+    let mut out = String::new();
+    let list_len = items.len();
+    if list_len == 0 {
+        out.push('\n');
+        return out;
+    }
+    let indices_len = number_len(list_len);
+    let max_item = items.iter().map(|s| select_displen(s)).max().unwrap_or(0);
+    // RP_SPACE_LEN (") ") = 2, plus bash's extra +2 gap.
+    let max_elem_len = max_item + indices_len + 2 + 2;
+
+    // max_elem_len >= 4 (indices_len >= 1, + RP_SPACE_LEN 2, + gap 2); safe to divide.
+    let mut cols = cols_width / max_elem_len;
+    if cols == 0 {
+        cols = 1;
+    }
+    let mut rows = list_len.div_ceil(cols);
+    cols = list_len.div_ceil(rows);
+    if rows == 1 {
+        rows = cols;
+        // cols = 1 (implicitly; no further use)
+    }
+    let first_col_iw = number_len(rows);
+    let other_iw = indices_len;
+
+    for row in 0..rows {
+        let mut ind = row;
+        let mut pos = 0usize;
+        loop {
+            let iw = if pos == 0 { first_col_iw } else { other_iw };
+            let item = &items[ind];
+            // bash print_index_and_element: "%*d" + ") " + item
+            out.push_str(&format!("{:>width$}) {}", ind + 1, item, width = iw));
+            let elem_len = select_displen(item) + iw + 2;
+            ind += rows;
+            if ind >= list_len {
+                break;
+            }
+            select_indent(&mut out, pos + elem_len, pos + max_elem_len);
+            pos += max_elem_len;
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Runs a standalone `((expr))` arith command. Per bash semantics, the
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
@@ -5274,5 +5364,98 @@ mod loop_levels_executor_tests {
         );
         // Normal break leaves $? = 0 (no regression from the status-carrying change).
         assert_eq!(sh.last_status(), 0);
+    }
+}
+
+#[cfg(test)]
+mod select_menu_tests {
+    use super::{format_select_menu, number_len, select_indent};
+
+    fn items(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn number_len_digit_counts() {
+        assert_eq!(number_len(1), 1);
+        assert_eq!(number_len(9), 1);
+        assert_eq!(number_len(10), 2);
+        assert_eq!(number_len(99), 2);
+        assert_eq!(number_len(100), 3);
+    }
+
+    #[test]
+    fn indent_emits_tab_across_stop_else_space() {
+        let mut s = String::new();
+        select_indent(&mut s, 6, 11); // crosses the 8-boundary once → tab + 3 spaces
+        assert_eq!(s, "\t   ");
+        let mut s2 = String::new();
+        select_indent(&mut s2, 20, 22); // same tab block → 2 spaces
+        assert_eq!(s2, "  ");
+    }
+
+    #[test]
+    fn single_item() {
+        assert_eq!(format_select_menu(&items(&["only"]), 80), "1) only\n");
+    }
+
+    #[test]
+    fn three_items_single_column() {
+        // 3 short items, COLS=80: cols=80/large, rows becomes 1 → flip to 1 col.
+        assert_eq!(
+            format_select_menu(&items(&["a", "b", "c"]), 80),
+            "1) a\n2) b\n3) c\n"
+        );
+    }
+
+    #[test]
+    fn ten_items_cols80_multicolumn() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            80,
+        );
+        // Verified byte-for-byte against bash 5.2 (COLUMNS=80, cat -A):
+        let expected = "1) one\t    3) three   5) five\t  7) seven   9) nine\n\
+                        2) two\t    4) four    6) six\t  8) eight  10) ten\n";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ten_items_cols40() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            40,
+        );
+        let expected = "1) one\t    5) five    9) nine\n\
+                        2) two\t    6) six    10) ten\n\
+                        3) three    7) seven\n\
+                        4) four\t    8) eight\n";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ten_items_cols110_single_column_flip() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            110,
+        );
+        // Wide COLS → rows==1 flip → single column, numbers right-justified to 2.
+        // (Verified byte-for-byte against bash 5.2 COLUMNS=110 via cat -A.)
+        let expected = concat!(
+            " 1) one\n",
+            " 2) two\n",
+            " 3) three\n",
+            " 4) four\n",
+            " 5) five\n",
+            " 6) six\n",
+            " 7) seven\n",
+            " 8) eight\n",
+            " 9) nine\n",
+            "10) ten\n",
+        );
+        assert_eq!(got, expected);
     }
 }
