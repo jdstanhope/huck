@@ -89,7 +89,7 @@ impl Action {
 /// The set of bash shell keywords huck recognizes. Used by `-A keyword`.
 const SHELL_KEYWORDS: &[&str] = &[
     "!", "[[", "]]", "case", "do", "done", "elif", "else", "esac",
-    "fi", "for", "function", "if", "in", "then", "until", "while", "{", "}",
+    "fi", "for", "function", "if", "in", "select", "then", "until", "while", "{", "}",
 ];
 
 /// Completion context for a single `resolve_spec` call.

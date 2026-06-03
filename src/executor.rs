@@ -236,6 +236,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         }
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
         Command::Arith(expr) => run_arith(expr, shell),
+        Command::Select(clause) => run_select(clause, shell, sink),
     }
 }
 
@@ -317,9 +318,16 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
     use std::sync::atomic::Ordering;
 
     // Expand the word list once — the same path command arguments take.
+    // The no-`in` form (`has_in == false`) iterates the positional
+    // parameters ("$@"); an explicit empty `in` (`has_in == true`, empty
+    // `words`) iterates nothing (M-24a, matching bash).
     let mut values: Vec<String> = Vec::new();
-    for word in &clause.words {
-        values.extend(glob_expand_fields(expand(word, shell)));
+    if clause.has_in {
+        for word in &clause.words {
+            values.extend(glob_expand_fields(expand(word, shell)));
+        }
+    } else {
+        values = shell.positional_args.clone();
     }
 
     let mut last = ExecOutcome::Continue(0);
@@ -358,6 +366,95 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
         }
     }
     last
+}
+
+/// Default screen width when $COLUMNS is unset/invalid (bash uses 80).
+const SELECT_DEFAULT_COLS: usize = 80;
+const SELECT_TABSIZE: usize = 8;
+
+/// Decimal digit count of `n` (bash NUMBER_LEN). n>=1 in practice.
+fn number_len(n: usize) -> usize {
+    let mut len = 1;
+    let mut v = n;
+    while v >= 10 {
+        v /= 10;
+        len += 1;
+    }
+    len
+}
+
+/// Display width of a menu item. ASCII-exact (codepoint count); wide-char
+/// width is a documented sub-divergence (see spec).
+fn select_displen(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Pad column position `from` up to `to` exactly as bash's `indent()`:
+/// emit a tab when crossing an 8-column tab stop, else a space.
+fn select_indent(out: &mut String, mut from: usize, to: usize) {
+    while from < to {
+        if to / SELECT_TABSIZE > from / SELECT_TABSIZE {
+            out.push('\t');
+            from += SELECT_TABSIZE - (from % SELECT_TABSIZE);
+        } else {
+            out.push(' ');
+            from += 1;
+        }
+    }
+}
+
+/// Render the numbered `select` menu byte-for-byte like bash 5.2's
+/// `print_select_list`. `cols_width` is the screen width (COLS). The returned
+/// string (with a trailing newline per row) is written to stderr by the caller.
+fn format_select_menu(items: &[String], cols_width: usize) -> String {
+    let mut out = String::new();
+    let list_len = items.len();
+    if list_len == 0 {
+        // bash print_select_list: `if (list == 0) { putc('\n', stderr); return; }` — emit one newline.
+        // (In practice run_select guards empty lists before calling this.)
+        out.push('\n');
+        return out;
+    }
+    let indices_len = number_len(list_len);
+    let max_item = items.iter().map(|s| select_displen(s)).max().unwrap_or(0);
+    // RP_SPACE_LEN (") ") = 2, plus bash's extra +2 gap.
+    let max_elem_len = max_item + indices_len + 2 + 2;
+
+    // max_elem_len >= 4 (indices_len >= 1, + RP_SPACE_LEN 2, + gap 2); safe to divide.
+    let mut cols = cols_width / max_elem_len;
+    if cols == 0 {
+        cols = 1;
+    }
+    let mut rows = list_len.div_ceil(cols);
+    cols = list_len.div_ceil(rows);
+    if rows == 1 {
+        rows = cols;
+        // After the flip, rows == item count and each row holds one item. cols is
+        // intentionally not set to 1: the inner loop advances ind by rows (now the
+        // full count), so ind >= list_len after the first item in every row.
+    }
+    let first_col_iw = number_len(rows);
+    let other_iw = indices_len;
+
+    for row in 0..rows {
+        let mut ind = row;
+        let mut pos = 0usize;
+        loop {
+            let iw = if pos == 0 { first_col_iw } else { other_iw };
+            let item = &items[ind];
+            // bash print_index_and_element: "%*d" + ") " + item
+            out.push_str(&format!("{:>width$}) {}", ind + 1, item, width = iw));
+            let elem_len = select_displen(item) + iw + 2;
+            ind += rows;
+            if ind >= list_len {
+                break;
+            }
+            select_indent(&mut out, pos + elem_len, pos + max_elem_len);
+            pos += max_elem_len;
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Runs a standalone `((expr))` arith command. Per bash semantics, the
@@ -461,6 +558,139 @@ fn run_arith_for_inner(
             eprintln!("huck: ((: {e}");
             return ExecOutcome::Continue(1);
         }
+    }
+    last
+}
+
+/// Reads one line from stdin into `REPLY` via the `read` builtin's
+/// no-NAME path. Returns the builtin's outcome: `Continue(0)` on success
+/// (REPLY set to the raw line, possibly empty), `Continue(1)` on EOF
+/// (nothing read).
+fn read_line_into_reply(shell: &mut Shell) -> ExecOutcome {
+    let mut devnull: Vec<u8> = Vec::new();
+    crate::builtins::run_builtin("read", &[], &mut devnull, shell)
+}
+
+/// Runs a `select NAME [in WORDS]; do BODY; done` menu loop, mirroring
+/// bash 5.2's `execute_select_command`/`select_query`. The numbered menu
+/// (via `format_select_menu`) and the `PS3` prompt go to stderr; one line
+/// is read into `REPLY` per prompt via the `read` builtin. An empty list
+/// runs the body zero times; `break`/`continue N` bubble via the v79
+/// loop infrastructure. Wrapped to keep a single `loop_depth` return path.
+fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    shell.loop_depth = shell.loop_depth.saturating_add(1);
+    let result = run_select_inner(clause, shell, sink);
+    shell.loop_depth = shell.loop_depth.saturating_sub(1);
+    result
+}
+
+fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    use std::sync::atomic::Ordering;
+
+    // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
+    let items: Vec<String> = match &clause.words {
+        Some(words) => {
+            let mut v = Vec::new();
+            for w in words {
+                v.extend(glob_expand_fields(expand(w, shell)));
+            }
+            v
+        }
+        None => shell.positional_args.clone(),
+    };
+
+    // 2. Empty list → body never runs (bash returns the loop's last status, 0).
+    if items.is_empty() {
+        return ExecOutcome::Continue(0);
+    }
+
+    // 3. Screen width: $COLUMNS if a positive integer, else the default (80).
+    let cols_width = shell
+        .lookup_var("COLUMNS")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(SELECT_DEFAULT_COLS);
+
+    // bash returns the read failure (1) if EOF hits before any body runs;
+    // otherwise the last body status.
+    let mut last = ExecOutcome::Continue(1);
+    let mut show_menu = true;
+
+    loop {
+        // 3a. PS3 (default "#? ").
+        let ps3 = shell.lookup_var("PS3").unwrap_or_else(|| "#? ".to_string());
+
+        // 3b. select_query: (re)print menu when show_menu, prompt, read one
+        //     line. An empty line reprints the menu; EOF terminates the loop.
+        let selection: String = loop {
+            if show_menu {
+                eprint!("{}", format_select_menu(&items, cols_width));
+            }
+            eprint!("{ps3}");
+            let _ = std::io::stderr().flush();
+
+            let r = read_line_into_reply(shell);
+            if !matches!(r, ExecOutcome::Continue(0)) {
+                // EOF / read failure → write a newline to stdout (bash) and
+                // terminate the loop with the last status (read failure if no
+                // body ran).
+                match sink {
+                    StdoutSink::Terminal => {
+                        let _ = writeln!(io::stdout());
+                    }
+                    StdoutSink::Capture(buf) => buf.push(b'\n'),
+                }
+                return last;
+            }
+            let reply = shell.lookup_var("REPLY").unwrap_or_default();
+            if reply.is_empty() {
+                show_menu = true;
+                continue; // reprint menu, re-prompt
+            }
+            // 1-based index; invalid / out-of-range → empty NAME (body runs).
+            match reply.trim().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= items.len() => break items[n - 1].clone(),
+                _ => break String::new(),
+            }
+        };
+
+        // 3c. Bind NAME (honor readonly like the other loop runners).
+        if shell.try_set(&clause.var, selection).is_err() {
+            eprintln!("huck: {}: readonly variable", clause.var);
+            return ExecOutcome::Continue(1);
+        }
+
+        // 3d. SIGINT check (mirror run_for).
+        if shell
+            .sigint_flag
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return ExecOutcome::Continue(130);
+        }
+
+        // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
+        match execute_sequence_body(&clause.body, shell, sink) {
+            ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
+            ExecOutcome::LoopBreak(1, st) => {
+                last = ExecOutcome::Continue(st);
+                break;
+            }
+            ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n - 1, st),
+            ExecOutcome::LoopContinue(1) => {
+                last = ExecOutcome::Continue(0);
+                // fall through — re-prompt
+            }
+            ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
+            ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
+        }
+
+        // 3f. Suppress the menu next iteration unless the last REPLY was empty
+        //     (KSH_COMPATIBLE_SELECT, bash 5.2's default). An empty REPLY was
+        //     handled inside the inner loop (it reprints there), so a body
+        //     iteration always means a non-empty REPLY → suppress.
+        show_menu = false;
     }
     last
 }
@@ -3865,6 +4095,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: echo_var_seq("x"),
         };
         let mut shell = Shell::new();
@@ -3878,6 +4109,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![],
+            has_in: true,
             body: echo_seq("hi"),
         };
         let mut shell = Shell::new();
@@ -3887,10 +4119,37 @@ mod tests {
     }
 
     #[test]
+    fn select_empty_list_runs_no_body_and_restores_depth() {
+        let mut sh = Shell::new();
+        // `select x in ; do exit 7; done` — empty `in` → body never runs → status 0.
+        let outcome = crate::shell::process_line("select x in; do exit 7; done", &mut sh, false);
+        assert_eq!(sh.loop_depth, 0, "loop_depth must be restored");
+        // The shell did not exit 7 (body never ran):
+        assert!(!matches!(outcome, ExecOutcome::Exit(7)));
+    }
+
+    #[test]
+    fn for_without_in_iterates_positionals() {
+        // M-24a: `for x; do ... done` with no `in` iterates "$@".
+        let clause = ForClause {
+            var: "x".to_string(),
+            words: vec![],
+            has_in: false,
+            body: echo_var_seq("x"),
+        };
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (out, status) = execute_capturing(&for_seq(clause), &mut shell);
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
     fn for_variable_holds_last_value_after_loop() {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: echo_var_seq("x"),
         };
         let mut shell = Shell::new();
@@ -3903,6 +4162,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: break_seq(),
         };
         let mut shell = Shell::new();
@@ -3930,6 +4190,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body,
         };
         let mut shell = Shell::new();
@@ -5274,5 +5535,101 @@ mod loop_levels_executor_tests {
         );
         // Normal break leaves $? = 0 (no regression from the status-carrying change).
         assert_eq!(sh.last_status(), 0);
+    }
+}
+
+#[cfg(test)]
+mod select_menu_tests {
+    use super::{format_select_menu, number_len, select_indent};
+
+    fn items(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn number_len_digit_counts() {
+        assert_eq!(number_len(1), 1);
+        assert_eq!(number_len(9), 1);
+        assert_eq!(number_len(10), 2);
+        assert_eq!(number_len(99), 2);
+        assert_eq!(number_len(100), 3);
+    }
+
+    #[test]
+    fn indent_emits_tab_across_stop_else_space() {
+        let mut s = String::new();
+        select_indent(&mut s, 6, 11); // crosses the 8-boundary once → tab + 3 spaces
+        assert_eq!(s, "\t   ");
+        let mut s2 = String::new();
+        select_indent(&mut s2, 20, 22); // same tab block → 2 spaces
+        assert_eq!(s2, "  ");
+        let mut s3 = String::new();
+        select_indent(&mut s3, 8, 11); // from is exactly on a tab stop → no tab emitted, 3 spaces
+        assert_eq!(s3, "   ");
+    }
+
+    #[test]
+    fn single_item() {
+        assert_eq!(format_select_menu(&items(&["only"]), 80), "1) only\n");
+    }
+
+    #[test]
+    fn three_items_single_column() {
+        // 3 items: max_elem_len=6, cols=80/6=13, rows=ceil(3/13)=1 → flip → 3 rows × 1 col.
+        assert_eq!(
+            format_select_menu(&items(&["a", "b", "c"]), 80),
+            "1) a\n2) b\n3) c\n"
+        );
+    }
+
+    #[test]
+    fn ten_items_cols80_multicolumn() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            80,
+        );
+        // Verified byte-for-byte against bash 5.2 (COLUMNS=80, cat -A):
+        let expected = "1) one\t    3) three   5) five\t  7) seven   9) nine\n\
+                        2) two\t    4) four    6) six\t  8) eight  10) ten\n";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ten_items_cols40() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            40,
+        );
+        let expected = "1) one\t    5) five    9) nine\n\
+                        2) two\t    6) six    10) ten\n\
+                        3) three    7) seven\n\
+                        4) four\t    8) eight\n";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ten_items_cols110_single_column_flip() {
+        let got = format_select_menu(
+            &items(&["one", "two", "three", "four", "five",
+                     "six", "seven", "eight", "nine", "ten"]),
+            110,
+        );
+        // Wide COLS → rows==1 flip → single column, numbers right-justified to 2.
+        // (Verified byte-for-byte against bash 5.2 COLUMNS=110 via cat -A.)
+        let expected = concat!(
+            " 1) one\n",
+            " 2) two\n",
+            " 3) three\n",
+            " 4) four\n",
+            " 5) five\n",
+            " 6) six\n",
+            " 7) seven\n",
+            " 8) eight\n",
+            " 9) nine\n",
+            "10) ten\n",
+        );
+        assert_eq!(got, expected);
     }
 }

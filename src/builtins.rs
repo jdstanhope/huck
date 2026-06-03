@@ -4390,6 +4390,11 @@ static HELP_ENTRIES: &[HelpEntry] = &[
                       -p (or no names) lists all readonly vars.",
     },
     HelpEntry {
+        name: "select",
+        synopsis: "select NAME [in WORDS ...]; do COMMANDS; done",
+        description: "Present a numbered menu of WORDS (or the positional parameters when `in WORDS` is omitted) on stderr, print the PS3 prompt, and read a line into REPLY. Set NAME to the chosen word (empty if the reply is not a valid item number) and run COMMANDS, repeating until end-of-input or a break. A blank line reprints the menu.",
+    },
+    HelpEntry {
         name: "return",
         synopsis: "return [N]",
         description: "Return from a shell function.\n\
@@ -4834,7 +4839,7 @@ fn is_shell_keyword(name: &str) -> bool {
         name,
         "if" | "then" | "elif" | "else" | "fi"
         | "while" | "until" | "do" | "done"
-        | "for" | "in"
+        | "for" | "in" | "select"
         | "case" | "esac"
         | "function"
         | "!"
@@ -9556,7 +9561,7 @@ mod help_tests {
         // Shell keywords (if/for/while/etc.) have their own HelpEntry
         // alongside builtins, so `help if` resolves rather than
         // erroring with "no help topics match".
-        for kw in ["if", "for", "while", "case", "function", "[[", "{"] {
+        for kw in ["if", "for", "while", "case", "function", "[[", "{", "select"] {
             let (oc, out) = run(&[kw]);
             assert!(
                 matches!(oc, ExecOutcome::Continue(0)),

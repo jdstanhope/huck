@@ -88,6 +88,7 @@ spec, an implementation plan, and a test suite.
 | v78       | C-style `for ((init;cond;step))` + standalone `((expr))` (M-23) |
 | v79       | `break N` / `continue N` loop levels (M-30)                     |
 | v80       | fix flaky pty test (post-Ctrl-C/Ctrl-Z input race under load)   |
+| v81       | `select` loops (M-24) + no-`in` `for` positionals (M-24a)       |
 
 ## Build and run
 
@@ -233,8 +234,9 @@ line.
 the loop — variables, command substitution, globs, and word-splitting
 all apply, exactly as for command arguments (`for f in *.txt`, `for x
 in $list`, `for n in $(seq 3)`). `break`/`continue` and multi-line form
-work as for `while`. The no-`in` form (`for NAME; do … done`) runs the
-body zero times — huck has no positional parameters for it to iterate.
+work as for `while`. The no-`in` form (`for NAME; do … done`) iterates
+`"$@"` — the current positional parameters — matching bash (M-24a, v81).
+An explicit empty `in` (`for x in ; …`) still iterates nothing.
 After the loop `NAME` keeps its last value. C-style `for ((init;cond;step))`
 is also supported (v78).
 
@@ -252,6 +254,14 @@ the enclosing loop — `case` is not a loop. Multi-line form works as for
 the other compound commands. Adding `case` made `(`, `)`, `;;`, `;&`,
 `;;&` lexer tokens; an unquoted `(` or `)` is now a shell metacharacter
 (quote it to keep it literal: `"("`/`')'`).
+
+**`select` loops (v81):**
+`select NAME [in WORDS ...]; do COMMANDS; done` presents a numbered menu
+of WORDS on stderr, prints the `PS3` prompt (`#? ` by default), and reads
+a line into `REPLY`. `NAME` is set to the chosen word (or empty if the
+reply is not a valid item number) and `COMMANDS` run; the loop repeats
+until EOF or `break`. A blank line at the prompt reprints the menu without
+running the body. The no-`in` form iterates `"$@"`, matching bash.
 
 **Functions (v22):**
 `name() compound-command` defines a function (the canonical body is a

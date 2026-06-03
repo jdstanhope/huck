@@ -81,7 +81,7 @@ pub fn classify(buffer: &str) -> Completeness {
 fn ends_with_control_keyword(line: &str) -> bool {
     matches!(
         line.split_whitespace().next_back(),
-        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "in" | "case" | "{")
+        Some("if" | "while" | "until" | "then" | "do" | "else" | "elif" | "for" | "select" | "in" | "case" | "{")
     )
 }
 
