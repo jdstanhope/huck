@@ -32,6 +32,7 @@ fn is_unterminated_lex(e: &LexError) -> bool {
             | LexError::UnterminatedBrace
             | LexError::UnterminatedSubstitution
             | LexError::UnterminatedArith
+            | LexError::UnterminatedArithBlock
     )
 }
 
@@ -151,6 +152,25 @@ mod tests {
     fn open_arithmetic_expansion_is_incomplete() {
         assert_eq!(
             classify("echo $((1 + 2"),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        );
+    }
+
+    #[test]
+    fn unterminated_arith_block_requests_more_input() {
+        // `((1+2` — no closing `))`. Should classify as Incomplete,
+        // not Error, so the REPL prompts for continuation.
+        assert_eq!(
+            classify("((1+2"),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        );
+    }
+
+    #[test]
+    fn unterminated_arith_for_header_requests_more_input() {
+        // `for ((;;` — the arith block isn't closed yet.
+        assert_eq!(
+            classify("for ((;;"),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
