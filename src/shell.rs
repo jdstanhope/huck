@@ -499,6 +499,12 @@ pub(crate) fn parse_error_message(error: ParseError) -> String {
         ParseError::TestExprMissingOperand => {
             "missing operand in '[[ ]]'".to_string()
         }
+        ParseError::ArithBlock(msg) => {
+            format!("arithmetic '((...))': {msg}")
+        }
+        ParseError::ArithForHeader(msg) => {
+            format!("'for ((...))' header: {msg}")
+        }
     }
 }
 
@@ -537,6 +543,9 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
         }
         LexError::ArrayLiteralMissingEquals => {
             ": array element subscript requires '=' after ']'".to_string()
+        }
+        LexError::UnterminatedArithBlock => {
+            ": unterminated '((' arithmetic block".to_string()
         }
     }
 }

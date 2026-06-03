@@ -234,6 +234,9 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::DoubleBracket { expr, inline_assignments } => {
             run_double_bracket(expr, inline_assignments, shell)
         }
+        Command::Arith(_) | Command::ArithFor(_) => {
+            unimplemented!("Command::Arith and Command::ArithFor wired in v78 Task 2")
+        }
     }
 }
 
