@@ -261,14 +261,18 @@ $ printf 'set -- a b c\nfor x; do echo got=$x; done\necho end\n' | bash   # → 
 leaves `words` empty for the no-`in` form, so the loop body never runs. This is
 a real, currently-undocumented divergence (call it **M-24a**).
 
-**Proposed handling (small, shares logic with `select`):** fix `for`'s no-`in`
-form to iterate `"$@"` as part of v81, since `select` needs the exact same
-positional-fallback expansion. This is a focused change (the loop runners gain
-"if no explicit `in`, use `shell.positional_args`") plus a regression test, and
-it closes M-24a in the same iteration. **Alternative:** leave `for` as-is, make
-only `select` correct, and log M-24a as a new `[deferred] low` entry. Decision
-to confirm at spec-review; the plan will assume the fix-both approach unless
-told otherwise (it is cheap and removes an inconsistency).
+**Decision (approved at spec review): fix `for` too in v81.** `select` and
+`for` share the no-`in` → `"$@"` positional fallback, so both are fixed in this
+iteration. To distinguish no-`in` from explicit-empty-`in`, `ForClause` needs
+the same `Option`-style distinction `SelectClause` uses, OR a `has_in: bool`
+flag added to `ForClause`. Implementation approach (confirm cheapest during
+planning): add `has_in: bool` to `ForClause` (set by `parse_for_after_keyword`)
+and, in `run_for_inner`, when `!has_in` expand `shell.positional_args` instead
+of the empty `words`. A regression test pins `set -- a b c; for x; do …; done`
+→ iterates `a b c`, and a `select`-side test pins the same for `select`. This
+closes M-24a. Note: `for x in ; do` (explicit empty `in`, `has_in=true`,
+`words=[]`) must still iterate nothing — only the *no-`in`* form falls back to
+positionals.
 
 ## Out of scope / documented divergences
 
@@ -286,8 +290,9 @@ told otherwise (it is cheap and removes an inconsistency).
 
 | File | Change |
 |------|--------|
-| `src/command.rs` | `Keyword::Select` (+`as_str`,+`keyword_of`); `SelectClause` struct; `Command::Select`; `parse_select_command`; wire into `parse_command` + `parse_next_stage`; parser unit tests |
-| `src/executor.rs` | `run_select` (loop runner, v79 `loop_depth` wrapper + decrement-and-bubble); `Command::Select` dispatch arm; `format_select_menu` helper + menu unit tests |
+| `src/command.rs` | `Keyword::Select` (+`as_str`,+`keyword_of`); `SelectClause` struct; `Command::Select`; `parse_select_command`; wire into `parse_command` + `parse_next_stage`; **`has_in: bool` added to `ForClause`** (M-24a); parser unit tests |
+| `src/executor.rs` | `run_select` (loop runner, v79 `loop_depth` wrapper + decrement-and-bubble); `Command::Select` dispatch arm; `format_select_menu` helper + menu unit tests; **`run_for_inner` no-`in` → `"$@"` fallback** (M-24a) + regression test |
+| `tests/scripts/select_diff_check.sh` / for harness | a `for`-no-`in` fragment (`set -- a b c; for x; do echo $x; done`) byte-identical to bash (M-24a) |
 | `tests/select_integration.rs` | NEW — binary-driven integration tests |
 | `tests/scripts/select_diff_check.sh` | NEW — huck's 8th bash-diff harness |
 | `tests/pty_interactive.rs` | one new pty `select` test |
