@@ -197,6 +197,14 @@ pub struct Shell {
     /// `builtin_local` checks for that.
     pub local_scopes: Vec<std::collections::HashMap<String, Option<Variable>>>,
 
+    /// Tracks current loop-nesting depth. Incremented by run_for /
+    /// run_while / run_arith_for via single-return-path wrappers,
+    /// decremented on exit. Saved+restored across call_function so
+    /// `break` inside a function called from a loop correctly errors.
+    /// Used by `break` / `continue` builtins to validate they're in
+    /// a loop and to cap the level argument to actual depth.
+    pub loop_depth: u32,
+
     /// Command-name hash table populated by the `hash` builtin.
     /// Maps a bare name to (resolved path, hit count). Hit count
     /// is currently always 0 — no executor integration yet (see
@@ -254,6 +262,7 @@ impl Shell {
             err_suppressed_depth: 0,
             source_depth: 0,
             local_scopes: Vec::new(),
+            loop_depth: 0,
             command_hash: std::collections::HashMap::new(),
             dir_stack: Vec::new(),
             completion_specs: CompletionSpecs::default(),
