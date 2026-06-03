@@ -66,6 +66,21 @@ else
 fi
 rm -f "$SCRIPT"
 
+# 8. Missing-file invocation: both bash and huck exit 127 for a nonexistent
+#    script. The stderr message text intentionally differs (bash uses its own
+#    prefix; huck uses "huck:" — documented in M-77a), so we compare ONLY the
+#    exit code here, not stderr.
+bc=$(bash /no/such/script-xyz 2>/dev/null; echo "$?")
+hc=$("$HUCK_BIN" /no/such/script-xyz 2>/dev/null; echo "$?")
+if [[ "$bc" == "$hc" ]]; then
+    printf 'PASS: %s\n' "missing file exit code ($bc)"
+    PASS=$((PASS + 1))
+else
+    printf 'FAIL: %s\n' "missing file exit code"
+    printf '    bash=%s huck=%s\n' "$bc" "$hc"
+    FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "Total: $((PASS + FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

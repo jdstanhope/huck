@@ -126,3 +126,11 @@ fn payoff_read_from_file_consumes_real_stdin() {
     let (out, _e, _c) = run(&[f.path().to_str().unwrap()], "hello\n");
     assert_eq!(out, "got=hello\n");
 }
+
+#[test]
+fn set_u_aborts_script_on_unbound_var() {
+    let f = write_script("set -u\necho \"x=$UNSET_VAR_XYZ\"\necho after\n");
+    let (out, _e, c) = run(&[f.path().to_str().unwrap()], "");
+    assert!(!out.contains("after"), "set -u should abort before 'after': {out:?}");
+    assert_ne!(c, 0, "set -u unbound var should exit non-zero");
+}
