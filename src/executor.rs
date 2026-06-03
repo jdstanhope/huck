@@ -236,6 +236,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         }
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
         Command::Arith(expr) => run_arith(expr, shell),
+        Command::Select(clause) => run_select(clause, shell, sink),
     }
 }
 
@@ -557,6 +558,17 @@ fn run_arith_for_inner(
         }
     }
     last
+}
+
+/// Stub for `select` execution — replaced in Task 3 with the real runner.
+#[allow(dead_code)]
+fn run_select(
+    _clause: &crate::command::SelectClause,
+    _shell: &mut Shell,
+    _sink: &mut StdoutSink,
+) -> ExecOutcome {
+    // Task 3 implements this.
+    ExecOutcome::Continue(0)
 }
 
 /// Matches `subject` against a `case` clause's `|`-patterns. A clause
@@ -3959,6 +3971,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: echo_var_seq("x"),
         };
         let mut shell = Shell::new();
@@ -3972,6 +3985,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![],
+            has_in: true,
             body: echo_seq("hi"),
         };
         let mut shell = Shell::new();
@@ -3985,6 +3999,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: echo_var_seq("x"),
         };
         let mut shell = Shell::new();
@@ -3997,6 +4012,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body: break_seq(),
         };
         let mut shell = Shell::new();
@@ -4024,6 +4040,7 @@ mod tests {
         let clause = ForClause {
             var: "x".to_string(),
             words: vec![lit_word("a"), lit_word("b"), lit_word("c")],
+            has_in: true,
             body,
         };
         let mut shell = Shell::new();

@@ -20,6 +20,7 @@ enum Keyword {
     DoubleBracketOpen,   // [[
     DoubleBracketClose,  // ]]
     Function,
+    Select,
 }
 
 impl Keyword {
@@ -43,6 +44,7 @@ impl Keyword {
             Keyword::DoubleBracketOpen => "[[",
             Keyword::DoubleBracketClose => "]]",
             Keyword::Function => "function",
+            Keyword::Select => "select",
         }
     }
 }
@@ -77,6 +79,7 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "[[" => Some(Keyword::DoubleBracketOpen),
         "]]" => Some(Keyword::DoubleBracketClose),
         "function" => Some(Keyword::Function),
+        "select" => Some(Keyword::Select),
         _ => None,
     }
 }
@@ -434,6 +437,8 @@ pub enum Command {
     Arith(crate::arith::ArithExpr),
     /// NEW (v78): C-style `for ((init; cond; step)) do BODY done`.
     ArithFor(Box<ArithForClause>),
+    /// NEW (v81): `select NAME [in WORDS]; do BODY; done`.
+    Select(Box<SelectClause>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -457,7 +462,21 @@ pub struct ForClause {
     pub var: String,
     /// The unexpanded `in` word list. Empty for the no-`in` form.
     pub words: Vec<Word>,
+    /// True when an explicit `in WORDS` clause was present. The no-`in`
+    /// form (`has_in == false`) iterates the positional params (Task 3).
+    pub has_in: bool,
     /// The do…done body.
+    pub body: Sequence,
+}
+
+/// NEW (v81): a `select NAME [in WORDS]; do BODY; done` clause.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct SelectClause {
+    /// Loop variable name — a validated identifier.
+    pub var: String,
+    /// None => no `in` clause (iterate the positional params "$@").
+    /// Some(words) => explicit `in WORDS` (Some(vec![]) = empty `in`).
+    pub words: Option<Vec<Word>>,
     pub body: Sequence,
 }
 
@@ -688,6 +707,10 @@ fn parse_command<I: Iterator<Item = Token>>(
             Ok(Command::While(Box::new(parse_while(iter)?)))
         }
         Some(Keyword::For) => parse_for_command(iter),
+        Some(Keyword::Select) => {
+            iter.next(); // consume `select`
+            parse_select_command(iter)
+        }
         Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
         Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
         Some(Keyword::DoubleBracketOpen) => parse_double_bracket(iter),
@@ -783,6 +806,7 @@ fn is_function_body_shape(body: &Command) -> bool {
         Command::If(_)
             | Command::While(_)
             | Command::For(_)
+            | Command::Select(_)
             | Command::Case(_)
             | Command::BraceGroup(_)
             | Command::Subshell { .. }
@@ -1102,7 +1126,7 @@ fn parse_for_after_keyword<I: Iterator<Item = Token>>(
 
     // Optional `in` plus the word list.
     let mut words: Vec<Word> = Vec::new();
-    if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
+    let has_in = if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
         iter.next(); // consume `in`
         loop {
             match iter.peek() {
@@ -1119,7 +1143,10 @@ fn parse_for_after_keyword<I: Iterator<Item = Token>>(
                 }
             }
         }
-    }
+        true
+    } else {
+        false
+    };
 
     // Skip `;`/newline separators, then `do`.
     while matches!(
@@ -1132,7 +1159,61 @@ fn parse_for_after_keyword<I: Iterator<Item = Token>>(
 
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
     expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
-    Ok(ForClause { var, words, body })
+    Ok(ForClause { var, words, has_in, body })
+}
+
+/// Parses `select NAME [in WORD...] sep do LIST done`. The `select` keyword
+/// has already been consumed by the caller. Mirrors `parse_for_after_keyword`
+/// but builds a `SelectClause` with `words: Option<Vec<Word>>` to distinguish
+/// the no-`in` form (None) from an explicit `in` clause (Some, possibly empty).
+fn parse_select_command<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    // Loop variable. End-of-input means the command is incomplete.
+    let var = match iter.next() {
+        None => return Err(ParseError::UnterminatedLoop),
+        Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
+    };
+
+    // POSIX allows a linebreak between the variable and `in`.
+    skip_newlines(iter);
+
+    // Optional `in` plus the word list.
+    let words: Option<Vec<Word>> = if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
+        iter.next(); // consume `in`
+        let mut list: Vec<Word> = Vec::new();
+        loop {
+            match iter.peek() {
+                None | Some(Token::Newline) | Some(Token::Op(Operator::Semi)) => break,
+                Some(tok) => {
+                    if keyword_of(tok) == Some(Keyword::Do) {
+                        break;
+                    }
+                    match iter.next() {
+                        Some(Token::Word(w)) => list.push(w),
+                        Some(Token::Op(_)) => return Err(ParseError::UnexpectedToken),
+                        _ => unreachable!("peek already ruled out Newline/Semi/None here"),
+                    }
+                }
+            }
+        }
+        Some(list)
+    } else {
+        None
+    };
+
+    // Skip `;`/newline separators, then `do`.
+    while matches!(
+        iter.peek(),
+        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+    ) {
+        iter.next();
+    }
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    Ok(Command::Select(Box::new(SelectClause { var, words, body })))
 }
 
 /// Parses `case WORD in [clause]... esac`. The caller has peeked `case`.
@@ -1610,6 +1691,10 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
             Ok((Command::While(Box::new(parse_while(iter)?)), false))
         }
         Some(Keyword::For) => Ok((parse_for_command(iter)?, false)),
+        Some(Keyword::Select) => {
+            iter.next(); // consume `select`
+            Ok((parse_select_command(iter)?, false))
+        }
         Some(Keyword::Case) => Ok((Command::Case(Box::new(parse_case(iter)?)), false)),
         Some(Keyword::LBrace) => {
             Ok((Command::BraceGroup(Box::new(parse_brace_group(iter)?)), false))
@@ -2030,6 +2115,7 @@ mod tests {
             Command::DoubleBracket { .. } => panic!("expected a pipeline, got a double bracket"),
             Command::Arith(_) => panic!("expected a pipeline, got an arith command"),
             Command::ArithFor(_) => panic!("expected a pipeline, got an arith for"),
+            Command::Select(_) => panic!("expected a pipeline, got a select"),
         }
     }
 
@@ -2547,6 +2633,7 @@ mod tests {
             Command::DoubleBracket { .. } => panic!("expected an if, got a double bracket"),
             Command::Arith(_) => panic!("expected an if, got an arith command"),
             Command::ArithFor(_) => panic!("expected an if, got an arith for"),
+            Command::Select(_) => panic!("expected an if, got a select"),
         }
     }
 
@@ -2841,6 +2928,48 @@ mod tests {
             ]),
             Err(ParseError::UnexpectedToken)
         );
+    }
+
+    /// Lex a string and parse it into a single `Command` — used by
+    /// select parser tests (mirrors the inline `parse()` token-vector
+    /// approach, but accepts raw source so the tests are readable).
+    fn parse_one(src: &str) -> Command {
+        let tokens = crate::lexer::tokenize(src).expect("lex failed");
+        let seq = parse(tokens).expect("parse failed").expect("empty parse");
+        seq.first
+    }
+
+    #[test]
+    fn parses_select_with_in() {
+        let cmd = parse_one("select x in a b c; do echo $x; done");
+        match cmd {
+            Command::Select(s) => {
+                assert_eq!(s.var, "x");
+                assert_eq!(s.words.as_ref().map(|w| w.len()), Some(3));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_select_without_in_is_none() {
+        let cmd = parse_one("select x; do echo $x; done");
+        match cmd {
+            Command::Select(s) => {
+                assert_eq!(s.var, "x");
+                assert!(s.words.is_none(), "no-`in` select must have words == None");
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_select_empty_in_is_some_empty() {
+        let cmd = parse_one("select x in; do echo $x; done");
+        match cmd {
+            Command::Select(s) => assert_eq!(s.words, Some(vec![])),
+            other => panic!("expected Select, got {other:?}"),
+        }
     }
 
     #[test]
