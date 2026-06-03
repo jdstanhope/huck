@@ -787,6 +787,8 @@ fn is_function_body_shape(body: &Command) -> bool {
             | Command::BraceGroup(_)
             | Command::Subshell { .. }
             | Command::DoubleBracket { .. }
+            | Command::Arith(_)
+            | Command::ArithFor(_)
     )
 }
 
@@ -4289,6 +4291,34 @@ mod tests {
                 assert_eq!(name, "f");
                 assert!(matches!(*body, Command::DoubleBracket { .. }),
                         "expected DoubleBracket body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_body_can_be_standalone_arith() {
+        let tokens = crate::lexer::tokenize("f() ((1+2))").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::Arith(_)),
+                        "expected arith body, got {body:?}");
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_body_can_be_arith_for_loop() {
+        let tokens = crate::lexer::tokenize("f() for ((i=0;i<3;i++)) do :; done").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty parse");
+        match parsed.first {
+            Command::FunctionDef { name, body } => {
+                assert_eq!(name, "f");
+                assert!(matches!(*body, Command::ArithFor(_)),
+                        "expected arith-for body, got {body:?}");
             }
             other => panic!("expected FunctionDef, got {other:?}"),
         }

@@ -1173,11 +1173,6 @@ fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
     }
 }
 
-/// Reads the inner text of a `$((...))` arithmetic expansion. The opening
-/// `$((` has already been consumed; this function scans forward until the
-/// matching `))` at depth 0. Returns the inner text (without the closing
-/// `))`). Tracks paren depth so that nested `(` / `)` inside the
-/// expression do not prematurely close the expansion.
 /// Scans the body of a `(( ... ))` block. The caller has already
 /// consumed both opening `(` characters; this function consumes the
 /// body and the matching `))`. Returns the raw body text. Tracks
@@ -1208,6 +1203,11 @@ fn scan_arith_block(
     Err(LexError::UnterminatedArithBlock)
 }
 
+/// Reads the inner text of a `$((...))` arithmetic expansion. The opening
+/// `$((` has already been consumed; this function scans forward until the
+/// matching `))` at depth 0. Returns the inner text (without the closing
+/// `))`). Tracks paren depth so that nested `(` / `)` inside the
+/// expression do not prematurely close the expansion.
 fn scan_arith_body(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 ) -> Result<String, LexError> {
