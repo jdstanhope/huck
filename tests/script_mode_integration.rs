@@ -44,8 +44,9 @@ fn c_mode_first_operand_is_argv0() {
 
 #[test]
 fn c_mode_no_operands_argv0_is_shell_name() {
-    let (out, _e, _c) = run(&["-c", "echo \"1=$1 #=$#\""], "");
-    assert_eq!(out, "1= #=0\n");
+    let (out, _e, _c) = run(&["-c", "echo \"0=$0 1=$1 #=$#\""], "");
+    assert!(out.starts_with("0=") && out.contains("huck"), "expected shell name in $0: {out:?}");
+    assert!(out.contains("#=0"), "expected #=0: {out:?}");
 }
 
 #[test]
@@ -109,8 +110,9 @@ fn set_e_propagates_failure_exit() {
 }
 
 #[test]
-fn double_dash_allows_dash_leading_script() {
-    // `--` so a leading-dash path isn't treated as an option.
+fn double_dash_routes_to_file_execution() {
+    // `--` routes remaining operands to file-execution mode (the dash-leading
+    // parse case is covered by the cli_double_dash_ends_options_for_file unit test).
     let f = write_script("echo viadashdash\n");
     let (out, _e, c) = run(&["--", f.path().to_str().unwrap()], "");
     assert_eq!(out, "viadashdash\n");

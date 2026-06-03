@@ -209,6 +209,8 @@ fn run_program(
     );
     let code = match outcome {
         ExecOutcome::Exit(n) => n,
+        // run_sourced_contents normalizes FunctionReturn -> Continue, so this arm is
+        // defensive; treat a stray top-level return code as the exit status.
         ExecOutcome::FunctionReturn(n) => n,
         ExecOutcome::Continue(s) => shell.take_pending_fatal_pe_error().unwrap_or(s),
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
@@ -249,9 +251,14 @@ pub fn run(args: &[String]) -> i32 {
         RunMode::File { path, args } => {
             let contents = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
-                Err(_) => {
-                    eprintln!("huck: {}: No such file or directory", path.display());
-                    return 127;
+                Err(e) => {
+                    let (msg, code) = if e.kind() == std::io::ErrorKind::NotFound {
+                        ("No such file or directory".to_string(), 127)
+                    } else {
+                        (e.to_string(), 126)
+                    };
+                    eprintln!("huck: {}: {msg}", path.display());
+                    return code;
                 }
             };
             let label = path.display().to_string();
