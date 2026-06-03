@@ -70,12 +70,27 @@ fn expect_eof(session: &mut OsSession) {
 }
 
 /// Brief pause to let huck cross a terminal-mode boundary that produces
-/// no output to sync on. Used before sending Ctrl-C into a blocking
-/// builtin: rustyline echoes the submitted line *before* huck leaves
-/// raw mode and enters the builtin, so a Ctrl-C sent the instant the
-/// echo is seen can land in raw mode (where `\x03` is a line-edit key,
-/// not a signal). Pausing guarantees huck has reached the cooked-mode
-/// poll loop, so the keystroke becomes a real SIGINT.
+/// no output to sync on. Two boundaries need it:
+///
+/// 1. **Before sending Ctrl-C/Ctrl-Z into a blocking builtin/pipeline:**
+///    rustyline echoes the submitted line *before* huck leaves raw mode
+///    and enters the builtin, so a control char sent the instant the echo
+///    is seen can land in raw mode (where `\x03` is a line-edit key, not a
+///    signal). Pausing guarantees huck reached the cooked-mode poll loop.
+///
+/// 2. **After a control-char-induced transition, before sending the next
+///    command:** when huck returns to the REPL after Ctrl-C/Ctrl-Z (job
+///    stopped, `wait` interrupted, heredoc/continuation aborted), it
+///    redraws the prompt and rustyline RE-ENTERS raw mode, which flushes
+///    pending terminal input (`TCSAFLUSH`). The redrawn `huck> ` prompt is
+///    therefore necessary but NOT sufficient: a command sent in the window
+///    between the prompt appearing and rustyline's read being ready is
+///    silently discarded, after which huck waits forever and the next
+///    `expect()` times out. Under CPU load (the 23 pty tests run in
+///    parallel) this window widens enough to drop the keystrokes. Pausing
+///    before the post-transition send lets rustyline finish re-entry first.
+///    (This is a test-synchronization concern, not a huck bug — a real
+///    user typing after the visible prompt is far slower than this window.)
 fn settle() {
     std::thread::sleep(Duration::from_millis(600));
 }
@@ -354,10 +369,12 @@ fn ctrl_c_breaks_out_of_wait() {
     settle();
     // Ctrl-C must break the blocking `wait` and return to the prompt.
     send(&mut session, CTRL_C);
-    // Sync to the fresh prompt the loop redraws after `wait` returns,
-    // so `echo afterwait` is not typed during the cooked->raw mode
-    // transition.
+    // Sync to the fresh prompt the loop redraws after `wait` returns, then
+    // settle: the prompt alone is not enough — rustyline's raw-mode re-entry
+    // flushes type-ahead, so `echo afterwait` typed in that window is lost
+    // under load (settle()'s boundary #2).
     expect(&mut session, "huck> ");
+    settle();
     send(&mut session, "echo afterwait");
     send(&mut session, ENTER);
     expect(&mut session, "afterwait");
@@ -532,6 +549,10 @@ fn pty_compound_stage_pipeline_stops_and_resumes() {
     send(&mut session, "\x1a");
     expect(&mut session, "Stopped");
     expect(&mut session, "huck> ");
+    // Let rustyline finish re-entering raw mode after the stop before we
+    // type again — see settle()'s boundary #2 (the redrawn prompt alone is
+    // not a safe barrier; the keystrokes can be flushed under load).
+    settle();
     // Kill the stopped job so the test exits cleanly.
     send(&mut session, "kill %1");
     send(&mut session, ENTER);
@@ -561,6 +582,7 @@ fn pty_heredoc_ctrl_c_aborts_body_collection() {
     send(&mut session, CTRL_C);
     // Buffer was discarded — confirm by running a fresh command.
     expect(&mut session, "huck> ");
+    settle(); // post-transition raw-mode re-entry flushes type-ahead (boundary #2)
     send(&mut session, "pwd");
     send(&mut session, ENTER);
     let marker = dir.path().file_name().unwrap().to_str().unwrap();
@@ -602,6 +624,7 @@ fn pty_subshell_ctrl_c_aborts_body_collection() {
     send(&mut session, CTRL_C);
     expect(&mut session, "huck> ");
     // Buffer was discarded — confirm by running a fresh command.
+    settle(); // post-transition raw-mode re-entry flushes type-ahead (boundary #2)
     send(&mut session, "pwd");
     send(&mut session, ENTER);
     let marker = dir.path().file_name().unwrap().to_str().unwrap();
