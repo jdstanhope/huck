@@ -407,6 +407,8 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
     let mut out = String::new();
     let list_len = items.len();
     if list_len == 0 {
+        // bash print_select_list: `if (list == 0) { putc('\n', stderr); return; }` — emit one newline.
+        // (In practice run_select guards empty lists before calling this.)
         out.push('\n');
         return out;
     }
@@ -424,7 +426,9 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
     cols = list_len.div_ceil(rows);
     if rows == 1 {
         rows = cols;
-        // cols = 1 (implicitly; no further use)
+        // After the flip, rows == item count and each row holds one item. cols is
+        // intentionally not set to 1: the inner loop advances ind by rows (now the
+        // full count), so ind >= list_len after the first item in every row.
     }
     let first_col_iw = number_len(rows);
     let other_iw = indices_len;
@@ -5392,6 +5396,9 @@ mod select_menu_tests {
         let mut s2 = String::new();
         select_indent(&mut s2, 20, 22); // same tab block → 2 spaces
         assert_eq!(s2, "  ");
+        let mut s3 = String::new();
+        select_indent(&mut s3, 8, 11); // from is exactly on a tab stop → no tab emitted, 3 spaces
+        assert_eq!(s3, "   ");
     }
 
     #[test]
@@ -5401,7 +5408,7 @@ mod select_menu_tests {
 
     #[test]
     fn three_items_single_column() {
-        // 3 short items, COLS=80: cols=80/large, rows becomes 1 → flip to 1 col.
+        // 3 items: max_elem_len=6, cols=80/6=13, rows=ceil(3/13)=1 → flip → 3 rows × 1 col.
         assert_eq!(
             format_select_menu(&items(&["a", "b", "c"]), 80),
             "1) a\n2) b\n3) c\n"
