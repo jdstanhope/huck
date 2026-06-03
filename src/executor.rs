@@ -585,7 +585,6 @@ fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &m
 }
 
 fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    use std::io::Write;
     use std::sync::atomic::Ordering;
 
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
