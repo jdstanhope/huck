@@ -88,6 +88,7 @@ spec, an implementation plan, and a test suite.
 | v78       | C-style `for ((init;cond;step))` + standalone `((expr))` (M-23) |
 | v79       | `break N` / `continue N` loop levels (M-30)                     |
 | v80       | fix flaky pty test (post-Ctrl-C/Ctrl-Z input race under load)   |
+| v81       | `select` loops (M-24) + no-`in` `for` positionals (M-24a)       |
 
 ## Build and run
 

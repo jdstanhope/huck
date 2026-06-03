@@ -632,3 +632,101 @@ fn pty_subshell_ctrl_c_aborts_body_collection() {
     send(&mut session, "exit");
     send(&mut session, ENTER);
 }
+
+// ── v81 select interactive pick tests ───────────────────────────────────────
+
+/// Send a `select` loop interactively; pick item 2 and verify the body runs.
+#[test]
+fn pty_select_pick() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(
+        &mut session,
+        "select x in alpha beta gamma; do echo \"got=$x reply=$REPLY\"; break; done",
+    );
+    send(&mut session, ENTER);
+    // After the command is submitted the menu appears on stderr (mixed into
+    // the pty stream).  Wait for each item so we know the menu was printed.
+    expect(&mut session, "1) alpha");
+    expect(&mut session, "2) beta");
+    expect(&mut session, "3) gamma");
+    expect(&mut session, "#? ");
+    // Settle: `select`'s `read` re-enters raw mode on the pty after printing
+    // the prompt; the prompt alone is not a sufficient readiness barrier (same
+    // TCSAFLUSH race as documented in settle()).
+    settle();
+    // Pick item 2.
+    send(&mut session, "2");
+    send(&mut session, ENTER);
+    // Body should echo the item and REPLY, then break returns the prompt.
+    expect(&mut session, "got=beta reply=2");
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+/// Invalid index (out of range) — body runs with NAME empty, REPLY set to input.
+#[test]
+fn pty_select_invalid_index_runs_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(
+        &mut session,
+        r#"select x in a b; do echo "x=[$x] r=$REPLY"; break; done"#,
+    );
+    send(&mut session, ENTER);
+    expect(&mut session, "1) a");
+    expect(&mut session, "2) b");
+    expect(&mut session, "#? ");
+    settle();
+    // Send an out-of-range index (9 > 2 items).
+    send(&mut session, "9");
+    send(&mut session, ENTER);
+    // NAME should be empty, REPLY should be "9".
+    expect(&mut session, "x=[] r=9");
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
+
+/// Empty line (just ENTER) reprints the menu without running the body;
+/// a subsequent valid pick does run the body.
+#[test]
+fn pty_select_empty_line_reprints_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = histfile_env(dir.path());
+    let Some(mut session) = try_spawn(dir.path(), &env_refs(&env)) else {
+        return;
+    };
+    expect(&mut session, "huck> ");
+    send(
+        &mut session,
+        r#"select x in a b; do echo "got=$x"; break; done"#,
+    );
+    send(&mut session, ENTER);
+    // First menu print.
+    expect(&mut session, "1) a");
+    expect(&mut session, "#? ");
+    settle();
+    // Send empty line — menu should reprint.
+    send(&mut session, ENTER);
+    // Expect the SECOND menu print (a new "1) a" after the empty-line reprint).
+    expect(&mut session, "1) a");
+    expect(&mut session, "#? ");
+    settle();
+    // Now pick item 1.
+    send(&mut session, "1");
+    send(&mut session, ENTER);
+    expect(&mut session, "got=a");
+    expect(&mut session, "huck> ");
+    send(&mut session, "exit");
+    send(&mut session, ENTER);
+}
