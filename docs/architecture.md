@@ -70,7 +70,7 @@ executor walk             (executor.rs::run_sequence/run_pipeline/run_command/ru
     │   └── fork+exec for external           (executor.rs)
     │
     ▼
-ExecOutcome  (Continue(i32) / Exit(i32) / FunctionReturn(i32) / LoopBreak(N) / LoopContinue(N))
+ExecOutcome  (Continue(i32) / Exit(i32) / FunctionReturn(i32) / LoopBreak(u32, i32) / LoopContinue(u32))
 ```
 
 Three points are load-bearing across multiple modules:
@@ -128,10 +128,12 @@ These appear in many call-site signatures; learn them once.
 - **`Shell`** (`shell_state.rs`) — session state: vars,
   positional_args, functions, aliases, jobs, history, traps,
   local_scopes, shell_options (errexit/nounset), command_hash,
-  dir_stack, and more. `Shell::ifs()` is the canonical IFS accessor.
+  dir_stack, loop_depth (current loop-nesting depth, for `break`/
+  `continue` N), and more. `Shell::ifs()` is the canonical IFS accessor.
 - **`ExecOutcome`** (`executor.rs`) — `Continue(i32)`, `Exit(i32)`,
-  `FunctionReturn(i32)`, `LoopBreak(usize)`, `LoopContinue(usize)`.
-  Propagates through short-circuit sites in sequences/pipelines.
+  `FunctionReturn(i32)`, `LoopBreak(u32, i32)` (level, terminal `$?`),
+  `LoopContinue(u32)`. Propagates through short-circuit sites in
+  sequences/pipelines.
 - **`ExpansionResult`** (`param_expansion.rs`) — `Value(String)`,
   `Empty`, `Fatal { status }`, `WordList(Vec<String>)` (for
   `"${a[@]}"`-style multi-word results).

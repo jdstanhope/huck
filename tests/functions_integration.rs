@@ -115,13 +115,24 @@ fn return_is_unshadowable() {
 }
 
 #[test]
-fn break_inside_function_targets_callers_loop() {
-    // POSIX/bash: `break` inside a function affects the caller's loop.
+fn break_inside_function_does_not_target_callers_loop() {
+    // bash 5.2: `break` inside a function does NOT affect the caller's loop.
+    // bash prints "break: only meaningful in a `for', `while', or `until' loop"
+    // to stderr on EACH call and the loop continues through all iterations.
+    // Verified with: printf 'leave() { break; }\nfor x in a b c; ...' | bash
+    // → at-a, at-b, at-c, after (exit 0), diagnostic on stderr each iteration.
     let script = "leave() { break; }\nfor x in a b c; do echo at-$x; leave; done\necho after\nexit\n";
-    let (out, _) = run(script);
+    let (out, err) = run(script);
+    // All three iterations must complete.
     assert!(out.lines().any(|l| l == "at-a"), "stdout: {out}");
-    assert!(!out.lines().any(|l| l == "at-b"), "break did not exit caller's loop: {out}");
+    assert!(out.lines().any(|l| l == "at-b"), "loop should not break: stdout: {out}");
+    assert!(out.lines().any(|l| l == "at-c"), "loop should not break: stdout: {out}");
     assert!(out.lines().any(|l| l == "after"), "stdout: {out}");
+    // Each iteration should have printed the diagnostic to stderr.
+    assert!(
+        err.contains("only meaningful in a"),
+        "expected break diagnostic in stderr: {err:?}",
+    );
 }
 
 #[test]

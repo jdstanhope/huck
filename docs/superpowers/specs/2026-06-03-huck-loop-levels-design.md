@@ -4,7 +4,16 @@
 **Iteration**: v79
 **Divergences closed**: M-30 partial (`break N` and `continue N` level
 arguments; plus the previously-uncatalogued silent-success of `break`/
-`continue` outside any loop, now diagnosed and exit-1 per bash).
+`continue` outside any loop, now diagnosed and exit-0 per bash).
+
+> **Correction (verified against bash 5.2.21 — supersedes the original
+> wording below).** Several claims in the original draft of this spec were
+> wrong; see the "Malformed-argument semantics" subsection immediately
+> following the Goal section for the authoritative, empirically-verified
+> table. In short: outside-loop is exit **0** (not 1); `N≤0` and
+> too-many-args break **all** enclosing loops with terminal `$?=1` and the
+> script continues (NOT exit 128, NOT a soft Continue(1)); only a
+> **non-numeric** N aborts the script with exit **128**.
 
 ## Goal
 
@@ -13,10 +22,38 @@ Add bash's multi-level loop control:
 - **`break N`** exits N enclosing loops (default N=1).
 - **`continue N`** continues the Nth enclosing loop (default N=1).
 - **N > loop depth** silently caps to loop depth (bash compat).
-- **N ≤ 0 or non-numeric** errors with status 128 and a bash-style diagnostic.
-- **`break` / `continue` outside any loop** errors with status 1 and a
-  bash-style diagnostic ("only meaningful in a `for', `while', or
-  `until' loop"). Previously silent exit 0.
+- See the "Malformed-argument semantics" subsection for the verified
+  handling of `N ≤ 0`, non-numeric N, too-many-args, and outside-loop.
+
+## Malformed-argument semantics (verified against bash 5.2.21)
+
+For `break [args]` / `continue [args]` the checks happen in this order
+(this is the authoritative table; it overrides any conflicting wording
+elsewhere in this historical spec):
+
+| Case | Diagnostic (stderr) | Effect | Terminal `$?` |
+|------|---------------------|--------|---------------|
+| **Outside any loop** (`loop_depth == 0`) | `huck: <cmd>: only meaningful in a \`for', \`while', or \`until' loop` | do nothing; arg validation skipped (even `break abc` / `break 0` / `break 1 2 3`) | **0** |
+| **Too many args** (`break 1 2 3`) | `huck: <cmd>: too many arguments` | break ALL enclosing loops; script continues | **1** |
+| **Non-numeric** N (`break abc`) | `huck: <cmd>: <arg>: numeric argument required` | abort the whole script (`Exit(128)`) | 128 (process) |
+| **N ≤ 0** (`break 0`, `break -1`) | `huck: <cmd>: <arg>: loop count out of range` | break ALL enclosing loops; script continues | **1** |
+| **N ≥ 1** | — | cap to `loop_depth`; break/continue N levels | **0** |
+
+Key facts:
+- Out-of-range (`N≤0`) and too-many-args are IDENTICAL in effect for both
+  `break` AND `continue` — "break all enclosing loops, terminal `$?=1`,
+  script continues" — only the diagnostic text differs. (Yes, out-of-range
+  and too-many-args `continue` both break all loops.)
+- A normal `break N` ends the loop with `$?=0`; the error breaks end with
+  `$?=1`. The `LoopBreak` outcome therefore carries a terminal status:
+  `LoopBreak(level, status)`.
+- **Known divergence (out of scope, documented):** when the too-many-args
+  diagnostic fires AND a subsequent command sits on the SAME input line as
+  the loop (e.g. `for i in 1; do break 1 2 3; done; echo rc=$?`), bash
+  discards the rest of that input line (the `echo` does not run; the line's
+  exit is 1). huck does not model that line-granularity discard — it runs
+  the rest of the line normally. On separate lines the two shells are
+  byte-identical. See `docs/bash-divergences.md`.
 
 ## Non-goals
 
