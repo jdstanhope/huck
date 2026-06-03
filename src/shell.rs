@@ -35,7 +35,6 @@ enum ReadResult {
 }
 
 /// How the shell was invoked — resolved by `parse_cli` from argv.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum RunMode {
     /// REPL (tty) or piped-stdin command reading — current behavior.
@@ -50,7 +49,6 @@ enum RunMode {
 struct CliOptions {
     rcfile_path: Option<PathBuf>,
     norc: bool,
-    #[allow(dead_code)]
     mode: RunMode,
 }
 
@@ -184,6 +182,42 @@ fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32> {
     }
 }
 
+/// Executes a non-interactive program (a `-c` string or a script file's
+/// contents) and returns the process exit code. Sets $0 and the positional
+/// parameters, marks the shell non-interactive (so the rc file is skipped),
+/// runs the program through the shared `run_sourced_contents` engine, fires the
+/// EXIT trap, and hangs up jobs. Does NOT touch interactive history or the
+/// line editor.
+fn run_program(
+    contents: &str,
+    argv0: Option<String>,
+    args: Vec<String>,
+    label: &str,
+    shell_cell: &Rc<RefCell<Shell>>,
+) -> i32 {
+    let mut shell = shell_cell.borrow_mut();
+    shell.is_interactive = false;
+    if let Some(a0) = argv0 {
+        shell.shell_argv0 = a0;
+    }
+    shell.positional_args = args;
+
+    let outcome = crate::builtins::run_sourced_contents(
+        contents,
+        std::path::Path::new(label),
+        &mut shell,
+    );
+    let code = match outcome {
+        ExecOutcome::Exit(n) => n,
+        ExecOutcome::FunctionReturn(n) => n,
+        ExecOutcome::Continue(s) => shell.take_pending_fatal_pe_error().unwrap_or(s),
+        ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
+    };
+    crate::traps::fire_exit_trap(&mut shell);
+    shell.hangup_jobs();
+    code
+}
+
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse_cli(args) {
@@ -196,6 +230,37 @@ pub fn run(args: &[String]) -> i32 {
 
     install_job_control_signals();
 
+    let shell_cell = Rc::new(RefCell::new(Shell::new()));
+
+    {
+        let shell = shell_cell.borrow();
+        install_sigint_handler(Arc::clone(&shell.sigint_flag));
+        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
+    }
+
+    // Non-interactive program modes bypass the REPL entirely.
+    match opts.mode {
+        RunMode::Command { command, argv0, args } => {
+            let label = argv0
+                .clone()
+                .unwrap_or_else(|| shell_cell.borrow().shell_argv0.clone());
+            return run_program(&command, argv0, args, &label, &shell_cell);
+        }
+        RunMode::File { path, args } => {
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("huck: {}: No such file or directory", path.display());
+                    return 127;
+                }
+            };
+            let label = path.display().to_string();
+            return run_program(&contents, Some(label.clone()), args, &label, &shell_cell);
+        }
+        RunMode::Interactive => {}
+    }
+
+    // ----- interactive / piped-stdin REPL (unchanged below this line) -----
     let config = Config::builder()
         .completion_type(CompletionType::List)
         .build();
@@ -206,13 +271,6 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let shell_cell = Rc::new(RefCell::new(Shell::new()));
-
-    {
-        let shell = shell_cell.borrow();
-        install_sigint_handler(Arc::clone(&shell.sigint_flag));
-        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
-    }
 
     {
         let mut shell = shell_cell.borrow_mut();
