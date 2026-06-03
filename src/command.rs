@@ -2840,7 +2840,9 @@ mod tests {
             kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
             kw("done"),
         ]).unwrap().unwrap();
-        assert!(first_for(&seq).words.is_empty());
+        let clause = first_for(&seq);
+        assert!(clause.words.is_empty());
+        assert!(!clause.has_in, "no-`in` for must have has_in == false");
     }
 
     #[test]
@@ -2850,7 +2852,9 @@ mod tests {
             kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
             kw("done"),
         ]).unwrap().unwrap();
-        assert!(first_for(&seq).words.is_empty());
+        let clause = first_for(&seq);
+        assert!(clause.words.is_empty());
+        assert!(clause.has_in, "explicit empty `in` must have has_in == true");
     }
 
     #[test]
