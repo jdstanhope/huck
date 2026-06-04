@@ -139,7 +139,10 @@ group.
   applies after pipefail; a `!`-pipeline is exempt from `set -e`/ERR (matches
   bash). New `Pipeline.negate`; detected at command position in `parse_command`
   (so `[ ! -e x ]` keeps `!` as an argument of `[`). Discovered loading a Debian
-  ~/.bashrc (`if ! shopt -oq posix`).
+  ~/.bashrc (`if ! shopt -oq posix`). **Minor known divergence**: a bare `!`
+  with no following command is a `ParseError` in huck (rc 2), whereas bash
+  negates the empty/true pipeline (rc 1) — a pathological case the v85 spec
+  explicitly sanctioned as an acceptable fallback; low-impact.
 - **M-09: `function name { … }` keyword form** — `[fixed v77]` medium. The `function` keyword is now reserved at command position; `function NAME { body }` and `function NAME () { body }` (optional parens) both parse to the same `Command::FunctionDef` AST as the POSIX `NAME() body` form. Names follow the POSIX identifier rule (`[A-Za-z_][A-Za-z0-9_]*`, no reserved keywords); both forms accept compound bodies (`{ }` / `( )` / `if` / `while` / `for` / `case` / `[[ ]]`). v77 also closes a pre-existing gap where the POSIX form rejected `[[ ]]` bodies — both forms now share a `is_function_body_shape` predicate. `function=value` continues to work as a variable assignment because the lexer's assignment-prefix detection fires before keyword classification. **Deferred** (new follow-on entries below): relaxed name characters (`.`/`-`/`+`/`:`) per bash 5; definition-attached redirections (`function NAME { body } > file` and `NAME() { body } > file` — neither form supports this in huck).
 - **M-09a: Relaxed function-name characters** — `[deferred]` low. huck restricts function names to POSIX identifiers (`[A-Za-z_][A-Za-z0-9_]*`) in BOTH the `name() body` and `function name body` forms. Bash 5 accepts `.`, `-`, `+`, `:` and other non-POSIX-identifier characters when the function is defined via the keyword form (`function foo.bar { :; }`). Rarely used in practice.
 - **M-09b: Definition-attached redirections** — `[deferred]` low. Both function-definition forms (`name() body > file` and `function name body > file`) currently reject trailing redirections. Bash allows attaching redirections to the function definition itself, taking effect at every call. Affects both forms equally.
