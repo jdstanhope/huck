@@ -174,7 +174,7 @@ complete -p
 
 #[test]
 fn complete_invalid_action_exits_2() {
-    let (_out, err, code) = run_huck(r#"complete -A hostname -- foo"#);
+    let (_out, err, code) = run_huck(r#"complete -A bogus_action -- foo"#);
     assert_eq!(code, 2);
     assert!(err.contains("invalid action"), "{err:?}");
 }

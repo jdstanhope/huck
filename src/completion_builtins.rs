@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn complete_invalid_action_errors() {
         let mut sh = Shell::new();
-        let (_, code) = run_complete(&["-A", "hostname", "--", "foo"], &mut sh);
+        let (_, code) = run_complete(&["-A", "bogus_action", "--", "foo"], &mut sh);
         assert_eq!(code, 2);
     }
 
