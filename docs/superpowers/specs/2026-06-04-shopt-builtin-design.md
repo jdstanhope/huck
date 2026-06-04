@@ -109,7 +109,8 @@ options in different namespaces.
 | `shopt -u NAME...` | disable each named option | 0, or 1 if any name invalid |
 | `shopt NAME...` | query: print each `NAME\t{on,off}` (table format) | 0 iff **all** named are set, else 1 |
 | `shopt -q NAME...` | quiet query: no output | 0 iff **all** named are set, else 1 |
-| `shopt -q` (no names) | quiet "are all options set?" — never true | 1 |
+| `shopt -q` (no names) | quiet, no names → vacuously "all set" | 0 |
+| `shopt -p NAME...` | like the `NAME...` query but prints `shopt -s/-u NAME` re-input form (rc still 0 iff all set) | 0/1 |
 
 Invalid name: emit `huck: shopt: NAME: invalid shell option name` to stderr,
 rc 1, but **still process the valid names in the same call** (bash sets the
