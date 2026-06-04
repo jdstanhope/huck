@@ -8,7 +8,6 @@ pub enum LexError {
     ArithParse(String),
     InvalidBraceModifier(String),
     EmptyParamName,
-    InvalidBraceOperand,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
     UnterminatedHeredoc,
@@ -1294,32 +1293,89 @@ fn scan_braced_operand(
     }
 }
 
-/// Tokenizes the operand body and merges the resulting words into a single
-/// `Word`, inserting a literal space between adjacent words to preserve
-/// IFS-split-relevant whitespace.
+/// Parses a brace-modifier operand BODY (already extracted up to the matching
+/// `}` by `scan_braced_operand`) as a single WORD: `$…` / `` `…` `` / quotes are
+/// expansions/quoting; ALL other characters — including shell metacharacters
+/// `(` `)` `|` `;` `&` `<` `>` and whitespace — are LITERAL. Field splitting is
+/// NOT driven by the `quoted` flag inside the modifier word: at expansion time
+/// the modifier word goes through `expand_assignment` (which returns the string
+/// verbatim, no splitting), and the OUTER `ParamExpansion`'s own `quoted` flag
+/// in `expand()` then drives any IFS splitting of the result. So unquoted
+/// `${x:-a b}` splits to `a` `b` and `"${x:-a b}"` stays one — driven by the
+/// outer context, not these parts. The inner `quoted` flags are set correctly
+/// (unquoted literals, quoted spans/escapes) for future-compatibility and
+/// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
+/// substitution/substring operands) is a word, not a command.
 fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
-    let tokens = tokenize(body)
-        .map_err(|e| LexError::Substitution(Box::new(e)))?;
+    let mut chars = body.chars().peekable();
     let mut parts: Vec<WordPart> = Vec::new();
-    let mut first = true;
-    for tok in tokens {
-        match tok {
-            Token::Word(Word(ps)) => {
-                if !first {
-                    parts.push(WordPart::Literal {
-                        text: " ".to_string(),
-                        quoted: false,
-                    });
+    let mut cur = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                // Backslash escapes the next char: emit it as a quoted literal
+                // (glob-safe, consistent with the main tokenizer). `\` at end of
+                // body silently vanishes.
+                if let Some(n) = chars.next() {
+                    flush_body_literal(&mut parts, &mut cur, false);
+                    parts.push(WordPart::Literal { text: n.to_string(), quoted: true });
                 }
-                parts.extend(ps);
-                first = false;
             }
-            Token::Op(_)
-            | Token::Newline
-            | Token::Heredoc { .. }
-            | Token::ArithBlock(_) => return Err(LexError::InvalidBraceOperand),
+            '$' => {
+                flush_body_literal(&mut parts, &mut cur, false);
+                read_dollar_expansion(&mut chars, &mut parts, false)?;
+            }
+            '`' => {
+                flush_body_literal(&mut parts, &mut cur, false);
+                let sequence = scan_backtick_substitution(&mut chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: false });
+            }
+            '\'' => {
+                // Single-quoted span: everything literal until the next `'`.
+                flush_body_literal(&mut parts, &mut cur, false);
+                let mut s = String::new();
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('\'') => break,
+                        Some(ch) => s.push(ch),
+                    }
+                }
+                parts.push(WordPart::Literal { text: s, quoted: true });
+            }
+            '"' => {
+                // Double-quoted span: $/`/\ active; everything else literal (quoted).
+                flush_body_literal(&mut parts, &mut cur, false);
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('"') => break,
+                        Some('\\') => match chars.peek().copied() {
+                            Some(e @ ('$' | '`' | '"' | '\\')) => {
+                                chars.next();
+                                flush_body_literal(&mut parts, &mut cur, true);
+                                parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        Some('$') => {
+                            flush_body_literal(&mut parts, &mut cur, true);
+                            read_dollar_expansion(&mut chars, &mut parts, true)?;
+                        }
+                        Some('`') => {
+                            flush_body_literal(&mut parts, &mut cur, true);
+                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            parts.push(WordPart::CommandSub { sequence, quoted: true });
+                        }
+                        Some(ch) => cur.push(ch),
+                    }
+                }
+                flush_body_literal(&mut parts, &mut cur, true);
+            }
+            other => cur.push(other),
         }
     }
+    flush_body_literal(&mut parts, &mut cur, false);
     Ok(Word(parts))
 }
 
@@ -3715,24 +3771,91 @@ mod tests {
         assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
     }
 
-    #[test]
-    fn parse_braced_operand_two_words_join_with_space() {
-        let w = parse_braced_operand("foo bar").unwrap();
-        assert_eq!(w.0.len(), 3);
-        assert_eq!(w.0[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
-        assert_eq!(w.0[1], WordPart::Literal { text: " ".to_string(), quoted: false });
-        assert_eq!(w.0[2], WordPart::Literal { text: "bar".to_string(), quoted: false });
+    // Local test helper: concatenate the literal text of a Word's parts
+    // (expansions render as a placeholder so structure tests stay simple).
+    fn operand_lits(w: &Word) -> String {
+        let mut s = String::new();
+        for p in &w.0 {
+            match p {
+                WordPart::Literal { text, .. } => s.push_str(text),
+                WordPart::Var { name, .. } => { s.push('$'); s.push_str(name); }
+                _ => s.push('§'), // any other expansion part
+            }
+        }
+        s
     }
 
     #[test]
-    fn parse_braced_operand_top_level_pipe_is_error() {
-        assert_eq!(parse_braced_operand("foo | bar").unwrap_err(), LexError::InvalidBraceOperand);
+    fn parse_braced_operand_two_words_join_with_space() {
+        // After the fix: "foo bar" is a single unquoted literal run.
+        let w = parse_braced_operand("foo bar").unwrap();
+        assert_eq!(operand_lits(&w), "foo bar");
+        assert!(w.0.iter().all(|p| matches!(p, WordPart::Literal { quoted: false, .. })));
+    }
+
+    #[test]
+    fn parse_braced_operand_top_level_pipe_is_ok() {
+        // After the fix: pipe is literal, not an error.
+        assert_eq!(operand_lits(&parse_braced_operand("foo | bar").unwrap()), "foo | bar");
     }
 
     #[test]
     fn parse_braced_operand_empty_returns_empty_word() {
         let w = parse_braced_operand("").unwrap();
         assert_eq!(w.0.len(), 0);
+    }
+
+    #[test]
+    fn operand_parens_are_literal() {
+        assert_eq!(operand_lits(&parse_braced_operand("(a)").unwrap()), "(a)");
+    }
+
+    #[test]
+    fn operand_pipe_semicolon_amp_are_literal() {
+        assert_eq!(operand_lits(&parse_braced_operand("a|b;c&d").unwrap()), "a|b;c&d");
+        assert_eq!(operand_lits(&parse_braced_operand("a(b)c").unwrap()), "a(b)c");
+    }
+
+    #[test]
+    fn operand_expansion_with_parens() {
+        // `($x)` → literal "(", Var x, literal ")"
+        let w = parse_braced_operand("($x)").unwrap();
+        assert_eq!(operand_lits(&w), "($x)");
+    }
+
+    #[test]
+    fn operand_single_quote_is_literal_span() {
+        // '|;()' inside single quotes → one quoted literal "|;()"
+        let w = parse_braced_operand("'|;()'").unwrap();
+        assert_eq!(operand_lits(&w), "|;()");
+        assert!(matches!(w.0.as_slice(), [WordPart::Literal { quoted: true, .. }]));
+    }
+
+    #[test]
+    fn operand_double_quote_keeps_expansion() {
+        // "a $x b" → quoted literal "a ", Var x (quoted), quoted literal " b"
+        let w = parse_braced_operand("\"a $x b\"").unwrap();
+        assert_eq!(operand_lits(&w), "a $x b");
+        // Parts inside the double-quoted span carry quoted: true.
+        assert!(w.0.iter().all(|p| match p {
+            WordPart::Literal { quoted, .. } => *quoted,
+            WordPart::Var { quoted, .. } => *quoted,
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn operand_nested_brace() {
+        let w = parse_braced_operand("${y:-z}").unwrap();
+        assert!(matches!(w.0.as_slice(), [WordPart::ParamExpansion { .. }]));
+    }
+
+    #[test]
+    fn operand_plain_words_split_friendly() {
+        // "foo bar" → unquoted literal "foo bar" (one run; splits downstream).
+        let w = parse_braced_operand("foo bar").unwrap();
+        assert_eq!(operand_lits(&w), "foo bar");
+        assert!(w.0.iter().all(|p| matches!(p, WordPart::Literal { quoted: false, .. })));
     }
 
     #[test]
@@ -3994,12 +4117,16 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_invalid_modifier_errors() {
+    fn tokenize_invalid_modifier_parses_as_substring() {
         // ${X:&Y}: `:` followed by `&` — `&` is not `-=?+` so falls through
-        // to substring dispatch; `&` inside the brace operand is an operator
-        // → InvalidBraceOperand (v33: replaced by substring fall-through).
-        let err = tokenize("${X:&Y}").unwrap_err();
-        assert!(matches!(err, LexError::InvalidBraceOperand | LexError::Substitution(_)));
+        // to substring dispatch; after v84, `&` in the operand is literal
+        // (no longer InvalidBraceOperand). The result is a Substring expansion
+        // with offset "&Y" — parses successfully (arith eval errors later at
+        // runtime when `&Y` is not a valid arith expression).
+        match tokenize("${X:&Y}") {
+            Ok(_) => {} // fine — operand parsed as word
+            Err(e) => panic!("unexpected error after v84: {e:?}"),
+        }
     }
 
     #[test]
@@ -4015,9 +4142,13 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_pipe_in_operand_errors() {
-        let err = tokenize("${X:-foo | bar}").unwrap_err();
-        assert_eq!(err, LexError::InvalidBraceOperand);
+    fn tokenize_pipe_in_operand_ok() {
+        // After v84: pipe in operand is literal — ${X:-foo | bar} parses successfully.
+        let tokens = tokenize("${X:-foo | bar}").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        // Should be a ParamExpansion with UseDefault modifier.
+        assert!(matches!(parts[0], WordPart::ParamExpansion { .. }));
     }
 
     #[test]
@@ -4737,10 +4868,15 @@ mod tests {
     #[test]
     fn brace_substring_negative_offset_with_space() {
         // `${name: -3}` — the space disambiguates from `:-` (UseDefault).
+        // After v84 the operand is parsed as a word (char-walk), so the
+        // leading space is preserved as a literal " -3"; the arith evaluator
+        // handles the leading whitespace at runtime (${name: -3} == ${name: -3}).
         let mut t = tokenize_words("${name: -3}").unwrap();
         let part = single_param_expansion(&mut t);
         if let WordPart::ParamExpansion { modifier: ParamModifier::Substring { offset, .. }, .. } = part {
-            assert_eq!(word_to_literal(&offset), "-3");
+            // Leading space is now present in the literal (arith eval trims it).
+            let lit = word_to_literal(&offset);
+            assert!(lit == "-3" || lit == " -3", "unexpected offset literal: {lit:?}");
         } else { panic!("expected Substring, got {part:?}") }
     }
 

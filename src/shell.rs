@@ -637,7 +637,6 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
         LexError::ArithParse(msg) => format!(": arithmetic expansion: {msg}"),
         LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
         LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
-        LexError::InvalidBraceOperand => ": invalid operator in parameter-expansion operand".to_string(),
         LexError::Substitution(inner) => {
             format!(" in command substitution{}", lex_error_message(*inner))
         }
