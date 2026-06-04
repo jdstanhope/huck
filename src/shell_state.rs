@@ -107,6 +107,7 @@ pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
 pub struct ShellOptions {
     pub errexit: bool,
     pub nounset: bool,
+    pub pipefail: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
