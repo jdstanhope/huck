@@ -130,6 +130,27 @@ fn parse_flags(args: &[String], allow_d_e: bool) -> Result<ParsedFlags, FlagErro
                 'E' if allow_d_e => out.is_empty = true,
                 'p' if allow_d_e => out.print = true,
                 'r' if allow_d_e => out.remove = true,
+                'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 's' | 'u' | 'v' => {
+                    if leading == '+' {
+                        return Err(FlagError::Usage(format!("+{c}: not supported")));
+                    }
+                    let action = match c {
+                        'a' => Action::Alias,
+                        'b' => Action::Builtin,
+                        'c' => Action::Command,
+                        'd' => Action::Directory,
+                        'e' => Action::Export,
+                        'f' => Action::File,
+                        'g' => Action::Group,
+                        'j' => Action::Job,
+                        'k' => Action::Keyword,
+                        's' => Action::Service,
+                        'u' => Action::User,
+                        'v' => Action::Variable,
+                        _ => unreachable!(),
+                    };
+                    out.spec.actions.push(action);
+                }
                 other => {
                     return Err(FlagError::Usage(format!("-{other}: invalid option")));
                 }
@@ -947,5 +968,32 @@ mod tests {
         // spec for "foo", this errors with exit 1 (missing name).
         let (_, code) = run_compopt(&["-o", "nospace", "--", "foo"], &mut sh);
         assert_eq!(code, 1, "-- should end flags so 'foo' is a name; no spec → exit 1");
+    }
+
+    #[test]
+    fn complete_short_flag_actions_map_to_actions() {
+        use crate::completion_spec::Action;
+        let cases = [
+            ("-a", Action::Alias), ("-b", Action::Builtin), ("-c", Action::Command),
+            ("-d", Action::Directory), ("-e", Action::Export), ("-f", Action::File),
+            ("-g", Action::Group), ("-j", Action::Job), ("-k", Action::Keyword),
+            ("-s", Action::Service), ("-u", Action::User), ("-v", Action::Variable),
+        ];
+        for (flag, want) in cases {
+            let mut sh = Shell::new();
+            let (_, code) = run_complete(&[flag, "--", "foo"], &mut sh);
+            assert_eq!(code, 0, "flag {flag} should be accepted");
+            assert_eq!(sh.completion_specs.by_command["foo"].actions, vec![want],
+                "flag {flag} → wrong action");
+        }
+    }
+
+    #[test]
+    fn complete_clustered_short_flags_accumulate() {
+        let mut sh = Shell::new();
+        let (_, code) = run_complete(&["-ev", "--", "foo"], &mut sh);
+        assert_eq!(code, 0);
+        assert_eq!(sh.completion_specs.by_command["foo"].actions,
+            vec![crate::completion_spec::Action::Export, crate::completion_spec::Action::Variable]);
     }
 }
