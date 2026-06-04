@@ -1133,6 +1133,7 @@ mod tests {
     fn echo_sequence(args: &[&str]) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("echo"),
@@ -1150,6 +1151,7 @@ mod tests {
     fn exit_sequence(code: i32) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("exit"),
@@ -1963,6 +1965,7 @@ mod tests {
         // the pre-expansion value (7) — not the post-`false` value (1).
         let false_cmd = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: lit("false"),

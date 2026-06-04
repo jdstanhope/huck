@@ -103,7 +103,11 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         // ERR fires for seq.first's failure if not suppressed AND the
         // next connector (if any) is not Or.
         let next_is_or = matches!(seq.rest.first(), Some((Connector::Or, _)));
-        if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+        if c != 0
+            && shell.err_suppressed_depth == 0
+            && !next_is_or
+            && !is_negated_pipeline(&seq.first)
+        {
             crate::traps::fire_err_trap(shell);
             if let Some(out) = maybe_errexit(shell, c) {
                 return out;
@@ -136,7 +140,11 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 // suppression context AND the NEXT connector is not Or
                 // (i.e. the failure isn't "handled" by a following || clause).
                 let next_is_or = matches!(seq.rest.get(i + 1), Some((Connector::Or, _)));
-                if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+                if c != 0
+                    && shell.err_suppressed_depth == 0
+                    && !next_is_or
+                    && !is_negated_pipeline(command)
+                {
                     crate::traps::fire_err_trap(shell);
                     if let Some(out) = maybe_errexit(shell, c) {
                         return out;
@@ -923,13 +931,26 @@ fn eval_binary(
 }
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    if pipeline.commands.len() == 1 {
+    let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
         // This covers both Simple commands and compound commands as single stages.
         run_command(&pipeline.commands[0], shell, sink)
     } else {
         run_multi_stage(&pipeline.commands, shell, sink)
+    };
+    if pipeline.negate {
+        // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
+        // stays raw, and control-flow outcomes propagate unchanged.
+        if let ExecOutcome::Continue(s) = outcome {
+            return ExecOutcome::Continue(if s == 0 { 1 } else { 0 });
+        }
     }
+    outcome
+}
+
+/// True if `cmd` is a `!`-negated pipeline — exempt from `set -e`/ERR (bash).
+fn is_negated_pipeline(cmd: &Command) -> bool {
+    matches!(cmd, Command::Pipeline(p) if p.negate)
 }
 
 // ----- background pipeline --------------------------------------------------
@@ -3762,6 +3783,7 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
@@ -3785,6 +3807,7 @@ mod tests {
         let lhs = if succeed { "0" } else { "1" };
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("test"),
@@ -3824,7 +3847,7 @@ mod tests {
 
     fn one_command_sequence(cmd: SimpleCommand) -> Sequence {
         Sequence {
-            first: Command::Pipeline(Pipeline { commands: vec![Command::Simple(cmd)] }),
+            first: Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(cmd)] }),
             rest: vec![],
             background: false,
         }
@@ -3924,6 +3947,7 @@ mod tests {
         // stdin), so we just confirm the terminal echo's output is captured.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(exec("echo", &["first"])), Command::Simple(exec("echo", &["second"]))],
             }),
             rest: vec![],
@@ -3945,6 +3969,7 @@ mod tests {
         // wait/reap), because the fork registered it as Running.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(exec("echo", &["hi"]))],
             }),
             rest: vec![],
@@ -3965,6 +3990,7 @@ mod tests {
         // the assignment must NOT leak back to the parent shell's environment.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
                 ]))],
@@ -3983,6 +4009,7 @@ mod tests {
         // `$(cmd &)` must wait and capture, not spawn an escaped bg job.
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(exec("echo", &["captured"]))],
             }),
             rest: vec![],
@@ -4013,6 +4040,7 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         let seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
@@ -4036,6 +4064,7 @@ mod tests {
         // is visible after.
         let assign = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
                 ]))],
@@ -4094,6 +4123,7 @@ mod tests {
     fn echo_var_seq(var: &str) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
@@ -4112,6 +4142,7 @@ mod tests {
     fn continue_seq() -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
@@ -4212,6 +4243,7 @@ mod tests {
         // body: `continue ; echo NOPE` — `continue` must skip the echo on
         // every iteration, so nothing prints, yet all values are visited.
         let echo_nope = Command::Pipeline(Pipeline {
+            negate: false,
             commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                 inline_assignments: Vec::new(),
                 program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
@@ -4243,6 +4275,7 @@ mod tests {
         let ww = |s: &str| Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]);
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
@@ -4419,6 +4452,7 @@ mod tests {
     fn function_def_registers_and_returns_zero() {
         let body = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
@@ -4546,7 +4580,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
+        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=inner true");
         assert_eq!(shell.get("FOO"), Some("outer"));
@@ -4570,7 +4604,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
+        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=val myfunc");
         assert_eq!(shell.get("FOO"), Some("val"));
@@ -4587,7 +4621,7 @@ mod tests {
             stdout: None,
             stderr: None,
         });
-        let pipeline = Pipeline { commands: vec![Command::Simple(cmd)] };
+        let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
