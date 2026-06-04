@@ -103,7 +103,11 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         // ERR fires for seq.first's failure if not suppressed AND the
         // next connector (if any) is not Or.
         let next_is_or = matches!(seq.rest.first(), Some((Connector::Or, _)));
-        if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+        if c != 0
+            && shell.err_suppressed_depth == 0
+            && !next_is_or
+            && !is_negated_pipeline(&seq.first)
+        {
             crate::traps::fire_err_trap(shell);
             if let Some(out) = maybe_errexit(shell, c) {
                 return out;
@@ -136,7 +140,11 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 // suppression context AND the NEXT connector is not Or
                 // (i.e. the failure isn't "handled" by a following || clause).
                 let next_is_or = matches!(seq.rest.get(i + 1), Some((Connector::Or, _)));
-                if c != 0 && shell.err_suppressed_depth == 0 && !next_is_or {
+                if c != 0
+                    && shell.err_suppressed_depth == 0
+                    && !next_is_or
+                    && !is_negated_pipeline(command)
+                {
                     crate::traps::fire_err_trap(shell);
                     if let Some(out) = maybe_errexit(shell, c) {
                         return out;
@@ -923,13 +931,26 @@ fn eval_binary(
 }
 
 fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    if pipeline.commands.len() == 1 {
+    let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
         // This covers both Simple commands and compound commands as single stages.
         run_command(&pipeline.commands[0], shell, sink)
     } else {
         run_multi_stage(&pipeline.commands, shell, sink)
+    };
+    if pipeline.negate {
+        // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
+        // stays raw, and control-flow outcomes propagate unchanged.
+        if let ExecOutcome::Continue(s) = outcome {
+            return ExecOutcome::Continue(if s == 0 { 1 } else { 0 });
+        }
     }
+    outcome
+}
+
+/// True if `cmd` is a `!`-negated pipeline — exempt from `set -e`/ERR (bash).
+fn is_negated_pipeline(cmd: &Command) -> bool {
+    matches!(cmd, Command::Pipeline(p) if p.negate)
 }
 
 // ----- background pipeline --------------------------------------------------
