@@ -359,6 +359,8 @@ pub enum SimpleCommand {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Pipeline {
+    /// True if the pipeline is prefixed with `!` (negate the exit status).
+    pub negate: bool,
     // BREAKING CHANGE (v25): was Vec<SimpleCommand>; now Vec<Command>.
     // The parser rejects Command::Pipeline as a stage (nested multi-stage
     // pipelines aren't a POSIX construct at this level).
@@ -608,7 +610,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 }
             }
         }
-        Command::Pipeline(Pipeline { commands: stages })
+        Command::Pipeline(Pipeline { negate: false, commands: stages })
     } else {
         raw_first
     };
@@ -685,8 +687,36 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     Ok(Sequence { first, rest, background })
 }
 
-/// Parses a single sequence element: a subshell, compound command, or pipeline.
+/// Pipeline negation wrapper: consumes a run of standalone `!` words at command
+/// position (odd count → negate), parses the inner command, and attaches the
+/// negation flag. Detected only here (command position), so `[ ! -e x ]` keeps
+/// `!` as an argument of `[`.
 fn parse_command<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    let mut bangs = 0usize;
+    while iter.peek().map(is_bang_word).unwrap_or(false) {
+        iter.next(); // consume `!`
+        bangs += 1;
+    }
+    if bangs == 0 {
+        return parse_command_inner(iter);
+    }
+    let inner = parse_command_inner(iter)?;
+    let negate = bangs % 2 == 1;
+    Ok(match inner {
+        Command::Pipeline(mut p) => {
+            p.negate = negate;
+            Command::Pipeline(p)
+        }
+        // A compound (if/while/for/case/select/{}/subshell/[[ ]]): wrap in a
+        // 1-element pipeline so the negation applies to its status.
+        other => Command::Pipeline(Pipeline { negate, commands: vec![other] }),
+    })
+}
+
+/// Parses a single sequence element: a subshell, compound command, or pipeline.
+fn parse_command_inner<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Command, ParseError> {
     skip_newlines(iter);
@@ -1377,7 +1407,7 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 }
             }
         }
-        Command::Pipeline(Pipeline { commands: stages })
+        Command::Pipeline(Pipeline { negate: false, commands: stages })
     } else {
         raw_first
     };
@@ -1421,7 +1451,7 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                             }
                         }
                     }
-                    Command::Pipeline(Pipeline { commands: stages })
+                    Command::Pipeline(Pipeline { negate: false, commands: stages })
                 } else {
                     raw
                 };
@@ -1469,7 +1499,7 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                             }
                         }
                     }
-                    Command::Pipeline(Pipeline { commands: stages })
+                    Command::Pipeline(Pipeline { negate: false, commands: stages })
                 } else {
                     raw
                 };
@@ -1763,7 +1793,7 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
         // else: simple stage already consumed `|`; pipe_follows remains true.
     }
 
-    Ok(Pipeline { commands })
+    Ok(Pipeline { negate: false, commands })
 }
 
 fn parse_pipeline<I: Iterator<Item = Token>>(
@@ -2092,6 +2122,7 @@ mod tests {
     fn one_pipeline(commands: Vec<SimpleCommand>) -> Sequence {
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: commands.into_iter().map(Command::Simple).collect(),
             }),
             rest: vec![],
@@ -2453,6 +2484,7 @@ mod tests {
         use crate::lexer::WordPart;
         let inner_seq = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
@@ -2814,7 +2846,7 @@ mod tests {
         assert_eq!(clause.words.len(), 3);
         assert_eq!(
             clause.body.first,
-            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("echo", &[]))] })
+            Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("echo", &[]))] })
         );
     }
 
@@ -2984,8 +3016,8 @@ mod tests {
             kw("fi"),
         ]).unwrap().unwrap();
         let c = first_if(&seq);
-        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
-        assert_eq!(c.then_body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] }));
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("a", &[]))] }));
+        assert_eq!(c.then_body.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("b", &[]))] }));
         assert!(c.elif_branches.is_empty());
         assert!(c.else_body.is_none());
     }
@@ -3122,6 +3154,7 @@ mod tests {
     fn parse_keyword_as_argument_is_literal() {
         let seq = parse(vec![w_tok("echo"), w_tok("if")]).unwrap().unwrap();
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
+            negate: false,
             commands: vec![Command::Simple(plain("echo", &["if"]))],
         }));
     }
@@ -3157,8 +3190,8 @@ mod tests {
         ]).unwrap().unwrap();
         let c = first_while(&seq);
         assert!(!c.until);
-        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
-        assert_eq!(c.body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] }));
+        assert_eq!(c.condition.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("a", &[]))] }));
+        assert_eq!(c.body.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("b", &[]))] }));
     }
 
     #[test]
@@ -3289,6 +3322,7 @@ mod tests {
     fn parse_keyword_while_as_argument_is_literal() {
         let seq = parse(vec![w_tok("echo"), w_tok("while")]).unwrap().unwrap();
         assert_eq!(seq.first, Command::Pipeline(Pipeline {
+            negate: false,
             commands: vec![Command::Simple(plain("echo", &["while"]))],
         }));
     }
@@ -3319,7 +3353,7 @@ mod tests {
         let clause = first_if(&seq);
         assert_eq!(
             clause.then_body.first,
-            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] })
+            Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("b", &[]))] })
         );
     }
 
@@ -3334,7 +3368,7 @@ mod tests {
         assert!(!clause.until);
         assert_eq!(
             clause.body.first,
-            Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("b", &[]))] })
+            Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("b", &[]))] })
         );
     }
 
@@ -3352,7 +3386,7 @@ mod tests {
         let seq = parse(vec![Token::Newline, Token::Newline, w_tok("a")])
             .unwrap()
             .unwrap();
-        assert_eq!(seq.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("a", &[]))] }));
+        assert_eq!(seq.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("a", &[]))] }));
     }
 
     #[test]
@@ -3462,7 +3496,7 @@ mod tests {
             Command::BraceGroup(b) => b.as_ref(),
             other => panic!("expected a brace group, got {other:?}"),
         };
-        assert_eq!(body.first, Command::Pipeline(Pipeline { commands: vec![Command::Simple(plain("echo", &["hi"]))] }));
+        assert_eq!(body.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("echo", &["hi"]))] }));
     }
 
     #[test]
@@ -4634,5 +4668,52 @@ mod tests {
         let tokens = crate::lexer::tokenize("((1++))").unwrap();
         let err = parse(tokens).expect_err("should error");
         assert!(matches!(err, ParseError::ArithBlock(_)), "got {err:?}");
+    }
+
+    /// Lex and parse a source string to a `Sequence`.
+    fn parse_seq(src: &str) -> Sequence {
+        let tokens = crate::lexer::tokenize(src).expect("lex failed");
+        parse(tokens).expect("parse failed").expect("empty parse")
+    }
+
+    #[test]
+    fn parses_bang_simple_negates() {
+        let seq = parse_seq("! false");
+        let p = first_pipeline(&seq);
+        assert!(p.negate);
+        assert_eq!(p.commands.len(), 1);
+    }
+
+    #[test]
+    fn parses_bang_pipeline_negates_whole() {
+        let seq = parse_seq("! a | b");
+        let p = first_pipeline(&seq);
+        assert!(p.negate);
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn parses_double_bang_cancels() {
+        let seq = parse_seq("! ! false");
+        assert!(!first_pipeline(&seq).negate);
+    }
+
+    #[test]
+    fn parses_bang_before_if_wraps() {
+        // `! if true; then :; fi` → Pipeline{negate:true, [Command::If]}
+        let seq = parse_seq("! if true; then :; fi");
+        let p = first_pipeline(&seq);
+        assert!(p.negate);
+        assert_eq!(p.commands.len(), 1);
+        assert!(matches!(p.commands[0], Command::If(_)));
+    }
+
+    #[test]
+    fn bang_inside_test_command_is_an_argument_not_negation() {
+        // `[ ! -e x ]` → `!` is an ARG of `[`, the pipeline is NOT negated.
+        let seq = parse_seq("[ ! -e x ]");
+        let p = first_pipeline(&seq);
+        assert!(!p.negate);
+        // first stage is the `[` simple command with `!` among its args
     }
 }

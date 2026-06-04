@@ -1506,6 +1506,7 @@ fn scan_backtick_substitution(
 fn empty_sequence() -> crate::command::Sequence {
     crate::command::Sequence {
         first: crate::command::Command::Pipeline(crate::command::Pipeline {
+            negate: false,
             commands: Vec::new(),
         }),
         rest: Vec::new(),
@@ -3148,6 +3149,7 @@ mod tests {
         use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
@@ -3202,7 +3204,7 @@ mod tests {
             vec![sub_word(vec![WordPart::CommandSub {
                 sequence: crate::command::Sequence {
                     first: crate::command::Command::Pipeline(
-                        crate::command::Pipeline { commands: vec![] },
+                        crate::command::Pipeline { negate: false, commands: vec![] },
                     ),
                     rest: vec![],
                     background: false,
@@ -3219,6 +3221,7 @@ mod tests {
         use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
         let inner = Sequence {
             first: Command::Pipeline(Pipeline {
+                negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
@@ -3252,6 +3255,7 @@ mod tests {
             use crate::command::{Command, ExecCommand, Pipeline, Sequence, SimpleCommand};
             Sequence {
                 first: Command::Pipeline(Pipeline {
+                    negate: false,
                     commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                         inline_assignments: Vec::new(),
                         program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
