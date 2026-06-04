@@ -3882,12 +3882,14 @@ struct OptionInfo {
 const SHELL_OPTIONS: &[OptionInfo] = &[
     OptionInfo { name: "errexit", short: Some('e') },
     OptionInfo { name: "nounset", short: Some('u') },
+    OptionInfo { name: "pipefail", short: None },
 ];
 
 fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     match name {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
+        "pipefail" => Some(shell.shell_options.pipefail),
         _ => None,
     }
 }
@@ -3896,6 +3898,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), ()> {
     match name {
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
         "nounset" => { shell.shell_options.nounset = value; Ok(()) }
+        "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
         _ => Err(()),
     }
 }
@@ -10055,5 +10058,35 @@ mod loop_levels_tests {
         sh.loop_depth = 1;
         let outcome = builtin_continue(&["abc".to_string()], &sh);
         assert_eq!(outcome, ExecOutcome::Exit(128));
+    }
+}
+
+#[cfg(test)]
+mod pipefail_option_tests {
+    use super::*;
+    use crate::shell_state::Shell;
+
+    #[test]
+    fn pipefail_option_round_trips() {
+        let mut sh = Shell::new();
+        assert_eq!(option_get(&sh, "pipefail"), Some(false));
+        option_set(&mut sh, "pipefail", true).unwrap();
+        assert_eq!(option_get(&sh, "pipefail"), Some(true));
+        assert!(sh.shell_options.pipefail);
+        option_set(&mut sh, "pipefail", false).unwrap();
+        assert_eq!(option_get(&sh, "pipefail"), Some(false));
+    }
+
+    #[test]
+    fn pipefail_not_in_dollar_dash() {
+        // pipefail has no short flag, so it must never appear in `$-`.
+        let mut sh = Shell::new();
+        option_set(&mut sh, "pipefail", true).unwrap();
+        assert!(!sh.dollar_dash_value().contains('p'), "$- must not include pipefail");
+    }
+
+    #[test]
+    fn pipefail_listed_in_shell_options() {
+        assert!(SHELL_OPTIONS.iter().any(|o| o.name == "pipefail" && o.short.is_none()));
     }
 }

@@ -107,6 +107,7 @@ pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
 pub struct ShellOptions {
     pub errexit: bool,
     pub nounset: bool,
+    pub pipefail: bool,
 }
 
 /// Per-session shell state: variables (each either exported or not) and the
@@ -591,6 +592,26 @@ impl Shell {
             .and_then(|m| m.keys().next_back().copied())
     }
 
+    /// Overwrites the `PIPESTATUS` indexed-array variable with the given
+    /// per-stage exit statuses. Always overwrites (even if a user marked
+    /// PIPESTATUS readonly) — bash maintains it unconditionally.
+    pub fn set_pipestatus(&mut self, statuses: &[i32]) {
+        let elements: BTreeMap<usize, String> = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.to_string()))
+            .collect();
+        self.vars.insert(
+            "PIPESTATUS".to_string(),
+            Variable {
+                value: VarValue::Indexed(elements),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
+    }
+
     /// Replaces (or creates) `name` as an indexed array with the given
     /// elements. Honors readonly. Preserves the existing `exported` and
     /// `integer` flags if the variable already exists.
@@ -1025,6 +1046,17 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_pipestatus_writes_indexed_array() {
+        let mut sh = Shell::new();
+        sh.set_pipestatus(&[0, 1, 0]);
+        let arr = sh.get_array("PIPESTATUS").expect("PIPESTATUS array");
+        assert_eq!(arr.get(&0).map(String::as_str), Some("0"));
+        assert_eq!(arr.get(&1).map(String::as_str), Some("1"));
+        assert_eq!(arr.get(&2).map(String::as_str), Some("0"));
+        assert_eq!(arr.len(), 3);
+    }
 
     #[test]
     fn new_captures_inherited_env_as_exported() {
