@@ -69,3 +69,65 @@ fn shopt_q_no_names_rc_zero() {
     assert_eq!(run("shopt -q; echo rc=$?\n").0, "rc=0\n");
     assert_eq!(run("shopt -oq; echo rc=$?\n").0, "rc=0\n");
 }
+
+// ---- Task 4: behavioral glob wiring (nullglob/dotglob/nocaseglob/failglob) ----
+use std::fs;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Runs `script` with cwd set to a fresh temp dir containing the given files.
+/// Returns (stdout, exit_code). Each call gets a unique dir so concurrently
+/// running tests never collide.
+fn run_in_dir(files: &[&str], script: &str) -> (String, i32) {
+    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("huck_shopt_{}_{}", std::process::id(), seq));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    for f in files { fs::write(dir.join(f), b"").unwrap(); }
+    let mut child = Command::new(huck_bin())
+        .current_dir(&dir)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().expect("spawn huck");
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    (String::from_utf8_lossy(&out.stdout).into_owned(),
+     out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn nullglob_no_match_expands_empty() {
+    // default: literal pattern survives.
+    assert_eq!(run_in_dir(&["a.txt"], "echo no*match\n").0, "no*match\n");
+    // nullglob: no match → no word; echo prints just a newline.
+    assert_eq!(run_in_dir(&["a.txt"], "shopt -s nullglob; echo no*match\n").0, "\n");
+}
+
+#[test]
+fn dotglob_includes_dotfiles() {
+    // default: `*` skips .hidden.
+    assert_eq!(run_in_dir(&["a", ".hidden"], "echo *\n").0, "a\n");
+    // dotglob: `*` includes .hidden (sorted).
+    assert_eq!(run_in_dir(&["a", ".hidden"], "shopt -s dotglob; echo *\n").0, ".hidden a\n");
+}
+
+#[test]
+fn nocaseglob_matches_case_insensitively() {
+    assert_eq!(run_in_dir(&["Abc.txt"], "echo a*\n").0, "a*\n"); // default: no match → literal
+    assert_eq!(run_in_dir(&["Abc.txt"], "shopt -s nocaseglob; echo a*\n").0, "Abc.txt\n");
+}
+
+#[test]
+fn failglob_no_match_aborts_command() {
+    // `echo no*match` aborts (status 1, no stdout); the shell continues to the
+    // NEXT line, so `echo after` still runs. (Commands are newline-separated:
+    // bash aborts the rest of a `;`-joined LINE on a failglob no-match, but
+    // continues across newlines — huck matches bash on the newline form. The
+    // `;`-same-line whole-line-abort is a documented minor divergence; see the
+    // M-08d note in bash-divergences.md.)
+    let (out, _) = run_in_dir(&["a.txt"], "shopt -s failglob\necho no*match\necho after\n");
+    assert_eq!(out, "after\n");
+    let (out2, _) = run_in_dir(&["a.txt"], "shopt -s failglob\necho no*match\necho rc=$?\n");
+    assert_eq!(out2, "rc=1\n");
+}
