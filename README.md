@@ -94,6 +94,7 @@ spec, an implementation plan, and a test suite.
 | v84       | `${var:+(…)}` operands parse as words (metachars literal)        |
 | v85       | `!` pipeline negation (`if ! cmd`, `! a \| b`) (M-08c)          |
 | v86       | `shopt` builtin: 57-name table + `set -o` bridge + `nullglob`/`dotglob`/`nocaseglob`/`failglob`/`nocasematch` (M-08d) |
+| v87       | multi-line `[[ … ]]` + `-v`/`-nt`/`-ot`/`-ef` in `[[ ]]` and `test`/`[` (M-14a) |
 
 ## Build and run
 
