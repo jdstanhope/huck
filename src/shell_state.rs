@@ -110,6 +110,117 @@ pub struct ShellOptions {
     pub pipefail: bool,
 }
 
+/// One row of the bash `shopt` option table.
+pub struct ShoptInfo {
+    pub name: &'static str,
+    pub default: bool,
+}
+
+/// bash 5.2's complete `shopt` option table, in bash's display order, with
+/// non-interactive default values. Bare `shopt` and `shopt -p` emit in this
+/// order. Only `nullglob`/`dotglob`/`nocaseglob`/`failglob`/`nocasematch`
+/// change huck's behavior; the rest are faithful inert toggles.
+pub const SHOPT_TABLE: &[ShoptInfo] = &[
+    ShoptInfo { name: "autocd", default: false },
+    ShoptInfo { name: "assoc_expand_once", default: false },
+    ShoptInfo { name: "cdable_vars", default: false },
+    ShoptInfo { name: "cdspell", default: false },
+    ShoptInfo { name: "checkhash", default: false },
+    ShoptInfo { name: "checkjobs", default: false },
+    ShoptInfo { name: "checkwinsize", default: true },
+    ShoptInfo { name: "cmdhist", default: true },
+    ShoptInfo { name: "compat31", default: false },
+    ShoptInfo { name: "compat32", default: false },
+    ShoptInfo { name: "compat40", default: false },
+    ShoptInfo { name: "compat41", default: false },
+    ShoptInfo { name: "compat42", default: false },
+    ShoptInfo { name: "compat43", default: false },
+    ShoptInfo { name: "compat44", default: false },
+    ShoptInfo { name: "complete_fullquote", default: true },
+    ShoptInfo { name: "direxpand", default: false },
+    ShoptInfo { name: "dirspell", default: false },
+    ShoptInfo { name: "dotglob", default: false },
+    ShoptInfo { name: "execfail", default: false },
+    ShoptInfo { name: "expand_aliases", default: false },
+    ShoptInfo { name: "extdebug", default: false },
+    ShoptInfo { name: "extglob", default: false },
+    ShoptInfo { name: "extquote", default: true },
+    ShoptInfo { name: "failglob", default: false },
+    ShoptInfo { name: "force_fignore", default: true },
+    ShoptInfo { name: "globasciiranges", default: true },
+    ShoptInfo { name: "globskipdots", default: true },
+    ShoptInfo { name: "globstar", default: false },
+    ShoptInfo { name: "gnu_errfmt", default: false },
+    ShoptInfo { name: "histappend", default: false },
+    ShoptInfo { name: "histreedit", default: false },
+    ShoptInfo { name: "histverify", default: false },
+    ShoptInfo { name: "hostcomplete", default: true },
+    ShoptInfo { name: "huponexit", default: false },
+    ShoptInfo { name: "inherit_errexit", default: false },
+    ShoptInfo { name: "interactive_comments", default: true },
+    ShoptInfo { name: "lastpipe", default: false },
+    ShoptInfo { name: "lithist", default: false },
+    ShoptInfo { name: "localvar_inherit", default: false },
+    ShoptInfo { name: "localvar_unset", default: false },
+    ShoptInfo { name: "login_shell", default: false },
+    ShoptInfo { name: "mailwarn", default: false },
+    ShoptInfo { name: "no_empty_cmd_completion", default: false },
+    ShoptInfo { name: "nocaseglob", default: false },
+    ShoptInfo { name: "nocasematch", default: false },
+    ShoptInfo { name: "noexpand_translation", default: false },
+    ShoptInfo { name: "nullglob", default: false },
+    ShoptInfo { name: "patsub_replacement", default: true },
+    ShoptInfo { name: "progcomp", default: true },
+    ShoptInfo { name: "progcomp_alias", default: false },
+    ShoptInfo { name: "promptvars", default: true },
+    ShoptInfo { name: "restricted_shell", default: false },
+    ShoptInfo { name: "shift_verbose", default: false },
+    ShoptInfo { name: "sourcepath", default: true },
+    ShoptInfo { name: "varredir_close", default: false },
+    ShoptInfo { name: "xpg_echo", default: false },
+];
+
+/// Number of `shopt` options (length of `SHOPT_TABLE`).
+pub const SHOPT_COUNT: usize = SHOPT_TABLE.len();
+
+/// Persistent `shopt` option state: one bool per `SHOPT_TABLE` entry,
+/// indexed by table position. Seeded from each option's bash default.
+#[derive(Debug, Clone)]
+pub struct ShoptOptions {
+    state: [bool; SHOPT_COUNT],
+}
+
+impl Default for ShoptOptions {
+    fn default() -> Self {
+        let mut state = [false; SHOPT_COUNT];
+        let mut i = 0;
+        while i < SHOPT_COUNT {
+            state[i] = SHOPT_TABLE[i].default;
+            i += 1;
+        }
+        Self { state }
+    }
+}
+
+impl ShoptOptions {
+    fn idx(name: &str) -> Option<usize> {
+        SHOPT_TABLE.iter().position(|o| o.name == name)
+    }
+
+    /// `Some(value)` for a known option, `None` for an unknown name.
+    pub fn get(&self, name: &str) -> Option<bool> {
+        Self::idx(name).map(|i| self.state[i])
+    }
+
+    /// Sets a known option; returns `false` (no-op) for an unknown name.
+    pub fn set(&mut self, name: &str, value: bool) -> bool {
+        match Self::idx(name) {
+            Some(i) => { self.state[i] = value; true }
+            None => false,
+        }
+    }
+}
+
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
 /// the process environment huck inherited at startup, every one marked
@@ -157,6 +268,9 @@ pub struct Shell {
     /// Persistent shell-option flags toggled by `set -e`/`-u`/`-o NAME`.
     /// See `ShellOptions` for the field list.
     pub shell_options: ShellOptions,
+
+    /// Persistent `shopt` option flags. See `ShoptOptions` / `SHOPT_TABLE`.
+    pub shopt_options: ShoptOptions,
 
     /// Registered trap handlers. `None` value = ignore that signal
     /// (corresponds to `trap "" SIGNAL`); `Some(text)` = action to
@@ -256,6 +370,7 @@ impl Shell {
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             shell_options: ShellOptions::default(),
+            shopt_options: ShoptOptions::default(),
             traps: std::collections::HashMap::new(),
             trap_pending: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             trap_sigids: std::collections::HashMap::new(),
@@ -289,6 +404,21 @@ impl Shell {
         if self.is_interactive { out.push('i'); }
         if self.shell_options.nounset { out.push('u'); }
         out
+    }
+
+    /// Derives pathname-expansion toggles from current `shopt` state.
+    pub fn glob_opts(&self) -> crate::expand::GlobOpts {
+        crate::expand::GlobOpts {
+            nullglob: self.shopt_options.get("nullglob").unwrap_or(false),
+            dotglob: self.shopt_options.get("dotglob").unwrap_or(false),
+            nocaseglob: self.shopt_options.get("nocaseglob").unwrap_or(false),
+            failglob: self.shopt_options.get("failglob").unwrap_or(false),
+        }
+    }
+
+    /// True when `shopt -s nocasematch` is in effect.
+    pub fn nocasematch(&self) -> bool {
+        self.shopt_options.get("nocasematch").unwrap_or(false)
     }
 
     /// Variable lookup for expansion. Recognises positional names
@@ -1557,5 +1687,52 @@ mod ifs_helper_tests {
         let mut s = Shell::new();
         s.set("IFS", "".to_string());
         assert_eq!(s.ifs(), "");
+    }
+}
+
+#[cfg(test)]
+mod shopt_tests {
+    use super::*;
+
+    #[test]
+    fn shopt_table_has_57_entries() {
+        assert_eq!(SHOPT_TABLE.len(), 57);
+    }
+
+    #[test]
+    fn shopt_defaults_match_bash() {
+        let o = ShoptOptions::default();
+        // default-off
+        assert_eq!(o.get("nullglob"), Some(false));
+        assert_eq!(o.get("dotglob"), Some(false));
+        assert_eq!(o.get("extglob"), Some(false));
+        // default-on
+        assert_eq!(o.get("checkwinsize"), Some(true));
+        assert_eq!(o.get("interactive_comments"), Some(true));
+        assert_eq!(o.get("sourcepath"), Some(true));
+        // exactly 13 default-on
+        assert_eq!(SHOPT_TABLE.iter().filter(|e| e.default).count(), 13);
+        // unknown
+        assert_eq!(o.get("bogus"), None);
+    }
+
+    #[test]
+    fn shopt_set_and_read_back() {
+        let mut o = ShoptOptions::default();
+        assert!(o.set("nullglob", true));
+        assert_eq!(o.get("nullglob"), Some(true));
+        assert!(!o.set("bogus", true)); // unknown → false (not applied)
+    }
+
+    #[test]
+    fn shell_glob_opts_reflects_shopt() {
+        let mut shell = Shell::new();
+        shell.shopt_options.set("nullglob", true);
+        shell.shopt_options.set("dotglob", true);
+        let g = shell.glob_opts();
+        assert!(g.nullglob && g.dotglob && !g.nocaseglob && !g.failglob);
+        assert!(!shell.nocasematch());
+        shell.shopt_options.set("nocasematch", true);
+        assert!(shell.nocasematch());
     }
 }

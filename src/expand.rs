@@ -4,6 +4,16 @@ use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
 use glob::{glob_with, MatchOptions};
 
+/// Pathname-expansion behavior toggles derived from `shopt` state.
+/// All-false ⇒ huck's default (pre-v86) globbing behavior.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GlobOpts {
+    pub nullglob: bool,
+    pub dotglob: bool,
+    pub nocaseglob: bool,
+    pub failglob: bool,
+}
+
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
     match spec {
         TildeSpec::Home   => shell.get("HOME").map(str::to_string),
