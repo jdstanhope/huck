@@ -4968,10 +4968,14 @@ pub(crate) fn run_sourced_contents(
         }
         buf.push_str(line);
         buf.push('\n');
-        if let Completeness::Incomplete(_) = classify(&buf) {
+        let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+        if let Completeness::Incomplete(_) = classify(&buf, extglob) {
             continue;
         }
-        let tokens = match crate::lexer::tokenize(&buf) {
+        let tokens = match crate::lexer::tokenize_with_opts(
+            &buf,
+            crate::lexer::LexerOptions { extglob },
+        ) {
             Ok(t) if t.is_empty() => {
                 buf.clear();
                 continue;

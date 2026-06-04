@@ -41,3 +41,15 @@ fn param_expansion_extglob_off_is_literal() {
     // extglob off: `+(a)` is a literal pattern, no strip (matches bash).
     assert_eq!(run("v=aaab\necho \"${v##+(a)}\"\n").0, "aaab\n");
 }
+
+#[test]
+fn dbracket_extglob_parses_when_enabled() {
+    // After Task 2 the pattern lexes as one word, so [[ no longer syntax-errors.
+    // (Matching is wired in Task 3; here we only assert it PARSES + runs.)
+    let (_, rc) = run("shopt -s extglob\n[[ x == +(a|b) ]]\necho done\n");
+    assert_eq!(rc, 0); // no syntax error; `echo done` ran
+    assert_eq!(
+        run("shopt -s extglob\n[[ x == +(a|b) ]]; echo done\n").0,
+        "done\n"
+    );
+}

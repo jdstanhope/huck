@@ -21,6 +21,9 @@ pub enum LexError {
     ArrayLiteralMissingEquals,
     /// `((1+2` — EOF before matching `))`.
     UnterminatedArithBlock,
+    /// `+(a|b` — EOF before the closing `)` of an extglob group (only
+    /// reachable when `LexerOptions::extglob` is set).
+    UnterminatedExtglob,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -190,7 +193,18 @@ struct PendingHeredoc {
     token_idx: usize,
 }
 
+/// Lexer feature toggles resolved from shell state at tokenize time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LexerOptions {
+    pub extglob: bool,
+}
+
+/// Back-compat entry: lexes with all options off (current behavior).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
+    tokenize_with_opts(input, LexerOptions::default())
+}
+
+pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
@@ -220,6 +234,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 }
                 tokens.push(Token::Newline);
             }
+            continue;
+        }
+
+        // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
+        // by `(` introduces a balanced parenthesised group (`+(a|b)`), lexed
+        // as a single literal word part. Checked before the normal
+        // `?`/`*`/`(` handling so the group is recognized first. With extglob
+        // off, this branch never fires and lexing is byte-identical.
+        if opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && chars.peek() == Some(&'(') {
+            has_token = true;
+            flush_literal(&mut parts, &mut current, false);
+            let group = scan_extglob_group(c, &mut chars)?;
+            parts.push(WordPart::Literal { text: group, quoted: false });
             continue;
         }
 
@@ -656,6 +683,36 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         return Err(LexError::UnterminatedHeredoc);
     }
     Ok(tokens)
+}
+
+/// Reads `X(...)` where `prefix` is the just-seen extglob prefix char (one of
+/// `? * + @ !`), consuming a balanced-paren group (nested parens; inner
+/// `|`/metachars literal). `chars` is positioned just before the `(`; returns
+/// the full group text INCLUDING the prefix char, e.g. `"+(a|b)"`. EOF before
+/// the closing `)` is `LexError::UnterminatedExtglob`.
+fn scan_extglob_group(
+    prefix: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<String, LexError> {
+    let mut out = String::new();
+    out.push(prefix);
+    out.push('(');
+    chars.next(); // consume '('
+    let mut depth = 1usize;
+    for c in chars.by_ref() {
+        out.push(c);
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(LexError::UnterminatedExtglob) // EOF before closing ')'
 }
 
 /// Returns true if any unquoted Literal part in `parts` contains
@@ -2432,6 +2489,28 @@ mod tests {
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
         Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+    }
+
+    #[test]
+    fn extglob_word_recognized_when_enabled() {
+        let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true }).unwrap();
+        assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
+        assert!(matches!(&toks[0], Token::Word(_)));
+    }
+
+    #[test]
+    fn extglob_word_split_when_disabled() {
+        // default tokenize: unchanged — `(` is an operator.
+        let toks = tokenize("+(a|b)").unwrap();
+        assert!(toks.len() > 1, "default lexing must be unchanged: {toks:?}");
+    }
+
+    #[test]
+    fn extglob_all_prefixes_and_nesting() {
+        for p in ["?(a)", "*(a)", "@(a|b)", "!(a)", "a+(b|c)d", "@(a*(b)c)"] {
+            let toks = tokenize_with_opts(p, LexerOptions { extglob: true }).unwrap();
+            assert_eq!(toks.len(), 1, "{p} should be one word, got {toks:?}");
+        }
     }
 
     /// Builds a Token that holds a single quoted-Literal Word.
