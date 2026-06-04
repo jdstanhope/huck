@@ -108,6 +108,7 @@ pub struct ShellOptions {
     pub errexit: bool,
     pub nounset: bool,
     pub pipefail: bool,
+    pub verbose: bool,
 }
 
 /// One row of the bash `shopt` option table.
@@ -397,12 +398,13 @@ impl Shell {
     /// Returns the value of `$-` — alphabetical concatenation of
     /// short-flag letters reflecting current shell-options state
     /// and the interactive flag. Order: `e` (errexit), `i`
-    /// (interactive), `u` (nounset).
+    /// (interactive), `u` (nounset), `v` (verbose).
     pub fn dollar_dash_value(&self) -> String {
         let mut out = String::new();
         if self.shell_options.errexit { out.push('e'); }
         if self.is_interactive { out.push('i'); }
         if self.shell_options.nounset { out.push('u'); }
+        if self.shell_options.verbose { out.push('v'); }
         out
     }
 
@@ -1807,5 +1809,22 @@ mod shopt_tests {
         assert!(!shell.nocasematch());
         shell.shopt_options.set("nocasematch", true);
         assert!(shell.nocasematch());
+    }
+
+    #[test]
+    fn dollar_dash_includes_v_when_verbose() {
+        let mut sh = Shell::new();
+        assert!(!sh.dollar_dash_value().contains('v'));
+        sh.shell_options.verbose = true;
+        assert!(sh.dollar_dash_value().contains('v'));
+    }
+
+    #[test]
+    fn dollar_dash_v_after_u() {
+        let mut sh = Shell::new();
+        sh.shell_options.nounset = true;
+        sh.shell_options.verbose = true;
+        let d = sh.dollar_dash_value();
+        assert!(d.find('u').unwrap() < d.find('v').unwrap(), "got {d:?}");
     }
 }

@@ -3950,6 +3950,7 @@ fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
         "pipefail" => Some(shell.shell_options.pipefail),
+        "verbose" => Some(shell.shell_options.verbose),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -3960,6 +3961,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
         "nounset" => { shell.shell_options.nounset = value; Ok(()) }
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
+        "verbose" => { shell.shell_options.verbose = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4058,6 +4060,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                 match c {
                     b'e' => shell.shell_options.errexit = true,
                     b'u' => shell.shell_options.nounset = true,
+                    b'v' => shell.shell_options.verbose = true,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -4098,6 +4101,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                 match c {
                     b'e' => shell.shell_options.errexit = false,
                     b'u' => shell.shell_options.nounset = false,
+                    b'v' => shell.shell_options.verbose = false,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -9940,6 +9944,25 @@ mod set_options_tests {
         let mut shell = Shell::new();
         let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_v_short_flag_toggles_verbose() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-v"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.verbose);
+        let (oc, _) = run(&["+v"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.verbose);
+    }
+
+    #[test]
+    fn set_o_verbose_long_form_enables() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "verbose"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.verbose);
     }
 
     #[test]
