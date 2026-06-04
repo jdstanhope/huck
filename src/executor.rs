@@ -9,7 +9,7 @@ use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, ForClause, IfClause,
     Pipeline, Redirect, Sequence, SimpleCommand, TestBinaryOp, TestExpr, TestUnaryOp, WhileClause,
 };
-use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields};
+use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
 use crate::shell_state::Shell;
 
 /// Where the terminal stage of a top-level pipeline sends its stdout when
@@ -334,7 +334,10 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
     let mut values: Vec<String> = Vec::new();
     if clause.has_in {
         for word in &clause.words {
-            values.extend(glob_expand_fields(expand(word, shell)));
+            match glob_expand_word(word, shell) {
+                Ok(v) => values.extend(v),
+                Err(()) => return ExecOutcome::Continue(1),
+            }
         }
     } else {
         values = shell.positional_args.clone();
@@ -602,7 +605,10 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
         Some(words) => {
             let mut v = Vec::new();
             for w in words {
-                v.extend(glob_expand_fields(expand(w, shell)));
+                match glob_expand_word(w, shell) {
+                    Ok(g) => v.extend(g),
+                    Err(()) => return ExecOutcome::Continue(1),
+                }
             }
             v
         }
@@ -709,7 +715,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
 /// matches if any pattern matches; an unparseable glob matches nothing.
 fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool {
     let opts = glob::MatchOptions {
-        case_sensitive: true,
+        case_sensitive: !shell.nocasematch(),
         require_literal_separator: false,
         require_literal_leading_dot: false,
     };
@@ -848,6 +854,7 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
         TestExpr::Regex { lhs, pattern } => {
             let l = expand_assignment(lhs, shell);
             let p = expand_assignment(pattern, shell);
+            let p = if shell.nocasematch() { format!("(?i){p}") } else { p };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
             Ok(re.is_match(&l))
         }
@@ -897,7 +904,12 @@ fn eval_binary(
             let pattern_str = expand_pattern(rhs_word, shell);
             let pat = glob::Pattern::new(&pattern_str)
                 .map_err(|e| format!("bad pattern: {e}"))?;
-            let matched = pat.matches(lhs);
+            let mopts = glob::MatchOptions {
+                case_sensitive: !shell.nocasematch(),
+                require_literal_separator: false,
+                require_literal_leading_dot: false,
+            };
+            let matched = pat.matches_with(lhs, mopts);
             Ok(if matches!(op, TestBinaryOp::StringEq) { matched } else { !matched })
         }
         TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
@@ -1590,8 +1602,27 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
         .map_err(|_| io::Error::other(format!("bad fd: {expanded}")))
 }
 
+/// Glob-expands one word honoring `shopt` flags. On a `failglob` no-match,
+/// prints the bash-style "no match" error to stderr and returns `Err(())`,
+/// signaling the caller to abort the command/loop with status 1.
+fn glob_expand_word(word: &crate::lexer::Word, shell: &mut Shell) -> Result<Vec<String>, ()> {
+    // Borrow note: take the owned `Copy` opts before the mutable `expand`
+    // borrow, so the immutable borrow ends first.
+    let opts = shell.glob_opts();
+    let fields = expand(word, shell);
+    let exp = glob_expand_fields_opts(fields, opts);
+    if !exp.failglob_unmatched.is_empty() {
+        eprintln!("huck: no match: {}", exp.failglob_unmatched.join(" "));
+        return Err(());
+    }
+    Ok(exp.words)
+}
+
 fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
-    let prog_fields = glob_expand_fields(expand(&cmd.program, shell));
+    let prog_fields = match glob_expand_word(&cmd.program, shell) {
+        Ok(v) => v,
+        Err(()) => return Err(1),
+    };
     if let Some(status) = shell.pending_fatal_pe_error {
         return Err(status);
     }
@@ -1633,7 +1664,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             }
             continue;
         }
-        let fields = glob_expand_fields(expand(word, shell));
+        let fields = match glob_expand_word(word, shell) {
+            Ok(v) => v,
+            Err(()) => return Err(1),
+        };
         if let Some(status) = shell.pending_fatal_pe_error {
             return Err(status);
         }

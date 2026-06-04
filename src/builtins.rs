@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::command::DeclArg;
-use crate::shell_state::Shell;
+use crate::shell_state::{Shell, SHOPT_TABLE};
 
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
@@ -20,7 +20,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
-    "set", "shift", ".", "source", "local",
+    "set", "shopt", "shift", ".", "source", "local",
     ":", "true", "false", "command",
     "readonly", "read", "printf", "type", "hash",
     "pushd", "popd", "dirs",
@@ -93,6 +93,7 @@ pub fn run_builtin(
         "history" => builtin_history(args, out, shell),
         "trap" => builtin_trap(args, out, shell),
         "set" => builtin_set(args, out, shell),
+        "shopt" => builtin_shopt(args, out, shell),
         "shift" => builtin_shift(args, shell),
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
@@ -3875,45 +3876,91 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
 struct OptionInfo {
     name: &'static str,
-    #[allow(dead_code)]
-    short: Option<char>,
+    default: bool,
 }
 
-const SHELL_OPTIONS: &[OptionInfo] = &[
-    OptionInfo { name: "errexit", short: Some('e') },
-    OptionInfo { name: "nounset", short: Some('u') },
-    OptionInfo { name: "pipefail", short: None },
+/// bash 5.2's full `set -o` option table, in bash's display order.
+/// `errexit`/`nounset`/`pipefail` are implemented (real state via
+/// `Shell.shell_options`); the rest are recognized for listing + querying
+/// only (their `default` is reported) and cannot be enabled.
+const SETO_TABLE: &[OptionInfo] = &[
+    OptionInfo { name: "allexport", default: false },
+    OptionInfo { name: "braceexpand", default: true },
+    OptionInfo { name: "emacs", default: false },
+    OptionInfo { name: "errexit", default: false },
+    OptionInfo { name: "errtrace", default: false },
+    OptionInfo { name: "functrace", default: false },
+    OptionInfo { name: "hashall", default: true },
+    OptionInfo { name: "histexpand", default: false },
+    OptionInfo { name: "history", default: false },
+    OptionInfo { name: "ignoreeof", default: false },
+    OptionInfo { name: "interactive-comments", default: true },
+    OptionInfo { name: "keyword", default: false },
+    OptionInfo { name: "monitor", default: false },
+    OptionInfo { name: "noclobber", default: false },
+    OptionInfo { name: "noexec", default: false },
+    OptionInfo { name: "noglob", default: false },
+    OptionInfo { name: "nolog", default: false },
+    OptionInfo { name: "notify", default: false },
+    OptionInfo { name: "nounset", default: false },
+    OptionInfo { name: "onecmd", default: false },
+    OptionInfo { name: "physical", default: false },
+    OptionInfo { name: "pipefail", default: false },
+    OptionInfo { name: "posix", default: false },
+    OptionInfo { name: "privileged", default: false },
+    OptionInfo { name: "verbose", default: false },
+    OptionInfo { name: "vi", default: false },
+    OptionInfo { name: "xtrace", default: false },
 ];
 
+/// Error from `option_set` for a non-settable `set -o` name.
+/// `Debug` is required because an existing test calls `option_set(...).unwrap()`.
+#[derive(Debug)]
+enum OptSetErr {
+    /// Known bash option huck does not implement (e.g. `xtrace`, `posix`).
+    Unimplemented,
+    /// Not a recognized `set -o` option name at all.
+    Unknown,
+}
+
+/// Reads a `set -o` option: real state for the 3 implemented, the table
+/// default for any other recognized name, `None` for an unknown name.
 fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     match name {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
         "pipefail" => Some(shell.shell_options.pipefail),
-        _ => None,
+        other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
 
-fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), ()> {
+/// Writes a `set -o` option. Only the 3 implemented options are settable.
+fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
         "nounset" => { shell.shell_options.nounset = value; Ok(()) }
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
-        _ => Err(()),
+        other => {
+            if SETO_TABLE.iter().any(|o| o.name == other) {
+                Err(OptSetErr::Unimplemented)
+            } else {
+                Err(OptSetErr::Unknown)
+            }
+        }
     }
 }
 
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
-    for opt in SHELL_OPTIONS {
-        let val = option_get(shell, opt.name).unwrap_or(false);
-        let _ = writeln!(out, "{:<16}{}", opt.name, if val { "on" } else { "off" });
+    for opt in SETO_TABLE {
+        let val = option_get(shell, opt.name).unwrap_or(opt.default);
+        let _ = writeln!(out, "{:<15}\t{}", opt.name, if val { "on" } else { "off" });
     }
     ExecOutcome::Continue(0)
 }
 
 fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
-    for opt in SHELL_OPTIONS {
-        let val = option_get(shell, opt.name).unwrap_or(false);
+    for opt in SETO_TABLE {
+        let val = option_get(shell, opt.name).unwrap_or(opt.default);
         let sign = if val { '-' } else { '+' };
         let _ = writeln!(out, "set {sign}o {}", opt.name);
     }
@@ -3950,9 +3997,16 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             if i >= args.len() {
                 return print_options_table(out, shell);
             }
-            if option_set(shell, &args[i], true).is_err() {
-                eprintln!("huck: set: -o: invalid option name: {}", args[i]);
-                return ExecOutcome::Continue(2);
+            match option_set(shell, &args[i], true) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: set: -o: invalid option name: {}", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
             }
             i += 1;
             continue;
@@ -3962,9 +4016,16 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             if i >= args.len() {
                 return print_options_reinput(out, shell);
             }
-            if option_set(shell, &args[i], false).is_err() {
-                eprintln!("huck: set: +o: invalid option name: {}", args[i]);
-                return ExecOutcome::Continue(2);
+            match option_set(shell, &args[i], false) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: set: +o: invalid option name: {}", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
             }
             i += 1;
             continue;
@@ -3982,12 +4043,22 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         if i >= args.len() {
                             return print_options_table(out, shell);
                         }
-                        if option_set(shell, &args[i], true).is_err() {
-                            eprintln!(
-                                "huck: set: -o: invalid option name: {}",
-                                args[i]
-                            );
-                            return ExecOutcome::Continue(2);
+                        match option_set(shell, &args[i], true) {
+                            Ok(()) => {}
+                            Err(OptSetErr::Unimplemented) => {
+                                eprintln!(
+                                    "huck: set: {}: not yet supported in this version",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
+                            Err(OptSetErr::Unknown) => {
+                                eprintln!(
+                                    "huck: set: -o: invalid option name: {}",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
                         }
                     }
                     other => {
@@ -4012,12 +4083,22 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         if i >= args.len() {
                             return print_options_reinput(out, shell);
                         }
-                        if option_set(shell, &args[i], false).is_err() {
-                            eprintln!(
-                                "huck: set: +o: invalid option name: {}",
-                                args[i]
-                            );
-                            return ExecOutcome::Continue(2);
+                        match option_set(shell, &args[i], false) {
+                            Ok(()) => {}
+                            Err(OptSetErr::Unimplemented) => {
+                                eprintln!(
+                                    "huck: set: {}: not yet supported in this version",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
+                            Err(OptSetErr::Unknown) => {
+                                eprintln!(
+                                    "huck: set: +o: invalid option name: {}",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
                         }
                     }
                     other => {
@@ -4044,6 +4125,167 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
         shell.positional_args = args[i..].to_vec();
     }
     ExecOutcome::Continue(0)
+}
+
+/// Formats one option line in bash's `%-15s\t%s` shopt/`set -o` format.
+fn fmt_opt_line(name: &str, on: bool) -> String {
+    format!("{:<15}\t{}", name, if on { "on" } else { "off" })
+}
+
+/// `shopt` builtin. Operates on the `shopt` option namespace, or — with
+/// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
+fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let (mut set_f, mut unset_f, mut quiet, mut print_f, mut o_bridge) =
+        (false, false, false, false, false);
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" { i += 1; break; }
+        if a.len() >= 2 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    's' => set_f = true,
+                    'u' => unset_f = true,
+                    'q' => quiet = true,
+                    'p' => print_f = true,
+                    'o' => o_bridge = true,
+                    _ => {
+                        eprintln!("huck: shopt: -{c}: invalid option");
+                        eprintln!("shopt: usage: shopt [-pqsu] [-o] [optname ...]");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if set_f && unset_f {
+        eprintln!("huck: shopt: cannot set and unset shell options simultaneously");
+        return ExecOutcome::Continue(1);
+    }
+    let names = &args[i..];
+
+    if o_bridge {
+        return shopt_o_bridge(names, set_f, unset_f, quiet, print_f, out, shell);
+    }
+
+    // ---- shopt namespace ----
+    if names.is_empty() {
+        if quiet {
+            // No names → vacuously "all set" (matches bash 5.2).
+            return ExecOutcome::Continue(0);
+        }
+        for opt in SHOPT_TABLE {
+            let on = shell.shopt_options.get(opt.name).unwrap_or(false);
+            if set_f && !on { continue; }
+            if unset_f && on { continue; }
+            if print_f {
+                let _ = writeln!(out, "shopt -{} {}", if on { 's' } else { 'u' }, opt.name);
+            } else {
+                let _ = writeln!(out, "{}", fmt_opt_line(opt.name, on));
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if set_f || unset_f {
+        let mut rc = 0;
+        for name in names {
+            if !shell.shopt_options.set(name, set_f) {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                rc = 1;
+            }
+        }
+        return ExecOutcome::Continue(rc);
+    }
+
+    // query mode
+    let mut all_set = true;
+    for name in names {
+        match shell.shopt_options.get(name) {
+            Some(on) => {
+                if !on { all_set = false; }
+                if !quiet {
+                    if print_f {
+                        let _ = writeln!(out, "shopt -{} {}", if on { 's' } else { 'u' }, name);
+                    } else {
+                        let _ = writeln!(out, "{}", fmt_opt_line(name, on));
+                    }
+                }
+            }
+            None => {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                all_set = false;
+            }
+        }
+    }
+    ExecOutcome::Continue(if all_set { 0 } else { 1 })
+}
+
+/// The `-o` bridge: every `shopt` form operates on the `set -o` namespace.
+fn shopt_o_bridge(
+    names: &[String], set_f: bool, unset_f: bool, quiet: bool, print_f: bool,
+    out: &mut dyn Write, shell: &mut Shell,
+) -> ExecOutcome {
+    if names.is_empty() {
+        if quiet {
+            // No names → vacuously "all set" (matches bash 5.2).
+            return ExecOutcome::Continue(0);
+        }
+        for opt in SETO_TABLE {
+            let on = option_get(shell, opt.name).unwrap_or(opt.default);
+            if set_f && !on { continue; }
+            if unset_f && on { continue; }
+            if print_f {
+                let _ = writeln!(out, "set {}o {}", if on { '-' } else { '+' }, opt.name);
+            } else {
+                let _ = writeln!(out, "{}", fmt_opt_line(opt.name, on));
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if set_f || unset_f {
+        let mut rc = 0;
+        for name in names {
+            match option_set(shell, name, set_f) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: shopt: {name}: not yet supported in this version");
+                    rc = 1;
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: shopt: {name}: invalid shell option name");
+                    rc = 1;
+                }
+            }
+        }
+        return ExecOutcome::Continue(rc);
+    }
+
+    // query mode
+    let mut all_set = true;
+    for name in names {
+        match option_get(shell, name) {
+            Some(on) => {
+                if !on { all_set = false; }
+                if !quiet {
+                    if print_f {
+                        let _ = writeln!(out, "set {}o {}", if on { '-' } else { '+' }, name);
+                    } else {
+                        let _ = writeln!(out, "{}", fmt_opt_line(name, on));
+                    }
+                }
+            }
+            None => {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                all_set = false;
+            }
+        }
+    }
+    ExecOutcome::Continue(if all_set { 0 } else { 1 })
 }
 
 fn set_escape_value(v: &str) -> String {
@@ -9722,6 +9964,44 @@ mod set_options_tests {
         assert!(!shell.shell_options.errexit, "expected errexit off");
         assert!(!shell.shell_options.nounset, "expected nounset off");
     }
+
+    #[test]
+    fn set_o_lists_full_27_name_table_tab_format() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-o"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 27, "set -o must list all 27 names; got {lines:?}");
+        // bash format: name left-justified in 15, a TAB, then on/off.
+        assert_eq!(lines[0], "allexport      \toff");
+        assert_eq!(lines[3], "errexit        \toff");
+        // long name (>=15 chars): no padding, just name + TAB + value.
+        assert!(lines.contains(&"interactive-comments\ton"));
+        assert!(lines.contains(&"braceexpand    \ton"));
+        assert!(lines.contains(&"hashall        \ton"));
+    }
+
+    #[test]
+    fn set_o_reflects_real_state_for_implemented() {
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        let (_, out) = run(&["-o"], &mut shell);
+        assert!(out.lines().any(|l| l == "errexit        \ton"));
+    }
+
+    #[test]
+    fn set_o_enable_unimplemented_says_not_supported() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "xtrace"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_o_enable_unknown_name_is_invalid() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
 }
 
 #[cfg(test)]
@@ -10087,6 +10367,28 @@ mod pipefail_option_tests {
 
     #[test]
     fn pipefail_listed_in_shell_options() {
-        assert!(SHELL_OPTIONS.iter().any(|o| o.name == "pipefail" && o.short.is_none()));
+        assert!(SETO_TABLE.iter().any(|o| o.name == "pipefail" && !o.default));
+    }
+
+    #[test]
+    fn shopt_bare_lists_all_57() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let oc = builtin_shopt(&[], &mut buf, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.lines().count(), 57);
+        assert_eq!(out.lines().next().unwrap(), "autocd         \toff");
+        assert!(out.lines().any(|l| l == "checkwinsize   \ton"));
+        assert!(out.lines().any(|l| l == "assoc_expand_once\toff")); // long name, no pad
+    }
+
+    #[test]
+    fn shopt_o_lists_27() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let oc = builtin_shopt(&["-o".into()], &mut buf, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 27);
     }
 }

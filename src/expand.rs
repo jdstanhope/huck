@@ -4,6 +4,16 @@ use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
 use glob::{glob_with, MatchOptions};
 
+/// Pathname-expansion behavior toggles derived from `shopt` state.
+/// All-false ⇒ huck's default (pre-v86) globbing behavior.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct GlobOpts {
+    pub nullglob: bool,
+    pub dotglob: bool,
+    pub nocaseglob: bool,
+    pub failglob: bool,
+}
+
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
     match spec {
         TildeSpec::Home   => shell.get("HOME").map(str::to_string),
@@ -1004,16 +1014,28 @@ fn emit_split_fields(
     }
 }
 
-/// Expands fields by pathname expansion (globbing). For fields with no
-/// unquoted glob metacharacters, returns the field as-is. For fields with
-/// unquoted metacharacters, builds a glob pattern (escaping quoted metachars
-/// via bracket expressions) and invokes the `glob` crate. If no matches,
-/// returns the field as-is (literal fallback — bash default behavior).
-pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
-    let mut out = Vec::new();
+/// Result of opts-aware pathname expansion. `words` are the expanded fields;
+/// `failglob_unmatched` lists patterns that matched nothing under `failglob`
+/// (the caller turns a non-empty list into a command abort with status 1).
+pub struct GlobExpansion {
+    pub words: Vec<String>,
+    pub failglob_unmatched: Vec<String>,
+}
+
+/// Pathname expansion honoring `shopt` glob toggles. See `GlobOpts`.
+///
+/// For fields with no unquoted glob metacharacters, the field passes through
+/// as-is. For fields with unquoted metacharacters, builds a glob pattern
+/// (escaping quoted metachars via bracket expressions) and invokes the `glob`
+/// crate. No-match behavior depends on `opts`: `failglob` records the pattern
+/// for the caller to abort, `nullglob` contributes nothing, otherwise the
+/// literal field survives (bash default).
+pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpansion {
+    let mut words = Vec::new();
+    let mut failglob_unmatched = Vec::new();
     for field in fields {
         if !has_unquoted_metachar(&field) {
-            out.push(field.chars);
+            words.push(field.chars);
             continue;
         }
         let pattern = build_glob_pattern(&field);
@@ -1024,15 +1046,16 @@ pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
         // `.foo`, or a bracket class like `[.]*`) from matching dotfiles, so
         // we toggle it off when the pattern's effective first char is a
         // literal `.`. We accept both bare `.` and the `[.]` single-element
-        // bracket form (verified empirically against `glob` 0.3).
+        // bracket form (verified empirically against `glob` 0.3). `dotglob`
+        // forces `*`/`?` to also match a leading dot.
         let literal_leading_dot =
             pattern.starts_with('.') || pattern.starts_with("[.]");
-        let opts = MatchOptions {
-            case_sensitive: true,
+        let match_opts = MatchOptions {
+            case_sensitive: !opts.nocaseglob,
             require_literal_separator: true,
-            require_literal_leading_dot: !literal_leading_dot,
+            require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
         };
-        match glob_with(&pattern, opts) {
+        match glob_with(&pattern, match_opts) {
             Ok(paths) => {
                 let mut matched = Vec::new();
                 for entry in paths {
@@ -1045,24 +1068,39 @@ pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
                 // Defensive: filter `.` and `..` if the glob crate ever emits
                 // them for patterns like `.*`. (Current versions exclude them
                 // under require_literal_leading_dot, but explicit filtering
-                // makes the contract loud.)
+                // makes the contract loud — and `dotglob` keeps it relevant.)
                 matched.retain(|p| {
                     let last = std::path::Path::new(p).file_name().and_then(|s| s.to_str());
                     !matches!(last, Some(".") | Some(".."))
                 });
                 if matched.is_empty() {
-                    out.push(field.chars);
+                    if opts.failglob {
+                        failglob_unmatched.push(field.chars);
+                    } else if opts.nullglob {
+                        // contribute nothing
+                    } else {
+                        words.push(field.chars);
+                    }
                 } else {
-                    out.extend(matched);
+                    words.extend(matched);
                 }
             }
             Err(_) => {
                 // Invalid pattern → literal fallback.
-                out.push(field.chars);
+                words.push(field.chars);
             }
         }
     }
-    out
+    GlobExpansion { words, failglob_unmatched }
+}
+
+/// Back-compat: default (all-off) globbing. Retained as a thin wrapper over
+/// `glob_expand_fields_opts` for the module's own glob tests, which assert the
+/// default (pre-v86) behavior is preserved. Production call sites now go
+/// through `glob_expand_fields_opts` (via `executor::glob_expand_word`).
+#[cfg(test)]
+pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
+    glob_expand_fields_opts(fields, GlobOpts::default()).words
 }
 
 /// Builds the glob pattern string for a `Field`: quoted metacharacters
