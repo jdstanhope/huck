@@ -845,6 +845,9 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
     match expr {
         TestExpr::Unary { op, operand } => {
             let s = expand_assignment(operand, shell);
+            if matches!(op, TestUnaryOp::VarSet) {
+                return Ok(shell.is_set(&s));
+            }
             Ok(eval_unary(*op, &s))
         }
         TestExpr::Binary { op, lhs, rhs } => {
@@ -890,6 +893,7 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
         TestUnaryOp::IsExecutable => test_builtin::evaluate(&["-x".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::IsNonEmpty   => test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::IsSymlink    => test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::VarSet       => unreachable!("VarSet handled in eval_test_expr"),
     }
 }
 
@@ -938,6 +942,16 @@ fn eval_binary(
                 TestBinaryOp::IntGe => l >= r,
                 _ => unreachable!(),
             })
+        }
+        TestBinaryOp::NewerThan | TestBinaryOp::OlderThan | TestBinaryOp::SameFile => {
+            let rhs = expand_assignment(rhs_word, shell);
+            let op_str = match op {
+                TestBinaryOp::NewerThan => "-nt",
+                TestBinaryOp::OlderThan => "-ot",
+                TestBinaryOp::SameFile => "-ef",
+                _ => unreachable!(),
+            };
+            Ok(crate::test_builtin::compare_files(op_str, lhs, &rhs))
         }
     }
 }

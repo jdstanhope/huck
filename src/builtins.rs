@@ -116,7 +116,7 @@ pub fn run_builtin(
         "declare" | "typeset" => builtin_declare(args, out, shell),
         "read" => builtin_read(args, out, shell),
         "printf" => builtin_printf(args, out, shell),
-        "test" | "[" => builtin_test(name, args),
+        "test" | "[" => builtin_test(name, args, shell),
         "break" => builtin_break(args, shell),
         "continue" => builtin_continue(args, shell),
         "return" => builtin_return(args, shell),
@@ -5608,7 +5608,7 @@ fn builtin_command(
     ExecOutcome::Continue(if any_not_found { 1 } else { 0 })
 }
 
-fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
+fn builtin_test(name: &str, args: &[String], shell: &Shell) -> ExecOutcome {
     let eval_args: &[String] = if name == "[" {
         match args.last() {
             Some(last) if last == "]" => &args[..args.len() - 1],
@@ -5620,7 +5620,7 @@ fn builtin_test(name: &str, args: &[String]) -> ExecOutcome {
     } else {
         args
     };
-    match crate::test_builtin::evaluate(eval_args) {
+    match crate::test_builtin::evaluate_with(eval_args, &|n| shell.is_set(n)) {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {
