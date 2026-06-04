@@ -1902,6 +1902,13 @@ fn status_code(status: &ExitStatus) -> i32 {
 
 // ----- single command -------------------------------------------------------
 
+// $PIPESTATUS leaf-site rule (M-50, v83): ONLY `run_single`, `run_multi_stage`,
+// and the foreground subshell arm write `$PIPESTATUS`. Compound runners
+// (`run_if`/`run_while`/`run_for`/`run_case`/`run_select`/brace group) are
+// deliberately PIPESTATUS-transparent — they never write it; their inner leaf
+// commands do. This matches bash: after `if cond; then ...; fi`, `$PIPESTATUS`
+// reflects the last inner pipeline (e.g. `cond`), not the `if` itself. Do NOT
+// add a set_pipestatus call to a compound runner.
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
@@ -2996,7 +3003,9 @@ fn run_multi_stage(
         give_terminal_to(shell.shell_pgid);
         if let PipelineWaitResult::Stopped(sig) = &last_status {
             let sig = *sig;
-            // Capture fd cleanup.
+            // Intentionally do NOT set $PIPESTATUS here: bash does not set it
+            // for a stopped (Ctrl-Z) pipeline. Capture fd cleanup before the
+            // early return.
             if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
             return ExecOutcome::Continue(128 + sig);
         }
