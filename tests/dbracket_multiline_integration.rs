@@ -32,8 +32,12 @@ fn multiline_break_after_open() {
 }
 
 #[test]
-fn multiline_break_after_operand() {
-    assert_eq!(run("[[ abc\n== abc ]] && echo eq\n").0, "eq\n");
+fn multiline_break_after_operand_errors_like_bash() {
+    // bash rejects a newline after an operand inside [[ ]] (binary operator
+    // expected); huck must error too (not silently accept).
+    let (out, rc) = run("[[ abc\n== abc ]] && echo eq\n");
+    assert_ne!(rc, 0, "expected nonzero exit; stdout={out:?}");
+    assert_eq!(out, "", "no stdout expected; got {out:?}");
 }
 
 #[test]
@@ -45,4 +49,17 @@ fn singleline_still_works() {
 fn bare_double_bracket_token_is_literal_arg() {
     // `echo [[` must NOT hang waiting for `]]`; prints the literal.
     assert_eq!(run("echo [[\n").0, "[[\n");
+}
+
+#[test]
+fn dbracket_v_set_and_unset() {
+    assert_eq!(run("x=1\n[[ -v x ]] && echo set || echo unset\n").0, "set\n");
+    assert_eq!(run("y=\"\"\n[[ -v y ]] && echo set || echo unset\n").0, "set\n"); // set-but-empty
+    assert_eq!(run("unset z\n[[ -v z ]] && echo set || echo unset\n").0, "unset\n");
+}
+
+#[test]
+fn test_builtin_v_set_and_unset() {
+    assert_eq!(run("x=1\n[ -v x ] && echo set || echo unset\n").0, "set\n");
+    assert_eq!(run("unset z\n[ -v z ] && echo set || echo unset\n").0, "unset\n");
 }

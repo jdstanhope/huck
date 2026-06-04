@@ -392,6 +392,7 @@ pub enum TestUnaryOp {
     IsSymlink,       // -L
     StringNonEmpty,  // -n
     StringEmpty,     // -z
+    VarSet,          // -v  (variable is set)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1853,6 +1854,7 @@ fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
         "-L" => Some(TestUnaryOp::IsSymlink),
         "-n" => Some(TestUnaryOp::StringNonEmpty),
         "-z" => Some(TestUnaryOp::StringEmpty),
+        "-v" => Some(TestUnaryOp::VarSet),
         _ => None,
     }
 }

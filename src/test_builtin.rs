@@ -3,9 +3,9 @@
 //! `evaluate` implements the POSIX argument-count algorithm. Operator
 //! application lives in `apply_unary` / `apply_binary`.
 
-/// Evaluates a `test` expression. `Ok(true)` / `Ok(false)` are the
-/// result; `Err(message)` is a usage error.
-pub fn evaluate(args: &[String]) -> Result<bool, String> {
+/// Evaluates a `test` expression. `var_is_set(name)` answers `-v NAME`.
+/// `Ok(true)` / `Ok(false)` are the result; `Err(message)` is a usage error.
+pub fn evaluate_with(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Result<bool, String> {
     // POSIX § 4.62 short-form for 0-1 args: required for correctness
     // (e.g. `[ -a ]` is true — a 1-arg call returns truthiness of the
     // string, not a unary-op application).
@@ -19,7 +19,7 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
     // to the grammar parser, which handles forms the short-form
     // rejects (e.g. `[ ( -n a ) ]`).
     if args.len() <= 4
-        && let Ok(b) = evaluate_short_form(args)
+        && let Ok(b) = evaluate_short_form(args, var_is_set)
     {
         return Ok(b);
     }
@@ -27,6 +27,7 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
         args,
         pos: 0,
         dry_run: false,
+        var_is_set,
     };
     let result = p.parse_expr()?;
     if p.pos != args.len() {
@@ -35,13 +36,23 @@ pub fn evaluate(args: &[String]) -> Result<bool, String> {
     Ok(result)
 }
 
-fn evaluate_short_form(args: &[String]) -> Result<bool, String> {
+/// Back-compat entry: no variables are considered set (`-v` → false).
+/// Used by every caller that doesn't evaluate `-v` (all existing unit
+/// tests and `[[`'s file-test delegation).
+pub fn evaluate(args: &[String]) -> Result<bool, String> {
+    evaluate_with(args, &|_| false)
+}
+
+fn evaluate_short_form(
+    args: &[String],
+    var_is_set: &dyn Fn(&str) -> bool,
+) -> Result<bool, String> {
     match args.len() {
         2 => {
             if args[0] == "!" {
-                negate(evaluate(&args[1..2]))
+                negate(evaluate_with(&args[1..2], var_is_set))
             } else if is_unary_op(&args[0]) {
-                apply_unary(&args[0], &args[1])
+                apply_unary(&args[0], &args[1], var_is_set)
             } else {
                 Err(format!("{}: unary operator expected", args[0]))
             }
@@ -50,14 +61,14 @@ fn evaluate_short_form(args: &[String]) -> Result<bool, String> {
             if is_binary_op(&args[1]) {
                 apply_binary(&args[1], &args[0], &args[2])
             } else if args[0] == "!" {
-                negate(evaluate(&args[1..3]))
+                negate(evaluate_with(&args[1..3], var_is_set))
             } else {
                 Err(format!("{}: binary operator expected", args[1]))
             }
         }
         4 => {
             if args[0] == "!" {
-                negate(evaluate(&args[1..4]))
+                negate(evaluate_with(&args[1..4], var_is_set))
             } else {
                 Err("too many arguments".to_string())
             }
@@ -78,7 +89,7 @@ fn is_unary_op(s: &str) -> bool {
         // `-a` is bash's deprecated unary alias for `-e` (file exists).
         // It also serves as the binary AND combinator in operator
         // position; the grammar parser (v75) disambiguates by context.
-        "-a" | "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n"
+        "-a" | "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n" | "-v"
     )
 }
 
@@ -91,8 +102,13 @@ fn is_binary_op(s: &str) -> bool {
 }
 
 /// Applies a unary operator to its operand.
-fn apply_unary(op: &str, operand: &str) -> Result<bool, String> {
+fn apply_unary(
+    op: &str,
+    operand: &str,
+    var_is_set: &dyn Fn(&str) -> bool,
+) -> Result<bool, String> {
     match op {
+        "-v" => Ok(var_is_set(operand)),
         "-z" => Ok(operand.is_empty()),
         "-n" => Ok(!operand.is_empty()),
         // `-a` and `-e` both test for file existence. POSIX prefers
@@ -177,6 +193,9 @@ struct Parser<'a> {
     /// implement bash-style short-circuit evaluation of `-a` / `-o`
     /// without duplicating the grammar walker.
     dry_run: bool,
+    /// Predicate answering `-v NAME` (variable-is-set). Injected so the
+    /// module stays decoupled from `Shell`.
+    var_is_set: &'a dyn Fn(&str) -> bool,
 }
 
 impl<'a> Parser<'a> {
@@ -287,7 +306,7 @@ impl<'a> Parser<'a> {
             if self.dry_run {
                 return Ok(false);
             }
-            return apply_unary(&op, &operand);
+            return apply_unary(&op, &operand, self.var_is_set);
         }
         // <word> <binop> <word> — three-token binary form.
         if let (Some(_lhs), Some(op), Some(_rhs)) = (
@@ -328,6 +347,14 @@ mod tests {
     #[test]
     fn zero_args_is_false() {
         assert_eq!(evaluate(&[]), Ok(false));
+    }
+
+    #[test]
+    fn test_v_uses_predicate() {
+        let setvars = ["HOME", "EMPTYVAR"];
+        let pred = |n: &str| setvars.contains(&n);
+        assert_eq!(evaluate_with(&["-v".into(), "HOME".into()], &pred), Ok(true));
+        assert_eq!(evaluate_with(&["-v".into(), "NOPE".into()], &pred), Ok(false));
     }
 
     #[test]

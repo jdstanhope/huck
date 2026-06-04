@@ -482,6 +482,28 @@ impl Shell {
         }
     }
 
+    /// True if the named variable/parameter is currently **set** (a
+    /// set-but-empty variable counts as set; unset is false). Backs
+    /// `[[ -v NAME ]]` and `test -v NAME`. Supports scalar names and
+    /// positional parameters; array-element forms (`arr[i]`) are out of
+    /// scope (M-14b) and fall through to a plain-name lookup (→ false).
+    pub fn is_set(&self, name: &str) -> bool {
+        // Always-defined special parameters.
+        match name {
+            "0" | "$" | "#" | "-" | "?" => return true,
+            "!" => return self.last_bg_pid.is_some(),
+            _ => {}
+        }
+        // Positional parameter: `1`, `2`, …
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+            return name
+                .parse::<usize>()
+                .map(|n| n >= 1 && n <= self.positional_args.len())
+                .unwrap_or(false);
+        }
+        self.vars.contains_key(name)
+    }
+
     /// Marks an existing variable as exported. If it doesn't exist, creates
     /// it with an empty value, already exported.
     pub fn export(&mut self, name: &str) {
@@ -1176,6 +1198,34 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_set_true_for_set_var_even_when_empty() {
+        let mut sh = Shell::new();
+        sh.set("X", String::new()); // Shell::set(&mut self, name: &str, value: String)
+        assert!(sh.is_set("X"));
+    }
+
+    #[test]
+    fn is_set_false_for_unset() {
+        let sh = Shell::new();
+        assert!(!sh.is_set("DEFINITELY_UNSET_VAR_XYZ"));
+    }
+
+    #[test]
+    fn is_set_positional_params() {
+        let mut sh = Shell::new();
+        sh.positional_args = vec!["a".into(), "b".into()];
+        assert!(sh.is_set("1"));
+        assert!(sh.is_set("2"));
+        assert!(!sh.is_set("3"));
+    }
+
+    #[test]
+    fn is_set_special_zero_is_true() {
+        let sh = Shell::new();
+        assert!(sh.is_set("0"));
+    }
 
     #[test]
     fn set_pipestatus_writes_indexed_array() {
