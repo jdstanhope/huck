@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::command::DeclArg;
-use crate::shell_state::Shell;
+use crate::shell_state::{Shell, SHOPT_TABLE};
 
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
@@ -20,7 +20,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
-    "set", "shift", ".", "source", "local",
+    "set", "shopt", "shift", ".", "source", "local",
     ":", "true", "false", "command",
     "readonly", "read", "printf", "type", "hash",
     "pushd", "popd", "dirs",
@@ -93,6 +93,7 @@ pub fn run_builtin(
         "history" => builtin_history(args, out, shell),
         "trap" => builtin_trap(args, out, shell),
         "set" => builtin_set(args, out, shell),
+        "shopt" => builtin_shopt(args, out, shell),
         "shift" => builtin_shift(args, shell),
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
@@ -4124,6 +4125,167 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
         shell.positional_args = args[i..].to_vec();
     }
     ExecOutcome::Continue(0)
+}
+
+/// Formats one option line in bash's `%-15s\t%s` shopt/`set -o` format.
+fn fmt_opt_line(name: &str, on: bool) -> String {
+    format!("{:<15}\t{}", name, if on { "on" } else { "off" })
+}
+
+/// `shopt` builtin. Operates on the `shopt` option namespace, or — with
+/// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
+fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let (mut set_f, mut unset_f, mut quiet, mut print_f, mut o_bridge) =
+        (false, false, false, false, false);
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" { i += 1; break; }
+        if a.len() >= 2 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    's' => set_f = true,
+                    'u' => unset_f = true,
+                    'q' => quiet = true,
+                    'p' => print_f = true,
+                    'o' => o_bridge = true,
+                    _ => {
+                        eprintln!("huck: shopt: -{c}: invalid option");
+                        eprintln!("shopt: usage: shopt [-pqsu] [-o] [optname ...]");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if set_f && unset_f {
+        eprintln!("huck: shopt: cannot set and unset shell options simultaneously");
+        return ExecOutcome::Continue(1);
+    }
+    let names = &args[i..];
+
+    if o_bridge {
+        return shopt_o_bridge(names, set_f, unset_f, quiet, print_f, out, shell);
+    }
+
+    // ---- shopt namespace ----
+    if names.is_empty() {
+        if quiet {
+            // No names → vacuously "all set" (matches bash 5.2).
+            return ExecOutcome::Continue(0);
+        }
+        for opt in SHOPT_TABLE {
+            let on = shell.shopt_options.get(opt.name).unwrap_or(false);
+            if set_f && !on { continue; }
+            if unset_f && on { continue; }
+            if print_f {
+                let _ = writeln!(out, "shopt -{} {}", if on { 's' } else { 'u' }, opt.name);
+            } else {
+                let _ = writeln!(out, "{}", fmt_opt_line(opt.name, on));
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if set_f || unset_f {
+        let mut rc = 0;
+        for name in names {
+            if !shell.shopt_options.set(name, set_f) {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                rc = 1;
+            }
+        }
+        return ExecOutcome::Continue(rc);
+    }
+
+    // query mode
+    let mut all_set = true;
+    for name in names {
+        match shell.shopt_options.get(name) {
+            Some(on) => {
+                if !on { all_set = false; }
+                if !quiet {
+                    if print_f {
+                        let _ = writeln!(out, "shopt -{} {}", if on { 's' } else { 'u' }, name);
+                    } else {
+                        let _ = writeln!(out, "{}", fmt_opt_line(name, on));
+                    }
+                }
+            }
+            None => {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                all_set = false;
+            }
+        }
+    }
+    ExecOutcome::Continue(if all_set { 0 } else { 1 })
+}
+
+/// The `-o` bridge: every `shopt` form operates on the `set -o` namespace.
+fn shopt_o_bridge(
+    names: &[String], set_f: bool, unset_f: bool, quiet: bool, print_f: bool,
+    out: &mut dyn Write, shell: &mut Shell,
+) -> ExecOutcome {
+    if names.is_empty() {
+        if quiet {
+            // No names → vacuously "all set" (matches bash 5.2).
+            return ExecOutcome::Continue(0);
+        }
+        for opt in SETO_TABLE {
+            let on = option_get(shell, opt.name).unwrap_or(opt.default);
+            if set_f && !on { continue; }
+            if unset_f && on { continue; }
+            if print_f {
+                let _ = writeln!(out, "set {}o {}", if on { '-' } else { '+' }, opt.name);
+            } else {
+                let _ = writeln!(out, "{}", fmt_opt_line(opt.name, on));
+            }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if set_f || unset_f {
+        let mut rc = 0;
+        for name in names {
+            match option_set(shell, name, set_f) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: shopt: {name}: not yet supported in this version");
+                    rc = 1;
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: shopt: {name}: invalid shell option name");
+                    rc = 1;
+                }
+            }
+        }
+        return ExecOutcome::Continue(rc);
+    }
+
+    // query mode
+    let mut all_set = true;
+    for name in names {
+        match option_get(shell, name) {
+            Some(on) => {
+                if !on { all_set = false; }
+                if !quiet {
+                    if print_f {
+                        let _ = writeln!(out, "set {}o {}", if on { '-' } else { '+' }, name);
+                    } else {
+                        let _ = writeln!(out, "{}", fmt_opt_line(name, on));
+                    }
+                }
+            }
+            None => {
+                eprintln!("huck: shopt: {name}: invalid shell option name");
+                all_set = false;
+            }
+        }
+    }
+    ExecOutcome::Continue(if all_set { 0 } else { 1 })
 }
 
 fn set_escape_value(v: &str) -> String {
@@ -10206,5 +10368,27 @@ mod pipefail_option_tests {
     #[test]
     fn pipefail_listed_in_shell_options() {
         assert!(SETO_TABLE.iter().any(|o| o.name == "pipefail" && !o.default));
+    }
+
+    #[test]
+    fn shopt_bare_lists_all_57() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let oc = builtin_shopt(&[], &mut buf, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.lines().count(), 57);
+        assert_eq!(out.lines().next().unwrap(), "autocd         \toff");
+        assert!(out.lines().any(|l| l == "checkwinsize   \ton"));
+        assert!(out.lines().any(|l| l == "assoc_expand_once\toff")); // long name, no pad
+    }
+
+    #[test]
+    fn shopt_o_lists_27() {
+        let mut shell = Shell::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let oc = builtin_shopt(&["-o".into()], &mut buf, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 27);
     }
 }
