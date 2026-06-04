@@ -164,7 +164,7 @@ pub enum WordPart {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Token {
     Word(Word),
     Op(Operator),

@@ -14,6 +14,7 @@ pub enum ContinuationReason {
     Compound,
     Heredoc,
     Subshell,
+    DoubleBracket,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -54,6 +55,14 @@ pub fn classify(buffer: &str) -> Completeness {
             };
         }
     };
+    // Run the parser first so that an unterminated `[[ … ]]` is detected even
+    // when the buffer ends with `&&`/`||` (which would otherwise short-circuit
+    // to `Operator` before the parser can identify the real reason).  The parser
+    // result is cloned away; the trailing-operator check runs on the original
+    // token slice if the parser didn't signal `DoubleBracket`.
+    if let Err(ParseError::UnterminatedDoubleBracket) = command::parse(tokens.clone()) {
+        return Completeness::Incomplete(ContinuationReason::DoubleBracket);
+    }
     if matches!(
         tokens.last(),
         Some(Token::Op(Operator::Pipe | Operator::And | Operator::Or))
@@ -102,6 +111,10 @@ pub fn joiner_for(reason: ContinuationReason, last_line: &str) -> &'static str {
         }
         ContinuationReason::Heredoc => "\n",
         ContinuationReason::Subshell => "; ",
+        // Unconditional space: `[[ ]]` has no keyword positions where a `;`
+        // would be needed (unlike `Compound`), and a space is valid in every
+        // bash-allowed break position (after `[[`, after `&&`/`||`, before `]]`).
+        ContinuationReason::DoubleBracket => " ",
     }
 }
 
@@ -372,5 +385,43 @@ mod tests {
     #[test]
     fn joiner_for_subshell_is_semi_space() {
         assert_eq!(joiner_for(ContinuationReason::Subshell, ""), "; ");
+    }
+
+    #[test]
+    fn classify_unclosed_double_bracket_is_incomplete() {
+        assert_eq!(
+            classify("[[ -f /etc/passwd"),
+            Completeness::Incomplete(ContinuationReason::DoubleBracket)
+        );
+    }
+
+    #[test]
+    fn classify_double_bracket_trailing_and_is_incomplete() {
+        assert_eq!(
+            classify("[[ -f /a &&"),
+            Completeness::Incomplete(ContinuationReason::DoubleBracket)
+        );
+    }
+
+    #[test]
+    fn classify_closed_double_bracket_is_complete() {
+        assert_eq!(classify("[[ a == b ]]"), Completeness::Complete);
+    }
+
+    #[test]
+    fn classify_double_bracket_missing_operand_is_error() {
+        // `]]` present, operand absent → genuine error; must NOT request continuation.
+        assert_eq!(classify("[[ a == ]]"), Completeness::Error);
+    }
+
+    #[test]
+    fn classify_bare_double_bracket_token_is_complete() {
+        // `echo [[` — `[[` is an ordinary argument, not a conditional opener.
+        assert_eq!(classify("echo [["), Completeness::Complete);
+    }
+
+    #[test]
+    fn joiner_for_double_bracket_is_space() {
+        assert_eq!(joiner_for(ContinuationReason::DoubleBracket, "[[ -f a &&"), " ");
     }
 }

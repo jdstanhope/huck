@@ -1818,6 +1818,14 @@ fn is_test_expr_stop<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I
     }
 }
 
+/// Skips zero or more `Token::Newline` tokens inside a `[[ … ]]` expression.
+/// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
+fn skip_test_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) {
+    while matches!(iter.peek(), Some(Token::Newline)) {
+        iter.next();
+    }
+}
+
 /// Returns the Word's single unquoted Literal text, if it is exactly that shape.
 /// Used to identify operator words like `==`, `!=`, `-eq`, etc.
 fn word_literal_text(w: &Word) -> Option<&str> {
@@ -1858,14 +1866,16 @@ fn is_bang_word(tok: &Token) -> bool {
     }
 }
 
-/// Reads the next token and asserts it is a Word. Returns the Word, or
-/// `ParseError::TestExprMissingOperand` if the iterator is exhausted or the
-/// token is not a Word.
+/// Reads the next token and asserts it is a Word. Returns the Word; on
+/// end-of-input (inside an unclosed `[[`) returns
+/// `ParseError::UnterminatedDoubleBracket` so the REPL requests a
+/// continuation line, and on a present-but-wrong token (`]]`/an operator,
+/// i.e. a genuine missing operand) returns `ParseError::TestExprMissingOperand`.
 fn next_test_word<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Word, ParseError> {
     match iter.peek() {
-        None => return Err(ParseError::TestExprMissingOperand),
+        None => return Err(ParseError::UnterminatedDoubleBracket),
         Some(tok) => {
             if keyword_of(tok) == Some(Keyword::DoubleBracketClose)
                 || matches!(tok, Token::Op(_))
@@ -1885,10 +1895,13 @@ fn parse_test_or<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_and(iter)?;
+    skip_test_newlines(iter);
     while matches!(iter.peek(), Some(Token::Op(Operator::Or))) {
         iter.next(); // consume `||`
+        skip_test_newlines(iter);
         let rhs = parse_test_and(iter)?;
         lhs = TestExpr::Or(Box::new(lhs), Box::new(rhs));
+        skip_test_newlines(iter);
     }
     Ok(lhs)
 }
@@ -1898,10 +1911,13 @@ fn parse_test_and<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_not(iter)?;
+    skip_test_newlines(iter);
     while matches!(iter.peek(), Some(Token::Op(Operator::And))) {
         iter.next(); // consume `&&`
+        skip_test_newlines(iter);
         let rhs = parse_test_not(iter)?;
         lhs = TestExpr::And(Box::new(lhs), Box::new(rhs));
+        skip_test_newlines(iter);
     }
     Ok(lhs)
 }
@@ -1929,6 +1945,7 @@ fn parse_test_primary<I: Iterator<Item = Token>>(
         // Expect `)`.
         match iter.next() {
             Some(Token::Op(Operator::RParen)) => {}
+            None => return Err(ParseError::UnterminatedDoubleBracket),
             _ => return Err(ParseError::TestExprMissingOperand),
         }
         return Ok(inner);
@@ -1941,7 +1958,11 @@ fn parse_test_primary<I: Iterator<Item = Token>>(
 fn parse_test_atom<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<TestExpr, ParseError> {
-    // Nothing at all (empty body or stop token).
+    // End of input mid-expression → unterminated (request continuation).
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedDoubleBracket);
+    }
+    // A present terminator (`]]` / `)`) with nothing before it → empty body.
     if is_test_expr_stop(iter) {
         return Err(ParseError::EmptyDoubleBracket);
     }
@@ -2067,6 +2088,9 @@ fn parse_double_bracket_with_assigns<I: Iterator<Item = Token>>(
     // Consume `[[`.
     iter.next();
 
+    // Skip newlines after `[[` (bash allows `[[\n expr ]]`).
+    skip_test_newlines(iter);
+
     // Immediately hit `]]` — empty body.
     if iter.peek().and_then(keyword_of) == Some(Keyword::DoubleBracketClose) {
         return Err(ParseError::EmptyDoubleBracket);
@@ -2083,6 +2107,9 @@ fn parse_double_bracket_with_assigns<I: Iterator<Item = Token>>(
             ParseError::UnterminatedDoubleBracket => ParseError::UnterminatedDoubleBracket,
             other => other,
         })?;
+
+    // Skip newlines before `]]` (bash allows `expr\n]]`).
+    skip_test_newlines(iter);
 
     // Consume `]]`.
     match iter.next() {
@@ -4715,5 +4742,29 @@ mod tests {
         let p = first_pipeline(&seq);
         assert!(!p.negate);
         // first stage is the `[` simple command with `!` among its args
+    }
+
+    #[test]
+    fn dbracket_eof_after_open_is_unterminated() {
+        let toks = crate::lexer::tokenize("[[ -f a").unwrap();
+        assert!(matches!(parse(toks), Err(ParseError::UnterminatedDoubleBracket)));
+    }
+
+    #[test]
+    fn dbracket_eof_after_and_is_unterminated() {
+        let toks = crate::lexer::tokenize("[[ -f a &&").unwrap();
+        assert!(matches!(parse(toks), Err(ParseError::UnterminatedDoubleBracket)));
+    }
+
+    #[test]
+    fn dbracket_eof_after_binop_is_unterminated() {
+        let toks = crate::lexer::tokenize("[[ a ==").unwrap();
+        assert!(matches!(parse(toks), Err(ParseError::UnterminatedDoubleBracket)));
+    }
+
+    #[test]
+    fn dbracket_missing_operand_with_close_is_error() {
+        let toks = crate::lexer::tokenize("[[ a == ]]").unwrap();
+        assert!(matches!(parse(toks), Err(ParseError::TestExprMissingOperand)));
     }
 }
