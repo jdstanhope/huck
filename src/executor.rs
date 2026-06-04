@@ -225,6 +225,8 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             } else {
                 1
             };
+            // A subshell is one forked unit → 1-element PIPESTATUS.
+            shell.set_pipestatus(&[code]);
             ExecOutcome::Continue(code)
         }
         Command::FunctionDef { name, body } => {
@@ -1901,22 +1903,29 @@ fn status_code(status: &ExitStatus) -> i32 {
 // ----- single command -------------------------------------------------------
 
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    match cmd {
+    let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
+            let mut st = 0;
             for a in items {
                 let name = a.target.name();
                 if shell.is_readonly(name) {
                     eprintln!("huck: {name}: readonly variable");
-                    return ExecOutcome::Continue(1);
+                    st = 1;
+                    break;
                 }
                 if apply_one_assignment(a, shell).is_err() {
-                    return ExecOutcome::Continue(1);
+                    st = 1;
+                    break;
                 }
             }
-            ExecOutcome::Continue(0)
+            ExecOutcome::Continue(st)
         }
+    };
+    if let ExecOutcome::Continue(c) = outcome {
+        shell.set_pipestatus(&[c]);
     }
+    outcome
 }
 
 /// True for the un-shadowable control builtins. Functions named the
@@ -2985,7 +2994,8 @@ fn run_multi_stage(
 
     if interactive {
         give_terminal_to(shell.shell_pgid);
-        if let PipelineWaitResult::Stopped(sig) = last_status {
+        if let PipelineWaitResult::Stopped(sig) = &last_status {
+            let sig = *sig;
             // Capture fd cleanup.
             if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
             return ExecOutcome::Continue(128 + sig);
@@ -3004,14 +3014,22 @@ fn run_multi_stage(
     }
 
     let status = match last_status {
-        PipelineWaitResult::AllExited(s) => s,
+        PipelineWaitResult::AllExited(stages) => {
+            shell.set_pipestatus(&stages);
+            if shell.shell_options.pipefail {
+                // rightmost non-zero stage, else 0
+                stages.iter().rev().find(|&&s| s != 0).copied().unwrap_or(0)
+            } else {
+                stages.last().copied().unwrap_or(0)
+            }
+        }
         PipelineWaitResult::Stopped(sig) => 128 + sig,
     };
     ExecOutcome::Continue(status)
 }
 
 enum PipelineWaitResult {
-    AllExited(i32),
+    AllExited(Vec<i32>),
     Stopped(i32),
 }
 
@@ -3121,7 +3139,8 @@ fn wait_pipeline_raw(
     }
 
     crate::traps::dispatch_pending_traps(shell);
-    PipelineWaitResult::AllExited(stage_status.last().copied().flatten().unwrap_or(0))
+    let stages: Vec<i32> = stage_status.iter().map(|s| s.unwrap_or(1)).collect();
+    PipelineWaitResult::AllExited(stages)
 }
 
 // ----- inline-assignment apply/restore helpers ------------------------------
