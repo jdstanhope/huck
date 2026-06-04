@@ -91,6 +91,7 @@ spec, an implementation plan, and a test suite.
 | v81       | `select` loops (M-24) + no-`in` `for` positionals (M-24a)       |
 | v82       | script-file mode (`huck script [args]`) + `-c` + `--` (M-77a)   |
 | v83       | `set -o pipefail` + `$PIPESTATUS` (M-50)                        |
+| v84       | `${var:+(…)}` operands parse as words (metachars literal)        |
 
 ## Build and run
 
