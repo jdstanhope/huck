@@ -131,3 +131,23 @@ fn failglob_no_match_aborts_command() {
     let (out2, _) = run_in_dir(&["a.txt"], "shopt -s failglob\necho no*match\necho rc=$?\n");
     assert_eq!(out2, "rc=1\n");
 }
+
+// ---- Task 5: behavioral nocasematch wiring ([[ == / =~ ]] and case) ----
+
+#[test]
+fn nocasematch_double_bracket_eq() {
+    assert_eq!(run("[[ ABC == abc ]] && echo m || echo n\n").0, "n\n");
+    assert_eq!(run("shopt -s nocasematch; [[ ABC == abc ]] && echo m || echo n\n").0, "m\n");
+}
+
+#[test]
+fn nocasematch_double_bracket_regex() {
+    assert_eq!(run("[[ ABC =~ ^abc$ ]] && echo m || echo n\n").0, "n\n");
+    assert_eq!(run("shopt -s nocasematch; [[ ABC =~ ^abc$ ]] && echo m || echo n\n").0, "m\n");
+}
+
+#[test]
+fn nocasematch_case_statement() {
+    assert_eq!(run("case ABC in abc) echo m;; *) echo n;; esac\n").0, "n\n");
+    assert_eq!(run("shopt -s nocasematch; case ABC in abc) echo m;; *) echo n;; esac\n").0, "m\n");
+}

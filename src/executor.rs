@@ -715,7 +715,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
 /// matches if any pattern matches; an unparseable glob matches nothing.
 fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool {
     let opts = glob::MatchOptions {
-        case_sensitive: true,
+        case_sensitive: !shell.nocasematch(),
         require_literal_separator: false,
         require_literal_leading_dot: false,
     };
@@ -854,6 +854,7 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
         TestExpr::Regex { lhs, pattern } => {
             let l = expand_assignment(lhs, shell);
             let p = expand_assignment(pattern, shell);
+            let p = if shell.nocasematch() { format!("(?i){p}") } else { p };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
             Ok(re.is_match(&l))
         }
@@ -903,7 +904,12 @@ fn eval_binary(
             let pattern_str = expand_pattern(rhs_word, shell);
             let pat = glob::Pattern::new(&pattern_str)
                 .map_err(|e| format!("bad pattern: {e}"))?;
-            let matched = pat.matches(lhs);
+            let mopts = glob::MatchOptions {
+                case_sensitive: !shell.nocasematch(),
+                require_literal_separator: false,
+                require_literal_leading_dot: false,
+            };
+            let matched = pat.matches_with(lhs, mopts);
             Ok(if matches!(op, TestBinaryOp::StringEq) { matched } else { !matched })
         }
         TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
