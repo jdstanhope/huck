@@ -152,18 +152,21 @@ pub fn expand_modifier_with_value(
         ParamModifier::RemovePrefix { pattern, longest } => {
             let v = get_raw(shell).unwrap_or_default();
             let p = expand_word_to_string(pattern, shell);
-            ExpansionResult::Value(remove_prefix(&v, &p, *longest))
+            let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+            ExpansionResult::Value(remove_prefix(&v, &p, *longest, extglob))
         }
         ParamModifier::RemoveSuffix { pattern, longest } => {
             let v = get_raw(shell).unwrap_or_default();
             let p = expand_word_to_string(pattern, shell);
-            ExpansionResult::Value(remove_suffix(&v, &p, *longest))
+            let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+            ExpansionResult::Value(remove_suffix(&v, &p, *longest, extglob))
         }
         ParamModifier::Substitute { pattern, replacement, anchor, all } => {
             let v = get_raw(shell).unwrap_or_default();
             let pat = expand_word_to_string(pattern, shell);
             let rep = expand_word_to_string(replacement, shell);
-            ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all))
+            let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+            ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all, extglob))
         }
         ParamModifier::Substring { offset, length } => {
             let value = lookup_v(shell);
@@ -189,7 +192,8 @@ pub fn expand_modifier_with_value(
         ParamModifier::Case { direction, all, pattern } => {
             let v = lookup_v(shell);
             let pat_string = pattern.as_ref().map(|w| expand_word_to_string(w, shell));
-            ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref()))
+            let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+            ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref(), extglob))
         }
     }
 }
@@ -229,28 +233,46 @@ pub(crate) fn expand_word_to_string(word: &Word, shell: &mut Shell) -> String {
     crate::expand::expand_assignment(word, shell)
 }
 
-fn remove_prefix(value: &str, pattern: &str, longest: bool) -> String {
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-    let pat = match glob::Pattern::new(pattern) {
-        Ok(p) => p,
-        Err(_) => return value.to_string(),
-    };
+/// Pattern match for parameter expansion: extglob engine when enabled+applicable,
+/// else the `glob` crate (preserving current behavior). `case_sensitive` mirrors
+/// the existing `MatchOptions`.
+fn pe_pattern_matches(pattern: &str, text: &str, extglob: bool, case_sensitive: bool) -> bool {
+    if extglob && crate::glob_match::has_extglob(pattern) {
+        crate::glob_match::extglob_match(pattern, text, !case_sensitive)
+    } else {
+        match glob::Pattern::new(pattern) {
+            Ok(p) => p.matches_with(
+                text,
+                glob::MatchOptions {
+                    case_sensitive,
+                    require_literal_separator: false,
+                    require_literal_leading_dot: false,
+                },
+            ),
+            Err(_) => false,
+        }
+    }
+}
+
+fn remove_prefix(value: &str, pattern: &str, longest: bool, extglob: bool) -> String {
+    // `${}` pattern stripping is always case-sensitive (bash `nocasematch`
+    // does not affect parameter expansion).
+    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
+    {
+        return value.to_string();
+    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
 
     if longest {
         for &end in boundaries.iter().rev() {
-            if pat.matches_with(&value[..end], opts) {
+            if pe_pattern_matches(pattern, &value[..end], extglob, true) {
                 return value[end..].to_string();
             }
         }
     } else {
         for &end in &boundaries {
-            if pat.matches_with(&value[..end], opts) {
+            if pe_pattern_matches(pattern, &value[..end], extglob, true) {
                 return value[end..].to_string();
             }
         }
@@ -258,28 +280,23 @@ fn remove_prefix(value: &str, pattern: &str, longest: bool) -> String {
     value.to_string()
 }
 
-fn remove_suffix(value: &str, pattern: &str, longest: bool) -> String {
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-    let pat = match glob::Pattern::new(pattern) {
-        Ok(p) => p,
-        Err(_) => return value.to_string(),
-    };
+fn remove_suffix(value: &str, pattern: &str, longest: bool, extglob: bool) -> String {
+    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
+    {
+        return value.to_string();
+    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
 
     if longest {
         for &start in &boundaries {
-            if pat.matches_with(&value[start..], opts) {
+            if pe_pattern_matches(pattern, &value[start..], extglob, true) {
                 return value[..start].to_string();
             }
         }
     } else {
         for &start in boundaries.iter().rev() {
-            if pat.matches_with(&value[start..], opts) {
+            if pe_pattern_matches(pattern, &value[start..], extglob, true) {
                 return value[..start].to_string();
             }
         }
@@ -293,20 +310,16 @@ fn substitute(
     replacement: &str,
     anchor: SubstAnchor,
     all: bool,
+    extglob: bool,
 ) -> String {
     // Bash treats an empty pattern as a no-op (`${var//}` → `$var`).
     if pattern.is_empty() {
         return value.to_string();
     }
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-    let pat = match glob::Pattern::new(pattern) {
-        Ok(p) => p,
-        Err(_) => return value.to_string(),
-    };
+    if glob::Pattern::new(pattern).is_err() && !(extglob && crate::glob_match::has_extglob(pattern))
+    {
+        return value.to_string();
+    }
     let mut boundaries: Vec<usize> = value.char_indices().map(|(i, _)| i).collect();
     boundaries.push(value.len());
 
@@ -318,7 +331,7 @@ fn substitute(
         // once we drop below `start`, every remaining entry is also below.
         for &end in boundaries.iter().rev() {
             if end < start { break; }
-            if pat.matches_with(&value[start..end], opts) {
+            if pe_pattern_matches(pattern, &value[start..end], extglob, true) {
                 return Some(end);
             }
         }
@@ -341,7 +354,7 @@ fn substitute(
             // Smallest start such that value[start..] matches → longest
             // suffix match.
             for &start in &boundaries {
-                if pat.matches_with(&value[start..], opts) {
+                if pe_pattern_matches(pattern, &value[start..], extglob, true) {
                     let mut out = String::with_capacity(start + replacement.len());
                     out.push_str(&value[..start]);
                     out.push_str(replacement);
@@ -407,26 +420,21 @@ fn case_modify(
     direction: CaseDirection,
     all: bool,
     pattern: Option<&str>,
+    extglob: bool,
 ) -> String {
-    // Compile the pattern, if any. On compile failure, return value
-    // unchanged (matches v32 substitute's silent-no-op convention).
-    let compiled = match pattern {
-        Some(p) => match glob::Pattern::new(p) {
-            Ok(pat) => Some(pat),
-            Err(_) => return value.to_string(),
-        },
-        None => None,
-    };
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
+    // Validate the pattern, if any. On a glob compile failure that is not a
+    // valid extglob pattern, return value unchanged (matches v32 substitute's
+    // silent-no-op convention).
+    if pattern
+        .is_some_and(|p| glob::Pattern::new(p).is_err() && !(extglob && crate::glob_match::has_extglob(p)))
+    {
+        return value.to_string();
+    }
 
     let should_modify = |c: char| -> bool {
-        match &compiled {
+        match pattern {
             None => true,
-            Some(pat) => pat.matches_with(&c.to_string(), opts),
+            Some(p) => pe_pattern_matches(p, &c.to_string(), extglob, true),
         }
     };
 
@@ -699,60 +707,60 @@ mod tests {
 
     #[test]
     fn remove_prefix_shortest_match() {
-        assert_eq!(remove_prefix("/path/to/file.txt", "*/", false), "path/to/file.txt");
+        assert_eq!(remove_prefix("/path/to/file.txt", "*/", false, false), "path/to/file.txt");
     }
 
     #[test]
     fn remove_prefix_longest_match() {
-        assert_eq!(remove_prefix("/path/to/file.txt", "*/", true), "file.txt");
+        assert_eq!(remove_prefix("/path/to/file.txt", "*/", true, false), "file.txt");
     }
 
     #[test]
     fn remove_prefix_no_match_returns_value_unchanged() {
-        assert_eq!(remove_prefix("hello", "world", false), "hello");
+        assert_eq!(remove_prefix("hello", "world", false, false), "hello");
     }
 
     #[test]
     fn remove_prefix_empty_pattern_removes_nothing() {
         // The empty glob pattern matches the empty prefix; removing an
         // empty prefix leaves the value intact (matches bash `${var#}`).
-        assert_eq!(remove_prefix("hello", "", false), "hello");
+        assert_eq!(remove_prefix("hello", "", false, false), "hello");
     }
 
     #[test]
     fn remove_prefix_invalid_glob_returns_value_unchanged() {
-        assert_eq!(remove_prefix("hello", "[abc", false), "hello");
+        assert_eq!(remove_prefix("hello", "[abc", false, false), "hello");
     }
 
     #[test]
     fn remove_prefix_literal_match() {
-        assert_eq!(remove_prefix("hello world", "hello ", false), "world");
+        assert_eq!(remove_prefix("hello world", "hello ", false, false), "world");
     }
 
     #[test]
     fn remove_prefix_glob_crosses_slash() {
-        assert_eq!(remove_prefix("a/b/c", "*", true), "");
-        assert_eq!(remove_prefix("a/b/c", "*/", true), "c");
+        assert_eq!(remove_prefix("a/b/c", "*", true, false), "");
+        assert_eq!(remove_prefix("a/b/c", "*/", true, false), "c");
     }
 
     #[test]
     fn remove_suffix_shortest_match() {
-        assert_eq!(remove_suffix("file.tar.gz", ".*", false), "file.tar");
+        assert_eq!(remove_suffix("file.tar.gz", ".*", false, false), "file.tar");
     }
 
     #[test]
     fn remove_suffix_longest_match() {
-        assert_eq!(remove_suffix("file.tar.gz", ".*", true), "file");
+        assert_eq!(remove_suffix("file.tar.gz", ".*", true, false), "file");
     }
 
     #[test]
     fn remove_suffix_no_match() {
-        assert_eq!(remove_suffix("hello", "world", false), "hello");
+        assert_eq!(remove_suffix("hello", "world", false, false), "hello");
     }
 
     #[test]
     fn remove_suffix_handles_utf8_boundaries() {
-        assert_eq!(remove_suffix("café.txt", ".txt", false), "café");
+        assert_eq!(remove_suffix("café.txt", ".txt", false, false), "café");
     }
 
     #[test]
@@ -792,81 +800,81 @@ mod tests {
 
     #[test]
     fn substitute_first_match_unanchored() {
-        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, false), "fXobar");
+        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, false, false), "fXobar");
     }
 
     #[test]
     fn substitute_all_unanchored() {
-        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, true), "fXXbar");
+        assert_eq!(substitute("foobar", "o", "X", SubstAnchor::None, true, false), "fXXbar");
     }
 
     #[test]
     fn substitute_first_unanchored_no_match_returns_value() {
-        assert_eq!(substitute("foobar", "z", "X", SubstAnchor::None, false), "foobar");
+        assert_eq!(substitute("foobar", "z", "X", SubstAnchor::None, false, false), "foobar");
     }
 
     #[test]
     fn substitute_all_with_empty_replacement_removes() {
-        assert_eq!(substitute("aaa", "a", "", SubstAnchor::None, true), "");
+        assert_eq!(substitute("aaa", "a", "", SubstAnchor::None, true, false), "");
     }
 
     #[test]
     fn substitute_anchored_prefix_hit() {
-        assert_eq!(substitute("hello", "he", "HI", SubstAnchor::Prefix, false), "HIllo");
+        assert_eq!(substitute("hello", "he", "HI", SubstAnchor::Prefix, false, false), "HIllo");
     }
 
     #[test]
     fn substitute_anchored_prefix_miss() {
-        assert_eq!(substitute("hello", "xo", "HI", SubstAnchor::Prefix, false), "hello");
+        assert_eq!(substitute("hello", "xo", "HI", SubstAnchor::Prefix, false, false), "hello");
     }
 
     #[test]
     fn substitute_anchored_suffix_hit() {
-        assert_eq!(substitute("hello", "lo", "LO", SubstAnchor::Suffix, false), "helLO");
+        assert_eq!(substitute("hello", "lo", "LO", SubstAnchor::Suffix, false, false), "helLO");
     }
 
     #[test]
     fn substitute_anchored_suffix_miss() {
-        assert_eq!(substitute("hello", "xo", "LO", SubstAnchor::Suffix, false), "hello");
+        assert_eq!(substitute("hello", "xo", "LO", SubstAnchor::Suffix, false, false), "hello");
     }
 
     #[test]
     fn substitute_glob_star_longest_match() {
         // `*` matches the whole tail at i=0; with all=true, the second pass
         // starts past the replacement and finds nothing more.
-        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true), "Q");
+        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true, false), "Q");
     }
 
     #[test]
     fn substitute_glob_question_mark() {
-        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, false), "Xbc");
-        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, true), "XXX");
+        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, false, false), "Xbc");
+        assert_eq!(substitute("abc", "?", "X", SubstAnchor::None, true, false), "XXX");
     }
 
     #[test]
     fn substitute_unicode_boundaries() {
-        assert_eq!(substitute("café", "é", "E", SubstAnchor::None, false), "cafE");
+        assert_eq!(substitute("café", "é", "E", SubstAnchor::None, false, false), "cafE");
     }
 
     #[test]
     fn substitute_invalid_glob_returns_value_unchanged() {
-        assert_eq!(substitute("hello", "[abc", "X", SubstAnchor::None, false), "hello");
+        assert_eq!(substitute("hello", "[abc", "X", SubstAnchor::None, false, false), "hello");
     }
 
     #[test]
     fn substitute_empty_value_returns_empty() {
-        assert_eq!(substitute("", "foo", "bar", SubstAnchor::None, true), "");
+        assert_eq!(substitute("", "foo", "bar", SubstAnchor::None, true, false), "");
     }
 
     #[test]
     fn substitute_empty_pattern_is_noop_first() {
         // Bash: empty pattern is a no-op for both /first and //all.
-        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, false), "abc");
+        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, false, false), "abc");
     }
 
     #[test]
     fn substitute_empty_pattern_is_noop_all() {
-        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, true), "abc");
+        assert_eq!(substitute("abc", "", "X", SubstAnchor::None, true, false), "abc");
     }
 
     #[test]
@@ -874,14 +882,14 @@ mod tests {
         // `*` matches the whole string at i=0; after the replacement,
         // the empty-match guard must not emit a second replacement at
         // the trailing position.
-        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true), "Q");
+        assert_eq!(substitute("xyz", "*", "Q", SubstAnchor::None, true, false), "Q");
     }
 
     #[test]
     fn substitute_glob_star_with_prefix_match_advances_past_match() {
         // `f*` against "foo bar foo" — greedy, all-mode still only one
         // replacement (matches whole tail from first `f`).
-        assert_eq!(substitute("foo bar foo", "f*", "X", SubstAnchor::None, true), "X");
+        assert_eq!(substitute("foo bar foo", "f*", "X", SubstAnchor::None, true, false), "X");
     }
 
     #[test]
@@ -1189,57 +1197,57 @@ mod tests {
 
     #[test]
     fn case_modify_upper_all_no_pattern() {
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, None), "HELLO");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, None, false), "HELLO");
     }
 
     #[test]
     fn case_modify_upper_first_no_pattern() {
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, None), "Hello");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, None, false), "Hello");
     }
 
     #[test]
     fn case_modify_lower_all_no_pattern() {
-        assert_eq!(case_modify("HELLO", CaseDirection::Lower, true, None), "hello");
+        assert_eq!(case_modify("HELLO", CaseDirection::Lower, true, None, false), "hello");
     }
 
     #[test]
     fn case_modify_lower_first_no_pattern() {
-        assert_eq!(case_modify("HELLO", CaseDirection::Lower, false, None), "hELLO");
+        assert_eq!(case_modify("HELLO", CaseDirection::Lower, false, None, false), "hELLO");
     }
 
     #[test]
     fn case_modify_upper_all_with_pattern_filters_chars() {
         // [aeiou] — only vowels upper-cased.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[aeiou]")), "hEllO");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[aeiou]"), false), "hEllO");
     }
 
     #[test]
     fn case_modify_upper_first_with_pattern_picks_first_match() {
         // Only the first MATCHING char (the `e`) gets upper-cased.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]")), "hEllo");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[aeiou]"), false), "hEllo");
     }
 
     #[test]
     fn case_modify_unicode_handles_multichar_uppercase() {
         // Rust's `'ß'.to_uppercase()` yields two chars: 'S', 'S'.
-        assert_eq!(case_modify("straße", CaseDirection::Upper, true, None), "STRASSE");
+        assert_eq!(case_modify("straße", CaseDirection::Upper, true, None, false), "STRASSE");
     }
 
     #[test]
     fn case_modify_empty_value_returns_empty() {
-        assert_eq!(case_modify("", CaseDirection::Upper, true, None), "");
+        assert_eq!(case_modify("", CaseDirection::Upper, true, None, false), "");
     }
 
     #[test]
     fn case_modify_invalid_glob_returns_value_unchanged() {
         // `[abc` (unclosed bracket) — glob::Pattern::new returns Err.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[abc")), "hello");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, true, Some("[abc"), false), "hello");
     }
 
     #[test]
     fn case_modify_no_match_first_form_returns_unchanged() {
         // No char in "hello" matches [xyz]; all=false → return unchanged.
-        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[xyz]")), "hello");
+        assert_eq!(case_modify("hello", CaseDirection::Upper, false, Some("[xyz]"), false), "hello");
     }
 
     #[test]
