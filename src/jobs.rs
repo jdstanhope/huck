@@ -47,6 +47,11 @@ impl JobTable {
         Self::default()
     }
 
+    /// Read-only view of the current jobs. Used by `compgen -A job/running/stopped`.
+    pub fn jobs(&self) -> &[Job] {
+        &self.jobs
+    }
+
     /// Inserts a new Running job. Allocates the lowest unused job id
     /// (bash-style reuse). Returns the allocated id.
     pub fn add(&mut self, pgid: i32, pids: Vec<i32>, command: String) -> u32 {

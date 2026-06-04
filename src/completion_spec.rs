@@ -53,6 +53,22 @@ pub enum Action {
     Alias,
     Builtin,
     Keyword,
+    Arrayvar,
+    Binding,
+    Disabled,
+    Enabled,
+    Export,
+    Group,
+    Helptopic,
+    Hostname,
+    Job,
+    Running,
+    Service,
+    Setopt,
+    Shopt,
+    Signal,
+    Stopped,
+    User,
 }
 
 impl Action {
@@ -68,6 +84,22 @@ impl Action {
             "alias" => Some(Action::Alias),
             "builtin" => Some(Action::Builtin),
             "keyword" => Some(Action::Keyword),
+            "arrayvar" => Some(Action::Arrayvar),
+            "binding" => Some(Action::Binding),
+            "disabled" => Some(Action::Disabled),
+            "enabled" => Some(Action::Enabled),
+            "export" => Some(Action::Export),
+            "group" => Some(Action::Group),
+            "helptopic" => Some(Action::Helptopic),
+            "hostname" => Some(Action::Hostname),
+            "job" => Some(Action::Job),
+            "running" => Some(Action::Running),
+            "service" => Some(Action::Service),
+            "setopt" => Some(Action::Setopt),
+            "shopt" => Some(Action::Shopt),
+            "signal" => Some(Action::Signal),
+            "stopped" => Some(Action::Stopped),
+            "user" => Some(Action::User),
             _ => None,
         }
     }
@@ -82,6 +114,22 @@ impl Action {
             Action::Alias => "alias",
             Action::Builtin => "builtin",
             Action::Keyword => "keyword",
+            Action::Arrayvar => "arrayvar",
+            Action::Binding => "binding",
+            Action::Disabled => "disabled",
+            Action::Enabled => "enabled",
+            Action::Export => "export",
+            Action::Group => "group",
+            Action::Helptopic => "helptopic",
+            Action::Hostname => "hostname",
+            Action::Job => "job",
+            Action::Running => "running",
+            Action::Service => "service",
+            Action::Setopt => "setopt",
+            Action::Shopt => "shopt",
+            Action::Signal => "signal",
+            Action::Stopped => "stopped",
+            Action::User => "user",
         }
     }
 }
@@ -387,6 +435,81 @@ fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> 
             .filter(|n| n.starts_with(prefix))
             .map(|s| s.to_string())
             .collect(),
+        Action::Setopt => crate::builtins::seto_option_names()
+            .filter(|n| n.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect(), // table order — bash compgen does not sort
+        Action::Shopt => crate::shell_state::SHOPT_TABLE
+            .iter()
+            .map(|o| o.name)
+            .filter(|n| n.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect(), // table order
+        Action::Helptopic => crate::builtins::help_topic_names()
+            .filter(|n| n.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect(),
+        Action::Signal => crate::builtins::signal_names()
+            .into_iter()
+            .filter(|n| n.starts_with(prefix))
+            .collect(),
+        Action::Export => {
+            let mut names: Vec<String> = shell
+                .var_names()
+                .filter(|n| shell.is_exported(n) && n.starts_with(prefix))
+                .map(|s| s.to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        }
+        Action::Arrayvar => {
+            let mut names: Vec<String> = shell
+                .array_var_names()
+                .into_iter()
+                .filter(|n| n.starts_with(prefix))
+                .collect();
+            names.sort();
+            names
+        }
+        Action::Enabled => {
+            let mut names: Vec<String> = crate::builtins::BUILTIN_NAMES
+                .iter()
+                .filter(|n| n.starts_with(prefix))
+                .map(|s| s.to_string())
+                .collect();
+            names.sort();
+            names
+        }
+        Action::Job => shell
+            .jobs
+            .jobs()
+            .iter()
+            .map(|j| j.command.clone())
+            .filter(|c| c.starts_with(prefix))
+            .collect(),
+        Action::Running => shell
+            .jobs
+            .jobs()
+            .iter()
+            .filter(|j| matches!(j.state, crate::jobs::JobState::Running))
+            .map(|j| j.command.clone())
+            .filter(|c| c.starts_with(prefix))
+            .collect(),
+        Action::Stopped => shell
+            .jobs
+            .jobs()
+            .iter()
+            .filter(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
+            .map(|j| j.command.clone())
+            .filter(|c| c.starts_with(prefix))
+            .collect(),
+        Action::Disabled
+        | Action::Binding
+        | Action::Hostname
+        | Action::User
+        | Action::Group
+        | Action::Service => Vec::new(),
     }
 }
 
@@ -443,6 +566,64 @@ fn list_dir_with_path_prefix(prefix: &str, dirs_only: bool) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::shell_state::Shell;
+
+    #[test]
+    fn action_parse_round_trips_all_24() {
+        let names = [
+            "file", "directory", "command", "function", "variable", "alias", "builtin", "keyword",
+            "arrayvar", "binding", "disabled", "enabled", "export", "group", "helptopic",
+            "hostname", "job", "running", "service", "setopt", "shopt", "signal", "stopped", "user",
+        ];
+        for n in names {
+            let a = Action::parse(n).unwrap_or_else(|| panic!("parse failed: {n}"));
+            assert_eq!(a.as_str(), n, "round-trip mismatch for {n}");
+        }
+        assert_eq!(Action::parse("bogus_action"), None);
+    }
+
+    #[test]
+    fn enumerate_setopt_shopt_table_order_and_membership() {
+        let sh = Shell::new();
+        let setopt = enumerate_action(Action::Setopt, "", &sh);
+        assert!(setopt.contains(&"errexit".to_string()));
+        assert_eq!(setopt[0], "allexport"); // table order, NOT sorted
+        let shopt = enumerate_action(Action::Shopt, "", &sh);
+        assert!(shopt.contains(&"nullglob".to_string()));
+        assert_eq!(
+            &shopt[0..2],
+            &["autocd".to_string(), "assoc_expand_once".to_string()]
+        ); // table order
+        assert_eq!(
+            enumerate_action(Action::Shopt, "null", &sh),
+            vec!["nullglob".to_string()]
+        );
+    }
+
+    #[test]
+    fn enumerate_signal_helptopic_enabled() {
+        let sh = Shell::new();
+        assert!(enumerate_action(Action::Signal, "SIGIN", &sh) == vec!["SIGINT".to_string()]);
+        assert!(!enumerate_action(Action::Helptopic, "", &sh).is_empty());
+        assert!(enumerate_action(Action::Enabled, "ech", &sh).contains(&"echo".to_string()));
+    }
+
+    #[test]
+    fn enumerate_empty_actions_return_empty() {
+        let sh = Shell::new();
+        for a in [
+            Action::Disabled,
+            Action::Binding,
+            Action::Hostname,
+            Action::User,
+            Action::Group,
+            Action::Service,
+        ] {
+            assert!(
+                enumerate_action(a, "", &sh).is_empty(),
+                "expected empty for {a:?}"
+            );
+        }
+    }
 
     fn ctx(cur: &str) -> CompletionCtx {
         CompletionCtx {
@@ -694,8 +875,8 @@ mod tests {
 
     #[test]
     fn action_parse_rejects_unknown() {
-        assert_eq!(Action::parse("hostname"), None);
-        assert_eq!(Action::parse("signal"), None);
+        assert_eq!(Action::parse("bogus_action"), None);
+        assert_eq!(Action::parse("nosuchaction"), None);
     }
 
     #[test]

@@ -585,6 +585,16 @@ impl Shell {
         self.vars.get(name).is_some_and(|v| v.exported)
     }
 
+    /// Names of variables whose value is an array (indexed or associative).
+    /// Used by `compgen -A arrayvar`.
+    pub fn array_var_names(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|(_, v)| matches!(v.value, VarValue::Indexed(_) | VarValue::Associative(_)))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// True if `name` is set and marked readonly. Unset names are
     /// trivially not readonly.
     pub fn is_readonly(&self, name: &str) -> bool {
@@ -1204,6 +1214,19 @@ mod tests {
         let mut sh = Shell::new();
         sh.set("X", String::new()); // Shell::set(&mut self, name: &str, value: String)
         assert!(sh.is_set("X"));
+    }
+
+    #[test]
+    fn array_var_names_lists_arrays_not_scalars() {
+        let mut sh = Shell::new();
+        sh.set("scal", "x".to_string());
+        let mut elements = std::collections::BTreeMap::new();
+        elements.insert(0usize, "a".to_string());
+        elements.insert(1usize, "b".to_string());
+        sh.replace_array("arr", elements).unwrap(); // existing pub Shell method (indexed array)
+        let names = sh.array_var_names();
+        assert!(names.contains(&"arr".to_string()));
+        assert!(!names.contains(&"scal".to_string()));
     }
 
     #[test]

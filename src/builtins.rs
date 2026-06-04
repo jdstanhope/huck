@@ -3879,6 +3879,26 @@ struct OptionInfo {
     default: bool,
 }
 
+/// Names of the `set -o` options, in table order. Used by `compgen -A setopt`.
+pub fn seto_option_names() -> impl Iterator<Item = &'static str> {
+    SETO_TABLE.iter().map(|o| o.name)
+}
+
+/// Names of all `help` topics (builtins + keywords). Used by `compgen -A helptopic`.
+pub fn help_topic_names() -> impl Iterator<Item = &'static str> {
+    HELP_ENTRIES.iter().map(|e| e.name)
+}
+
+/// `SIG`-prefixed names of the real signals huck knows (excludes the trap
+/// pseudo-signals EXIT/ERR/DEBUG/RETURN). Used by `compgen -A signal`.
+pub fn signal_names() -> Vec<String> {
+    crate::traps::name_table()
+        .iter()
+        .filter(|(n, _)| !matches!(*n, "EXIT" | "ERR" | "DEBUG" | "RETURN"))
+        .map(|(n, _)| format!("SIG{n}"))
+        .collect()
+}
+
 /// bash 5.2's full `set -o` option table, in bash's display order.
 /// `errexit`/`nounset`/`pipefail` are implemented (real state via
 /// `Shell.shell_options`); the rest are recognized for listing + querying
@@ -5920,6 +5940,25 @@ fn builtin_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seto_option_names_includes_errexit_in_table_order() {
+        let names: Vec<&str> = seto_option_names().collect();
+        assert!(names.contains(&"errexit"));
+        assert_eq!(names.len(), 27);
+        assert_eq!(names[0], "allexport"); // table order
+    }
+    #[test]
+    fn signal_names_are_sig_prefixed_and_exclude_pseudo() {
+        let names = signal_names();
+        assert!(names.contains(&"SIGINT".to_string()));
+        assert!(names.iter().all(|n| n.starts_with("SIG")));
+        assert!(!names.iter().any(|n| n.contains("EXIT")));
+    }
+    #[test]
+    fn help_topic_names_nonempty() {
+        assert!(help_topic_names().count() >= 40);
+    }
 
     #[test]
     fn is_builtin_recognizes_builtins() {
