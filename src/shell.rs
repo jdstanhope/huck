@@ -437,6 +437,12 @@ fn read_logical_command(
                     }
                 };
 
+                // `set -v` verbose: echo each physical input line to stderr as
+                // it is read, before it is parsed/executed.
+                if cell.borrow().shell_options.verbose {
+                    eprintln!("{line}");
+                }
+
                 match pending.take() {
                     None => {
                         // First physical line.

@@ -4962,6 +4962,10 @@ pub(crate) fn run_sourced_contents(
     let mut last_status = shell.last_status();
     let mut buf = String::new();
     for line in contents.lines() {
+        // `set -v` verbose: echo each physical input line to stderr as read.
+        if shell.shell_options.verbose {
+            eprintln!("{line}");
+        }
         buf.push_str(line);
         buf.push('\n');
         if let Completeness::Incomplete(_) = classify(&buf) {
