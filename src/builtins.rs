@@ -3875,45 +3875,91 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
 struct OptionInfo {
     name: &'static str,
-    #[allow(dead_code)]
-    short: Option<char>,
+    default: bool,
 }
 
-const SHELL_OPTIONS: &[OptionInfo] = &[
-    OptionInfo { name: "errexit", short: Some('e') },
-    OptionInfo { name: "nounset", short: Some('u') },
-    OptionInfo { name: "pipefail", short: None },
+/// bash 5.2's full `set -o` option table, in bash's display order.
+/// `errexit`/`nounset`/`pipefail` are implemented (real state via
+/// `Shell.shell_options`); the rest are recognized for listing + querying
+/// only (their `default` is reported) and cannot be enabled.
+const SETO_TABLE: &[OptionInfo] = &[
+    OptionInfo { name: "allexport", default: false },
+    OptionInfo { name: "braceexpand", default: true },
+    OptionInfo { name: "emacs", default: false },
+    OptionInfo { name: "errexit", default: false },
+    OptionInfo { name: "errtrace", default: false },
+    OptionInfo { name: "functrace", default: false },
+    OptionInfo { name: "hashall", default: true },
+    OptionInfo { name: "histexpand", default: false },
+    OptionInfo { name: "history", default: false },
+    OptionInfo { name: "ignoreeof", default: false },
+    OptionInfo { name: "interactive-comments", default: true },
+    OptionInfo { name: "keyword", default: false },
+    OptionInfo { name: "monitor", default: false },
+    OptionInfo { name: "noclobber", default: false },
+    OptionInfo { name: "noexec", default: false },
+    OptionInfo { name: "noglob", default: false },
+    OptionInfo { name: "nolog", default: false },
+    OptionInfo { name: "notify", default: false },
+    OptionInfo { name: "nounset", default: false },
+    OptionInfo { name: "onecmd", default: false },
+    OptionInfo { name: "physical", default: false },
+    OptionInfo { name: "pipefail", default: false },
+    OptionInfo { name: "posix", default: false },
+    OptionInfo { name: "privileged", default: false },
+    OptionInfo { name: "verbose", default: false },
+    OptionInfo { name: "vi", default: false },
+    OptionInfo { name: "xtrace", default: false },
 ];
 
+/// Error from `option_set` for a non-settable `set -o` name.
+/// `Debug` is required because an existing test calls `option_set(...).unwrap()`.
+#[derive(Debug)]
+enum OptSetErr {
+    /// Known bash option huck does not implement (e.g. `xtrace`, `posix`).
+    Unimplemented,
+    /// Not a recognized `set -o` option name at all.
+    Unknown,
+}
+
+/// Reads a `set -o` option: real state for the 3 implemented, the table
+/// default for any other recognized name, `None` for an unknown name.
 fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     match name {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
         "pipefail" => Some(shell.shell_options.pipefail),
-        _ => None,
+        other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
 
-fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), ()> {
+/// Writes a `set -o` option. Only the 3 implemented options are settable.
+fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
         "nounset" => { shell.shell_options.nounset = value; Ok(()) }
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
-        _ => Err(()),
+        other => {
+            if SETO_TABLE.iter().any(|o| o.name == other) {
+                Err(OptSetErr::Unimplemented)
+            } else {
+                Err(OptSetErr::Unknown)
+            }
+        }
     }
 }
 
 fn print_options_table(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
-    for opt in SHELL_OPTIONS {
-        let val = option_get(shell, opt.name).unwrap_or(false);
-        let _ = writeln!(out, "{:<16}{}", opt.name, if val { "on" } else { "off" });
+    for opt in SETO_TABLE {
+        let val = option_get(shell, opt.name).unwrap_or(opt.default);
+        let _ = writeln!(out, "{:<15}\t{}", opt.name, if val { "on" } else { "off" });
     }
     ExecOutcome::Continue(0)
 }
 
 fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
-    for opt in SHELL_OPTIONS {
-        let val = option_get(shell, opt.name).unwrap_or(false);
+    for opt in SETO_TABLE {
+        let val = option_get(shell, opt.name).unwrap_or(opt.default);
         let sign = if val { '-' } else { '+' };
         let _ = writeln!(out, "set {sign}o {}", opt.name);
     }
@@ -3950,9 +3996,16 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             if i >= args.len() {
                 return print_options_table(out, shell);
             }
-            if option_set(shell, &args[i], true).is_err() {
-                eprintln!("huck: set: -o: invalid option name: {}", args[i]);
-                return ExecOutcome::Continue(2);
+            match option_set(shell, &args[i], true) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: set: -o: invalid option name: {}", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
             }
             i += 1;
             continue;
@@ -3962,9 +4015,16 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             if i >= args.len() {
                 return print_options_reinput(out, shell);
             }
-            if option_set(shell, &args[i], false).is_err() {
-                eprintln!("huck: set: +o: invalid option name: {}", args[i]);
-                return ExecOutcome::Continue(2);
+            match option_set(shell, &args[i], false) {
+                Ok(()) => {}
+                Err(OptSetErr::Unimplemented) => {
+                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
+                Err(OptSetErr::Unknown) => {
+                    eprintln!("huck: set: +o: invalid option name: {}", args[i]);
+                    return ExecOutcome::Continue(2);
+                }
             }
             i += 1;
             continue;
@@ -3982,12 +4042,22 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         if i >= args.len() {
                             return print_options_table(out, shell);
                         }
-                        if option_set(shell, &args[i], true).is_err() {
-                            eprintln!(
-                                "huck: set: -o: invalid option name: {}",
-                                args[i]
-                            );
-                            return ExecOutcome::Continue(2);
+                        match option_set(shell, &args[i], true) {
+                            Ok(()) => {}
+                            Err(OptSetErr::Unimplemented) => {
+                                eprintln!(
+                                    "huck: set: {}: not yet supported in this version",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
+                            Err(OptSetErr::Unknown) => {
+                                eprintln!(
+                                    "huck: set: -o: invalid option name: {}",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
                         }
                     }
                     other => {
@@ -4012,12 +4082,22 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         if i >= args.len() {
                             return print_options_reinput(out, shell);
                         }
-                        if option_set(shell, &args[i], false).is_err() {
-                            eprintln!(
-                                "huck: set: +o: invalid option name: {}",
-                                args[i]
-                            );
-                            return ExecOutcome::Continue(2);
+                        match option_set(shell, &args[i], false) {
+                            Ok(()) => {}
+                            Err(OptSetErr::Unimplemented) => {
+                                eprintln!(
+                                    "huck: set: {}: not yet supported in this version",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
+                            Err(OptSetErr::Unknown) => {
+                                eprintln!(
+                                    "huck: set: +o: invalid option name: {}",
+                                    args[i]
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
                         }
                     }
                     other => {
@@ -9722,6 +9802,44 @@ mod set_options_tests {
         assert!(!shell.shell_options.errexit, "expected errexit off");
         assert!(!shell.shell_options.nounset, "expected nounset off");
     }
+
+    #[test]
+    fn set_o_lists_full_27_name_table_tab_format() {
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-o"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 27, "set -o must list all 27 names; got {lines:?}");
+        // bash format: name left-justified in 15, a TAB, then on/off.
+        assert_eq!(lines[0], "allexport      \toff");
+        assert_eq!(lines[3], "errexit        \toff");
+        // long name (>=15 chars): no padding, just name + TAB + value.
+        assert!(lines.contains(&"interactive-comments\ton"));
+        assert!(lines.contains(&"braceexpand    \ton"));
+        assert!(lines.contains(&"hashall        \ton"));
+    }
+
+    #[test]
+    fn set_o_reflects_real_state_for_implemented() {
+        let mut shell = Shell::new();
+        shell.shell_options.errexit = true;
+        let (_, out) = run(&["-o"], &mut shell);
+        assert!(out.lines().any(|l| l == "errexit        \ton"));
+    }
+
+    #[test]
+    fn set_o_enable_unimplemented_says_not_supported() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "xtrace"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_o_enable_unknown_name_is_invalid() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
 }
 
 #[cfg(test)]
@@ -10087,6 +10205,6 @@ mod pipefail_option_tests {
 
     #[test]
     fn pipefail_listed_in_shell_options() {
-        assert!(SHELL_OPTIONS.iter().any(|o| o.name == "pipefail" && o.short.is_none()));
+        assert!(SETO_TABLE.iter().any(|o| o.name == "pipefail" && !o.default));
     }
 }
