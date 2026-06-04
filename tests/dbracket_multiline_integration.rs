@@ -63,3 +63,77 @@ fn test_builtin_v_set_and_unset() {
     assert_eq!(run("x=1\n[ -v x ] && echo set || echo unset\n").0, "set\n");
     assert_eq!(run("unset z\n[ -v z ] && echo set || echo unset\n").0, "unset\n");
 }
+
+use std::fs;
+
+fn run_in_dir(setup: &dyn Fn(&std::path::Path), script: &str) -> (String, i32) {
+    let dir = std::env::temp_dir().join(format!(
+        "huck_v87_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    setup(&dir);
+    let mut child = Command::new(huck_bin())
+        .current_dir(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn huck");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn make_old_new_link(dir: &std::path::Path) {
+    fs::write(dir.join("old"), b"o").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    fs::write(dir.join("new"), b"n").unwrap();
+    fs::hard_link(dir.join("new"), dir.join("link")).unwrap();
+}
+
+#[test]
+fn dbracket_file_ops() {
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[[ new -nt old ]] && echo nt\n").0,
+        "nt\n"
+    );
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[[ old -ot new ]] && echo ot\n").0,
+        "ot\n"
+    );
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[[ new -ef link ]] && echo ef\n").0,
+        "ef\n"
+    );
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[[ old -ef new ]] && echo ef || echo no\n").0,
+        "no\n"
+    );
+}
+
+#[test]
+fn test_builtin_file_ops() {
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[ new -nt old ] && echo nt\n").0,
+        "nt\n"
+    );
+    assert_eq!(
+        run_in_dir(&make_old_new_link, "[ new -ef link ] && echo ef\n").0,
+        "ef\n"
+    );
+}

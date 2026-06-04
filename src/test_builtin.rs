@@ -97,8 +97,35 @@ fn is_unary_op(s: &str) -> bool {
 fn is_binary_op(s: &str) -> bool {
     matches!(
         s,
-        "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+        "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-nt" | "-ot" | "-ef"
     )
+}
+
+/// `-nt`/`-ot`/`-ef` for the `test`/`[` and `[[ ]]` constructs. A missing
+/// file is treated as the oldest possible mtime; `-ef` requires both files
+/// to exist (bash 5.2 semantics).
+pub(crate) fn compare_files(op: &str, lhs: &str, rhs: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let lm = std::fs::metadata(lhs);
+    let rm = std::fs::metadata(rhs);
+    let nanos = |m: &std::fs::Metadata| (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
+    match op {
+        "-nt" => match (&lm, &rm) {
+            (Ok(a), Ok(b)) => nanos(a) > nanos(b),
+            (Ok(_), Err(_)) => true, // lhs exists, rhs missing
+            _ => false,              // lhs missing
+        },
+        "-ot" => match (&lm, &rm) {
+            (Ok(a), Ok(b)) => nanos(a) < nanos(b),
+            (Err(_), Ok(_)) => true, // lhs missing, rhs exists
+            _ => false,
+        },
+        "-ef" => match (&lm, &rm) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Applies a unary operator to its operand.
@@ -161,6 +188,7 @@ fn apply_binary(op: &str, lhs: &str, rhs: &str) -> Result<bool, String> {
                 _ => unreachable!("checked by the outer match"),
             })
         }
+        "-nt" | "-ot" | "-ef" => Ok(compare_files(op, lhs, rhs)),
         _ => Err(format!("{op}: unknown operator")),
     }
 }
@@ -347,6 +375,35 @@ mod tests {
     #[test]
     fn zero_args_is_false() {
         assert_eq!(evaluate(&[]), Ok(false));
+    }
+
+    #[test]
+    fn compare_files_nt_ot_ef() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("huck_ntot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old");
+        let new = dir.join("new");
+        std::fs::File::create(&old).unwrap().write_all(b"x").unwrap();
+        // Force `new` to be strictly newer.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::File::create(&new).unwrap().write_all(b"y").unwrap();
+        let (o, n) = (old.to_str().unwrap(), new.to_str().unwrap());
+        let missing = dir.join("missing");
+        let m = missing.to_str().unwrap();
+
+        assert!(compare_files("-nt", n, o)); // new newer than old
+        assert!(!compare_files("-nt", o, n));
+        assert!(compare_files("-ot", o, n)); // old older than new
+        assert!(compare_files("-nt", n, m)); // exists -nt missing → true
+        assert!(!compare_files("-nt", m, n)); // missing -nt exists → false
+        assert!(compare_files("-ot", m, n)); // missing -ot exists → true
+        assert!(!compare_files("-nt", m, m)); // both missing → false
+        assert!(compare_files("-ef", o, o)); // same path → same inode
+        assert!(!compare_files("-ef", o, n));
+        assert!(!compare_files("-ef", m, m)); // missing -ef → false
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

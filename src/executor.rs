@@ -943,6 +943,16 @@ fn eval_binary(
                 _ => unreachable!(),
             })
         }
+        TestBinaryOp::NewerThan | TestBinaryOp::OlderThan | TestBinaryOp::SameFile => {
+            let rhs = expand_assignment(rhs_word, shell);
+            let op_str = match op {
+                TestBinaryOp::NewerThan => "-nt",
+                TestBinaryOp::OlderThan => "-ot",
+                TestBinaryOp::SameFile => "-ef",
+                _ => unreachable!(),
+            };
+            Ok(crate::test_builtin::compare_files(op_str, lhs, &rhs))
+        }
     }
 }
 

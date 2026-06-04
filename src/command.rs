@@ -407,6 +407,9 @@ pub enum TestBinaryOp {
     IntGt,     // -gt
     IntLe,     // -le
     IntGe,     // -ge
+    NewerThan, // -nt
+    OlderThan, // -ot
+    SameFile,  // -ef
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -2054,6 +2057,18 @@ fn parse_test_atom<I: Iterator<Item = Token>>(
                 "-ge" => {
                     let rhs = next_test_word(iter)?;
                     Ok(TestExpr::Binary { op: TestBinaryOp::IntGe, lhs, rhs })
+                }
+                "-nt" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::NewerThan, lhs, rhs })
+                }
+                "-ot" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::OlderThan, lhs, rhs })
+                }
+                "-ef" => {
+                    let rhs = next_test_word(iter)?;
+                    Ok(TestExpr::Binary { op: TestBinaryOp::SameFile, lhs, rhs })
                 }
                 other => Err(ParseError::TestExprBadOperator(other.to_string())),
             }
