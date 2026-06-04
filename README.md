@@ -92,6 +92,7 @@ spec, an implementation plan, and a test suite.
 | v82       | script-file mode (`huck script [args]`) + `-c` + `--` (M-77a)   |
 | v83       | `set -o pipefail` + `$PIPESTATUS` (M-50)                        |
 | v84       | `${var:+(…)}` operands parse as words (metachars literal)        |
+| v85       | `!` pipeline negation (`if ! cmd`, `! a \| b`) (M-08c)          |
 
 ## Build and run
 
