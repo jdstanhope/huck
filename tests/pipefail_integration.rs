@@ -89,3 +89,17 @@ fn pipestatus_function_is_opaque() {
         "5\n"
     );
 }
+
+#[test]
+fn pipestatus_after_break_continue_is_zero() {
+    // break/continue exit 0 (the builtin succeeds), so $PIPESTATUS is [0]
+    // afterward, not the stale prior pipeline — matching bash.
+    assert_eq!(
+        run("for i in 1; do true | false; break; done\necho \"${PIPESTATUS[@]}\"\n").0,
+        "0\n"
+    );
+    assert_eq!(
+        run("for i in 1 2; do true | false; continue; done\necho \"${PIPESTATUS[@]}\"\n").0,
+        "0\n"
+    );
+}

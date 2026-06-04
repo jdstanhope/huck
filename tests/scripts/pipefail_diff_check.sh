@@ -84,6 +84,9 @@ check "pipestatus subshell" \
 check "pipestatus function" \
       'f() { true | false; }; f; echo "${PIPESTATUS[@]}"'
 
+check "pipestatus after break" \
+      'for i in 1; do true | false; break; done; echo "${PIPESTATUS[@]}"'
+
 echo ""
 echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

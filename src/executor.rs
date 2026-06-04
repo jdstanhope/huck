@@ -1929,8 +1929,16 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
             ExecOutcome::Continue(st)
         }
     };
-    if let ExecOutcome::Continue(c) = outcome {
-        shell.set_pipestatus(&[c]);
+    // $PIPESTATUS reflects this leaf command's exit status. break/continue
+    // bubble up as LoopBreak/LoopContinue (not Continue) but the builtin itself
+    // succeeds, so bash sets PIPESTATUS=[0] — match that. (exit/return don't
+    // reach here as themselves: `return` is normalized to Continue by
+    // call_function; `exit` ends the shell.)
+    match outcome {
+        ExecOutcome::Continue(c) => shell.set_pipestatus(&[c]),
+        ExecOutcome::LoopBreak(_, st) => shell.set_pipestatus(&[st]),
+        ExecOutcome::LoopContinue(_) => shell.set_pipestatus(&[0]),
+        ExecOutcome::Exit(_) | ExecOutcome::FunctionReturn(_) => {}
     }
     outcome
 }
