@@ -53,3 +53,43 @@ fn dbracket_extglob_parses_when_enabled() {
         "done\n"
     );
 }
+
+#[test]
+fn dbracket_extglob_matches() {
+    assert_eq!(
+        run("shopt -s extglob\n[[ aab == +(a|b) ]] && echo y || echo n\n").0,
+        "y\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\n[[ abcd == @(ab|cd) ]] && echo y || echo n\n").0,
+        "n\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\n[[ foo == !(bar) ]] && echo y || echo n\n").0,
+        "y\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\n[[ bar == !(bar) ]] && echo y || echo n\n").0,
+        "n\n"
+    );
+}
+
+#[test]
+fn case_extglob_matches() {
+    assert_eq!(
+        run("shopt -s extglob\ncase hello in +([a-z])) echo lc;; *) echo o;; esac\n").0,
+        "lc\n"
+    );
+    assert_eq!(
+        run("shopt -s extglob\ncase ab in @(a|b)) echo one;; *) echo o;; esac\n").0,
+        "o\n"
+    ); // ab != one-of a|b
+}
+
+#[test]
+fn dbracket_extglob_nocasematch() {
+    assert_eq!(
+        run("shopt -s extglob nocasematch\n[[ AAB == +(a|b) ]] && echo y || echo n\n").0,
+        "y\n"
+    );
+}

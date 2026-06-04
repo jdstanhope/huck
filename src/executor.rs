@@ -714,16 +714,27 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
 /// Matches `subject` against a `case` clause's `|`-patterns. A clause
 /// matches if any pattern matches; an unparseable glob matches nothing.
 fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool {
-    let opts = glob::MatchOptions {
-        case_sensitive: !shell.nocasematch(),
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
+    let nocase = shell.nocasematch();
+    let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
     for pattern_word in &item.patterns {
         let pattern = expand_pattern(pattern_word, shell);
-        if let Ok(p) = glob::Pattern::new(&pattern)
-            && p.matches_with(subject, opts)
-        {
+        let hit = if extglob && crate::glob_match::has_extglob(&pattern) {
+            crate::glob_match::extglob_match(&pattern, subject, nocase)
+        } else {
+            glob::Pattern::new(&pattern)
+                .map(|p| {
+                    p.matches_with(
+                        subject,
+                        glob::MatchOptions {
+                            case_sensitive: !nocase,
+                            require_literal_separator: false,
+                            require_literal_leading_dot: false,
+                        },
+                    )
+                })
+                .unwrap_or(false)
+        };
+        if hit {
             return true;
         }
     }
@@ -906,14 +917,19 @@ fn eval_binary(
     match op {
         TestBinaryOp::StringEq | TestBinaryOp::StringNe => {
             let pattern_str = expand_pattern(rhs_word, shell);
-            let pat = glob::Pattern::new(&pattern_str)
-                .map_err(|e| format!("bad pattern: {e}"))?;
-            let mopts = glob::MatchOptions {
-                case_sensitive: !shell.nocasematch(),
-                require_literal_separator: false,
-                require_literal_leading_dot: false,
+            let nocase = shell.nocasematch();
+            let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+            let matched = if extglob && crate::glob_match::has_extglob(&pattern_str) {
+                crate::glob_match::extglob_match(&pattern_str, lhs, nocase)
+            } else {
+                let pat = glob::Pattern::new(&pattern_str)
+                    .map_err(|e| format!("bad pattern: {e}"))?;
+                pat.matches_with(lhs, glob::MatchOptions {
+                    case_sensitive: !nocase,
+                    require_literal_separator: false,
+                    require_literal_leading_dot: false,
+                })
             };
-            let matched = pat.matches_with(lhs, mopts);
             Ok(if matches!(op, TestBinaryOp::StringEq) { matched } else { !matched })
         }
         TestBinaryOp::StringLt | TestBinaryOp::StringGt => {
