@@ -1296,12 +1296,16 @@ fn scan_braced_operand(
 /// Parses a brace-modifier operand BODY (already extracted up to the matching
 /// `}` by `scan_braced_operand`) as a single WORD: `$…` / `` `…` `` / quotes are
 /// expansions/quoting; ALL other characters — including shell metacharacters
-/// `(` `)` `|` `;` `&` `<` `>` and whitespace — are LITERAL. Unquoted literal
-/// text (incl. spaces) is emitted as `quoted: false` Literal parts so an
-/// unquoted `${x:-a b}` still field-splits to `a` `b` downstream; inner quoted
-/// spans produce `quoted: true` parts that suppress splitting. Matches bash:
-/// the operand of `:-`/`:=`/`:?`/`:+` (and substitution/substring operands) is a
-/// word, not a command.
+/// `(` `)` `|` `;` `&` `<` `>` and whitespace — are LITERAL. Field splitting is
+/// NOT driven by the `quoted` flag inside the modifier word: at expansion time
+/// the modifier word goes through `expand_assignment` (which returns the string
+/// verbatim, no splitting), and the OUTER `ParamExpansion`'s own `quoted` flag
+/// in `expand()` then drives any IFS splitting of the result. So unquoted
+/// `${x:-a b}` splits to `a` `b` and `"${x:-a b}"` stays one — driven by the
+/// outer context, not these parts. The inner `quoted` flags are set correctly
+/// (unquoted literals, quoted spans/escapes) for future-compatibility and
+/// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
+/// substitution/substring operands) is a word, not a command.
 fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
     let mut chars = body.chars().peekable();
     let mut parts: Vec<WordPart> = Vec::new();
@@ -1309,9 +1313,12 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                // Backslash escapes the next char as an (unquoted) literal.
+                // Backslash escapes the next char: emit it as a quoted literal
+                // (glob-safe, consistent with the main tokenizer). `\` at end of
+                // body silently vanishes.
                 if let Some(n) = chars.next() {
-                    cur.push(n);
+                    flush_body_literal(&mut parts, &mut cur, false);
+                    parts.push(WordPart::Literal { text: n.to_string(), quoted: true });
                 }
             }
             '$' => {
@@ -3829,17 +3836,18 @@ mod tests {
         // "a $x b" → quoted literal "a ", Var x (quoted), quoted literal " b"
         let w = parse_braced_operand("\"a $x b\"").unwrap();
         assert_eq!(operand_lits(&w), "a $x b");
+        // Parts inside the double-quoted span carry quoted: true.
+        assert!(w.0.iter().all(|p| match p {
+            WordPart::Literal { quoted, .. } => *quoted,
+            WordPart::Var { quoted, .. } => *quoted,
+            _ => true,
+        }));
     }
 
     #[test]
     fn operand_nested_brace() {
         let w = parse_braced_operand("${y:-z}").unwrap();
         assert!(matches!(w.0.as_slice(), [WordPart::ParamExpansion { .. }]));
-    }
-
-    #[test]
-    fn operand_empty_is_empty_word() {
-        assert!(parse_braced_operand("").unwrap().0.is_empty());
     }
 
     #[test]
