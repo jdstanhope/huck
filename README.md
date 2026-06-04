@@ -96,6 +96,7 @@ spec, an implementation plan, and a test suite.
 | v86       | `shopt` builtin: 57-name table + `set -o` bridge + `nullglob`/`dotglob`/`nocaseglob`/`failglob`/`nocasematch` (M-08d) |
 | v87       | multi-line `[[ … ]]` + `-v`/`-nt`/`-ot`/`-ef` in `[[ ]]` and `test`/`[` (M-14a) |
 | v88       | `complete`/`compgen` actions: full 24-name `-A` set + 12 short flags (`-u`/`-j`/`-v`/…); generates `setopt`/`shopt`/`signal`/`export`/`arrayvar`/etc. (M-36a) |
+| v89       | `set -v` verbose mode: echoes each input line to stderr as read (before execution) at both input readers; `v` in `$-`; closes the last `set -v`/`+v` bashrc errors (M-08e) |
 
 ## Build and run
 
