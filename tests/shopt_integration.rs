@@ -42,6 +42,11 @@ fn shopt_invalid_name_rc_one() {
 }
 
 #[test]
+fn shopt_set_and_unset_together_rc_one() {
+    assert_eq!(run("shopt -s -u nullglob; echo rc=$?\n").0, "rc=1\n");
+}
+
+#[test]
 fn shopt_query_prints_state() {
     assert_eq!(run("shopt -s dotglob; shopt dotglob\n").0, "dotglob        \ton\n");
 }
