@@ -60,3 +60,10 @@ fn array_keys_still_work() {
     // Regression: ${!a[@]} is array keys, NOT indirect.
     assert_eq!(run("a=(p q r)\necho \"${!a[@]}\"\n").0, "0 1 2\n");
 }
+
+#[test]
+fn indirect_spaced_source_value_is_not_trimmed() {
+    // bash: a through-value with surrounding spaces is an invalid name -> empty,
+    // NOT resolved to the trimmed name. (Verbatim, no trim.)
+    assert_eq!(run("x=hi\nref=\" x \"\necho \"[${!ref}]\"\n").0, "[]\n");
+}

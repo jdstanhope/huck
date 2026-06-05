@@ -433,8 +433,12 @@ fn expand_indirect(
             }
         }
     };
-    let n = through.trim();
-    if n.is_empty() {
+    // Use the through-value VERBATIM as the effective name N — bash does
+    // not trim or word-split it. An all-whitespace or space-containing
+    // value is a non-empty (invalid) name that falls through to the normal
+    // lookup path and yields empty, matching bash's observable result.
+    let n: &str = &through;
+    if through.is_empty() {
         // Empty through-value (source unset OR set-but-empty) is a fatal
         // "invalid indirect expansion" in bash — and it fires regardless
         // of `set -u`. Route it through the fatal-PE mechanism so a
