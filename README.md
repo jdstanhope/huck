@@ -103,6 +103,7 @@ spec, an implementation plan, and a test suite.
 | v93       | `$`-form expansion inside `(( ))`/`$(( ))`/arith-`for` (M-88, expand-then-parse): `$#`/`${…}`/`$(…)`/`$@`/`$1`/positional params now expand before arithmetic eval (the dominant bash-completion blocker, `(($# == 2))`); quote removal honored, malformed arith errors at eval time; `declare -f`/`-F` silent-on-missing |
 | v94       | line numbers in sourced-script syntax errors (`FILE: line N: syntax error`); diagnostics iteration (no M-flip) |
 | v95       | `${!var}` indirect parameter expansion (M-91): bare `${!ref}`, alphabetic + numeric-positional source (`${!2}`), modifier composition, array-element source; new `indirect` field + `expand_indirect` helper; clears the entire bash-completion `${!…}` error cascade. Bundled: `[[ ]]` integer comparison treats an empty operand as `0` (M-14). 20th bash-diff harness; prefix-name `${!prefix@}`/`${!prefix*}` deferred (M-92) |
+| v96       | `${var@OP}` scalar parameter transforms (M-86 scalar subset): `@P` (prompt-expand), `@Q` (shell-quote; unset→empty), `@U`/`@L`/`@u` (case), `@E` (backslash-escape expand) via a new `ParamModifier::Transform`/`TransformOp` reusing `expand_prompt`/`case_modify`/`decode_ansi_c_escapes`/`shell_quote`; clears oh-my-posh's `${prompt@P}` block. 21st bash-diff harness; array/attribute forms `@A`/`@K`/`@k`/`@a` deferred (M-93) |
 
 ## Build and run
 
