@@ -245,8 +245,8 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
         if opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && chars.peek() == Some(&'(') {
             has_token = true;
             flush_literal(&mut parts, &mut current, false);
-            let group = scan_extglob_group(c, &mut chars)?;
-            parts.push(WordPart::Literal { text: group, quoted: false });
+            let group_parts = scan_extglob_group(c, &mut chars)?;
+            parts.extend(group_parts);
             continue;
         }
 
@@ -688,28 +688,102 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 /// Reads `X(...)` where `prefix` is the just-seen extglob prefix char (one of
 /// `? * + @ !`), consuming a balanced-paren group (nested parens; inner
 /// `|`/metachars literal). `chars` is positioned just before the `(`; returns
-/// the full group text INCLUDING the prefix char, e.g. `"+(a|b)"`. EOF before
-/// the closing `)` is `LexError::UnterminatedExtglob`.
+/// the group's word PARTS INCLUDING the prefix char, e.g. `+($x)` yields a
+/// Literal `"+("`, a Var for `$x`, and a Literal `")"`. Inner `$…`/`` `…` ``/
+/// quotes are preserved as their own parts so they expand at runtime; the
+/// structural `(`/`|`/`)`/prefix stay literal. EOF before the closing `)` is
+/// `LexError::UnterminatedExtglob`.
 fn scan_extglob_group(
     prefix: char,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<String, LexError> {
-    let mut out = String::new();
-    out.push(prefix);
-    out.push('(');
+) -> Result<Vec<WordPart>, LexError> {
+    let mut group_parts: Vec<WordPart> = Vec::new();
+    let mut lit = format!("{prefix}(");
     chars.next(); // consume '('
     let mut depth = 1usize;
-    for c in chars.by_ref() {
-        out.push(c);
+
+    // Flush the accumulated structural/literal text as one unquoted Literal.
+    fn flush(lit: &mut String, parts: &mut Vec<WordPart>) {
+        if !lit.is_empty() {
+            parts.push(WordPart::Literal { text: std::mem::take(lit), quoted: false });
+        }
+    }
+
+    while let Some(c) = chars.next() {
         match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(out);
+            '$' => {
+                flush(&mut lit, &mut group_parts);
+                read_dollar_expansion(chars, &mut group_parts, false)?;
+            }
+            '`' => {
+                flush(&mut lit, &mut group_parts);
+                let sequence = scan_backtick_substitution(chars)?;
+                group_parts.push(WordPart::CommandSub { sequence, quoted: false });
+            }
+            '\'' => {
+                // Single quote: literal, no expansion.
+                flush(&mut lit, &mut group_parts);
+                let mut inner = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(ch) => inner.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+                group_parts.push(WordPart::Literal { text: inner, quoted: true });
+            }
+            '"' => {
+                // Double quote: mirror the main loop's `"` arm.
+                flush(&mut lit, &mut group_parts);
+                let mut quoted_current = String::new();
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => quoted_current.push(esc),
+                            Some('\n') => {}
+                            Some(other) => {
+                                quoted_current.push('\\');
+                                quoted_current.push(other);
+                            }
+                            None => return Err(LexError::UnterminatedQuote),
+                        },
+                        Some('$') => {
+                            flush_literal(&mut group_parts, &mut quoted_current, true);
+                            read_dollar_expansion(chars, &mut group_parts, true)?;
+                        }
+                        Some('`') => {
+                            flush_literal(&mut group_parts, &mut quoted_current, true);
+                            let sequence = scan_backtick_substitution(chars)?;
+                            group_parts.push(WordPart::CommandSub { sequence, quoted: true });
+                        }
+                        Some(ch) => quoted_current.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+                flush_literal(&mut group_parts, &mut quoted_current, true);
+            }
+            '\\' => {
+                // Literal escape: keep both chars.
+                lit.push('\\');
+                if let Some(next) = chars.next() {
+                    lit.push(next);
                 }
             }
-            _ => {}
+            '(' => {
+                lit.push('(');
+                depth += 1;
+            }
+            ')' => {
+                lit.push(')');
+                depth -= 1;
+                if depth == 0 {
+                    flush(&mut lit, &mut group_parts);
+                    return Ok(group_parts);
+                }
+            }
+            other => lit.push(other),
         }
     }
     Err(LexError::UnterminatedExtglob) // EOF before closing ')'
@@ -2511,6 +2585,22 @@ mod tests {
             let toks = tokenize_with_opts(p, LexerOptions { extglob: true }).unwrap();
             assert_eq!(toks.len(), 1, "{p} should be one word, got {toks:?}");
         }
+    }
+
+    #[test]
+    fn extglob_group_preserves_inner_expansion() {
+        // `+($x)` must NOT collapse to a single flat literal — the `$x`
+        // inside the group has to survive as a Param part so it expands.
+        let toks = tokenize_with_opts("+($x)", LexerOptions { extglob: true }).unwrap();
+        assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
+        let Token::Word(Word(parts)) = &toks[0] else {
+            panic!("expected a Word token, got {:?}", toks[0]);
+        };
+        assert!(parts.len() > 1, "group should not be one flat literal: {parts:?}");
+        assert!(
+            parts.iter().any(|p| matches!(p, WordPart::Var { .. })),
+            "expected a Var part for $x, got {parts:?}"
+        );
     }
 
     /// Builds a Token that holds a single quoted-Literal Word.
