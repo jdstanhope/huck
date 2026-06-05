@@ -69,6 +69,18 @@ fn indirect_spaced_source_value_is_not_trimmed() {
 }
 
 #[test]
+fn indirect_through_numeric_positional() {
+    // ${!2}: indirect through $2's value as a name.
+    assert_eq!(run("two=DEREF\nset -- a two c\necho \"${!2}\"\n").0, "DEREF\n");
+}
+
+#[test]
+fn indirect_numeric_positional_with_default() {
+    // set -- a b c; ${!2-na}: $2=b; b is unset as a var -> na (matches bash).
+    assert_eq!(run("set -- a b c\necho \"${!2-na}\"\n").0, "na\n");
+}
+
+#[test]
 fn dbracket_empty_operand_is_zero() {
     assert_eq!(run("[[ \"\" -ge 0 ]] && echo Y || echo N\n").0, "Y\n");
     assert_eq!(run("[[ \"\" -eq 0 ]] && echo Y || echo N\n").0, "Y\n");

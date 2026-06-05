@@ -1855,6 +1855,23 @@ fn read_braced_param_expansion(
     // the name.
     if chars.peek() == Some(&'!') {
         chars.next(); // consume '!'
+        // `${!N}` — indirect through a numeric positional source (e.g.
+        // `${!2}`, `${!1-default}`). The source name is a positional
+        // parameter reference; `read_braced_name` rejects digit-leading
+        // names, so read the run of digits directly here. Positionals
+        // cannot be subscripted, so the subscript is `None`.
+        if matches!(chars.peek().copied(), Some(c) if c.is_ascii_digit()) {
+            let mut name = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    name.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true);
+        }
         let name = read_braced_name(chars)?;
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
