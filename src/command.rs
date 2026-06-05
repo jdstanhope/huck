@@ -445,6 +445,14 @@ pub enum Command {
     ArithFor(Box<ArithForClause>),
     /// NEW (v81): `select NAME [in WORDS]; do BODY; done`.
     Select(Box<SelectClause>),
+    /// A compound command with trailing redirections applied to its whole
+    /// execution: `{ …; } >f`, `while … done <<EOF`, etc. (v97)
+    Redirected {
+        inner: Box<Command>,
+        stdin: Option<Redirect>,
+        stdout: Option<Redirect>,
+        stderr: Option<Redirect>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -732,22 +740,31 @@ fn parse_command_inner<I: Iterator<Item = Token>>(
         };
         let body = crate::lexer::arith_string_to_word(&text)
             .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
-        return Ok(Command::Arith(body));
+        return maybe_wrap_redirects(Command::Arith(body), iter);
     }
 
     match iter.peek().and_then(keyword_of) {
-        Some(Keyword::If) => Ok(Command::If(Box::new(parse_if(iter)?))),
+        Some(Keyword::If) => maybe_wrap_redirects(Command::If(Box::new(parse_if(iter)?)), iter),
         Some(Keyword::While) | Some(Keyword::Until) => {
-            Ok(Command::While(Box::new(parse_while(iter)?)))
+            maybe_wrap_redirects(Command::While(Box::new(parse_while(iter)?)), iter)
         }
-        Some(Keyword::For) => parse_for_command(iter),
+        Some(Keyword::For) => {
+            let cmd = parse_for_command(iter)?;
+            maybe_wrap_redirects(cmd, iter)
+        }
         Some(Keyword::Select) => {
             iter.next(); // consume `select`
-            parse_select_command(iter)
+            let cmd = parse_select_command(iter)?;
+            maybe_wrap_redirects(cmd, iter)
         }
-        Some(Keyword::Case) => Ok(Command::Case(Box::new(parse_case(iter)?))),
-        Some(Keyword::LBrace) => Ok(Command::BraceGroup(Box::new(parse_brace_group(iter)?))),
-        Some(Keyword::DoubleBracketOpen) => parse_double_bracket(iter),
+        Some(Keyword::Case) => maybe_wrap_redirects(Command::Case(Box::new(parse_case(iter)?)), iter),
+        Some(Keyword::LBrace) => {
+            maybe_wrap_redirects(Command::BraceGroup(Box::new(parse_brace_group(iter)?)), iter)
+        }
+        Some(Keyword::DoubleBracketOpen) => {
+            let cmd = parse_double_bracket(iter)?;
+            maybe_wrap_redirects(cmd, iter)
+        }
         Some(Keyword::Function) => parse_function_keyword_def(iter),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
@@ -757,7 +774,8 @@ fn parse_command_inner<I: Iterator<Item = Token>>(
             // a Word token, not an Op(LParen). Still, the comment clarifies
             // intent.
             if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
-                return parse_subshell(iter);
+                let cmd = parse_subshell(iter)?;
+                return maybe_wrap_redirects(cmd, iter);
             }
             // Non-keyword, non-LParen: may be a function definition
             // `name() compound`, or a plain pipeline. Need two-token lookahead.
@@ -1545,6 +1563,108 @@ fn parse_while<I: Iterator<Item = Token>>(
     Ok(WhileClause { condition, body, until })
 }
 
+/// stdin/stdout/stderr redirect slots plus a flag (true iff at least one
+/// redirect token was consumed).
+type RedirSlots = (Option<Redirect>, Option<Redirect>, Option<Redirect>, bool);
+
+/// True for the operators that introduce a redirection (and thus a trailing
+/// target word). Excludes pipeline/grouping operators (`|`, `(`, `)`, etc.).
+fn is_redirect_op(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::RedirIn
+            | Operator::RedirOut
+            | Operator::RedirAppend
+            | Operator::RedirErr
+            | Operator::RedirErrAppend
+            | Operator::HereString
+            | Operator::DupOut
+            | Operator::DupErr
+            | Operator::AndRedirOut
+            | Operator::AndRedirAppend
+    )
+}
+
+/// Consumes a run of trailing redirect tokens (`<`, `>`, `>>`, `2>`, `2>>`,
+/// `<<<`, `>&`, `2>&`, `&>`, `&>>`, and `Token::Heredoc`) from `iter`,
+/// filling the stdin/stdout/stderr slots (last-wins). Stops at the first
+/// non-redirect token. The `bool` is true iff at least one redirect was
+/// consumed. The op→slot mapping is identical to `parse_simple_stage`'s.
+fn parse_trailing_redirects<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<RedirSlots, ParseError> {
+    let mut stdin: Option<Redirect> = None;
+    let mut stdout: Option<Redirect> = None;
+    let mut stderr: Option<Redirect> = None;
+    let mut saw = false;
+    loop {
+        match iter.peek() {
+            Some(Token::Heredoc { .. }) => {
+                let Some(Token::Heredoc { body, expand, strip_tabs }) = iter.next() else {
+                    unreachable!("peek confirmed Heredoc")
+                };
+                // Last-wins: a later heredoc or <file overwrites this.
+                stdin = Some(Redirect::Heredoc { body, expand, strip_tabs });
+                saw = true;
+            }
+            Some(Token::Op(op)) if is_redirect_op(op) => {
+                let op = *op;
+                iter.next();
+                let target = match iter.next() {
+                    Some(Token::Word(word)) => word,
+                    Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                    Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(Token::ArithBlock(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                };
+                match op {
+                    Operator::RedirIn => stdin = Some(Redirect::Read(target)),
+                    Operator::RedirOut => stdout = Some(Redirect::Truncate(target)),
+                    Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
+                    Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
+                    Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
+                    Operator::HereString => stdin = Some(Redirect::HereString(target)),
+                    Operator::DupOut => {
+                        stdout = Some(Redirect::Dup { fd: 1, source: target });
+                    }
+                    Operator::DupErr => {
+                        stderr = Some(Redirect::Dup { fd: 2, source: target });
+                    }
+                    Operator::AndRedirOut => {
+                        stdout = Some(Redirect::Truncate(target));
+                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
+                    }
+                    Operator::AndRedirAppend => {
+                        stdout = Some(Redirect::Append(target));
+                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
+                    }
+                    // is_redirect_op excludes all other operators.
+                    _ => unreachable!("is_redirect_op gates the match arms above"),
+                }
+                saw = true;
+            }
+            _ => break,
+        }
+    }
+    Ok((stdin, stdout, stderr, saw))
+}
+
+/// Wraps a freshly-parsed compound command in `Command::Redirected` when one
+/// or more redirects immediately follow its terminator; otherwise returns the
+/// command unchanged. Applied to compound arms only (simple commands consume
+/// their own redirects inline in `parse_simple_stage`).
+fn maybe_wrap_redirects<I: Iterator<Item = Token>>(
+    cmd: Command,
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    let (stdin, stdout, stderr, saw) = parse_trailing_redirects(iter)?;
+    if saw {
+        Ok(Command::Redirected { inner: Box::new(cmd), stdin, stdout, stderr })
+    } else {
+        Ok(cmd)
+    }
+}
+
 /// Parses a simple-command stage — accumulates program/args/redirects
 /// tokens until a pipeline terminator (`|`, `;`, `&&`, `||`, newline,
 /// etc.) is reached. Returns `Command::Simple(...)` and a flag indicating
@@ -1602,6 +1722,28 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
         ) {
             break;
         }
+        // Redirect tokens (a heredoc, or a redirect operator) — delegate to the
+        // shared `parse_trailing_redirects` helper, then merge its slots
+        // last-wins into this stage's. This keeps the simple-command redirect
+        // semantics byte-identical with compound-command redirects.
+        let is_redirect_token = match iter.peek() {
+            Some(Token::Heredoc { .. }) => true,
+            Some(Token::Op(op)) => is_redirect_op(op),
+            _ => false,
+        };
+        if is_redirect_token {
+            let (rin, rout, rerr, _saw) = parse_trailing_redirects(iter)?;
+            if rin.is_some() {
+                stdin = rin;
+            }
+            if rout.is_some() {
+                stdout = rout;
+            }
+            if rerr.is_some() {
+                stderr = rerr;
+            }
+            continue;
+        }
         let token = iter.next().unwrap();
         match token {
             Token::Word(word) => {
@@ -1637,53 +1779,16 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
                 // Unreachable: the peek-break above stops on RParen.
                 unreachable!("RParen terminates the stage via the peek-break above");
             }
-            Token::Heredoc { body, expand, strip_tabs } => {
-                // A here-doc token produced by the lexer — attach as stdin.
-                // Last-wins: a later heredoc or <file overwrites this.
-                stdin = Some(Redirect::Heredoc { body, expand, strip_tabs });
+            Token::Heredoc { .. } => {
+                // Unreachable: the redirect-delegation branch above consumes
+                // heredoc tokens before this match.
+                unreachable!("Heredoc consumed by parse_trailing_redirects branch");
             }
-            Token::Op(op) => {
-                let target = match iter.next() {
-                    Some(Token::Word(word)) => word,
-                    Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
-                    Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::ArithBlock(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                };
-                match op {
-                    Operator::RedirIn => stdin = Some(Redirect::Read(target)),
-                    Operator::RedirOut => stdout = Some(Redirect::Truncate(target)),
-                    Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
-                    Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
-                    Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
-                    Operator::HereString => stdin = Some(Redirect::HereString(target)),
-                    Operator::DupOut => {
-                        stdout = Some(Redirect::Dup { fd: 1, source: target });
-                    }
-                    Operator::DupErr => {
-                        stderr = Some(Redirect::Dup { fd: 2, source: target });
-                    }
-                    Operator::AndRedirOut => {
-                        stdout = Some(Redirect::Truncate(target));
-                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
-                    }
-                    Operator::AndRedirAppend => {
-                        stdout = Some(Redirect::Append(target));
-                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
-                    }
-                    Operator::Pipe
-                    | Operator::And
-                    | Operator::Or
-                    | Operator::Semi
-                    | Operator::Background
-                    | Operator::LParen
-                    | Operator::RParen
-                    | Operator::DoubleSemi
-                    | Operator::SemiAmp
-                    | Operator::DoubleSemiAmp => {
-                        unreachable!("handled in the outer arms or peek-break");
-                    }
-                }
+            Token::Op(_) => {
+                // A non-terminator, non-redirect operator at this point is a
+                // syntax error (redirect ops are consumed by the delegation
+                // branch; terminators break via the peek-break above).
+                return Err(ParseError::UnexpectedToken);
             }
         }
     }
@@ -2221,6 +2326,7 @@ mod tests {
             Command::Arith(_) => panic!("expected a pipeline, got an arith command"),
             Command::ArithFor(_) => panic!("expected a pipeline, got an arith for"),
             Command::Select(_) => panic!("expected a pipeline, got a select"),
+            Command::Redirected { .. } => panic!("expected a pipeline, got a redirected compound"),
         }
     }
 
@@ -2740,6 +2846,7 @@ mod tests {
             Command::Arith(_) => panic!("expected an if, got an arith command"),
             Command::ArithFor(_) => panic!("expected an if, got an arith for"),
             Command::Select(_) => panic!("expected an if, got a select"),
+            Command::Redirected { .. } => panic!("expected an if, got a redirected compound"),
         }
     }
 
@@ -3080,6 +3187,43 @@ mod tests {
             Command::Select(s) => assert_eq!(s.words, Some(vec![])),
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn brace_group_with_trailing_redirect_wraps() {
+        let cmd = parse_one("{ echo a; } > f");
+        match cmd {
+            Command::Redirected { inner, stdin, stdout, stderr } => {
+                assert!(matches!(*inner, Command::BraceGroup(_)), "inner should be BraceGroup");
+                assert!(stdin.is_none());
+                assert!(matches!(stdout, Some(Redirect::Truncate(_))), "stdout should be Truncate");
+                assert!(stderr.is_none());
+            }
+            other => panic!("expected Redirected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_with_trailing_heredoc_wraps() {
+        let cmd = parse_one("while read x; do echo $x; done <<EOF\na\nb\nEOF\n");
+        match cmd {
+            Command::Redirected { inner, stdin, stdout, stderr } => {
+                assert!(matches!(*inner, Command::While(_)), "inner should be While");
+                assert!(matches!(stdin, Some(Redirect::Heredoc { .. })), "stdin should be Heredoc");
+                assert!(stdout.is_none());
+                assert!(stderr.is_none());
+            }
+            other => panic!("expected Redirected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_for_is_not_wrapped() {
+        let cmd = parse_one("for i in 1 2; do echo $i; done");
+        assert!(
+            matches!(cmd, Command::For(_)),
+            "a bare compound must stay plain, got {cmd:?}"
+        );
     }
 
     #[test]
