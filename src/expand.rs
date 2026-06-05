@@ -404,12 +404,15 @@ fn expand_assoc_param(
 /// Through-value resolution: a plain name uses `shell.lookup_var` (which
 /// resolves named vars, positionals, and specials); a subscripted source
 /// (`${!a[i]}`) reads the array element scalar. An empty/all-whitespace
-/// through-value yields `Empty`. The effective name N is interpreted as a
-/// parameter reference: a plain name, a positional digit / special param,
-/// or `name[sub]` (re-expanded as an array element).
+/// through-value (source unset OR set-but-empty) is a FATAL "invalid
+/// indirect expansion" in bash and fires regardless of `set -u`. The
+/// effective name N is interpreted as a parameter reference: a plain
+/// name, a positional digit / special param, or `name[sub]` (re-expanded
+/// as an array element).
 ///
-/// `set -u`: a truly-unset plain source (no subscript) raises the same
-/// unbound-variable fatal as a normal `${unset}` reference.
+/// `set -u`: when N is a valid-but-unset name (a bare reference, no
+/// substitution modifier), it raises the same unbound-variable fatal as a
+/// normal `${N}` reference would.
 fn expand_indirect(
     name: &str,
     subscript: Option<&crate::lexer::SubscriptKind>,
@@ -420,18 +423,7 @@ fn expand_indirect(
     use crate::param_expansion::ExpansionResult;
     // Step 1: through-value = scalar value of (name, subscript).
     let through = match subscript {
-        None => match shell.lookup_var(name) {
-            Some(v) => v,
-            None => {
-                // Source name is unset. Under `set -u`, a normal `${name}`
-                // reference is fatal; mirror that here.
-                if shell.shell_options.nounset {
-                    eprintln!("huck: {name}: unbound variable");
-                    return ExpansionResult::Fatal { status: 1 };
-                }
-                String::new()
-            }
-        },
+        None => shell.lookup_var(name).unwrap_or_default(),
         Some(sub) => {
             // Indirect through an array element: read its scalar value;
             // empty if absent.
@@ -443,7 +435,13 @@ fn expand_indirect(
     };
     let n = through.trim();
     if n.is_empty() {
-        return ExpansionResult::Empty;
+        // Empty through-value (source unset OR set-but-empty) is a fatal
+        // "invalid indirect expansion" in bash — and it fires regardless
+        // of `set -u`. Route it through the fatal-PE mechanism so a
+        // non-interactive shell exits and an interactive one aborts the
+        // command (the caller turns `Fatal` into `pending_fatal_pe_error`).
+        eprintln!("huck: {name}: invalid indirect expansion");
+        return ExpansionResult::Fatal { status: 1 };
     }
     // Step 2: parse N into (effective_name, effective_subscript) and
     // re-expand. The only structured form we honor is `name[sub]`.
@@ -452,6 +450,19 @@ fn expand_indirect(
             WordPart::Literal { text: sub_text, quoted: false },
         ]));
         return expand_array_param(&base, modifier, &sub, quoted, shell);
+    }
+    // The effective name N is a valid parameter. When N is itself unset
+    // and `set -u` is active, a bare reference must raise the same
+    // unbound-variable fatal as a normal `${N}` would — `expand_modifier`
+    // does not enforce nounset, so apply it here for the bare-reference
+    // case (a substitution modifier like `:-`/`-`/`+` handles unset on
+    // its own and must not be pre-empted).
+    if matches!(modifier, crate::lexer::ParamModifier::None)
+        && shell.shell_options.nounset
+        && shell.lookup_var(n).is_none()
+    {
+        eprintln!("huck: {n}: unbound variable");
+        return ExpansionResult::Fatal { status: 1 };
     }
     crate::param_expansion::expand_modifier(n, modifier, shell)
 }

@@ -35,8 +35,24 @@ fn indirect_with_default_modifier_set() {
 }
 
 #[test]
-fn indirect_source_unset_is_empty() {
-    assert_eq!(run("unset ref\necho \"[${!ref}]\"\n").0, "[]\n");
+fn indirect_unset_source_errors() {
+    // bash: empty through-value -> "invalid indirect expansion", fatal (rc != 0),
+    // no normal output. (NOT empty-string.)
+    let (out, rc) = run("unset ref\necho \"[${!ref}]\"\necho AFTER\n");
+    assert_ne!(rc, 0, "expected nonzero exit; out={out:?}");
+    assert!(!out.contains("[]"), "should not emit empty indirect result; out={out:?}");
+}
+
+#[test]
+fn indirect_effective_name_unbound_under_set_u() {
+    let (out, rc) = run("set -u\nref=missingvar\necho \"[${!ref}]\"\necho AFTER\n");
+    assert_ne!(rc, 0, "expected nonzero exit under set -u; out={out:?}");
+}
+
+#[test]
+fn indirect_effective_name_unset_no_u_is_empty() {
+    // No set -u: effective name is valid but unset -> empty, like ${missingvar}.
+    assert_eq!(run("ref=missingvar\necho \"[${!ref}]\"\n").0, "[]\n");
 }
 
 #[test]
