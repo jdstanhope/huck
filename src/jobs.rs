@@ -317,7 +317,9 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
-        eprintln!("{}", notification_line(&job, flag));
+        if shell.is_interactive {
+            eprintln!("{}", notification_line(&job, flag));
+        }
     }
     shell.jobs.remove_notified();
 }
