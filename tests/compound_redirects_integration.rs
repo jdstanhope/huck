@@ -72,3 +72,23 @@ fn capture_with_inner_redirect() {
     assert_eq!(run("x=$({ echo a; echo b > /tmp/huck_t_cap; }); echo \"[$x]\"\ncat /tmp/huck_t_cap\n").0,
                "[a]\nb\n");
 }
+
+#[test]
+fn capture_with_compound_stdout_redirect() {
+    // bash: a >file on the COMPOUND inside $() diverts to the file; capture is empty.
+    let (out, _rc) = run("x=$({ echo a; echo b; } > /tmp/huck_t_capredir); echo \"[$x]\"\ncat /tmp/huck_t_capredir\n");
+    assert_eq!(out, "[]\na\nb\n");
+}
+
+#[test]
+fn capture_stdout_not_redirected_still_captures() {
+    // Only stderr redirected on the compound -> stdout is still captured.
+    // The stderr writer is an external command (`sh -c`) rather than a
+    // builtin: huck has a separate, pre-existing limitation where a builtin's
+    // `>&2` write is steered into the in-memory capture buffer instead of the
+    // real fd 2, so `echo e >&2` would wrongly appear in the capture. That bug
+    // is orthogonal to this fix (compound stdout-redirect diversion); using an
+    // external isolates the behavior under test, and matches bash's `[o]`.
+    let (out, _rc) = run("x=$({ echo o; sh -c 'echo e 1>&2'; } 2>/dev/null); echo \"[$x]\"\n");
+    assert_eq!(out, "[o]\n");
+}

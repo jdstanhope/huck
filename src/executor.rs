@@ -384,7 +384,23 @@ fn run_redirected(
 
     // Run the inner compound with the now-redirected fds. Its (possibly
     // buffered) terminal output is flushed by the scope's Drop before restore.
-    let outcome = run_command(inner, shell, sink);
+    //
+    // If a stdout redirect (`>`/`>>`/`>&`/`&>`) is present, fd 1 now points at
+    // the redirect target. In capture mode (`$(...)`) the outer `sink` would
+    // otherwise steer the inner command's stdout into the capture buf/pipe,
+    // ignoring the redirect entirely. Force `Terminal` so builtins write via
+    // `io::stdout()` (= fd 1 = the target) and externals inherit the redirected
+    // fd 1 — the capture then correctly receives nothing for the diverted
+    // stream. This is a no-op when the outer sink is already `Terminal`. A
+    // compound with only a stdin/stderr redirect keeps the outer sink so its
+    // stdout is still captured.
+    let mut terminal_sink = StdoutSink::Terminal;
+    let inner_sink: &mut StdoutSink = if stdout.is_some() {
+        &mut terminal_sink
+    } else {
+        sink
+    };
+    let outcome = run_command(inner, shell, inner_sink);
     let _ = io::stdout().flush();
     drop(scope);
     outcome
