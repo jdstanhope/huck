@@ -1822,6 +1822,28 @@ fn is_test_expr_stop<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I
     }
 }
 
+/// Peeks (consumes nothing) and reports whether the next token is a recognized
+/// `[[ ]]` binary operator. Used by `parse_test_atom` to distinguish a binary
+/// test (`lhs OP rhs`) from a bare-word test (`[[ word ]]` ≡ `[[ -n word ]]`).
+///
+/// KEEP THIS OPERATOR SET IN SYNC with the operator match arms in
+/// `parse_test_atom` below. `<` / `>` arrive as `Op(RedirIn)` / `Op(RedirOut)`;
+/// every other operator arrives as a `Word` because the lexer has no dedicated
+/// token for it.
+fn next_is_test_binary_operator<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> bool {
+    match iter.peek() {
+        Some(Token::Op(Operator::RedirIn)) | Some(Token::Op(Operator::RedirOut)) => true,
+        Some(Token::Word(w)) => matches!(
+            word_literal_text(w),
+            Some("==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
+                | "-le" | "-ge" | "-nt" | "-ot" | "-ef")
+        ),
+        _ => false,
+    }
+}
+
 /// Skips zero or more `Token::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
 fn skip_test_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) {
@@ -1989,6 +2011,14 @@ fn parse_test_atom<I: Iterator<Item = Token>>(
     // Consume the LHS word (first_word peeked above).
     iter.next();
     let lhs = first_word;
+
+    // Bash: `[[ word ]]` ≡ `[[ -n word ]]`. When no binary operator follows the
+    // operand (next token is `]]` / `)` / `&&` / `||` / end-of-input), the lhs
+    // alone is a non-empty-string test. See `next_is_test_binary_operator` —
+    // keep its operator set in sync with the match arms below.
+    if !next_is_test_binary_operator(iter) {
+        return Ok(TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, operand: lhs });
+    }
 
     // Peek at the operator token.  Operators like `==`, `!=`, `=~`, `<`, `>`,
     // `-eq`, etc. arrive as Word tokens because the lexer doesn't have them as
@@ -4293,6 +4323,54 @@ mod tests {
         let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
         let TestExpr::Not(inner) = &*expr else { panic!("expected Not, got {:?}", expr) };
         assert!(matches!(&**inner, TestExpr::Unary { .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_bareword_single() {
+        let tokens = crate::lexer::tokenize("[[ foo ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
+        let TestExpr::Unary { op, operand } = &*expr else {
+            panic!("expected Unary, got {:?}", expr)
+        };
+        assert!(matches!(op, TestUnaryOp::StringNonEmpty));
+        assert_eq!(word_literal_text(operand), Some("foo"));
+    }
+
+    #[test]
+    fn parse_dbracket_bareword_and() {
+        let tokens = crate::lexer::tokenize("[[ a && b ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
+        let TestExpr::And(l, r) = &*expr else { panic!("expected And, got {:?}", expr) };
+        assert!(matches!(&**l, TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, .. }));
+        assert!(matches!(&**r, TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_bareword_not() {
+        let tokens = crate::lexer::tokenize("[[ ! foo ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
+        let TestExpr::Not(inner) = &*expr else { panic!("expected Not, got {:?}", expr) };
+        assert!(matches!(&**inner, TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_bareword_grouped() {
+        let tokens = crate::lexer::tokenize("[[ ( foo ) ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
+        assert!(matches!(&*expr, TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, .. }));
+    }
+
+    #[test]
+    fn parse_dbracket_operator_still_wins() {
+        let tokens = crate::lexer::tokenize("[[ word == x ]]").unwrap();
+        let parsed = parse(tokens).unwrap().expect("non-empty");
+        let Command::DoubleBracket { expr, .. } = parsed.first else { panic!() };
+        let TestExpr::Binary { op, .. } = &*expr else { panic!("expected Binary, got {:?}", expr) };
+        assert!(matches!(op, TestBinaryOp::StringEq));
     }
 
     #[test]
