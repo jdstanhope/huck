@@ -98,6 +98,7 @@ spec, an implementation plan, and a test suite.
 | v88       | `complete`/`compgen` actions: full 24-name `-A` set + 12 short flags (`-u`/`-j`/`-v`/…); generates `setopt`/`shopt`/`signal`/`export`/`arrayvar`/etc. (M-36a) |
 | v89       | `set -v` verbose mode: echoes each input line to stderr as read (before execution) at both input readers; `v` in `$-`; closes the last `set -v`/`+v` bashrc errors (M-08e) |
 | v90       | extglob string matching: `?()`/`*()`/`+()`/`@()`/`!()` (alternation + nesting) in `[[`/`case`/`${}` under `shopt -s extglob`; new backtracking matcher; pathname globbing deferred (M-84, M-84a) |
+| v91       | extglob pathname globbing (M-84a): `+(a\|b)` etc. now filesystem-expand via a custom recursive directory walker (reuses the v90 matcher per component; dotfile/sort/nocaseglob/dotglob/nullglob/failglob-aware); completes extglob (string + pathname) |
 
 ## Build and run
 
