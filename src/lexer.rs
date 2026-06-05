@@ -70,6 +70,18 @@ pub enum CaseDirection {
     Lower,  // , / ,,
 }
 
+/// Scalar `${var@OP}` transform operators (bash 5.x). Array/attribute
+/// forms `@A`/`@K`/`@k`/`@a` are deferred (lexer rejects them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformOp {
+    PromptExpand, // @P — prompt-string expansion of the value
+    Quote,        // @Q — shell-quote so it re-reads as the same value
+    Upper,        // @U — uppercase all
+    Lower,        // @L — lowercase all
+    UpperFirst,   // @u — uppercase first char
+    EscapeExpand, // @E — expand backslash escapes ($'...' style)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamModifier {
     /// No scalar-style modifier — bare `${a[i]}`, `${a[@]}`, `${a[*]}`.
@@ -105,6 +117,8 @@ pub enum ParamModifier {
         all: bool,
         pattern: Option<Word>,
     },
+    /// `${var@OP}` scalar transform (`@P`/`@Q`/`@U`/`@L`/`@u`/`@E`).
+    Transform { op: TransformOp },
 }
 
 /// Subscript form attached to `${a[…]}` / `${a[@]}` / `${a[*]}`.
@@ -1276,6 +1290,26 @@ fn read_ansi_c_quoted(
     }
 }
 
+/// Expands backslash escapes in `v` exactly as `$'...'` (ANSI-C quoting)
+/// does, returning the decoded string. Used by `${var@E}`. Unknown
+/// escapes (`\q`) and trailing `\` are preserved verbatim, matching bash.
+pub(crate) fn decode_ansi_c_escapes(v: &str) -> String {
+    let mut out = String::new();
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // `decode_ansi_c_escape` only errors on `\` at EOF (no escape
+            // char). bash's `@E` leaves a trailing backslash literal.
+            if decode_ansi_c_escape(&mut chars, &mut out).is_err() {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Decodes a single backslash escape inside `$'...'` and appends the
 /// result to `out`. The leading `\` has already been consumed.
 fn decode_ansi_c_escape(
@@ -2374,6 +2408,38 @@ fn dispatch_braced_modifier(
                 indirect,
             });
             Ok(())
+        }
+        Some('@') => {
+            let op = match chars.next() {
+                Some('P') => TransformOp::PromptExpand,
+                Some('Q') => TransformOp::Quote,
+                Some('U') => TransformOp::Upper,
+                Some('L') => TransformOp::Lower,
+                Some('u') => TransformOp::UpperFirst,
+                Some('E') => TransformOp::EscapeExpand,
+                other => {
+                    // `@A`/`@K`/`@k`/`@a` (deferred) and unknown letters
+                    // are a bad substitution.
+                    return Err(LexError::InvalidBraceModifier(format!(
+                        "@{}",
+                        other.map(|c| c.to_string()).unwrap_or_default()
+                    )));
+                }
+            };
+            // After the operator letter, the next char must close the brace.
+            match chars.next() {
+                Some('}') => {
+                    parts.push(WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::Transform { op },
+                        quoted,
+                        subscript,
+                        indirect,
+                    });
+                    Ok(())
+                }
+                _ => Err(LexError::UnterminatedBrace),
+            }
         }
         Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
         None => Err(LexError::UnterminatedBrace),
@@ -5929,6 +5995,34 @@ mod array_parse_tests {
         } else {
             panic!("expected ParamExpansion");
         }
+    }
+
+    #[test]
+    fn parse_transform_ops() {
+        for (src, want) in [
+            ("${v@P}", TransformOp::PromptExpand),
+            ("${v@Q}", TransformOp::Quote),
+            ("${v@U}", TransformOp::Upper),
+            ("${v@L}", TransformOp::Lower),
+            ("${v@u}", TransformOp::UpperFirst),
+            ("${v@E}", TransformOp::EscapeExpand),
+        ] {
+            let parts = match &tokenize(src).unwrap()[0] {
+                Token::Word(Word(p)) => p.clone(),
+                _ => panic!(),
+            };
+            let WordPart::ParamExpansion {
+                modifier: ParamModifier::Transform { op },
+                ..
+            } = &parts[0]
+            else {
+                panic!("expected Transform for {src}")
+            };
+            assert_eq!(*op, want);
+        }
+        // `@Z` and other operators (incl. deferred `@A`) are bad subst.
+        assert!(tokenize("${v@Z}").is_err());
+        assert!(tokenize("${v@A}").is_err());
     }
 }
 
