@@ -211,7 +211,16 @@ pub fn expand_modifier_with_value(
                 crate::lexer::TransformOp::UpperFirst => {
                     case_modify(&v, CaseDirection::Upper, false, None, false)
                 }
-                crate::lexer::TransformOp::Quote => shell_quote(&v),
+                crate::lexer::TransformOp::Quote => match get_raw(shell) {
+                    // bash: `@Q` on a genuinely unset variable yields an
+                    // empty string (no quotes); set-but-empty yields `''`.
+                    // `get_raw` returns `None` for unset (Scalar via
+                    // `lookup_var`, or `Element(None)` for a missing
+                    // subscript), `Some` for set (incl. empty), so this
+                    // also keeps `${a[1]@Q}` quoting correctly.
+                    None => String::new(),
+                    Some(val) => shell_quote(&val),
+                },
                 crate::lexer::TransformOp::EscapeExpand => {
                     crate::lexer::decode_ansi_c_escapes(&v)
                 }

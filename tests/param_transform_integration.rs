@@ -26,6 +26,13 @@ fn transform_upper_first() { assert_eq!(run("v=hello\necho \"${v@u}\"\n").0, "He
 fn transform_quote_simple() { assert_eq!(run("v='a b'\necho \"${v@Q}\"\n").0, "'a b'\n"); }
 
 #[test]
+fn transform_quote_unset_is_empty() {
+    // bash: ${unset@Q} -> empty (no quotes); set-empty -> ''
+    assert_eq!(run("unset v\nprintf '[%s]\\n' \"${v@Q}\"\n").0, "[]\n");
+    assert_eq!(run("v=\nprintf '[%s]\\n' \"${v@Q}\"\n").0, "['']\n");
+}
+
+#[test]
 fn transform_escape_expand() {
     // v='a\tb' (literal backslash-t) -> @E expands to a<TAB>b
     assert_eq!(run("v='a\\tb'\necho \"${v@E}\"\n").0, "a\tb\n");
