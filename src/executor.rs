@@ -247,6 +247,223 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
         Command::Arith(expr) => run_arith(expr, shell),
         Command::Select(clause) => run_select(clause, shell, sink),
+        Command::Redirected { inner, stdin, stdout, stderr } => {
+            run_redirected(inner, stdin, stdout, stderr, shell, sink)
+        }
+    }
+}
+
+/// RAII guard that records fds saved (via `dup`) before they were replaced by
+/// `dup2`, and restores each on Drop. `saved` holds `(target_fd, saved_dup_fd)`
+/// pairs; restoration runs in reverse to undo overlapping swaps cleanly.
+struct CompoundRedirectScope {
+    saved: Vec<(RawFd, RawFd)>,
+}
+
+impl CompoundRedirectScope {
+    fn new() -> Self {
+        CompoundRedirectScope { saved: Vec::new() }
+    }
+
+    /// Replace `target_fd` with a dup of `new_fd`, saving the original so Drop
+    /// can restore it. `new_fd` is NOT consumed (caller closes it).
+    fn redirect(&mut self, new_fd: RawFd, target_fd: RawFd) -> Result<(), ()> {
+        unsafe {
+            let saved = libc::dup(target_fd);
+            if saved < 0 {
+                eprintln!("huck: dup: {}", io::Error::last_os_error());
+                return Err(());
+            }
+            if libc::dup2(new_fd, target_fd) < 0 {
+                eprintln!("huck: dup2: {}", io::Error::last_os_error());
+                libc::close(saved);
+                return Err(());
+            }
+            self.saved.push((target_fd, saved));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CompoundRedirectScope {
+    fn drop(&mut self) {
+        // Flush any buffered stdout written through the redirected fd before we
+        // swap the original fd back, so it lands in the redirect target.
+        let _ = io::stdout().flush();
+        // Restore in reverse application order.
+        while let Some((target_fd, saved)) = self.saved.pop() {
+            unsafe {
+                libc::dup2(saved, target_fd);
+                libc::close(saved);
+            }
+        }
+    }
+}
+
+/// Runs a compound command with trailing redirections applied at the real fd
+/// level: each present redirect is `dup2`'d onto fd 0/1/2 (originals saved and
+/// restored on scope exit), `inner` runs through the existing `sink`, and its
+/// status is returned. A redirect-open failure prints `huck: <target>: <err>`
+/// and returns `Continue(1)` WITHOUT running `inner`.
+fn run_redirected(
+    inner: &Command,
+    stdin: &Option<Redirect>,
+    stdout: &Option<Redirect>,
+    stderr: &Option<Redirect>,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    use std::os::unix::io::IntoRawFd;
+
+    // Flush buffered terminal/builtin output BEFORE swapping fds so prior
+    // output is not diverted into the redirect target.
+    let _ = io::stdout().flush();
+
+    let mut scope = CompoundRedirectScope::new();
+
+    // --- stdin (fd 0) ---
+    if let Some(r) = stdin {
+        let new_fd: RawFd = match r {
+            Redirect::Read(word) => {
+                let path = match expand_single(word, shell) {
+                    Ok(p) => p,
+                    Err(()) => return ExecOutcome::Continue(1),
+                };
+                match File::open(&path) {
+                    Ok(f) => f.into_raw_fd(),
+                    Err(e) => {
+                        eprintln!("huck: {path}: {e}");
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
+            Redirect::Heredoc { body, .. } => {
+                let bytes = expand_assignment(body, shell).into_bytes();
+                match write_pipe_for_stdin(&bytes) {
+                    Ok(fd) => fd,
+                    Err(()) => return ExecOutcome::Continue(1),
+                }
+            }
+            Redirect::HereString(body) => {
+                let mut bytes = expand_assignment(body, shell).into_bytes();
+                bytes.push(b'\n');
+                match write_pipe_for_stdin(&bytes) {
+                    Ok(fd) => fd,
+                    Err(()) => return ExecOutcome::Continue(1),
+                }
+            }
+            // `<&N` on a compound is out of scope; only `<file`/heredoc/
+            // here-string reach the stdin slot from the parser.
+            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Dup { .. } => {
+                eprintln!("huck: unsupported stdin redirect on compound");
+                return ExecOutcome::Continue(1);
+            }
+        };
+        if scope.redirect(new_fd, libc::STDIN_FILENO).is_err() {
+            unsafe { libc::close(new_fd) };
+            return ExecOutcome::Continue(1);
+        }
+        unsafe { libc::close(new_fd) };
+    }
+
+    // --- stdout (fd 1) ---
+    if let Some(r) = stdout {
+        match apply_out_redirect(r, libc::STDOUT_FILENO, &mut scope, shell) {
+            Ok(()) => {}
+            Err(outcome) => return outcome,
+        }
+    }
+
+    // --- stderr (fd 2) ---
+    if let Some(r) = stderr {
+        match apply_out_redirect(r, libc::STDERR_FILENO, &mut scope, shell) {
+            Ok(()) => {}
+            Err(outcome) => return outcome,
+        }
+    }
+
+    // Run the inner compound with the now-redirected fds. Its (possibly
+    // buffered) terminal output is flushed by the scope's Drop before restore.
+    //
+    // If a stdout redirect (`>`/`>>`/`>&`/`&>`) is present, fd 1 now points at
+    // the redirect target. In capture mode (`$(...)`) the outer `sink` would
+    // otherwise steer the inner command's stdout into the capture buf/pipe,
+    // ignoring the redirect entirely. Force `Terminal` so builtins write via
+    // `io::stdout()` (= fd 1 = the target) and externals inherit the redirected
+    // fd 1 — the capture then correctly receives nothing for the diverted
+    // stream. This is a no-op when the outer sink is already `Terminal`. A
+    // compound with only a stdin/stderr redirect keeps the outer sink so its
+    // stdout is still captured.
+    let mut terminal_sink = StdoutSink::Terminal;
+    let inner_sink: &mut StdoutSink = if stdout.is_some() {
+        &mut terminal_sink
+    } else {
+        sink
+    };
+    let outcome = run_command(inner, shell, inner_sink);
+    let _ = io::stdout().flush();
+    drop(scope);
+    outcome
+}
+
+/// Apply a stdout/stderr-class redirect (`>`/`>>`/`>&N`/`2>&N`) onto
+/// `target_fd`, recording the swap in `scope`. On open/resolve failure prints
+/// the bash-style error and returns `Err(Continue(1))`.
+fn apply_out_redirect(
+    r: &Redirect,
+    target_fd: RawFd,
+    scope: &mut CompoundRedirectScope,
+    shell: &mut Shell,
+) -> Result<(), ExecOutcome> {
+    use std::os::unix::io::IntoRawFd;
+    match r {
+        Redirect::Truncate(word) | Redirect::Append(word) => {
+            let path = match expand_single(word, shell) {
+                Ok(p) => p,
+                Err(()) => return Err(ExecOutcome::Continue(1)),
+            };
+            let resolved = if matches!(r, Redirect::Append(_)) {
+                ResolvedRedirect::Append(path)
+            } else {
+                ResolvedRedirect::Truncate(path)
+            };
+            let file = match open_resolved(&resolved) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("huck: {}: {e}", resolved_path(&resolved));
+                    return Err(ExecOutcome::Continue(1));
+                }
+            };
+            let new_fd = file.into_raw_fd();
+            if scope.redirect(new_fd, target_fd).is_err() {
+                unsafe { libc::close(new_fd) };
+                return Err(ExecOutcome::Continue(1));
+            }
+            unsafe { libc::close(new_fd) };
+            Ok(())
+        }
+        Redirect::Dup { source, .. } => {
+            // `>&N` / `2>&N`: duplicate the source fd onto target_fd. Resolve
+            // the source AFTER any earlier fd swaps so e.g. `>file 2>&1` makes
+            // stderr follow the already-redirected stdout (last-wins ordering
+            // matches the parser slot fill).
+            let src = match resolve_fd_target(source, shell) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!("huck: {e}");
+                    return Err(ExecOutcome::Continue(1));
+                }
+            };
+            if scope.redirect(src, target_fd).is_err() {
+                return Err(ExecOutcome::Continue(1));
+            }
+            Ok(())
+        }
+        Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_) => {
+            // The parser never routes these to the stdout/stderr slots.
+            eprintln!("huck: unsupported output redirect on compound");
+            Err(ExecOutcome::Continue(1))
+        }
     }
 }
 
