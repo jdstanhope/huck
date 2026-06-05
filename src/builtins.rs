@@ -4961,7 +4961,13 @@ pub(crate) fn run_sourced_contents(
     use crate::continuation::{classify, Completeness};
     let mut last_status = shell.last_status();
     let mut buf = String::new();
+    let mut physical_line: usize = 0;
+    let mut cmd_start_line: usize = 0;
     for line in contents.lines() {
+        physical_line += 1;
+        if buf.is_empty() {
+            cmd_start_line = physical_line;
+        }
         // `set -v` verbose: echo each physical input line to stderr as read.
         if shell.shell_options.verbose {
             eprintln!("{line}");
@@ -4983,8 +4989,9 @@ pub(crate) fn run_sourced_contents(
             Ok(t) => t,
             Err(e) => {
                 eprintln!(
-                    "huck: {}: syntax error{}",
+                    "huck: {}: line {}: syntax error{}",
                     path.display(),
+                    cmd_start_line,
                     crate::shell::lex_error_message(e)
                 );
                 last_status = 2;
@@ -5023,8 +5030,9 @@ pub(crate) fn run_sourced_contents(
             Ok(None) => buf.clear(),
             Err(e) => {
                 eprintln!(
-                    "huck: {}: syntax error: {}",
+                    "huck: {}: line {}: syntax error: {}",
                     path.display(),
+                    cmd_start_line,
                     crate::shell::parse_error_message(e)
                 );
                 last_status = 2;
