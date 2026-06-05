@@ -107,6 +107,22 @@ pub(crate) fn eval_subscript_key(
     crate::param_expansion::expand_word_to_string(subscript, shell)
 }
 
+/// Bash-faithful arithmetic evaluation of an arith body `Word`: expand all
+/// `$`-forms + quotes first (as `eval_subscript` does for subscripts), then
+/// parse and evaluate. Empty/all-whitespace expansion is `0` (bash: `$(())`==0).
+pub(crate) fn eval_arith_word(
+    body: &Word,
+    shell: &mut Shell,
+) -> Result<i64, crate::arith::ArithError> {
+    let s = crate::param_expansion::expand_word_to_string(body, shell);
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(0);
+    }
+    let expr = crate::arith::parse(t)?;
+    crate::arith::eval(&expr, shell)
+}
+
 /// Arith-evaluates an array subscript `Word` to a `usize`, honouring
 /// bash's bash-4.3+ rule that a negative result counts from the end:
 /// `${a[-1]}` is the highest-subscript element. Returns `Err(msg)` if
@@ -662,8 +678,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 let ifs = shell.ifs();
                 emit_split_fields(&output, &ifs, &mut current, &mut result, &mut has_emitted);
             }
-            WordPart::Arith { expr, quoted: _ } => {
-                match crate::arith::eval(expr, shell) {
+            WordPart::Arith { body, quoted: _ } => {
+                match eval_arith_word(body, shell) {
                     Ok(n) => {
                         current.push_str(&n.to_string(), true);
                         has_emitted = true;
@@ -792,8 +808,8 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
             WordPart::CommandSub { sequence, .. } => {
                 result.push_str(&run_substitution(sequence, shell));
             }
-            WordPart::Arith { expr, quoted: _ } => {
-                match crate::arith::eval(expr, shell) {
+            WordPart::Arith { body, quoted: _ } => {
+                match eval_arith_word(body, shell) {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
                         eprintln!("huck: arithmetic: {}", e);
@@ -1877,17 +1893,19 @@ mod tests {
         assert_eq!(argv, vec!["hello".to_string()]);
     }
 
+    /// Helper: a `WordPart::Arith` whose body is a single literal (the
+    /// post-v93 deferred-parse shape; arithmetic is parsed at eval time).
+    fn arith_part(text: &str) -> WordPart {
+        WordPart::Arith {
+            body: Word(vec![WordPart::Literal { text: text.to_string(), quoted: true }]),
+            quoted: false,
+        }
+    }
+
     #[test]
     fn expand_arith_part_renders_decimal_result() {
-        use crate::arith::ArithExpr;
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Arith {
-            expr: ArithExpr::Add(
-                Box::new(ArithExpr::Num(2)),
-                Box::new(ArithExpr::Num(3)),
-            ),
-            quoted: false,
-        }]);
+        let word = Word(vec![arith_part("2 + 3")]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "5");
@@ -1896,15 +1914,8 @@ mod tests {
 
     #[test]
     fn expand_arith_part_division_by_zero_yields_empty_field_and_sets_status() {
-        use crate::arith::ArithExpr;
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Arith {
-            expr: ArithExpr::Div(
-                Box::new(ArithExpr::Num(1)),
-                Box::new(ArithExpr::Num(0)),
-            ),
-            quoted: false,
-        }]);
+        let word = Word(vec![arith_part("1 / 0")]);
         let fields = expand(&word, &mut shell);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].chars, "");
@@ -1913,15 +1924,8 @@ mod tests {
 
     #[test]
     fn expand_assignment_arith_part_renders_decimal() {
-        use crate::arith::ArithExpr;
         let mut shell = Shell::new();
-        let word = Word(vec![WordPart::Arith {
-            expr: ArithExpr::Mul(
-                Box::new(ArithExpr::Num(6)),
-                Box::new(ArithExpr::Num(7)),
-            ),
-            quoted: false,
-        }]);
+        let word = Word(vec![arith_part("6 * 7")]);
         let value = expand_assignment(&word, &mut shell);
         assert_eq!(value, "42");
     }

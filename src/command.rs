@@ -440,7 +440,7 @@ pub enum Command {
         inline_assignments: Vec<Assignment>,
     },
     /// NEW (v78): standalone `((expr))` command. Exit 0 if non-zero, 1 if zero.
-    Arith(crate::arith::ArithExpr),
+    Arith(crate::lexer::Word),
     /// NEW (v78): C-style `for ((init; cond; step)) do BODY done`.
     ArithFor(Box<ArithForClause>),
     /// NEW (v81): `select NAME [in WORDS]; do BODY; done`.
@@ -490,9 +490,9 @@ pub struct SelectClause {
 /// Each header section is optional; an empty cond is treated as always-true.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ArithForClause {
-    pub init: Option<crate::arith::ArithExpr>,
-    pub cond: Option<crate::arith::ArithExpr>,
-    pub step: Option<crate::arith::ArithExpr>,
+    pub init: Option<crate::lexer::Word>,
+    pub cond: Option<crate::lexer::Word>,
+    pub step: Option<crate::lexer::Word>,
     pub body: Sequence,
 }
 
@@ -730,9 +730,9 @@ fn parse_command_inner<I: Iterator<Item = Token>>(
         let Some(Token::ArithBlock(text)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
-        let expr = crate::arith::parse(&text)
-            .map_err(|e| ParseError::ArithBlock(e.to_string()))?;
-        return Ok(Command::Arith(expr));
+        let body = crate::lexer::arith_string_to_word(&text)
+            .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))?;
+        return Ok(Command::Arith(body));
     }
 
     match iter.peek().and_then(keyword_of) {
@@ -1059,9 +1059,9 @@ fn split_top_level_semi(text: &str) -> Vec<String> {
 /// Triple of optional arith expressions — the three sections of an
 /// arith-for header `((init; cond; step))`. Each may be `None`.
 type ArithForHeaderTriple = (
-    Option<crate::arith::ArithExpr>,
-    Option<crate::arith::ArithExpr>,
-    Option<crate::arith::ArithExpr>,
+    Option<crate::lexer::Word>,
+    Option<crate::lexer::Word>,
+    Option<crate::lexer::Word>,
 );
 
 /// Splits an arith-for header into three optional arith expressions.
@@ -1075,14 +1075,14 @@ fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError
             sections.len()
         )));
     }
-    let parse_section = |s: &str| -> Result<Option<crate::arith::ArithExpr>, ParseError> {
+    let parse_section = |s: &str| -> Result<Option<crate::lexer::Word>, ParseError> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
             Ok(None)
         } else {
-            crate::arith::parse(trimmed)
+            crate::lexer::arith_string_to_word(trimmed)
                 .map(Some)
-                .map_err(|e| ParseError::ArithBlock(e.to_string()))
+                .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))
         }
     };
     Ok((
@@ -1714,9 +1714,9 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
         let Some(Token::ArithBlock(text)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
-        let expr = crate::arith::parse(&text)
-            .map_err(|e| ParseError::ArithBlock(e.to_string()))?;
-        return Ok((Command::Arith(expr), false));
+        let body = crate::lexer::arith_string_to_word(&text)
+            .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))?;
+        return Ok((Command::Arith(body), false));
     }
 
     match iter.peek().and_then(keyword_of) {
@@ -4771,11 +4771,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_arith_for_bad_arith_in_section_errors() {
-        // `for ((i=+;;))` — `i=+` is not a valid arith expression.
+    fn parse_arith_for_bad_arith_in_section_parses_deferred() {
+        // Post-v93: arith bodies are parsed at EVAL time, so `for ((i=+;;))`
+        // parses successfully into an ArithFor (the `i=+` arith error surfaces
+        // when the loop runs, not at parse time).
         let tokens = crate::lexer::tokenize("for ((i=+;;)) do :; done").unwrap();
-        let err = parse(tokens).expect_err("should error");
-        assert!(matches!(err, ParseError::ArithBlock(_)), "got {err:?}");
+        let seq = parse(tokens).expect("should parse").expect("non-empty");
+        assert!(matches!(seq.first, Command::ArithFor(_)), "got {:?}", seq.first);
     }
 
     #[test]
@@ -4786,10 +4788,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_standalone_arith_with_bad_expr_errors() {
+    fn parse_standalone_arith_with_bad_expr_parses_deferred() {
+        // Post-v93: arith bodies are parsed at EVAL time, so `((1++))` parses
+        // into a Command::Arith (the syntax error surfaces when it runs).
         let tokens = crate::lexer::tokenize("((1++))").unwrap();
-        let err = parse(tokens).expect_err("should error");
-        assert!(matches!(err, ParseError::ArithBlock(_)), "got {err:?}");
+        let seq = parse(tokens).expect("should parse").expect("non-empty");
+        assert!(matches!(seq.first, Command::Arith(_)), "got {:?}", seq.first);
     }
 
     /// Lex and parse a source string to a `Sequence`.

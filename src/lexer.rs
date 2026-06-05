@@ -5,7 +5,6 @@ pub enum LexError {
     UnterminatedBrace,
     UnterminatedSubstitution,
     UnterminatedArith,
-    ArithParse(String),
     InvalidBraceModifier(String),
     EmptyParamName,
     Substitution(Box<LexError>),
@@ -135,7 +134,7 @@ pub enum WordPart {
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
-    Arith { expr: crate::arith::ArithExpr, quoted: bool },
+    Arith { body: Word, quoted: bool },
     ParamExpansion {
         name: String,
         modifier: ParamModifier,
@@ -1102,6 +1101,88 @@ fn flush_body_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: b
 /// Reads what follows a `$`. Pushes the resulting WordPart onto `parts` or
 /// (for an unrecognized form) pushes a literal `$` and lets the caller
 /// continue tokenizing.
+/// Converts a raw arithmetic body string into an expandable `Word`, treating
+/// it as if within double quotes (bash's rule for arithmetic expressions).
+/// `$`-forms become ParamExpansion/Var/CommandSub/Arith parts; backticks
+/// become CommandSub; everything else is literal text. Used by `$(( ))`
+/// (lexer) and, via `command.rs`, by `(( ))` and arith-`for` headers.
+pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
+    let mut chars = s.chars().peekable();
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut lit = String::new();
+    macro_rules! flush_lit {
+        () => {
+            if !lit.is_empty() {
+                parts.push(WordPart::Literal { text: std::mem::take(&mut lit), quoted: true });
+            }
+        };
+    }
+    while let Some(&c) = chars.peek() {
+        match c {
+            '$' => {
+                flush_lit!();
+                chars.next();
+                read_dollar_expansion(&mut chars, &mut parts, true)?;
+            }
+            '`' => {
+                flush_lit!();
+                chars.next();
+                let sequence = scan_backtick_substitution(&mut chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: true });
+            }
+            // bash performs quote removal within arithmetic: the quote
+            // characters disappear and adjacent text concatenates
+            // (`1"2"3` == 123, `x == "5"` == `x == 5`). Single quotes are
+            // literal; double quotes still expand `$`-forms inside.
+            '\'' => {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch == '\'' { break; }
+                    lit.push(ch);
+                }
+            }
+            '"' => {
+                chars.next();
+                while let Some(&ch) = chars.peek() {
+                    match ch {
+                        '"' => { chars.next(); break; }
+                        '\\' => {
+                            chars.next();
+                            if let Some(&n) = chars.peek() {
+                                // Inside double quotes, `\` only escapes a few
+                                // metacharacters; otherwise it stays literal.
+                                if matches!(n, '"' | '\\' | '$' | '`') {
+                                    chars.next();
+                                    lit.push(n);
+                                } else {
+                                    lit.push('\\');
+                                }
+                            } else {
+                                lit.push('\\');
+                            }
+                        }
+                        '$' => {
+                            flush_lit!();
+                            chars.next();
+                            read_dollar_expansion(&mut chars, &mut parts, true)?;
+                        }
+                        '`' => {
+                            flush_lit!();
+                            chars.next();
+                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            parts.push(WordPart::CommandSub { sequence, quoted: true });
+                        }
+                        _ => { lit.push(ch); chars.next(); }
+                    }
+                }
+            }
+            _ => { lit.push(c); chars.next(); }
+        }
+    }
+    flush_lit!();
+    Ok(Word(parts))
+}
+
 fn read_dollar_expansion(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     parts: &mut Vec<WordPart>,
@@ -1113,9 +1194,8 @@ fn read_dollar_expansion(
             if chars.peek() == Some(&'(') {
                 chars.next(); // consume second '(' — this is `$((`
                 let inner = scan_arith_body(chars)?;
-                let expr = crate::arith::parse(&inner)
-                    .map_err(|e| LexError::ArithParse(e.to_string()))?;
-                parts.push(WordPart::Arith { expr, quoted });
+                let body = arith_string_to_word(&inner)?;
+                parts.push(WordPart::Arith { body, quoted });
             } else {
                 let sequence = scan_paren_substitution(chars)?;
                 parts.push(WordPart::CommandSub { sequence, quoted });
@@ -3816,36 +3896,38 @@ mod tests {
         assert_eq!(parts[2], WordPart::Literal { text: "baz".to_string(), quoted: false });
     }
 
+    /// Helper: the literal text of a single-literal arith body `Word`.
+    fn arith_body_lit(part: &WordPart) -> &str {
+        let WordPart::Arith { body: Word(bparts), .. } = part else {
+            panic!("expected Arith part, got {part:?}")
+        };
+        assert_eq!(bparts.len(), 1, "expected single-literal body, got {bparts:?}");
+        let WordPart::Literal { text, .. } = &bparts[0] else {
+            panic!("expected Literal body part, got {:?}", bparts[0])
+        };
+        text
+    }
+
     #[test]
     fn tokenize_arith_simple() {
-        use crate::arith::ArithExpr;
+        // Post-v93: the arith body is deferred as an expandable Word; here it is
+        // a single literal `1+2` (parsed at eval time, not lex time).
         let tokens = tokenize("$((1+2))").unwrap();
         assert_eq!(tokens.len(), 1);
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts.len(), 1);
-        let WordPart::Arith { expr, quoted } = &parts[0] else {
+        let WordPart::Arith { quoted, .. } = &parts[0] else {
             panic!("expected Arith part, got {:?}", parts[0])
         };
         assert!(!(*quoted));
-        assert_eq!(*expr, ArithExpr::Add(
-            Box::new(ArithExpr::Num(1)),
-            Box::new(ArithExpr::Num(2)),
-        ));
+        assert_eq!(arith_body_lit(&parts[0]), "1+2");
     }
 
     #[test]
     fn tokenize_arith_with_nested_parens() {
-        use crate::arith::ArithExpr;
         let tokens = tokenize("$(( (1+2) * 3 ))").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        let WordPart::Arith { expr, .. } = &parts[0] else { panic!() };
-        assert_eq!(*expr, ArithExpr::Mul(
-            Box::new(ArithExpr::Add(
-                Box::new(ArithExpr::Num(1)),
-                Box::new(ArithExpr::Num(2)),
-            )),
-            Box::new(ArithExpr::Num(3)),
-        ));
+        assert_eq!(arith_body_lit(&parts[0]), " (1+2) * 3 ");
     }
 
     #[test]
@@ -3863,9 +3945,13 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_arith_parse_error_returns_arith_parse_err() {
-        let err = tokenize("$((1+))").unwrap_err();
-        assert!(matches!(err, LexError::ArithParse(_)), "got {:?}", err);
+    fn tokenize_arith_parse_error_is_deferred_to_eval() {
+        // Post-v93: arithmetic is parsed at eval time, so a body that would
+        // fail to parse (`1+`) still lexes successfully into an Arith part.
+        let tokens = tokenize("$((1+))").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(matches!(parts[0], WordPart::Arith { .. }));
+        assert_eq!(arith_body_lit(&parts[0]), "1+");
     }
 
     #[test]
@@ -3879,24 +3965,23 @@ mod tests {
 
     #[test]
     fn tokenize_arith_var_with_dollar_prefix_inside() {
-        use crate::arith::ArithExpr;
+        // Post-v93: `$x` inside `$(())` is now an expandable Var body part
+        // (expanded before arith parse), not a pre-parsed ArithExpr::Var.
         let tokens = tokenize("$(($x))").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        let WordPart::Arith { expr, .. } = &parts[0] else { panic!() };
-        assert_eq!(*expr, ArithExpr::Var("x".to_string()));
+        let WordPart::Arith { body: Word(bparts), .. } = &parts[0] else { panic!() };
+        assert_eq!(bparts.len(), 1);
+        assert_eq!(bparts[0], WordPart::Var { name: "x".to_string(), quoted: true });
     }
 
     #[test]
     fn tokenize_arith_back_to_back_in_same_word() {
-        use crate::arith::ArithExpr;
         let tokens = tokenize("$((1+2))$((3+4))").unwrap();
         assert_eq!(tokens.len(), 1);
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts.len(), 2);
-        let WordPart::Arith { expr: e1, .. } = &parts[0] else { panic!() };
-        let WordPart::Arith { expr: e2, .. } = &parts[1] else { panic!() };
-        assert_eq!(*e1, ArithExpr::Add(Box::new(ArithExpr::Num(1)), Box::new(ArithExpr::Num(2))));
-        assert_eq!(*e2, ArithExpr::Add(Box::new(ArithExpr::Num(3)), Box::new(ArithExpr::Num(4))));
+        assert_eq!(arith_body_lit(&parts[0]), "1+2");
+        assert_eq!(arith_body_lit(&parts[1]), "3+4");
     }
 
     #[test]

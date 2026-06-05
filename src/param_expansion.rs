@@ -62,7 +62,10 @@ pub fn expand_modifier_with_value(
     // the caller-supplied value verbatim (Some=set, None=unset).
     let get_raw = |sh: &Shell| -> Option<String> {
         match source {
-            ParamLookup::Scalar => sh.get(name).map(|s| s.to_string()),
+            // `lookup_var` (not `get`) so positional (`$1`) and special
+            // params resolve here too — `get` consults only named vars,
+            // which silently dropped e.g. `${1#-a}` to empty (v93 fix).
+            ParamLookup::Scalar => sh.lookup_var(name),
             ParamLookup::Element(Some(s)) => Some(s.to_string()),
             ParamLookup::Element(None) => None,
         }

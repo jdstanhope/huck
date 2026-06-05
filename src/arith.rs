@@ -141,6 +141,10 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                 };
                 out.push(ArithToken::Number(n));
             }
+            // Unreachable post-v93 for the three arith *contexts* (`(( ))`,
+            // `$(( ))`, arith-`for`): those expand `$`-forms before calling
+            // `arith::parse`. Kept defensive for any other `arith::parse`
+            // caller (e.g. integer-coerce on a value still bearing a `$`).
             '$' => {
                 chars.next();
                 let mut s = String::new();
