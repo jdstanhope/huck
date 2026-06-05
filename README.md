@@ -97,6 +97,7 @@ spec, an implementation plan, and a test suite.
 | v87       | multi-line `[[ … ]]` + `-v`/`-nt`/`-ot`/`-ef` in `[[ ]]` and `test`/`[` (M-14a) |
 | v88       | `complete`/`compgen` actions: full 24-name `-A` set + 12 short flags (`-u`/`-j`/`-v`/…); generates `setopt`/`shopt`/`signal`/`export`/`arrayvar`/etc. (M-36a) |
 | v89       | `set -v` verbose mode: echoes each input line to stderr as read (before execution) at both input readers; `v` in `$-`; closes the last `set -v`/`+v` bashrc errors (M-08e) |
+| v90       | extglob string matching: `?()`/`*()`/`+()`/`@()`/`!()` (alternation + nesting) in `[[`/`case`/`${}` under `shopt -s extglob`; new backtracking matcher; pathname globbing deferred (M-84, M-84a) |
 
 ## Build and run
 

@@ -461,7 +461,7 @@ fn read_logical_command(
                     }
                 }
 
-                match classify(&buffer) {
+                match classify(&buffer, cell.borrow().shopt_options.get("extglob").unwrap_or(false)) {
                     Completeness::Complete | Completeness::Error => {
                         return ReadResult::Ready { buffer, history };
                     }
@@ -553,7 +553,10 @@ pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
 
 /// Tokenizes, parses, and executes a single input line.
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
-    let tokens = match lexer::tokenize(line) {
+    let tokens = match lexer::tokenize_with_opts(
+        line,
+        lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) },
+    ) {
         Ok(tokens) => tokens,
         Err(e) => {
             eprintln!("huck: syntax error{}", lex_error_message(e));
@@ -665,6 +668,9 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
         }
         LexError::UnterminatedArithBlock => {
             ": unterminated '((' arithmetic block".to_string()
+        }
+        LexError::UnterminatedExtglob => {
+            ": unterminated extglob group".to_string()
         }
     }
 }

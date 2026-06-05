@@ -34,15 +34,18 @@ fn is_unterminated_lex(e: &LexError) -> bool {
             | LexError::UnterminatedSubstitution
             | LexError::UnterminatedArith
             | LexError::UnterminatedArithBlock
+            | LexError::UnterminatedExtglob
     )
 }
 
-/// Classifies `buffer`. See module docs.
-pub fn classify(buffer: &str) -> Completeness {
+/// Classifies `buffer`. See module docs. `extglob` is the shell's
+/// `shopt -s extglob` state, threaded into the lexer so a line-broken
+/// extglob group (`+(a|`) requests continuation.
+pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     if ends_with_continuation_backslash(buffer) {
         return Completeness::Incomplete(ContinuationReason::Backslash);
     }
-    let tokens = match lexer::tokenize(buffer) {
+    let tokens = match lexer::tokenize_with_opts(buffer, lexer::LexerOptions { extglob }) {
         Ok(tokens) => tokens,
         Err(LexError::UnterminatedHeredoc) => {
             return Completeness::Incomplete(ContinuationReason::Heredoc);
@@ -124,23 +127,23 @@ mod tests {
 
     #[test]
     fn complete_simple_command() {
-        assert_eq!(classify("echo hi"), Completeness::Complete);
+        assert_eq!(classify("echo hi", false), Completeness::Complete);
     }
 
     #[test]
     fn complete_multiline_if() {
-        assert_eq!(classify("if true\nthen echo hi\nfi"), Completeness::Complete);
+        assert_eq!(classify("if true\nthen echo hi\nfi", false), Completeness::Complete);
     }
 
     #[test]
     fn empty_buffer_is_complete() {
-        assert_eq!(classify(""), Completeness::Complete);
+        assert_eq!(classify("", false), Completeness::Complete);
     }
 
     #[test]
     fn open_double_quote_is_incomplete() {
         assert_eq!(
-            classify("echo \"hello"),
+            classify("echo \"hello", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -148,7 +151,7 @@ mod tests {
     #[test]
     fn open_command_substitution_is_incomplete() {
         assert_eq!(
-            classify("echo $(date"),
+            classify("echo $(date", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -156,7 +159,7 @@ mod tests {
     #[test]
     fn open_brace_expansion_is_incomplete() {
         assert_eq!(
-            classify("echo ${FOO"),
+            classify("echo ${FOO", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -164,7 +167,7 @@ mod tests {
     #[test]
     fn open_arithmetic_expansion_is_incomplete() {
         assert_eq!(
-            classify("echo $((1 + 2"),
+            classify("echo $((1 + 2", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -174,7 +177,7 @@ mod tests {
         // `((1+2` — no closing `))`. Should classify as Incomplete,
         // not Error, so the REPL prompts for continuation.
         assert_eq!(
-            classify("((1+2"),
+            classify("((1+2", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -183,7 +186,7 @@ mod tests {
     fn unterminated_arith_for_header_requests_more_input() {
         // `for ((;;` — the arith block isn't closed yet.
         assert_eq!(
-            classify("for ((;;"),
+            classify("for ((;;", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
@@ -191,7 +194,7 @@ mod tests {
     #[test]
     fn trailing_pipe_is_incomplete() {
         assert_eq!(
-            classify("echo hi |"),
+            classify("echo hi |", false),
             Completeness::Incomplete(ContinuationReason::Operator)
         );
     }
@@ -199,7 +202,7 @@ mod tests {
     #[test]
     fn trailing_andand_is_incomplete() {
         assert_eq!(
-            classify("echo hi &&"),
+            classify("echo hi &&", false),
             Completeness::Incomplete(ContinuationReason::Operator)
         );
     }
@@ -207,7 +210,7 @@ mod tests {
     #[test]
     fn trailing_oror_is_incomplete() {
         assert_eq!(
-            classify("echo hi ||"),
+            classify("echo hi ||", false),
             Completeness::Incomplete(ContinuationReason::Operator)
         );
     }
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn unterminated_if_is_incomplete() {
         assert_eq!(
-            classify("if true"),
+            classify("if true", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -223,7 +226,7 @@ mod tests {
     #[test]
     fn unterminated_while_is_incomplete() {
         assert_eq!(
-            classify("while true\ndo echo hi"),
+            classify("while true\ndo echo hi", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -231,7 +234,7 @@ mod tests {
     #[test]
     fn unterminated_for_is_incomplete() {
         assert_eq!(
-            classify("for x in a b c"),
+            classify("for x in a b c", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -239,7 +242,7 @@ mod tests {
     #[test]
     fn unterminated_until_is_incomplete() {
         assert_eq!(
-            classify("until false\ndo echo hi"),
+            classify("until false\ndo echo hi", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -247,7 +250,7 @@ mod tests {
     #[test]
     fn if_awaiting_body_is_incomplete() {
         assert_eq!(
-            classify("if true\nthen"),
+            classify("if true\nthen", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -255,7 +258,7 @@ mod tests {
     #[test]
     fn trailing_backslash_is_incomplete() {
         assert_eq!(
-            classify("echo hi \\"),
+            classify("echo hi \\", false),
             Completeness::Incomplete(ContinuationReason::Backslash)
         );
     }
@@ -263,18 +266,18 @@ mod tests {
     #[test]
     fn even_trailing_backslashes_are_not_a_continuation() {
         // `\\` is an escaped backslash — the line is complete.
-        assert_eq!(classify("echo hi\\\\"), Completeness::Complete);
+        assert_eq!(classify("echo hi\\\\", false), Completeness::Complete);
     }
 
     #[test]
     fn genuine_syntax_error_is_error() {
         // A doubled `|` is a parser error, not an incompletion.
-        assert_eq!(classify("echo hi | | grep x"), Completeness::Error);
+        assert_eq!(classify("echo hi | | grep x", false), Completeness::Error);
     }
 
     #[test]
     fn stray_word_after_fi_is_error() {
-        assert_eq!(classify("if true; then echo; fi extra"), Completeness::Error);
+        assert_eq!(classify("if true; then echo; fi extra", false), Completeness::Error);
     }
 
     #[test]
@@ -312,7 +315,7 @@ mod tests {
     #[test]
     fn unterminated_case_is_incomplete() {
         assert_eq!(
-            classify("case x in a) echo hi"),
+            classify("case x in a) echo hi", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -325,14 +328,14 @@ mod tests {
     #[test]
     fn unterminated_brace_is_incomplete() {
         assert_eq!(
-            classify("{ echo hi"),
+            classify("{ echo hi", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
 
     #[test]
     fn complete_brace_group_is_complete() {
-        assert_eq!(classify("{ echo hi; }"), Completeness::Complete);
+        assert_eq!(classify("{ echo hi; }", false), Completeness::Complete);
     }
 
     #[test]
@@ -343,7 +346,7 @@ mod tests {
     #[test]
     fn unterminated_function_def_is_incomplete() {
         assert_eq!(
-            classify("foo()"),
+            classify("foo()", false),
             Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
@@ -351,7 +354,7 @@ mod tests {
     #[test]
     fn classify_heredoc_unclosed_is_incomplete() {
         assert_eq!(
-            classify("cat <<EOF\nhello"),
+            classify("cat <<EOF\nhello", false),
             Completeness::Incomplete(ContinuationReason::Heredoc)
         );
     }
@@ -359,7 +362,7 @@ mod tests {
     #[test]
     fn classify_heredoc_closed_is_complete() {
         assert_eq!(
-            classify("cat <<EOF\nhello\nEOF\n"),
+            classify("cat <<EOF\nhello\nEOF\n", false),
             Completeness::Complete
         );
     }
@@ -372,14 +375,14 @@ mod tests {
     #[test]
     fn classify_subshell_unclosed_is_incomplete() {
         assert_eq!(
-            classify("(echo hi"),
+            classify("(echo hi", false),
             Completeness::Incomplete(ContinuationReason::Subshell)
         );
     }
 
     #[test]
     fn classify_subshell_closed_is_complete() {
-        assert_eq!(classify("(echo hi)"), Completeness::Complete);
+        assert_eq!(classify("(echo hi)", false), Completeness::Complete);
     }
 
     #[test]
@@ -390,7 +393,7 @@ mod tests {
     #[test]
     fn classify_unclosed_double_bracket_is_incomplete() {
         assert_eq!(
-            classify("[[ -f /etc/passwd"),
+            classify("[[ -f /etc/passwd", false),
             Completeness::Incomplete(ContinuationReason::DoubleBracket)
         );
     }
@@ -398,26 +401,26 @@ mod tests {
     #[test]
     fn classify_double_bracket_trailing_and_is_incomplete() {
         assert_eq!(
-            classify("[[ -f /a &&"),
+            classify("[[ -f /a &&", false),
             Completeness::Incomplete(ContinuationReason::DoubleBracket)
         );
     }
 
     #[test]
     fn classify_closed_double_bracket_is_complete() {
-        assert_eq!(classify("[[ a == b ]]"), Completeness::Complete);
+        assert_eq!(classify("[[ a == b ]]", false), Completeness::Complete);
     }
 
     #[test]
     fn classify_double_bracket_missing_operand_is_error() {
         // `]]` present, operand absent → genuine error; must NOT request continuation.
-        assert_eq!(classify("[[ a == ]]"), Completeness::Error);
+        assert_eq!(classify("[[ a == ]]", false), Completeness::Error);
     }
 
     #[test]
     fn classify_bare_double_bracket_token_is_complete() {
         // `echo [[` — `[[` is an ordinary argument, not a conditional opener.
-        assert_eq!(classify("echo [["), Completeness::Complete);
+        assert_eq!(classify("echo [[", false), Completeness::Complete);
     }
 
     #[test]
