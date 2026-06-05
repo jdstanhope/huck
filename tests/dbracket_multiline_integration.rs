@@ -137,3 +137,37 @@ fn test_builtin_file_ops() {
         "ef\n"
     );
 }
+
+#[test]
+fn bareword_nonempty_true() {
+    assert_eq!(run("[[ foo ]] && echo Y || echo N\n").0, "Y\n");
+}
+
+#[test]
+fn bareword_empty_false() {
+    assert_eq!(run("[[ \"\" ]] && echo Y || echo N\n").0, "N\n");
+}
+
+#[test]
+fn bareword_var_set_vs_empty() {
+    assert_eq!(run("x=hi\n[[ $x ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(run("x=\"\"\n[[ $x ]] && echo Y || echo N\n").0, "N\n");
+    assert_eq!(run("unset x\n[[ $x ]] && echo Y || echo N\n").0, "N\n");
+}
+
+#[test]
+fn bareword_in_connectives() {
+    assert_eq!(run("[[ -n foo && foo ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(run("[[ \"\" || foo ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(run("[[ foo && \"\" ]] && echo Y || echo N\n").0, "N\n");
+}
+
+#[test]
+fn bareword_negated_empty_true() {
+    assert_eq!(run("[[ ! \"\" ]] && echo Y || echo N\n").0, "Y\n");
+}
+
+#[test]
+fn bareword_grouped() {
+    assert_eq!(run("[[ ( foo ) ]] && echo Y || echo N\n").0, "Y\n");
+}
