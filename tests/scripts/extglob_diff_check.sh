@@ -30,5 +30,8 @@ check "pe ## "         'v=aaab; echo "${v##+(a)}"'
 check "pe %% "         'v=foobarbar; echo "${v%%+(bar)}"'
 check "pe / "          'v=abcabc; echo "${v/+(abc)/X}"'
 check "pe # shortest"  'v=aaab; echo "${v#+(a)}"'
+check "quoted | literal" '[[ a == @("a|b") ]] && echo y || echo n'
+check "quoted | match"   '[[ "a|b" == @("a|b") ]] && echo y || echo n'
+check "var in group" 'x="a|b"; [[ ab == +($x) ]] && echo y || echo n'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

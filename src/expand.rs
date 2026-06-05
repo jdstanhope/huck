@@ -867,10 +867,25 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
     }
 }
 
+/// Escapes a quoted span so its metacharacters match literally — both the
+/// `glob`-crate wildcards (`* ? [ ]`, via `glob::Pattern::escape`) AND the
+/// extglob structural chars `| ( )` (wrapped as single-char classes `[|]`/
+/// `[(]`/`[)]`, which are literal-equivalent in both the `glob` crate and the
+/// extglob engine). Without the extra step, a quoted `|`/`(`/`)` inside an
+/// extglob group (e.g. `@("a|b")`) would be parsed as alternation/group syntax.
+fn escape_pattern_literal(text: &str) -> String {
+    // `glob::Pattern::escape` only emits `[?]`/`[*]`/`[[]`/`[]]`, so it never
+    // introduces a bare `|`/`(`/`)` — the replaces below can't double-escape.
+    glob::Pattern::escape(text)
+        .replace('|', "[|]")
+        .replace('(', "[(]")
+        .replace(')', "[)]")
+}
+
 /// Expands `word` into a glob-pattern string for `case` matching.
 /// Like `expand_assignment` (no field splitting), but text contributed
-/// by a quoted part is escaped via `glob::Pattern::escape`, so a quoted
-/// `*`/`?`/`[` matches literally while an unquoted one is a wildcard.
+/// by a quoted part is escaped via `escape_pattern_literal`, so a quoted
+/// `*`/`?`/`[`/`|`/`(`/`)` matches literally while an unquoted one is special.
 pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
     // Snapshot `$?` so `LastStatus` parts read the value at the start of
     // the expansion, not whatever a preceding `$(cmd)` mutated it to.
@@ -887,7 +902,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
             return result;
         }
         if word_part_is_quoted(part) {
-            result.push_str(&glob::Pattern::escape(&text));
+            result.push_str(&escape_pattern_literal(&text));
         } else {
             result.push_str(&text);
         }
