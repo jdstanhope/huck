@@ -415,6 +415,7 @@ impl Shell {
             dotglob: self.shopt_options.get("dotglob").unwrap_or(false),
             nocaseglob: self.shopt_options.get("nocaseglob").unwrap_or(false),
             failglob: self.shopt_options.get("failglob").unwrap_or(false),
+            extglob: self.shopt_options.get("extglob").unwrap_or(false),
         }
     }
 

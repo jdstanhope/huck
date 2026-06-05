@@ -12,6 +12,7 @@ pub struct GlobOpts {
     pub dotglob: bool,
     pub nocaseglob: bool,
     pub failglob: bool,
+    pub extglob: bool,
 }
 
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
@@ -1049,61 +1050,73 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
     let mut words = Vec::new();
     let mut failglob_unmatched = Vec::new();
     for field in fields {
-        if !has_unquoted_metachar(&field) {
+        let pattern = build_glob_pattern(&field);
+        let is_extglob = opts.extglob && crate::glob_match::has_extglob(&pattern);
+
+        // No globbing needed: not a wildcard field AND not an extglob field.
+        if !has_unquoted_metachar(&field) && !is_extglob {
             words.push(field.chars);
             continue;
         }
-        let pattern = build_glob_pattern(&field);
-        // Bash semantics: a leading literal `.` in the pattern matches a
-        // leading `.` in filenames; otherwise `*` and `?` never match one.
-        // The `glob` crate's `require_literal_leading_dot=true` enforces the
-        // "never" rule but also blocks an explicit dot-prefix pattern (`.*`,
-        // `.foo`, or a bracket class like `[.]*`) from matching dotfiles, so
-        // we toggle it off when the pattern's effective first char is a
-        // literal `.`. We accept both bare `.` and the `[.]` single-element
-        // bracket form (verified empirically against `glob` 0.3). `dotglob`
-        // forces `*`/`?` to also match a leading dot.
-        let literal_leading_dot =
-            pattern.starts_with('.') || pattern.starts_with("[.]");
-        let match_opts = MatchOptions {
-            case_sensitive: !opts.nocaseglob,
-            require_literal_separator: true,
-            require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
-        };
-        match glob_with(&pattern, match_opts) {
-            Ok(paths) => {
-                let mut matched = Vec::new();
-                for entry in paths {
-                    let Ok(path) = entry else { continue };
-                    match path.into_os_string().into_string() {
-                        Ok(s) => matched.push(s),
-                        Err(_) => eprintln!("huck: skipping non-UTF8 path"),
+
+        let matched: Vec<String> = if is_extglob {
+            crate::glob_match::extglob_pathname_expand(&pattern, opts.nocaseglob, opts.dotglob)
+        } else {
+            // Existing `glob` crate path (unchanged behavior for plain globs).
+            // Bash semantics: a leading literal `.` in the pattern matches a
+            // leading `.` in filenames; otherwise `*` and `?` never match one.
+            // The `glob` crate's `require_literal_leading_dot=true` enforces the
+            // "never" rule but also blocks an explicit dot-prefix pattern (`.*`,
+            // `.foo`, or a bracket class like `[.]*`) from matching dotfiles, so
+            // we toggle it off when the pattern's effective first char is a
+            // literal `.`. We accept both bare `.` and the `[.]` single-element
+            // bracket form (verified empirically against `glob` 0.3). `dotglob`
+            // forces `*`/`?` to also match a leading dot.
+            let literal_leading_dot =
+                pattern.starts_with('.') || pattern.starts_with("[.]");
+            let match_opts = MatchOptions {
+                case_sensitive: !opts.nocaseglob,
+                require_literal_separator: true,
+                require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
+            };
+            match glob_with(&pattern, match_opts) {
+                Ok(paths) => {
+                    let mut m = Vec::new();
+                    for entry in paths {
+                        let Ok(path) = entry else { continue };
+                        match path.into_os_string().into_string() {
+                            Ok(s) => m.push(s),
+                            Err(_) => eprintln!("huck: skipping non-UTF8 path"),
+                        }
                     }
+                    // Defensive: filter `.` and `..` if the glob crate ever emits
+                    // them for patterns like `.*`. (Current versions exclude them
+                    // under require_literal_leading_dot, but explicit filtering
+                    // makes the contract loud — and `dotglob` keeps it relevant.)
+                    m.retain(|p| {
+                        let last = std::path::Path::new(p).file_name().and_then(|s| s.to_str());
+                        !matches!(last, Some(".") | Some(".."))
+                    });
+                    m
                 }
-                // Defensive: filter `.` and `..` if the glob crate ever emits
-                // them for patterns like `.*`. (Current versions exclude them
-                // under require_literal_leading_dot, but explicit filtering
-                // makes the contract loud — and `dotglob` keeps it relevant.)
-                matched.retain(|p| {
-                    let last = std::path::Path::new(p).file_name().and_then(|s| s.to_str());
-                    !matches!(last, Some(".") | Some(".."))
-                });
-                if matched.is_empty() {
-                    if opts.failglob {
-                        failglob_unmatched.push(field.chars);
-                    } else if opts.nullglob {
-                        // contribute nothing
-                    } else {
-                        words.push(field.chars);
-                    }
-                } else {
-                    words.extend(matched);
+                Err(_) => {
+                    // Invalid glob pattern → literal fallback (unchanged).
+                    words.push(field.chars);
+                    continue;
                 }
             }
-            Err(_) => {
-                // Invalid pattern → literal fallback.
+        };
+
+        if matched.is_empty() {
+            if opts.failglob {
+                failglob_unmatched.push(field.chars);
+            } else if opts.nullglob {
+                // contribute nothing
+            } else {
                 words.push(field.chars);
             }
+        } else {
+            words.extend(matched);
         }
     }
     GlobExpansion { words, failglob_unmatched }
@@ -1125,7 +1138,7 @@ pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
 fn build_glob_pattern(field: &Field) -> String {
     let mut p = String::new();
     for (c, &q) in field.chars.chars().zip(field.quoted.iter()) {
-        if q && matches!(c, '*' | '?' | '[' | ']') {
+        if q && matches!(c, '*' | '?' | '[' | ']' | '|' | '(' | ')') {
             p.push('[');
             p.push(c);
             p.push(']');
