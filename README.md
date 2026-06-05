@@ -102,6 +102,7 @@ spec, an implementation plan, and a test suite.
 | v92       | bare-word `[[ word ]]` truthiness (M-14c): a lone operand inside `[[ ]]` is a non-empty-string test (`[[ word ]]` ≡ `[[ -n word ]]`); closes a v30 M-14 gap that cascaded into `unexpected else/fi/}` errors when sourcing bash-completion |
 | v93       | `$`-form expansion inside `(( ))`/`$(( ))`/arith-`for` (M-88, expand-then-parse): `$#`/`${…}`/`$(…)`/`$@`/`$1`/positional params now expand before arithmetic eval (the dominant bash-completion blocker, `(($# == 2))`); quote removal honored, malformed arith errors at eval time; `declare -f`/`-F` silent-on-missing |
 | v94       | line numbers in sourced-script syntax errors (`FILE: line N: syntax error`); diagnostics iteration (no M-flip) |
+| v95       | `${!var}` indirect parameter expansion (M-91): bare `${!ref}`, alphabetic + numeric-positional source (`${!2}`), modifier composition, array-element source; new `indirect` field + `expand_indirect` helper; clears the entire bash-completion `${!…}` error cascade. Bundled: `[[ ]]` integer comparison treats an empty operand as `0` (M-14). 20th bash-diff harness; prefix-name `${!prefix@}`/`${!prefix*}` deferred (M-92) |
 
 ## Build and run
 

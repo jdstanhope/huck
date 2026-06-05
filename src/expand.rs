@@ -398,6 +398,96 @@ fn expand_assoc_param(
     }
 }
 
+/// `${!name<modifier>}` indirect expansion: resolve `name`(+`subscript`)'s
+/// scalar value to an effective name N, then expand `${N<modifier>}`.
+///
+/// Through-value resolution: a plain name uses `shell.lookup_var` (which
+/// resolves named vars, positionals, and specials); a subscripted source
+/// (`${!a[i]}`) reads the array element scalar. An empty/all-whitespace
+/// through-value (source unset OR set-but-empty) is a FATAL "invalid
+/// indirect expansion" in bash and fires regardless of `set -u`. The
+/// effective name N is interpreted as a parameter reference: a plain
+/// name, a positional digit / special param, or `name[sub]` (re-expanded
+/// as an array element).
+///
+/// `set -u`: when N is a valid-but-unset name (a bare reference, no
+/// substitution modifier), it raises the same unbound-variable fatal as a
+/// normal `${N}` reference would.
+fn expand_indirect(
+    name: &str,
+    subscript: Option<&crate::lexer::SubscriptKind>,
+    modifier: &crate::lexer::ParamModifier,
+    quoted: bool,
+    shell: &mut Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::param_expansion::ExpansionResult;
+    // Step 1: through-value = scalar value of (name, subscript).
+    let through = match subscript {
+        None => shell.lookup_var(name).unwrap_or_default(),
+        Some(sub) => {
+            // Indirect through an array element: read its scalar value;
+            // empty if absent.
+            match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, quoted, shell) {
+                ExpansionResult::Value(v) => v,
+                _ => String::new(),
+            }
+        }
+    };
+    // Use the through-value VERBATIM as the effective name N — bash does
+    // not trim or word-split it. An all-whitespace or space-containing
+    // value is a non-empty (invalid) name that falls through to the normal
+    // lookup path and yields empty, matching bash's observable result.
+    let n: &str = &through;
+    if through.is_empty() {
+        // Empty through-value (source unset OR set-but-empty) is a fatal
+        // "invalid indirect expansion" in bash — and it fires regardless
+        // of `set -u`. Route it through the fatal-PE mechanism so a
+        // non-interactive shell exits and an interactive one aborts the
+        // command (the caller turns `Fatal` into `pending_fatal_pe_error`).
+        eprintln!("huck: {name}: invalid indirect expansion");
+        return ExpansionResult::Fatal { status: 1 };
+    }
+    // Step 2: parse N into (effective_name, effective_subscript) and
+    // re-expand. The only structured form we honor is `name[sub]`.
+    if let Some((base, sub_text)) = split_name_subscript(n) {
+        let sub = crate::lexer::SubscriptKind::Index(Word(vec![
+            WordPart::Literal { text: sub_text, quoted: false },
+        ]));
+        return expand_array_param(&base, modifier, &sub, quoted, shell);
+    }
+    // The effective name N is a valid parameter. When N is itself unset
+    // and `set -u` is active, a bare reference must raise the same
+    // unbound-variable fatal as a normal `${N}` would — `expand_modifier`
+    // does not enforce nounset, so apply it here for the bare-reference
+    // case (a substitution modifier like `:-`/`-`/`+` handles unset on
+    // its own and must not be pre-empted).
+    if matches!(modifier, crate::lexer::ParamModifier::None)
+        && shell.shell_options.nounset
+        && shell.lookup_var(n).is_none()
+    {
+        eprintln!("huck: {n}: unbound variable");
+        return ExpansionResult::Fatal { status: 1 };
+    }
+    crate::param_expansion::expand_modifier(n, modifier, shell)
+}
+
+/// Splits a `name[sub]` effective-name string into `(name, sub)`. Returns
+/// `None` for a plain name / positional / special param (the common path).
+/// Only the simple `ends-with-']' and contains-'['` shape is recognized;
+/// the inner `sub` text is re-parsed as an arithmetic subscript Word.
+fn split_name_subscript(n: &str) -> Option<(String, String)> {
+    if !n.ends_with(']') {
+        return None;
+    }
+    let open = n.find('[')?;
+    if open == 0 {
+        return None;
+    }
+    let base = n[..open].to_string();
+    let sub = n[open + 1..n.len() - 1].to_string();
+    Some((base, sub))
+}
+
 /// Dispatches `${a[...]}` forms. The `subscript` field of
 /// `WordPart::ParamExpansion` distinguishes `[@]`, `[*]`, and
 /// `[<expr>]`; the `modifier` is the scalar-style suffix (or
@@ -692,11 +782,13 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
                 // Substring on `$@` / `$*` is array-shaped (closes v33's
                 // `${@:o:l}` deferral) — route through the shared
                 // word-list path even though there's no `subscript`.
-                let result_pe = if let Some(sub) = subscript {
+                let result_pe = if *indirect {
+                    expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
+                } else if let Some(sub) = subscript {
                     expand_array_param(name, modifier, sub, *quoted, shell)
                 } else if matches!(
                     (name.as_str(), modifier),
@@ -818,8 +910,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
-                let result_pe = if let Some(sub) = subscript {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+                let result_pe = if *indirect {
+                    expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
+                } else if let Some(sub) = subscript {
                     expand_array_param(name, modifier, sub, *quoted, shell)
                 } else if matches!(
                     (name.as_str(), modifier),
@@ -1942,6 +2036,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1960,6 +2055,7 @@ mod tests {
             },
             quoted: true,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1979,6 +2075,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1997,6 +2094,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let value = expand_assignment(&word, &mut shell);
         assert_eq!(value, "a b c");
@@ -2014,6 +2112,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         // v34 (Task 4): expand() now bails early on Fatal, stashing status on
