@@ -87,3 +87,11 @@ fn command_no_operand_zero() {
 fn command_dash_p_accepts() {
     assert_eq!(run("command -p echo hi\n").0, "hi\n");
 }
+
+#[test]
+fn command_bypass_inline_assignment_is_temporary() {
+    // `command <fn-name>` runs the external/builtin; a leading inline assignment
+    // must be TEMPORARY (restored), like bash — not persisted via the bypassed fn.
+    let (out, _rc) = run("true() { return 0; }\nFOO=zzz command true\necho \"after=[${FOO}]\"\n");
+    assert_eq!(out, "after=[]\n");
+}

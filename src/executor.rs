@@ -2564,7 +2564,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // Note: is_control_builtin's set {break,continue,exit,return} is a strict
     // subset of is_special_builtin's set, so only the latter term is needed.
     let persistent = builtins::is_special_builtin(&resolved.program)
-        || shell.functions.contains_key(&resolved.program);
+        || (!bypass_functions && shell.functions.contains_key(&resolved.program));
 
     // 1. Control builtins always win — they cannot be shadowed by functions.
     // 2. User-defined function lookup.
