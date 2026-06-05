@@ -34,5 +34,18 @@ check "ef hardlink"        "[[ '$FIX/new' -ef '$FIX/link' ]] && echo ef || echo 
 check "ef different"       "[[ '$FIX/old' -ef '$FIX/new' ]] && echo ef || echo no"
 check "nt missing rhs"     "[[ '$FIX/new' -nt '$FIX/missing' ]] && echo nt || echo no"
 check "test nt"            "[ '$FIX/new' -nt '$FIX/old' ] && echo nt || echo no"
+# Bare-word truthiness: [[ word ]] ≡ [[ -n word ]]  (M-14c, v92)
+check "bareword nonempty"  '[[ foo ]]; echo $?'
+check "bareword empty"     '[[ "" ]]; echo $?'
+check "bareword var set"   's=x; [[ $s ]]; echo $?'
+check "bareword var empty" 'e=; [[ $e ]]; echo $?'
+check "bareword var unset" 'unset u; [[ $u ]]; echo $?'
+check "bareword and"       '[[ a && b ]]; echo $?'
+check "bareword or empty"  '[[ "" || z ]]; echo $?'
+check "bareword and empty" '[[ a && "" ]]; echo $?'
+check "bareword not empty" '[[ ! "" ]]; echo $?'
+check "bareword grouped"   '[[ ( a ) ]]; echo $?'
+check "bareword op wins"   '[[ word == x ]]; echo $?'
+check "bareword op match"  '[[ word == word ]]; echo $?'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
