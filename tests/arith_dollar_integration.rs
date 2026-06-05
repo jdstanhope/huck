@@ -52,3 +52,12 @@ fn quote_removal_in_arith() {
 fn empty_arith_expansion_is_zero() {
     assert_eq!(run("e=\necho $(( e ))\n").0, "0\n");
 }
+
+#[test]
+fn malformed_arith_errors_at_eval() {
+    // Bad arith now parses (deferred) but must still fail at eval, rc != 0.
+    let (_o, rc) = run("(( 1++ ))\n");
+    assert_ne!(rc, 0);
+    let (_o2, rc2) = run("for ((i=+;;)); do echo x; done\n");
+    assert_ne!(rc2, 0);
+}

@@ -58,8 +58,9 @@ pub fn expand_modifier_with_value(
         return ExpansionResult::Empty;
     }
     // `get_raw` returns the value to test against null/unset. For
-    // Scalar lookup it consults `shell.get(name)`; for Element it uses
-    // the caller-supplied value verbatim (Some=set, None=unset).
+    // Scalar lookup it consults `shell.lookup_var(name)` (so positional
+    // and special params resolve too); for Element it uses the
+    // caller-supplied value verbatim (Some=set, None=unset).
     let get_raw = |sh: &Shell| -> Option<String> {
         match source {
             // `lookup_var` (not `get`) so positional (`$1`) and special

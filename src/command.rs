@@ -731,7 +731,7 @@ fn parse_command_inner<I: Iterator<Item = Token>>(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text)
-            .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))?;
+            .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
         return Ok(Command::Arith(body));
     }
 
@@ -1082,7 +1082,7 @@ fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError
         } else {
             crate::lexer::arith_string_to_word(trimmed)
                 .map(Some)
-                .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))
+                .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))
         }
     };
     Ok((
@@ -1715,7 +1715,7 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text)
-            .map_err(|e| ParseError::ArithBlock(format!("{e:?}")))?;
+            .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
         return Ok((Command::Arith(body), false));
     }
 
