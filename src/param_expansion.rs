@@ -199,6 +199,69 @@ pub fn expand_modifier_with_value(
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref(), extglob))
         }
+        ParamModifier::Transform { op } => {
+            let v = lookup_v(shell);
+            let out = match op {
+                crate::lexer::TransformOp::Upper => {
+                    case_modify(&v, CaseDirection::Upper, true, None, false)
+                }
+                crate::lexer::TransformOp::Lower => {
+                    case_modify(&v, CaseDirection::Lower, true, None, false)
+                }
+                crate::lexer::TransformOp::UpperFirst => {
+                    case_modify(&v, CaseDirection::Upper, false, None, false)
+                }
+                crate::lexer::TransformOp::Quote => match get_raw(shell) {
+                    // bash: `@Q` on a genuinely unset variable yields an
+                    // empty string (no quotes); set-but-empty yields `''`.
+                    // `get_raw` returns `None` for unset (Scalar via
+                    // `lookup_var`, or `Element(None)` for a missing
+                    // subscript), `Some` for set (incl. empty), so this
+                    // also keeps `${a[1]@Q}` quoting correctly.
+                    None => String::new(),
+                    Some(val) => shell_quote(&val),
+                },
+                crate::lexer::TransformOp::EscapeExpand => {
+                    crate::lexer::decode_ansi_c_escapes(&v)
+                }
+                crate::lexer::TransformOp::PromptExpand => {
+                    crate::prompt::expand_prompt(&v, shell)
+                }
+            };
+            ExpansionResult::Value(out)
+        }
+    }
+}
+
+/// bash `${v@Q}`: shell-quote `v` so the result re-reads as the same
+/// value. If `v` contains a control char (`\0`..`\x1F` or `\x7F`) it uses
+/// the `$'…'` ANSI-C form (escaping `\`, `'`, and control chars); empty
+/// and ordinary strings use single quotes with `'` rewritten as `'\''`.
+fn shell_quote(v: &str) -> String {
+    if v.chars().any(|c| c.is_control()) {
+        let mut out = String::from("$'");
+        for c in v.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                '\x07' => out.push_str("\\a"),
+                '\x08' => out.push_str("\\b"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\x0B' => out.push_str("\\v"),
+                '\x0C' => out.push_str("\\f"),
+                '\r' => out.push_str("\\r"),
+                '\x1B' => out.push_str("\\E"),
+                c if (c as u32) < 0x20 || c == '\x7F' => {
+                    out.push_str(&format!("\\{:03o}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        out
+    } else {
+        format!("'{}'", crate::builtins::escape_alias_value(v))
     }
 }
 
