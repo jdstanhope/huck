@@ -89,6 +89,53 @@ fn command_dash_p_accepts() {
 }
 
 #[test]
+fn command_declaration_builtin_no_panic() {
+    // `command export …` / `command declare …` must not panic; a scalar export
+    // runs the declaration builtin and persists, exactly like bash.
+    let (out, rc) = run("command export FOO=bar\necho \"[${FOO}]\"\n");
+    assert_eq!(out, "[bar]\n");
+    assert_ne!(rc, 101); // never a panic
+}
+
+#[test]
+fn command_declaration_array_literal_no_panic() {
+    // Compound RHS `arr=(x y z)` carries a parser-internal ArrayLiteral that
+    // previously panicked through expand() (rc 101). It must now run the
+    // declaration builtin cleanly. (bash actually rejects this with a syntax
+    // error after `command`; huck is a no-panic superset and assigns the array.)
+    let (out, rc) = run("command declare -a a=(x y z); echo \"${a[1]}\"\n");
+    assert_eq!(out, "y\n");
+    assert_ne!(rc, 101); // never a panic
+}
+
+#[test]
+fn command_p_with_introspect() {
+    // -p before -v must not spuriously error ("invalid option").
+    let (out, rc) = run("command -p -v echo\n");
+    assert_eq!(out, "echo\n");
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn command_v_then_p_with_introspect() {
+    // -v before -p is also accepted.
+    let (out, rc) = run("command -v -p echo\n");
+    assert_eq!(out, "echo\n");
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn command_dashdash_no_operand() {
+    assert_eq!(run("command --; echo rc=$?\n").0, "rc=0\n");
+}
+
+#[test]
+fn command_echo_dash_v_is_echo_arg() {
+    // `-v` here is echo's ARG, not command's flag.
+    assert_eq!(run("command echo -v\n").0, "-v\n");
+}
+
+#[test]
 fn command_bypass_inline_assignment_is_temporary() {
     // `command <fn-name>` runs the external/builtin; a leading inline assignment
     // must be TEMPORARY (restored), like bash — not persisted via the bypassed fn.

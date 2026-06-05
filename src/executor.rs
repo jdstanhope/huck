@@ -2494,6 +2494,30 @@ pub(crate) fn call_function_body(
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     crate::traps::fire_debug_trap(shell);
+
+    // Pre-resolve interception: `command [-p|--]… <decl-command> …` where the
+    // inner program is a declaration builtin (`declare`/`export`/…). Detected
+    // statically from RAW Words so a compound RHS (`arr=(x y z)`) never reaches
+    // the outer `resolve` (which would expand the `command` operands and panic
+    // on the parser-internal `ArrayLiteral` WordPart). When matched, rewrite to
+    // an inner `ExecCommand` over the raw operand Words and recurse: the normal
+    // flow then builds correct `decl_args` and dispatches `run_declaration_builtin`.
+    // Declaration builtins are special builtins, so suppressing function lookup
+    // is moot — recursion is equivalent and reuses all redirect/assign handling.
+    if word_static_text(&cmd.program).as_deref() == Some("command")
+        && let Some(k) = command_decl_operand_index(&cmd.args)
+    {
+        let inner = ExecCommand {
+            inline_assignments: cmd.inline_assignments.clone(),
+            program: cmd.args[k].clone(),
+            args: cmd.args[k + 1..].to_vec(),
+            stdin: cmd.stdin.clone(),
+            stdout: cmd.stdout.clone(),
+            stderr: cmd.stderr.clone(),
+        };
+        return run_exec_single(&inner, shell, sink);
+    }
+
     let mut resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
@@ -2537,6 +2561,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 resolved.program = new_program;
                 resolved.args = new_args;
                 // The inner CMD is not the outer `command`'s declaration form.
+                // (A `command <decl-builtin> …` is intercepted pre-resolve above
+                // and never reaches here, so this is always a non-declaration.)
                 resolved.decl_args = None;
                 bypass_functions = true;
                 // loop: collapse `command command …`
@@ -3726,6 +3752,50 @@ fn apply_inline_assignments(
 fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
     for (name, prior) in snap.into_iter().rev() {
         shell.restore_var(&name, prior);
+    }
+}
+
+/// Returns the static text of `word` iff it is a single unquoted `Literal`
+/// part (e.g. a statically-written `command`/`declare`/`-p`). Returns `None`
+/// for dynamic words (`$x`, quoted, multi-part). Mirrors
+/// `ExecCommand::program_static_text` at the `Word` level.
+fn word_static_text(word: &crate::lexer::Word) -> Option<String> {
+    if word.0.len() == 1
+        && let crate::lexer::WordPart::Literal { text, quoted: false } = &word.0[0]
+    {
+        return Some(text.clone());
+    }
+    None
+}
+
+/// For a `command …` invocation, scans the RAW arg Words for the leading
+/// `-p` / `--` flags (statically) and returns the index of the first operand
+/// IFF that operand is statically a declaration builtin (`declare`/`export`/…).
+/// Returns `None` otherwise (no operand, dynamic flag/operand, or non-decl
+/// operand), in which case the normal post-resolve `command` path handles it.
+///
+/// This narrow static match exists only to keep a compound `arr=(x y z)` RHS
+/// (a parser-internal `ArrayLiteral` WordPart) away from the outer `resolve`,
+/// which would panic trying to `expand()` it under the non-declaration
+/// `command` program.
+fn command_decl_operand_index(args: &[crate::lexer::Word]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        match word_static_text(args.get(i)?).as_deref() {
+            Some("-p") => i += 1,
+            Some("--") => {
+                i += 1;
+                break;
+            }
+            Some(s) if s.starts_with('-') && s.len() > 1 => return None,
+            _ => break, // first operand (or a dynamic word)
+        }
+    }
+    let prog = word_static_text(args.get(i)?)?;
+    if builtins::is_declaration_command(&prog) {
+        Some(i)
+    } else {
+        None
     }
 }
 

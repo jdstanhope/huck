@@ -5572,6 +5572,7 @@ fn builtin_command(
         match args[i].as_str() {
             "-v" => { concise = true; i += 1; }
             "-V" => { verbose = true; i += 1; }
+            "-p" => { i += 1; } // accept; introspection uses current $PATH
             "--" => { i += 1; break; }
             s if s.starts_with('-') && s.len() > 1 => {
                 eprintln!("huck: command: {s}: invalid option");
