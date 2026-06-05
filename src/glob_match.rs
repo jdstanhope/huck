@@ -259,6 +259,100 @@ fn match_here(items: &[Item], text: &[char], ci: bool) -> bool {
     }
 }
 
+/// Filesystem pathname expansion for an extglob `pattern` (the `glob` crate
+/// can't do extglob). Returns matched paths sorted lexicographically; empty if
+/// nothing matches. Honors the dotfile rule, `nocaseglob`, and `dotglob`.
+/// Per-component matching delegates to `extglob_match` (which also implements
+/// `*`/`?`/`[…]`), so mixed patterns like `dir*/+(foo|bar).txt` work.
+pub fn extglob_pathname_expand(pattern: &str, nocaseglob: bool, dotglob: bool) -> Vec<String> {
+    let absolute = pattern.starts_with('/');
+    let comps: Vec<String> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if comps.is_empty() {
+        return Vec::new();
+    }
+    let start = if absolute { "/".to_string() } else { String::new() };
+    let mut out = Vec::new();
+    walk_components(&start, &comps, 0, nocaseglob, dotglob, &mut out);
+    out.sort();
+    out
+}
+
+/// True if a path component needs directory matching (vs literal descent):
+/// it has a glob wildcard or an extglob operator.
+fn component_needs_match(comp: &str) -> bool {
+    comp.contains('*') || comp.contains('?') || comp.contains('[') || has_extglob(comp)
+}
+
+/// Joins `prefix` + `name` into a path: empty prefix → bare name (relative,
+/// no `./`); root prefix → `/name`; else `prefix/name`.
+fn join_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else if prefix == "/" {
+        format!("/{name}")
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+fn walk_components(
+    prefix: &str,
+    comps: &[String],
+    idx: usize,
+    nocaseglob: bool,
+    dotglob: bool,
+    out: &mut Vec<String>,
+) {
+    if idx == comps.len() {
+        out.push(prefix.to_string());
+        return;
+    }
+    let comp = &comps[idx];
+    let is_last = idx + 1 == comps.len();
+
+    // Literal component: descend (or include) only if the path exists on disk.
+    if !component_needs_match(comp) {
+        let next = join_path(prefix, comp);
+        if std::path::Path::new(&next).exists() {
+            walk_components(&next, comps, idx + 1, nocaseglob, dotglob, out);
+        }
+        return;
+    }
+
+    // Pattern component: list the directory and keep matching entries.
+    let dir = if prefix.is_empty() { "." } else { prefix };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Dotfile rule: a leading-dot entry is matched only if `dotglob` is on or
+    // the component's first char is a literal `.` (the pattern is dot-anchored).
+    let dot_anchored = comp.starts_with('.');
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue, // skip non-UTF8 names
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        if name.starts_with('.') && !dotglob && !dot_anchored {
+            continue;
+        }
+        if extglob_match(comp, &name, nocaseglob) {
+            let next = join_path(prefix, &name);
+            if is_last {
+                out.push(next);
+            } else if std::path::Path::new(&next).is_dir() {
+                walk_components(&next, comps, idx + 1, nocaseglob, dotglob, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +439,88 @@ mod tests {
     fn case_insensitive() {
         assert!(extglob_match("@(ABC)", "abc", true));
         assert!(!extglob_match("@(ABC)", "abc", false));
+    }
+}
+
+#[cfg(test)]
+mod pathname_tests {
+    use super::*;
+    use std::fs;
+
+    /// Builds a tempdir fixture and returns (TempDir, its absolute path string).
+    fn fixture() -> (tempfile::TempDir, String) {
+        let d = tempfile::tempdir().unwrap();
+        for f in ["a", "b", "ab", "aab", "abc", "cd", "xy", ".hidden", ".ab"] {
+            fs::write(d.path().join(f), b"").unwrap();
+        }
+        fs::create_dir(d.path().join("dir1")).unwrap();
+        fs::create_dir(d.path().join("dir2")).unwrap();
+        fs::write(d.path().join("dir1/foo.txt"), b"").unwrap();
+        fs::write(d.path().join("dir1/bar.log"), b"").unwrap();
+        fs::write(d.path().join("dir2/foo.txt"), b"").unwrap();
+        let base = d.path().to_str().unwrap().to_string();
+        (d, base)
+    }
+
+    /// Maps file names to absolute paths under `base`, sorted.
+    fn abs(base: &str, names: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = names.iter().map(|n| format!("{base}/{n}")).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn plus_one_or_more_excludes_dotfiles() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/+(a|b)"), false, false);
+        assert_eq!(got, abs(&base, &["a", "aab", "ab", "b"]));
+    }
+
+    #[test]
+    fn at_exactly_one() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/@(a|cd)"), false, false);
+        assert_eq!(got, abs(&base, &["a", "cd"]));
+    }
+
+    #[test]
+    fn negation_excludes_listed_and_dotfiles() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/!(a|ab)"), false, false);
+        assert_eq!(got, abs(&base, &["aab", "abc", "b", "cd", "dir1", "dir2", "xy"]));
+    }
+
+    #[test]
+    fn class_inside_extglob() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/+([a-c])"), false, false);
+        assert_eq!(got, abs(&base, &["a", "aab", "ab", "abc", "b"]));
+    }
+
+    #[test]
+    fn explicit_dot_matches_dotfile() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/.+(ab)"), false, false);
+        assert_eq!(got, abs(&base, &[".ab"]));
+    }
+
+    #[test]
+    fn nocaseglob_folds_case() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/@(A|AB)"), true, false);
+        assert_eq!(got, abs(&base, &["a", "ab"]));
+    }
+
+    #[test]
+    fn multi_component() {
+        let (_d, base) = fixture();
+        let got = extglob_pathname_expand(&format!("{base}/dir*/+(foo|bar).txt"), false, false);
+        assert_eq!(got, abs(&base, &["dir1/foo.txt", "dir2/foo.txt"]));
+    }
+
+    #[test]
+    fn no_match_is_empty() {
+        let (_d, base) = fixture();
+        assert!(extglob_pathname_expand(&format!("{base}/+(zzz)"), false, false).is_empty());
     }
 }
