@@ -869,7 +869,7 @@ fn declare_list_functions(
         if shell.functions.contains_key(name) {
             let _ = writeln!(out, "declare -f {name}");
         } else {
-            eprintln!("huck: declare: {name}: not found");
+            // bash: `declare -f`/`-F` on a missing function is silent (rc 1).
             exit = 1;
         }
     }
@@ -9549,6 +9549,16 @@ mod declare_tests {
             out.find("fn1").unwrap() < out.find("fn2").unwrap(),
             "expected sorted; got {out:?}",
         );
+    }
+
+    #[test]
+    fn declare_f_missing_is_silent() {
+        // bash: `declare -f`/`-F` on a missing function emits nothing on
+        // stdout and returns rc 1 (the "not found" stderr line is gone).
+        let mut shell = Shell::new();
+        let (oc, out) = run(&["-f", "nope"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+        assert_eq!(out, "");
     }
 
     #[test]

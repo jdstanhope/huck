@@ -473,8 +473,8 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// Runs a standalone `((expr))` arith command. Per bash semantics, the
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
-fn run_arith(expr: &crate::arith::ArithExpr, shell: &mut Shell) -> ExecOutcome {
-    match crate::arith::eval(expr, shell) {
+fn run_arith(body: &crate::lexer::Word, shell: &mut Shell) -> ExecOutcome {
+    match crate::expand::eval_arith_word(body, shell) {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
@@ -508,7 +508,7 @@ fn run_arith_for_inner(
 
     // 1. Eval init once (if present).
     if let Some(init) = &clause.init
-        && let Err(e) = crate::arith::eval(init, shell)
+        && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
         eprintln!("huck: ((: {e}");
         return ExecOutcome::Continue(1);
@@ -528,7 +528,7 @@ fn run_arith_for_inner(
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
-            Some(c) => match crate::arith::eval(c, shell) {
+            Some(c) => match crate::expand::eval_arith_word(c, shell) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("huck: ((: {e}");
@@ -566,7 +566,7 @@ fn run_arith_for_inner(
 
         // 4. Eval step (if present).
         if let Some(step) = &clause.step
-            && let Err(e) = crate::arith::eval(step, shell)
+            && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
             eprintln!("huck: ((: {e}");
             return ExecOutcome::Continue(1);
