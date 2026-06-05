@@ -36,7 +36,13 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
 
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    if seq.background {
+    // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
+    // `&`-separators inside the list). This preserves the real source-derived
+    // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.
+    // Sequences containing `Connector::Amp` (mid-list `&` separators) fall
+    // through to the group-aware `execute_sequence_body`.
+    let has_amp_separator = seq.rest.iter().any(|(c, _)| matches!(c, Connector::Amp));
+    if seq.background && !has_amp_separator {
         if seq.rest.is_empty() {
             // Single-pipeline or subshell backgrounded — existing paths.
             if let Command::Pipeline(p) = &seq.first {
@@ -45,11 +51,17 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
             if let Command::Subshell { .. } = &seq.first {
                 return run_background_subshell(&seq.first, shell, &mut sink, source);
             }
-        } else {
-            // v49: multi-pipeline sequence backgrounded. Synthesize
-            // (seq) & by wrapping the whole sequence in a Subshell.
-            // The wrapped sequence has background=false because the
-            // child process runs it foreground inside its own pid.
+        } else if seq
+            .rest
+            .iter()
+            .all(|(c, _)| matches!(c, Connector::And | Connector::Or))
+        {
+            // A trailing-`&` backgrounding a single and-or group spanning
+            // multiple stages (`a && b &`, `a || b &`). Wrap the whole group
+            // in a Subshell and background it (bash-correct: the whole group
+            // runs in the child). Groups separated by `;` are NOT collapsed
+            // here — those go through execute_sequence_body so only the LAST
+            // group is backgrounded.
             let inner = Sequence {
                 first: seq.first.clone(),
                 rest: seq.rest.clone(),
@@ -68,10 +80,34 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// background children whose pids the parent's JobTable doesn't track
 /// would let them escape `wait`/`jobs` and litter the terminal.
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    // Command substitution must complete before its output is interpolated, so
+    // ALL backgrounding is ignored here: the trailing `&` (seq.background) and
+    // any mid-list `&` separators (Connector::Amp) are run synchronously.
+    // Spawning real background children whose pids the parent's JobTable
+    // doesn't track would let them escape `wait`/`jobs` and litter the
+    // terminal. Amp → Semi so each group runs foreground in source order.
+    let sanitized = if seq.background
+        || seq.rest.iter().any(|(c, _)| matches!(c, Connector::Amp))
+    {
+        Sequence {
+            first: seq.first.clone(),
+            rest: seq
+                .rest
+                .iter()
+                .map(|(c, cmd)| {
+                    let c = if matches!(c, Connector::Amp) { Connector::Semi } else { *c };
+                    (c, cmd.clone())
+                })
+                .collect(),
+            background: false,
+        }
+    } else {
+        seq.clone()
+    };
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
         let mut sink = StdoutSink::Capture(&mut buf);
-        execute_sequence_body(seq, shell, &mut sink)
+        execute_sequence_body(&sanitized, shell, &mut sink)
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
@@ -81,8 +117,19 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
 
-fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    let mut status = run_command(&seq.first, shell, sink);
+/// Runs ONE and-or group foreground: a `first` command plus a `rest` of
+/// `(And|Or, &Command)` (NO `Semi`/`Amp` — those are group boundaries handled
+/// by `execute_sequence_body`). Carries the existing `&&`/`||` short-circuit
+/// plus `$?` propagation, pending-trap dispatch, ERR-trap firing, and errexit
+/// handling. Returns the group's final `ExecOutcome` (which may be
+/// `Exit`/`LoopBreak`/`LoopContinue`/`FunctionReturn` to propagate upward).
+fn run_andor_group(
+    first: &Command,
+    rest: &[(Connector, &Command)],
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    let mut status = run_command(first, shell, sink);
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
@@ -100,13 +147,13 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             return ExecOutcome::Continue(c);
         }
         crate::traps::dispatch_pending_traps(shell);
-        // ERR fires for seq.first's failure if not suppressed AND the
+        // ERR fires for first's failure if not suppressed AND the
         // next connector (if any) is not Or.
-        let next_is_or = matches!(seq.rest.first(), Some((Connector::Or, _)));
+        let next_is_or = matches!(rest.first(), Some((Connector::Or, _)));
         if c != 0
             && shell.err_suppressed_depth == 0
             && !next_is_or
-            && !is_negated_pipeline(&seq.first)
+            && !is_negated_pipeline(first)
         {
             crate::traps::fire_err_trap(shell);
             if let Some(out) = maybe_errexit(shell, c) {
@@ -114,12 +161,13 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             }
         }
     }
-    for i in 0..seq.rest.len() {
-        let (connector, command) = &seq.rest[i];
+    for i in 0..rest.len() {
+        let (connector, command) = &rest[i];
         let should_run = match connector {
-            Connector::Semi => true,
             Connector::And => matches!(status, ExecOutcome::Continue(0)),
             Connector::Or => matches!(status, ExecOutcome::Continue(c) if c != 0),
+            // Semi/Amp are group boundaries; they never appear inside a group.
+            Connector::Semi | Connector::Amp => true,
         };
         if should_run {
             status = run_command(command, shell, sink);
@@ -139,7 +187,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                 // ERR fires if this command failed AND we're not in a
                 // suppression context AND the NEXT connector is not Or
                 // (i.e. the failure isn't "handled" by a following || clause).
-                let next_is_or = matches!(seq.rest.get(i + 1), Some((Connector::Or, _)));
+                let next_is_or = matches!(rest.get(i + 1), Some((Connector::Or, _)));
                 if c != 0
                     && shell.err_suppressed_depth == 0
                     && !next_is_or
@@ -154,6 +202,94 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
         }
     }
     status
+}
+
+/// A single and-or group carved out of a flat `Sequence`. `backgrounded` is
+/// true when the separator that *terminates* this group is `&` (or, for the
+/// final group, the sequence's trailing-`&` `background` flag).
+struct AndOrGroup<'a> {
+    first: &'a Command,
+    rest: Vec<(Connector, &'a Command)>,
+    backgrounded: bool,
+}
+
+/// Partitions a flat `Sequence` into and-or groups at `Semi`/`Amp` boundaries.
+/// Each group's `backgrounded` reflects the separator that closes it (`Amp` →
+/// true, `Semi` → false); the LAST group inherits `seq.background`.
+fn partition_into_groups(seq: &Sequence) -> Vec<AndOrGroup<'_>> {
+    let mut groups: Vec<AndOrGroup<'_>> = Vec::new();
+    let mut cur_first: &Command = &seq.first;
+    let mut cur_rest: Vec<(Connector, &Command)> = Vec::new();
+    for (connector, command) in &seq.rest {
+        match connector {
+            Connector::Semi | Connector::Amp => {
+                // This connector closes the current group.
+                groups.push(AndOrGroup {
+                    first: cur_first,
+                    rest: std::mem::take(&mut cur_rest),
+                    backgrounded: matches!(connector, Connector::Amp),
+                });
+                cur_first = command;
+            }
+            Connector::And | Connector::Or => {
+                cur_rest.push((*connector, command));
+            }
+        }
+    }
+    // Final group inherits the sequence's trailing-`&` flag.
+    groups.push(AndOrGroup {
+        first: cur_first,
+        rest: cur_rest,
+        backgrounded: seq.background,
+    });
+    groups
+}
+
+fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    let groups = partition_into_groups(seq);
+    // The status of the most recent FOREGROUND group; a list that ends with a
+    // backgrounded group reports the launch status 0.
+    let mut last_status = ExecOutcome::Continue(0);
+    for group in &groups {
+        if group.backgrounded {
+            // Background the group: wrap its commands into a synthetic
+            // foreground `Sequence`, then a `Subshell`, and reuse the existing
+            // background-subshell path (forks, registers a job, sets `$!`, no
+            // wait). A backgrounded group does NOT affect the foreground `$?`
+            // or trigger parent `set -e` (it runs in a child).
+            let inner = Sequence {
+                first: group.first.clone(),
+                rest: group
+                    .rest
+                    .iter()
+                    .map(|(c, cmd)| (*c, (*cmd).clone()))
+                    .collect(),
+                background: false,
+            };
+            // Best-effort job-display label for the backgrounded group. The
+            // original source text isn't threaded down to this point, so derive
+            // a label from the group's first command's static program name when
+            // possible (good enough for `jobs` listings — not byte-diffed).
+            let source = group_display_label(group.first);
+            let subshell = Command::Subshell { body: Box::new(inner) };
+            // Launch; ignore the Continue(0) it returns — the foreground status
+            // is unchanged by a background launch.
+            run_background_subshell(&subshell, shell, sink, &source);
+        } else {
+            last_status = run_andor_group(group.first, &group.rest, shell, sink);
+            // Propagate control-flow outcomes immediately.
+            if matches!(
+                last_status,
+                ExecOutcome::Exit(_)
+                    | ExecOutcome::LoopBreak(_, _)
+                    | ExecOutcome::LoopContinue(_)
+                    | ExecOutcome::FunctionReturn(_)
+            ) {
+                return last_status;
+            }
+        }
+    }
+    last_status
 }
 
 /// Dispatches a single sequence element.
@@ -1794,6 +1930,28 @@ fn display_command(source: &str) -> String {
         .trim_end_matches('&')
         .trim_end()
         .to_string()
+}
+
+/// Best-effort `jobs`-listing label for a backgrounded and-or group produced by
+/// a mid-list `&` separator (where the original source text isn't available at
+/// the executor partition site). Uses the first command's static program name
+/// when it is a plain literal; otherwise falls back to a generic label.
+fn group_display_label(first: &Command) -> String {
+    // Look through a single-stage pipeline wrapper (the parser wraps even a
+    // lone simple command in a Pipeline at some sites).
+    let simple = match first {
+        Command::Simple(s) => Some(s),
+        Command::Pipeline(p) if p.commands.len() == 1 => {
+            if let Command::Simple(s) = &p.commands[0] { Some(s) } else { None }
+        }
+        _ => None,
+    };
+    if let Some(SimpleCommand::Exec(e)) = simple
+        && let Some(name) = e.program_static_text()
+    {
+        return name;
+    }
+    "background job".to_string()
 }
 
 // ----- resolved command (post-expansion) ------------------------------------

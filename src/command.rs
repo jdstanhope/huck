@@ -374,6 +374,9 @@ pub enum Connector {
     Semi,
     And,
     Or,
+    /// `&` as a list separator: backgrounds the preceding and-or group and
+    /// continues the list (v98).
+    Amp,
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -594,7 +597,6 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
-    let at_top_level = stop_at.is_empty();
     let raw_first = parse_command(iter)?;
     // If the command is immediately followed by `|`, it is the first stage of
     // a pipeline — even if it is a compound command (if/while/for/case/brace).
@@ -646,21 +648,48 @@ fn parse_sequence<I: Iterator<Item = Token>>(
         let token = iter.next().unwrap();
         match token {
             Token::Op(Operator::Background) => {
-                if !at_top_level {
-                    return Err(ParseError::UnexpectedBackground);
-                }
-                // Skip any trailing Newline tokens that the heredoc body
-                // collector emits at the end of the input (e.g. when the
-                // buffer is "cat <<EOF &\nbody\nEOF" the lexer emits a
-                // Newline after the heredoc body). Trailing Newlines after
-                // `&` are not meaningful — `&` already terminates the
-                // sequence.
+                // `&` is a list separator (v98): it backgrounds the preceding
+                // and-or group. Skip any trailing Newline tokens that the
+                // heredoc body collector emits at the end of the input (e.g.
+                // when the buffer is "cat <<EOF &\nbody\nEOF" the lexer emits a
+                // Newline after the heredoc body). Newlines after `&` are not
+                // meaningful as separators.
                 skip_newlines(iter);
-                if iter.peek().is_some() {
-                    return Err(ParseError::UnexpectedBackground);
+                match iter.peek() {
+                    // Nothing meaningful follows -> trailing `&`: background the
+                    // whole (final group of the) sequence.
+                    None => {
+                        background = true;
+                        break;
+                    }
+                    // A `stop_at` keyword (e.g. `done`/`fi`/`then`) terminates a
+                    // compound body -> trailing `&` for the last group.
+                    Some(tok)
+                        if keyword_of(tok)
+                            .map(|k| stop_at.contains(&k))
+                            .unwrap_or(false) =>
+                    {
+                        background = true;
+                        break;
+                    }
+                    // A case-clause terminator ends the clause body -> trailing
+                    // `&` for the last group.
+                    Some(Token::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => {
+                        background = true;
+                        break;
+                    }
+                    // Another `&` (`cmd & &`) has no preceding command -> invalid.
+                    Some(Token::Op(Operator::Background)) => {
+                        return Err(ParseError::UnexpectedBackground);
+                    }
+                    // A command follows -> `&` is a separator: background the
+                    // preceding group, continue the list.
+                    Some(_) => {
+                        rest.push((Connector::Amp, parse_command(iter)?));
+                    }
                 }
-                background = true;
-                break;
             }
             Token::Op(Operator::Semi) | Token::Newline => {
                 skip_newlines(iter);
@@ -1500,9 +1529,9 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 if iter.peek().is_none() {
                     return Err(ParseError::UnterminatedSubshell);
                 }
-                // More commands follow (`(cmd1 &; cmd2)` pattern): parse the
-                // next command and continue. The `&` acts as a `;` separator
-                // here; only the trailing `&` before `)` sets background.
+                // More commands follow (`(cmd1 & cmd2)` pattern): parse the
+                // next command and continue. The `&` backgrounds the preceding
+                // group (v98); only the trailing `&` before `)` sets background.
                 let raw = parse_command(iter)?;
                 let cmd = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
                     let mut stages = vec![raw];
@@ -1525,7 +1554,7 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 } else {
                     raw
                 };
-                rest.push((Connector::Semi, cmd));
+                rest.push((Connector::Amp, cmd));
             }
             Some(Token::Op(Operator::And)) => {
                 iter.next();
@@ -2735,15 +2764,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_background_mid_sequence_is_error() {
-        assert_eq!(
-            parse(vec![
-                w_tok("cmd1"),
-                Token::Op(Operator::Background),
-                w_tok("cmd2"),
-            ]),
-            Err(ParseError::UnexpectedBackground)
-        );
+    fn parse_background_mid_sequence_is_amp_separator() {
+        // v98: `cmd1 & cmd2` now parses as an Amp-separated list (cmd1 is
+        // backgrounded, cmd2 follows), not an error.
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::Background),
+            w_tok("cmd2"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(seq.rest.len(), 1);
+        assert_eq!(seq.rest[0].0, Connector::Amp);
+        assert!(!seq.background, "mid-list `&` does not set trailing background");
     }
 
     #[test]
@@ -2789,21 +2822,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_background_mid_sequence_after_andor_is_unexpected_background() {
-        // cmd1 && cmd2 & cmd3 — the `&` is followed by another token,
-        // which is now the only error (UnexpectedBackground). Previously
-        // BackgroundedMultiPipelineSequence won; with that variant
-        // removed, UnexpectedBackground is the appropriate error.
-        assert_eq!(
-            parse(vec![
-                w_tok("cmd1"),
-                Token::Op(Operator::And),
-                w_tok("cmd2"),
-                Token::Op(Operator::Background),
-                w_tok("cmd3"),
-            ]),
-            Err(ParseError::UnexpectedBackground)
-        );
+    fn parse_background_mid_sequence_after_andor_is_amp_separator() {
+        // v98: `cmd1 && cmd2 & cmd3` — the `&` backgrounds the `cmd1 && cmd2`
+        // group and `cmd3` follows. rest = [(And, cmd2), (Amp, cmd3)].
+        let seq = parse(vec![
+            w_tok("cmd1"),
+            Token::Op(Operator::And),
+            w_tok("cmd2"),
+            Token::Op(Operator::Background),
+            w_tok("cmd3"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(seq.rest.len(), 2);
+        assert_eq!(seq.rest[0].0, Connector::And);
+        assert_eq!(seq.rest[1].0, Connector::Amp);
+        assert!(!seq.background);
+    }
+
+    #[test]
+    fn parse_amp_separator_then_trailing_amp() {
+        // v98: `a & b &` → rest = [(Amp, b)], background = true.
+        let seq = parse(vec![
+            w_tok("a"),
+            Token::Op(Operator::Background),
+            w_tok("b"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(seq.rest.len(), 1);
+        assert_eq!(seq.rest[0].0, Connector::Amp);
+        assert!(seq.background, "trailing `&` sets background");
+    }
+
+    #[test]
+    fn parse_andor_then_trailing_amp_single_group() {
+        // v98 regression: `a && b &` → rest = [(And, b)], background = true
+        // (one and-or group, trailing `&`).
+        let seq = parse(vec![
+            w_tok("a"),
+            Token::Op(Operator::And),
+            w_tok("b"),
+            Token::Op(Operator::Background),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(seq.rest.len(), 1);
+        assert_eq!(seq.rest[0].0, Connector::And);
+        assert!(seq.background);
     }
 
     #[test]
@@ -3390,13 +3457,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_if_condition_with_background_is_error() {
-        // `&` is not allowed inside an `if` condition/body (v17 limitation).
-        let r = parse(vec![
+    fn parse_if_condition_with_background_is_accepted() {
+        // v98: `if a & then b; fi` — the `&` backgrounds the condition `a`
+        // (bash-correct); the condition sequence has background=true.
+        let c = parse(vec![
             kw("if"), w_tok("a"), Token::Op(Operator::Background),
             kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
-        ]);
-        assert_eq!(r, Err(ParseError::UnexpectedBackground));
+        ]).unwrap().unwrap();
+        match &c.first {
+            Command::If(clause) => {
+                assert!(clause.condition.background, "condition should be backgrounded");
+            }
+            other => panic!("expected if clause, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3527,13 +3600,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_while_background_in_body_is_error() {
-        let r = parse(vec![
+    fn parse_while_background_in_body_is_accepted() {
+        // v98: `while a; do b & done` — the `&` backgrounds `b` in the loop
+        // body (bash-correct); the body sequence has background=true.
+        let c = parse(vec![
             kw("while"), w_tok("a"), Token::Op(Operator::Semi),
             kw("do"), w_tok("b"), Token::Op(Operator::Background),
             kw("done"),
-        ]);
-        assert_eq!(r, Err(ParseError::UnexpectedBackground));
+        ]).unwrap().unwrap();
+        match &c.first {
+            Command::While(clause) => {
+                assert!(clause.body.background, "body should be backgrounded");
+            }
+            other => panic!("expected while clause, got {other:?}"),
+        }
     }
 
     #[test]
