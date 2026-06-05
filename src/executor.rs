@@ -947,8 +947,15 @@ fn eval_binary(
         | TestBinaryOp::IntLe
         | TestBinaryOp::IntGe => {
             let rhs = expand_assignment(rhs_word, shell);
-            let l: i64 = lhs.parse().map_err(|_| format!("bad integer: {lhs}"))?;
-            let r: i64 = rhs.parse().map_err(|_| format!("bad integer: {rhs}"))?;
+            let parse_int = |s: &str| -> Result<i64, String> {
+                let t = s.trim();
+                if t.is_empty() {
+                    return Ok(0);
+                }
+                t.parse().map_err(|_| format!("bad integer: {s}"))
+            };
+            let l: i64 = parse_int(lhs)?;
+            let r: i64 = parse_int(&rhs)?;
             Ok(match op {
                 TestBinaryOp::IntEq => l == r,
                 TestBinaryOp::IntNe => l != r,

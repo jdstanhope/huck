@@ -67,3 +67,10 @@ fn indirect_spaced_source_value_is_not_trimmed() {
     // NOT resolved to the trimmed name. (Verbatim, no trim.)
     assert_eq!(run("x=hi\nref=\" x \"\necho \"[${!ref}]\"\n").0, "[]\n");
 }
+
+#[test]
+fn dbracket_empty_operand_is_zero() {
+    assert_eq!(run("[[ \"\" -ge 0 ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(run("[[ \"\" -eq 0 ]] && echo Y || echo N\n").0, "Y\n");
+    assert_eq!(run("[[ 3 -gt \"\" ]] && echo Y || echo N\n").0, "Y\n");
+}
