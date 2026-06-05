@@ -2494,10 +2494,55 @@ pub(crate) fn call_function_body(
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     crate::traps::fire_debug_trap(shell);
-    let resolved = match resolve(cmd, shell) {
+    let mut resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
     };
+
+    // `command CMD args` (bare form): run CMD suppressing shell-FUNCTION lookup
+    // (builtins + $PATH still resolve). `-v`/`-V` introspection is left to the
+    // `command` builtin (not intercepted here).
+    let mut bypass_functions = false;
+    while resolved.program == "command" {
+        // Scan leading flags in resolved.args.
+        let mut idx = 0;
+        let mut introspect = false;
+        loop {
+            match resolved.args.get(idx).map(String::as_str) {
+                Some("-v") | Some("-V") => {
+                    introspect = true;
+                    break;
+                }
+                Some("-p") => idx += 1, // accept; v99 uses current $PATH
+                Some("--") => {
+                    idx += 1;
+                    break;
+                }
+                Some(s) if s.starts_with('-') && s.len() > 1 => {
+                    eprintln!("huck: command: {s}: invalid option");
+                    return ExecOutcome::Continue(2);
+                }
+                _ => break, // first operand (or end)
+            }
+        }
+        if introspect {
+            break; // leave program=="command" -> dispatch runs builtin_command (-v/-V)
+        }
+        // Bare form: the operand at `idx` (if any) becomes the new program.
+        match resolved.args.get(idx) {
+            None => return ExecOutcome::Continue(0), // `command` / `command -p` alone
+            Some(_) => {
+                let new_program = resolved.args[idx].clone();
+                let new_args = resolved.args[idx + 1..].to_vec();
+                resolved.program = new_program;
+                resolved.args = new_args;
+                // The inner CMD is not the outer `command`'s declaration form.
+                resolved.decl_args = None;
+                bypass_functions = true;
+                // loop: collapse `command command …`
+            }
+        }
+    }
 
     // Apply inline assignments (e.g. FOO=bar in `FOO=bar cmd args`) before
     // dispatch. The snapshot is used to restore state for temporary-scope
@@ -2549,7 +2594,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 }
             },
         }
-    } else if let Some(body) = shell.functions.get(&resolved.program).cloned() {
+    } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
         call_function(&resolved.program.clone(), body, resolved.args, shell, sink)
     } else if builtins::is_builtin(&resolved.program) {
         let files = match open_stage_files(&resolved, shell) {

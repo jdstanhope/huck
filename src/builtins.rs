@@ -8400,7 +8400,12 @@ mod command_tests {
     }
 
     #[test]
-    fn command_bare_form_errors() {
+    fn command_builtin_bare_form_still_errors_when_called_directly() {
+        // As of v99 the bare form `command CMD args` is handled in the executor
+        // (`run_exec_single` rewrites the program and bypasses function lookup
+        // before the `command` builtin is ever reached). The builtin itself
+        // retains its defensive rejection for the bare form when invoked
+        // directly (e.g. via run_builtin), which this test asserts.
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["echo".to_string(), "hi".to_string()];
