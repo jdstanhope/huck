@@ -46,6 +46,18 @@ whole-group backgrounding for `a && b &` — because backgrounding a group reuse
 the existing "wrap the group in a synthetic `Subshell` and fork" mechanism that
 `execute()` already uses for `(multi-command sequence) &`.
 
+### Future work (deferred)
+
+This iteration keeps the flat `Sequence` model and computes and-or group
+boundaries in the executor. That is correct and low-risk, but the flat model
+(no nested and-or grammar) remains a structural shortcut: features that need a
+*first-class* and-or node — e.g. timing/`time` on a group, per-group traps, or a
+cleaner `$?`/pipeline-status model — may eventually want the proper restructure
+of `Sequence` into nested and-or lists (`list → and_or → pipeline → command`).
+Recorded as a future refactor (a low-priority `[deferred]` note in
+`docs/bash-divergences.md`), NOT done here: the executor-grouping approach
+delivers identical observable semantics for `&`/`;`/`&&`/`||`/backgrounding.
+
 ## Section 1 — AST (`src/command.rs`)
 
 Add `Connector::Amp` to `enum Connector { Semi, And, Or, Amp }`. An `Amp`
