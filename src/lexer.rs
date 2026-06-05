@@ -142,6 +142,11 @@ pub enum WordPart {
         /// `Some(...)` for `${a[i]}` / `${a[@]}` / `${a[*]}`;
         /// `None` for `${a}`.
         subscript: Option<SubscriptKind>,
+        /// `${!name}` indirect expansion: resolve `name`'s value to an
+        /// effective name, then expand THAT (with `modifier`). v95.
+        /// Distinct from `ParamModifier::IndirectKeys` (`${!a[@]}` array
+        /// keys), which keeps `indirect: false`.
+        indirect: bool,
     },
     /// `$@` (joined=false) or `$*` (joined=true). `quoted` reflects whether
     /// this was inside double quotes.
@@ -1761,7 +1766,7 @@ fn read_braced_param_expansion(
             }
             // `${@<mod>...}` — fall through to the modifier dispatcher
             // with name="@" and no subscript.
-            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts);
+            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false);
         }
         Some('*') => {
             chars.next();
@@ -1770,7 +1775,7 @@ fn read_braced_param_expansion(
                 parts.push(WordPart::AllArgs { joined: true, quoted });
                 return Ok(());
             }
-            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts);
+            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false);
         }
         _ => {}
     }
@@ -1824,6 +1829,7 @@ fn read_braced_param_expansion(
             modifier: ParamModifier::Length,
             quoted,
             subscript,
+            indirect: false,
         });
         return Ok(());
     }
@@ -1840,7 +1846,7 @@ fn read_braced_param_expansion(
             }
         }
         // Positional parameters cannot be subscripted.
-        return dispatch_braced_modifier(name, quoted, None, chars, parts);
+        return dispatch_braced_modifier(name, quoted, None, chars, parts, false);
     }
 
     // `${!NAME[@]}` / `${!NAME[*]}` — array-keys form (v71). The bare
@@ -1864,13 +1870,16 @@ fn read_braced_param_expansion(
                     modifier: ParamModifier::IndirectKeys,
                     quoted,
                     subscript,
+                    indirect: false,
                 });
                 return Ok(());
             }
             _ => {
-                // `${!NAME}` or `${!NAME[i]}` — neither shape is
-                // supported in v71.
-                return Err(LexError::InvalidBraceModifier("!".to_string()));
+                // `${!NAME}` / `${!NAME-word}` / `${!NAME[i]}` — indirect
+                // scalar expansion (v95): resolve NAME's value to a name,
+                // then expand that (with any trailing modifier). The name +
+                // (non-`[@]`/`[*]`) subscript are already read/scanned here.
+                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true);
             }
         }
     }
@@ -1881,7 +1890,7 @@ fn read_braced_param_expansion(
     }
     // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
     let subscript = scan_param_subscript(chars)?;
-    dispatch_braced_modifier(name, quoted, subscript, chars, parts)
+    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false)
 }
 
 /// Scans an optional `[…]` subscript immediately after the parameter name
@@ -2193,6 +2202,7 @@ fn dispatch_braced_modifier(
     subscript: Option<SubscriptKind>,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     parts: &mut Vec<WordPart>,
+    indirect: bool,
 ) -> Result<(), LexError> {
     match chars.next() {
         Some('}') => {
@@ -2209,6 +2219,20 @@ fn dispatch_braced_modifier(
                     modifier: ParamModifier::None,
                     quoted,
                     subscript,
+                    indirect,
+                });
+                return Ok(());
+            }
+            if indirect {
+                // Bare `${!ref}` — indirect scalar expansion with no
+                // trailing modifier. Emit `ParamModifier::None` so the
+                // eval `indirect` branch resolves the through-value.
+                parts.push(WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::None,
+                    quoted,
+                    subscript,
+                    indirect: true,
                 });
                 return Ok(());
             }
@@ -2220,25 +2244,25 @@ fn dispatch_braced_modifier(
                 Some('-') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('=') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('?') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('+') => {
                     chars.next();
                     let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
-                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+                    parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('}') => Err(LexError::InvalidBraceModifier(":".to_string())),
@@ -2249,6 +2273,7 @@ fn dispatch_braced_modifier(
                         modifier: ParamModifier::Substring { offset, length },
                         quoted,
                         subscript,
+                        indirect,
                     });
                     Ok(())
                 }
@@ -2257,36 +2282,36 @@ fn dispatch_braced_modifier(
         }
         Some('-') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('=') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('?') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('+') => {
             let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('#') => {
             let longest = chars.peek() == Some(&'#');
             if longest { chars.next(); }
             let modifier = modifier_with_operand(chars, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('%') => {
             let longest = chars.peek() == Some(&'%');
             if longest { chars.next(); }
             let modifier = modifier_with_operand(chars, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
-            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript });
+            parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('/') => {
@@ -2303,6 +2328,7 @@ fn dispatch_braced_modifier(
                 modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
                 quoted,
                 subscript,
+                indirect,
             });
             Ok(())
         }
@@ -2315,6 +2341,7 @@ fn dispatch_braced_modifier(
                 modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
                 quoted,
                 subscript,
+                indirect,
             });
             Ok(())
         }
@@ -2327,6 +2354,7 @@ fn dispatch_braced_modifier(
                 modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
                 quoted,
                 subscript,
+                indirect,
             });
             Ok(())
         }
@@ -4168,6 +4196,44 @@ mod tests {
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_indirect_bare() {
+        // `${!ref}` — v95 indirect scalar expansion, no modifier.
+        let tokens = tokenize("${!ref}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "ref");
+        assert!(*indirect);
+        assert!(matches!(modifier, ParamModifier::None));
+        assert!(subscript.is_none());
+    }
+
+    #[test]
+    fn tokenize_indirect_with_default_modifier() {
+        // `${!ref-w}` — v95 indirect + trailing UseDefault modifier.
+        let tokens = tokenize("${!ref-w}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "ref");
+        assert!(*indirect);
+        assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_indirect_array_keys_is_not_indirect() {
+        // Regression: `${!a[@]}` is array-keys (IndirectKeys), NOT the
+        // scalar indirect path — it must keep `indirect: false`.
+        let tokens = tokenize("${!a[@]}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "a");
+        assert!(!(*indirect));
+        assert!(matches!(modifier, ParamModifier::IndirectKeys));
     }
 
     #[test]

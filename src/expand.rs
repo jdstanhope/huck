@@ -398,6 +398,81 @@ fn expand_assoc_param(
     }
 }
 
+/// `${!name<modifier>}` indirect expansion: resolve `name`(+`subscript`)'s
+/// scalar value to an effective name N, then expand `${N<modifier>}`.
+///
+/// Through-value resolution: a plain name uses `shell.lookup_var` (which
+/// resolves named vars, positionals, and specials); a subscripted source
+/// (`${!a[i]}`) reads the array element scalar. An empty/all-whitespace
+/// through-value yields `Empty`. The effective name N is interpreted as a
+/// parameter reference: a plain name, a positional digit / special param,
+/// or `name[sub]` (re-expanded as an array element).
+///
+/// `set -u`: a truly-unset plain source (no subscript) raises the same
+/// unbound-variable fatal as a normal `${unset}` reference.
+fn expand_indirect(
+    name: &str,
+    subscript: Option<&crate::lexer::SubscriptKind>,
+    modifier: &crate::lexer::ParamModifier,
+    quoted: bool,
+    shell: &mut Shell,
+) -> crate::param_expansion::ExpansionResult {
+    use crate::param_expansion::ExpansionResult;
+    // Step 1: through-value = scalar value of (name, subscript).
+    let through = match subscript {
+        None => match shell.lookup_var(name) {
+            Some(v) => v,
+            None => {
+                // Source name is unset. Under `set -u`, a normal `${name}`
+                // reference is fatal; mirror that here.
+                if shell.shell_options.nounset {
+                    eprintln!("huck: {name}: unbound variable");
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+                String::new()
+            }
+        },
+        Some(sub) => {
+            // Indirect through an array element: read its scalar value;
+            // empty if absent.
+            match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, quoted, shell) {
+                ExpansionResult::Value(v) => v,
+                _ => String::new(),
+            }
+        }
+    };
+    let n = through.trim();
+    if n.is_empty() {
+        return ExpansionResult::Empty;
+    }
+    // Step 2: parse N into (effective_name, effective_subscript) and
+    // re-expand. The only structured form we honor is `name[sub]`.
+    if let Some((base, sub_text)) = split_name_subscript(n) {
+        let sub = crate::lexer::SubscriptKind::Index(Word(vec![
+            WordPart::Literal { text: sub_text, quoted: false },
+        ]));
+        return expand_array_param(&base, modifier, &sub, quoted, shell);
+    }
+    crate::param_expansion::expand_modifier(n, modifier, shell)
+}
+
+/// Splits a `name[sub]` effective-name string into `(name, sub)`. Returns
+/// `None` for a plain name / positional / special param (the common path).
+/// Only the simple `ends-with-']' and contains-'['` shape is recognized;
+/// the inner `sub` text is re-parsed as an arithmetic subscript Word.
+fn split_name_subscript(n: &str) -> Option<(String, String)> {
+    if !n.ends_with(']') {
+        return None;
+    }
+    let open = n.find('[')?;
+    if open == 0 {
+        return None;
+    }
+    let base = n[..open].to_string();
+    let sub = n[open + 1..n.len() - 1].to_string();
+    Some((base, sub))
+}
+
 /// Dispatches `${a[...]}` forms. The `subscript` field of
 /// `WordPart::ParamExpansion` distinguishes `[@]`, `[*]`, and
 /// `[<expr>]`; the `modifier` is the scalar-style suffix (or
@@ -692,11 +767,13 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
                 // Substring on `$@` / `$*` is array-shaped (closes v33's
                 // `${@:o:l}` deferral) — route through the shared
                 // word-list path even though there's no `subscript`.
-                let result_pe = if let Some(sub) = subscript {
+                let result_pe = if *indirect {
+                    expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
+                } else if let Some(sub) = subscript {
                     expand_array_param(name, modifier, sub, *quoted, shell)
                 } else if matches!(
                     (name.as_str(), modifier),
@@ -818,8 +895,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     }
                 }
             }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript } => {
-                let result_pe = if let Some(sub) = subscript {
+            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+                let result_pe = if *indirect {
+                    expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
+                } else if let Some(sub) = subscript {
                     expand_array_param(name, modifier, sub, *quoted, shell)
                 } else if matches!(
                     (name.as_str(), modifier),
@@ -1942,6 +2021,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1960,6 +2040,7 @@ mod tests {
             },
             quoted: true,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1979,6 +2060,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         let strings: Vec<String> = fields.into_iter().map(|f| f.chars).collect();
@@ -1997,6 +2079,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let value = expand_assignment(&word, &mut shell);
         assert_eq!(value, "a b c");
@@ -2014,6 +2097,7 @@ mod tests {
             },
             quoted: false,
             subscript: None,
+            indirect: false,
         }]);
         let fields = expand(&word, &mut shell);
         // v34 (Task 4): expand() now bails early on Fatal, stashing status on
