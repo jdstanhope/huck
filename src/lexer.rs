@@ -1649,9 +1649,10 @@ fn scan_paren_substitution(
                 body.push(c);
             }
             '(' => {
-                // Bare `(` is just a character. huck has no subshell
-                // `(cmd)` syntax — only `$(` increments depth (handled in
-                // the `$` arm below).
+                // A subshell `(cmd)` or the inner `(` of `$((…))` raises depth
+                // so its matching `)` doesn't close the command substitution
+                // early. (huck has had subshell syntax since v28.)
+                depth += 1;
                 body.push(c);
             }
             '\\' => {
@@ -3636,6 +3637,32 @@ mod tests {
                 quoted: false,
             }])]
         );
+    }
+
+    #[test]
+    fn tokenize_command_sub_with_subshell_body() {
+        // v101: `$( (echo a) )` — the inner `(` raises paren depth so the
+        // subshell's `)` doesn't close the command substitution early. Used to
+        // error with UnterminatedSubstitution (the bare-`(` arm didn't count).
+        let tokens = tokenize("$( (echo a) )").unwrap();
+        assert_eq!(tokens.len(), 1);
+        match &tokens[0] {
+            Token::Word(Word(parts)) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    WordPart::CommandSub { sequence, .. } => {
+                        // The command sub's body is a single subshell `(echo a)`.
+                        assert!(
+                            matches!(&sequence.first, crate::command::Command::Subshell { .. }),
+                            "expected first command to be a Subshell, got {:?}",
+                            sequence.first
+                        );
+                    }
+                    other => panic!("expected CommandSub, got {other:?}"),
+                }
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
     }
 
     #[test]
