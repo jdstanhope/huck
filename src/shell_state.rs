@@ -441,6 +441,7 @@ impl Shell {
                 self.last_bg_pid.map(|p| p.to_string()).unwrap_or_default()
             ),
             "-" => return Some(self.dollar_dash_value()),
+            "?" => return Some(self.last_status().to_string()),
             _ => {}
         }
         if name == "#" {

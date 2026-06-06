@@ -1812,6 +1812,21 @@ fn read_braced_param_expansion(
             }
             return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false);
         }
+        // Scalar special params: ${-} (option flags), ${?} (exit status),
+        // ${$} (shell pid). Route bare `}` and modifiers through the
+        // dispatcher (e.g. `${-#*e}` from nvm). Resolved by `lookup_var`.
+        Some('-') => {
+            chars.next();
+            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false);
+        }
+        Some('?') => {
+            chars.next();
+            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false);
+        }
+        Some('$') => {
+            chars.next();
+            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false);
+        }
         _ => {}
     }
 
@@ -1890,6 +1905,12 @@ fn read_braced_param_expansion(
     // the name.
     if chars.peek() == Some(&'!') {
         chars.next(); // consume '!'
+        // Bare `${!}` is the `$!` special param (last bg pid), NOT indirect.
+        if chars.peek() == Some(&'}') {
+            chars.next(); // consume `}`
+            parts.push(WordPart::Var { name: "!".to_string(), quoted });
+            return Ok(());
+        }
         // `${!N}` — indirect through a numeric positional source (e.g.
         // `${!2}`, `${!1-default}`). The source name is a positional
         // parameter reference; `read_braced_name` rejects digit-leading
@@ -4344,6 +4365,71 @@ mod tests {
         assert_eq!(name, "a");
         assert!(!(*indirect));
         assert!(matches!(modifier, ParamModifier::IndirectKeys));
+    }
+
+    #[test]
+    fn tokenize_braced_dash_bare() {
+        // v102: `${-}` — option-flags special param, no modifier. Like
+        // `${a}`, the bare form is emitted as a plain Var, not ParamExpansion.
+        let tokens = tokenize("${-}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Var { name, .. } = &parts[0]
+        else { panic!("expected Var, got {:?}", parts[0]) };
+        assert_eq!(name, "-");
+    }
+
+    #[test]
+    fn tokenize_braced_dash_remove_prefix() {
+        // v102: `${-#*e}` — nvm's errexit driver, RemovePrefix modifier.
+        let tokens = tokenize("${-#*e}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "-");
+        assert!(!(*indirect));
+        assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: false, .. }));
+    }
+
+    #[test]
+    fn tokenize_braced_status_bare() {
+        // v102: `${?}` — exit-status special param, bare form is a Var.
+        let tokens = tokenize("${?}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Var { name, .. } = &parts[0]
+        else { panic!("expected Var, got {:?}", parts[0]) };
+        assert_eq!(name, "?");
+    }
+
+    #[test]
+    fn tokenize_braced_pid_bare() {
+        // v102: `${$}` — shell-pid special param, bare form is a Var.
+        let tokens = tokenize("${$}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Var { name, .. } = &parts[0]
+        else { panic!("expected Var, got {:?}", parts[0]) };
+        assert_eq!(name, "$");
+    }
+
+    #[test]
+    fn tokenize_braced_bgpid_bare() {
+        // v102: bare `${!}` is the `$!` last-bg-pid special param,
+        // emitted as a plain Var, NOT the v95 indirect path.
+        let tokens = tokenize("${!}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::Var { name, .. } = &parts[0]
+        else { panic!("expected Var, got {:?}", parts[0]) };
+        assert_eq!(name, "!");
+    }
+
+    #[test]
+    fn tokenize_braced_indirect_still_indirect() {
+        // Regression: `${!var}` (non-`}` after `!`) stays the v95 indirect path.
+        let tokens = tokenize("${!var}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "var");
+        assert!(*indirect);
     }
 
     #[test]
