@@ -589,6 +589,50 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
     Ok(Some(seq))
 }
 
+/// Parses one sequence ELEMENT: a command, plus — if a `|` immediately
+/// follows — the rest of the pipeline (the command is the first stage).
+/// `parse_command` already consumes a pipeline when the first stage is a
+/// SIMPLE command; this helper adds the wrap for a COMPOUND/subshell first
+/// stage (which `parse_command` returns without checking for a trailing `|`).
+/// Returns `raw` unchanged when no `|` follows — so non-pipeline elements are
+/// byte-identical to before.
+fn parse_command_then_pipeline<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Command, ParseError> {
+    let raw = parse_command(iter)?;
+    if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+        // The bang wrapper in `parse_command` may have produced a 1-element
+        // negated Pipeline around a compound/subshell first stage (e.g.
+        // `! ( false ) | cat`). Since `!` negates the WHOLE pipeline, hoist
+        // its `negate` flag to the outer pipeline and unwrap the inner stage.
+        let (negate, first_stage) = match raw {
+            Command::Pipeline(p) if p.negate && p.commands.len() == 1 => {
+                (true, p.commands.into_iter().next().unwrap())
+            }
+            other => (false, other),
+        };
+        let mut stages = vec![first_stage];
+        iter.next(); // consume `|`
+        skip_newlines(iter);
+        let mut more = true;
+        while more {
+            let (cmd, next_pipe) = parse_next_stage(iter)?;
+            stages.push(cmd);
+            if next_pipe {
+                // Simple stage already consumed its own `|`; continue.
+            } else if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+                iter.next();
+                skip_newlines(iter);
+            } else {
+                more = false;
+            }
+        }
+        Ok(Command::Pipeline(Pipeline { negate, commands: stages }))
+    } else {
+        Ok(raw)
+    }
+}
+
 /// Parses commands joined by `;` / `&&` / `||` (and an optional trailing
 /// `&` at top level only). Stops — without consuming — when the next
 /// token is a keyword in `stop_at`. `stop_at` is empty only at the top
@@ -597,37 +641,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
-    let raw_first = parse_command(iter)?;
-    // If the command is immediately followed by `|`, it is the first stage of
-    // a pipeline — even if it is a compound command (if/while/for/case/brace).
-    // `parse_command` dispatches compound commands without checking for a
-    // trailing `|`, so we handle that here.
-    let first = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-        let mut stages = vec![raw_first];
-        // Consume the `|` that was peeked above.
-        iter.next();
-        skip_newlines(iter);
-        let mut more_stages = true;
-        while more_stages {
-            let (cmd, next_pipe) = parse_next_stage(iter)?;
-            stages.push(cmd);
-            if next_pipe {
-                // Simple stage: it already consumed the `|` internally.
-                // Continue to collect the next stage.
-            } else {
-                // Compound stage: did not consume a trailing `|`. Check now.
-                if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                    iter.next(); // consume `|`
-                    skip_newlines(iter);
-                } else {
-                    more_stages = false;
-                }
-            }
-        }
-        Command::Pipeline(Pipeline { negate: false, commands: stages })
-    } else {
-        raw_first
-    };
+    let first = parse_command_then_pipeline(iter)?;
     let mut rest = Vec::new();
     let mut background = false;
 
@@ -687,7 +701,7 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                     // A command follows -> `&` is a separator: background the
                     // preceding group, continue the list.
                     Some(_) => {
-                        rest.push((Connector::Amp, parse_command(iter)?));
+                        rest.push((Connector::Amp, parse_command_then_pipeline(iter)?));
                     }
                 }
             }
@@ -704,15 +718,15 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                         }
                     }
                 }
-                rest.push((Connector::Semi, parse_command(iter)?));
+                rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
             }
             Token::Op(Operator::And) => {
                 skip_newlines(iter);
-                rest.push((Connector::And, parse_command(iter)?));
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
             Token::Op(Operator::Or) => {
                 skip_newlines(iter);
-                rest.push((Connector::Or, parse_command(iter)?));
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
             }
             other => {
                 if let Some(kw) = keyword_of(&other) {
@@ -1436,32 +1450,8 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Sequence, ParseError> {
     // Parse first command. It may itself be a subshell, compound command, etc.
-    let raw_first = parse_command(iter)?;
-
-    // If followed by `|`, wrap into a pipeline (same logic as parse_sequence).
-    let first = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-        let mut stages = vec![raw_first];
-        iter.next(); // consume `|`
-        skip_newlines(iter);
-        let mut more_stages = true;
-        while more_stages {
-            let (cmd, next_pipe) = parse_next_stage(iter)?;
-            stages.push(cmd);
-            if next_pipe {
-                // simple stage already consumed `|`; continue.
-            } else {
-                if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                    iter.next();
-                    skip_newlines(iter);
-                } else {
-                    more_stages = false;
-                }
-            }
-        }
-        Command::Pipeline(Pipeline { negate: false, commands: stages })
-    } else {
-        raw_first
-    };
+    // — and, if followed by `|`, the rest of the pipeline.
+    let first = parse_command_then_pipeline(iter)?;
 
     let mut rest = Vec::new();
     loop {
@@ -1484,28 +1474,7 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 if iter.peek().is_none() {
                     return Err(ParseError::UnterminatedSubshell);
                 }
-                let raw = parse_command(iter)?;
-                let cmd = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                    let mut stages = vec![raw];
-                    iter.next();
-                    skip_newlines(iter);
-                    let mut more = true;
-                    while more {
-                        let (c, np) = parse_next_stage(iter)?;
-                        stages.push(c);
-                        if !np {
-                            if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                                iter.next();
-                                skip_newlines(iter);
-                            } else {
-                                more = false;
-                            }
-                        }
-                    }
-                    Command::Pipeline(Pipeline { negate: false, commands: stages })
-                } else {
-                    raw
-                };
+                let cmd = parse_command_then_pipeline(iter)?;
                 rest.push((Connector::Semi, cmd));
             }
             Some(Token::Op(Operator::Background)) => {
@@ -1532,39 +1501,18 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
                 // More commands follow (`(cmd1 & cmd2)` pattern): parse the
                 // next command and continue. The `&` backgrounds the preceding
                 // group (v98); only the trailing `&` before `)` sets background.
-                let raw = parse_command(iter)?;
-                let cmd = if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                    let mut stages = vec![raw];
-                    iter.next();
-                    skip_newlines(iter);
-                    let mut more = true;
-                    while more {
-                        let (c, np) = parse_next_stage(iter)?;
-                        stages.push(c);
-                        if !np {
-                            if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
-                                iter.next();
-                                skip_newlines(iter);
-                            } else {
-                                more = false;
-                            }
-                        }
-                    }
-                    Command::Pipeline(Pipeline { negate: false, commands: stages })
-                } else {
-                    raw
-                };
+                let cmd = parse_command_then_pipeline(iter)?;
                 rest.push((Connector::Amp, cmd));
             }
             Some(Token::Op(Operator::And)) => {
                 iter.next();
                 skip_newlines(iter);
-                rest.push((Connector::And, parse_command(iter)?));
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
             Some(Token::Op(Operator::Or)) => {
                 iter.next();
                 skip_newlines(iter);
-                rest.push((Connector::Or, parse_command(iter)?));
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
             }
             // Any other token (stray keyword, another `(`, etc.) after a
             // complete command and before `)` is unexpected.
@@ -5065,6 +5013,37 @@ mod tests {
         let p = first_pipeline(&seq);
         assert!(!p.negate);
         // first stage is the `[` simple command with `!` among its args
+    }
+
+    #[test]
+    fn subshell_pipe_after_semi_wraps_in_pipeline() {
+        // `echo z; ( echo a ) | cat` → rest[0] is a Pipeline whose first
+        // stage is a Subshell (M-11a: subshell-headed pipe in non-first pos).
+        let seq = parse_seq("echo z; ( echo a ) | cat");
+        assert_eq!(seq.rest.len(), 1);
+        let (conn, cmd) = &seq.rest[0];
+        assert_eq!(*conn, Connector::Semi);
+        match cmd {
+            Command::Pipeline(p) => {
+                assert!(!p.negate);
+                assert_eq!(p.commands.len(), 2);
+                assert!(matches!(p.commands[0], Command::Subshell { .. }));
+            }
+            other => panic!("expected Pipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_sequence_element_is_not_a_multistage_pipeline() {
+        // `x; a` → rest[0] is the unchanged single-command result (no `|`
+        // follows, so the helper returns `raw` verbatim — a 1-element
+        // pipeline, exactly as `parse_command` produced before M-11a).
+        let seq = parse_seq("x; a");
+        assert_eq!(seq.rest.len(), 1);
+        match &seq.rest[0].1 {
+            Command::Pipeline(p) => assert_eq!(p.commands.len(), 1, "got {p:?}"),
+            other => panic!("expected 1-element Pipeline, got {other:?}"),
+        }
     }
 
     #[test]
