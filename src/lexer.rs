@@ -279,7 +279,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// the byte offset where lexing failed.
 // Consumed by the linear source reader (a later v104 task); the offset sidecar
 // lands first behind this thin public wrapper.
-#[allow(dead_code)]
 pub fn tokenize_with_offsets(
     input: &str,
     opts: LexerOptions,

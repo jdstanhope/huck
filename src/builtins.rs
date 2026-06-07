@@ -4962,85 +4962,129 @@ pub(crate) fn run_sourced_contents(
     path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
 ) -> ExecOutcome {
-    use crate::continuation::{classify, Completeness};
     let mut last_status = shell.last_status();
-    let mut buf = String::new();
-    let mut physical_line: usize = 0;
-    let mut cmd_start_line: usize = 0;
-    for line in contents.lines() {
-        physical_line += 1;
-        if buf.is_empty() {
-            cmd_start_line = physical_line;
+
+    let line_of = |abs: usize| -> usize {
+        1 + contents.as_bytes()[..abs.min(contents.len())]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+    };
+    let next_line_start = |from: usize| -> usize {
+        match contents[from.min(contents.len())..].find('\n') {
+            Some(rel) => (from + rel + 1).min(contents.len()),
+            None => contents.len(),
         }
-        // `set -v` verbose: echo each physical input line to stderr as read.
-        if shell.shell_options.verbose {
-            eprintln!("{line}");
+    };
+
+    let mut start = 0usize; // byte offset of the unconsumed remainder
+    let mut prev_end = 0usize; // bytes already echoed for `set -v`
+
+    'outer: loop {
+        if start >= contents.len() {
+            break;
         }
-        buf.push_str(line);
-        buf.push('\n');
         let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-        if let Completeness::Incomplete(_) = classify(&buf, extglob) {
-            continue;
-        }
-        let tokens = match crate::lexer::tokenize_with_opts(
-            &buf,
+        let (tokens, offsets) = match crate::lexer::tokenize_with_offsets(
+            &contents[start..],
             crate::lexer::LexerOptions { extglob },
         ) {
-            Ok(t) if t.is_empty() => {
-                buf.clear();
-                continue;
-            }
             Ok(t) => t,
-            Err(e) => {
+            Err((e, fail_off)) => {
                 eprintln!(
                     "huck: {}: line {}: syntax error{}",
                     path.display(),
-                    cmd_start_line,
+                    line_of(start + fail_off),
                     crate::shell::lex_error_message(e)
                 );
                 last_status = 2;
-                buf.clear();
-                continue;
+                start = next_line_start(start + fail_off);
+                prev_end = start;
+                continue 'outer;
             }
         };
-        match crate::command::parse(tokens) {
-            Ok(Some(seq)) => {
-                let outcome = crate::executor::execute(&seq, shell, &buf);
-                buf.clear();
-                match outcome {
-                    ExecOutcome::Continue(c) => {
-                        last_status = c;
-                        // In a non-interactive shell, a fatal parameter-
-                        // expansion error (set -u unbound var, ${x:?}, etc.)
-                        // must abort the rest of the program like bash. Drain
-                        // it mid-loop rather than only at the end. Gated on
-                        // !is_interactive so interactive source/. and the rc
-                        // path keep continuing past the error.
-                        if !shell.is_interactive
-                            && let Some(st) = shell.take_pending_fatal_pe_error()
-                        {
-                            return ExecOutcome::Exit(st);
+        let total = tokens.len();
+        if total == 0 {
+            break;
+        }
+        let mut iter = tokens.into_iter().peekable();
+
+        loop {
+            while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) {
+                iter.next();
+            }
+            let unit_start_idx = total - iter.len();
+            if iter.peek().is_none() {
+                break 'outer;
+            }
+            match crate::command::parse_one_unit(&mut iter) {
+                Ok(None) => {
+                    break 'outer;
+                }
+                Ok(Some(seq)) => {
+                    let unit_end_idx = total - iter.len();
+                    let unit_start_abs = start + offsets[unit_start_idx];
+                    let unit_end_abs = start + offsets[unit_end_idx];
+
+                    if shell.shell_options.verbose {
+                        eprint!("{}", &contents[prev_end..unit_end_abs]);
+                    }
+                    prev_end = unit_end_abs;
+
+                    let span = &contents[unit_start_abs..unit_end_abs];
+                    let outcome = crate::executor::execute(&seq, shell, span);
+
+                    match outcome {
+                        ExecOutcome::Continue(c) => {
+                            last_status = c;
+                            // In a non-interactive shell, a fatal parameter-
+                            // expansion error (set -u unbound var, ${x:?}, etc.)
+                            // must abort the rest of the program like bash. Drain
+                            // it mid-loop rather than only at the end. Gated on
+                            // !is_interactive so interactive source/. and the rc
+                            // path keep continuing past the error.
+                            if !shell.is_interactive
+                                && let Some(st) = shell.take_pending_fatal_pe_error()
+                            {
+                                return ExecOutcome::Exit(st);
+                            }
+                        }
+                        ExecOutcome::Exit(n) => return ExecOutcome::Exit(n),
+                        ExecOutcome::FunctionReturn(n) => {
+                            return ExecOutcome::Continue(n);
+                        }
+                        ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
+                            last_status = 0;
                         }
                     }
-                    ExecOutcome::Exit(n) => return ExecOutcome::Exit(n),
-                    ExecOutcome::FunctionReturn(n) => {
-                        return ExecOutcome::Continue(n);
-                    }
-                    ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
-                        last_status = 0;
+
+                    // A command may have flipped `shopt extglob`, which changes
+                    // how the remainder must be lexed. Re-lex from here.
+                    let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+                    if new_extglob != extglob {
+                        start = unit_end_abs;
+                        prev_end = start;
+                        continue 'outer;
                     }
                 }
+                Err(e) => {
+                    eprintln!(
+                        "huck: {}: line {}: syntax error: {}",
+                        path.display(),
+                        line_of(start + offsets[unit_start_idx]),
+                        crate::shell::parse_error_message(e)
+                    );
+                    last_status = 2;
+                    for t in iter.by_ref() {
+                        if matches!(t, crate::lexer::Token::Newline) {
+                            break;
+                        }
+                    }
+                    prev_end = start + offsets[total - iter.len()];
+                }
             }
-            Ok(None) => buf.clear(),
-            Err(e) => {
-                eprintln!(
-                    "huck: {}: line {}: syntax error: {}",
-                    path.display(),
-                    cmd_start_line,
-                    crate::shell::parse_error_message(e)
-                );
-                last_status = 2;
-                buf.clear();
+            if iter.peek().is_none() {
+                break 'outer;
             }
         }
     }

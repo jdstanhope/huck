@@ -648,7 +648,6 @@ fn parse_sequence<I: Iterator<Item = Token>>(
 /// (and consuming) the next top-level newline or EOF. Skips leading blank-line
 /// newlines. Returns `Ok(None)` when only newlines / EOF remain. Used by the
 /// non-interactive script reader.
-#[allow(dead_code)] // consumed by the v104 source reader (later task)
 pub fn parse_one_unit<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
 ) -> Result<Option<Sequence>, ParseError> {
