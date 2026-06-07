@@ -926,6 +926,16 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<
             Some(&c) => c,
         };
         if depth == 0 && c.is_whitespace() {
+            // Leading whitespace only reaches here after a `\`-newline line
+            // continuation was consumed just before the operand began (e.g.
+            // bash_completion's `[[ $line =~ \<newline>   regex ]]`); the
+            // continuation line's indentation must be skipped, not treated as
+            // the (still-empty) operand's terminator. Once the operand has
+            // content, depth-0 whitespace ends it as before.
+            if lit.is_empty() && parts.is_empty() {
+                chars.next();
+                continue;
+            }
             break; // terminate, leave whitespace for the main loop
         }
         chars.next();
@@ -1836,7 +1846,20 @@ fn scan_braced_operand(
                     }
                 }
             }
-            Some('{') => { depth += 1; body.push('{'); }
+            Some('$') => {
+                // Only a `${` (dollar-brace) nests the `${...}` and needs a
+                // matching `}`. A BARE `{` (e.g. in a `%%`/`##` glob pattern like
+                // `${x%%[<{(]*}`) is a literal character and must NOT raise depth,
+                // or the real `}` would close the inner brace and the operand would
+                // never terminate.
+                body.push('$');
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    body.push('{');
+                    depth += 1;
+                }
+            }
+            Some('{') => { body.push('{'); } // bare brace: literal, does not nest
             Some('}') => {
                 if depth == 1 { return Ok(body); }
                 depth -= 1;
@@ -3177,6 +3200,29 @@ mod tests {
         let toks = tokenize("[[ x =~ (a b) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "x", "=~", "(a b)", "]]"]);
+    }
+
+    #[test]
+    fn dbracket_regex_operand_after_line_continuation() {
+        // bash_completion line 876 shape: the `=~` operand is on a `\`-newline
+        // continuation line whose indentation must NOT end the operand empty.
+        let toks = tokenize("[[ $x =~ \\\n   (a|b)c ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        // the regex operand is the single word `(a|b)c`, then `]]`.
+        assert!(texts.contains(&"(a|b)c".to_string()), "texts: {texts:?}");
+        assert!(texts.contains(&"]]".to_string()));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_) | Token::Op(Operator::LParen))));
+    }
+
+    #[test]
+    fn braced_operand_bare_brace_is_literal() {
+        // bash_completion line 849/854: `${var%%[<{(]*}` — a bare `{` in the
+        // pattern must not nest the `${...}` (only `${` nests). Previously this
+        // raised UnterminatedBrace.
+        assert!(tokenize("${x%%[<{(]*}").is_ok());
+        assert!(tokenize("${x%%{*}").is_ok());
+        // nested ${...} still depth-tracks:
+        assert!(tokenize("${x:-${y}}").is_ok());
     }
 
     #[test]
