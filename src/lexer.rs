@@ -309,11 +309,41 @@ fn tokenize_core(
     let mut has_token = false;
     let mut token_start: usize = 0;
     let mut in_assignment_value = false;
+    // `[[ … ]]` context tracking for the `=~` regex operand. `dbracket_depth`
+    // counts open `[[`; `expect_regex` is armed right after an `=~` keyword
+    // inside `[[ ]]` so the NEXT word is scanned as one literal regex Word.
+    let mut dbracket_depth: u32 = 0;
+    let mut expect_regex = false;
     let mut chars = CharCursor::new(input);
     let mut pending_heredocs: std::collections::VecDeque<PendingHeredoc> = std::collections::VecDeque::new();
 
     let result: Result<(), LexError> = (|| {
     loop {
+        // `=~` regex operand inside `[[ … ]]`: once `expect_regex` is armed and
+        // the next char is the operand's first (non-whitespace) char, scan the
+        // whole operand as one literal regex Word. Whitespace between `=~` and
+        // the operand falls through to the normal loop (which skips it and keeps
+        // `expect_regex` set). Branching before `chars.next()` keeps the emitted
+        // offset exactly at the operand's first byte.
+        if expect_regex {
+            if let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    // skip leading whitespace via the normal path below
+                } else {
+                    expect_regex = false;
+                    // The operand's first byte. Push the Word directly (NOT via
+                    // emit_word_with_braces) so no brace expansion applies.
+                    let operand_start = chars.offset();
+                    let parts = scan_regex_operand(&mut chars)?;
+                    tokens.push(Token::Word(Word(parts)));
+                    offsets.push(operand_start);
+                    has_token = false;
+                    continue;
+                }
+            } else {
+                break;
+            }
+        }
         let c_off = chars.offset();
         let c = match chars.next() {
             Some(c) => c,
@@ -326,8 +356,15 @@ fn tokenize_core(
                     !parts.is_empty(),
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
+                let kw = single_unquoted_literal(&parts).map(str::to_owned);
                 let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
                 for _ in 0..n { offsets.push(token_start); }
+                match kw.as_deref() {
+                    Some("[[") => dbracket_depth += 1,
+                    Some("]]") => dbracket_depth = dbracket_depth.saturating_sub(1),
+                    Some("=~") if dbracket_depth > 0 => expect_regex = true,
+                    _ => {}
+                }
                 has_token = false;
                 in_assignment_value = false;
             }
@@ -839,6 +876,113 @@ fn tokenize_core(
 /// quotes are preserved as their own parts so they expand at runtime; the
 /// structural `(`/`|`/`)`/prefix stay literal. EOF before the closing `)` is
 /// `LexError::UnterminatedExtglob`.
+/// `Some(text)` when `parts` is exactly one unquoted `Literal` (the keyword form,
+/// like `[[` / `]]` / `=~`); `None` otherwise.
+fn single_unquoted_literal(parts: &[WordPart]) -> Option<&str> {
+    match parts {
+        [WordPart::Literal { text, quoted: false }] => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// Scan the RHS operand of `=~` inside `[[ … ]]` as one regex word. `(`/`)`/`|`/`((`
+/// are literal; paren depth keeps unquoted whitespace part of the operand while >0.
+/// `$…`/`` `…` ``/quotes/`\` behave as in a normal word. No brace expansion, no
+/// extglob. The cursor starts at the operand's first char; returns sitting just
+/// before the terminating depth-0 whitespace (or at EOF).
+fn scan_regex_operand(chars: &mut CharCursor<'_>) -> Result<Vec<WordPart>, LexError> {
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut lit = String::new();
+    let mut depth: u32 = 0;
+    fn flush(lit: &mut String, parts: &mut Vec<WordPart>) {
+        if !lit.is_empty() {
+            parts.push(WordPart::Literal { text: std::mem::take(lit), quoted: false });
+        }
+    }
+    loop {
+        let c = match chars.peek() {
+            None => break,
+            Some(&c) => c,
+        };
+        if depth == 0 && c.is_whitespace() {
+            break; // terminate, leave whitespace for the main loop
+        }
+        chars.next();
+        match c {
+            '$' => {
+                flush(&mut lit, &mut parts);
+                read_dollar_expansion(chars, &mut parts, false)?;
+            }
+            '`' => {
+                flush(&mut lit, &mut parts);
+                let sequence = scan_backtick_substitution(chars)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: false });
+            }
+            '\'' => {
+                flush(&mut lit, &mut parts);
+                let mut inner = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(ch) => inner.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+                parts.push(WordPart::Literal { text: inner, quoted: true });
+            }
+            '"' => {
+                flush(&mut lit, &mut parts);
+                let mut q = String::new();
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => q.push(esc),
+                            Some('\n') => {}
+                            Some(other) => {
+                                q.push('\\');
+                                q.push(other);
+                            }
+                            None => return Err(LexError::UnterminatedQuote),
+                        },
+                        Some('$') => {
+                            flush_literal(&mut parts, &mut q, true);
+                            read_dollar_expansion(chars, &mut parts, true)?;
+                        }
+                        Some('`') => {
+                            flush_literal(&mut parts, &mut q, true);
+                            let sequence = scan_backtick_substitution(chars)?;
+                            parts.push(WordPart::CommandSub { sequence, quoted: true });
+                        }
+                        Some(ch) => q.push(ch),
+                        None => return Err(LexError::UnterminatedQuote),
+                    }
+                }
+                flush_literal(&mut parts, &mut q, true);
+            }
+            '\\' => match chars.next() {
+                Some('\n') => {} // line continuation
+                Some(next) => {
+                    lit.push('\\');
+                    lit.push(next);
+                }
+                None => lit.push('\\'),
+            },
+            '(' => {
+                lit.push('(');
+                depth += 1;
+            }
+            ')' => {
+                lit.push(')');
+                depth = depth.saturating_sub(1);
+            }
+            other => lit.push(other), // includes | < > ; & and depth>0 whitespace
+        }
+    }
+    flush(&mut lit, &mut parts);
+    Ok(parts)
+}
+
 fn scan_extglob_group(
     prefix: char,
     chars: &mut CharCursor<'_>,
@@ -2910,6 +3054,67 @@ mod tests {
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
         Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+    }
+
+    fn word_text(t: &Token) -> Option<String> {
+        if let Token::Word(Word(parts)) = t
+            && parts.len() == 1
+            && let WordPart::Literal { text, quoted: false } = &parts[0]
+        {
+            return Some(text.clone());
+        }
+        None
+    }
+
+    #[test]
+    fn dbracket_regex_paren_operand_is_one_word() {
+        let toks = tokenize("[[ x =~ (a) ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        assert_eq!(texts, vec!["[[", "x", "=~", "(a)", "]]"]);
+        assert!(!toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen) | Token::ArithBlock(_))));
+    }
+
+    #[test]
+    fn dbracket_regex_double_paren_not_arithblock() {
+        let toks = tokenize("[[ ab =~ ((a)) ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        assert_eq!(texts, vec!["[[", "ab", "=~", "((a))", "]]"]);
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+    }
+
+    #[test]
+    fn dbracket_regex_line847_shape() {
+        let toks = tokenize(r"[[ $option =~ (\[((no|dont)-?)\]). ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        assert!(texts.iter().any(|t| t.starts_with("(\\[")));
+        assert!(texts.contains(&"]]".to_string()));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+    }
+
+    #[test]
+    fn dbracket_regex_space_inside_parens_kept() {
+        let toks = tokenize("[[ x =~ (a b) ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        assert_eq!(texts, vec!["[[", "x", "=~", "(a b)", "]]"]);
+    }
+
+    #[test]
+    fn grouping_paren_outside_regex_still_op() {
+        let toks = tokenize("[[ ( -n a ) ]]").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen))));
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RParen))));
+    }
+
+    #[test]
+    fn arith_block_outside_dbracket_unchanged() {
+        let toks = tokenize("(( 1 + 1 ))").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+    }
+
+    #[test]
+    fn quoted_dbracket_word_does_not_change_depth() {
+        let toks = tokenize("[[ '[[' = x ]]").unwrap();
+        assert!(toks.iter().filter_map(word_text).any(|t| t == "]]"));
     }
 
     #[test]
