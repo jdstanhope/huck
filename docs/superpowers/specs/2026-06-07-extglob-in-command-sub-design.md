@@ -82,6 +82,61 @@ does not get extglob — a negligible edge (extglob inside an arithmetic-nested
 command sub is essentially never used). Record as a low `L-` note. Arithmetic
 itself does no globbing, so this loses nothing else.
 
+## Section 3.5 — Reader fix: execute the clean prefix before a failing unit (v104 interaction)
+
+**Discovered during implementation.** Section 1's threading is necessary but not
+sufficient for the `source`/file path, because the v104 reader
+(`run_sourced_contents`, `src/builtins.rs`) tokenizes a whole chunk with the
+extglob value *at chunk start*. bash_completion enables extglob at **line 45**,
+but the initial chunk (extglob off) fails to tokenize at line 1232 — a `$()`-body
+parse error becomes a `LexError::SubstitutionParseError`, so the chunk tokenize
+fails *before* line 45's `shopt` executes, and the reader discards everything up
+to the failing line. Net: huck defines 20/81 bash_completion functions. v104
+already re-lexes the remainder on an extglob *flip* (success case); the gap is the
+*error* case — a later line that cannot lex until an earlier `shopt` runs.
+
+**Fix (lexer + reader):**
+
+1. **Lexer — partial tokens on error.** Add `tokenize_partial(input, opts) ->
+   (Vec<Token>, Vec<usize>, Option<(LexError, usize)>)`: the existing
+   `tokenize_core`, but on a lex error it returns the tokens **successfully
+   produced before the error** plus `Some((error, error_byte_offset))` (offsets get
+   a trailing entry = the error offset). `tokenize_with_offsets` /
+   `tokenize_with_opts` stay as today (wrap the core and return `Err` when the
+   option is `Some`), so their existing callers/tests are unchanged. Only the
+   reader uses `tokenize_partial`.
+
+2. **Reader — consume complete units, then re-lex the truncated one.** In
+   `run_sourced_contents`, replace the all-or-nothing tokenize with
+   `tokenize_partial`. Process units from the (possibly partial) token batch via
+   `parse_one_unit` as today. When the batch carried a trailing error
+   (`terr.is_some()`):
+   - Complete units before the truncation execute normally (this is where line
+     45's `shopt -s extglob` runs).
+   - When `parse_one_unit` returns an **unterminated** error (`UnterminatedFunction`
+     / `UnterminatedLoop` / `UnterminatedIf` / `UnterminatedCase` /
+     `UnterminatedBrace` / `UnterminatedSubshell` / `UnterminatedDoubleBracket`),
+     OR the iterator empties, with `terr` set: this is the truncated trailing unit.
+     Re-lex the remainder from the truncated unit's start —
+     `start = start + offsets[unit_start_idx]` (the byte offset of that unit's
+     first token; if the iterator emptied cleanly, use `start + terr_offset`) — and
+     `continue 'outer`. The next chunk is re-tokenized with the now-current
+     `extglob`, so the previously-failing construct lexes.
+   - **Progress guard:** if the re-lex `start` would not advance past the chunk's
+     starting `start` (the truncated unit is the *first* unit — no clean prefix
+     executed, and `extglob` is unchanged from this chunk's value), then this is a
+     genuine un-lexable line: report the lex error (`terr`) at its line and
+     `start = next_line_start(start + terr_offset)` (the existing skip behavior).
+     This prevents an infinite loop on a truly malformed line.
+   - An **unterminated** error with `terr.is_none()` (the whole chunk tokenized
+     fine) is a *genuine* incomplete construct (file ends mid-`fi`) → report as
+     today. A non-unterminated parse error is handled by the existing
+     report-and-resync path regardless of `terr`.
+
+This makes the reader behave like bash (execute, then lex/parse the next command),
+recovering the early-`shopt`-then-later-extglob-use pattern. Performance is
+unaffected for clean scripts (`terr` is `None`; the path is byte-identical).
+
 ## Section 3 — Not changed
 
 - The parser, AST, evaluator, and `command::parse` — untouched.
@@ -94,7 +149,8 @@ itself does no globbing, so this loses nothing else.
 
 | File | Change |
 |------|--------|
-| `src/lexer.rs` | thread `opts: LexerOptions` through the 10 private helpers in Section 1; `tokenize(body)` → `tokenize_with_opts(body, opts)` at the recursive sites; `arith_string_to_word` passes `LexerOptions::default()` (Section 2) |
+| `src/lexer.rs` | thread `opts: LexerOptions` through the private helpers in Section 1; `tokenize(body)` → `tokenize_with_opts(body, opts)` at the recursive sites; `arith_string_to_word` passes `LexerOptions::default()` (Section 2); add `tokenize_partial` (Section 3.5) |
+| `src/builtins.rs` | `run_sourced_contents`: use `tokenize_partial`; execute the clean prefix and re-lex the truncated trailing unit so an earlier `shopt -s extglob` takes effect (Section 3.5) |
 | `tests/extglob_command_sub_integration.rs` | NEW — extglob in `$()`/backtick/array-literal/`${}` |
 | `tests/scripts/extglob_command_sub_diff_check.sh` | NEW — 31st bash-diff harness |
 | `docs/bash-divergences.md`, `README.md` | M-101 `[fixed v106]`; changelog; README row; arith-nested L-note |
@@ -120,9 +176,17 @@ itself does no globbing, so this loses nothing else.
    deterministic fragments (create temp files, `cd` to a known dir) byte-identical
    to bash 5.2 — `$()`+extglob, backtick+extglob, array-literal+extglob, and an
    extglob-off control.
-4. **Regression**: full suite (2691+), all 30 existing harnesses, and **the payoff**
-   — sourcing `/usr/share/bash-completion/bash_completion` no longer errors at
-   lines 1232/1249 (report the next gap, if any).
+4. **Reader fix (Section 3.5)**: a 3-line script
+   `shopt -s extglob` / `echo MARKER` / `echo $(printf '%s\n' !(skip))` (with a real
+   `skip` file present) must print `MARKER` AND the glob result (today MARKER is
+   skipped). A `shopt -s extglob` then a later **function** whose body has a
+   `$()`-extglob (the bash_completion `_xinetd_services` shape) must define+run. A
+   genuinely malformed line still reports once and skips (no infinite loop). A
+   clean script with no lex error is byte-identical (the `terr` path is inert).
+5. **Regression**: full suite (2691+), all 30 existing harnesses, and **the payoff**
+   — sourcing `/usr/share/bash-completion/bash_completion` defines ≈ bash's count
+   of functions and no longer errors at lines 1232/1249 (report the next gap, if
+   any).
 
 ## Edge cases & notes
 

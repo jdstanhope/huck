@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum LexError {
     UnterminatedQuote,
     InvalidVarName,
@@ -279,28 +279,37 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// the byte offset where lexing failed.
 // Consumed by the linear source reader (a later v104 task); the offset sidecar
 // lands first behind this thin public wrapper.
+// Retained as a thin `Result`-returning wrapper over `tokenize_partial` and
+// exercised by the offset unit tests; the source reader now calls
+// `tokenize_partial` directly, so it is otherwise unused in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tokenize_with_offsets(
     input: &str,
     opts: LexerOptions,
 ) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
-    tokenize_core(input, opts)
-}
-
-pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
-    match tokenize_core(input, opts) {
-        Ok((tokens, _offsets)) => Ok(tokens),
-        Err((e, _off)) => Err(e),
+    match tokenize_partial(input, opts) {
+        (tokens, offsets, None) => Ok((tokens, offsets)),
+        (_, _, Some((e, off))) => Err((e, off)),
     }
 }
 
-/// The single tokenizer implementation. Emits the token stream plus a parallel
-/// `offsets` vector holding each token's start byte offset, with a trailing
-/// `input.len()` sentinel on success. On a lex error, returns the error and the
-/// byte offset where lexing stopped (`chars.offset()`).
-fn tokenize_core(
+pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
+    match tokenize_partial(input, opts) {
+        (tokens, _offsets, None) => Ok(tokens),
+        (_, _, Some((e, _off))) => Err(e),
+    }
+}
+
+/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
+/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
+/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
+/// trailing offset is `input.len()` on success, or the error byte offset on
+/// failure. This lets the source reader execute the complete units that lexed
+/// before the failure and re-lex the truncated trailing unit.
+pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
-) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
+) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
     let mut tokens: Vec<Token> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let mut parts: Vec<WordPart> = Vec::new();
@@ -334,7 +343,7 @@ fn tokenize_core(
                     // The operand's first byte. Push the Word directly (NOT via
                     // emit_word_with_braces) so no brace expansion applies.
                     let operand_start = chars.offset();
-                    let parts = scan_regex_operand(&mut chars)?;
+                    let parts = scan_regex_operand(&mut chars, opts)?;
                     tokens.push(Token::Word(Word(parts)));
                     offsets.push(operand_start);
                     has_token = false;
@@ -372,7 +381,7 @@ fn tokenize_core(
                 // If there are pending heredocs, collect their bodies now
                 // before emitting the Newline token.
                 if !pending_heredocs.is_empty() {
-                    collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens)?;
+                    collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens, opts)?;
                 }
                 tokens.push(Token::Newline);
                 offsets.push(c_off);
@@ -397,7 +406,7 @@ fn tokenize_core(
         if opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && chars.peek() == Some(&'(') {
             has_token = true;
             flush_literal(&mut parts, &mut current, false);
-            let group_parts = scan_extglob_group(c, &mut chars)?;
+            let group_parts = scan_extglob_group(c, &mut chars, opts)?;
             parts.extend(group_parts);
             continue;
         }
@@ -445,12 +454,12 @@ fn tokenize_core(
                         Some('$') => {
                             // Expansion inside double quotes (quoted: true).
                             flush_literal(&mut parts, &mut quoted_current, true);
-                            read_dollar_expansion(&mut chars, &mut parts, true)?;
+                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             // Backtick substitution inside double quotes (quoted: true).
                             flush_literal(&mut parts, &mut quoted_current, true);
-                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         Some(ch) => quoted_current.push(ch),
@@ -489,7 +498,7 @@ fn tokenize_core(
                 // Expansion outside any quotes (quoted: false).
                 has_token = true;
                 flush_literal(&mut parts, &mut current, false);
-                read_dollar_expansion(&mut chars, &mut parts, false)?;
+                read_dollar_expansion(&mut chars, &mut parts, false, opts)?;
             }
             '#' if !has_token => {
                 // POSIX: an unquoted `#` that begins a word starts a comment
@@ -515,7 +524,7 @@ fn tokenize_core(
             '`' => {
                 has_token = true;
                 flush_literal(&mut parts, &mut current, false);
-                let sequence = scan_backtick_substitution(&mut chars)?;
+                let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '|' => {
@@ -714,7 +723,7 @@ fn tokenize_core(
                 if chars.peek() == Some(&'(') {
                     chars.next(); // consume '('
                     flush_literal(&mut parts, &mut current, false);
-                    let elements = read_array_literal(&mut chars)?;
+                    let elements = read_array_literal(&mut chars, opts)?;
                     parts.push(WordPart::ArrayLiteral(elements));
                 }
             }
@@ -741,7 +750,7 @@ fn tokenize_core(
                 // Compound RHS: `name+=(...)`.
                 if chars.peek() == Some(&'(') {
                     chars.next();
-                    let elements = read_array_literal(&mut chars)?;
+                    let elements = read_array_literal(&mut chars, opts)?;
                     parts.push(WordPart::ArrayLiteral(elements));
                 }
             }
@@ -806,7 +815,7 @@ fn tokenize_core(
                             parts.is_empty(),
                             "word_is_identifier_so_far guarantees no prior parts"
                         );
-                        let subscript = parse_subscript_body(&raw_subscript)?;
+                        let subscript = parse_subscript_body(&raw_subscript, opts)?;
                         in_assignment_value = true;
                         has_token = true;
                         parts.push(WordPart::AssignPrefix {
@@ -816,7 +825,7 @@ fn tokenize_core(
                         // Compound RHS: `name[i]=(...)`.
                         if chars.peek() == Some(&'(') {
                             chars.next();
-                            let elements = read_array_literal(&mut chars)?;
+                            let elements = read_array_literal(&mut chars, opts)?;
                             parts.push(WordPart::ArrayLiteral(elements));
                         }
                     }
@@ -862,9 +871,21 @@ fn tokenize_core(
                 tokens.len() + 1,
                 "offset sidecar must have one entry per token plus a sentinel"
             );
-            Ok((tokens, offsets))
+            (tokens, offsets, None)
         }
-        Err(e) => Err((e, chars.offset())),
+        Err(e) => {
+            // Partial: keep the tokens produced before the error and push the
+            // error byte offset as the trailing sentinel, preserving the
+            // `offsets.len() == tokens.len() + 1` invariant.
+            let off = chars.offset();
+            offsets.push(off);
+            debug_assert_eq!(
+                offsets.len(),
+                tokens.len() + 1,
+                "offset sidecar must have one entry per token plus a sentinel"
+            );
+            (tokens, offsets, Some((e, off)))
+        }
     }
 }
 
@@ -890,7 +911,7 @@ fn single_unquoted_literal(parts: &[WordPart]) -> Option<&str> {
 /// `$…`/`` `…` ``/quotes/`\` behave as in a normal word. No brace expansion, no
 /// extglob. The cursor starts at the operand's first char; returns sitting just
 /// before the terminating depth-0 whitespace (or at EOF).
-fn scan_regex_operand(chars: &mut CharCursor<'_>) -> Result<Vec<WordPart>, LexError> {
+fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<Vec<WordPart>, LexError> {
     let mut parts: Vec<WordPart> = Vec::new();
     let mut lit = String::new();
     let mut depth: u32 = 0;
@@ -905,17 +926,27 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>) -> Result<Vec<WordPart>, LexEr
             Some(&c) => c,
         };
         if depth == 0 && c.is_whitespace() {
+            // Leading whitespace only reaches here after a `\`-newline line
+            // continuation was consumed just before the operand began (e.g.
+            // bash_completion's `[[ $line =~ \<newline>   regex ]]`); the
+            // continuation line's indentation must be skipped, not treated as
+            // the (still-empty) operand's terminator. Once the operand has
+            // content, depth-0 whitespace ends it as before.
+            if lit.is_empty() && parts.is_empty() {
+                chars.next();
+                continue;
+            }
             break; // terminate, leave whitespace for the main loop
         }
         chars.next();
         match c {
             '$' => {
                 flush(&mut lit, &mut parts);
-                read_dollar_expansion(chars, &mut parts, false)?;
+                read_dollar_expansion(chars, &mut parts, false, opts)?;
             }
             '`' => {
                 flush(&mut lit, &mut parts);
-                let sequence = scan_backtick_substitution(chars)?;
+                let sequence = scan_backtick_substitution(chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '\'' => {
@@ -947,11 +978,11 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>) -> Result<Vec<WordPart>, LexEr
                         },
                         Some('$') => {
                             flush_literal(&mut parts, &mut q, true);
-                            read_dollar_expansion(chars, &mut parts, true)?;
+                            read_dollar_expansion(chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_literal(&mut parts, &mut q, true);
-                            let sequence = scan_backtick_substitution(chars)?;
+                            let sequence = scan_backtick_substitution(chars, opts)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         Some(ch) => q.push(ch),
@@ -986,6 +1017,7 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>) -> Result<Vec<WordPart>, LexEr
 fn scan_extglob_group(
     prefix: char,
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Vec<WordPart>, LexError> {
     let mut group_parts: Vec<WordPart> = Vec::new();
     let mut lit = format!("{prefix}(");
@@ -1003,11 +1035,11 @@ fn scan_extglob_group(
         match c {
             '$' => {
                 flush(&mut lit, &mut group_parts);
-                read_dollar_expansion(chars, &mut group_parts, false)?;
+                read_dollar_expansion(chars, &mut group_parts, false, opts)?;
             }
             '`' => {
                 flush(&mut lit, &mut group_parts);
-                let sequence = scan_backtick_substitution(chars)?;
+                let sequence = scan_backtick_substitution(chars, opts)?;
                 group_parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '\'' => {
@@ -1041,11 +1073,11 @@ fn scan_extglob_group(
                         },
                         Some('$') => {
                             flush_literal(&mut group_parts, &mut quoted_current, true);
-                            read_dollar_expansion(chars, &mut group_parts, true)?;
+                            read_dollar_expansion(chars, &mut group_parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_literal(&mut group_parts, &mut quoted_current, true);
-                            let sequence = scan_backtick_substitution(chars)?;
+                            let sequence = scan_backtick_substitution(chars, opts)?;
                             group_parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         Some(ch) => quoted_current.push(ch),
@@ -1245,9 +1277,10 @@ fn collect_heredoc_bodies(
     chars: &mut CharCursor<'_>,
     pending: &mut std::collections::VecDeque<PendingHeredoc>,
     tokens: &mut [Token],
+    opts: LexerOptions,
 ) -> Result<(), LexError> {
     while let Some(ph) = pending.pop_front() {
-        let body = collect_one_heredoc_body(chars, &ph)?;
+        let body = collect_one_heredoc_body(chars, &ph, opts)?;
         if let Some(Token::Heredoc { body: slot, expand, strip_tabs }) = tokens.get_mut(ph.token_idx) {
             *slot = body;
             *expand = ph.expand;
@@ -1270,6 +1303,7 @@ pub(crate) fn ends_with_continuation_backslash(s: &str) -> bool {
 fn collect_one_heredoc_body(
     chars: &mut CharCursor<'_>,
     ph: &PendingHeredoc,
+    opts: LexerOptions,
 ) -> Result<Word, LexError> {
     let mut body_parts: Vec<WordPart> = Vec::new();
     loop {
@@ -1330,7 +1364,7 @@ fn collect_one_heredoc_body(
             current_line
         };
         if ph.expand {
-            scan_expanding_body_line(&body_line, &mut body_parts)?;
+            scan_expanding_body_line(&body_line, &mut body_parts, opts)?;
         } else {
             // Literal mode: entire line verbatim as a single quoted Literal.
             body_parts.push(WordPart::Literal {
@@ -1351,6 +1385,7 @@ fn collect_one_heredoc_body(
 fn scan_expanding_body_line(
     line: &str,
     parts: &mut Vec<WordPart>,
+    opts: LexerOptions,
 ) -> Result<(), LexError> {
     let mut chars = CharCursor::new(line);
     let mut current = String::new();
@@ -1372,11 +1407,11 @@ fn scan_expanding_body_line(
             '$' => {
                 flush_body_literal(parts, &mut current, false);
                 // Heredoc bodies are quoted-context (no word-splitting).
-                read_dollar_expansion(&mut chars, parts, true)?;
+                read_dollar_expansion(&mut chars, parts, true, opts)?;
             }
             '`' => {
                 flush_body_literal(parts, &mut current, false);
-                let sequence = scan_backtick_substitution(&mut chars)?;
+                let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: true });
             }
             other => current.push(other),
@@ -1419,12 +1454,12 @@ pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
             '$' => {
                 flush_lit!();
                 chars.next();
-                read_dollar_expansion(&mut chars, &mut parts, true)?;
+                read_dollar_expansion(&mut chars, &mut parts, true, LexerOptions::default())?;
             }
             '`' => {
                 flush_lit!();
                 chars.next();
-                let sequence = scan_backtick_substitution(&mut chars)?;
+                let sequence = scan_backtick_substitution(&mut chars, LexerOptions::default())?;
                 parts.push(WordPart::CommandSub { sequence, quoted: true });
             }
             // bash performs quote removal within arithmetic: the quote
@@ -1461,12 +1496,12 @@ pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
                         '$' => {
                             flush_lit!();
                             chars.next();
-                            read_dollar_expansion(&mut chars, &mut parts, true)?;
+                            read_dollar_expansion(&mut chars, &mut parts, true, LexerOptions::default())?;
                         }
                         '`' => {
                             flush_lit!();
                             chars.next();
-                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            let sequence = scan_backtick_substitution(&mut chars, LexerOptions::default())?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         _ => { lit.push(ch); chars.next(); }
@@ -1484,6 +1519,7 @@ fn read_dollar_expansion(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
+    opts: LexerOptions,
 ) -> Result<(), LexError> {
     match chars.peek().copied() {
         Some('(') => {
@@ -1494,13 +1530,13 @@ fn read_dollar_expansion(
                 let body = arith_string_to_word(&inner)?;
                 parts.push(WordPart::Arith { body, quoted });
             } else {
-                let sequence = scan_paren_substitution(chars)?;
+                let sequence = scan_paren_substitution(chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted });
             }
         }
         Some('{') => {
             chars.next();
-            read_braced_param_expansion(chars, parts, quoted)?;
+            read_braced_param_expansion(chars, parts, quoted, opts)?;
         }
         Some('\'') => {
             chars.next();
@@ -1810,7 +1846,20 @@ fn scan_braced_operand(
                     }
                 }
             }
-            Some('{') => { depth += 1; body.push('{'); }
+            Some('$') => {
+                // Only a `${` (dollar-brace) nests the `${...}` and needs a
+                // matching `}`. A BARE `{` (e.g. in a `%%`/`##` glob pattern like
+                // `${x%%[<{(]*}`) is a literal character and must NOT raise depth,
+                // or the real `}` would close the inner brace and the operand would
+                // never terminate.
+                body.push('$');
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    body.push('{');
+                    depth += 1;
+                }
+            }
+            Some('{') => { body.push('{'); } // bare brace: literal, does not nest
             Some('}') => {
                 if depth == 1 { return Ok(body); }
                 depth -= 1;
@@ -1834,7 +1883,7 @@ fn scan_braced_operand(
 /// (unquoted literals, quoted spans/escapes) for future-compatibility and
 /// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
 /// substitution/substring operands) is a word, not a command.
-fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
+fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, LexError> {
     let mut chars = CharCursor::new(body);
     let mut parts: Vec<WordPart> = Vec::new();
     let mut cur = String::new();
@@ -1851,11 +1900,11 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
             }
             '$' => {
                 flush_body_literal(&mut parts, &mut cur, false);
-                read_dollar_expansion(&mut chars, &mut parts, false)?;
+                read_dollar_expansion(&mut chars, &mut parts, false, opts)?;
             }
             '`' => {
                 flush_body_literal(&mut parts, &mut cur, false);
-                let sequence = scan_backtick_substitution(&mut chars)?;
+                let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: false });
             }
             '\'' => {
@@ -1888,11 +1937,11 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
                         },
                         Some('$') => {
                             flush_body_literal(&mut parts, &mut cur, true);
-                            read_dollar_expansion(&mut chars, &mut parts, true)?;
+                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_body_literal(&mut parts, &mut cur, true);
-                            let sequence = scan_backtick_substitution(&mut chars)?;
+                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         Some(ch) => cur.push(ch),
@@ -1907,6 +1956,14 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
     Ok(Word(parts))
 }
 
+/// Back-compat shim for unit tests that parse a braced operand with extglob
+/// off (the historical behavior). Production callers thread `LexerOptions`
+/// via `parse_braced_operand_opts`.
+#[cfg(test)]
+fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
+    parse_braced_operand_opts(body, LexerOptions::default())
+}
+
 /// Reads the body of a `$(...)` substitution. The opening `$(` is already
 /// consumed; this function consumes through the matching `)` at depth 0.
 /// Tracks quote and escape state so that `)` inside `'...'`, `"..."`, or
@@ -1914,13 +1971,14 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
 /// the depth.
 fn scan_paren_substitution(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<crate::command::Sequence, LexError> {
     let mut body = String::new();
     let mut depth: usize = 0;
     while let Some(c) = chars.next() {
         match c {
             ')' if depth == 0 => {
-                return parse_substitution_body(&body);
+                return parse_substitution_body(&body, opts);
             }
             ')' => {
                 depth -= 1;
@@ -1994,8 +2052,8 @@ fn scan_paren_substitution(
 /// Tokenizes and parses a substitution body, wrapping any errors with the
 /// substitution-context `LexError` variants. Empty bodies (whitespace only)
 /// produce an empty `Sequence`.
-fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexError> {
-    let tokens = tokenize(body).map_err(|e| LexError::Substitution(Box::new(e)))?;
+fn parse_substitution_body(body: &str, opts: LexerOptions) -> Result<crate::command::Sequence, LexError> {
+    let tokens = tokenize_with_opts(body, opts).map_err(|e| LexError::Substitution(Box::new(e)))?;
     let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
 }
@@ -2009,12 +2067,13 @@ fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexEr
 /// - `\` + any other char `c` -> both `\` and `c` are preserved verbatim
 fn scan_backtick_substitution(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<crate::command::Sequence, LexError> {
     let mut body = String::new();
     while let Some(c) = chars.next() {
         match c {
             '`' => {
-                return parse_substitution_body(&body);
+                return parse_substitution_body(&body, opts);
             }
             '\\' => match chars.next() {
                 Some('`') => body.push('`'),
@@ -2063,6 +2122,7 @@ fn read_braced_param_expansion(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
+    opts: LexerOptions,
 ) -> Result<(), LexError> {
     // Special single-char forms: ${@}, ${*}, ${#} (arg count).
     // These must be checked before the Length form (${#name}) disambiguation.
@@ -2079,7 +2139,7 @@ fn read_braced_param_expansion(
             }
             // `${@<mod>...}` — fall through to the modifier dispatcher
             // with name="@" and no subscript.
-            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false);
+            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false, opts);
         }
         Some('*') => {
             chars.next();
@@ -2088,22 +2148,22 @@ fn read_braced_param_expansion(
                 parts.push(WordPart::AllArgs { joined: true, quoted });
                 return Ok(());
             }
-            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false);
+            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false, opts);
         }
         // Scalar special params: ${-} (option flags), ${?} (exit status),
         // ${$} (shell pid). Route bare `}` and modifiers through the
         // dispatcher (e.g. `${-#*e}` from nvm). Resolved by `lookup_var`.
         Some('-') => {
             chars.next();
-            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false);
+            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false, opts);
         }
         Some('?') => {
             chars.next();
-            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false);
+            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false, opts);
         }
         Some('$') => {
             chars.next();
-            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false);
+            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts);
         }
         _ => {}
     }
@@ -2145,7 +2205,7 @@ fn read_braced_param_expansion(
         let subscript = if name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
             && !name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true)
         {
-            scan_param_subscript(chars)?
+            scan_param_subscript(chars, opts)?
         } else {
             None
         };
@@ -2174,7 +2234,7 @@ fn read_braced_param_expansion(
             }
         }
         // Positional parameters cannot be subscripted.
-        return dispatch_braced_modifier(name, quoted, None, chars, parts, false);
+        return dispatch_braced_modifier(name, quoted, None, chars, parts, false, opts);
     }
 
     // `${!NAME[@]}` / `${!NAME[*]}` — array-keys form (v71). The bare
@@ -2204,13 +2264,13 @@ fn read_braced_param_expansion(
                     break;
                 }
             }
-            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true);
+            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts);
         }
         let name = read_braced_name(chars)?;
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
         }
-        let subscript = scan_param_subscript(chars)?;
+        let subscript = scan_param_subscript(chars, opts)?;
         match subscript {
             Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
                 if chars.next() != Some('}') {
@@ -2230,7 +2290,7 @@ fn read_braced_param_expansion(
                 // scalar expansion (v95): resolve NAME's value to a name,
                 // then expand that (with any trailing modifier). The name +
                 // (non-`[@]`/`[*]`) subscript are already read/scanned here.
-                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true);
+                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts);
             }
         }
     }
@@ -2240,8 +2300,8 @@ fn read_braced_param_expansion(
         return Err(LexError::EmptyParamName);
     }
     // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
-    let subscript = scan_param_subscript(chars)?;
-    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false)
+    let subscript = scan_param_subscript(chars, opts)?;
+    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts)
 }
 
 /// Scans an optional `[…]` subscript immediately after the parameter name
@@ -2251,6 +2311,7 @@ fn read_braced_param_expansion(
 /// `SubscriptKind::Index`.
 fn scan_param_subscript(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Option<SubscriptKind>, LexError> {
     if chars.peek() != Some(&'[') {
         return Ok(None);
@@ -2269,7 +2330,7 @@ fn scan_param_subscript(
             }))
         }
         _ => {
-            let inner = read_subscript(chars)?;
+            let inner = read_subscript(chars, opts)?;
             Ok(Some(SubscriptKind::Index(inner)))
         }
     }
@@ -2280,6 +2341,7 @@ fn scan_param_subscript(
 /// arith-style expressions like `a[$((i+1))]`).
 fn read_subscript(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Word, LexError> {
     let mut depth: usize = 1;
     let mut buf = String::new();
@@ -2296,7 +2358,7 @@ fn read_subscript(
                 if depth == 0 {
                     // Re-tokenize the subscript body so embedded
                     // expansions (`$i`, `${j}`, `$((n))`) are honoured.
-                    return parse_subscript_body(&buf);
+                    return parse_subscript_body(&buf, opts);
                 }
                 buf.push(c);
             }
@@ -2313,8 +2375,8 @@ fn read_subscript(
 /// `tokenize` returns more or fewer than one Word token, falls back to
 /// a single unquoted Literal containing the raw text (which is exactly
 /// what arithmetic evaluation will see).
-fn parse_subscript_body(src: &str) -> Result<Word, LexError> {
-    let toks = tokenize(src)?;
+fn parse_subscript_body(src: &str, opts: LexerOptions) -> Result<Word, LexError> {
+    let toks = tokenize_with_opts(src, opts)?;
     let mut words: Vec<Word> = Vec::new();
     for t in toks {
         if let Token::Word(w) = t {
@@ -2341,6 +2403,7 @@ fn parse_subscript_body(src: &str) -> Result<Word, LexError> {
 /// `subscript` Word.
 fn read_array_literal(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Vec<ArrayLiteralElement>, LexError> {
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
@@ -2357,7 +2420,7 @@ fn read_array_literal(
         // Optional explicit `[expr]=`.
         let subscript = if chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            let sub = read_subscript(chars)?;
+            let sub = read_subscript(chars, opts)?;
             if chars.next() != Some('=') {
                 return Err(LexError::ArrayLiteralMissingEquals);
             }
@@ -2365,7 +2428,7 @@ fn read_array_literal(
         } else {
             None
         };
-        let value = read_array_element_word(chars)?;
+        let value = read_array_element_word(chars, opts)?;
         elements.push(ArrayLiteralElement { subscript, value });
     }
 }
@@ -2390,6 +2453,7 @@ fn skip_array_literal_whitespace(
 /// re-tokenized via `tokenize` to produce a `Word`.
 fn read_array_element_word(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Word, LexError> {
     let mut buf = String::new();
     loop {
@@ -2498,7 +2562,7 @@ fn read_array_element_word(
         }
     }
     // Re-tokenize the collected text as a single Word.
-    let toks = tokenize(&buf)?;
+    let toks = tokenize_with_opts(&buf, opts)?;
     let mut words: Vec<Word> = Vec::new();
     for t in toks {
         if let Token::Word(w) = t {
@@ -2554,6 +2618,7 @@ fn dispatch_braced_modifier(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     indirect: bool,
+    opts: LexerOptions,
 ) -> Result<(), LexError> {
     match chars.next() {
         Some('}') => {
@@ -2594,31 +2659,31 @@ fn dispatch_braced_modifier(
             match chars.peek().copied() {
                 Some('-') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseDefault { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('=') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('?') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('+') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('}') => Err(LexError::InvalidBraceModifier(":".to_string())),
                 Some(_) => {
-                    let (offset, length) = scan_substring_operands(chars)?;
+                    let (offset, length) = scan_substring_operands(chars, opts)?;
                     parts.push(WordPart::ParamExpansion {
                         name,
                         modifier: ParamModifier::Substring { offset, length },
@@ -2632,36 +2697,36 @@ fn dispatch_braced_modifier(
             }
         }
         Some('-') => {
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::UseDefault { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseDefault { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('=') => {
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('?') => {
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('+') => {
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('#') => {
             let longest = chars.peek() == Some(&'#');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('%') => {
             let longest = chars.peek() == Some(&'%');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
@@ -2673,7 +2738,7 @@ fn dispatch_braced_modifier(
                 Some('%') if !all => { chars.next(); SubstAnchor::Suffix }
                 _ => SubstAnchor::None,
             };
-            let (pattern, replacement) = scan_substitution_operand(chars)?;
+            let (pattern, replacement) = scan_substitution_operand(chars, opts)?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
@@ -2686,7 +2751,7 @@ fn dispatch_braced_modifier(
         Some('^') => {
             let all = chars.peek() == Some(&'^');
             if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars)?;
+            let pattern = scan_optional_braced_operand(chars, opts)?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
@@ -2699,7 +2764,7 @@ fn dispatch_braced_modifier(
         Some(',') => {
             let all = chars.peek() == Some(&',');
             if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars)?;
+            let pattern = scan_optional_braced_operand(chars, opts)?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
@@ -2750,13 +2815,14 @@ fn dispatch_braced_modifier(
 /// `Word`. Builds the `ParamModifier` via the caller's closure.
 fn modifier_with_operand<F>(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
     build: F,
 ) -> Result<ParamModifier, LexError>
 where
     F: FnOnce(Word) -> ParamModifier,
 {
     let body = scan_braced_operand(chars)?;
-    let word = parse_braced_operand(&body)?;
+    let word = parse_braced_operand_opts(&body, opts)?;
     Ok(build(word))
 }
 
@@ -2767,12 +2833,13 @@ where
 /// `${...}` constructs in the operand are handled correctly.
 fn scan_optional_braced_operand(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<Option<Word>, LexError> {
     let body = scan_braced_operand(chars)?;
     if body.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(parse_braced_operand(&body)?))
+        Ok(Some(parse_braced_operand_opts(&body, opts)?))
     }
 }
 
@@ -2785,11 +2852,12 @@ fn scan_optional_braced_operand(
 /// through unchanged so the inner operand tokenizer sees it.
 fn scan_substitution_operand(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<(Word, Word), LexError> {
     let body = scan_braced_operand(chars)?;
     let (pattern_src, replacement_src) = split_substitution_body(&body);
-    let pattern = parse_braced_operand(&pattern_src)?;
-    let replacement = parse_braced_operand(&replacement_src)?;
+    let pattern = parse_braced_operand_opts(&pattern_src, opts)?;
+    let replacement = parse_braced_operand_opts(&replacement_src, opts)?;
     Ok((pattern, replacement))
 }
 
@@ -2856,12 +2924,13 @@ fn split_substitution_body(body: &str) -> (String, String) {
 /// to collect and parse the offset and optional length Words.
 fn scan_substring_operands(
     chars: &mut CharCursor<'_>,
+    opts: LexerOptions,
 ) -> Result<(Word, Option<Word>), LexError> {
     let body = scan_braced_operand(chars)?;
     let (offset_src, length_src) = split_substring_body(&body);
-    let offset = parse_braced_operand(&offset_src)?;
+    let offset = parse_braced_operand_opts(&offset_src, opts)?;
     let length = match length_src {
-        Some(s) => Some(parse_braced_operand(&s)?),
+        Some(s) => Some(parse_braced_operand_opts(&s, opts)?),
         None => None,
     };
     Ok((offset, length))
@@ -3067,6 +3136,41 @@ mod tests {
     }
 
     #[test]
+    fn extglob_inside_command_sub_lexes() {
+        let opts = LexerOptions { extglob: true };
+        let toks = tokenize_with_opts("echo $(echo !(x))", opts).unwrap();
+        assert!(toks.iter().any(|t| matches!(
+            t, Token::Word(Word(parts)) if parts.iter().any(|p| matches!(p, WordPart::CommandSub { .. }))
+        )));
+    }
+
+    #[test]
+    fn extglob_inside_backtick_sub_lexes() {
+        let opts = LexerOptions { extglob: true };
+        tokenize_with_opts("echo `echo !(x)`", opts).unwrap();
+    }
+
+    #[test]
+    fn extglob_inside_array_literal_command_sub_lexes() {
+        let opts = LexerOptions { extglob: true };
+        tokenize_with_opts("a=($(printf '%s\\n' /tmp/!(x)))", opts).unwrap();
+    }
+
+    #[test]
+    fn command_sub_without_extglob_still_errors_on_bare_extglob() {
+        let opts = LexerOptions { extglob: false };
+        assert!(tokenize_with_opts("echo $(echo !(x))", opts).is_err());
+    }
+
+    #[test]
+    fn plain_command_sub_unchanged() {
+        for eg in [false, true] {
+            let opts = LexerOptions { extglob: eg };
+            tokenize_with_opts("echo $(echo hi) $((1+1))", opts).unwrap();
+        }
+    }
+
+    #[test]
     fn dbracket_regex_paren_operand_is_one_word() {
         let toks = tokenize("[[ x =~ (a) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
@@ -3096,6 +3200,29 @@ mod tests {
         let toks = tokenize("[[ x =~ (a b) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "x", "=~", "(a b)", "]]"]);
+    }
+
+    #[test]
+    fn dbracket_regex_operand_after_line_continuation() {
+        // bash_completion line 876 shape: the `=~` operand is on a `\`-newline
+        // continuation line whose indentation must NOT end the operand empty.
+        let toks = tokenize("[[ $x =~ \\\n   (a|b)c ]]").unwrap();
+        let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
+        // the regex operand is the single word `(a|b)c`, then `]]`.
+        assert!(texts.contains(&"(a|b)c".to_string()), "texts: {texts:?}");
+        assert!(texts.contains(&"]]".to_string()));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_) | Token::Op(Operator::LParen))));
+    }
+
+    #[test]
+    fn braced_operand_bare_brace_is_literal() {
+        // bash_completion line 849/854: `${var%%[<{(]*}` — a bare `{` in the
+        // pattern must not nest the `${...}` (only `${` nests). Previously this
+        // raised UnterminatedBrace.
+        assert!(tokenize("${x%%[<{(]*}").is_ok());
+        assert!(tokenize("${x%%{*}").is_ok());
+        // nested ${...} still depth-tracks:
+        assert!(tokenize("${x:-${y}}").is_ok());
     }
 
     #[test]

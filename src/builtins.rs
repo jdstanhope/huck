@@ -4957,6 +4957,24 @@ fn resolve_source_path(
     None
 }
 
+/// A parse error that only signals "the input ended mid-compound". When the
+/// source chunk was truncated by a lex error, such an error means the trailing
+/// unit was cut off (not genuinely malformed), so it should be re-lexed rather
+/// than reported.
+fn is_unterminated(e: &crate::command::ParseError) -> bool {
+    use crate::command::ParseError::*;
+    matches!(
+        e,
+        UnterminatedFunction
+            | UnterminatedLoop
+            | UnterminatedIf
+            | UnterminatedCase
+            | UnterminatedBrace
+            | UnterminatedSubshell
+            | UnterminatedDoubleBracket
+    )
+}
+
 pub(crate) fn run_sourced_contents(
     contents: &str,
     path: &std::path::Path,
@@ -4976,6 +4994,14 @@ pub(crate) fn run_sourced_contents(
             None => contents.len(),
         }
     };
+    // Byte offset of the START of the line containing `abs`. Used to resume after
+    // a lex truncation whose failing construct produced no token (e.g. an array
+    // literal `a=($(…!(x)…))`): the failure byte sits mid-construct, so the clean
+    // re-lex boundary is the start of the failing line, not the failure byte.
+    let line_start_of = |abs: usize| -> usize {
+        let a = abs.min(contents.len());
+        contents[..a].rfind('\n').map(|i| i + 1).unwrap_or(0)
+    };
 
     let mut start = 0usize; // byte offset of the unconsumed remainder
     let mut prev_end = 0usize; // bytes already echoed for `set -v`
@@ -4985,26 +5011,27 @@ pub(crate) fn run_sourced_contents(
             break;
         }
         let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-        let (tokens, offsets) = match crate::lexer::tokenize_with_offsets(
+        // Partial tokenize: keep the tokens produced BEFORE any lex error so the
+        // complete units (e.g. an earlier `shopt -s extglob`) can run first; the
+        // truncated trailing unit is re-lexed with the now-current extglob.
+        let (tokens, offsets, terr) = crate::lexer::tokenize_partial(
             &contents[start..],
             crate::lexer::LexerOptions { extglob },
-        ) {
-            Ok(t) => t,
-            Err((e, fail_off)) => {
+        );
+        let total = tokens.len();
+        if total == 0 {
+            if let Some((e, foff)) = terr {
                 eprintln!(
                     "huck: {}: line {}: syntax error{}",
                     path.display(),
-                    line_of(start + fail_off),
+                    line_of(start + foff),
                     crate::shell::lex_error_message(e)
                 );
                 last_status = 2;
-                start = next_line_start(start + fail_off);
+                start = next_line_start(start + foff);
                 prev_end = start;
                 continue 'outer;
             }
-        };
-        let total = tokens.len();
-        if total == 0 {
             break;
         }
         let mut iter = tokens.into_iter().peekable();
@@ -5015,6 +5042,33 @@ pub(crate) fn run_sourced_contents(
             }
             let unit_start_idx = total - iter.len();
             if iter.peek().is_none() {
+                // Consumed every complete token. If the chunk truncated at a lex
+                // error, the un-lexed tail begins at `prev_end` (the end of the
+                // last executed unit). Re-lex that tail ONLY if a command in this
+                // chunk flipped extglob — otherwise re-lexing would fail
+                // identically (an infinite loop), so report the error instead.
+                if let Some((e, foff)) = &terr {
+                    let now_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+                    // Resume from the start of the failing line (a clean boundary)
+                    // rather than `prev_end`, which may be the mid-construct lex
+                    // failure byte when the failing construct produced no token.
+                    let resume = line_start_of(start + *foff);
+                    if now_extglob != extglob && resume > start {
+                        start = resume;
+                        prev_end = start;
+                        continue 'outer;
+                    }
+                    eprintln!(
+                        "huck: {}: line {}: syntax error{}",
+                        path.display(),
+                        line_of(start + foff),
+                        crate::shell::lex_error_message(e.clone())
+                    );
+                    last_status = 2;
+                    start = next_line_start(start + foff);
+                    prev_end = start;
+                    continue 'outer;
+                }
                 break 'outer;
             }
             match crate::command::parse_one_unit(&mut iter) {
@@ -5062,10 +5116,46 @@ pub(crate) fn run_sourced_contents(
                     // how the remainder must be lexed. Re-lex from here.
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
                     if new_extglob != extglob {
-                        start = unit_end_abs;
+                        // If this flipping unit was the last complete token before
+                        // a lex truncation, the un-lexed tail begins at the start
+                        // of the failing line — `offsets[total]` is the
+                        // mid-construct failure byte, not a clean boundary.
+                        start = match &terr {
+                            Some((_, foff)) if unit_end_idx == total => {
+                                line_start_of(start + *foff)
+                            }
+                            _ => unit_end_abs,
+                        };
                         prev_end = start;
                         continue 'outer;
                     }
+                }
+                Err(e) if terr.is_some() && is_unterminated(&e) => {
+                    // The trailing unit parsed as "unterminated" only because the
+                    // chunk was truncated by a lex error. Re-lex this unit from
+                    // its start ONLY if a command earlier in this chunk flipped
+                    // extglob (so an earlier `shopt -s extglob` now applies);
+                    // otherwise re-lexing fails identically (an infinite loop), so
+                    // report the lex error instead. The `> start` guard also
+                    // covers the first-unit case (nothing ran, prefix offset 0).
+                    let now_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+                    let resume = start + offsets[unit_start_idx];
+                    if now_extglob != extglob && resume > start {
+                        start = resume;
+                        prev_end = start;
+                        continue 'outer;
+                    }
+                    let (le, foff) = terr.clone().unwrap();
+                    eprintln!(
+                        "huck: {}: line {}: syntax error{}",
+                        path.display(),
+                        line_of(start + foff),
+                        crate::shell::lex_error_message(le)
+                    );
+                    last_status = 2;
+                    start = next_line_start(start + foff);
+                    prev_end = start;
+                    continue 'outer;
                 }
                 Err(e) => {
                     eprintln!(
@@ -5083,7 +5173,11 @@ pub(crate) fn run_sourced_contents(
                     prev_end = start + offsets[total - iter.len()];
                 }
             }
-            if iter.peek().is_none() {
+            // When the chunk lexed cleanly, exiting here once the tokens run out
+            // is correct. But if `terr` is Some, the chunk was truncated by a lex
+            // error: loop back to the top so the iter-empty truncation branch can
+            // re-lex the tail (if extglob flipped) or report the lex error.
+            if iter.peek().is_none() && terr.is_none() {
                 break 'outer;
             }
         }
