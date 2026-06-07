@@ -3951,6 +3951,7 @@ fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "nounset" => Some(shell.shell_options.nounset),
         "pipefail" => Some(shell.shell_options.pipefail),
         "verbose" => Some(shell.shell_options.verbose),
+        "xtrace" => Some(shell.shell_options.xtrace),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -3962,6 +3963,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "nounset" => { shell.shell_options.nounset = value; Ok(()) }
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
         "verbose" => { shell.shell_options.verbose = value; Ok(()) }
+        "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4061,6 +4063,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                     b'e' => shell.shell_options.errexit = true,
                     b'u' => shell.shell_options.nounset = true,
                     b'v' => shell.shell_options.verbose = true,
+                    b'x' => shell.shell_options.xtrace = true,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -4102,6 +4105,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                     b'e' => shell.shell_options.errexit = false,
                     b'u' => shell.shell_options.nounset = false,
                     b'v' => shell.shell_options.verbose = false,
+                    b'x' => shell.shell_options.xtrace = false,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -8125,20 +8129,23 @@ mod set_tests {
     }
 
     #[test]
-    fn set_dash_x_rejects_with_status_2() {
-        // -x (xtrace) remains deferred per v69 scope.
+    fn set_dash_x_enables_xtrace() {
+        // -x (xtrace) implemented in v103.
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("set", &["-x".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.xtrace);
     }
 
     #[test]
-    fn set_plus_x_rejects_with_status_2() {
+    fn set_plus_x_disables_xtrace() {
         let mut shell = Shell::new();
+        shell.shell_options.xtrace = true;
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("set", &["+x".to_string()], &mut buf, &mut shell);
-        assert!(matches!(outcome, ExecOutcome::Continue(2)));
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.xtrace);
     }
 }
 
@@ -9998,6 +10005,34 @@ mod set_options_tests {
     }
 
     #[test]
+    fn set_x_short_flag_toggles_xtrace() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-x"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.xtrace);
+        let (oc, _) = run(&["+x"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.shell_options.xtrace);
+    }
+
+    #[test]
+    fn set_o_xtrace_long_form_enables() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-o", "xtrace"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.shell_options.xtrace);
+    }
+
+    #[test]
+    fn option_set_xtrace_round_trips() {
+        let mut shell = Shell::new();
+        assert!(option_set(&mut shell, "xtrace", true).is_ok());
+        assert_eq!(option_get(&shell, "xtrace"), Some(true));
+        assert!(option_set(&mut shell, "xtrace", false).is_ok());
+        assert_eq!(option_get(&shell, "xtrace"), Some(false));
+    }
+
+    #[test]
     fn set_o_listing_shows_state() {
         let mut shell = Shell::new();
         let (oc, out) = run(&["-o"], &mut shell);
@@ -10086,7 +10121,7 @@ mod set_options_tests {
     #[test]
     fn set_o_enable_unimplemented_says_not_supported() {
         let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "xtrace"], &mut shell);
+        let (oc, _) = run(&["-o", "noclobber"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
     }
 
