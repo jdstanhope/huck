@@ -109,6 +109,7 @@ pub struct ShellOptions {
     pub nounset: bool,
     pub pipefail: bool,
     pub verbose: bool,
+    pub xtrace: bool,
 }
 
 /// One row of the bash `shopt` option table.
@@ -405,6 +406,7 @@ impl Shell {
         if self.is_interactive { out.push('i'); }
         if self.shell_options.nounset { out.push('u'); }
         if self.shell_options.verbose { out.push('v'); }
+        if self.shell_options.xtrace { out.push('x'); }
         out
     }
 
@@ -1819,6 +1821,25 @@ mod shopt_tests {
         assert!(!sh.dollar_dash_value().contains('v'));
         sh.shell_options.verbose = true;
         assert!(sh.dollar_dash_value().contains('v'));
+    }
+
+    #[test]
+    fn dollar_dash_includes_x_when_xtrace() {
+        let mut sh = Shell::new();
+        assert!(!sh.dollar_dash_value().contains('x'));
+        sh.shell_options.xtrace = true;
+        assert!(sh.dollar_dash_value().contains('x'));
+    }
+
+    #[test]
+    fn dollar_dash_x_after_v() {
+        let mut sh = Shell::new();
+        sh.shell_options.verbose = true;
+        sh.shell_options.xtrace = true;
+        let d = sh.dollar_dash_value();
+        let v = d.find('v').unwrap();
+        let x = d.find('x').unwrap();
+        assert!(v < x, "expected v before x in {d:?}");
     }
 
     #[test]

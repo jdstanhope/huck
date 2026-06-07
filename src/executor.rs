@@ -2583,6 +2583,36 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         }
     };
 
+    // xtrace (`set -x`): print the expanded command to stderr, prefixed by
+    // `$PS4` (default `+ `), BEFORE dispatch so a hanging command is traced
+    // first. Use the already-expanded `resolved.program`/`resolved.args` (do
+    // NOT re-expand). For a pure-assignment command (empty program) render
+    // `name=value` from the just-applied values (read back via lookup_var). The
+    // inline-assignment PREFIX on `VAR=v cmd` is omitted (minor divergence).
+    if shell.shell_options.xtrace {
+        let ps4 = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
+        let mut line = String::new();
+        if resolved.program.is_empty() {
+            let mut first = true;
+            for a in &cmd.inline_assignments {
+                if !first {
+                    line.push(' ');
+                }
+                first = false;
+                let n = a.target.name();
+                let v = shell.lookup_var(n).unwrap_or_default();
+                line.push_str(&format!("{n}={v}"));
+            }
+        } else {
+            line.push_str(&resolved.program);
+            for a in &resolved.args {
+                line.push(' ');
+                line.push_str(a);
+            }
+        }
+        eprintln!("{ps4}{line}");
+    }
+
     // Determine whether the assignments should persist after the command.
     // Control builtins and special builtins: persistent.
     // User functions: persistent.
