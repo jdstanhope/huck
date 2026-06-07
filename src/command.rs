@@ -641,6 +641,35 @@ fn parse_sequence<I: Iterator<Item = Token>>(
     iter: &mut std::iter::Peekable<I>,
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
+    parse_sequence_opts(iter, stop_at, false)
+}
+
+/// Parse ONE top-level command unit from a pre-tokenized stream, stopping at
+/// (and consuming) the next top-level newline or EOF. Skips leading blank-line
+/// newlines. Returns `Ok(None)` when only newlines / EOF remain. Used by the
+/// non-interactive script reader.
+pub fn parse_one_unit<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+) -> Result<Option<Sequence>, ParseError> {
+    while matches!(iter.peek(), Some(Token::Newline)) {
+        iter.next();
+    }
+    if iter.peek().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(parse_sequence_opts(iter, &[], true)?))
+}
+
+/// The shared body of [`parse_sequence`]. When `stop_at_top_newline` is set, a
+/// top-level `Token::Newline` terminates the command unit (used by
+/// [`parse_one_unit`] for the non-interactive script reader); otherwise a
+/// top-level newline is a Semi-like continue connector (the historical
+/// behavior — all existing callers go through the `false` wrapper).
+fn parse_sequence_opts<I: Iterator<Item = Token>>(
+    iter: &mut std::iter::Peekable<I>,
+    stop_at: &[Keyword],
+    stop_at_top_newline: bool,
+) -> Result<Sequence, ParseError> {
     let first = parse_command_then_pipeline(iter)?;
     let mut rest = Vec::new();
     let mut background = false;
@@ -706,6 +735,12 @@ fn parse_sequence<I: Iterator<Item = Token>>(
                 }
             }
             Token::Op(Operator::Semi) | Token::Newline => {
+                if stop_at_top_newline && matches!(token, Token::Newline) {
+                    // Unit mode: a top-level newline ends the command unit
+                    // (already consumed by iter.next() above). `;`, `&&`,
+                    // `||`, `&`, and compound-internal newlines are unaffected.
+                    break;
+                }
                 skip_newlines(iter);
                 match iter.peek() {
                     None => break,
@@ -2261,6 +2296,38 @@ mod tests {
 
     fn ww(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    }
+
+    #[test]
+    fn parse_one_unit_splits_on_top_level_newline() {
+        let toks = crate::lexer::tokenize("echo a\necho b\n").unwrap();
+        let mut it = toks.into_iter().peekable();
+        let u1 = parse_one_unit(&mut it).unwrap().expect("unit 1");
+        assert!(u1.rest.is_empty());
+        let u2 = parse_one_unit(&mut it).unwrap().expect("unit 2");
+        assert!(u2.rest.is_empty());
+        assert!(parse_one_unit(&mut it).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_one_unit_keeps_semicolon_list_and_andor_together() {
+        // `a; b && c` on one line is ONE unit (semicolon and && do not split).
+        let toks = crate::lexer::tokenize("a; b && c\n").unwrap();
+        let mut it = toks.into_iter().peekable();
+        let u = parse_one_unit(&mut it).unwrap().expect("unit");
+        assert_eq!(u.rest.len(), 2); // (Semi, b), (And, c)
+        assert!(parse_one_unit(&mut it).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_one_unit_keeps_multiline_if_as_one_unit() {
+        let toks = crate::lexer::tokenize("if true\nthen echo hi\nfi\necho after\n").unwrap();
+        let mut it = toks.into_iter().peekable();
+        let u1 = parse_one_unit(&mut it).unwrap().expect("if unit");
+        // u1.first should be the If compound (tuple variant Command::If(_)).
+        assert!(matches!(u1.first, Command::If(_)));
+        let _u2 = parse_one_unit(&mut it).unwrap().expect("after unit");
+        assert!(parse_one_unit(&mut it).unwrap().is_none());
     }
 
     /// Builds a SimpleCommand::Exec with no redirections, all-Literal Words.
