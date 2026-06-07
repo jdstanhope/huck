@@ -183,7 +183,203 @@ Trailer MANDATORY/canonical.
 
 ---
 
-## Task 2: Integration tests + bash_completion smoke
+## Task 2: Reader fix — execute the clean prefix before a failing unit
+
+**Why:** Task 1 threads extglob into recursive lexing, but the v104 reader
+(`run_sourced_contents`) tokenizes a whole chunk with the extglob value at chunk
+start. bash_completion enables extglob at line 45, but the initial chunk fails to
+tokenize at line 1232 (a `$()`-extglob body errors under extglob-off) *before*
+line 45's `shopt` runs — so the reader discards everything up to the failure
+(huck defines 20/81 functions). Fix: the lexer returns the partial tokens it
+produced before the error; the reader executes the complete units (running line
+45's `shopt`), then re-lexes the truncated trailing unit with the now-current
+extglob. See spec Section 3.5.
+
+**Files:** Modify `src/lexer.rs` (add `tokenize_partial`), `src/builtins.rs`
+(`run_sourced_contents`).
+
+- [ ] **Step 1: Failing integration test (the reader symptom)**
+
+Add to `tests/extglob_command_sub_integration.rs` (created in Task 3 — if not yet,
+create it now with the `run` helper copied from `tests/set_x_integration.rs`):
+
+```rust
+#[test]
+fn shopt_extglob_then_later_command_sub_in_same_chunk() {
+    // 3-line: shopt on line 1, a marker on line 2, an extglob-in-$() on line 3.
+    // Before the reader fix, the whole chunk fails to tokenize and MARKER is
+    // skipped. After: MARKER prints and the $() runs.
+    let (out, _e, _c) = run("shopt -s extglob\necho MARKER\necho $(echo ok)\n");
+    assert!(out.contains("MARKER"));
+}
+
+#[test]
+fn shopt_extglob_then_function_with_extglob_sub() {
+    // The bash_completion _xinetd_services shape: shopt, then a function whose
+    // body has a $()-extglob; defining + calling it must work.
+    let script = "shopt -s extglob\nf() { echo $(printf '%s\\n' /nonexist/!(x)); }\nf\necho done\n";
+    let (out, _e, _c) = run(script);
+    assert!(out.contains("done"));
+}
+
+#[test]
+fn malformed_line_reports_once_no_loop() {
+    // A genuinely un-lexable line must report once and continue (no hang).
+    let (out, err, _c) = run("echo a\n$(\necho b\n");
+    assert!(out.contains('a') || out.contains('b'));
+    assert!(err.contains("syntax error"));
+}
+```
+Run `cargo test --test extglob_command_sub_integration shopt_extglob 2>&1 | tail` → `shopt_extglob_then_*` FAIL (MARKER/done skipped), `malformed_line` must not hang. (Use a per-test timeout mindset; if a test hangs, the progress guard is missing.)
+
+- [ ] **Step 2: Add `tokenize_partial` to `src/lexer.rs`**
+
+`tokenize_core` currently returns `Result<(Vec<Token>, Vec<usize>), (LexError, usize)>` via an IIFE closure that returns `Result<(), LexError>`. Change the core to ALSO expose the partial tokens on error, and add a public `tokenize_partial`:
+
+```rust
+/// Like `tokenize_with_offsets`, but on a lex error returns the tokens
+/// successfully produced BEFORE the error plus `Some((error, byte_offset))`.
+/// `offsets.len() == tokens.len() + 1`; the trailing offset is the error offset
+/// (or `input.len()` on success).
+pub fn tokenize_partial(
+    input: &str,
+    opts: LexerOptions,
+) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
+    // same body as tokenize_core, but the final match becomes:
+    //   match result {
+    //     Ok(()) => { offsets.push(input.len()); (tokens, offsets, None) }
+    //     Err(e) => { offsets.push(chars.offset()); (tokens, offsets, Some((e, chars.offset()))) }
+    //   }
+}
+```
+Refactor so `tokenize_core`/`tokenize_with_offsets`/`tokenize_with_opts` delegate to ONE implementation (e.g. `tokenize_partial` is the core; `tokenize_with_offsets` wraps it: `let (t,o,err) = tokenize_partial(...); match err { None => Ok((t,o)), Some(e) => Err(e) }`; `tokenize_with_opts` drops offsets the same way). Existing `tokenize_with_offsets`/`tokenize_with_opts` behavior + their tests are UNCHANGED.
+
+Build + run the existing offset tests: `cargo test --bin huck offsets_ tokenize 2>&1 | tail` → still pass.
+
+- [ ] **Step 3: Rewrite the tokenize call in `run_sourced_contents`**
+
+In `src/builtins.rs`, replace the `match tokenize_with_offsets(...) { Ok ... Err ... }`
+block with `tokenize_partial` + the truncation handling. Sketch (preserve all
+existing unit-execution + extglob-flip + `set -v` + ExecOutcome logic):
+
+```rust
+let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
+let (tokens, offsets, terr) = crate::lexer::tokenize_partial(
+    &contents[start..], crate::lexer::LexerOptions { extglob },
+);
+let total = tokens.len();
+if total == 0 {
+    // nothing lexed. If there was an error, report+skip; else done.
+    if let Some((e, foff)) = terr {
+        eprintln!("huck: {}: line {}: syntax error{}", path.display(),
+            line_of(start + foff), crate::shell::lex_error_message(e));
+        last_status = 2;
+        start = next_line_start(start + foff);
+        prev_end = start;
+        continue 'outer;
+    }
+    break;
+}
+let mut iter = tokens.into_iter().peekable();
+loop {
+    while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) { iter.next(); }
+    let unit_start_idx = total - iter.len();
+    if iter.peek().is_none() {
+        // Consumed every token in this (possibly partial) batch.
+        if let Some((e, foff)) = &terr {
+            // The batch was truncated by a lex error after the last complete unit.
+            let resume = start + offsets[total]; // = error offset (sentinel)
+            if resume > start {
+                start = resume; prev_end = start; continue 'outer; // re-lex remainder
+            }
+            // No progress possible -> report + skip.
+            eprintln!("huck: {}: line {}: syntax error{}", path.display(),
+                line_of(start + foff), crate::shell::lex_error_message(e.clone()));
+            last_status = 2;
+            start = next_line_start(start + foff);
+            prev_end = start;
+            continue 'outer;
+        }
+        break 'outer; // clean end of input
+    }
+    match crate::command::parse_one_unit(&mut iter) {
+        Ok(None) => { /* same as today */ }
+        Ok(Some(seq)) => { /* execute exactly as today: set -v echo, execute,
+                              ExecOutcome match, extglob-flip re-lex */ }
+        Err(e) if terr.is_some() && is_unterminated(&e) => {
+            // Truncated trailing unit: re-lex it with the now-current extglob.
+            let resume = start + offsets[unit_start_idx];
+            if resume > start {
+                start = resume; prev_end = start; continue 'outer;
+            }
+            // Truncated unit is the FIRST unit and extglob did not change ->
+            // genuinely un-lexable. Report the lex error + skip its line.
+            let (le, foff) = terr.clone().unwrap();
+            eprintln!("huck: {}: line {}: syntax error{}", path.display(),
+                line_of(start + foff), crate::shell::lex_error_message(le));
+            last_status = 2;
+            start = next_line_start(start + foff);
+            prev_end = start;
+            continue 'outer;
+        }
+        Err(e) => { /* genuine parse error: existing report + resync path */ }
+    }
+}
+```
+Add a small helper:
+```rust
+fn is_unterminated(e: &crate::command::ParseError) -> bool {
+    use crate::command::ParseError::*;
+    matches!(e, UnterminatedFunction | UnterminatedLoop | UnterminatedIf
+        | UnterminatedCase | UnterminatedBrace | UnterminatedSubshell
+        | UnterminatedDoubleBracket)
+}
+```
+(Confirm the exact `ParseError` variant names by reading `src/command.rs`; include every "unterminated/incomplete compound" variant. `LexError` may need `Clone` — it likely already derives it; if not, clone the message string instead.)
+
+IMPORTANT subtleties:
+- The progress guard (`resume > start`) is what prevents an infinite loop on a
+  genuinely malformed first unit. Make sure BOTH the iter-empty and the
+  unterminated-Err branches enforce it.
+- Keep the existing extglob-flip re-lex inside the `Ok(Some(seq))` arm — when the
+  clean prefix's `shopt -s extglob` executes, that flip path ALSO triggers a
+  re-lex; the truncation path is the fallback when the flip happens to land mid
+  un-lexable construct.
+- `LexError` doesn't implement `Display` directly — reuse `crate::shell::lex_error_message` exactly as the current code does.
+
+- [ ] **Step 4: Run tests**
+- `cargo test --test extglob_command_sub_integration 2>&1 | tail -20` → Step-1 tests pass (MARKER/done print; malformed reports once, no hang).
+- `cargo test 2>&1 | tail -20` → FULL suite green (the reader change must not regress v104's linear-source-reader tests, `set -v`, errexit, etc.).
+- `cargo clippy --all-targets 2>&1 | tail -3` → clean.
+
+- [ ] **Step 5: bash_completion smoke**
+```bash
+printf 'source /usr/share/bash-completion/bash_completion\ndeclare -F 2>/dev/null | wc -l\n' > /tmp/bcf.sh
+./target/debug/huck /tmp/bcf.sh 2>/tmp/bce.txt | tail -1   # function count (target: ~81)
+echo "errors: $(grep -c 'syntax error' /tmp/bce.txt)"; grep 'syntax error' /tmp/bce.txt | head -3
+```
+Report the function count (should jump from 20 toward ~81) and the remaining errors (the next gaps). Lines 1232/1249 `command substitution` errors should be GONE.
+
+- [ ] **Step 6: Commit**
+```bash
+git add src/lexer.rs src/builtins.rs
+git commit -m "feat: reader executes clean prefix before a lex-failing unit (M-101)
+
+tokenize_partial returns tokens produced before a lex error; run_sourced_contents
+executes the complete units (so an earlier shopt -s extglob takes effect) then
+re-lexes the truncated trailing unit with the now-current extglob. Fixes the v104
+batch-reader interaction where an early shopt couldn't affect a later extglob-in-
+command-sub in the same chunk. Progress guard prevents loops on malformed lines.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
+```
+
+### Task 2 report
+**DONE/BLOCKED**, commit SHA, the `tokenize_partial` approach, confirmation existing `tokenize_with_offsets`/`tokenize_with_opts` are unchanged, the integration + full-suite pass lines, the bash_completion function count (before/after), clippy.
+
+---
+
+## Task 3: Integration tests + bash_completion smoke
 
 **Files:** Create `tests/extglob_command_sub_integration.rs`.
 
@@ -261,7 +457,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 3: bash-diff harness (31st)
+## Task 4: bash-diff harness (31st)
 
 **Files:** Create `tests/scripts/extglob_command_sub_diff_check.sh`.
 
@@ -291,7 +487,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 4: Documentation
+## Task 5: Documentation
 
 **Files:** Modify `docs/bash-divergences.md`, `README.md`.
 
