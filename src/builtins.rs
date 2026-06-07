@@ -4994,6 +4994,14 @@ pub(crate) fn run_sourced_contents(
             None => contents.len(),
         }
     };
+    // Byte offset of the START of the line containing `abs`. Used to resume after
+    // a lex truncation whose failing construct produced no token (e.g. an array
+    // literal `a=($(…!(x)…))`): the failure byte sits mid-construct, so the clean
+    // re-lex boundary is the start of the failing line, not the failure byte.
+    let line_start_of = |abs: usize| -> usize {
+        let a = abs.min(contents.len());
+        contents[..a].rfind('\n').map(|i| i + 1).unwrap_or(0)
+    };
 
     let mut start = 0usize; // byte offset of the unconsumed remainder
     let mut prev_end = 0usize; // bytes already echoed for `set -v`
@@ -5041,8 +5049,13 @@ pub(crate) fn run_sourced_contents(
                 // identically (an infinite loop), so report the error instead.
                 if let Some((e, foff)) = &terr {
                     let now_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-                    if now_extglob != extglob && prev_end > start {
-                        start = prev_end;
+                    // Resume from the start of the failing line (a clean boundary)
+                    // rather than `prev_end`, which may be the mid-construct lex
+                    // failure byte when the failing construct produced no token.
+                    let resume = line_start_of(start + *foff);
+                    if now_extglob != extglob && resume > start {
+                        start = resume;
+                        prev_end = start;
                         continue 'outer;
                     }
                     eprintln!(
@@ -5103,7 +5116,16 @@ pub(crate) fn run_sourced_contents(
                     // how the remainder must be lexed. Re-lex from here.
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
                     if new_extglob != extglob {
-                        start = unit_end_abs;
+                        // If this flipping unit was the last complete token before
+                        // a lex truncation, the un-lexed tail begins at the start
+                        // of the failing line — `offsets[total]` is the
+                        // mid-construct failure byte, not a clean boundary.
+                        start = match &terr {
+                            Some((_, foff)) if unit_end_idx == total => {
+                                line_start_of(start + *foff)
+                            }
+                            _ => unit_end_abs,
+                        };
                         prev_end = start;
                         continue 'outer;
                     }
