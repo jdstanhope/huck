@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum LexError {
     UnterminatedQuote,
     InvalidVarName,
@@ -279,28 +279,37 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// the byte offset where lexing failed.
 // Consumed by the linear source reader (a later v104 task); the offset sidecar
 // lands first behind this thin public wrapper.
+// Retained as a thin `Result`-returning wrapper over `tokenize_partial` and
+// exercised by the offset unit tests; the source reader now calls
+// `tokenize_partial` directly, so it is otherwise unused in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tokenize_with_offsets(
     input: &str,
     opts: LexerOptions,
 ) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
-    tokenize_core(input, opts)
-}
-
-pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
-    match tokenize_core(input, opts) {
-        Ok((tokens, _offsets)) => Ok(tokens),
-        Err((e, _off)) => Err(e),
+    match tokenize_partial(input, opts) {
+        (tokens, offsets, None) => Ok((tokens, offsets)),
+        (_, _, Some((e, off))) => Err((e, off)),
     }
 }
 
-/// The single tokenizer implementation. Emits the token stream plus a parallel
-/// `offsets` vector holding each token's start byte offset, with a trailing
-/// `input.len()` sentinel on success. On a lex error, returns the error and the
-/// byte offset where lexing stopped (`chars.offset()`).
-fn tokenize_core(
+pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
+    match tokenize_partial(input, opts) {
+        (tokens, _offsets, None) => Ok(tokens),
+        (_, _, Some((e, _off))) => Err(e),
+    }
+}
+
+/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
+/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
+/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
+/// trailing offset is `input.len()` on success, or the error byte offset on
+/// failure. This lets the source reader execute the complete units that lexed
+/// before the failure and re-lex the truncated trailing unit.
+pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
-) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
+) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
     let mut tokens: Vec<Token> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let mut parts: Vec<WordPart> = Vec::new();
@@ -862,9 +871,21 @@ fn tokenize_core(
                 tokens.len() + 1,
                 "offset sidecar must have one entry per token plus a sentinel"
             );
-            Ok((tokens, offsets))
+            (tokens, offsets, None)
         }
-        Err(e) => Err((e, chars.offset())),
+        Err(e) => {
+            // Partial: keep the tokens produced before the error and push the
+            // error byte offset as the trailing sentinel, preserving the
+            // `offsets.len() == tokens.len() + 1` invariant.
+            let off = chars.offset();
+            offsets.push(off);
+            debug_assert_eq!(
+                offsets.len(),
+                tokens.len() + 1,
+                "offset sidecar must have one entry per token plus a sentinel"
+            );
+            (tokens, offsets, Some((e, off)))
+        }
     }
 }
 

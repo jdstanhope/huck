@@ -544,7 +544,7 @@ pub struct Sequence {
     pub background: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ParseError {
     MissingCommand,
     MissingRedirectTarget,
