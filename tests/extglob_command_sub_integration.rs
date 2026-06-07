@@ -1,6 +1,7 @@
 //! v106 (M-101): the source reader executes the clean prefix before a
 //! lex-failing trailing unit, so an early `shopt -s extglob` takes effect
 //! before a later extglob-in-command-sub is re-lexed.
+use std::fs;
 use std::io::Write;
 use std::process::Command;
 
@@ -63,4 +64,57 @@ fn clean_script_unaffected() {
     let (out, _e, c) = run("echo one\necho two\n");
     assert_eq!(out, "one\ntwo\n");
     assert_eq!(c, 0);
+}
+
+fn in_tmp(files: &[&str], script: &str) -> (String, String, i32) {
+    let dir = std::env::temp_dir().join(format!("huck_egA_{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    for f in files {
+        let _ = fs::write(dir.join(f), "");
+    }
+    let full = format!("cd '{}'\nshopt -s extglob\n{}", dir.display(), script);
+    let r = run(&full);
+    let _ = fs::remove_dir_all(&dir);
+    r
+}
+
+#[test]
+fn extglob_in_command_sub_globs() {
+    let (out, _e, _c) = in_tmp(&["keep", "skip"], "echo $(printf '%s\\n' !(skip))\n");
+    assert_eq!(out, "keep\n");
+}
+
+#[test]
+fn extglob_in_backtick_sub() {
+    let (out, _e, _c) = in_tmp(&["keep", "skip"], "echo `printf '%s\\n' !(skip)`\n");
+    assert_eq!(out, "keep\n");
+}
+
+#[test]
+fn extglob_in_array_literal_command_sub() {
+    let (out, _e, _c) = in_tmp(
+        &["keep", "skip"],
+        "a=($(printf '%s\\n' !(skip))); echo \"${a[0]}\"\n",
+    );
+    assert_eq!(out, "keep\n");
+}
+
+#[test]
+fn extglob_off_command_sub_unchanged() {
+    let (out, _e, _c) = run("echo $(echo hi)\n");
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn regex_operand_line_continuation() {
+    // [[ =~ ]] with the regex operand on a backslash-newline continuation line.
+    let (out, _e, _c) = run("[[ abc =~ \\\n  (a|x)bc ]] && echo M || echo N\n");
+    assert_eq!(out, "M\n");
+}
+
+#[test]
+fn braced_operand_bare_brace_pattern() {
+    // ${var%%pattern} where the pattern contains a bare `{`.
+    let (out, _e, _c) = run("x='abc{def'; echo ${x%%[<{(]*}\n");
+    assert_eq!(out, "abc\n");
 }
