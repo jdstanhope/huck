@@ -274,17 +274,52 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_with_opts(input, LexerOptions::default())
 }
 
+/// Tokenize, returning each token's start byte offset (and a trailing sentinel
+/// `offsets[tokens.len()] == input.len()`). On error, returns the LexError and
+/// the byte offset where lexing failed.
+// Consumed by the linear source reader (a later v104 task); the offset sidecar
+// lands first behind this thin public wrapper.
+#[allow(dead_code)]
+pub fn tokenize_with_offsets(
+    input: &str,
+    opts: LexerOptions,
+) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
+    tokenize_core(input, opts)
+}
+
 pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
+    match tokenize_core(input, opts) {
+        Ok((tokens, _offsets)) => Ok(tokens),
+        Err((e, _off)) => Err(e),
+    }
+}
+
+/// The single tokenizer implementation. Emits the token stream plus a parallel
+/// `offsets` vector holding each token's start byte offset, with a trailing
+/// `input.len()` sentinel on success. On a lex error, returns the error and the
+/// byte offset where lexing stopped (`chars.offset()`).
+fn tokenize_core(
+    input: &str,
+    opts: LexerOptions,
+) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
     let mut tokens: Vec<Token> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
     let mut quoted_current = String::new();
     let mut has_token = false;
+    let mut token_start: usize = 0;
     let mut in_assignment_value = false;
     let mut chars = CharCursor::new(input);
     let mut pending_heredocs: std::collections::VecDeque<PendingHeredoc> = std::collections::VecDeque::new();
 
-    while let Some(c) = chars.next() {
+    let result: Result<(), LexError> = (|| {
+    loop {
+        let c_off = chars.offset();
+        let c = match chars.next() {
+            Some(c) => c,
+            None => break,
+        };
         if c.is_whitespace() {
             if has_token {
                 flush_literal(&mut parts, &mut current, false);
@@ -292,7 +327,8 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                     !parts.is_empty(),
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
-                emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                for _ in 0..n { offsets.push(token_start); }
                 has_token = false;
                 in_assignment_value = false;
             }
@@ -303,8 +339,18 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                     collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens)?;
                 }
                 tokens.push(Token::Newline);
+                offsets.push(c_off);
             }
             continue;
+        }
+
+        // Record the start byte offset of a word as soon as its first char is
+        // seen. When `has_token` is false at the top of an iteration, this char
+        // is a candidate first char; operator arms (which leave `has_token`
+        // false) simply overwrite `token_start` on the next iteration, while
+        // word arms read the value captured at the word's true first char.
+        if !has_token {
+            token_start = c_off;
         }
 
         // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
@@ -439,7 +485,8 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
             '|' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
@@ -448,12 +495,14 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::Pipe));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
@@ -470,12 +519,14 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::Background));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 let op = if chars.peek() == Some(&';') {
@@ -493,12 +544,14 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                     Operator::Semi
                 };
                 tokens.push(Token::Op(op));
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 // Detect `((` (contiguous, no whitespace). The peek/next
@@ -513,21 +566,25 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::LParen));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::RParen));
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '<' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'<') {
@@ -562,12 +619,14 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::RedirIn));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '>' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
@@ -579,6 +638,7 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '1' if !has_token && chars.peek() == Some(&'>') => {
@@ -592,6 +652,7 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '2' if !has_token && chars.peek() == Some(&'>') => {
@@ -605,6 +666,7 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
                 } else {
                     tokens.push(Token::Op(Operator::RedirErr));
                 }
+                offsets.push(c_off);
                 in_assignment_value = false;
             }
             '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
@@ -746,13 +808,28 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 
     if has_token {
         flush_literal(&mut parts, &mut current, false);
-        emit_word_with_braces(&mut tokens, parts)?;
+        let n = emit_word_with_braces(&mut tokens, parts)?;
+        for _ in 0..n { offsets.push(token_start); }
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
     if !pending_heredocs.is_empty() {
         return Err(LexError::UnterminatedHeredoc);
     }
-    Ok(tokens)
+    Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            offsets.push(input.len()); // sentinel, ONLY on success
+            debug_assert_eq!(
+                offsets.len(),
+                tokens.len() + 1,
+                "offset sidecar must have one entry per token plus a sentinel"
+            );
+            Ok((tokens, offsets))
+        }
+        Err(e) => Err((e, chars.offset())),
+    }
 }
 
 /// Reads `X(...)` where `prefix` is the just-seen extglob prefix char (one of
@@ -930,22 +1007,28 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
 
 /// Emits a Word into `tokens`. If the parts contain an unquoted
 /// `{`, runs brace expansion and emits one Word per expansion.
+/// Emits the word for `parts` into `tokens`, expanding any unquoted braces.
+/// Returns the number of tokens pushed (1 normally, or one per brace-expansion
+/// product). Callers that track byte offsets push the word's start offset this
+/// many times to keep the offset sidecar in lockstep with the token stream.
 fn emit_word_with_braces(
     tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,
-) -> Result<(), LexError> {
+) -> Result<usize, LexError> {
     if !word_contains_unquoted_brace(&parts) {
         tokens.push(Token::Word(Word(parts)));
-        return Ok(());
+        return Ok(1);
     }
     let (concat, placeholders) = build_concat_with_sentinels(&parts);
     let expansions = crate::brace_expand::expand(&concat)
         .map_err(|_| LexError::BraceExpansionLimit)?;
+    let mut count = 0;
     for s in expansions {
         let new_parts = split_on_sentinels(&s, &placeholders);
         tokens.push(Token::Word(Word(new_parts)));
+        count += 1;
     }
-    Ok(())
+    Ok(count)
 }
 
 fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
@@ -2845,6 +2928,74 @@ mod tests {
         assert_eq!(c.offset(), 4);
         assert_eq!(c.next(), None);
         assert_eq!(c.offset(), 4);
+    }
+
+    #[test]
+    fn offsets_align_with_token_starts() {
+        // "echo hi\nls" -> Word(echo)@0 Word(hi)@5 Newline@7 Word(ls)@8, sentinel@10
+        let (toks, offs) = tokenize_with_offsets("echo hi\nls", LexerOptions::default()).unwrap();
+        assert_eq!(offs.len(), toks.len() + 1);
+        assert_eq!(offs[toks.len()], 10); // sentinel = input.len()
+        assert_eq!(offs[0], 0);
+        let nl = toks.iter().position(|t| matches!(t, Token::Newline)).unwrap();
+        assert_eq!(offs[nl], 7);
+        assert_eq!(offs[nl + 1], 8);
+    }
+
+    /// Each token's recorded offset must point at the byte where that token's
+    /// source actually begins (verified by re-deriving the offset from a
+    /// distinctive first character). Guards offset *correctness*, not just the
+    /// lockstep length invariant.
+    #[test]
+    fn offsets_point_at_real_token_starts() {
+        // Leading whitespace before the first word; operators; a quoted word.
+        //          0123456789012345678901
+        let src = "  echo a && ls 'x y'\n";
+        let (toks, offs) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
+        assert_eq!(offs.len(), toks.len() + 1);
+        // First word "echo" starts at byte 2 (after two spaces).
+        assert_eq!(offs[0], 2);
+        // The `&&` operator starts at byte 9.
+        let and = toks.iter().position(|t| matches!(t, Token::Op(Operator::And))).unwrap();
+        assert_eq!(offs[and], 9);
+        assert_eq!(&src[offs[and]..offs[and] + 2], "&&");
+        // The quoted word 'x y' starts at byte 15 (the opening quote).
+        assert_eq!(&src[offs[toks.len() - 2]..offs[toks.len() - 2] + 1], "'");
+        // Trailing Newline at byte 20; sentinel at 21.
+        assert_eq!(offs[toks.len() - 1], 20);
+        assert_eq!(offs[toks.len()], 21);
+        // Offsets are non-decreasing and in range.
+        for w in offs.windows(2) {
+            assert!(w[0] <= w[1]);
+        }
+        assert!(offs.iter().all(|&o| o <= src.len()));
+    }
+
+    /// Offsets across multiple physical lines map to the right line when the
+    /// reader counts newlines up to an offset (the v94 line-number mechanism).
+    #[test]
+    fn offsets_support_line_lookup() {
+        let src = "echo a\necho b\nbad)\n";
+        let (toks, offs) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
+        // The `)` operator is on line 3; line = 1 + newlines before its offset.
+        let rp = toks.iter().position(|t| matches!(t, Token::Op(Operator::RParen))).unwrap();
+        let line = 1 + src.as_bytes()[..offs[rp]].iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn offsets_error_returns_failure_position() {
+        let err = tokenize_with_offsets("echo 'oops", LexerOptions::default());
+        assert!(err.is_err());
+        let (_e, off) = err.unwrap_err();
+        assert!(off >= 5, "failure offset {off} should be at/after the open quote");
+    }
+
+    #[test]
+    fn tokenize_with_opts_output_unchanged() {
+        let a = tokenize_with_opts("if true; then echo hi; fi", LexerOptions::default()).unwrap();
+        let (b, _o) = tokenize_with_offsets("if true; then echo hi; fi", LexerOptions::default()).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
