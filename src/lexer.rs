@@ -25,6 +25,58 @@ pub enum LexError {
     UnterminatedExtglob,
 }
 
+/// A char cursor over a `&str` that also tracks the byte offset of the next
+/// char to be produced. Drop-in for the `Peekable<Chars>` the lexer used:
+/// implements `Iterator<Item = char>`, a `peek()` returning `Option<&char>`,
+/// `Clone`, and (via `Iterator`) `by_ref()`. `offset()` is the byte position
+/// of the char that the next `next()`/`peek()` will yield (or `s.len()` at end).
+#[derive(Clone)]
+pub struct CharCursor<'a> {
+    s: &'a str,
+    pos: usize,
+    peeked: Option<char>,
+    peeked_len: usize,
+}
+
+impl<'a> CharCursor<'a> {
+    pub fn new(s: &'a str) -> Self {
+        CharCursor { s, pos: 0, peeked: None, peeked_len: 0 }
+    }
+
+    /// Peek the next char without consuming it.
+    pub fn peek(&mut self) -> Option<&char> {
+        if self.peeked.is_none()
+            && let Some(c) = self.s[self.pos..].chars().next()
+        {
+            self.peeked = Some(c);
+            self.peeked_len = c.len_utf8();
+        }
+        self.peeked.as_ref()
+    }
+
+    /// Byte offset of the next char to be produced (start of the next token
+    /// when the cursor sits on a token boundary). Equals `s.len()` at EOF.
+    pub fn offset(&self) -> usize {
+        self.pos
+    }
+}
+
+impl Iterator for CharCursor<'_> {
+    type Item = char;
+    fn next(&mut self) -> Option<char> {
+        if let Some(c) = self.peeked.take() {
+            self.pos += self.peeked_len;
+            self.peeked_len = 0;
+            Some(c)
+        } else if let Some(c) = self.s[self.pos..].chars().next() {
+            self.pos += c.len_utf8();
+            Some(c)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Operator {
     Pipe,           // |
@@ -229,7 +281,7 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
     let mut quoted_current = String::new();
     let mut has_token = false;
     let mut in_assignment_value = false;
-    let mut chars = input.chars().peekable();
+    let mut chars = CharCursor::new(input);
     let mut pending_heredocs: std::collections::VecDeque<PendingHeredoc> = std::collections::VecDeque::new();
 
     while let Some(c) = chars.next() {
@@ -713,7 +765,7 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 /// `LexError::UnterminatedExtglob`.
 fn scan_extglob_group(
     prefix: char,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Vec<WordPart>, LexError> {
     let mut group_parts: Vec<WordPart> = Vec::new();
     let mut lit = format!("{prefix}(");
@@ -846,7 +898,7 @@ fn build_concat_with_sentinels(parts: &[WordPart]) -> (String, Vec<WordPart>) {
 fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     let mut out: Vec<WordPart> = Vec::new();
     let mut buf = String::new();
-    let mut chars = s.chars().peekable();
+    let mut chars = CharCursor::new(s);
     while let Some(c) = chars.next() {
         if c == '\u{E000}' {
             if !buf.is_empty() {
@@ -910,7 +962,7 @@ fn flush_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) 
 /// of the delimiter word was quoted (per POSIX 2.7.4: any quoting in the
 /// delimiter word forces literal-mode body collection).
 fn parse_heredoc_delim(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<(String, bool), LexError> {
     // Skip leading whitespace (POSIX: `<< EOF` is allowed).
     while matches!(chars.peek(), Some(&' ') | Some(&'\t')) {
@@ -964,7 +1016,7 @@ fn parse_heredoc_delim(
 /// After each heredoc's body is collected, it is patched back into the
 /// placeholder `Token::Heredoc` at `token_idx`.
 fn collect_heredoc_bodies(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     pending: &mut std::collections::VecDeque<PendingHeredoc>,
     tokens: &mut [Token],
 ) -> Result<(), LexError> {
@@ -990,7 +1042,7 @@ pub(crate) fn ends_with_continuation_backslash(s: &str) -> bool {
 /// Collects the body of one heredoc, reading lines until the close-delimiter
 /// is matched (or end-of-input, which is an error).
 fn collect_one_heredoc_body(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     ph: &PendingHeredoc,
 ) -> Result<Word, LexError> {
     let mut body_parts: Vec<WordPart> = Vec::new();
@@ -1074,7 +1126,7 @@ fn scan_expanding_body_line(
     line: &str,
     parts: &mut Vec<WordPart>,
 ) -> Result<(), LexError> {
-    let mut chars = line.chars().peekable();
+    let mut chars = CharCursor::new(line);
     let mut current = String::new();
     while let Some(c) = chars.next() {
         match c {
@@ -1126,7 +1178,7 @@ fn flush_body_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: b
 /// become CommandSub; everything else is literal text. Used by `$(( ))`
 /// (lexer) and, via `command.rs`, by `(( ))` and arith-`for` headers.
 pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
-    let mut chars = s.chars().peekable();
+    let mut chars = CharCursor::new(s);
     let mut parts: Vec<WordPart> = Vec::new();
     let mut lit = String::new();
     macro_rules! flush_lit {
@@ -1203,7 +1255,7 @@ pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
 }
 
 fn read_dollar_expansion(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
 ) -> Result<(), LexError> {
@@ -1277,7 +1329,7 @@ fn read_dollar_expansion(
 /// escapes, until the matching unescaped `'` is consumed. Returns the
 /// decoded string.
 fn read_ansi_c_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut out = String::new();
     loop {
@@ -1295,7 +1347,7 @@ fn read_ansi_c_quoted(
 /// escapes (`\q`) and trailing `\` are preserved verbatim, matching bash.
 pub(crate) fn decode_ansi_c_escapes(v: &str) -> String {
     let mut out = String::new();
-    let mut chars = v.chars().peekable();
+    let mut chars = CharCursor::new(v);
     while let Some(c) = chars.next() {
         if c == '\\' {
             // `decode_ansi_c_escape` only errors on `\` at EOF (no escape
@@ -1313,7 +1365,7 @@ pub(crate) fn decode_ansi_c_escapes(v: &str) -> String {
 /// Decodes a single backslash escape inside `$'...'` and appends the
 /// result to `out`. The leading `\` has already been consumed.
 fn decode_ansi_c_escape(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     out: &mut String,
 ) -> Result<(), LexError> {
     match chars.next() {
@@ -1394,7 +1446,7 @@ fn decode_ansi_c_escape(
 /// returns their value. Caller has already confirmed at least one hex
 /// digit is available.
 fn scan_hex_digits(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     max: u32,
 ) -> u32 {
     let mut v: u32 = 0;
@@ -1428,7 +1480,7 @@ fn push_codepoint(out: &mut String, v: u32) -> Result<(), LexError> {
 /// nested paren depth so `(((a+b)*c))` correctly captures `((a+b)*c)`
 /// as the body.
 fn scan_arith_block(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut collected = String::new();
     let mut depth: i32 = 0;
@@ -1458,7 +1510,7 @@ fn scan_arith_block(
 /// `))`). Tracks paren depth so that nested `(` / `)` inside the
 /// expression do not prematurely close the expansion.
 fn scan_arith_body(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut body = String::new();
     let mut depth: u32 = 1; // we are inside the outer `((`
@@ -1492,7 +1544,7 @@ fn scan_arith_body(
 /// quoted span doesn't close the expansion. Returns the inner text (without
 /// the closing `}`).
 fn scan_braced_operand(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     // Known limitation: a `${...}` nested *inside* a double-quoted span of
     // the operand (e.g. `${X:-"${Y}}"}`) is not depth-tracked — the inner
@@ -1557,7 +1609,7 @@ fn scan_braced_operand(
 /// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
 /// substitution/substring operands) is a word, not a command.
 fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
-    let mut chars = body.chars().peekable();
+    let mut chars = CharCursor::new(body);
     let mut parts: Vec<WordPart> = Vec::new();
     let mut cur = String::new();
     while let Some(c) = chars.next() {
@@ -1635,7 +1687,7 @@ fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
 /// after `\` does not close the substitution, and nested `$(...)` increments
 /// the depth.
 fn scan_paren_substitution(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<crate::command::Sequence, LexError> {
     let mut body = String::new();
     let mut depth: usize = 0;
@@ -1730,7 +1782,7 @@ fn parse_substitution_body(body: &str) -> Result<crate::command::Sequence, LexEr
 /// - `\` + `$` -> literal `$` in the body
 /// - `\` + any other char `c` -> both `\` and `c` are preserved verbatim
 fn scan_backtick_substitution(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<crate::command::Sequence, LexError> {
     let mut body = String::new();
     while let Some(c) = chars.next() {
@@ -1765,7 +1817,7 @@ fn empty_sequence() -> crate::command::Sequence {
     }
 }
 
-fn read_var_name(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+fn read_var_name(chars: &mut CharCursor<'_>) -> String {
     let mut name = String::new();
     while let Some(&c) = chars.peek() {
         if is_name_cont(c) {
@@ -1782,7 +1834,7 @@ fn read_var_name(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String
 /// already been consumed. Pushes either a `WordPart::Var` (plain `${name}`)
 /// or a `WordPart::ParamExpansion` (any modifier).
 fn read_braced_param_expansion(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
 ) -> Result<(), LexError> {
@@ -1972,7 +2024,7 @@ fn read_braced_param_expansion(
 /// any other expression is parsed via `read_subscript` into
 /// `SubscriptKind::Index`.
 fn scan_param_subscript(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Option<SubscriptKind>, LexError> {
     if chars.peek() != Some(&'[') {
         return Ok(None);
@@ -2001,7 +2053,7 @@ fn scan_param_subscript(
 /// already consumed the leading `[`. Balanced over nested `[…]` (for
 /// arith-style expressions like `a[$((i+1))]`).
 fn read_subscript(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Word, LexError> {
     let mut depth: usize = 1;
     let mut buf = String::new();
@@ -2062,7 +2114,7 @@ fn parse_subscript_body(src: &str) -> Result<Word, LexError> {
 /// element. Subscripted elements `[expr]=value` carry an explicit
 /// `subscript` Word.
 fn read_array_literal(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Vec<ArrayLiteralElement>, LexError> {
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
@@ -2094,7 +2146,7 @@ fn read_array_literal(
 
 /// Skips whitespace AND newlines inside an array literal.
 fn skip_array_literal_whitespace(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) {
     while let Some(&c) = chars.peek() {
         if c.is_whitespace() {
@@ -2111,7 +2163,7 @@ fn skip_array_literal_whitespace(
 /// end the array literal prematurely. The collected raw text is then
 /// re-tokenized via `tokenize` to produce a `Word`.
 fn read_array_element_word(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Word, LexError> {
     let mut buf = String::new();
     loop {
@@ -2247,7 +2299,7 @@ fn read_array_element_word(
 /// Reads identifier chars (the parameter name) inside a `${...}` until it
 /// hits a non-identifier char. Does NOT consume the terminator.
 fn read_braced_name(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut name = String::new();
     while let Some(&c) = chars.peek() {
@@ -2273,7 +2325,7 @@ fn dispatch_braced_modifier(
     name: String,
     quoted: bool,
     subscript: Option<SubscriptKind>,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     indirect: bool,
 ) -> Result<(), LexError> {
@@ -2471,7 +2523,7 @@ fn dispatch_braced_modifier(
 /// Scans the operand text until the matching `}` and parses it as a single
 /// `Word`. Builds the `ParamModifier` via the caller's closure.
 fn modifier_with_operand<F>(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     build: F,
 ) -> Result<ParamModifier, LexError>
 where
@@ -2488,7 +2540,7 @@ where
 /// Delegates to `scan_braced_operand` (depth + quote aware) so nested
 /// `${...}` constructs in the operand are handled correctly.
 fn scan_optional_braced_operand(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<Option<Word>, LexError> {
     let body = scan_braced_operand(chars)?;
     if body.is_empty() {
@@ -2506,7 +2558,7 @@ fn scan_optional_braced_operand(
 /// a literal `/`; `\\` becomes a literal `\`; any other `\x` passes
 /// through unchanged so the inner operand tokenizer sees it.
 fn scan_substitution_operand(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<(Word, Word), LexError> {
     let body = scan_braced_operand(chars)?;
     let (pattern_src, replacement_src) = split_substitution_body(&body);
@@ -2525,7 +2577,7 @@ fn split_substitution_body(body: &str) -> (String, String) {
     let mut replacement = String::new();
     let mut delim_seen = false;
     let mut depth: u32 = 0;
-    let mut chars = body.chars().peekable();
+    let mut chars = CharCursor::new(body);
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
@@ -2577,7 +2629,7 @@ fn split_substitution_body(body: &str) -> (String, String) {
 /// to `scan_braced_operand` + `split_substring_body` + `parse_braced_operand`
 /// to collect and parse the offset and optional length Words.
 fn scan_substring_operands(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
 ) -> Result<(Word, Option<Word>), LexError> {
     let body = scan_braced_operand(chars)?;
     let (offset_src, length_src) = split_substring_body(&body);
@@ -2598,7 +2650,7 @@ fn split_substring_body(body: &str) -> (String, Option<String>) {
     let mut length = String::new();
     let mut delim_seen = false;
     let mut depth: u32 = 0;
-    let mut chars = body.chars().peekable();
+    let mut chars = CharCursor::new(body);
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
@@ -2663,7 +2715,7 @@ fn is_name_cont(c: char) -> bool {
 /// the `+` in `~+`). On failure, leaves the iterator untouched and
 /// returns `None` (the caller treats `~` as a literal).
 fn try_parse_tilde(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut CharCursor<'_>,
     in_assignment_value: bool,
 ) -> Option<TildeSpec> {
     let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
@@ -2776,6 +2828,34 @@ mod tests {
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
         Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+    }
+
+    #[test]
+    fn char_cursor_tracks_byte_offset() {
+        let mut c = CharCursor::new("ab\nc");
+        assert_eq!(c.offset(), 0);
+        assert_eq!(c.peek(), Some(&'a'));
+        assert_eq!(c.offset(), 0); // peek does not advance
+        assert_eq!(c.next(), Some('a'));
+        assert_eq!(c.offset(), 1);
+        assert_eq!(c.next(), Some('b'));
+        assert_eq!(c.next(), Some('\n'));
+        assert_eq!(c.offset(), 3);
+        assert_eq!(c.next(), Some('c'));
+        assert_eq!(c.offset(), 4);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.offset(), 4);
+    }
+
+    #[test]
+    fn char_cursor_offset_with_multibyte() {
+        // 'é' is 2 bytes in UTF-8.
+        let mut c = CharCursor::new("é!");
+        assert_eq!(c.offset(), 0);
+        assert_eq!(c.next(), Some('é'));
+        assert_eq!(c.offset(), 2);
+        assert_eq!(c.next(), Some('!'));
+        assert_eq!(c.offset(), 3);
     }
 
     #[test]
@@ -4153,31 +4233,31 @@ mod tests {
 
     #[test]
     fn scan_braced_operand_simple() {
-        let mut chars = "foo}".chars().peekable();
+        let mut chars = CharCursor::new("foo}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "foo");
     }
 
     #[test]
     fn scan_braced_operand_nested_braces() {
-        let mut chars = "${Y}}".chars().peekable();
+        let mut chars = CharCursor::new("${Y}}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "${Y}");
     }
 
     #[test]
     fn scan_braced_operand_double_quote_protects_brace() {
-        let mut chars = "\"a}b\"c}".chars().peekable();
+        let mut chars = CharCursor::new("\"a}b\"c}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "\"a}b\"c");
     }
 
     #[test]
     fn scan_braced_operand_single_quote_protects_brace() {
-        let mut chars = "'a}b'c}".chars().peekable();
+        let mut chars = CharCursor::new("'a}b'c}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "'a}b'c");
     }
 
     #[test]
     fn scan_braced_operand_unterminated_is_error() {
-        let mut chars = "foo".chars().peekable();
+        let mut chars = CharCursor::new("foo");
         assert_eq!(scan_braced_operand(&mut chars).unwrap_err(), LexError::UnterminatedBrace);
     }
 
