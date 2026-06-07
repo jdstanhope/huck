@@ -3057,12 +3057,11 @@ mod tests {
     }
 
     fn word_text(t: &Token) -> Option<String> {
-        if let Token::Word(Word(parts)) = t {
-            if parts.len() == 1 {
-                if let WordPart::Literal { text, quoted: false } = &parts[0] {
-                    return Some(text.clone());
-                }
-            }
+        if let Token::Word(Word(parts)) = t
+            && parts.len() == 1
+            && let WordPart::Literal { text, quoted: false } = &parts[0]
+        {
+            return Some(text.clone());
         }
         None
     }
