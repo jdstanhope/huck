@@ -523,8 +523,47 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
 }
 
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    // Leading flags select the namespace and apply to all following names:
+    // `-f` => function namespace, `-v` (or no flag) => variable namespace.
+    let mut mode_fn = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-f" => {
+                mode_fn = true;
+                idx += 1;
+            }
+            "-v" => {
+                mode_fn = false;
+                idx += 1;
+            }
+            "--" => {
+                idx += 1;
+                break;
+            }
+            s if s.len() > 1 && s.starts_with('-') => {
+                eprintln!("huck: unset: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+    let names = &args[idx..];
     let mut any_error = false;
-    for arg in args {
+    for arg in names {
+        if mode_fn {
+            // Function namespace: remove if present. Identifier validity is
+            // still enforced (bash rejects e.g. `unset -f 1bad`), but an
+            // absent function name is success (no error), matching bash. No
+            // readonly/array-subscript handling applies here.
+            if !is_valid_name(arg) {
+                eprintln!("huck: unset: '{arg}': not a valid identifier");
+                any_error = true;
+                continue;
+            }
+            shell.functions.remove(arg);
+            continue;
+        }
         match parse_subscripted_arg(arg) {
             Ok(Some((name, sub_text))) => {
                 // `unset a[i]`: remove a single element. The subscript is

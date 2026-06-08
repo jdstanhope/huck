@@ -54,3 +54,20 @@ fn declare_g_toplevel_and_composed() {
     assert_eq!(run("declare -g X=2\necho \"$X\"\n").0, "2\n");
     assert_eq!(run("f() { declare -gx E=7; }\nf\necho \"$E\"\n").0, "7\n");
 }
+
+#[test]
+fn unset_f_removes_function() {
+    assert_eq!(run("f() { echo hi; }\nunset -f f\ntype f >/dev/null 2>&1 && echo found || echo gone\n").0, "gone\n");
+}
+#[test]
+fn unset_v_removes_variable() {
+    assert_eq!(run("v=1\nunset -v v\necho \"[${v-}]\"\n").0, "[]\n");
+}
+#[test]
+fn unset_missing_is_success() {
+    assert_eq!(run("unset -f NOPE_FN\n").2, 0);
+}
+#[test]
+fn unset_f_does_not_touch_samename_var() {
+    assert_eq!(run("x=VAR\nx() { :; }\nunset -f x\necho \"$x\"\n").0, "VAR\n");
+}
