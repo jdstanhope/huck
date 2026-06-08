@@ -1172,6 +1172,35 @@ fn builtin_export_decl(
         }
         return ExecOutcome::Continue(0);
     }
+    // Consume leading flags from Plain args. huck tracks no allexport/array
+    // attribute, so `-a` is a no-op; `-p`/`-n`/`-f` are likewise accepted and
+    // ignored here (bash's listing/unexport/function modes are not modeled).
+    // `--` stops flag parsing. This lets `export -a chpwd_functions` (emitted
+    // by `mise activate bash`) succeed instead of erroring on `-a`.
+    let mut idx = 0;
+    while idx < args.len() {
+        match &args[idx] {
+            DeclArg::Plain(s) => {
+                if s == "--" {
+                    idx += 1;
+                    break;
+                }
+                if s.starts_with('-') && s.len() > 1 {
+                    if s[1..].chars().all(|c| matches!(c, 'a' | 'p' | 'n' | 'f')) {
+                        idx += 1;
+                        continue;
+                    }
+                    eprintln!("huck: export: {s}: invalid option");
+                    return ExecOutcome::Continue(1);
+                }
+                break;
+            }
+            DeclArg::Assign(_) => break,
+        }
+    }
+    // Flags consumed but nothing left to export (e.g. bare `export -a`):
+    // bash returns rc 0 with no output, NOT the full export listing.
+    let args = &args[idx..];
     let mut any_error = false;
     for arg in args {
         match arg {

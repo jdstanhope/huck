@@ -386,6 +386,47 @@ fn expand_assoc_param(
                 shell,
             )
         }
+        // `${m[@]+word}` / `${m[@]-word}` (and :+/:-) on a whole assoc array.
+        // Set iff it has >=1 pair; empty `declare -A n=()` counts as UNSET.
+        // Mirrors the indexed-array path. The word is field-preserving.
+        (PM::UseAlternate { word, colon: _ }, SK::All | SK::Star) => {
+            if !values.is_empty() {
+                let words: Vec<String> =
+                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(words.join(&sep))
+                } else {
+                    ExpansionResult::WordList(words)
+                }
+            } else {
+                ExpansionResult::Empty
+            }
+        }
+        (PM::UseDefault { word, colon: _ }, SK::All | SK::Star) => {
+            if !values.is_empty() {
+                // Set: behave exactly like ${m[@]} / ${m[*]}.
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(values.join(&sep))
+                } else {
+                    ExpansionResult::WordList(values)
+                }
+            } else {
+                // Unset: expand `word` (field-preserving).
+                let words: Vec<String> =
+                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(words.join(&sep))
+                } else {
+                    ExpansionResult::WordList(words)
+                }
+            }
+        }
         // Other scalar modifiers on @/* — explicit error for v72 scope
         // (per-element modifiers across the whole array are deferred).
         (other, SK::All | SK::Star) => {
@@ -634,6 +675,52 @@ fn expand_array_param(
                 crate::param_expansion::ParamLookup::Element(val.as_deref()),
                 shell,
             )
+        }
+        // `${arr[@]+word}` / `${arr[@]-word}` (and :+/:-) on a whole array.
+        // A whole array is "set and non-null" iff it has >=1 element; the
+        // colon and non-colon variants behave identically (a whole array
+        // can't be "set but null"). Empty array () counts as UNSET. Matches
+        // bash. The alternate/default `word` is expanded field-preserving so
+        // the idiom ${arr[@]+"${arr[@]}"} keeps element boundaries.
+        (PM::UseAlternate { word, colon: _ }, SK::All | SK::Star) => {
+            let set = !collect_values(shell).is_empty();
+            if set {
+                let words: Vec<String> =
+                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(words.join(&sep))
+                } else {
+                    ExpansionResult::WordList(words)
+                }
+            } else {
+                ExpansionResult::Empty
+            }
+        }
+        (PM::UseDefault { word, colon: _ }, SK::All | SK::Star) => {
+            let values = collect_values(shell);
+            if !values.is_empty() {
+                // Set: behave exactly like ${arr[@]} / ${arr[*]}.
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(values.join(&sep))
+                } else {
+                    ExpansionResult::WordList(values)
+                }
+            } else {
+                // Unset: expand `word` (field-preserving).
+                let words: Vec<String> =
+                    expand(word, shell).into_iter().map(|f| f.chars).collect();
+                if matches!(subscript, SK::Star) {
+                    let ifs = shell.ifs();
+                    let sep = ifs_join_sep(&ifs);
+                    ExpansionResult::Value(words.join(&sep))
+                } else {
+                    ExpansionResult::WordList(words)
+                }
+            }
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
         (other, SK::All | SK::Star) => {
