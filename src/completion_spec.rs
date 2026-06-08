@@ -370,7 +370,8 @@ fn filename_matches_prefix(path: &str, prefix: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    match glob::Pattern::new(pattern) {
+    let pattern = crate::glob_match::translate_bracket_negation(pattern);
+    match glob::Pattern::new(&pattern) {
         Ok(p) => p.matches(candidate),
         Err(_) => false,
     }

@@ -1434,7 +1434,8 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
                 require_literal_separator: true,
                 require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
             };
-            match glob_with(&pattern, match_opts) {
+            let npat = crate::glob_match::translate_bracket_negation(&pattern);
+            match glob_with(&npat, match_opts) {
                 Ok(paths) => {
                     let mut m = Vec::new();
                     for entry in paths {
