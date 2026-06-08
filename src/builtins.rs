@@ -20,7 +20,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "cd", "exit", "pwd", "echo", "export", "unset", "jobs",
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
-    "set", "shopt", "shift", ".", "source", "local",
+    "set", "shopt", "shift", "getopts", ".", "source", "local",
     ":", "true", "false", "command",
     "readonly", "read", "printf", "type", "hash",
     "pushd", "popd", "dirs",
@@ -95,6 +95,7 @@ pub fn run_builtin(
         "set" => builtin_set(args, out, shell),
         "shopt" => builtin_shopt(args, out, shell),
         "shift" => builtin_shift(args, shell),
+        "getopts" => builtin_getopts(args, shell),
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
         "help" => builtin_help(args, out, shell),
@@ -4072,6 +4073,57 @@ fn optstring_takes_arg(optstring: &str, c: char) -> bool {
         if o == c { return chars.peek() == Some(&':'); }
     }
     false
+}
+
+/// `getopts optstring name [arg ...]` — POSIX option parser (M-106). Reads/
+/// writes OPTIND/OPTARG/OPTERR + the matched-letter `name`, holding the
+/// within-word cursor in Shell. Delegates the state machine to `getopts_step`.
+fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.len() < 2 {
+        eprintln!("huck: getopts: usage: getopts optstring name [arg]");
+        return ExecOutcome::Continue(2);
+    }
+    let optstring = args[0].clone();
+    let name = args[1].clone();
+    if !is_valid_name(&name) {
+        eprintln!("huck: getopts: `{name}': not a valid identifier");
+        return ExecOutcome::Continue(2);
+    }
+    // Parse explicit args if given, else the current positional parameters.
+    let parse_args: Vec<String> = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        shell.positional_args.clone()
+    };
+    // Read OPTIND (default 1; clamp <1 to 1).
+    let optind = shell
+        .lookup_var("OPTIND")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    // Detect an external OPTIND reset → fresh within-word cursor.
+    let sp = if optind != shell.getopts_optind_cache { 1 } else { shell.getopts_sp };
+
+    let step = getopts_step(&optstring, &parse_args, optind, sp);
+
+    // Write back OPTIND + cursor cache.
+    shell.set("OPTIND", step.optind.to_string());
+    shell.getopts_optind_cache = step.optind;
+    shell.getopts_sp = step.sp;
+    // Assign the matched letter (or '?' / ':').
+    shell.set(&name, step.name.clone());
+    // OPTARG: set or unset.
+    match step.optarg {
+        Some(v) => shell.set("OPTARG", v),
+        None => shell.unset("OPTARG"),
+    }
+    // Verbose error message (suppressed by OPTERR=0).
+    if let Some(body) = step.error
+        && shell.lookup_var("OPTERR").as_deref() != Some("0")
+    {
+        eprintln!("huck: {body}");
+    }
+    ExecOutcome::Continue(if step.done { 1 } else { 0 })
 }
 
 fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
