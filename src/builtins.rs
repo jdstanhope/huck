@@ -685,7 +685,13 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 .unwrap()
                 .insert(name.to_string(), snap);
         }
-        shell.set(name, value.unwrap_or_default());
+        match value {
+            // `local NAME=` / `local NAME=val`: set (possibly empty).
+            Some(v) => shell.set(name, v),
+            // Bare `local NAME`: declare local but UNSET (M-111). The snapshot
+            // above records the outer value for restore-on-return.
+            None => shell.unset(name),
+        }
     }
     ExecOutcome::Continue(exit)
 }
@@ -1357,9 +1363,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                         exit = 1;
                     }
                 } else {
-                    // Bare `local NAME` with no value: set empty scalar,
-                    // matching the legacy builtin_local behavior.
-                    shell.set(name, String::new());
+                    // Bare `local NAME` with no value: declare it function-local
+                    // but UNSET (matches bash + `declare NAME`). The snapshot
+                    // above records the outer value so it is restored on return;
+                    // unsetting here makes `[[ -v NAME ]]` / `${NAME-d}` see it
+                    // as unset until assigned. (M-111)
+                    shell.unset(name);
                 }
             }
             DeclArg::Assign(a) => {
@@ -8689,7 +8698,10 @@ mod local_tests {
     }
 
     #[test]
-    fn local_without_value_sets_empty() {
+    fn local_without_value_leaves_unset() {
+        // Bare `local NAME` declares the var function-local but UNSET, matching
+        // bash (verified: `f(){ local x; [[ -v x ]] && echo S || echo U; }; f`
+        // prints `U`). It used to be set-empty; that was the M-111 bug.
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
@@ -8700,7 +8712,7 @@ mod local_tests {
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        assert_eq!(shell.lookup_var("XYZ_LOCAL_T2").as_deref(), Some(""));
+        assert_eq!(shell.lookup_var("XYZ_LOCAL_T2").as_deref(), None);
     }
 
     #[test]
