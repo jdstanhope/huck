@@ -71,3 +71,83 @@ fn export_plain_assignment_unchanged() {
     let (out, _e, _c) = run("export NAME=v\ndeclare -p NAME\n");
     assert!(out.contains("declare -x NAME=\"v\""), "NAME should be exported: {out}");
 }
+
+// M-82: ${arr[@]+word} / ${arr[@]-word} (and :+/:-, [*], assoc) on whole arrays.
+#[test]
+fn array_alt_set() {
+    let (out, err, _c) = run("a=(x y z)\nprintf '[%s]' \"${a[@]+SET}\"\n");
+    assert_eq!(out, "[SET]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_alt_empty_is_unset() {
+    let (out, err, _c) = run("b=()\nprintf '[%s]' \"${b[@]+SET}\"\n");
+    assert_eq!(out, "[]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_alt_unset() {
+    let (out, err, _c) = run("unset c\nprintf '[%s]' \"${c[@]+SET}\"\n");
+    assert_eq!(out, "[]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_default_set_yields_elements() {
+    let (out, err, _c) = run("a=(x y z)\nprintf '<%s>' \"${a[@]-DEF}\"\n");
+    assert_eq!(out, "<x><y><z>", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_default_unset_yields_word() {
+    let (out, err, _c) = run("b=()\nprintf '<%s>' \"${b[@]-DEF}\"\n");
+    assert_eq!(out, "<DEF>", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_star_alt() {
+    let (out, err, _c) = run("a=(x y z)\nprintf '[%s]' \"${a[*]+SET}\"\n");
+    assert_eq!(out, "[SET]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_safe_idiom() {
+    let (out, err, _c) = run("set -u\na=(1 2)\nprintf '<%s>' \"${a[@]+\"${a[@]}\"}\"\n");
+    assert_eq!(out, "<1><2>", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn array_idiom_unset_empty() {
+    let (out, err, _c) = run("set -u\nunset c\nprintf '<%s>' \"${c[@]+\"${c[@]}\"}\"\necho END\n");
+    assert!(out.contains("END"), "should print END: {out}");
+    // The <...> part is empty: printf with zero args still emits one <>.
+    assert_eq!(out, "<>END\n", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn assoc_alt_set() {
+    let (out, err, _c) = run("declare -A m=([k]=v)\nprintf '[%s]' \"${m[@]+SET}\"\n");
+    assert_eq!(out, "[SET]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn assoc_alt_empty() {
+    let (out, err, _c) = run("declare -A n=()\nprintf '[%s]' \"${n[@]+SET}\"\n");
+    assert_eq!(out, "[]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
+
+#[test]
+fn assoc_default_unset() {
+    let (out, err, _c) = run("declare -A n=()\nprintf '[%s]' \"${n[@]-DEF}\"\n");
+    assert_eq!(out, "[DEF]", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}
