@@ -523,8 +523,47 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
 }
 
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    // Leading flags select the namespace and apply to all following names:
+    // `-f` => function namespace, `-v` (or no flag) => variable namespace.
+    let mut mode_fn = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-f" => {
+                mode_fn = true;
+                idx += 1;
+            }
+            "-v" => {
+                mode_fn = false;
+                idx += 1;
+            }
+            "--" => {
+                idx += 1;
+                break;
+            }
+            s if s.len() > 1 && s.starts_with('-') => {
+                eprintln!("huck: unset: {s}: invalid option");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break,
+        }
+    }
+    let names = &args[idx..];
     let mut any_error = false;
-    for arg in args {
+    for arg in names {
+        if mode_fn {
+            // Function namespace: remove if present. Identifier validity is
+            // still enforced (bash rejects e.g. `unset -f 1bad`), but an
+            // absent function name is success (no error), matching bash. No
+            // readonly/array-subscript handling applies here.
+            if !is_valid_name(arg) {
+                eprintln!("huck: unset: '{arg}': not a valid identifier");
+                any_error = true;
+                continue;
+            }
+            shell.functions.remove(arg);
+            continue;
+        }
         match parse_subscripted_arg(arg) {
             Ok(Some((name, sub_text))) => {
                 // `unset a[i]`: remove a single element. The subscript is
@@ -891,6 +930,7 @@ fn builtin_declare(
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
+    let mut global = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -923,7 +963,8 @@ fn builtin_declare(
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'l' | b'u' | b'a' | b'A' | b'n' | b'g' if minus => {
+                b'g' if minus => global = true,
+                b'l' | b'u' | b'a' | b'A' | b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -983,7 +1024,15 @@ fn builtin_declare(
         // For any mutation form, record the pre-state into the current
         // local frame BEFORE mutating — so attribute changes unwind on
         // function exit. No-op outside a function.
-        snapshot_for_local_scope(shell, name);
+        if global {
+            // -g: write to the global map AND drop any outer local snapshot for
+            // this name so the global value is not rolled back on function exit.
+            if let Some(frame) = shell.local_scopes.last_mut() {
+                frame.remove(name);
+            }
+        } else {
+            snapshot_for_local_scope(shell, name);
+        }
 
         // Reject integer-attribute transitions on a readonly variable
         // (bash-compat: bash leaves attributes unchanged when the
@@ -1464,6 +1513,7 @@ fn builtin_declare_decl(
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
+    let mut global = false;
 
     // Parse leading flags from Plain args. As soon as we hit a non-flag
     // Plain or any Assign, switch into the per-name phase.
@@ -1517,7 +1567,8 @@ fn builtin_declare_decl(
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'l' | b'u' | b'n' | b'g' if minus => {
+                b'g' if minus => global = true,
+                b'l' | b'u' | b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1622,8 +1673,15 @@ fn builtin_declare_decl(
             continue;
         }
 
-        // Snapshot for local-scope unwind BEFORE mutating.
-        snapshot_for_local_scope(shell, name);
+        // Snapshot for local-scope unwind BEFORE mutating. With -g, write to
+        // the global map and drop any outer snapshot so it survives function exit.
+        if global {
+            if let Some(frame) = shell.local_scopes.last_mut() {
+                frame.remove(name);
+            }
+        } else {
+            snapshot_for_local_scope(shell, name);
+        }
 
         // Integer-attribute changes on readonly variable are rejected.
         if (want_integer || want_remove_integer) && shell.is_readonly(name) {
@@ -3945,7 +4003,7 @@ enum OptSetErr {
 
 /// Reads a `set -o` option: real state for the 3 implemented, the table
 /// default for any other recognized name, `None` for an unknown name.
-fn option_get(shell: &Shell, name: &str) -> Option<bool> {
+pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     match name {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
