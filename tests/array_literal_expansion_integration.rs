@@ -94,3 +94,8 @@ fn append_continues_index() {
 fn append_to_unset_starts_at_zero() {
     assert_eq!(run("arr+=(x y)\necho \"idx=[${!arr[@]}]\"\n"), "idx=[0 1]\n");
 }
+#[test]
+fn fatal_pe_in_subscripted_element_aborts() {
+    // set -u + unset var in a [i]=value element: bash aborts the assignment.
+    assert_eq!(run("set -u\narr=([0]=$undef)\necho after\n"), "");
+}

@@ -4185,6 +4185,9 @@ fn expand_array_elements(
                 };
                 map.insert(idx, expand_assignment(&e.value, shell));
                 implicit = idx + 1;
+                if shell.pending_fatal_pe_error.is_some() {
+                    return Err(());
+                }
             }
             None => {
                 for field in glob_expand_word(&e.value, shell)? {
