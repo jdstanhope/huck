@@ -151,3 +151,12 @@ fn assoc_default_unset() {
     assert_eq!(out, "[DEF]", "out: {out}");
     assert_eq!(err, "", "stderr leaked: {err}");
 }
+
+#[test]
+fn assoc_default_set_yields_values() {
+    // Set assoc + `-DEF`: yields the array's values, not DEF. Single key
+    // keeps iteration order deterministic.
+    let (out, err, _c) = run("declare -A m=([k]=v)\nprintf '<%s>' \"${m[@]-DEF}\"\n");
+    assert_eq!(out, "<v>", "out: {out}");
+    assert_eq!(err, "", "stderr leaked: {err}");
+}

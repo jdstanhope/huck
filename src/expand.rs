@@ -412,7 +412,7 @@ fn expand_assoc_param(
                     let sep = ifs_join_sep(&ifs);
                     ExpansionResult::Value(values.join(&sep))
                 } else {
-                    ExpansionResult::WordList(values.clone())
+                    ExpansionResult::WordList(values)
                 }
             } else {
                 // Unset: expand `word` (field-preserving).
