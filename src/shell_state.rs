@@ -234,6 +234,13 @@ pub struct Shell {
     /// Current frame of positional parameters. Populated only by
     /// function calls (Task 5); empty at the top level.
     pub positional_args: Vec<String>,
+    /// getopts: 1-based char offset of the next option char within the current
+    /// word (1 = "fresh word, re-check the leading dash"). Paired with
+    /// `getopts_optind_cache` to detect an external OPTIND reset. (M-106)
+    pub getopts_sp: usize,
+    /// getopts: the OPTIND value getopts itself last wrote. If the live OPTIND
+    /// differs at entry, the caller reset it → start a fresh scan.
+    pub getopts_optind_cache: usize,
     /// User-defined functions. Populated by `Command::FunctionDef`
     /// execution; looked up by `run_exec_single` when dispatching a
     /// simple command.
@@ -363,6 +370,8 @@ impl Shell {
             vars,
             last_status: 0,
             positional_args: Vec::new(),
+            getopts_sp: 0,
+            getopts_optind_cache: 0,
             functions: HashMap::new(),
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),

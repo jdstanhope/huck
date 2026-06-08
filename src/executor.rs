@@ -2521,6 +2521,12 @@ pub(crate) fn call_function(
 ) -> ExecOutcome {
     let saved = std::mem::take(&mut shell.positional_args);
     let saved_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
+    // getopts' within-word cursor is per-call-context: save it and start the
+    // function body fresh, so a function that runs getopts (e.g. with
+    // `local OPTIND=1`) cannot corrupt a caller that is mid-cluster. Restored
+    // below so the caller resumes its own scan, matching bash. (M-106)
+    let saved_getopts_sp = std::mem::replace(&mut shell.getopts_sp, 0);
+    let saved_getopts_optind_cache = std::mem::replace(&mut shell.getopts_optind_cache, 0);
     shell.positional_args = args;
     shell.function_arg0.push(name.to_string());
     shell.local_scopes.push(std::collections::HashMap::new());
@@ -2551,6 +2557,8 @@ pub(crate) fn call_function(
     shell.function_arg0.pop();
     shell.positional_args = saved;
     shell.loop_depth = saved_loop_depth;
+    shell.getopts_sp = saved_getopts_sp;
+    shell.getopts_optind_cache = saved_getopts_optind_cache;
     match result {
         ExecOutcome::FunctionReturn(n) => ExecOutcome::Continue(n),
         other => other,
