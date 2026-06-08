@@ -383,6 +383,7 @@ fn expand_assoc_param(
                 name,
                 modif,
                 crate::param_expansion::ParamLookup::Element(val.as_deref()),
+                quoted,
                 shell,
             )
         }
@@ -390,7 +391,11 @@ fn expand_assoc_param(
         // Set iff it has >=1 pair; empty `declare -A n=()` counts as UNSET.
         // Mirrors the indexed-array path. The word is field-preserving.
         (PM::UseAlternate { word, colon: _ }, SK::All | SK::Star) => {
-            if !values.is_empty() {
+            if values.is_empty() {
+                ExpansionResult::Empty
+            } else if quoted {
+                // Quoted outer: keep the existing field-preserving WordList /
+                // [*]-join path (already correct).
                 let words: Vec<String> =
                     expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
@@ -401,12 +406,14 @@ fn expand_assoc_param(
                     ExpansionResult::WordList(words)
                 }
             } else {
-                ExpansionResult::Empty
+                // Unquoted outer: emit the alternate's own fields verbatim
+                // (preserves empties / quoted-spaced fields).
+                ExpansionResult::Fields(expand(word, shell))
             }
         }
         (PM::UseDefault { word, colon: _ }, SK::All | SK::Star) => {
             if !values.is_empty() {
-                // Set: behave exactly like ${m[@]} / ${m[*]}.
+                // Set: behave exactly like ${m[@]} / ${m[*]} (unchanged).
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -414,8 +421,8 @@ fn expand_assoc_param(
                 } else {
                     ExpansionResult::WordList(values)
                 }
-            } else {
-                // Unset: expand `word` (field-preserving).
+            } else if quoted {
+                // Unset, quoted outer: existing field-preserving path.
                 let words: Vec<String> =
                     expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
@@ -425,6 +432,9 @@ fn expand_assoc_param(
                 } else {
                     ExpansionResult::WordList(words)
                 }
+            } else {
+                // Unset, unquoted outer: emit the default word's own fields.
+                ExpansionResult::Fields(expand(word, shell))
             }
         }
         // Other scalar modifiers on @/* — explicit error for v72 scope
@@ -509,7 +519,7 @@ fn expand_indirect(
         eprintln!("huck: {n}: unbound variable");
         return ExpansionResult::Fatal { status: 1 };
     }
-    crate::param_expansion::expand_modifier(n, modifier, shell)
+    crate::param_expansion::expand_modifier_quoted(n, modifier, quoted, shell)
 }
 
 /// Splits a `name[sub]` effective-name string into `(name, sub)`. Returns
@@ -673,6 +683,7 @@ fn expand_array_param(
                 name,
                 modif,
                 crate::param_expansion::ParamLookup::Element(val.as_deref()),
+                quoted,
                 shell,
             )
         }
@@ -683,8 +694,11 @@ fn expand_array_param(
         // bash. The alternate/default `word` is expanded field-preserving so
         // the idiom ${arr[@]+"${arr[@]}"} keeps element boundaries.
         (PM::UseAlternate { word, colon: _ }, SK::All | SK::Star) => {
-            let set = !collect_values(shell).is_empty();
-            if set {
+            if collect_values(shell).is_empty() {
+                ExpansionResult::Empty
+            } else if quoted {
+                // Quoted outer: keep the existing field-preserving WordList /
+                // [*]-join path (already correct).
                 let words: Vec<String> =
                     expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
@@ -695,13 +709,15 @@ fn expand_array_param(
                     ExpansionResult::WordList(words)
                 }
             } else {
-                ExpansionResult::Empty
+                // Unquoted outer: emit the alternate's own fields verbatim
+                // (preserves empties / quoted-spaced fields).
+                ExpansionResult::Fields(expand(word, shell))
             }
         }
         (PM::UseDefault { word, colon: _ }, SK::All | SK::Star) => {
             let values = collect_values(shell);
             if !values.is_empty() {
-                // Set: behave exactly like ${arr[@]} / ${arr[*]}.
+                // Set: behave exactly like ${arr[@]} / ${arr[*]} (unchanged).
                 if matches!(subscript, SK::Star) {
                     let ifs = shell.ifs();
                     let sep = ifs_join_sep(&ifs);
@@ -709,8 +725,8 @@ fn expand_array_param(
                 } else {
                     ExpansionResult::WordList(values)
                 }
-            } else {
-                // Unset: expand `word` (field-preserving).
+            } else if quoted {
+                // Unset, quoted outer: existing field-preserving path.
                 let words: Vec<String> =
                     expand(word, shell).into_iter().map(|f| f.chars).collect();
                 if matches!(subscript, SK::Star) {
@@ -720,6 +736,9 @@ fn expand_array_param(
                 } else {
                     ExpansionResult::WordList(words)
                 }
+            } else {
+                // Unset, unquoted outer: emit the default word's own fields.
+                ExpansionResult::Fields(expand(word, shell))
             }
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
@@ -883,7 +902,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 ) {
                     expand_positional_substring(name, modifier, *quoted, shell)
                 } else {
-                    crate::param_expansion::expand_modifier(name, modifier, shell)
+                    crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
                 };
                 match result_pe {
                     crate::param_expansion::ExpansionResult::Value(v) => {
@@ -926,6 +945,26 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                             let sep = ifs_join_sep(&ifs);
                             let joined = words.join(&sep);
                             emit_split_fields(&joined, &ifs, &mut current, &mut result, &mut has_emitted);
+                        }
+                    }
+                    crate::param_expansion::ExpansionResult::Fields(fields) => {
+                        // Substituted word of an UNQUOTED outer ${p+word} /
+                        // ${p-word} (M-110). Each Field came from expand(word),
+                        // so it already encodes per-char quoting; bash then
+                        // word-splits the result, protecting quoted regions.
+                        // Field boundaries from expand() (e.g. "${a[@]}"
+                        // elements) are word boundaries; within each field we
+                        // IFS-split only at UNQUOTED whitespace/IFS — so
+                        // quoted-empty fields survive and quoted-spaced fields
+                        // are not re-split.
+                        let ifs = shell.ifs();
+                        for (i, f) in fields.into_iter().enumerate() {
+                            if i > 0 {
+                                result.push(std::mem::take(&mut current));
+                            }
+                            emit_split_field_quoted(
+                                &f, &ifs, &mut current, &mut result, &mut has_emitted,
+                            );
                         }
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
@@ -1015,7 +1054,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 ) {
                     expand_positional_substring(name, modifier, *quoted, shell)
                 } else {
-                    crate::param_expansion::expand_modifier(name, modifier, shell)
+                    crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
                 };
                 match result_pe {
                     crate::param_expansion::ExpansionResult::Value(v) => result.push_str(&v),
@@ -1027,6 +1066,16 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         let ifs = shell.ifs();
                         let sep = ifs_join_sep(&ifs);
                         result.push_str(&words.join(&sep));
+                    }
+                    crate::param_expansion::ExpansionResult::Fields(fields) => {
+                        let ifs = shell.ifs();
+                        let sep = ifs_join_sep(&ifs);
+                        let joined = fields
+                            .iter()
+                            .map(|f| f.chars.as_str())
+                            .collect::<Vec<_>>()
+                            .join(&sep);
+                        result.push_str(&joined);
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
                         shell.pending_fatal_pe_error = Some(status);
@@ -1232,6 +1281,108 @@ fn emit_split_fields(
             break;
         }
     }
+}
+
+/// IFS-splits a single already-expanded `Field`, honoring its per-char
+/// `quoted` mask: only UNQUOTED IFS characters act as separators, so quoted
+/// regions (incl. quoted whitespace and quoted empties) survive intact. The
+/// surviving characters keep their original `quoted` flags. Used by the
+/// `ExpansionResult::Fields` consumer for an UNQUOTED outer `${p+word}` /
+/// `${p-word}` (M-110): bash word-splits the substituted word's expansion
+/// but protects its quoted regions.
+fn emit_split_field_quoted(
+    field: &Field,
+    ifs: &str,
+    current: &mut Field,
+    result: &mut Vec<Field>,
+    has_emitted: &mut bool,
+) {
+    let chars: Vec<char> = field.chars.chars().collect();
+    // A char is a separator iff it is an IFS char AND unquoted.
+    let sep_at = |idx: usize| -> bool {
+        !field.quoted.get(idx).copied().unwrap_or(false)
+            && ifs.contains(chars[idx])
+    };
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n') && ifs.contains(c);
+
+    let n = chars.len();
+
+    // A zero-length field (from a quoted-empty `""` inner) is a real, empty
+    // word unit — mark emitted so it survives even though splitting adds
+    // nothing. (A NON-empty field that splits away to nothing — e.g. all
+    // unquoted whitespace — must NOT force a word; the loop decides.)
+    if n == 0 {
+        *has_emitted = true;
+        return;
+    }
+
+    // Empty IFS → no splitting; append the whole field verbatim.
+    if ifs.is_empty() {
+        for (idx, c) in chars.iter().enumerate() {
+            current.push_str(&c.to_string(), field.quoted.get(idx).copied().unwrap_or(false));
+        }
+        *has_emitted = true;
+        return;
+    }
+    let mut i = 0usize;
+    // Skip leading IFS-whitespace separators.
+    while i < n && sep_at(i) && is_ws(chars[i]) {
+        i += 1;
+    }
+
+    let mut first_field = true;
+    let mut produced_any = false;
+    while i < n {
+        // Read one field: run of chars that are not unquoted-IFS separators.
+        let mut piece = Field::new();
+        while i < n && !sep_at(i) {
+            piece.push_str(&chars[i].to_string(), field.quoted.get(i).copied().unwrap_or(false));
+            i += 1;
+        }
+        if first_field {
+            current.chars.push_str(&piece.chars);
+            current.quoted.extend(piece.quoted);
+            *has_emitted = true;
+            first_field = false;
+        } else {
+            result.push(std::mem::take(current));
+            *current = piece;
+        }
+        produced_any = true;
+
+        if i >= n {
+            break;
+        }
+        // Sitting on an unquoted IFS separator. Mirror emit_split_fields.
+        if !is_ws(chars[i]) {
+            // Non-whitespace IFS: consume one, plus trailing ws-IFS.
+            i += 1;
+            while i < n && sep_at(i) && is_ws(chars[i]) {
+                i += 1;
+            }
+        } else {
+            // Whitespace IFS run.
+            while i < n && sep_at(i) && is_ws(chars[i]) {
+                i += 1;
+            }
+            if i < n && sep_at(i) && !is_ws(chars[i]) {
+                i += 1;
+                while i < n && sep_at(i) && is_ws(chars[i]) {
+                    i += 1;
+                }
+            }
+        }
+        if i >= n {
+            break;
+        }
+    }
+
+    // A wholly-quoted field with no chars at all (e.g. `${x+""}` quoted-empty
+    // inner) still must contribute an empty field: expand() already emitted a
+    // zero-length Field, so reaching here with n==0 means append nothing —
+    // the empty Field was its own element and is preserved by the caller's
+    // per-field push.
+    let _ = produced_any;
 }
 
 /// Result of opts-aware pathname expansion. `words` are the expanded fields;
