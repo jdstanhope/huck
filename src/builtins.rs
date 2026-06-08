@@ -3942,6 +3942,138 @@ fn signal_number_to_name(signum: i32) -> Option<String> {
     })
 }
 
+/// One step of `getopts` parsing — pure, no shell access (unit-testable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GetoptsStep {
+    /// Value to assign to the `name` variable ("a", "?", or ":").
+    pub name: String,
+    /// `Some(v)` → set OPTARG to v; `None` → unset OPTARG.
+    pub optarg: Option<String>,
+    /// New OPTIND to write back.
+    pub optind: usize,
+    /// New within-word cursor to cache.
+    pub sp: usize,
+    /// Verbose-mode error message BODY (no "huck: " prefix); printed by the
+    /// caller only when set AND OPTERR != "0". `None` in silent mode / success.
+    pub error: Option<String>,
+    /// true → options exhausted / non-option / `--` (caller returns rc 1);
+    /// false → an option (possibly invalid) was processed (rc 0).
+    pub done: bool,
+}
+
+/// Compute one `getopts` step. `optind` is 1-based into `args`; `sp` is the
+/// 1-based char offset within the current word (1 = fresh word). Silent mode
+/// is derived from a leading ':' in `optstring`. See the v111 spec.
+pub(crate) fn getopts_step(
+    optstring: &str,
+    args: &[String],
+    optind: usize,
+    sp: usize,
+) -> GetoptsStep {
+    let silent = optstring.starts_with(':');
+    let done = |optind: usize| GetoptsStep {
+        name: "?".to_string(), optarg: None, optind, sp: 1, error: None, done: true,
+    };
+
+    // Options exhausted.
+    if optind == 0 || optind > args.len() {
+        return done(optind.max(1));
+    }
+    let word: Vec<char> = args[optind - 1].chars().collect();
+    let mut sp = if sp == 0 { 1 } else { sp };
+
+    if sp == 1 {
+        // Fresh word: must start with '-' and not be just "-".
+        if word.first() != Some(&'-') || word.len() == 1 {
+            return done(optind); // non-option, OPTIND unchanged
+        }
+        if word.len() == 2 && word[1] == '-' {
+            return done(optind + 1); // "--" → end of options, advance past it
+        }
+        sp = 2; // skip the leading '-'
+    }
+
+    let c = word[sp - 1];
+    let mut sp = sp + 1;
+    let word_done = sp > word.len();
+
+    // Look up `c` in optstring. A leading ':' (silent flag) is NOT a valid
+    // option letter; ':' can never itself be an option char.
+    let takes_arg = optstring_takes_arg(optstring, c);
+    let known = c != ':' && optstring_has(optstring, c);
+
+    if !known {
+        // Invalid option.
+        let mut next_optind = optind;
+        if word_done { next_optind += 1; sp = 1; }
+        return GetoptsStep {
+            name: "?".to_string(),
+            optarg: if silent { Some(c.to_string()) } else { None },
+            optind: next_optind,
+            sp,
+            error: if silent { None } else { Some(format!("illegal option -- {c}")) },
+            done: false,
+        };
+    }
+
+    if takes_arg {
+        if !word_done {
+            // Attached arg: rest of the word.
+            let arg: String = word[(sp - 1)..].iter().collect();
+            return GetoptsStep {
+                name: c.to_string(), optarg: Some(arg),
+                optind: optind + 1, sp: 1, error: None, done: false,
+            };
+        }
+        if optind < args.len() {
+            // Separate arg: the next word.
+            return GetoptsStep {
+                name: c.to_string(), optarg: Some(args[optind].clone()),
+                optind: optind + 2, sp: 1, error: None, done: false,
+            };
+        }
+        // Missing argument.
+        return GetoptsStep {
+            name: if silent { ":".to_string() } else { "?".to_string() },
+            optarg: if silent { Some(c.to_string()) } else { None },
+            optind: optind + 1, sp: 1,
+            error: if silent { None } else { Some(format!("option requires an argument -- {c}")) },
+            done: false,
+        };
+    }
+
+    // Plain valid option, no argument.
+    let mut next_optind = optind;
+    if word_done { next_optind += 1; sp = 1; }
+    GetoptsStep {
+        name: c.to_string(), optarg: None, optind: next_optind, sp, error: None, done: false,
+    }
+}
+
+/// True if `c` appears as an option letter in `optstring` (ignoring a leading
+/// ':' silent flag and the ':' arg-markers that follow letters).
+fn optstring_has(optstring: &str, c: char) -> bool {
+    let mut chars = optstring.chars().peekable();
+    if chars.peek() == Some(&':') { chars.next(); }
+    for o in chars {
+        if o == ':' { continue; } // arg-marker for the previous letter
+        if o == c { return true; }
+    }
+    false
+}
+
+/// True if option letter `c` is immediately followed by ':' in `optstring`
+/// (i.e. it takes an argument).
+fn optstring_takes_arg(optstring: &str, c: char) -> bool {
+    let mut chars = optstring.chars().peekable();
+    if chars.peek() == Some(&':') { chars.next(); }
+    while let Some(o) = chars.next() {
+        if o == ':' { continue; }
+        if o == c { return chars.peek() == Some(&':'); }
+    }
+    false
+}
+
 fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let n: usize = match args.first() {
         None => 1,
@@ -10744,5 +10876,110 @@ mod pipefail_option_tests {
         let oc = builtin_shopt(&["-o".into()], &mut buf, &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 27);
+    }
+}
+
+#[cfg(test)]
+mod getopts_step_tests {
+    use super::{getopts_step, GetoptsStep};
+
+    fn args(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn plain_option_then_advance() {
+        // "-a" at optind=1, sp=1 (fresh): consume 'a', word done -> optind=2, sp=1.
+        let s = getopts_step("ab", &args(&["-a"]), 1, 1);
+        assert_eq!(s.name, "a");
+        assert_eq!(s.optarg, None);
+        assert_eq!((s.optind, s.sp), (2, 1));
+        assert!(!s.done);
+        assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn clustered_options_walk_within_word() {
+        // "-ab": first call consumes 'a' (optind stays 1, sp 1->3),
+        let s1 = getopts_step("ab", &args(&["-ab"]), 1, 1);
+        assert_eq!(s1.name, "a");
+        assert_eq!((s1.optind, s1.sp), (1, 3));
+        // second call (sp=3) consumes 'b', word done -> optind=2, sp=1.
+        let s2 = getopts_step("ab", &args(&["-ab"]), 1, 3);
+        assert_eq!(s2.name, "b");
+        assert_eq!((s2.optind, s2.sp), (2, 1));
+    }
+
+    #[test]
+    fn option_with_attached_arg() {
+        // "-bval": 'b' takes an arg; rest of word "val" is OPTARG; optind=2.
+        let s = getopts_step("ab:", &args(&["-bval"]), 1, 1);
+        assert_eq!(s.name, "b");
+        assert_eq!(s.optarg.as_deref(), Some("val"));
+        assert_eq!((s.optind, s.sp), (2, 1));
+    }
+
+    #[test]
+    fn option_with_separate_arg() {
+        // "-b" "val": arg is the next word; optind jumps to 3.
+        let s = getopts_step("ab:", &args(&["-b", "val"]), 1, 1);
+        assert_eq!(s.name, "b");
+        assert_eq!(s.optarg.as_deref(), Some("val"));
+        assert_eq!((s.optind, s.sp), (3, 1));
+    }
+
+    #[test]
+    fn exhausted_returns_done_question() {
+        let s = getopts_step("ab", &args(&["-a"]), 2, 1); // optind past end
+        assert_eq!(s.name, "?");
+        assert!(s.done);
+        assert_eq!(s.optarg, None);
+    }
+
+    #[test]
+    fn non_option_terminates() {
+        let s = getopts_step("ab", &args(&["foo"]), 1, 1);
+        assert_eq!(s.name, "?");
+        assert!(s.done);
+        assert_eq!(s.optind, 1); // OPTIND unchanged
+    }
+
+    #[test]
+    fn double_dash_terminates_and_advances() {
+        let s = getopts_step("ab", &args(&["--", "x"]), 1, 1);
+        assert_eq!(s.name, "?");
+        assert!(s.done);
+        assert_eq!(s.optind, 2); // advanced past "--"
+    }
+
+    #[test]
+    fn invalid_option_verbose() {
+        let s = getopts_step("ab", &args(&["-z"]), 1, 1);
+        assert_eq!(s.name, "?");
+        assert_eq!(s.optarg, None);
+        assert!(!s.done);
+        assert_eq!(s.error.as_deref(), Some("illegal option -- z"));
+    }
+
+    #[test]
+    fn invalid_option_silent() {
+        let s = getopts_step(":ab", &args(&["-z"]), 1, 1);
+        assert_eq!(s.name, "?");
+        assert_eq!(s.optarg.as_deref(), Some("z")); // silent: OPTARG = offending char
+        assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn missing_arg_verbose() {
+        let s = getopts_step("ab:", &args(&["-b"]), 1, 1);
+        assert_eq!(s.name, "?");
+        assert_eq!(s.optarg, None);
+        assert_eq!(s.error.as_deref(), Some("option requires an argument -- b"));
+    }
+
+    #[test]
+    fn missing_arg_silent() {
+        let s = getopts_step(":ab:", &args(&["-b"]), 1, 1);
+        assert_eq!(s.name, ":");
+        assert_eq!(s.optarg.as_deref(), Some("b"));
+        assert!(s.error.is_none());
     }
 }
