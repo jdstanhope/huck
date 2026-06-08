@@ -581,6 +581,48 @@ impl Shell {
         self.vars.remove(name);
     }
 
+    /// Scope-aware variable unset for the `unset` builtin's `-v`/default path
+    /// (M-115). Implements bash's dynamic scope: `unset NAME` acts on the
+    /// nearest dynamically-visible binding.
+    ///
+    /// - NAME local to the CURRENT function (snapshot in the TOP `local_scopes`
+    ///   frame), or not local anywhere: plain `vars.remove` — the local
+    ///   attribute persists via the kept snapshot, a read shows unset, and the
+    ///   enclosing binding is restored on return (cases C/F/E).
+    /// - NAME local to an ENCLOSING function (snapshot in a lower frame): pop
+    ///   that frame's snapshot (so it will NOT restore-clobber on return) and
+    ///   reveal the value it was shadowing, so a subsequent assignment promotes
+    ///   upward (cases A/B/D/G/H).
+    ///
+    /// `Shell::unset` (plain `vars.remove`) is left for internal callers.
+    pub fn unset_var(&mut self, name: &str) {
+        // Nearest frame holding a snapshot for `name`, innermost-first
+        // (the stack's top is the last element).
+        let nearest = self
+            .local_scopes
+            .iter()
+            .rposition(|frame| frame.contains_key(name));
+        match nearest {
+            // An ENCLOSING frame (not the top) localized `name`: pop it + reveal.
+            Some(i) if i + 1 < self.local_scopes.len() => {
+                match self.local_scopes[i].remove(name) {
+                    Some(Some(var)) => {
+                        self.vars.insert(name.to_string(), var);
+                    }
+                    Some(None) => {
+                        self.vars.remove(name);
+                    }
+                    // rposition just found the key, so the entry is present.
+                    None => {}
+                }
+            }
+            // Top-frame local, or not local anywhere: plain unset.
+            _ => {
+                self.vars.remove(name);
+            }
+        }
+    }
+
     /// Returns a clone of the named variable's current state, or
     /// None if unset. Used by `local` to snapshot pre-local state.
     pub fn snapshot_var(&self, name: &str) -> Option<Variable> {
@@ -1344,6 +1386,42 @@ mod tests {
         assert_eq!(shell.get("HUCK_TEST_REMOVE"), None);
         let in_exported = shell.exported_env().any(|(k, _)| k == "HUCK_TEST_REMOVE");
         assert!(!in_exported);
+    }
+
+    #[test]
+    fn unset_var_enclosing_local_pops_and_reveals() {
+        let mut s = Shell::new();
+        s.set("x", "midval".into());
+        let mut outer = std::collections::HashMap::new();
+        outer.insert("x".to_string(), None); // outer `local x` shadowed an unset global
+        let mut mid = std::collections::HashMap::new();
+        mid.insert("x".to_string(), Some(Variable::scalar("orig".into())));
+        s.local_scopes.push(outer);
+        s.local_scopes.push(mid);
+        s.local_scopes.push(std::collections::HashMap::new()); // top frame (inner): no local x
+        s.unset_var("x");
+        assert_eq!(s.get("x"), Some("orig"));         // mid's snapshot revealed
+        assert!(!s.local_scopes[1].contains_key("x")); // mid's snapshot popped
+    }
+
+    #[test]
+    fn unset_var_top_frame_local_plain_removes() {
+        let mut s = Shell::new();
+        s.set("x", "v".into());
+        let mut top = std::collections::HashMap::new();
+        top.insert("x".to_string(), Some(Variable::scalar("orig".into())));
+        s.local_scopes.push(top);
+        s.unset_var("x");
+        assert_eq!(s.get("x"), None);                 // value removed
+        assert!(s.local_scopes[0].contains_key("x")); // snapshot KEPT (restores on return)
+    }
+
+    #[test]
+    fn unset_var_no_frames_plain_removes() {
+        let mut s = Shell::new();
+        s.set("x", "v".into());
+        s.unset_var("x");
+        assert_eq!(s.get("x"), None);
     }
 
     #[test]
