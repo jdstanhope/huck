@@ -42,3 +42,32 @@ fn builtin_stderr_2_redirect_to_stdout_fd() {
     let (out, _e, _c) = run("declare -p NOPE4 2>&1 | grep NOPE4 >/dev/null && echo matched\n");
     assert!(out.contains("matched"), "2>&1 did not route stderr to fd 1: {out}");
 }
+
+// M-89: export accepts leading flags (-a no-op), fixing `mise activate bash`.
+#[test]
+fn export_a_flag_bare_no_output() {
+    let (out, err, c) = run("export -a\necho done\n");
+    assert_eq!(out, "done\n", "stdout should only contain 'done': {out}");
+    assert_eq!(c, 0, "exit code should be 0");
+    assert_eq!(err, "", "stderr should be empty: {err}");
+}
+
+#[test]
+fn export_a_bare_name_exported() {
+    let (out, err, _c) = run("export -a chpwd_functions\necho rc=$?\n");
+    assert!(out.contains("rc=0"), "rc should be 0: {out}");
+    assert_eq!(err, "", "stderr should be empty (no 'not a valid identifier'): {err}");
+}
+
+#[test]
+fn export_a_with_assignment_exports() {
+    let (out, _e, c) = run("export -a FOO=bar\ndeclare -p FOO\n");
+    assert!(out.contains("declare -x FOO=\"bar\""), "FOO should be exported: {out}");
+    assert_eq!(c, 0, "exit code should be 0");
+}
+
+#[test]
+fn export_plain_assignment_unchanged() {
+    let (out, _e, _c) = run("export NAME=v\ndeclare -p NAME\n");
+    assert!(out.contains("declare -x NAME=\"v\""), "NAME should be exported: {out}");
+}
