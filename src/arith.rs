@@ -8,7 +8,7 @@ pub(crate) enum ArithToken {
     Plus, Minus, Star, Slash, Percent,
     Eq, Ne, Lt, Le, Gt, Ge,
     AndAnd, OrOr, Bang,
-    Question, Colon,
+    Question, Colon, Comma,
     // v38 — bitwise & shift:
     Amp, Pipe, Caret, Tilde,
     Shl, Shr,
@@ -170,6 +170,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
             }
             '(' => { chars.next(); out.push(ArithToken::LParen); }
             ')' => { chars.next(); out.push(ArithToken::RParen); }
+            ',' => { chars.next(); out.push(ArithToken::Comma); }
             '+' => {
                 chars.next();
                 match chars.peek() {
@@ -336,6 +337,9 @@ pub enum ArithExpr {
     And(Box<ArithExpr>, Box<ArithExpr>),
     Or(Box<ArithExpr>, Box<ArithExpr>),
     Ternary(Box<ArithExpr>, Box<ArithExpr>, Box<ArithExpr>),
+    /// `L , R` — evaluate L (for side effects), then R; value is R. Lowest
+    /// precedence. (M-108)
+    Comma(Box<ArithExpr>, Box<ArithExpr>),
     // v38 — bitwise binops:
     BitAnd(Box<ArithExpr>, Box<ArithExpr>),
     BitOr(Box<ArithExpr>, Box<ArithExpr>),
@@ -384,7 +388,7 @@ impl std::fmt::Display for ArithError {
 pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
     let tokens = tokenize(input)?;
     let mut p = Parser { tokens, pos: 0 };
-    let expr = p.parse_expr(0)?;
+    let expr = p.parse_comma_expr()?;
     if p.pos < p.tokens.len() {
         return Err(ArithError::Parse(format!(
             "unexpected token after expression: {:?}", p.tokens[p.pos]
@@ -430,6 +434,21 @@ impl Parser {
         let t = self.tokens.get(self.pos).cloned();
         self.pos += 1;
         t
+    }
+
+    /// Parse a comma-separated sequence of full expressions (each
+    /// `parse_expr(0)`); left-associative, value is the last. Comma is the
+    /// lowest-precedence arithmetic operator, so it lives ABOVE the Pratt loop
+    /// — this keeps every existing binding power untouched and makes
+    /// `a = 1, 2` parse as `(a=1), 2`. (M-108)
+    fn parse_comma_expr(&mut self) -> Result<ArithExpr, ArithError> {
+        let mut lhs = self.parse_expr(0)?;
+        while self.peek() == Some(&ArithToken::Comma) {
+            self.bump();
+            let rhs = self.parse_expr(0)?;
+            lhs = ArithExpr::Comma(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<ArithExpr, ArithError> {
@@ -562,7 +581,7 @@ impl Parser {
                 }
             }
             Some(ArithToken::LParen) => {
-                let inner = self.parse_expr(0)?;
+                let inner = self.parse_comma_expr()?;
                 match self.bump() {
                     Some(ArithToken::RParen) => Ok(inner),
                     other => Err(ArithError::Parse(format!(
@@ -656,6 +675,10 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             } else {
                 eval(e, shell)
             }
+        }
+        ArithExpr::Comma(l, r) => {
+            eval(l, shell)?; // evaluate L for its side effects; discard value
+            eval(r, shell)   // value of a comma sequence is the last operand
         }
         ArithExpr::BitAnd(a, b) => Ok(eval(a, shell)? & eval(b, shell)?),
         ArithExpr::BitOr(a, b)  => Ok(eval(a, shell)? | eval(b, shell)?),
@@ -1190,6 +1213,61 @@ mod tests {
 
     fn eval_str(s: &str, shell: &mut Shell) -> Result<i64, ArithError> {
         eval(&parse(s).unwrap(), shell)
+    }
+
+    #[test]
+    fn comma_value_is_last_operand() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("1, 2, 3", &mut s).unwrap(), 3);
+    }
+
+    #[test]
+    fn comma_keeps_side_effects_of_all_operands() {
+        let mut s = Shell::new();
+        // a=1 then b=2; value is the last (2); both vars set.
+        assert_eq!(eval_str("a=1, b=2", &mut s).unwrap(), 2);
+        assert_eq!(s.lookup_var("a").as_deref(), Some("1"));
+        assert_eq!(s.lookup_var("b").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn comma_is_lower_precedence_than_assignment() {
+        // `a = 1, 2` is `(a=1), 2`: value 2, a==1 (NOT a=(1,2)=2).
+        let mut s = Shell::new();
+        assert_eq!(eval_str("a = 1, 2", &mut s).unwrap(), 2);
+        assert_eq!(s.lookup_var("a").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn comma_inside_parens() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("(1, 2) + 3", &mut s).unwrap(), 5);
+    }
+
+    #[test]
+    fn comma_side_effect_ordering() {
+        // i=0 then i++ : value of i++ is 0, i becomes 1.
+        let mut s = Shell::new();
+        assert_eq!(eval_str("i=0, i++", &mut s).unwrap(), 0);
+        assert_eq!(s.lookup_var("i").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn comma_nested_left_fold() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("(1,2),3", &mut s).unwrap(), 3);
+    }
+
+    #[test]
+    fn trailing_comma_is_error() {
+        // `eval_str` unwraps `parse`, so a parse error would panic rather than
+        // surface as Err — assert on `parse` directly to capture the error.
+        assert!(parse("1,").is_err());
+    }
+
+    #[test]
+    fn leading_comma_is_error() {
+        assert!(parse(",1").is_err());
     }
 
     #[test]
