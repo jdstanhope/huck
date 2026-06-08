@@ -2283,23 +2283,27 @@ impl Drop for BuiltinStderrGuard {
 ///
 /// `stderr` is the opened `2>file`/`2>>file` target (mirrors
 /// `prepare_builtin_stdin`'s `File` handling via `into_raw_fd` + close-after).
-/// `dup_to_stdout` is true for `2>&1` (a `Redirect::Dup{fd:2,source:1}` resolves
-/// to no File), in which case fd 2 is dup2'd onto wherever fd 1 currently
-/// points — applied AFTER any stdout setup so `>out 2>&1` / pipeline ordering
-/// holds.
-fn prepare_builtin_stderr(stderr: Option<File>, dup_to_stdout: bool) -> Option<BuiltinStderrGuard> {
+/// `dup_target` is `Some(fd)` for `2>&1` (a `Redirect::Dup{fd:2,source:1}`
+/// resolves to no File): the fd that `2>&1` should follow — the real fd 1 for a
+/// Terminal sink, or a redirected stdout file's fd for `>file 2>&1`. fd 2 is
+/// dup2'd onto a copy of that target, applied AFTER any stdout setup so
+/// `>out 2>&1` / pipeline ordering holds. `None` means no in-process dup.
+fn prepare_builtin_stderr(stderr: Option<File>, dup_target: Option<RawFd>) -> Option<BuiltinStderrGuard> {
     use std::os::unix::io::IntoRawFd;
     let new_fd: RawFd = match stderr {
         Some(file) => file.into_raw_fd(),
-        None if dup_to_stdout => {
-            // `2>&1`: duplicate fd 1 so we dup2 a copy onto fd 2 and can close it.
-            let d = unsafe { libc::dup(libc::STDOUT_FILENO) };
-            if d < 0 {
-                return None;
+        None => match dup_target {
+            // `2>&1`: duplicate the target fd (the real fd 1, or a redirected
+            // stdout file's fd) so we dup2 a copy onto fd 2 and can close it.
+            Some(target) => {
+                let d = unsafe { libc::dup(target) };
+                if d < 0 {
+                    return None;
+                }
+                d
             }
-            d
-        }
-        None => return None,
+            None => return None,
+        },
     };
     unsafe {
         let saved = libc::dup(libc::STDERR_FILENO);
@@ -2715,14 +2719,23 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
-        // Honor a stderr redirect around the control builtin (mirrors the
-        // regular-builtin arm). `2>&1` follows fd 1 only under a Terminal sink
-        // with no stdout File override.
-        let dup_stderr_to_stdout = files.stderr.is_none()
-            && files.stdout.is_none()
-            && matches!(sink, StdoutSink::Terminal)
-            && stderr_dups_to_stdout(cmd, shell);
-        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_stderr_to_stdout);
+        // `2>&1` on a builtin: follow wherever the builtin's stdout actually
+        // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
+        // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
+        // sink, dup the real fd 1; a Capture sink has no fd (L-25 residual).
+        let dup_target: Option<RawFd> = if files.stderr.is_none() && stderr_dups_to_stdout(cmd, shell) {
+            if let Some(file) = files.stdout.as_ref() {
+                use std::os::unix::io::AsRawFd;
+                Some(file.as_raw_fd())
+            } else if matches!(sink, StdoutSink::Terminal) {
+                Some(libc::STDOUT_FILENO)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_target);
         let outcome = match files.stdout {
             Some(mut file) => {
                 builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
@@ -2763,17 +2776,23 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
-        // Apply stderr redirection in-process so builtins' `eprintln!`
-        // diagnostics honor `2>file`/`2>>file`/`2>&1`. The `2>&1` dup follows
-        // the real fd 1 — meaningful when fd 1 is the terminal or a pipe
-        // (Terminal sink, no stdout File override); under a Capture sink or a
-        // stdout File the builtin writes stdout via a Rust writer, not fd 1, so
-        // `2>&1` cannot follow it (documented residual).
-        let dup_stderr_to_stdout = files.stderr.is_none()
-            && files.stdout.is_none()
-            && matches!(sink, StdoutSink::Terminal)
-            && stderr_dups_to_stdout(cmd, shell);
-        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_stderr_to_stdout);
+        // `2>&1` on a builtin: follow wherever the builtin's stdout actually
+        // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
+        // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
+        // sink, dup the real fd 1; a Capture sink has no fd (L-25 residual).
+        let dup_target: Option<RawFd> = if files.stderr.is_none() && stderr_dups_to_stdout(cmd, shell) {
+            if let Some(file) = files.stdout.as_ref() {
+                use std::os::unix::io::AsRawFd;
+                Some(file.as_raw_fd())
+            } else if matches!(sink, StdoutSink::Terminal) {
+                Some(libc::STDOUT_FILENO)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_target);
         let outcome = match files.stdout {
             Some(mut file) => {
                 if let Some(da) = resolved.decl_args.as_deref() {

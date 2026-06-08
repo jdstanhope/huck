@@ -896,7 +896,14 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         }
                     }
                     crate::param_expansion::ExpansionResult::Empty => {
-                        has_emitted = true;
+                        // A QUOTED empty expansion (`"${u+x}"` when unset) still
+                        // contributes one empty field; an UNQUOTED one vanishes
+                        // (contributes no field), matching bash. Setting
+                        // has_emitted unconditionally injected a spurious empty
+                        // field for unquoted `${x+alt}` / `${arr[@]+…}` (M-105).
+                        if *quoted {
+                            has_emitted = true;
+                        }
                     }
                     crate::param_expansion::ExpansionResult::WordList(words) => {
                         if *quoted {
