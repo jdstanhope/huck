@@ -891,6 +891,7 @@ fn builtin_declare(
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
+    let mut global = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -923,7 +924,8 @@ fn builtin_declare(
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'l' | b'u' | b'a' | b'A' | b'n' | b'g' if minus => {
+                b'g' if minus => global = true,
+                b'l' | b'u' | b'a' | b'A' | b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -983,7 +985,15 @@ fn builtin_declare(
         // For any mutation form, record the pre-state into the current
         // local frame BEFORE mutating — so attribute changes unwind on
         // function exit. No-op outside a function.
-        snapshot_for_local_scope(shell, name);
+        if global {
+            // -g: write to the global map AND drop any outer local snapshot for
+            // this name so the global value is not rolled back on function exit.
+            if let Some(frame) = shell.local_scopes.last_mut() {
+                frame.remove(name);
+            }
+        } else {
+            snapshot_for_local_scope(shell, name);
+        }
 
         // Reject integer-attribute transitions on a readonly variable
         // (bash-compat: bash leaves attributes unchanged when the
@@ -1464,6 +1474,7 @@ fn builtin_declare_decl(
     let mut function_mode = false;
     let mut function_names_only = false;
     let mut print_mode = false;
+    let mut global = false;
 
     // Parse leading flags from Plain args. As soon as we hit a non-flag
     // Plain or any Assign, switch into the per-name phase.
@@ -1517,7 +1528,8 @@ fn builtin_declare_decl(
                     function_names_only = true;
                 }
                 b'p' if minus => print_mode = true,
-                b'l' | b'u' | b'n' | b'g' if minus => {
+                b'g' if minus => global = true,
+                b'l' | b'u' | b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1622,8 +1634,15 @@ fn builtin_declare_decl(
             continue;
         }
 
-        // Snapshot for local-scope unwind BEFORE mutating.
-        snapshot_for_local_scope(shell, name);
+        // Snapshot for local-scope unwind BEFORE mutating. With -g, write to
+        // the global map and drop any outer snapshot so it survives function exit.
+        if global {
+            if let Some(frame) = shell.local_scopes.last_mut() {
+                frame.remove(name);
+            }
+        } else {
+            snapshot_for_local_scope(shell, name);
+        }
 
         // Integer-attribute changes on readonly variable are rejected.
         if (want_integer || want_remove_integer) && shell.is_readonly(name) {

@@ -40,3 +40,17 @@ fn dbracket_o_git_prompt_shape() {
     // is reached and is false, so `echo fallback` runs — like bash.
     assert_eq!(run("ZSH_VERSION=1\n[ -z \"${ZSH_VERSION-}\" ] || [[ -o PROMPT_SUBST ]] || echo fallback\n").0, "fallback\n");
 }
+
+#[test]
+fn declare_g_survives_function_exit() {
+    assert_eq!(run("f() { declare -g G=1; }\nf\necho \"[${G-}]\"\n").0, "[1]\n");
+}
+#[test]
+fn declare_without_g_is_local() {
+    assert_eq!(run("f() { declare L=1; }\nf\necho \"[${L-}]\"\n").0, "[]\n");
+}
+#[test]
+fn declare_g_toplevel_and_composed() {
+    assert_eq!(run("declare -g X=2\necho \"$X\"\n").0, "2\n");
+    assert_eq!(run("f() { declare -gx E=7; }\nf\necho \"$E\"\n").0, "7\n");
+}
