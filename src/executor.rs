@@ -1212,6 +1212,9 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
             if matches!(op, TestUnaryOp::VarSet) {
                 return Ok(shell.is_set(&s));
             }
+            if matches!(op, TestUnaryOp::OptEnabled) {
+                return Ok(crate::builtins::option_get(shell, &s).unwrap_or(false));
+            }
             Ok(eval_unary(*op, &s))
         }
         TestExpr::Binary { op, lhs, rhs } => {
@@ -1258,6 +1261,7 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
         TestUnaryOp::IsNonEmpty   => test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::IsSymlink    => test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::VarSet       => unreachable!("VarSet handled in eval_test_expr"),
+        TestUnaryOp::OptEnabled   => unreachable!("OptEnabled handled in eval_test_expr"),
     }
 }
 

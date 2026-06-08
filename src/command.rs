@@ -396,6 +396,8 @@ pub enum TestUnaryOp {
     StringNonEmpty,  // -n
     StringEmpty,     // -z
     VarSet,          // -v  (variable is set)
+    /// `[[ -o NAME ]]` — true iff the `set -o` option NAME is enabled.
+    OptEnabled,      // -o
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1997,6 +1999,7 @@ fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
         "-n" => Some(TestUnaryOp::StringNonEmpty),
         "-z" => Some(TestUnaryOp::StringEmpty),
         "-v" => Some(TestUnaryOp::VarSet),
+        "-o" => Some(TestUnaryOp::OptEnabled),
         _ => None,
     }
 }

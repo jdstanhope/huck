@@ -3945,7 +3945,7 @@ enum OptSetErr {
 
 /// Reads a `set -o` option: real state for the 3 implemented, the table
 /// default for any other recognized name, `None` for an unknown name.
-fn option_get(shell: &Shell, name: &str) -> Option<bool> {
+pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     match name {
         "errexit" => Some(shell.shell_options.errexit),
         "nounset" => Some(shell.shell_options.nounset),
