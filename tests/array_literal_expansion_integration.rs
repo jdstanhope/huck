@@ -78,3 +78,19 @@ fn local_array_literal_fans_out() {
         "n=5\n"
     );
 }
+#[test]
+fn append_scalar_split() {
+    assert_eq!(run("arr=(a)\ns=\"b c\"\narr+=($s)\necho \"n=${#arr[@]}\"\n"), "n=3\n");
+}
+#[test]
+fn append_array_at_fans_out() {
+    assert_eq!(run("arr=(a)\nw=(b c d)\narr+=(\"${w[@]}\")\necho \"n=${#arr[@]}\"\n"), "n=4\n");
+}
+#[test]
+fn append_continues_index() {
+    assert_eq!(run("arr=(a b)\narr+=(c d)\necho \"idx=[${!arr[@]}]\"\n"), "idx=[0 1 2 3]\n");
+}
+#[test]
+fn append_to_unset_starts_at_zero() {
+    assert_eq!(run("arr+=(x y)\necho \"idx=[${!arr[@]}]\"\n"), "idx=[0 1]\n");
+}

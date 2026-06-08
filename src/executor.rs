@@ -3975,7 +3975,7 @@ fn is_array_value_word(word: &crate::lexer::Word) -> bool {
 
 /// Applies one `Assignment` to `shell`. Dispatches on the four
 /// combinations of (target kind, value kind):
-///   1. Bare + compound array RHS  →  `replace_array` / `append_array`
+///   1. Bare + compound array RHS  →  `replace_array` / `extend_indexed`
 ///   2. Bare + scalar RHS          →  `try_set` / scalar+=value
 ///   3. Indexed + scalar RHS       →  `set_array_element` / `append_array_element`
 ///   4. Indexed + compound array   →  rejected (matches bash)
@@ -4057,12 +4057,25 @@ pub(crate) fn apply_one_assignment(
         // Bare name + compound array RHS.
         (AssignTarget::Bare(name), Some(elements)) => {
             if a.append {
-                // a+=(elements): append new keys after max_index.
-                let values: Vec<String> = elements
-                    .iter()
-                    .map(|e| expand_assignment(&e.value, shell))
-                    .collect();
-                shell.append_array(name, &values).map_err(|_| ())
+                // a+=(elements): field-expand each bare element (split/glob/[@])
+                // and append after the current max index, honoring explicit
+                // [i]=v elements. Readonly pre-check avoids a partial write.
+                if shell.is_readonly(name) {
+                    eprintln!("huck: {name}: readonly variable");
+                    return Err(());
+                }
+                // Starting auto-index: max+1 for an existing array; 1 for a
+                // scalar (which promotes to element 0); 0 when unset — matching
+                // append_array / extend_indexed promotion.
+                let start = if shell.get_array(name).is_some() {
+                    shell.array_max_index(name).map_or(0, |m| m + 1)
+                } else if shell.get(name).is_some() {
+                    1
+                } else {
+                    0
+                };
+                let map = expand_array_elements(elements, name, shell, start)?;
+                shell.extend_indexed(name, map).map_err(|_| ())
             } else {
                 // a=(elements): replace whole array.
                 let map = build_array_map(elements, name, shell)?;
