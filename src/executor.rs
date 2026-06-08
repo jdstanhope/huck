@@ -4178,6 +4178,9 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
+                if shell.pending_fatal_pe_error.is_some() {
+                    return Err(());
+                }
             }
         }
     }
