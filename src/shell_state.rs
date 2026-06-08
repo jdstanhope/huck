@@ -267,6 +267,11 @@ pub struct Shell {
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
 
+    /// True when this process is a forked subshell child. A subshell must NOT
+    /// perform interactive job-control process-grouping for its inner pipelines
+    /// (that deadlocks on a controlling terminal — M-104).
+    pub in_subshell: bool,
+
     /// Persistent shell-option flags toggled by `set -e`/`-u`/`-o NAME`.
     /// See `ShellOptions` for the field list.
     pub shell_options: ShellOptions,
@@ -371,6 +376,7 @@ impl Shell {
             function_arg0: Vec::new(),
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
+            in_subshell: false,
             shell_options: ShellOptions::default(),
             shopt_options: ShoptOptions::default(),
             traps: std::collections::HashMap::new(),

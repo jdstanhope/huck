@@ -2987,7 +2987,12 @@ fn run_multi_stage(
 ) -> ExecOutcome {
     use std::os::fd::FromRawFd;
 
-    let interactive = matches!(sink, StdoutSink::Terminal);
+    // Job-control process-grouping is only correct in the top-level shell. Inside
+    // a forked subshell it places the inner pipeline in a background process group
+    // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
+    // controlling terminal (M-104). A subshell's inner pipeline uses the
+    // non-job-control path (stages stay in the subshell's pgrp), matching bash.
+    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_subshell;
     let n = commands.len();
 
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
@@ -4153,6 +4158,9 @@ pub fn fork_and_run_in_subshell(
         // trap state so the parent's EXIT trap and real-signal traps
         // don't inherit into the child.
         crate::traps::clear_for_subshell(shell);
+        // Mark this process as a forked subshell so its inner pipelines skip
+        // interactive job-control process-grouping (deadlocks on a tty — M-104).
+        shell.in_subshell = true;
         // 8. Run the body via the existing dispatcher.
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.
