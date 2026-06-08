@@ -4066,7 +4066,7 @@ pub(crate) fn apply_one_assignment(
                 }
                 // Starting auto-index: max+1 for an existing array; 1 for a
                 // scalar (which promotes to element 0); 0 when unset — matching
-                // append_array / extend_indexed promotion.
+                // extend_indexed's promotion.
                 let start = if shell.get_array(name).is_some() {
                     shell.array_max_index(name).map_or(0, |m| m + 1)
                 } else if shell.get(name).is_some() {
