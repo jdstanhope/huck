@@ -1074,7 +1074,8 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
         let hit = if extglob && crate::glob_match::has_extglob(&pattern) {
             crate::glob_match::extglob_match(&pattern, subject, nocase)
         } else {
-            glob::Pattern::new(&pattern)
+            let npat = crate::glob_match::translate_bracket_negation(&pattern);
+            glob::Pattern::new(&npat)
                 .map(|p| {
                     p.matches_with(
                         subject,
@@ -1279,7 +1280,8 @@ fn eval_binary(
             let matched = if extglob && crate::glob_match::has_extglob(&pattern_str) {
                 crate::glob_match::extglob_match(&pattern_str, lhs, nocase)
             } else {
-                let pat = glob::Pattern::new(&pattern_str)
+                let npat = crate::glob_match::translate_bracket_negation(&pattern_str);
+                let pat = glob::Pattern::new(&npat)
                     .map_err(|e| format!("bad pattern: {e}"))?;
                 pat.matches_with(lhs, glob::MatchOptions {
                     case_sensitive: !nocase,

@@ -2,6 +2,69 @@
 //! Used by `[[`/`case`/`${}` only when extglob is on AND the pattern contains
 //! an extglob operator (`has_extglob`). Plain globs keep using the `glob` crate.
 
+use std::borrow::Cow;
+
+/// Rewrite a class-leading `^` to `!` so the `glob` crate (which only honors
+/// `[!…]`) treats `[^…]` as negation, matching bash (which accepts both). Only
+/// the FIRST char inside an unescaped class-opening `[` is the negation slot; a
+/// `^` anywhere else stays literal. Honors `\[` escapes and the literal-first-`]`
+/// rule (`[^]x]` → `[!]x]`, `[]x]` unchanged). Returns the input borrowed when
+/// there is nothing to change (zero-copy). (M-113)
+pub(crate) fn translate_bracket_negation(pattern: &str) -> Cow<'_, str> {
+    if !pattern.contains('[') {
+        return Cow::Borrowed(pattern);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out: Option<String> = None; // built lazily on first change
+    let mut in_class = false;
+    let mut escaped = false;
+    let mut pos_in_class = 0usize; // chars seen since '[' (1 = first content char)
+    let mut negated = false;       // class opened with `!` or `^`
+    for i in 0..chars.len() {
+        let c = chars[i];
+        let mut emit = c;
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if !in_class {
+            if c == '[' {
+                in_class = true;
+                pos_in_class = 0;
+                negated = false;
+            }
+            // '^' / ']' outside a class are literal — nothing to do.
+        } else {
+            pos_in_class += 1;
+            if pos_in_class == 1 {
+                // The negation slot (first char after `[`).
+                if c == '^' {
+                    emit = '!';
+                    negated = true;
+                    if out.is_none() {
+                        out = Some(chars[..i].iter().collect());
+                    }
+                } else if c == '!' {
+                    negated = true;
+                }
+                // A `]` here (`[]…`) is a LITERAL `]`; class stays open. Any
+                // other char is ordinary class content.
+            } else if pos_in_class == 2 && negated && c == ']' {
+                // Literal `]` immediately after `[!` / `[^` — class stays open.
+            } else if c == ']' {
+                in_class = false;
+            }
+        }
+        if let Some(o) = out.as_mut() {
+            o.push(emit);
+        }
+    }
+    match out {
+        Some(s) => Cow::Owned(s),
+        None => Cow::Borrowed(pattern),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GroupKind {
     ZeroOrOne,
@@ -522,5 +585,57 @@ mod pathname_tests {
     fn no_match_is_empty() {
         let (_d, base) = fixture();
         assert!(extglob_pathname_expand(&format!("{base}/+(zzz)"), false, false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bracket_negation_tests {
+    use super::translate_bracket_negation;
+    use std::borrow::Cow;
+
+    fn t(p: &str) -> String { translate_bracket_negation(p).into_owned() }
+
+    #[test]
+    fn leading_caret_becomes_bang() {
+        assert_eq!(t("[^abc]"), "[!abc]");
+        assert_eq!(t("[^0-9]"), "[!0-9]");
+    }
+    #[test]
+    fn bang_unchanged() { assert_eq!(t("[!abc]"), "[!abc]"); }
+    #[test]
+    fn plain_class_unchanged() { assert_eq!(t("[abc]"), "[abc]"); }
+    #[test]
+    fn caret_not_leading_is_literal() {
+        assert_eq!(t("[a^b]"), "[a^b]");
+        assert_eq!(t("a^b"), "a^b");
+        assert_eq!(t("^foo"), "^foo");
+    }
+    #[test]
+    fn literal_first_bracket_after_neg() {
+        assert_eq!(t("[^]x]"), "[!]x]");
+        assert_eq!(t("[]x]"), "[]x]");
+    }
+    #[test]
+    fn escaped_open_bracket_not_a_class() {
+        assert_eq!(t(r"\[^a]"), r"\[^a]");
+    }
+    #[test]
+    fn caret_inside_existing_class_is_literal() {
+        // `[a[^b]` is one class containing a,[,^,b — the inner ^ is NOT leading.
+        assert_eq!(t("[a[^b]"), "[a[^b]");
+    }
+    #[test]
+    fn multiple_classes_each_converted() {
+        assert_eq!(t("x[^0-9]y[^a]z"), "x[!0-9]y[!a]z");
+    }
+    #[test]
+    fn posix_class_inner_brackets() {
+        assert_eq!(t("[[:alpha:]]"), "[[:alpha:]]");      // no leading ^
+        assert_eq!(t("[^[:digit:]]"), "[![:digit:]]");    // leading ^ converted
+    }
+    #[test]
+    fn no_change_returns_borrowed() {
+        assert!(matches!(translate_bracket_negation("[abc]"), Cow::Borrowed(_)));
+        assert!(matches!(translate_bracket_negation("plain"), Cow::Borrowed(_)));
     }
 }
