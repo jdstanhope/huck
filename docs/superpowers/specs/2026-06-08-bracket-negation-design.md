@@ -142,9 +142,13 @@ the helper there only if trivial; not required).
    before/after.
 
 ## Edge cases & notes
-- **`^` as the only class char** (`[^]`): in bash `[^]` is an incomplete/odd
-  class; the helper converts `[^]`'s leading `^`→`!` giving `[!]` (negated class
-  whose first `]` is literal → "any char except `]`") — matches bash. Verify.
+- **`^` as the only class char** (`[^]`, nothing after): bash treats this
+  degenerate/unterminated class as a LITERAL string `[^]` (verified: `[[ x ==
+  [^] ]]` and `[[ ] == [^] ]]` are both false). The helper would convert it to
+  `[!]`, whose treatment by the `glob` crate may differ from bash's literal —
+  this is a pathological, non-load-bearing edge (no real pattern is just `[^]`);
+  accept whatever the harness shows and note it as a low `L-` divergence if it
+  differs, rather than special-casing.
 - **`nocaseglob`/`nocasematch`** flow unchanged (the helper runs before, on the
   pattern string; case-insensitivity is a `MatchOptions`/flag concern).
 - This does NOT touch the extglob matcher; extglob `[^]` already worked.
