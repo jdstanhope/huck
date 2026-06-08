@@ -2661,11 +2661,16 @@ fn builtin_printf(
                     eprintln!("huck: printf: -v: option requires an argument");
                     return ExecOutcome::Continue(2);
                 }
-                if !is_valid_name(&args[i]) {
-                    eprintln!("huck: printf: `{}': not a valid identifier", args[i]);
+                let target = &args[i];
+                let valid = is_valid_name(target)
+                    || crate::expand::split_name_subscript(target)
+                        .map(|(name, sub)| is_valid_name(&name) && !sub.is_empty())
+                        .unwrap_or(false);
+                if !valid {
+                    eprintln!("huck: printf: `{target}': not a valid identifier");
                     return ExecOutcome::Continue(1);
                 }
-                v_var = Some(args[i].clone());
+                v_var = Some(target.clone());
                 i += 1;
             }
             "--" => {
@@ -2754,7 +2759,29 @@ fn builtin_printf(
     // Output.
     if let Some(var) = v_var {
         let s = String::from_utf8_lossy(&buf).into_owned();
-        if shell.try_set(&var, s).is_err() {
+        if let Some((name, sub)) = crate::expand::split_name_subscript(&var) {
+            // Array-element target: write via the same path as `name[sub]=value`,
+            // so the subscript is arith-evaluated (indexed) / string-keyed
+            // (associative), the array is created/promoted, and readonly is
+            // enforced — all by reuse. (M-109)
+            let assignment = crate::command::Assignment {
+                target: crate::command::AssignTarget::Indexed {
+                    name,
+                    subscript: crate::lexer::Word(vec![
+                        crate::lexer::WordPart::Literal { text: sub, quoted: false },
+                    ]),
+                },
+                value: crate::lexer::Word(vec![
+                    crate::lexer::WordPart::Literal { text: s, quoted: true },
+                ]),
+                append: false,
+            };
+            if crate::executor::apply_one_assignment(&assignment, shell).is_err() {
+                // apply_one_assignment already printed the specific diagnostic
+                // (readonly / type mismatch / bad subscript).
+                return ExecOutcome::Continue(1);
+            }
+        } else if shell.try_set(&var, s).is_err() {
             eprintln!("huck: printf: {var}: readonly variable");
             return ExecOutcome::Continue(1);
         }
