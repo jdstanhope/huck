@@ -161,8 +161,17 @@ fn tab_double_tab_lists() {
     expect(&mut session, "huck> ");
     send(&mut session, TAB);
     send(&mut session, TAB);
-    expect(&mut session, "echo");
-    expect(&mut session, "history");
+    // The double-tab lists builtins in a multi-column (column-major) layout, so
+    // the stream order of any two entries depends on column packing and reflows
+    // as builtins are added. Capture the whole listing up to the redrawn prompt
+    // and assert membership, rather than expecting two entries in a fixed order
+    // (which broke when `getopts` was added in v111 and shifted the columns).
+    let caps = session
+        .expect("huck> ")
+        .unwrap_or_else(|e| panic!("no prompt redraw after double-tab: {e}"));
+    let listing = String::from_utf8_lossy(caps.before());
+    assert!(listing.contains("echo"), "double-tab listing missing 'echo': {listing:?}");
+    assert!(listing.contains("history"), "double-tab listing missing 'history': {listing:?}");
     send(&mut session, CTRL_C);
     expect(&mut session, "huck> ");
     send(&mut session, "exit");
