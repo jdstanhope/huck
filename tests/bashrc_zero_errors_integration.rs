@@ -1,0 +1,44 @@
+//! v109: bashrc-zero-errors integration tests.
+//! M-90: builtin error output honors 2> / 2>> / 2>&1 redirection.
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
+
+/// Returns (stdout, stderr, exit_code).
+fn run(script: &str) -> (String, String, i32) {
+    let mut child = Command::new(huck_bin())
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().expect("spawn huck");
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into_owned(),
+     String::from_utf8_lossy(&out.stderr).into_owned(),
+     out.status.code().unwrap_or(-1))
+}
+
+#[test]
+fn builtin_stderr_2_devnull_suppressed() {
+    let (out, err, _c) = run("declare -p NOPE_VAR 2>/dev/null\necho after\n");
+    assert_eq!(out, "after\n");
+    assert!(!err.contains("NOPE_VAR"), "stderr leaked: {err}");
+}
+
+#[test]
+fn builtin_stderr_unredirected_still_reaches_stderr() {
+    let (_o, err, _c) = run("declare -p NOPE3\n");
+    assert!(err.contains("NOPE3"), "stderr should still appear unredirected: {err}");
+}
+
+#[test]
+fn builtin_stderr_2_file_captured() {
+    let (out, _e, _c) = run("declare -p NOPE2 2>/tmp/huck_m90.err\necho \"got=[$(cat /tmp/huck_m90.err)]\"\nrm -f /tmp/huck_m90.err\n");
+    assert!(out.contains("NOPE2"), "stderr not captured to file: {out}");
+}
+
+#[test]
+fn builtin_stderr_2_redirect_to_stdout_fd() {
+    // `declare -p NOPE 2>&1 | grep` should let grep see the error text.
+    let (out, _e, _c) = run("declare -p NOPE4 2>&1 | grep NOPE4 >/dev/null && echo matched\n");
+    assert!(out.contains("matched"), "2>&1 did not route stderr to fd 1: {out}");
+}
