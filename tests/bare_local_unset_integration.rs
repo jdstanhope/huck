@@ -63,3 +63,12 @@ fn get_comp_words_local_v_shape() {
          }\nf\n");
     assert_eq!(out, "n=1 [cur]\n", "out: {out}");
 }
+
+#[test]
+fn re_local_of_already_set_local_preserves_value() {
+    // bash: a bare `local x` after `local x=v` in the SAME function keeps v
+    // (only a FRESH bare local is unset). Regression guard for the
+    // already_local gate.
+    let (out, _e, _c) = run("f(){ local x=v; local x; [[ -v x ]] && echo \"SET=[$x]\" || echo UNSET; }\nf\n");
+    assert_eq!(out, "SET=[v]\n", "out: {out}");
+}

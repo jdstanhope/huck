@@ -688,9 +688,12 @@ fn builtin_local(args: &[String], shell: &mut Shell) -> ExecOutcome {
         match value {
             // `local NAME=` / `local NAME=val`: set (possibly empty).
             Some(v) => shell.set(name, v),
-            // Bare `local NAME`: declare local but UNSET (M-111). The snapshot
-            // above records the outer value for restore-on-return.
-            None => shell.unset(name),
+            // Bare `local NAME` (fresh local): declare local but UNSET (M-111).
+            // The snapshot above records the outer value for restore-on-return.
+            // A bare re-`local` of an already-local name preserves its value
+            // (bash), so only unset when NOT already_saved.
+            None if !already_saved => shell.unset(name),
+            None => {}
         }
     }
     ExecOutcome::Continue(exit)
@@ -1335,6 +1338,16 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     exit = 1;
                     continue;
                 }
+                // Whether NAME is already local in the current frame (a prior
+                // `local NAME` in this function). A bare re-`local` of an
+                // already-local name must NOT unset it (bash preserves the
+                // value: `local x=v; local x` keeps v); capture this before the
+                // snapshot no-ops on an already-saved name.
+                let already_local = shell
+                    .local_scopes
+                    .last()
+                    .map(|f| f.contains_key(name))
+                    .unwrap_or(false);
                 snapshot_for_local_scope(shell, name);
                 if want_array {
                     // Promote existing scalar to element 0 (bash semantics)
@@ -1362,12 +1375,14 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                         );
                         exit = 1;
                     }
-                } else {
-                    // Bare `local NAME` with no value: declare it function-local
-                    // but UNSET (matches bash + `declare NAME`). The snapshot
-                    // above records the outer value so it is restored on return;
-                    // unsetting here makes `[[ -v NAME ]]` / `${NAME-d}` see it
-                    // as unset until assigned. (M-111)
+                } else if !already_local {
+                    // Bare `local NAME` with no value (fresh local): declare it
+                    // function-local but UNSET (matches bash + `declare NAME`).
+                    // The snapshot above records the outer value so it is
+                    // restored on return; unsetting makes `[[ -v NAME ]]` /
+                    // `${NAME-d}` see it as unset until assigned. A bare
+                    // re-`local` of an already-local name preserves its value
+                    // (bash), so only unset when NOT already_local. (M-111)
                     shell.unset(name);
                 }
             }
