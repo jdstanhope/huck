@@ -80,3 +80,13 @@ fn h_caller_reassigns_after_callee_unset() {
              outer\n";
     assert_eq!(run(s), "mid:[re]\nout:[re]\n");
 }
+#[test]
+fn i_unset_reveals_unset_when_enclosing_local_shadowed_nothing() {
+    // mid's bare `local x` shadowed an unset global (snapshot None); inner's
+    // unset pops mid's local and reveals "unset" (the Some(None) reveal arm).
+    let s = "inner(){ unset -v \"$1\"; echo \"in:${x-U}\"; }\n\
+             mid(){ local x=mv; inner x; echo \"mid:${x-U}\"; }\n\
+             outer(){ mid x; echo \"out:${x-U}\"; }\n\
+             outer\n";
+    assert_eq!(run(s), "in:U\nmid:U\nout:U\n");
+}
