@@ -49,3 +49,41 @@ fn unredirected_builtin_error_still_reaches_stderr() {
     let (_o, err, _c) = run("declare -p NOPED\n");
     assert!(err.contains("NOPED"), "unredirected error should reach stderr: {err}");
 }
+
+// --- Part B: M-105 unquoted `${x+alt}` spurious empty field ---
+
+#[test]
+fn unquoted_empty_alt_no_spurious_field() {
+    // `${u+X}` unset, unquoted, followed by more words: must NOT inject an
+    // empty leading field. bash: $# == 2.
+    let (out, _e, _c) = run("set -- ${u+X} a b\necho $#\n");
+    assert_eq!(out, "2\n", "out: {out}");
+}
+
+#[test]
+fn empty_array_alt_no_spurious_field() {
+    // The mise shape: empty array + `${arr[@]+"${arr[@]}"}` -> nothing.
+    let (out, _e, _c) = run("f=()\nset -- ${f[@]+\"${f[@]}\"} -s bash\necho $#\n");
+    assert_eq!(out, "2\n", "out: {out}");
+}
+
+#[test]
+fn quoted_empty_alt_still_one_field() {
+    // A QUOTED empty must still be one field. bash: $# == 2.
+    let (out, _e, _c) = run("set -- \"${u+x}\" a\necho $#\n");
+    assert_eq!(out, "2\n", "out: {out}");
+}
+
+#[test]
+fn quoted_empty_field_printf() {
+    // `printf '<%s>' "${u+x}"` (unset, whole-quoted) -> one empty field `<>`.
+    let (out, _e, _c) = run("printf '<%s>' \"${u+x}\"\necho\n");
+    assert_eq!(out, "<>\n", "out: {out}");
+}
+
+#[test]
+fn set_array_idiom_unchanged() {
+    // v109 behavior must be unchanged: a SET array still yields its elements.
+    let (out, _e, _c) = run("a=(1 2)\nprintf '<%s>' \"${a[@]+\"${a[@]}\"}\"\necho\n");
+    assert_eq!(out, "<1><2>\n", "out: {out}");
+}
