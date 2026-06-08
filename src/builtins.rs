@@ -10940,7 +10940,7 @@ mod pipefail_option_tests {
 
 #[cfg(test)]
 mod getopts_step_tests {
-    use super::{getopts_step, GetoptsStep};
+    use super::getopts_step;
 
     fn args(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
 
