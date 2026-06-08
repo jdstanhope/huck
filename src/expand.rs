@@ -516,7 +516,7 @@ fn expand_indirect(
 /// `None` for a plain name / positional / special param (the common path).
 /// Only the simple `ends-with-']' and contains-'['` shape is recognized;
 /// the inner `sub` text is re-parsed as an arithmetic subscript Word.
-fn split_name_subscript(n: &str) -> Option<(String, String)> {
+pub(crate) fn split_name_subscript(n: &str) -> Option<(String, String)> {
     if !n.ends_with(']') {
         return None;
     }
