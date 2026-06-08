@@ -4141,29 +4141,55 @@ fn build_associative_map(
 /// Builds the `BTreeMap<usize, String>` for a compound `name=(...)`
 /// RHS. Implicit subscripts continue from the highest explicit
 /// subscript seen so far (bash's rule for sparse mixed-form literals).
+/// Field-expands a compound array literal's elements into an explicit
+/// `(index → value)` map, starting bare-element auto-indexing at `start`.
+///
+/// Bare elements (no `[subscript]=`) go through the SAME field+glob path
+/// command arguments use (`glob_expand_word`): unquoted word-splitting,
+/// command-substitution splitting, pathname globbing, and the
+/// quoted/unquoted `${arr[@]}`/`$@` multi-field rule — one element may yield
+/// zero, one, or many values, and the implicit index advances per produced
+/// FIELD. Subscripted `[i]=value` elements keep single-value semantics (no
+/// splitting, via `expand_assignment`) and reset the implicit index to
+/// `i + 1`. (M-112)
+fn expand_array_elements(
+    elements: &[crate::lexer::ArrayLiteralElement],
+    name: &str,
+    shell: &mut Shell,
+    start: usize,
+) -> Result<std::collections::BTreeMap<usize, String>, ()> {
+    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut implicit = start;
+    for e in elements {
+        match &e.subscript {
+            Some(sw) => {
+                let idx = match crate::expand::eval_subscript(sw, shell, name) {
+                    Ok(i) => i,
+                    Err(msg) => {
+                        eprintln!("huck: {msg}");
+                        return Err(());
+                    }
+                };
+                map.insert(idx, expand_assignment(&e.value, shell));
+                implicit = idx + 1;
+            }
+            None => {
+                for field in glob_expand_word(&e.value, shell)? {
+                    map.insert(implicit, field);
+                    implicit += 1;
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn build_array_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     name: &str,
     shell: &mut Shell,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
-    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
-    let mut implicit: usize = 0;
-    for e in elements {
-        let val = expand_assignment(&e.value, shell);
-        let idx = match &e.subscript {
-            Some(sw) => match crate::expand::eval_subscript(sw, shell, name) {
-                Ok(i) => i,
-                Err(msg) => {
-                    eprintln!("huck: {msg}");
-                    return Err(());
-                }
-            },
-            None => implicit,
-        };
-        map.insert(idx, val);
-        implicit = idx + 1;
-    }
-    Ok(map)
+    expand_array_elements(elements, name, shell, 0)
 }
 
 // ----- job-control helpers -------------------------------------------------
