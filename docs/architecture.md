@@ -210,7 +210,7 @@ The "(1M context)" parenthetical is canonical — do not remove it.
 | New control-flow construct | `lexer.rs`: add token recognition + AST construction (in `command.rs`). `executor.rs`: add `run_*` walker for the new `Command` variant. |
 | New `set -o` option | `shell_state.rs::ShellOptions`: add the bool field. `builtins.rs::builtin_set`: add to the OptionInfo registry and the get/set/print helpers. Wire into the executor at the relevant action site. |
 | New trap signal / pseudo-signal | `traps.rs`: add to the signal name table. `executor.rs`: add a `fire_*_trap` call at the appropriate spot. |
-| Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_array_element` / `Shell::append_array` / etc. (or the associative siblings). The expansion side is already wired. |
+| Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_array_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
 
 ## Pointers for new sessions
 

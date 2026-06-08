@@ -3975,7 +3975,7 @@ fn is_array_value_word(word: &crate::lexer::Word) -> bool {
 
 /// Applies one `Assignment` to `shell`. Dispatches on the four
 /// combinations of (target kind, value kind):
-///   1. Bare + compound array RHS  →  `replace_array` / `append_array`
+///   1. Bare + compound array RHS  →  `replace_array` / `extend_indexed`
 ///   2. Bare + scalar RHS          →  `try_set` / scalar+=value
 ///   3. Indexed + scalar RHS       →  `set_array_element` / `append_array_element`
 ///   4. Indexed + compound array   →  rejected (matches bash)
@@ -4057,12 +4057,25 @@ pub(crate) fn apply_one_assignment(
         // Bare name + compound array RHS.
         (AssignTarget::Bare(name), Some(elements)) => {
             if a.append {
-                // a+=(elements): append new keys after max_index.
-                let values: Vec<String> = elements
-                    .iter()
-                    .map(|e| expand_assignment(&e.value, shell))
-                    .collect();
-                shell.append_array(name, &values).map_err(|_| ())
+                // a+=(elements): field-expand each bare element (split/glob/[@])
+                // and append after the current max index, honoring explicit
+                // [i]=v elements. Readonly pre-check avoids a partial write.
+                if shell.is_readonly(name) {
+                    eprintln!("huck: {name}: readonly variable");
+                    return Err(());
+                }
+                // Starting auto-index: max+1 for an existing array; 1 for a
+                // scalar (which promotes to element 0); 0 when unset — matching
+                // extend_indexed's promotion.
+                let start = if shell.get_array(name).is_some() {
+                    shell.array_max_index(name).map_or(0, |m| m + 1)
+                } else if shell.get(name).is_some() {
+                    1
+                } else {
+                    0
+                };
+                let map = expand_array_elements(elements, name, shell, start)?;
+                shell.extend_indexed(name, map).map_err(|_| ())
             } else {
                 // a=(elements): replace whole array.
                 let map = build_array_map(elements, name, shell)?;
@@ -4141,29 +4154,61 @@ fn build_associative_map(
 /// Builds the `BTreeMap<usize, String>` for a compound `name=(...)`
 /// RHS. Implicit subscripts continue from the highest explicit
 /// subscript seen so far (bash's rule for sparse mixed-form literals).
+/// Field-expands a compound array literal's elements into an explicit
+/// `(index → value)` map, starting bare-element auto-indexing at `start`.
+///
+/// Bare elements (no `[subscript]=`) go through the SAME field+glob path
+/// command arguments use (`glob_expand_word`): unquoted word-splitting,
+/// command-substitution splitting, pathname globbing, and the
+/// quoted/unquoted `${arr[@]}`/`$@` multi-field rule — one element may yield
+/// zero, one, or many values, and the implicit index advances per produced
+/// FIELD. Subscripted `[i]=value` elements keep single-value semantics (no
+/// splitting, via `expand_assignment`) and reset the implicit index to
+/// `i + 1`. (M-112)
+fn expand_array_elements(
+    elements: &[crate::lexer::ArrayLiteralElement],
+    name: &str,
+    shell: &mut Shell,
+    start: usize,
+) -> Result<std::collections::BTreeMap<usize, String>, ()> {
+    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    let mut implicit = start;
+    for e in elements {
+        match &e.subscript {
+            Some(sw) => {
+                let idx = match crate::expand::eval_subscript(sw, shell, name) {
+                    Ok(i) => i,
+                    Err(msg) => {
+                        eprintln!("huck: {msg}");
+                        return Err(());
+                    }
+                };
+                map.insert(idx, expand_assignment(&e.value, shell));
+                implicit = idx + 1;
+                if shell.pending_fatal_pe_error.is_some() {
+                    return Err(());
+                }
+            }
+            None => {
+                for field in glob_expand_word(&e.value, shell)? {
+                    map.insert(implicit, field);
+                    implicit += 1;
+                }
+                if shell.pending_fatal_pe_error.is_some() {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn build_array_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     name: &str,
     shell: &mut Shell,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
-    let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
-    let mut implicit: usize = 0;
-    for e in elements {
-        let val = expand_assignment(&e.value, shell);
-        let idx = match &e.subscript {
-            Some(sw) => match crate::expand::eval_subscript(sw, shell, name) {
-                Ok(i) => i,
-                Err(msg) => {
-                    eprintln!("huck: {msg}");
-                    return Err(());
-                }
-            },
-            None => implicit,
-        };
-        map.insert(idx, val);
-        implicit = idx + 1;
-    }
-    Ok(map)
+    expand_array_elements(elements, name, shell, 0)
 }
 
 // ----- job-control helpers -------------------------------------------------

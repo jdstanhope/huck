@@ -56,7 +56,7 @@ impl Variable {
 }
 
 /// Error kind returned by the readonly-aware array mutator helpers
-/// (`replace_array`, `set_array_element`, `append_array`,
+/// (`replace_array`, `set_array_element`, `extend_indexed`,
 /// `append_array_element`, `unset_array_element`). The mutator prints
 /// the user-facing diagnostic itself; callers translate this into the
 /// appropriate exit status.
@@ -879,18 +879,24 @@ impl Shell {
         Ok(())
     }
 
-    /// Appends elements to the array. New keys start at `max_index+1`
-    /// (or 0 for empty/missing). Promotes a scalar variable to an
-    /// indexed array (scalar becomes element 0; new elements start at
-    /// index 1). Honors readonly.
-    pub fn append_array(&mut self, name: &str, elements: &[String]) -> Result<(), AssignErr> {
+    /// Merges explicit `(index → value)` entries into the named indexed
+    /// array, creating it if missing and promoting a scalar to element 0
+    /// first. Honors readonly (callers should pre-check to avoid a partial
+    /// write; this re-checks defensively). Used by `a+=(elements)` after the
+    /// elements are field-expanded with continuation indices already
+    /// computed. Appending to an associative array is a type error.
+    pub fn extend_indexed(
+        &mut self,
+        name: &str,
+        entries: BTreeMap<usize, String>,
+    ) -> Result<(), AssignErr> {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        // Promote scalar to indexed if needed.
+        // Promote scalar to indexed (scalar becomes element 0).
         if matches!(
             self.vars.get(name).map(|v| &v.value),
             Some(VarValue::Scalar(_))
@@ -901,7 +907,6 @@ impl Shell {
             m.insert(0, std::mem::take(s));
             v.value = VarValue::Indexed(m);
         }
-        let start = self.array_max_index(name).map_or(0, |m| m + 1);
         if !self.vars.contains_key(name) {
             self.vars.insert(
                 name.to_string(),
@@ -916,11 +921,14 @@ impl Shell {
         if let Some(v) = self.vars.get_mut(name)
             && let VarValue::Indexed(m) = &mut v.value
         {
-            for (i, val) in elements.iter().enumerate() {
-                m.insert(start + i, val.clone());
+            for (idx, val) in entries {
+                m.insert(idx, val);
             }
+            Ok(())
+        } else {
+            eprintln!("huck: {name}: cannot append array literal to associative array");
+            Err(AssignErr::TypeMismatch)
         }
-        Ok(())
     }
 
     /// Appends `value` to the existing element at `idx` (concatenation).
