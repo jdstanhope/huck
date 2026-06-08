@@ -18,14 +18,37 @@ pub enum ExpansionResult {
     /// `@`-style context, each word becomes its own field; in an
     /// unquoted context it's joined and word-split.
     WordList(Vec<String>),
+    /// Pre-split, quoting-final fields from expanding a substituted *word*
+    /// (the alternate of `${p+word}` / the default of `${p-word}`) when the
+    /// OUTER `${…}` is unquoted. The consumer emits these as-is — no further
+    /// IFS-splitting or re-joining — so quoted-empty fields survive and
+    /// quoted-spaced fields are not re-split. (M-110)
+    Fields(Vec<crate::expand::Field>),
 }
 
+/// Scalar modifier evaluation with `quoted = false` (the unquoted-outer
+/// default). Retained as the 3-arg form used by the unit tests; production
+/// callers route through `expand_modifier_quoted` to pass the real outer
+/// quoting (M-110).
+#[allow(dead_code)]
 pub fn expand_modifier(
     name: &str,
     modifier: &ParamModifier,
     shell: &mut Shell,
 ) -> ExpansionResult {
-    expand_modifier_with_value(name, modifier, ParamLookup::Scalar, shell)
+    expand_modifier_with_value(name, modifier, ParamLookup::Scalar, false, shell)
+}
+
+/// Like `expand_modifier`, but the caller supplies the OUTER `${…}` quoting so
+/// `${p+word}` / `${p-word}` can field-preserve the substituted word when
+/// unquoted (M-110).
+pub fn expand_modifier_quoted(
+    name: &str,
+    modifier: &ParamModifier,
+    quoted: bool,
+    shell: &mut Shell,
+) -> ExpansionResult {
+    expand_modifier_with_value(name, modifier, ParamLookup::Scalar, quoted, shell)
 }
 
 /// Source of the parameter value for `expand_modifier_with_value`.
@@ -52,6 +75,7 @@ pub fn expand_modifier_with_value(
     name: &str,
     modifier: &ParamModifier,
     source: ParamLookup,
+    quoted: bool,
     shell: &mut Shell,
 ) -> ExpansionResult {
     if shell.pending_fatal_pe_error.is_some() {
@@ -101,7 +125,11 @@ pub fn expand_modifier_with_value(
         ParamModifier::UseDefault { word, colon } => {
             let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
-                ExpansionResult::Value(expand_word_to_string(word, shell))
+                if quoted {
+                    ExpansionResult::Value(expand_word_to_string(word, shell))
+                } else {
+                    ExpansionResult::Fields(crate::expand::expand(word, shell))
+                }
             } else {
                 ExpansionResult::Value(raw.unwrap_or_default())
             }
@@ -149,8 +177,10 @@ pub fn expand_modifier_with_value(
             let raw = get_raw(shell);
             if condition_is_null(raw.as_deref(), *colon) {
                 ExpansionResult::Empty
-            } else {
+            } else if quoted {
                 ExpansionResult::Value(expand_word_to_string(word, shell))
+            } else {
+                ExpansionResult::Fields(crate::expand::expand(word, shell))
             }
         }
         ParamModifier::RemovePrefix { pattern, longest } => {
@@ -654,12 +684,21 @@ mod tests {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
     }
 
+    /// Expected `Fields` result for a single unquoted literal word `s`
+    /// (what `${p+s}` / `${p-s}` now returns under an unquoted outer).
+    fn fields(s: &str) -> ExpansionResult {
+        ExpansionResult::Fields(vec![crate::expand::Field {
+            chars: s.to_string(),
+            quoted: vec![false; s.chars().count()],
+        }])
+    }
+
     #[test]
     fn use_default_colon_unset_uses_default() {
         let mut shell = Shell::new();
         let m = ParamModifier::UseDefault { word: lit("default"), colon: true };
         let r = expand_modifier("HUCK_TEST_PE_UD1", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Value("default".to_string()));
+        assert_eq!(r, fields("default"));
     }
 
     #[test]
@@ -668,7 +707,7 @@ mod tests {
         shell.export_set("HUCK_TEST_PE_UD2", "".to_string());
         let m = ParamModifier::UseDefault { word: lit("default"), colon: true };
         let r = expand_modifier("HUCK_TEST_PE_UD2", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Value("default".to_string()));
+        assert_eq!(r, fields("default"));
     }
 
     #[test]
@@ -743,7 +782,7 @@ mod tests {
         shell.export_set("HUCK_TEST_PE_UA1", "anything".to_string());
         let m = ParamModifier::UseAlternate { word: lit("alt"), colon: true };
         let r = expand_modifier("HUCK_TEST_PE_UA1", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Value("alt".to_string()));
+        assert_eq!(r, fields("alt"));
     }
 
     #[test]
@@ -769,7 +808,28 @@ mod tests {
         shell.export_set("HUCK_TEST_PE_UA4", "".to_string());
         let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
         let r = expand_modifier("HUCK_TEST_PE_UA4", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Value("alt".to_string()));
+        assert_eq!(r, fields("alt"));
+    }
+
+    #[test]
+    fn use_alternate_unquoted_returns_fields() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_M110_A", "set".to_string());
+        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
+        // quoted=false (the 3-arg wrapper) → Fields.
+        assert_eq!(expand_modifier("HUCK_M110_A", &m, &mut shell), fields("alt"));
+    }
+
+    #[test]
+    fn use_alternate_quoted_returns_value() {
+        let mut shell = Shell::new();
+        shell.export_set("HUCK_M110_B", "set".to_string());
+        let m = ParamModifier::UseAlternate { word: lit("alt"), colon: false };
+        // quoted=true → the old Value path (no split).
+        assert_eq!(
+            expand_modifier_quoted("HUCK_M110_B", &m, true, &mut shell),
+            ExpansionResult::Value("alt".to_string())
+        );
     }
 
     #[test]
