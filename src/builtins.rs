@@ -10902,6 +10902,8 @@ mod getopts_step_tests {
         let s1 = getopts_step("ab", &args(&["-ab"]), 1, 1);
         assert_eq!(s1.name, "a");
         assert_eq!((s1.optind, s1.sp), (1, 3));
+        assert!(!s1.done);
+        assert!(s1.error.is_none());
         // second call (sp=3) consumes 'b', word done -> optind=2, sp=1.
         let s2 = getopts_step("ab", &args(&["-ab"]), 1, 3);
         assert_eq!(s2.name, "b");
@@ -10931,6 +10933,7 @@ mod getopts_step_tests {
         let s = getopts_step("ab", &args(&["-a"]), 2, 1); // optind past end
         assert_eq!(s.name, "?");
         assert!(s.done);
+        assert_eq!(s.optind, 2); // optind.max(1), unchanged
         assert_eq!(s.optarg, None);
     }
 
@@ -10955,7 +10958,8 @@ mod getopts_step_tests {
         let s = getopts_step("ab", &args(&["-z"]), 1, 1);
         assert_eq!(s.name, "?");
         assert_eq!(s.optarg, None);
-        assert!(!s.done);
+        assert!(!s.done); // invalid option is NOT terminating (rc 0, keep going)
+        assert_eq!(s.optind, 2); // "-z" exhausts the word → optind advances
         assert_eq!(s.error.as_deref(), Some("illegal option -- z"));
     }
 
@@ -10964,6 +10968,8 @@ mod getopts_step_tests {
         let s = getopts_step(":ab", &args(&["-z"]), 1, 1);
         assert_eq!(s.name, "?");
         assert_eq!(s.optarg.as_deref(), Some("z")); // silent: OPTARG = offending char
+        assert!(!s.done); // still rc 0 (keep processing)
+        assert_eq!(s.optind, 2);
         assert!(s.error.is_none());
     }
 
