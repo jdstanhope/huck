@@ -109,3 +109,20 @@ fn regression_get_comp_words_by_ref_shape() {
     assert_eq!(out, "arg:cur\narg:prev\nexclude=:\n", "out: {out}");
     assert!(!err.contains("unknown argument"), "cascade still present: {err}");
 }
+
+#[test]
+fn nested_getopts_does_not_corrupt_mid_cluster_caller() {
+    // A caller mid-cluster (-abc, after 'a') invokes a function that runs its
+    // own getopts loop. The caller must resume at 'b'/'c' (not panic, not
+    // re-process 'a') — the within-word cursor is per-call-context. Matches
+    // bash; previously panicked (index out of bounds).
+    let (out, _e, c) = run(
+        "nested() { local OPTIND=1 n; while getopts \"xy\" n; do echo \"  nested:$n\"; done; }\n\
+         set -- -abc\n\
+         while getopts \"abc\" o; do\n\
+           echo \"caller:$o\"\n\
+           if [ \"$o\" = a ]; then nested -x -y; fi\n\
+         done\n");
+    assert_eq!(out, "caller:a\n  nested:x\n  nested:y\ncaller:b\ncaller:c\n", "out: {out}");
+    assert_eq!(c, 0, "should not panic/abort");
+}

@@ -3983,6 +3983,13 @@ pub(crate) fn getopts_step(
     let word: Vec<char> = args[optind - 1].chars().collect();
     let mut sp = if sp == 0 { 1 } else { sp };
 
+    // Defensive: a stale within-word cursor (e.g. inherited across a function
+    // call, or an externally manipulated OPTIND) that points past the current
+    // word must not index out of bounds — restart this word fresh.
+    if sp > word.len() {
+        sp = 1;
+    }
+
     if sp == 1 {
         // Fresh word: must start with '-' and not be just "-".
         if word.first() != Some(&'-') || word.len() == 1 {
