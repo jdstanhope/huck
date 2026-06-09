@@ -186,7 +186,6 @@ pub fn has_extglob(pattern: &str) -> bool {
 /// `[[:name:]]` form) — an unescaped `[:` followed later by `:]`. Liberal: a
 /// false positive only routes a class-free pattern through the (faithful)
 /// own-matcher, which is harmless.
-#[allow(dead_code)] // wired into the dispatch sites in Task 2.
 pub fn has_posix_class(pattern: &str) -> bool {
     let b: Vec<char> = pattern.chars().collect();
     let mut i = 0;

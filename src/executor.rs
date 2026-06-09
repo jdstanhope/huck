@@ -1071,7 +1071,9 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
     let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
     for pattern_word in &item.patterns {
         let pattern = expand_pattern(pattern_word, shell);
-        let hit = if extglob && crate::glob_match::has_extglob(&pattern) {
+        let hit = if (extglob && crate::glob_match::has_extglob(&pattern))
+            || crate::glob_match::has_posix_class(&pattern)
+        {
             crate::glob_match::extglob_match(&pattern, subject, nocase)
         } else {
             let npat = crate::glob_match::translate_bracket_negation(&pattern);
@@ -1277,7 +1279,9 @@ fn eval_binary(
             let pattern_str = expand_pattern(rhs_word, shell);
             let nocase = shell.nocasematch();
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-            let matched = if extglob && crate::glob_match::has_extglob(&pattern_str) {
+            let matched = if (extglob && crate::glob_match::has_extglob(&pattern_str))
+                || crate::glob_match::has_posix_class(&pattern_str)
+            {
                 crate::glob_match::extglob_match(&pattern_str, lhs, nocase)
             } else {
                 let npat = crate::glob_match::translate_bracket_negation(&pattern_str);

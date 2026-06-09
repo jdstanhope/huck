@@ -370,6 +370,12 @@ fn filename_matches_prefix(path: &str, prefix: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, candidate: &str) -> bool {
+    // The glob crate lacks POSIX [:name:] classes; route class-bearing
+    // patterns through the own-matcher (case-sensitive, matching the
+    // default glob::Pattern::matches below).
+    if crate::glob_match::has_posix_class(pattern) {
+        return crate::glob_match::extglob_match(pattern, candidate, false);
+    }
     let pattern = crate::glob_match::translate_bracket_negation(pattern);
     match glob::Pattern::new(&pattern) {
         Ok(p) => p.matches(candidate),
