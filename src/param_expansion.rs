@@ -263,36 +263,41 @@ pub fn expand_modifier_with_value(
     }
 }
 
-/// bash `${v@Q}`: shell-quote `v` so the result re-reads as the same
-/// value. If `v` contains a control char (`\0`..`\x1F` or `\x7F`) it uses
-/// the `$'…'` ANSI-C form (escaping `\`, `'`, and control chars); empty
-/// and ordinary strings use single quotes with `'` rewritten as `'\''`.
+/// bash `${v@Q}`: shell-quote `v` so the result re-reads as the same value.
+/// Control chars use the `$'…'` ANSI-C form; empty/ordinary strings use single
+/// quotes with `'` rewritten as `'\''`.
 fn shell_quote(v: &str) -> String {
     if v.chars().any(|c| c.is_control()) {
-        let mut out = String::from("$'");
-        for c in v.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '\'' => out.push_str("\\'"),
-                '\x07' => out.push_str("\\a"),
-                '\x08' => out.push_str("\\b"),
-                '\t' => out.push_str("\\t"),
-                '\n' => out.push_str("\\n"),
-                '\x0B' => out.push_str("\\v"),
-                '\x0C' => out.push_str("\\f"),
-                '\r' => out.push_str("\\r"),
-                '\x1B' => out.push_str("\\E"),
-                c if (c as u32) < 0x20 || c == '\x7F' => {
-                    out.push_str(&format!("\\{:03o}", c as u32));
-                }
-                c => out.push(c),
-            }
-        }
-        out.push('\'');
-        out
+        ansi_c_quote(v)
     } else {
         format!("'{}'", crate::builtins::escape_alias_value(v))
     }
+}
+
+/// ANSI-C `$'…'` quoting of `v` (escaping `\`, `'`, and control chars). Shared
+/// by `${v@Q}` (control-char branch) and `printf %q`.
+pub(crate) fn ansi_c_quote(v: &str) -> String {
+    let mut out = String::from("$'");
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\x0B' => out.push_str("\\v"),
+            '\x0C' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '\x1B' => out.push_str("\\E"),
+            c if (c as u32) < 0x20 || c == '\x7F' => {
+                out.push_str(&format!("\\{:03o}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Expands `word` to a string (no field-splitting), parses it as

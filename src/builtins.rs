@@ -2261,6 +2261,7 @@ enum ConvChar {
     BigX,
     C,
     B,
+    Q,
     Percent,
 }
 
@@ -2430,6 +2431,7 @@ fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
             b'X' => ConvChar::BigX,
             b'c' => ConvChar::C,
             b'b' => ConvChar::B,
+            b'q' => ConvChar::Q,
             b'%' => ConvChar::Percent,
             c => return Err(format!("`%{}': invalid directive", c as char)),
         };
@@ -2511,6 +2513,28 @@ fn parse_printf_int(s: &str) -> (i64, Option<String>) {
     (sign.saturating_mul(parsed), err)
 }
 
+/// bash `printf %q`: quote `arg` so it re-reads as the same word. Empty → `''`;
+/// a control char → the `$'…'` ANSI-C form; otherwise backslash-escape each
+/// shell-special char (SPACE plus `!"#$&'()*,;<>?[\]^`{|}~`). Letters, digits,
+/// `%+-./:=@_`, and printable UTF-8 are emitted as-is.
+fn printf_q(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().any(|c| c.is_control()) {
+        return crate::param_expansion::ansi_c_quote(arg);
+    }
+    const SPECIAL: &str = " !\"#$&'()*,;<>?[\\]^`{|}~";
+    let mut out = String::with_capacity(arg.len());
+    for c in arg.chars() {
+        if SPECIAL.contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Formats a single conv-spec + arg into `out`. Returns Ok(true) for
 /// normal completion, Ok(false) if `\c` halted output (only possible
 /// for `%b`), Err for an invalid integer arg (caller logs + sets
@@ -2588,6 +2612,10 @@ fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, Str
     match spec.conv {
         ConvChar::S => {
             out.extend_from_slice(&pad_string(arg.as_bytes(), spec));
+            Ok(true)
+        }
+        ConvChar::Q => {
+            out.extend_from_slice(&pad_string(printf_q(arg).as_bytes(), spec));
             Ok(true)
         }
         ConvChar::C => {
@@ -6432,6 +6460,20 @@ fn builtin_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printf_q_quoting() {
+        assert_eq!(printf_q("plain"), "plain");
+        assert_eq!(printf_q("a b"), "a\\ b");
+        assert_eq!(printf_q("c'd"), "c\\'d");
+        assert_eq!(printf_q("a$b"), "a\\$b");
+        assert_eq!(printf_q("x\"y"), "x\\\"y");
+        assert_eq!(printf_q("*"), "\\*");
+        assert_eq!(printf_q(""), "''");
+        assert_eq!(printf_q("p/q-r.s"), "p/q-r.s"); // /,-,. not escaped
+        assert_eq!(printf_q("a\tb"), "$'a\\tb'");    // control -> $'...'
+        assert_eq!(printf_q("ünï"), "ünï");          // UTF-8 as-is
+    }
 
     #[test]
     fn seto_option_names_includes_errexit_in_table_order() {
