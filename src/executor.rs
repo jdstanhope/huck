@@ -2378,6 +2378,44 @@ fn prepare_builtin_stderr(stderr: Option<File>, dup_target: Option<RawFd>) -> Op
     }
 }
 
+/// For an in-process builtin whose stdout has a `>&N` (`Redirect::Dup`)
+/// redirect, returns the `File` the builtin should write to:
+///
+///   - not a Dup, or `>&1` (source == 1)  -> `Ok(None)` (use the normal sink)
+///   - `>&-` (source expands to "-")        -> `Ok(Some(/dev/null))` (discard)
+///   - `>&N`, N != 1                         -> `Ok(Some(File))` dup'd from fd N
+///
+/// On a bad fd target, prints `huck: <err>` and returns `Err(())` (status 1),
+/// mirroring the external path's `resolve_fd_target` error handling.
+fn builtin_stdout_dup_file(cmd: &ExecCommand, shell: &mut Shell) -> Result<Option<File>, ()> {
+    let source = match &cmd.stdout {
+        Some(Redirect::Dup { source, .. }) => source,
+        _ => return Ok(None),
+    };
+    let expanded = expand_assignment(source, shell);
+    if expanded == "-" {
+        return match OpenOptions::new().write(true).open("/dev/null") {
+            Ok(f) => Ok(Some(f)),
+            Err(e) => { eprintln!("huck: /dev/null: {e}"); Err(()) }
+        };
+    }
+    let target = match resolve_fd_target(source, shell) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("huck: {e}"); return Err(()); }
+    };
+    if target == 1 {
+        return Ok(None);
+    }
+    let dup_fd = unsafe { libc::dup(target) };
+    if dup_fd < 0 {
+        let e = io::Error::last_os_error();
+        eprintln!("huck: {target}: {e}");
+        return Err(());
+    }
+    use std::os::unix::io::FromRawFd;
+    Ok(Some(unsafe { File::from_raw_fd(dup_fd) }))
+}
+
 /// True when `cmd.stderr` is a `2>&1`-style dup whose source resolves to fd 1,
 /// so an in-process builtin's stderr should follow fd 1 for the call's
 /// duration. `2>&N` for other N is left to the subprocess path (rare on
@@ -2808,6 +2846,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
+        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
+        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
+        // to the 2>&1-on-builtin handling below).
+        if files.stdout.is_none() {
+            match builtin_stdout_dup_file(cmd, shell) {
+                Ok(f) => files.stdout = f,
+                Err(()) => return ExecOutcome::Continue(1),
+            }
+        }
         // `2>&1` on a builtin: follow wherever the builtin's stdout actually
         // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
         // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
@@ -2853,6 +2900,18 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
+        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
+        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
+        // to the 2>&1-on-builtin handling below).
+        if files.stdout.is_none() {
+            match builtin_stdout_dup_file(cmd, shell) {
+                Ok(f) => files.stdout = f,
+                Err(()) => {
+                    if !persistent { restore_inline_assignments(snap, shell); }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
         // Apply stdin redirection in-process for builtins: builtins that read
         // from stdin (e.g. `read`) need `<<<`, `<<`, and `<file` to actually
         // affect the fd they read from. Save+dup2 around the call.

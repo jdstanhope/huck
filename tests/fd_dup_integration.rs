@@ -33,12 +33,18 @@ fn dup_stderr_to_stdout_canonical() {
 
 #[test]
 fn dup_stdout_to_stderr() {
+    // `1>&2` redirects builtin stdout to fd 2 (stderr). `2>file` then redirects
+    // fd 2 to the file. Since `1>&2` copies fd 2 *before* `2>file` takes
+    // effect (left-to-right POSIX ordering), "hi" goes to stderr (the old fd 2),
+    // not the file. The file is empty; "hi" appears on stderr.
     let tmp = format!("/tmp/v29_dup_stdout_{}", std::process::id());
     let script = format!(
         "echo hi 1>&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
     );
-    let (out, _) = run(&script);
-    assert!(out.lines().any(|l| l.trim() == "hi"), "got: {out}");
+    let (out, err) = run(&script);
+    // stdout (from `cat {tmp}`) is empty; "hi" reached stderr
+    assert!(out.trim().is_empty(), "stdout must be empty, got: {out:?}");
+    assert!(err.lines().any(|l| l.trim() == "hi"), "stderr must contain 'hi', got: {err:?}");
 }
 
 #[test]
@@ -102,12 +108,17 @@ fn dup_runtime_bad_fd_target() {
 
 #[test]
 fn echo_to_stderr_shorthand() {
+    // `>&2` redirects builtin stdout to fd 2 (stderr). The `2>file` redirect
+    // takes effect after `1>&2` per POSIX left-to-right ordering, so "error"
+    // goes to the original fd 2 (stderr), and the file is empty.
     let tmp = format!("/tmp/v29_shorthand_{}", std::process::id());
     let script = format!(
         "echo error >&2 2> {tmp}\ncat {tmp}\nrm -f {tmp}\nexit\n"
     );
-    let (out, _) = run(&script);
-    assert!(out.lines().any(|l| l.trim() == "error"), "got: {out}");
+    let (out, err) = run(&script);
+    // stdout (from `cat {tmp}`) is empty; "error" reached stderr
+    assert!(out.trim().is_empty(), "stdout must be empty, got: {out:?}");
+    assert!(err.lines().any(|l| l.trim() == "error"), "stderr must contain 'error', got: {err:?}");
 }
 
 #[test]
