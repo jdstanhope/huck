@@ -13,12 +13,14 @@ read these two docs — they're the project's authoritative source:
   cheatsheet (new builtin / modifier / `test` operator / control
   flow / `set -o` option / trap signal / array follow-on).
 
-- **`docs/bash-divergences.md`** — every divergence from bash 5.x,
-  grouped into Bugs / Missing features / Intentional / Low-impact
-  tiers. Every entry has a status: `[fixed vNN]`, `[deferred]`,
-  `[intentional]`, etc. Grep for `[deferred]` to find pending work,
-  ranked by severity (`high`/`medium`/`low`). The change log at
-  the end records every shipped iteration.
+- **`docs/bash-divergences.md`** — the CURRENT (open) divergences from
+  bash 5.x only, grouped into Bugs / Missing features / Intentional /
+  Low-impact tiers. Each entry is `[deferred]` (pending work, ranked by
+  severity `high`/`medium`/`low`) or `[intentional]` (kept by design).
+  Resolved divergences and the per-iteration history are NOT here — they
+  live in git history and `docs/superpowers/` specs+plans. (The doc was
+  slimmed 2026-06-09; it previously carried every `[fixed vNN]` entry and
+  a change log.)
 
 The README's iteration table indexes the v1–vNN history at a glance.
 For per-iteration design context, `docs/superpowers/specs/` and
@@ -40,9 +42,11 @@ Run the standard iteration loop without being asked:
    quality review between tasks.
 5. **Final review** of the whole branch diff before merge.
 6. **Merge** with `--no-ff`, push to origin, delete the local
-   branch. Update `docs/bash-divergences.md` (flip the relevant
-   `M-*` from `[deferred]` to `[fixed vNN]`, add change-log entry),
-   the README iteration table, and the long-running memory files.
+   branch. Update `docs/bash-divergences.md` (DELETE the resolved
+   `M-*`/`L-*` entry — it's a current-divergences-only doc; add a new
+   `[deferred]` entry for any follow-on gap discovered), and record the
+   iteration in the long-running memory files (`project_huck_iterations.md`
+   + `MEMORY.md`). (The README no longer carries a per-version table.)
 
 ## Conventions
 
