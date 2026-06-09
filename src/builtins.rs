@@ -613,7 +613,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             any_error = true;
             continue;
         }
-        shell.unset(arg);
+        shell.unset_var(arg);
     }
     if any_error {
         ExecOutcome::Continue(1)
