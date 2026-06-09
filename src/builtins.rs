@@ -2515,8 +2515,10 @@ fn parse_printf_int(s: &str) -> (i64, Option<String>) {
 
 /// bash `printf %q`: quote `arg` so it re-reads as the same word. Empty → `''`;
 /// a control char → the `$'…'` ANSI-C form; otherwise backslash-escape each
-/// shell-special char (SPACE plus `!"#$&'()*,;<>?[\]^`{|}~`). Letters, digits,
-/// `%+-./:=@_`, and printable UTF-8 are emitted as-is.
+/// shell-special char. `~` and `#` are special ONLY as the leading char
+/// (tilde-expansion / comment); everything else in the set is special at any
+/// position. Letters, digits, `%+-./:=@_`, and printable UTF-8 are emitted
+/// as-is.
 fn printf_q(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
@@ -2524,10 +2526,10 @@ fn printf_q(arg: &str) -> String {
     if arg.chars().any(|c| c.is_control()) {
         return crate::param_expansion::ansi_c_quote(arg);
     }
-    const SPECIAL: &str = " !\"#$&'()*,;<>?[\\]^`{|}~";
+    const ALWAYS: &str = " !\"$&'()*,;<>?[\\]^`{|}";
     let mut out = String::with_capacity(arg.len());
-    for c in arg.chars() {
-        if SPECIAL.contains(c) {
+    for (i, c) in arg.chars().enumerate() {
+        if ALWAYS.contains(c) || (i == 0 && (c == '#' || c == '~')) {
             out.push('\\');
         }
         out.push(c);
@@ -6473,6 +6475,12 @@ mod tests {
         assert_eq!(printf_q("p/q-r.s"), "p/q-r.s"); // /,-,. not escaped
         assert_eq!(printf_q("a\tb"), "$'a\\tb'");    // control -> $'...'
         assert_eq!(printf_q("ünï"), "ünï");          // UTF-8 as-is
+        assert_eq!(printf_q("~a"), "\\~a");   // leading ~ escaped
+        assert_eq!(printf_q("a~"), "a~");      // trailing ~ not escaped
+        assert_eq!(printf_q("b~c"), "b~c");    // mid ~ not escaped
+        assert_eq!(printf_q("#a"), "\\#a");   // leading # escaped
+        assert_eq!(printf_q("a#"), "a#");      // trailing # not escaped
+        assert_eq!(printf_q("a$b"), "a\\$b");  // $ special at any position
     }
 
     #[test]

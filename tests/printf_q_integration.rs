@@ -29,3 +29,7 @@ fn q_width_and_capture() {
     assert_eq!(run("printf '[%6q]\\n' 'a b'\n"), "[  a\\ b]\n");
     assert_eq!(run("printf -v x '%q' 'a b'\necho \"$x\"\n"), "a\\ b\n");
 }
+#[test]
+fn q_tilde_hash_leading_only() {
+    assert_eq!(run("printf '%q\\n' '~a' 'a~' 'b~c' '#a' 'a#'\n"), "\\~a\na~\nb~c\n\\#a\na#\n");
+}
