@@ -2506,6 +2506,9 @@ fn open_writable(path: &str, guard_noclobber: bool) -> io::Result<File> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(f) => Ok(f),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // TOCTOU: the stat-then-reopen on this exemption path has a benign
+            // race (path could be swapped between metadata and open) — bash's
+            // set -C has the same inherent race; no truncate is requested.
             match std::fs::metadata(path) {
                 Ok(md) if !md.is_file() => OpenOptions::new().write(true).open(path),
                 _ => Err(io::Error::new(
