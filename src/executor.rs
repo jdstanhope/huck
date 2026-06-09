@@ -1229,7 +1229,29 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
             let p = expand_assignment(pattern, shell);
             let p = if shell.nocasematch() { format!("(?i){p}") } else { p };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
-            Ok(re.is_match(&l))
+            match re.captures(&l) {
+                Some(caps) => {
+                    // BASH_REMATCH[0] = whole matched substring; [1..] = capture
+                    // groups (a non-participating group is "" but still indexed).
+                    let map: std::collections::BTreeMap<usize, String> = (0..caps.len())
+                        .map(|i| {
+                            (
+                                i,
+                                caps.get(i)
+                                    .map(|m| m.as_str().to_string())
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    let _ = shell.replace_array("BASH_REMATCH", map);
+                    Ok(true)
+                }
+                None => {
+                    // bash clears BASH_REMATCH to an empty array on no match.
+                    let _ = shell.replace_array("BASH_REMATCH", std::collections::BTreeMap::new());
+                    Ok(false)
+                }
+            }
         }
         TestExpr::Not(inner) => eval_test_expr(inner, shell).map(|b| !b),
         TestExpr::And(a, b) => {
