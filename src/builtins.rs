@@ -4316,7 +4316,8 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
     }
 }
 
-/// Writes a `set -o` option. Only the 3 implemented options are settable.
+/// Writes a `set -o` option. Only the behaviorally-implemented options are
+/// settable; the rest of `SETO_TABLE` is inert (`Unimplemented`).
 fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
