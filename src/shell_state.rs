@@ -423,8 +423,9 @@ impl Shell {
 
     /// Returns the value of `$-` — alphabetical concatenation of
     /// short-flag letters reflecting current shell-options state
-    /// and the interactive flag. Order: `e` (errexit), `i`
-    /// (interactive), `u` (nounset), `v` (verbose).
+    /// and the interactive flag. Order: `e` (errexit), `f` (noglob),
+    /// `i` (interactive), `u` (nounset), `v` (verbose), `x` (xtrace),
+    /// `C` (noclobber).
     pub fn dollar_dash_value(&self) -> String {
         let mut out = String::new();
         if self.shell_options.errexit { out.push('e'); }
@@ -1963,6 +1964,17 @@ mod shopt_tests {
         sh.shell_options.verbose = true;
         let d = sh.dollar_dash_value();
         assert!(d.find('u').unwrap() < d.find('v').unwrap(), "got {d:?}");
+    }
+
+    #[test]
+    fn dollar_dash_C_after_x() {
+        let mut sh = Shell::new();
+        sh.shell_options.xtrace = true;
+        sh.shell_options.noclobber = true;
+        let d = sh.dollar_dash_value();
+        let xi = d.find('x').expect("x present");
+        let ci = d.find('C').expect("C present");
+        assert!(ci > xi, "C must come after x in $-: got {d:?}");
     }
 
     #[test]
