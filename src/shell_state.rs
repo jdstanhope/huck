@@ -1967,7 +1967,7 @@ mod shopt_tests {
     }
 
     #[test]
-    fn dollar_dash_C_after_x() {
+    fn dollar_dash_c_after_x() {
         let mut sh = Shell::new();
         sh.shell_options.xtrace = true;
         sh.shell_options.noclobber = true;
