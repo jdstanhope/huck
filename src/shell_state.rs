@@ -111,6 +111,7 @@ pub struct ShellOptions {
     pub verbose: bool,
     pub xtrace: bool,
     pub noglob: bool,
+    pub noclobber: bool,
 }
 
 /// One row of the bash `shopt` option table.
@@ -432,6 +433,7 @@ impl Shell {
         if self.shell_options.nounset { out.push('u'); }
         if self.shell_options.verbose { out.push('v'); }
         if self.shell_options.xtrace { out.push('x'); }
+        if self.shell_options.noclobber { out.push('C'); }
         out
     }
 
@@ -1961,5 +1963,19 @@ mod shopt_tests {
         sh.shell_options.verbose = true;
         let d = sh.dollar_dash_value();
         assert!(d.find('u').unwrap() < d.find('v').unwrap(), "got {d:?}");
+    }
+
+    #[test]
+    fn noclobber_off_by_default() {
+        let sh = Shell::new();
+        assert!(!sh.shell_options.noclobber);
+        assert!(!sh.dollar_dash_value().contains('C'));
+    }
+
+    #[test]
+    fn noclobber_shows_in_dollar_dash() {
+        let mut sh = Shell::new();
+        sh.shell_options.noclobber = true;
+        assert!(sh.dollar_dash_value().contains('C'));
     }
 }
