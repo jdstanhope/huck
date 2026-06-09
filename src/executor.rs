@@ -490,19 +490,24 @@ impl Drop for CompoundRedirectScope {
     }
 }
 
-/// Runs a compound command with trailing redirections applied at the real fd
-/// level: each present redirect is `dup2`'d onto fd 0/1/2 (originals saved and
-/// restored on scope exit), `inner` runs through the existing `sink`, and its
-/// status is returned. A redirect-open failure prints `huck: <target>: <err>`
-/// and returns `Continue(1)` WITHOUT running `inner`.
-fn run_redirected(
-    inner: &Command,
+/// Applies stdin/stdout/stderr redirects at the real-fd level (saved/restored
+/// via `CompoundRedirectScope`), forcing a `Terminal` inner sink when a stdout
+/// redirect is present so the redirect wins over an outer capture, then runs
+/// `run_inner(shell, inner_sink)` and returns its status. A redirect-open
+/// failure prints `huck: <target>: <err>` and returns `Continue(1)` WITHOUT
+/// running `run_inner`. (Shared by `run_redirected` for compounds and by the
+/// function-call branch.)
+fn with_redirect_scope<F>(
     stdin: &Option<Redirect>,
     stdout: &Option<Redirect>,
     stderr: &Option<Redirect>,
     shell: &mut Shell,
     sink: &mut StdoutSink,
-) -> ExecOutcome {
+    run_inner: F,
+) -> ExecOutcome
+where
+    F: FnOnce(&mut Shell, &mut StdoutSink) -> ExecOutcome,
+{
     use std::os::unix::io::IntoRawFd;
 
     // Flush buffered terminal/builtin output BEFORE swapping fds so prior
@@ -590,10 +595,28 @@ fn run_redirected(
     } else {
         sink
     };
-    let outcome = run_command(inner, shell, inner_sink);
+    let outcome = run_inner(shell, inner_sink);
     let _ = io::stdout().flush();
     drop(scope);
     outcome
+}
+
+/// Runs a compound command with trailing redirections applied at the real fd
+/// level: each present redirect is `dup2`'d onto fd 0/1/2 (originals saved and
+/// restored on scope exit), `inner` runs through the existing `sink`, and its
+/// status is returned. A redirect-open failure prints `huck: <target>: <err>`
+/// and returns `Continue(1)` WITHOUT running `inner`.
+fn run_redirected(
+    inner: &Command,
+    stdin: &Option<Redirect>,
+    stdout: &Option<Redirect>,
+    stderr: &Option<Redirect>,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    with_redirect_scope(stdin, stdout, stderr, shell, sink, |shell, inner_sink| {
+        run_command(inner, shell, inner_sink)
+    })
 }
 
 /// Apply a stdout/stderr-class redirect (`>`/`>>`/`>&N`/`2>&N`) onto
@@ -6102,6 +6125,28 @@ mod tests {
         // local should have errored; X unchanged.
         assert_eq!(shell.lookup_var("X").as_deref(), Some("outer"));
         assert_eq!(shell.last_status(), 1);
+    }
+
+    /// Smoke-test for `with_redirect_scope` via `run_redirected`: a brace
+    /// group redirected to a file writes its output there (not to stdout).
+    #[test]
+    fn compound_stdout_redirect_writes_to_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("huck_redir_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("out.txt");
+        let _ = std::fs::remove_file(&p);
+
+        let mut shell = Shell::new();
+        exec_script(
+            &format!("{{ echo HI; }} > {}\n", p.display()),
+            &mut shell,
+        );
+
+        let content = std::fs::read_to_string(&p)
+            .expect("redirect target file should exist");
+        assert_eq!(content.trim(), "HI");
+        let _ = std::fs::remove_file(&p);
     }
 }
 
