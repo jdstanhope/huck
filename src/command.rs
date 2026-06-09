@@ -256,6 +256,8 @@ pub enum Redirect {
     Truncate(Word),
     /// `>>file` — open file for writing (append).
     Append(Word),
+    /// `>|file` — force truncate, overriding `noclobber` (`set -C`).
+    Clobber(Word),
     /// `<<DELIM` (and friends) — heredoc body.
     /// `expand` is false for `<<'DELIM'` (any quoted part of the delim
     /// word triggers literal mode). `strip_tabs` is true for `<<-`.
@@ -1596,6 +1598,8 @@ fn is_redirect_op(op: &Operator) -> bool {
             | Operator::DupErr
             | Operator::AndRedirOut
             | Operator::AndRedirAppend
+            | Operator::RedirClobber
+            | Operator::RedirErrClobber
     )
 }
 
@@ -1652,6 +1656,8 @@ fn parse_trailing_redirects<I: Iterator<Item = Token>>(
                         stdout = Some(Redirect::Append(target));
                         stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
                     }
+                    Operator::RedirClobber => stdout = Some(Redirect::Clobber(target)),
+                    Operator::RedirErrClobber => stderr = Some(Redirect::Clobber(target)),
                     // is_redirect_op excludes all other operators.
                     _ => unreachable!("is_redirect_op gates the match arms above"),
                 }
@@ -2461,6 +2467,31 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(exec_stderr(&seq), &Some(Redirect::Append(ww("e"))));
+    }
+
+    // ── >| clobber redirect parser tests (v123) ──────────────────────────
+    #[test]
+    fn parse_clobber_stdout() {
+        let seq = parse(vec![
+            w_tok("cmd"),
+            Token::Op(Operator::RedirClobber),
+            w_tok("f"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(exec_stdout(&seq), &Some(Redirect::Clobber(ww("f"))));
+    }
+
+    #[test]
+    fn parse_clobber_stderr() {
+        let seq = parse(vec![
+            w_tok("cmd"),
+            Token::Op(Operator::RedirErrClobber),
+            w_tok("e"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(exec_stderr(&seq), &Some(Redirect::Clobber(ww("e"))));
     }
 
     #[test]

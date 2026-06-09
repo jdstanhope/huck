@@ -490,7 +490,7 @@ fn run_redirected(
             }
             // `<&N` on a compound is out of scope; only `<file`/heredoc/
             // here-string reach the stdin slot from the parser.
-            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Dup { .. } => {
+            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_) | Redirect::Dup { .. } => {
                 eprintln!("huck: unsupported stdin redirect on compound");
                 return ExecOutcome::Continue(1);
             }
@@ -553,13 +553,18 @@ fn apply_out_redirect(
 ) -> Result<(), ExecOutcome> {
     use std::os::unix::io::IntoRawFd;
     match r {
-        Redirect::Truncate(word) | Redirect::Append(word) => {
+        Redirect::Truncate(word) | Redirect::Append(word) | Redirect::Clobber(word) => {
             let path = match expand_single(word, shell) {
                 Ok(p) => p,
                 Err(()) => return Err(ExecOutcome::Continue(1)),
             };
             let resolved = if matches!(r, Redirect::Append(_)) {
                 ResolvedRedirect::Append(path)
+            } else if matches!(r, Redirect::Clobber(_)) {
+                // `>|` forces truncate, overriding noclobber.
+                ResolvedRedirect::Truncate(path)
+            } else if shell.shell_options.noclobber {
+                ResolvedRedirect::NoclobberTruncate(path)
             } else {
                 ResolvedRedirect::Truncate(path)
             };
@@ -1639,7 +1644,7 @@ fn run_background_sequence(
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.stdout {
-                    Some(Redirect::Truncate(w)) => {
+                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
                             Err(()) => {
@@ -1652,7 +1657,9 @@ fn run_background_sequence(
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                        let guard = shell.shell_options.noclobber
+                            && !matches!(r, Redirect::Clobber(_));
+                        match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
                                 eprintln!("huck: {path}: {e}");
@@ -1701,7 +1708,7 @@ fn run_background_sequence(
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.stderr {
-                    Some(Redirect::Truncate(w)) => {
+                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
                             Err(()) => {
@@ -1715,7 +1722,9 @@ fn run_background_sequence(
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                        let guard = shell.shell_options.noclobber
+                            && !matches!(r, Redirect::Clobber(_));
+                        match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
                                 eprintln!("huck: {path}: {e}");
@@ -2024,6 +2033,7 @@ struct ResolvedCommand {
 
 enum ResolvedRedirect {
     Truncate(String),
+    NoclobberTruncate(String),
     Append(String),
 }
 
@@ -2142,8 +2152,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             Some(ResolvedStdin::Heredoc(body.clone()))
         }
         Some(Redirect::HereString(w)) => Some(ResolvedStdin::HereString(w.clone())),
-        Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
-            unreachable!("parser never produces Truncate/Append for stdin")
+        Some(Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_)) => {
+            unreachable!("parser never produces Truncate/Append/Clobber for stdin")
         }
         Some(Redirect::Dup { .. }) => unreachable!(
             "Redirect::Dup on stdin (<&n) is out of scope for v29"
@@ -2151,12 +2161,19 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         None => None,
     };
     let stdout = match &cmd.stdout {
-        Some(Redirect::Truncate(w)) => {
+        Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
                 return Err(status);
             }
-            Some(ResolvedRedirect::Truncate(path))
+            let resolved = if matches!(r, Redirect::Clobber(_)) {
+                ResolvedRedirect::Truncate(path)
+            } else if shell.shell_options.noclobber {
+                ResolvedRedirect::NoclobberTruncate(path)
+            } else {
+                ResolvedRedirect::Truncate(path)
+            };
+            Some(resolved)
         }
         Some(Redirect::Append(w)) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
@@ -2176,12 +2193,19 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         None => None,
     };
     let stderr = match &cmd.stderr {
-        Some(Redirect::Truncate(w)) => {
+        Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
                 return Err(status);
             }
-            Some(ResolvedRedirect::Truncate(path))
+            let resolved = if matches!(r, Redirect::Clobber(_)) {
+                ResolvedRedirect::Truncate(path)
+            } else if shell.shell_options.noclobber {
+                ResolvedRedirect::NoclobberTruncate(path)
+            } else {
+                ResolvedRedirect::Truncate(path)
+            };
+            Some(resolved)
         }
         Some(Redirect::Append(w)) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
@@ -2458,11 +2482,8 @@ fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFi
 
 fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
     match redirect {
-        ResolvedRedirect::Truncate(path) => OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path),
+        ResolvedRedirect::Truncate(path) => open_writable(path, false),
+        ResolvedRedirect::NoclobberTruncate(path) => open_writable(path, true),
         ResolvedRedirect::Append(path) => OpenOptions::new()
             .create(true)
             .append(true)
@@ -2470,9 +2491,41 @@ fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
     }
 }
 
+/// Opens `path` for writing, truncating. When `guard_noclobber` is true
+/// (the `noclobber` option is on and this is a plain `>`/`&>`, not `>|`),
+/// refuse to overwrite an existing **regular** file — but exempt
+/// non-regular files (e.g. /dev/null, FIFOs), matching bash's `set -C`.
+fn open_writable(path: &str, guard_noclobber: bool) -> io::Result<File> {
+    if !guard_noclobber {
+        return OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path);
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // TOCTOU: the stat-then-reopen on this exemption path has a benign
+            // race (path could be swapped between metadata and open) — bash's
+            // set -C has the same inherent race; no truncate is requested.
+            match std::fs::metadata(path) {
+                Ok(md) if !md.is_file() => OpenOptions::new().write(true).open(path),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "cannot overwrite existing file",
+                )),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn resolved_path(redirect: &ResolvedRedirect) -> &str {
     match redirect {
-        ResolvedRedirect::Truncate(p) | ResolvedRedirect::Append(p) => p,
+        ResolvedRedirect::Truncate(p)
+        | ResolvedRedirect::NoclobberTruncate(p)
+        | ResolvedRedirect::Append(p) => p,
     }
 }
 
@@ -3373,7 +3426,7 @@ fn run_multi_stage(
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.stdout {
-                    Some(Redirect::Truncate(w)) => {
+                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
                             Err(()) => {
@@ -3385,7 +3438,9 @@ fn run_multi_stage(
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                        let guard = shell.shell_options.noclobber
+                            && !matches!(r, Redirect::Clobber(_));
+                        match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
                                 eprintln!("huck: {path}: {e}");
@@ -3431,7 +3486,7 @@ fn run_multi_stage(
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.stderr {
-                    Some(Redirect::Truncate(w)) => {
+                    Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
                             Err(()) => {
@@ -3444,7 +3499,9 @@ fn run_multi_stage(
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
-                        match OpenOptions::new().write(true).create(true).truncate(true).open(&path) {
+                        let guard = shell.shell_options.noclobber
+                            && !matches!(r, Redirect::Clobber(_));
+                        match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
                                 eprintln!("huck: {path}: {e}");
@@ -4576,6 +4633,47 @@ mod tests {
     use super::*;
     use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
+
+    #[test]
+    fn open_writable_guard_creates_new_file() {
+        let dir = std::env::temp_dir().join(format!("huck_nc_new_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("new.txt");
+        let _ = std::fs::remove_file(&p);
+        let f = open_writable(p.to_str().unwrap(), true);
+        assert!(f.is_ok(), "guarded open should create a nonexistent file");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_writable_guard_blocks_existing_regular_file() {
+        let dir = std::env::temp_dir().join(format!("huck_nc_block_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("exists.txt");
+        std::fs::write(&p, b"orig").unwrap();
+        let f = open_writable(p.to_str().unwrap(), true);
+        assert!(f.is_err(), "guarded open must refuse an existing regular file");
+        assert_eq!(f.err().unwrap().to_string(), "cannot overwrite existing file");
+        assert_eq!(std::fs::read(&p).unwrap(), b"orig");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn open_writable_guard_exempts_dev_null() {
+        let f = open_writable("/dev/null", true);
+        assert!(f.is_ok(), "guarded open must allow non-regular files like /dev/null");
+    }
+
+    #[test]
+    fn open_writable_unguarded_truncates_existing() {
+        let dir = std::env::temp_dir().join(format!("huck_nc_trunc_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("trunc.txt");
+        std::fs::write(&p, b"original-content").unwrap();
+        { let _f = open_writable(p.to_str().unwrap(), false).unwrap(); }
+        assert_eq!(std::fs::read(&p).unwrap(), b"", "unguarded open should truncate");
+        let _ = std::fs::remove_file(&p);
+    }
 
     /// A top-level sequence wrapping a single Command.
     fn seq_of(cmd: Command) -> Sequence {

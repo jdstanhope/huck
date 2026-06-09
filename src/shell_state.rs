@@ -111,6 +111,7 @@ pub struct ShellOptions {
     pub verbose: bool,
     pub xtrace: bool,
     pub noglob: bool,
+    pub noclobber: bool,
 }
 
 /// One row of the bash `shopt` option table.
@@ -422,8 +423,9 @@ impl Shell {
 
     /// Returns the value of `$-` — alphabetical concatenation of
     /// short-flag letters reflecting current shell-options state
-    /// and the interactive flag. Order: `e` (errexit), `i`
-    /// (interactive), `u` (nounset), `v` (verbose).
+    /// and the interactive flag. Order: `e` (errexit), `f` (noglob),
+    /// `i` (interactive), `u` (nounset), `v` (verbose), `x` (xtrace),
+    /// `C` (noclobber).
     pub fn dollar_dash_value(&self) -> String {
         let mut out = String::new();
         if self.shell_options.errexit { out.push('e'); }
@@ -432,6 +434,7 @@ impl Shell {
         if self.shell_options.nounset { out.push('u'); }
         if self.shell_options.verbose { out.push('v'); }
         if self.shell_options.xtrace { out.push('x'); }
+        if self.shell_options.noclobber { out.push('C'); }
         out
     }
 
@@ -1961,5 +1964,30 @@ mod shopt_tests {
         sh.shell_options.verbose = true;
         let d = sh.dollar_dash_value();
         assert!(d.find('u').unwrap() < d.find('v').unwrap(), "got {d:?}");
+    }
+
+    #[test]
+    fn dollar_dash_c_after_x() {
+        let mut sh = Shell::new();
+        sh.shell_options.xtrace = true;
+        sh.shell_options.noclobber = true;
+        let d = sh.dollar_dash_value();
+        let xi = d.find('x').expect("x present");
+        let ci = d.find('C').expect("C present");
+        assert!(ci > xi, "C must come after x in $-: got {d:?}");
+    }
+
+    #[test]
+    fn noclobber_off_by_default() {
+        let sh = Shell::new();
+        assert!(!sh.shell_options.noclobber);
+        assert!(!sh.dollar_dash_value().contains('C'));
+    }
+
+    #[test]
+    fn noclobber_shows_in_dollar_dash() {
+        let mut sh = Shell::new();
+        sh.shell_options.noclobber = true;
+        assert!(sh.dollar_dash_value().contains('C'));
     }
 }

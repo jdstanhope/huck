@@ -4312,6 +4312,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "verbose" => Some(shell.shell_options.verbose),
         "xtrace" => Some(shell.shell_options.xtrace),
         "noglob" => Some(shell.shell_options.noglob),
+        "noclobber" => Some(shell.shell_options.noclobber),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -4326,6 +4327,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "verbose" => { shell.shell_options.verbose = value; Ok(()) }
         "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
         "noglob" => { shell.shell_options.noglob = value; Ok(()) }
+        "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4422,6 +4424,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             // the long-form option name (matches bash).
             for &c in &arg.as_bytes()[1..] {
                 match c {
+                    b'C' => shell.shell_options.noclobber = true,
                     b'e' => shell.shell_options.errexit = true,
                     b'f' => shell.shell_options.noglob = true,
                     b'u' => shell.shell_options.nounset = true,
@@ -4465,6 +4468,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
         if arg.starts_with('+') && arg.len() >= 2 {
             for &c in &arg.as_bytes()[1..] {
                 match c {
+                    b'C' => shell.shell_options.noclobber = false,
                     b'e' => shell.shell_options.errexit = false,
                     b'f' => shell.shell_options.noglob = false,
                     b'u' => shell.shell_options.nounset = false,
@@ -10646,7 +10650,7 @@ mod set_options_tests {
     #[test]
     fn set_o_enable_unimplemented_says_not_supported() {
         let mut shell = Shell::new();
-        let (oc, _) = run(&["-o", "noclobber"], &mut shell);
+        let (oc, _) = run(&["-o", "allexport"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
     }
 
@@ -10655,6 +10659,29 @@ mod set_options_tests {
         let mut shell = Shell::new();
         let (oc, _) = run(&["-o", "nope_no_such_opt"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)));
+    }
+
+    #[test]
+    fn set_dash_c_enables_noclobber() {
+        let mut shell = Shell::new();
+        let _ = run(&["-C"], &mut shell);
+        assert!(shell.shell_options.noclobber);
+        assert_eq!(option_get(&shell, "noclobber"), Some(true));
+    }
+
+    #[test]
+    fn set_plus_c_disables_noclobber() {
+        let mut shell = Shell::new();
+        let _ = run(&["-C"], &mut shell);
+        let _ = run(&["+C"], &mut shell);
+        assert!(!shell.shell_options.noclobber);
+    }
+
+    #[test]
+    fn set_o_noclobber_enables() {
+        let mut shell = Shell::new();
+        let _ = run(&["-o", "noclobber"], &mut shell);
+        assert_eq!(option_get(&shell, "noclobber"), Some(true));
     }
 }
 

@@ -16,7 +16,7 @@ system `bash-completion` package.
 
 Actively developed, one coherent feature at a time. Current scope:
 
-- **~2,900 tests** (unit + integration) and **45 bash-diff harnesses**, all
+- **~2,900 tests** (unit + integration) and **46 bash-diff harnesses**, all
   green; `cargo clippy --all-targets` clean.
 - Sources `~/.bashrc`-class startup files and the system `bash-completion`
   framework without errors.
@@ -42,8 +42,9 @@ cargo test               # full test suite
 Simple commands and pipelines (`a | b`); lists with `;`, `&&`, `||`, and `&`
 (background, including backgrounding an and-or group and `&` as a list
 separator); grouping with `( … )` (subshell) and `{ …; }` (current shell);
-redirections `<`, `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, fd duplication (`2>&1`,
-`1>&2`), here-documents (`<<`, `<<-`), and here-strings (`<<<`); redirections on
+redirections `<`, `>`, `>>`, `>|` (force-clobber), `2>`, `2>>`, `&>`, `&>>`,
+fd duplication (`2>&1`, `1>&2`), here-documents (`<<`, `<<-`), and
+here-strings (`<<<`); redirections on
 compound commands (`while …; done > file`). Comments (`#`), line continuation
 (`\`), and multi-line input (an open quote/expansion/compound/operator carries
 onto a `>` continuation prompt).
@@ -95,7 +96,7 @@ drives the system `bash-completion` framework.
 **Builtins & options**
 `cd`, `pwd`, `echo`, `printf` (incl. `%q`), `read`, `test`/`[`, `[[`, `export`,
 `readonly`, `local`, `declare`/`typeset`, `unset`, `set` (`-e`/`-u`/`-x`/`-f`/
-`-o`/`-o pipefail`/`set --`/`shift`), `shopt`, `getopts`, `eval`, `command`,
+`-o`/`-o pipefail`/`-C`/`-o noclobber`/`set --`/`shift`), `shopt`, `getopts`, `eval`, `command`,
 `hash`, `trap` (EXIT/ERR/DEBUG/RETURN + signals), `alias`/`unalias`, `jobs`,
 `fg`, `bg`, `wait`, `kill`, `disown`, `history`, `break`, `continue`, `return`,
 `exit`, `complete`/`compgen`/`compopt`.
@@ -107,11 +108,11 @@ huck targets byte-identical behavior; remaining differences are tracked in
 exhaustive list, tiered by severity). In summary:
 
 **Not yet implemented** (parity backlog — bash accepts these, huck doesn't yet):
-- Redirections: `>|` (noclobber override), `n<>file` (read-write open), `|&`
+- Redirections: `n<>file` (read-write open), `|&`
   (pipe stdout+stderr shorthand); process substitution `<(…)` / `>(…)`.
 - Array I/O: `mapfile`/`readarray`, `read -a`/`-A`; array/attribute transforms
   `${v@A}` / `@K` / `@k` / `@a`; prefix-name `${!prefix@}` / `${!prefix*}`.
-- Some `set`/`declare` modes: `set -n` (noexec), `-C` (noclobber), `-b`, `-h`,
+- Some `set`/`declare` modes: `set -n` (noexec), `-b`, `-h`,
   job-control `monitor`; `declare -l`/`-u`/`-n` (lowercase/uppercase/nameref);
   integer/exported arrays.
 - Misc: `$"…"` locale quoting, `cd -P`/`-L`, `pwd -P`/`-L`, `FUNCNAME`,

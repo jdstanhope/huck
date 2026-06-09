@@ -99,6 +99,8 @@ pub enum Operator {
     DupErr,         // 2>&
     AndRedirOut,    // &>
     AndRedirAppend, // &>>
+    RedirClobber,   // >|
+    RedirErrClobber, // 2>|
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -680,6 +682,9 @@ pub fn tokenize_partial(
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::DupOut));
+                } else if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::RedirClobber));
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
@@ -694,6 +699,9 @@ pub fn tokenize_partial(
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::DupOut));
+                } else if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::RedirClobber));
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
@@ -708,6 +716,9 @@ pub fn tokenize_partial(
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::DupErr));
+                } else if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Op(Operator::RedirErrClobber));
                 } else {
                     tokens.push(Token::Op(Operator::RedirErr));
                 }
@@ -5878,6 +5889,37 @@ mod tests {
     fn tokenize_background_regression() {
         assert_eq!(tokenize("&").unwrap(), vec![Token::Op(Operator::Background)]);
         assert_eq!(tokenize("&&").unwrap(), vec![Token::Op(Operator::And)]);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // >| clobber redirect tests (v123)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lex_clobber_stdout() {
+        assert_eq!(tokenize(">|").unwrap(), vec![Token::Op(Operator::RedirClobber)]);
+        assert_eq!(tokenize("1>|").unwrap(), vec![Token::Op(Operator::RedirClobber)]);
+    }
+
+    #[test]
+    fn lex_clobber_stderr() {
+        assert_eq!(tokenize("2>|").unwrap(), vec![Token::Op(Operator::RedirErrClobber)]);
+    }
+
+    #[test]
+    fn lex_clobber_with_target() {
+        assert_eq!(
+            tokenize("cmd >|f").unwrap(),
+            vec![w("cmd"), Token::Op(Operator::RedirClobber), w("f")]
+        );
+    }
+
+    #[test]
+    fn lex_redir_then_pipe_unaffected() {
+        assert_eq!(
+            tokenize("> |").unwrap(),
+            vec![Token::Op(Operator::RedirOut), Token::Op(Operator::Pipe)]
+        );
     }
 
     // ──────────────────────────────────────────────────────────────
