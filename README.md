@@ -16,7 +16,7 @@ system `bash-completion` package.
 
 Actively developed, one coherent feature at a time. Current scope:
 
-- **~2,900 tests** (unit + integration) and **47 bash-diff harnesses**, all
+- **~2,900 tests** (unit + integration) and **48 bash-diff harnesses**, all
   green; `cargo clippy --all-targets` clean.
 - Sources `~/.bashrc`-class startup files and the system `bash-completion`
   framework without errors.

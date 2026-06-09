@@ -27,7 +27,7 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-117). |
+| Bugs (Tier 1) | 1 | Open bug to fix (M-114). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
@@ -46,13 +46,6 @@ huck behaves wrong without a design reason; should be fixed.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
 
-### M-117: redirections on a function-call command are ignored
-- **Status**: `[deferred]` (found v124 — the real cause of `nvm ls`'s `→ ∞`)
-- **Severity**: high (silently wrong redirection for a very common idiom)
-- **huck**: a redirect attached to a *function-call* command — `func >file`, `func 2>&1`, `func >&2` — is NOT applied to the function body. `run_exec_single`'s function branch (`src/executor.rs:~2844`) calls `call_function(…, sink)` without applying `cmd.stdout`/`cmd.stderr`, so the body runs with the shell's own fds. E.g. `f(){ printf '%s\n' BODY; }; f >/tmp/x` leaves `/tmp/x` empty and prints `BODY` to the terminal.
-- **bash**: applies the redirect for the duration of the function body (`f >/tmp/x` writes `BODY` to the file).
-- **Impact**: nvm's `nvm_err(){ >&2 nvm_echo "$@"; }` writes "Alias does not exist." to STDOUT (not fd 2), so `nvm_resolve_alias`'s `$( … 2>/dev/null )` captures it → false alias-cycle → every alias prints `→ ∞` instead of the real version. v124 fixed `>&N` on *builtins* (`echo X >&2`) and the interactive subshell hang, but not this function-call case.
-- **Next**: apply redirects around in-process function-body execution (save fds / dup2 / restore, like the builtin redirect path; honor the Capture-vs-Terminal stdout sink). Own iteration (v125).
 
 ---
 
@@ -342,7 +335,7 @@ than silently producing invalid UTF-8.
 
 - **Status**: `[intentional]`, low (noted v109)
 - **Severity**: low
-- **huck**: a builtin's `2>&1` inside a CAPTURE context (`r=$(declare -p X 2>&1)`) does not capture the builtin's stderr. The M-90 redirect guard dup2's the dup-target onto the real fd 2, but a Capture sink writes the builtin's stdout to a Rust buffer (not real fd 1), so fd-level `2>&1` can't reach it. The file/pipe cases (`2>file`, `2>&1 | cmd`) work.
+- **huck**: a builtin's `2>&1` inside a CAPTURE context (`r=$(declare -p X 2>&1)`) does not capture the builtin's stderr. The M-90 redirect guard dup2's the dup-target onto the real fd 2, but a Capture sink writes the builtin's stdout to a Rust buffer (not real fd 1), so fd-level `2>&1` can't reach it. The file/pipe cases (`2>file`, `2>&1 | cmd`) work. Also applies to a function-call's `2>&1` under capture (`r=$(func 2>&1)`) — same in-memory-buffer cause; v125's function-call redirects fixed the divert/suppress directions but not capture-of-stderr.
 - **bash**: the builtin's stderr is merged into the captured stdout.
 - **Why intentional**: capturing a builtin's stdout via a Rust buffer (rather than a real fd 1) is the design that makes `$(builtin …)` work without forking; a real `dup2(1,2)` has no in-buffer fd 1 to target. The file/pipe redirect cases (the common ones) are correct.
 - **Workaround**: redirect the builtin's stderr to a file and read the file, or run the builtin in a forked subshell.
