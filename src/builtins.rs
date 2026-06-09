@@ -4311,6 +4311,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "pipefail" => Some(shell.shell_options.pipefail),
         "verbose" => Some(shell.shell_options.verbose),
         "xtrace" => Some(shell.shell_options.xtrace),
+        "noglob" => Some(shell.shell_options.noglob),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -4323,6 +4324,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
         "verbose" => { shell.shell_options.verbose = value; Ok(()) }
         "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
+        "noglob" => { shell.shell_options.noglob = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4420,6 +4422,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             for &c in &arg.as_bytes()[1..] {
                 match c {
                     b'e' => shell.shell_options.errexit = true,
+                    b'f' => shell.shell_options.noglob = true,
                     b'u' => shell.shell_options.nounset = true,
                     b'v' => shell.shell_options.verbose = true,
                     b'x' => shell.shell_options.xtrace = true,
@@ -4462,6 +4465,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             for &c in &arg.as_bytes()[1..] {
                 match c {
                     b'e' => shell.shell_options.errexit = false,
+                    b'f' => shell.shell_options.noglob = false,
                     b'u' => shell.shell_options.nounset = false,
                     b'v' => shell.shell_options.verbose = false,
                     b'x' => shell.shell_options.xtrace = false,
