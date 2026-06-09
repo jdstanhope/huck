@@ -280,6 +280,13 @@ pub struct Shell {
     /// (that deadlocks on a controlling terminal — M-104).
     pub in_subshell: bool,
 
+    /// Set for the dynamic extent of a completion-function invocation
+    /// (`call_completion_function`). Suppresses interactive job control for the
+    /// completer's subprocesses/pipelines so they don't `setpgid` / hand the
+    /// controlling terminal to a new process group mid-line-edit (that wedges
+    /// the shell — M-116). bash runs completion functions without job control.
+    pub in_completion: bool,
+
     /// Persistent shell-option flags toggled by `set -e`/`-u`/`-o NAME`.
     /// See `ShellOptions` for the field list.
     pub shell_options: ShellOptions,
@@ -387,6 +394,7 @@ impl Shell {
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             in_subshell: false,
+            in_completion: false,
             shell_options: ShellOptions::default(),
             shopt_options: ShoptOptions::default(),
             traps: std::collections::HashMap::new(),

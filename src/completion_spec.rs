@@ -291,7 +291,14 @@ fn call_completion_function(
 
     // 5. Invoke. Exit/Continue/Return all treated as "function finished"
     //    — see header comment about the rustyline-propagation divergence.
+    // Run the completer WITHOUT job control: a completer's external commands /
+    // pipelines must not setpgid / hand off the controlling terminal while huck
+    // is mid-line-edit (that deadlocks — M-116). bash runs completion functions
+    // without job control.
+    let saved_in_completion = shell.in_completion;
+    shell.in_completion = true;
     let _outcome = crate::executor::call_function_body(func_name, pos_args, shell);
+    shell.in_completion = saved_in_completion;
 
     // 6. Read COMPREPLY (values in index order).
     let reply_values: Vec<String> = match shell.get_array("COMPREPLY") {
