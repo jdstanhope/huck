@@ -110,6 +110,7 @@ pub struct ShellOptions {
     pub pipefail: bool,
     pub verbose: bool,
     pub xtrace: bool,
+    pub noglob: bool,
 }
 
 /// One row of the bash `shopt` option table.
@@ -418,6 +419,7 @@ impl Shell {
     pub fn dollar_dash_value(&self) -> String {
         let mut out = String::new();
         if self.shell_options.errexit { out.push('e'); }
+        if self.shell_options.noglob { out.push('f'); }
         if self.is_interactive { out.push('i'); }
         if self.shell_options.nounset { out.push('u'); }
         if self.shell_options.verbose { out.push('v'); }
@@ -433,6 +435,7 @@ impl Shell {
             nocaseglob: self.shopt_options.get("nocaseglob").unwrap_or(false),
             failglob: self.shopt_options.get("failglob").unwrap_or(false),
             extglob: self.shopt_options.get("extglob").unwrap_or(false),
+            noglob: self.shell_options.noglob,
         }
     }
 

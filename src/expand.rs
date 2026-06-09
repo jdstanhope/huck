@@ -13,6 +13,7 @@ pub struct GlobOpts {
     pub nocaseglob: bool,
     pub failglob: bool,
     pub extglob: bool,
+    pub noglob: bool,
 }
 
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
@@ -1405,6 +1406,10 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
     let mut words = Vec::new();
     let mut failglob_unmatched = Vec::new();
     for field in fields {
+        if opts.noglob {
+            words.push(field.chars);
+            continue;
+        }
         let pattern = build_glob_pattern(&field);
         // Route POSIX-class patterns through the own-matcher too (the glob
         // crate lacks [:name:]); unconditional on the extglob shopt.

@@ -2261,6 +2261,7 @@ enum ConvChar {
     BigX,
     C,
     B,
+    Q,
     Percent,
 }
 
@@ -2430,6 +2431,7 @@ fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
             b'X' => ConvChar::BigX,
             b'c' => ConvChar::C,
             b'b' => ConvChar::B,
+            b'q' => ConvChar::Q,
             b'%' => ConvChar::Percent,
             c => return Err(format!("`%{}': invalid directive", c as char)),
         };
@@ -2511,6 +2513,30 @@ fn parse_printf_int(s: &str) -> (i64, Option<String>) {
     (sign.saturating_mul(parsed), err)
 }
 
+/// bash `printf %q`: quote `arg` so it re-reads as the same word. Empty → `''`;
+/// a control char → the `$'…'` ANSI-C form; otherwise backslash-escape each
+/// shell-special char. `~` and `#` are special ONLY as the leading char
+/// (tilde-expansion / comment); everything else in the set is special at any
+/// position. Letters, digits, `%+-./:=@_`, and printable UTF-8 are emitted
+/// as-is.
+fn printf_q(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.chars().any(|c| c.is_control()) {
+        return crate::param_expansion::ansi_c_quote(arg);
+    }
+    const ALWAYS: &str = " !\"$&'()*,;<>?[\\]^`{|}";
+    let mut out = String::with_capacity(arg.len());
+    for (i, c) in arg.chars().enumerate() {
+        if ALWAYS.contains(c) || (i == 0 && (c == '#' || c == '~')) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Formats a single conv-spec + arg into `out`. Returns Ok(true) for
 /// normal completion, Ok(false) if `\c` halted output (only possible
 /// for `%b`), Err for an invalid integer arg (caller logs + sets
@@ -2588,6 +2614,10 @@ fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, Str
     match spec.conv {
         ConvChar::S => {
             out.extend_from_slice(&pad_string(arg.as_bytes(), spec));
+            Ok(true)
+        }
+        ConvChar::Q => {
+            out.extend_from_slice(&pad_string(printf_q(arg).as_bytes(), spec));
             Ok(true)
         }
         ConvChar::C => {
@@ -4281,11 +4311,13 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "pipefail" => Some(shell.shell_options.pipefail),
         "verbose" => Some(shell.shell_options.verbose),
         "xtrace" => Some(shell.shell_options.xtrace),
+        "noglob" => Some(shell.shell_options.noglob),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
 
-/// Writes a `set -o` option. Only the 3 implemented options are settable.
+/// Writes a `set -o` option. Only the behaviorally-implemented options are
+/// settable; the rest of `SETO_TABLE` is inert (`Unimplemented`).
 fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetErr> {
     match name {
         "errexit" => { shell.shell_options.errexit = value; Ok(()) }
@@ -4293,6 +4325,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "pipefail" => { shell.shell_options.pipefail = value; Ok(()) }
         "verbose" => { shell.shell_options.verbose = value; Ok(()) }
         "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
+        "noglob" => { shell.shell_options.noglob = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4390,6 +4423,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             for &c in &arg.as_bytes()[1..] {
                 match c {
                     b'e' => shell.shell_options.errexit = true,
+                    b'f' => shell.shell_options.noglob = true,
                     b'u' => shell.shell_options.nounset = true,
                     b'v' => shell.shell_options.verbose = true,
                     b'x' => shell.shell_options.xtrace = true,
@@ -4432,6 +4466,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             for &c in &arg.as_bytes()[1..] {
                 match c {
                     b'e' => shell.shell_options.errexit = false,
+                    b'f' => shell.shell_options.noglob = false,
                     b'u' => shell.shell_options.nounset = false,
                     b'v' => shell.shell_options.verbose = false,
                     b'x' => shell.shell_options.xtrace = false,
@@ -6432,6 +6467,26 @@ fn builtin_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printf_q_quoting() {
+        assert_eq!(printf_q("plain"), "plain");
+        assert_eq!(printf_q("a b"), "a\\ b");
+        assert_eq!(printf_q("c'd"), "c\\'d");
+        assert_eq!(printf_q("a$b"), "a\\$b");
+        assert_eq!(printf_q("x\"y"), "x\\\"y");
+        assert_eq!(printf_q("*"), "\\*");
+        assert_eq!(printf_q(""), "''");
+        assert_eq!(printf_q("p/q-r.s"), "p/q-r.s"); // /,-,. not escaped
+        assert_eq!(printf_q("a\tb"), "$'a\\tb'");    // control -> $'...'
+        assert_eq!(printf_q("ünï"), "ünï");          // UTF-8 as-is
+        assert_eq!(printf_q("~a"), "\\~a");   // leading ~ escaped
+        assert_eq!(printf_q("a~"), "a~");      // trailing ~ not escaped
+        assert_eq!(printf_q("b~c"), "b~c");    // mid ~ not escaped
+        assert_eq!(printf_q("#a"), "\\#a");   // leading # escaped
+        assert_eq!(printf_q("a#"), "a#");      // trailing # not escaped
+        assert_eq!(printf_q("a$b"), "a\\$b");  // $ special at any position
+    }
 
     #[test]
     fn seto_option_names_includes_errexit_in_table_order() {
