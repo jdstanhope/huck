@@ -490,7 +490,7 @@ fn run_redirected(
             }
             // `<&N` on a compound is out of scope; only `<file`/heredoc/
             // here-string reach the stdin slot from the parser.
-            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Dup { .. } => {
+            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_) | Redirect::Dup { .. } => {
                 eprintln!("huck: unsupported stdin redirect on compound");
                 return ExecOutcome::Continue(1);
             }
@@ -553,7 +553,7 @@ fn apply_out_redirect(
 ) -> Result<(), ExecOutcome> {
     use std::os::unix::io::IntoRawFd;
     match r {
-        Redirect::Truncate(word) | Redirect::Append(word) => {
+        Redirect::Truncate(word) | Redirect::Append(word) | Redirect::Clobber(word) => {
             let path = match expand_single(word, shell) {
                 Ok(p) => p,
                 Err(()) => return Err(ExecOutcome::Continue(1)),
@@ -561,6 +561,8 @@ fn apply_out_redirect(
             let resolved = if matches!(r, Redirect::Append(_)) {
                 ResolvedRedirect::Append(path)
             } else {
+                // Clobber behaves as plain truncate until noclobber enforcement
+                // is added in a later task.
                 ResolvedRedirect::Truncate(path)
             };
             let file = match open_resolved(&resolved) {
@@ -2142,8 +2144,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             Some(ResolvedStdin::Heredoc(body.clone()))
         }
         Some(Redirect::HereString(w)) => Some(ResolvedStdin::HereString(w.clone())),
-        Some(Redirect::Truncate(_) | Redirect::Append(_)) => {
-            unreachable!("parser never produces Truncate/Append for stdin")
+        Some(Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_)) => {
+            unreachable!("parser never produces Truncate/Append/Clobber for stdin")
         }
         Some(Redirect::Dup { .. }) => unreachable!(
             "Redirect::Dup on stdin (<&n) is out of scope for v29"
@@ -2151,7 +2153,9 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         None => None,
     };
     let stdout = match &cmd.stdout {
-        Some(Redirect::Truncate(w)) => {
+        Some(Redirect::Truncate(w) | Redirect::Clobber(w)) => {
+            // Clobber behaves as plain truncate until noclobber enforcement
+            // is added in a later task.
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
                 return Err(status);
@@ -2176,7 +2180,9 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         None => None,
     };
     let stderr = match &cmd.stderr {
-        Some(Redirect::Truncate(w)) => {
+        Some(Redirect::Truncate(w) | Redirect::Clobber(w)) => {
+            // Clobber behaves as plain truncate until noclobber enforcement
+            // is added in a later task.
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
                 return Err(status);
