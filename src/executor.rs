@@ -2894,7 +2894,7 @@ fn run_subprocess(
     stdout_dup_target: Option<i32>,
     stderr_dup_target: Option<i32>,
 ) -> ExecOutcome {
-    let interactive = matches!(sink, StdoutSink::Terminal);
+    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_completion;
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
@@ -3122,7 +3122,7 @@ fn run_multi_stage(
     // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
     // controlling terminal (M-104). A subshell's inner pipeline uses the
     // non-job-control path (stages stay in the subshell's pgrp), matching bash.
-    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_subshell;
+    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
     let n = commands.len();
 
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
