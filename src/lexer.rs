@@ -99,7 +99,7 @@ pub enum Operator {
     DupErr,         // 2>&
     AndRedirOut,    // &>
     AndRedirAppend, // &>>
-    RedirClobber,    // >|
+    RedirClobber,   // >|
     RedirErrClobber, // 2>|
 }
 
