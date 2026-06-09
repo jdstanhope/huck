@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 1 | Open bug to fix (M-114). |
-| Missing features (Tier 2) | 25 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 24 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -74,7 +74,6 @@ group.
 ### Redirects
 
 - **M-20: `n<>file` read-write open** — `[deferred]` low. huck: not implemented. bash: opens fd for read+write.
-- **M-21: `>|` and `noclobber`** — `[deferred]` low. huck: no `set -o noclobber`, no `>|`. bash: `noclobber` blocks overwriting; `>|` forces.
 - **M-51: `|&` pipe stdout+stderr** — `[deferred]` low. huck: parse error. bash: shorthand for `2>&1 |`.
 
 ### Quoting
