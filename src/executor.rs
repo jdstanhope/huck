@@ -2966,7 +2966,14 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         drop(stderr_guard);
         outcome
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
-        call_function(&resolved.program.clone(), body, resolved.args, shell, sink)
+        let name = resolved.program.clone();
+        let args = resolved.args;
+        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+                move |shell, inner_sink| call_function(&name, body, args, shell, inner_sink))
+        } else {
+            call_function(&name, body, args, shell, sink)
+        }
     } else if builtins::is_builtin(&resolved.program) {
         let mut files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
