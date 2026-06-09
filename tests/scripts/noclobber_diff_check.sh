@@ -3,6 +3,7 @@
 # (M-21). File-arg execution. The noclobber *error message* prefix differs
 # (huck: vs bash: line N:), so blocking cases suppress stderr and assert
 # rc + file content; the error text is checked in the Rust integration test.
+# (file-arg execution avoids huck's history-expansion-on-piped-stdin divergence, L-27.)
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }

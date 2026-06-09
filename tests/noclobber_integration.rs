@@ -12,8 +12,8 @@ fn run_huck_frag(frag: &str) -> (String, String, i32) {
     let path = std::env::temp_dir()
         .join(format!("huck_v123_{}_{}.sh", std::process::id(), n));
     {
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(frag.as_bytes()).unwrap();
+        let mut f = std::fs::File::create(&path).expect("create temp script");
+        f.write_all(frag.as_bytes()).expect("write temp script");
     }
     let out = Command::new(env!("CARGO_BIN_EXE_huck"))
         .arg(&path)
@@ -49,8 +49,9 @@ fn force_clobber_overwrites() {
 
 #[test]
 fn devnull_exempt_under_noclobber() {
-    let (_o, _e, code) = run_huck_frag(r#"set -C; echo x > /dev/null; echo done"#);
+    let (out, _e, code) = run_huck_frag(r#"set -C; echo x > /dev/null; echo done"#);
     assert_eq!(code, 0);
+    assert!(out.contains("done"), "command after /dev/null redirect must run: {out}");
 }
 
 #[test]
