@@ -303,6 +303,9 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
         Command::Subshell { .. } => {
+            let interactive = matches!(sink, StdoutSink::Terminal)
+                && !shell.in_subshell
+                && !shell.in_completion;
             // Determine stdout fd for the child.  For Terminal (the common
             // case) we pass STDOUT_FILENO directly.  For Capture we create a
             // pipe so the parent can read the child's output back into the
@@ -356,22 +359,70 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 // f is dropped here, closing r.
             }
 
-            // Wait for the child.
-            let mut raw_status: libc::c_int = 0;
-            let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
-            if r < 0 {
-                return ExecOutcome::Continue(1);
-            }
-            let code = if libc::WIFEXITED(raw_status) {
-                libc::WEXITSTATUS(raw_status)
-            } else if libc::WIFSIGNALED(raw_status) {
-                128 + libc::WTERMSIG(raw_status)
+            if interactive {
+                // Foreground subshell: make it a job that owns the terminal,
+                // mirroring the single-command/pipeline dance. Without this the
+                // subshell runs in a background pgroup and deadlocks on tty I/O.
+                unsafe {
+                    if libc::setpgid(pid, pid) != 0 {
+                        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        debug_assert!(
+                            errno == libc::ESRCH || errno == libc::EACCES,
+                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+                        );
+                    }
+                }
+                give_terminal_to(pid);
+                let outcome = match wait_with_untraced(pid) {
+                    Ok((raw_status, true)) => {
+                        let sig = libc::WSTOPSIG(raw_status);
+                        let job_id = shell.jobs.add(pid, vec![pid], "( subshell )".to_string());
+                        for job in shell.jobs.jobs_mut() {
+                            if job.id == job_id {
+                                job.state = crate::jobs::JobState::Stopped(sig);
+                                job.notified = true;
+                                break;
+                            }
+                        }
+                        let line = shell.jobs.iter()
+                            .find(|j| j.id == job_id)
+                            .map(|j| crate::jobs::notification_line(j, '+'))
+                            .unwrap_or_default();
+                        eprintln!("\n{line}");
+                        128 + sig
+                    }
+                    Ok((raw_status, false)) => {
+                        if libc::WIFEXITED(raw_status) {
+                            libc::WEXITSTATUS(raw_status)
+                        } else if libc::WIFSIGNALED(raw_status) {
+                            128 + libc::WTERMSIG(raw_status)
+                        } else {
+                            1
+                        }
+                    }
+                    Err(()) => 1,
+                };
+                give_terminal_to(shell.shell_pgid);
+                shell.set_pipestatus(&[outcome]);
+                ExecOutcome::Continue(outcome)
             } else {
-                1
-            };
-            // A subshell is one forked unit → 1-element PIPESTATUS.
-            shell.set_pipestatus(&[code]);
-            ExecOutcome::Continue(code)
+                // Non-interactive (script), capture (`$( ( … ) )`), nested
+                // subshell, or completion: plain reap, no terminal handoff.
+                let mut raw_status: libc::c_int = 0;
+                let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+                if r < 0 {
+                    return ExecOutcome::Continue(1);
+                }
+                let code = if libc::WIFEXITED(raw_status) {
+                    libc::WEXITSTATUS(raw_status)
+                } else if libc::WIFSIGNALED(raw_status) {
+                    128 + libc::WTERMSIG(raw_status)
+                } else {
+                    1
+                };
+                shell.set_pipestatus(&[code]);
+                ExecOutcome::Continue(code)
+            }
         }
         Command::FunctionDef { name, body } => {
             shell.functions.insert(name.clone(), body.clone());
@@ -3028,7 +3079,8 @@ fn run_subprocess(
     stdout_dup_target: Option<i32>,
     stderr_dup_target: Option<i32>,
 ) -> ExecOutcome {
-    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_completion;
+    let interactive =
+        matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
