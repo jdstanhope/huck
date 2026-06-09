@@ -363,6 +363,9 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 // Foreground subshell: make it a job that owns the terminal,
                 // mirroring the single-command/pipeline dance. Without this the
                 // subshell runs in a background pgroup and deadlocks on tty I/O.
+                // (fork_and_run_in_subshell already race-closes setpgid in the
+                // parent; this is belt-and-suspenders to guarantee the pgrp
+                // exists before give_terminal_to, mirroring the pipeline path.)
                 unsafe {
                     if libc::setpgid(pid, pid) != 0 {
                         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
