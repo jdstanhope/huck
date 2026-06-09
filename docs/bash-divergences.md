@@ -27,10 +27,10 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 1 | Open bug to fix (M-114). |
+| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-117). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 24 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -45,6 +45,14 @@ huck behaves wrong without a design reason; should be fixed.
 - **bash**: treats `x=(…)` specially even as an argument and does not error.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
+
+### M-117: redirections on a function-call command are ignored
+- **Status**: `[deferred]` (found v124 — the real cause of `nvm ls`'s `→ ∞`)
+- **Severity**: high (silently wrong redirection for a very common idiom)
+- **huck**: a redirect attached to a *function-call* command — `func >file`, `func 2>&1`, `func >&2` — is NOT applied to the function body. `run_exec_single`'s function branch (`src/executor.rs:~2844`) calls `call_function(…, sink)` without applying `cmd.stdout`/`cmd.stderr`, so the body runs with the shell's own fds. E.g. `f(){ printf '%s\n' BODY; }; f >/tmp/x` leaves `/tmp/x` empty and prints `BODY` to the terminal.
+- **bash**: applies the redirect for the duration of the function body (`f >/tmp/x` writes `BODY` to the file).
+- **Impact**: nvm's `nvm_err(){ >&2 nvm_echo "$@"; }` writes "Alias does not exist." to STDOUT (not fd 2), so `nvm_resolve_alias`'s `$( … 2>/dev/null )` captures it → false alias-cycle → every alias prints `→ ∞` instead of the real version. v124 fixed `>&N` on *builtins* (`echo X >&2`) and the interactive subshell hang, but not this function-call case.
+- **Next**: apply redirects around in-process function-body execution (save fds / dup2 / restore, like the builtin redirect path; honor the Capture-vs-Terminal stdout sink). Own iteration (v125).
 
 ---
 
@@ -192,6 +200,7 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-05**: `[N] PID` spawn notification shows only the last pipeline stage's PID; bash shows all.
 - **L-06**: `jobs` column width is fixed at 24; bash uses terminal width.
 - **L-07**: `wait` polls (50ms) rather than blocking — small latency / minor CPU usage.
+- **L-28: job-control notifications for `&` jobs started inside a running function** — `[low]` (found v124). huck prints `[N] pid` start lines and `[N] Done … &` completion lines for background (`&`) jobs that a FUNCTION spawns while it runs (e.g. nvm's `nvm_print_alias_path &`), cluttering output. bash suppresses job-change notifications while a function/compound command is executing, reporting them (if at all) only at the next interactive prompt. Surfaced by `nvm ls`, which backgrounds many helpers. Cosmetic; job results are correct.
 - **L-27: history expansion runs on piped (non-interactive) stdin** — `[low]`. huck applies `!`-history expansion to commands read from piped stdin (`printf 'echo hi!there\n' | huck` → `huck: !there: event not found`), whereas bash disables history expansion when non-interactive (piped stdin or a script) and prints `hi!there`. huck's file-arg path (`huck script.sh`) and `source` are unaffected — they match bash. Root: the REPL/piped-stdin reader (`src/shell.rs` `read_logical_command`) runs the history scanner regardless of interactivity; bash gates `histexpand` on an interactive shell. Surfaced repeatedly while testing `[!…]`/`[^…]` glob fragments (which contain `!`) via piped stdin; the v116 bracket-negation harness and integration tests run fragments as file-args to avoid it. Low impact: interactive use and scripts/`source` (the common paths) are correct; only literal piped-to-stdin command streams containing `!` diverge.
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)

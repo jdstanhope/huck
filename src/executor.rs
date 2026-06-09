@@ -303,6 +303,9 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
         Command::Subshell { .. } => {
+            let interactive = matches!(sink, StdoutSink::Terminal)
+                && !shell.in_subshell
+                && !shell.in_completion;
             // Determine stdout fd for the child.  For Terminal (the common
             // case) we pass STDOUT_FILENO directly.  For Capture we create a
             // pipe so the parent can read the child's output back into the
@@ -356,22 +359,73 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 // f is dropped here, closing r.
             }
 
-            // Wait for the child.
-            let mut raw_status: libc::c_int = 0;
-            let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
-            if r < 0 {
-                return ExecOutcome::Continue(1);
-            }
-            let code = if libc::WIFEXITED(raw_status) {
-                libc::WEXITSTATUS(raw_status)
-            } else if libc::WIFSIGNALED(raw_status) {
-                128 + libc::WTERMSIG(raw_status)
+            if interactive {
+                // Foreground subshell: make it a job that owns the terminal,
+                // mirroring the single-command/pipeline dance. Without this the
+                // subshell runs in a background pgroup and deadlocks on tty I/O.
+                // (fork_and_run_in_subshell already race-closes setpgid in the
+                // parent; this is belt-and-suspenders to guarantee the pgrp
+                // exists before give_terminal_to, mirroring the pipeline path.)
+                unsafe {
+                    if libc::setpgid(pid, pid) != 0 {
+                        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        debug_assert!(
+                            errno == libc::ESRCH || errno == libc::EACCES,
+                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+                        );
+                    }
+                }
+                give_terminal_to(pid);
+                let outcome = match wait_with_untraced(pid) {
+                    Ok((raw_status, true)) => {
+                        let sig = libc::WSTOPSIG(raw_status);
+                        let job_id = shell.jobs.add(pid, vec![pid], "( subshell )".to_string());
+                        for job in shell.jobs.jobs_mut() {
+                            if job.id == job_id {
+                                job.state = crate::jobs::JobState::Stopped(sig);
+                                job.notified = true;
+                                break;
+                            }
+                        }
+                        let line = shell.jobs.iter()
+                            .find(|j| j.id == job_id)
+                            .map(|j| crate::jobs::notification_line(j, '+'))
+                            .unwrap_or_default();
+                        eprintln!("\n{line}");
+                        128 + sig
+                    }
+                    Ok((raw_status, false)) => {
+                        if libc::WIFEXITED(raw_status) {
+                            libc::WEXITSTATUS(raw_status)
+                        } else if libc::WIFSIGNALED(raw_status) {
+                            128 + libc::WTERMSIG(raw_status)
+                        } else {
+                            1
+                        }
+                    }
+                    Err(()) => 1,
+                };
+                give_terminal_to(shell.shell_pgid);
+                shell.set_pipestatus(&[outcome]);
+                ExecOutcome::Continue(outcome)
             } else {
-                1
-            };
-            // A subshell is one forked unit → 1-element PIPESTATUS.
-            shell.set_pipestatus(&[code]);
-            ExecOutcome::Continue(code)
+                // Non-interactive (script), capture (`$( ( … ) )`), nested
+                // subshell, or completion: plain reap, no terminal handoff.
+                let mut raw_status: libc::c_int = 0;
+                let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+                if r < 0 {
+                    return ExecOutcome::Continue(1);
+                }
+                let code = if libc::WIFEXITED(raw_status) {
+                    libc::WEXITSTATUS(raw_status)
+                } else if libc::WIFSIGNALED(raw_status) {
+                    128 + libc::WTERMSIG(raw_status)
+                } else {
+                    1
+                };
+                shell.set_pipestatus(&[code]);
+                ExecOutcome::Continue(code)
+            }
         }
         Command::FunctionDef { name, body } => {
             shell.functions.insert(name.clone(), body.clone());
@@ -2378,6 +2432,44 @@ fn prepare_builtin_stderr(stderr: Option<File>, dup_target: Option<RawFd>) -> Op
     }
 }
 
+/// For an in-process builtin whose stdout has a `>&N` (`Redirect::Dup`)
+/// redirect, returns the `File` the builtin should write to:
+///
+///   - not a Dup, or `>&1` (source == 1)  -> `Ok(None)` (use the normal sink)
+///   - `>&-` (source expands to "-")        -> `Ok(Some(/dev/null))` (discard)
+///   - `>&N`, N != 1                         -> `Ok(Some(File))` dup'd from fd N
+///
+/// On a bad fd target, prints `huck: <err>` and returns `Err(())` (status 1),
+/// mirroring the external path's `resolve_fd_target` error handling.
+fn builtin_stdout_dup_file(cmd: &ExecCommand, shell: &mut Shell) -> Result<Option<File>, ()> {
+    let source = match &cmd.stdout {
+        Some(Redirect::Dup { source, .. }) => source,
+        _ => return Ok(None),
+    };
+    let expanded = expand_assignment(source, shell);
+    if expanded == "-" {
+        return match OpenOptions::new().write(true).open("/dev/null") {
+            Ok(f) => Ok(Some(f)),
+            Err(e) => { eprintln!("huck: /dev/null: {e}"); Err(()) }
+        };
+    }
+    let target = match resolve_fd_target(source, shell) {
+        Ok(fd) => fd,
+        Err(e) => { eprintln!("huck: {e}"); return Err(()); }
+    };
+    if target == 1 {
+        return Ok(None);
+    }
+    let dup_fd = unsafe { libc::dup(target) };
+    if dup_fd < 0 {
+        let e = io::Error::last_os_error();
+        eprintln!("huck: {target}: {e}");
+        return Err(());
+    }
+    use std::os::unix::io::FromRawFd;
+    Ok(Some(unsafe { File::from_raw_fd(dup_fd) }))
+}
+
 /// True when `cmd.stderr` is a `2>&1`-style dup whose source resolves to fd 1,
 /// so an in-process builtin's stderr should follow fd 1 for the call's
 /// duration. `2>&N` for other N is left to the subprocess path (rare on
@@ -2808,6 +2900,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
+        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
+        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
+        // to the 2>&1-on-builtin handling below).
+        if files.stdout.is_none() {
+            match builtin_stdout_dup_file(cmd, shell) {
+                Ok(f) => files.stdout = f,
+                Err(()) => return ExecOutcome::Continue(1),
+            }
+        }
         // `2>&1` on a builtin: follow wherever the builtin's stdout actually
         // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
         // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
@@ -2853,6 +2954,18 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 return ExecOutcome::Continue(1);
             }
         };
+        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
+        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
+        // to the 2>&1-on-builtin handling below).
+        if files.stdout.is_none() {
+            match builtin_stdout_dup_file(cmd, shell) {
+                Ok(f) => files.stdout = f,
+                Err(()) => {
+                    if !persistent { restore_inline_assignments(snap, shell); }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
         // Apply stdin redirection in-process for builtins: builtins that read
         // from stdin (e.g. `read`) need `<<<`, `<<`, and `<file` to actually
         // affect the fd they read from. Save+dup2 around the call.
@@ -2969,7 +3082,8 @@ fn run_subprocess(
     stdout_dup_target: Option<i32>,
     stderr_dup_target: Option<i32>,
 ) -> ExecOutcome {
-    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_completion;
+    let interactive =
+        matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
