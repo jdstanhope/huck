@@ -334,7 +334,9 @@ pub(crate) fn expand_word_to_string(word: &Word, shell: &mut Shell) -> String {
 /// else the `glob` crate (preserving current behavior). `case_sensitive` mirrors
 /// the existing `MatchOptions`.
 fn pe_pattern_matches(pattern: &str, text: &str, extglob: bool, case_sensitive: bool) -> bool {
-    if extglob && crate::glob_match::has_extglob(pattern) {
+    if (extglob && crate::glob_match::has_extglob(pattern))
+        || crate::glob_match::has_posix_class(pattern)
+    {
         crate::glob_match::extglob_match(pattern, text, !case_sensitive)
     } else {
         let pattern = crate::glob_match::translate_bracket_negation(pattern);

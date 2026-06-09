@@ -1406,7 +1406,10 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
     let mut failglob_unmatched = Vec::new();
     for field in fields {
         let pattern = build_glob_pattern(&field);
-        let is_extglob = opts.extglob && crate::glob_match::has_extglob(&pattern);
+        // Route POSIX-class patterns through the own-matcher too (the glob
+        // crate lacks [:name:]); unconditional on the extglob shopt.
+        let is_extglob = (opts.extglob && crate::glob_match::has_extglob(&pattern))
+            || crate::glob_match::has_posix_class(&pattern);
 
         // No globbing needed: not a wildcard field AND not an extglob field.
         if !has_unquoted_metachar(&field) && !is_extglob {

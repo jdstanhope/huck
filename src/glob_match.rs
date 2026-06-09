@@ -93,6 +93,75 @@ enum Item {
 enum ClassAtom {
     Ch(char),
     Range(char, char),
+    Posix(PosixClass),
+    Never, // unknown POSIX class name: matches nothing
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosixClass {
+    Alpha,
+    Digit,
+    Alnum,
+    Upper,
+    Lower,
+    Space,
+    Blank,
+    Punct,
+    Cntrl,
+    Graph,
+    Print,
+    Xdigit,
+}
+
+fn posix_class_from_name(name: &str) -> Option<PosixClass> {
+    use PosixClass::*;
+    Some(match name {
+        "alpha" => Alpha,
+        "digit" => Digit,
+        "alnum" => Alnum,
+        "upper" => Upper,
+        "lower" => Lower,
+        "xdigit" => Xdigit,
+        "punct" => Punct,
+        "cntrl" => Cntrl,
+        "graph" => Graph,
+        "space" => Space,
+        "blank" => Blank,
+        "print" => Print,
+        _ => return None,
+    })
+}
+
+fn posix_matches(pc: PosixClass, c: char, ci: bool) -> bool {
+    use PosixClass::*;
+    match pc {
+        Alpha => c.is_ascii_alphabetic(),
+        Digit => c.is_ascii_digit(),
+        Alnum => c.is_ascii_alphanumeric(),
+        // Under case-insensitive matching, upper/lower widen to any letter.
+        Upper => {
+            if ci {
+                c.is_ascii_alphabetic()
+            } else {
+                c.is_ascii_uppercase()
+            }
+        }
+        Lower => {
+            if ci {
+                c.is_ascii_alphabetic()
+            } else {
+                c.is_ascii_lowercase()
+            }
+        }
+        Xdigit => c.is_ascii_hexdigit(),
+        Punct => c.is_ascii_punctuation(),
+        Cntrl => c.is_ascii_control(),
+        Graph => c.is_ascii_graphic(),
+        // POSIX `space` includes \v (0x0b), which Rust's is_ascii_whitespace omits.
+        Space => matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}'),
+        Blank => matches!(c, ' ' | '\t'),
+        Print => c.is_ascii_graphic() || c == ' ',
+    }
 }
 
 /// True if `pattern` contains an extglob operator: one of `? * + @ !` directly
@@ -109,6 +178,32 @@ pub fn has_extglob(pattern: &str) -> bool {
             '?' | '*' | '+' | '@' | '!' if i + 1 < b.len() && b[i + 1] == '(' => return true,
             _ => i += 1,
         }
+    }
+    false
+}
+
+/// True if `pattern` contains a POSIX bracket class `[:name:]` (the
+/// `[[:name:]]` form) — an unescaped `[:` followed later by `:]`. Liberal: a
+/// false positive only routes a class-free pattern through the (faithful)
+/// own-matcher, which is harmless.
+pub fn has_posix_class(pattern: &str) -> bool {
+    let b: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] == '[' && i + 1 < b.len() && b[i + 1] == ':' {
+            let mut j = i + 2;
+            while j + 1 < b.len() {
+                if b[j] == ':' && b[j + 1] == ']' {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
     }
     false
 }
@@ -216,6 +311,22 @@ fn parse_class(chars: &[char], pos: &mut usize) -> Item {
             i += 1;
             break;
         }
+        // POSIX class `[:name:]` (the inner `[:` of `[[:name:]]`).
+        #[allow(clippy::collapsible_if)] // keep the explicit fall-through comment.
+        if chars[i] == '[' && i + 1 < chars.len() && chars[i + 1] == ':' {
+            if let Some(close) = (i + 2..chars.len().saturating_sub(1))
+                .find(|&k| chars[k] == ':' && chars[k + 1] == ']')
+            {
+                let name: String = chars[i + 2..close].iter().collect();
+                set.push(match posix_class_from_name(&name) {
+                    Some(pc) => ClassAtom::Posix(pc),
+                    None => ClassAtom::Never,
+                });
+                i = close + 2; // skip past ":]"
+                continue;
+            }
+            // not a valid `[:...:]` — fall through to literal handling.
+        }
         // Range: x-y (where y is not the closing ']').
         if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
             set.push(ClassAtom::Range(chars[i], chars[i + 2]));
@@ -269,6 +380,13 @@ fn class_matches(set: &[ClassAtom], negated: bool, c: char, ci: bool) -> bool {
                     break;
                 }
             }
+            ClassAtom::Posix(pc) => {
+                if posix_matches(*pc, c, ci) {
+                    hit = true;
+                    break;
+                }
+            }
+            ClassAtom::Never => {}
         }
     }
     hit ^ negated
@@ -637,5 +755,64 @@ mod bracket_negation_tests {
     fn no_change_returns_borrowed() {
         assert!(matches!(translate_bracket_negation("[abc]"), Cow::Borrowed(_)));
         assert!(matches!(translate_bracket_negation("plain"), Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod posix_class_tests {
+    use super::{extglob_match, has_posix_class};
+
+    fn m(p: &str, t: &str) -> bool { extglob_match(p, t, false) }
+
+    #[test]
+    fn digit_alpha_space() {
+        assert!(m("[[:digit:]]", "5"));
+        assert!(!m("[[:digit:]]", "x"));
+        assert!(m("[[:alpha:]]", "x"));
+        assert!(!m("[[:alpha:]]", "5"));
+        assert!(m("[[:space:]]", " "));
+        assert!(m("[[:space:]]", "\u{0b}")); // vertical tab — POSIX space includes \v
+        assert!(!m("[[:space:]]", "x"));
+    }
+    #[test]
+    fn upper_lower_alnum_xdigit() {
+        assert!(m("[[:upper:]]", "A") && !m("[[:upper:]]", "a"));
+        assert!(m("[[:lower:]]", "a") && !m("[[:lower:]]", "A"));
+        assert!(m("[[:alnum:]]", "Z") && m("[[:alnum:]]", "7") && !m("[[:alnum:]]", "_"));
+        assert!(m("[[:xdigit:]]", "f") && m("[[:xdigit:]]", "9") && !m("[[:xdigit:]]", "g"));
+    }
+    #[test]
+    fn punct_cntrl_graph_print_blank() {
+        assert!(m("[[:punct:]]", "]") && m("[[:punct:]]", "!") && !m("[[:punct:]]", "a"));
+        assert!(m("[[:cntrl:]]", "\u{01}") && !m("[[:cntrl:]]", "a"));
+        assert!(m("[[:graph:]]", "!") && !m("[[:graph:]]", " "));
+        assert!(m("[[:print:]]", " ") && m("[[:print:]]", "!") && !m("[[:print:]]", "\u{01}"));
+        assert!(m("[[:blank:]]", " ") && m("[[:blank:]]", "\t") && !m("[[:blank:]]", "\n"));
+    }
+    #[test]
+    fn negation_and_mixed() {
+        assert!(m("[^[:digit:]]", "x") && !m("[^[:digit:]]", "5"));
+        assert!(m("[[:digit:]_]", "5") && m("[[:digit:]_]", "_") && !m("[[:digit:]_]", "a"));
+        assert!(m("[[:digit:]a-f]", "c") && m("[[:digit:]a-f]", "3") && !m("[[:digit:]a-f]", "z"));
+    }
+    #[test]
+    fn unknown_class_matches_nothing() {
+        assert!(!m("[[:bogus:]]", "x"));
+        assert!(!m("[[:bogus:]]", ":"));
+    }
+    #[test]
+    fn single_bracket_colon_is_literal_set() {
+        // `[:y:]` (single bracket) is a literal set {':','y'}, NOT a class.
+        assert!(m("[:y:]", ":") && m("[:y:]", "y") && !m("[:y:]", "z"));
+    }
+    #[test]
+    fn has_posix_class_detection() {
+        assert!(has_posix_class("[[:space:]]"));
+        assert!(has_posix_class("x[[:digit:]]y"));
+        assert!(has_posix_class("[^[:alpha:]]"));
+        assert!(!has_posix_class("[abc]"));
+        assert!(!has_posix_class("[a-z]"));
+        assert!(!has_posix_class("plain*"));
+        assert!(!has_posix_class("\\[[:x"));  // escaped, no close
     }
 }
