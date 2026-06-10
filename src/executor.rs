@@ -2797,6 +2797,19 @@ pub(crate) fn call_function_body(
     call_function(name, body, args, shell, &mut sink)
 }
 
+fn ps4(shell: &Shell) -> String {
+    shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string())
+}
+
+/// Join (prefix ++ program ++ args), each xtrace-quoted, into one trace-line body.
+fn xtrace_command_line(prefix: &[String], program: &str, args: &[String]) -> String {
+    use crate::param_expansion::xtrace_quote;
+    let mut parts: Vec<String> = prefix.iter().map(|w| xtrace_quote(w)).collect();
+    parts.push(xtrace_quote(program));
+    parts.extend(args.iter().map(|a| xtrace_quote(a)));
+    parts.join(" ")
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     crate::traps::fire_debug_trap(shell);
 
@@ -2832,6 +2845,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // (builtins + $PATH still resolve). `-v`/`-V` introspection is left to the
     // `command` builtin (not intercepted here).
     let mut bypass_functions = false;
+    let mut command_prefix: Vec<String> = Vec::new();
     while resolved.program == "command" {
         // Scan leading flags in resolved.args.
         let mut idx = 0;
@@ -2861,6 +2875,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         match resolved.args.get(idx) {
             None => return ExecOutcome::Continue(0), // `command` / `command -p` alone
             Some(_) => {
+                command_prefix.push("command".to_string());
+                command_prefix.extend(resolved.args[..idx].iter().cloned());
                 let new_program = resolved.args[idx].clone();
                 let new_args = resolved.args[idx + 1..].to_vec();
                 resolved.program = new_program;
@@ -2895,27 +2911,44 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // `name=value` from the just-applied values (read back via lookup_var). The
     // inline-assignment PREFIX on `VAR=v cmd` is omitted (minor divergence).
     if shell.shell_options.xtrace {
-        let ps4 = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
-        let mut line = String::new();
-        if resolved.program.is_empty() {
-            let mut first = true;
-            for a in &cmd.inline_assignments {
-                if !first {
-                    line.push(' ');
-                }
-                first = false;
-                let n = a.target.name();
-                let v = shell.lookup_var(n).unwrap_or_default();
-                line.push_str(&format!("{n}={v}"));
-            }
-        } else {
-            line.push_str(&resolved.program);
-            for a in &resolved.args {
-                line.push(' ');
-                line.push_str(a);
-            }
+        let p4 = ps4(shell);
+        // Inline-assignment prefix: each on its own preceding line (bash).
+        for a in &cmd.inline_assignments {
+            let name = a.target.name();
+            let val = shell.lookup_var(name).unwrap_or_default();
+            eprintln!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val));
         }
-        eprintln!("{ps4}{line}");
+        if !resolved.program.is_empty() {
+            let body = if let Some(dargs) = &resolved.decl_args {
+                let mut parts: Vec<String> = command_prefix
+                    .iter()
+                    .map(|w| crate::param_expansion::xtrace_quote(w))
+                    .collect();
+                parts.push(crate::param_expansion::xtrace_quote(&resolved.program));
+                for da in dargs {
+                    match da {
+                        crate::command::DeclArg::Plain(s) => {
+                            parts.push(crate::param_expansion::xtrace_quote(s))
+                        }
+                        crate::command::DeclArg::Assign(a) => {
+                            let name = a.target.name();
+                            let rhs = match crate::command::word_literal_text(&a.value) {
+                                Some(t) => t.to_string(),
+                                None => crate::expand::expand_assignment(&a.value, shell),
+                            };
+                            parts.push(format!(
+                                "{name}={}",
+                                crate::param_expansion::xtrace_quote(&rhs)
+                            ));
+                        }
+                    }
+                }
+                parts.join(" ")
+            } else {
+                xtrace_command_line(&command_prefix, &resolved.program, &resolved.args)
+            };
+            eprintln!("{p4}{body}");
+        }
     }
 
     // Determine whether the assignments should persist after the command.

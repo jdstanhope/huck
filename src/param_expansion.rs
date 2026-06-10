@@ -278,8 +278,6 @@ fn shell_quote(v: &str) -> String {
 /// contains a shell metacharacter, in which case single-quote it (with `'`
 /// rewritten `'\''`); empty → `''`; any control char → ANSI-C `$'…'`. Distinct
 /// from `shell_quote`/`${v@Q}`, which ALWAYS quotes.
-// wired up in v130 Task 2
-#[allow(dead_code)]
 pub(crate) fn xtrace_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
