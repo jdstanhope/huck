@@ -27,7 +27,7 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-118). |
+| Bugs (Tier 1) | 1 | Open bugs to fix (M-114). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 24 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
@@ -45,14 +45,6 @@ huck behaves wrong without a design reason; should be fixed.
 - **bash**: treats `x=(…)` specially even as an argument and does not error.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
-
-### M-118: builtin writing to a pipe drops the trailing non-newline-terminated chunk
-- **Status**: `[deferred]` (found v128)
-- **Severity**: high (silent data loss; corrupts captured/piped multi-line output)
-- **huck**: when a builtin that emits output via the StdoutSink runs as a stage in a PIPELINE, any output AFTER the final `\n` (a trailing line with no newline terminator) is dropped. `printf "%s" "a$(printf '\n')b" | cat` → `a\n` (loses `b`); `printf "a\nb" | od -c` → `a \n`; `echo -n "a$NL b" | cat` likewise. `printf "x\ny\nz" | cat` → `x\ny\n` (drops `z`). Affects `printf` and `echo -n` (any builtin emitting a final unterminated line). NOT triggered when the format string supplies the trailing `\n` (`printf "a\nb\n"` is intact), nor in the non-pipe / redirect-to-file paths (those are byte-correct), nor for `echo` (it appends its own `\n`). Deterministic.
-- **bash**: writes the builtin's complete output to the pipe verbatim, including the final unterminated line (`printf "%s" "a${NL}b" | cat` → `a\nb`).
-- **Impact**: surfaced in `nvm ls`. nvm's `nvm_print_versions` builds `remote_versions="$(printf '%s' "${1-}" | tr '\n' '|')"`; the multi-line installed/remote version list loses its LAST entry (`v24.15.0\nv24.16.0` → `v24.15.0|`), so the awk renders the second installed-version row with the wrong (current `->`) marker — huck prints `->     v24.15.0` twice where bash prints `->     v24.15.0` then `       v24.16.0`. Distinct from the v128/L-28 job-notice noise (which is fixed; 0 notices in both shells) and from the v126/v127 `→ ∞` alias-dup (no `∞` involved here).
-- **Next**: inspect the builtin-stdout-in-pipeline write path (the StdoutSink → pipe-fd flush in `run_multi_stage`/the builtin pipeline branch); likely a line-buffered split on `\n` that drops a trailing partial line, or a missing final flush of the residual buffer. Own iteration.
 
 
 ---
