@@ -19,6 +19,15 @@ pub enum StdoutSink<'a> {
     Capture(&'a mut Vec<u8>),
 }
 
+/// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
+/// partial line is held back) before handing fd 1 to another process. A fork
+/// child would otherwise inherit — and possibly duplicate — the pending bytes,
+/// and a spawned peer would otherwise race ahead of them. Call at every fork/spawn
+/// handoff. `io::stderr()` is unbuffered, so it needs no equivalent.
+fn flush_stdout() {
+    let _ = io::stdout().flush();
+}
+
 /// Called after a simple command's status is set. If errexit is on, the
 /// status is non-zero, and we're not in an err-suppressed context (matches
 /// v36's ERR-trap gate), returns the Exit outcome to terminate the shell
@@ -3197,6 +3206,9 @@ fn run_subprocess(
         process.stderr(Stdio::inherit());
     }
 
+    // Flush pending parent stdout before spawning so the child's output is
+    // ordered after buffered parent bytes (M-118 sibling: ordering).
+    flush_stdout();
     match process.spawn() {
         Ok(mut child) => {
             // Write heredoc bytes into the child's piped stdin, then drop
@@ -4510,6 +4522,10 @@ pub fn fork_and_run_in_subshell(
     stdout_dup_target: Option<i32>,
     stderr_dup_target: Option<i32>,
 ) -> Result<i32, io::Error> {
+    // Flush buffered parent stdout BEFORE forking so the child does not inherit
+    // (and then re-flush, duplicating) any pending partial line, and so pending
+    // parent bytes are ordered ahead of the child's output.
+    flush_stdout();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
@@ -4590,6 +4606,10 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::FunctionReturn(n) => n,
         };
         let status = status.rem_euclid(256);
+        // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or
+        // terminal) before _exit (M-118): _exit skips Rust's flush, which is
+        // wanted for parent-state side effects but would drop a trailing line.
+        flush_stdout();
         // _exit bypasses Drop and Rust's atexit/flush machinery, which is
         // exactly what we want: the parent's history.save() etc. must not run.
         unsafe { libc::_exit(status) };
@@ -4658,6 +4678,9 @@ fn spawn_external_with_fds(
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
 ) -> Result<i32, io::Error> {
+    // Flush pending parent stdout before spawning an external stage so its output
+    // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
+    flush_stdout();
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
 
