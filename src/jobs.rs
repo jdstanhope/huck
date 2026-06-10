@@ -317,6 +317,7 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         } else {
             ' '
         };
+        // bash suppresses automatic job notices inside a subshell environment / completion funcs
         if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
             eprintln!("{}", notification_line(&job, flag));
         }

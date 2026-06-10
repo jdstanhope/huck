@@ -1498,6 +1498,7 @@ fn run_background_subshell(
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
             let id = shell.jobs.add(pid, vec![pid], display);
+            // bash suppresses automatic job notices inside a subshell environment / completion funcs
             if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
                 eprintln!("[{id}] {pid}");
             }
@@ -2023,6 +2024,7 @@ fn run_background_sequence(
     let last_pid = *spawned_pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
     let id = shell.jobs.add(pgid, spawned_pids, display);
+    // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         eprintln!("[{id}] {last_pid}");
     }
