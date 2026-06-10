@@ -3104,6 +3104,22 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         } else {
             call_function(&name, body, args, shell, sink)
         }
+    } else if resolved.program == "eval" {
+        let args = resolved.args;
+        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+                move |shell, inner_sink| builtins::eval_in_sink(&args, shell, inner_sink))
+        } else {
+            builtins::eval_in_sink(&args, shell, sink)
+        }
+    } else if resolved.program == "source" || resolved.program == "." {
+        let args = resolved.args;
+        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+                move |shell, inner_sink| builtins::source_in_sink(&args, shell, inner_sink))
+        } else {
+            builtins::source_in_sink(&args, shell, sink)
+        }
     } else if builtins::is_builtin(&resolved.program) {
         let mut files = match open_stage_files(&resolved, shell) {
             Ok(f) => f,
