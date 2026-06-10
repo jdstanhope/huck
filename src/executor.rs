@@ -2689,7 +2689,6 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
                     break;
                 }
                 if shell.shell_options.xtrace {
-                    let name = a.target.name();
                     let val = shell.lookup_var(name).unwrap_or_default();
                     xtrace_emit(&format!("{}{name}={}", ps4(shell),
                               crate::param_expansion::xtrace_quote(&val)));
@@ -2818,8 +2817,12 @@ fn xtrace_emit(line: &str) {
     buf.push_str(line);
     buf.push('\n');
     let bytes = buf.as_bytes();
+    // Ignore partial write / EINTR: trace lines are small (< PIPE_BUF = 4096, the
+    // POSIX pipe-atomicity threshold) and best-effort; a short write at most
+    // truncates one line. Single write keeps a line intact against concurrent
+    // fd-2 writers (forked pipeline stages).
     unsafe {
-        libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        let _ = libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
 }
 
