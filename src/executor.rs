@@ -2803,7 +2803,18 @@ pub(crate) fn call_function_body(
 }
 
 fn ps4(shell: &Shell) -> String {
-    shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string())
+    // bash expands $PS4 (prompt escapes + $VAR, via the PS1/PS2 expander), THEN
+    // replicates the FIRST char of the EXPANDED value once per nesting level.
+    let raw = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
+    let expanded = crate::prompt::expand_prompt(&raw, shell);
+    let mut chars = expanded.chars();
+    let Some(first) = chars.next() else { return String::new(); };
+    let rest: String = chars.collect();
+    let level = shell.xtrace_depth + 1;
+    let mut out = String::with_capacity(level + rest.len());
+    for _ in 0..level { out.push(first); }
+    out.push_str(&rest);
+    out
 }
 
 /// Emit one xtrace line (the trailing newline is added) to fd 2 in a SINGLE

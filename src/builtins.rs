@@ -4703,7 +4703,13 @@ fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if joined.trim().is_empty() {
         return ExecOutcome::Continue(0);
     }
-    crate::shell::process_line(&joined, shell, true)
+    // PS4 depth-repeat: eval's body traces one level deeper (bash). The
+    // `+ eval '…'` line was already emitted at the outer depth before dispatch.
+    let saved = shell.xtrace_depth;
+    shell.xtrace_depth += 1;
+    let r = crate::shell::process_line(&joined, shell, true);
+    shell.xtrace_depth = saved;
+    r
 }
 
 struct HelpEntry {
