@@ -590,6 +590,8 @@ pub fn process_line_in_sink(
     }
 }
 
+/// Terminal-sink wrapper around [`process_line_in_sink`] — the entry point for
+/// callers (REPL, traps, helpers) that run at top level (stdout → terminal).
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
     process_line_in_sink(line, shell, expand_aliases, &mut sink)

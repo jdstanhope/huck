@@ -5579,6 +5579,8 @@ pub(crate) fn run_sourced_contents_in_sink(
     ExecOutcome::Continue(last_status)
 }
 
+/// Terminal-sink wrapper around [`run_sourced_contents_in_sink`] — used by
+/// script/`-c` mode (top-level sourcing, stdout → terminal).
 pub(crate) fn run_sourced_contents(
     contents: &str,
     path: &std::path::Path,
