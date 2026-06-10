@@ -25,7 +25,6 @@ pub enum StdoutSink<'a> {
 /// and a spawned peer would otherwise race ahead of them. Call at every fork/spawn
 /// handoff. `io::stderr()` is unbuffered, so it needs no equivalent.
 fn flush_stdout() {
-    use std::io::Write;
     let _ = io::stdout().flush();
 }
 
