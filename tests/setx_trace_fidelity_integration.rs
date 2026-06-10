@@ -63,3 +63,18 @@ fn array_literal_decl_does_not_crash() {
     assert_ne!(c, 101, "must not panic; stderr: {e}"); // 101 = Rust panic abort
     assert!(trace_lines(&e).iter().any(|l| l == "+ local arr=(a b c)"), "stderr: {e}");
 }
+
+#[test]
+fn bare_assignment_traced() {
+    let (_o, e, _c) = run("set -x\nA=1\nB=\"x y\"\n");
+    let t = trace_lines(&e);
+    assert!(t.contains(&"+ A=1".to_string()), "stderr: {e}");
+    assert!(t.contains(&"+ B='x y'".to_string()), "stderr: {e}");
+}
+#[test]
+fn external_pipeline_stage_traced() {
+    let (_o, e, _c) = run("set -x\necho a | cat\n");
+    let t = trace_lines(&e);
+    assert!(t.contains(&"+ echo a".to_string()), "stderr: {e}");
+    assert!(t.contains(&"+ cat".to_string()), "stderr: {e}");
+}
