@@ -3206,6 +3206,9 @@ fn run_subprocess(
         process.stderr(Stdio::inherit());
     }
 
+    // Flush pending parent stdout before spawning so the child's output is
+    // ordered after buffered parent bytes (M-118 sibling: ordering).
+    flush_stdout();
     match process.spawn() {
         Ok(mut child) => {
             // Write heredoc bytes into the child's piped stdin, then drop
@@ -4675,6 +4678,9 @@ fn spawn_external_with_fds(
     pgid_target: i32,
     parent_fds_to_close: &[RawFd],
 ) -> Result<i32, io::Error> {
+    // Flush pending parent stdout before spawning an external stage so its output
+    // does not race ahead of buffered parent bytes (M-118 sibling: ordering).
+    flush_stdout();
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
 

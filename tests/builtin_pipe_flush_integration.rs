@@ -56,3 +56,21 @@ fn loop_of_builtins_unterminated_piped() {
     let (out, _e, _c) = run("for i in 1 2 3; do printf \"$i\"; done | cat\n");
     assert_eq!(out, "123", "out: {out:?}");
 }
+
+#[test]
+fn external_ordering_piped() {
+    let (out, _e, _c) = run("printf x; /usr/bin/printf y | cat\n");
+    assert_eq!(out, "xy", "out: {out:?}");
+}
+
+#[test]
+fn external_ordering_bare() {
+    let (out, _e, _c) = run("printf x; /usr/bin/printf y\n");
+    assert_eq!(out, "xy", "out: {out:?}");
+}
+
+#[test]
+fn external_ordering_in_subshell() {
+    let (out, _e, _c) = run("printf x; ( /usr/bin/printf y )\n");
+    assert_eq!(out, "xy", "out: {out:?}");
+}
