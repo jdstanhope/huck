@@ -1979,7 +1979,7 @@ fn skip_test_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<
 
 /// Returns the Word's single unquoted Literal text, if it is exactly that shape.
 /// Used to identify operator words like `==`, `!=`, `-eq`, etc.
-fn word_literal_text(w: &Word) -> Option<&str> {
+pub(crate) fn word_literal_text(w: &Word) -> Option<&str> {
     if w.0.len() != 1 {
         return None;
     }

@@ -274,6 +274,45 @@ fn shell_quote(v: &str) -> String {
     }
 }
 
+/// Quote `s` the way bash's xtrace (`set -x`) does: leave it bare unless it
+/// contains a shell metacharacter, in which case single-quote it (with `'`
+/// rewritten `'\''`); empty → `''`; any control char → ANSI-C `$'…'`. Distinct
+/// from `shell_quote`/`${v@Q}`, which ALWAYS quotes.
+pub(crate) fn xtrace_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.chars().any(|c| c.is_control()) {
+        return ansi_c_quote(s);
+    }
+    if contains_shell_metas(s) {
+        return format!("'{}'", crate::builtins::escape_alias_value(s));
+    }
+    s.to_string()
+}
+
+/// bash `sh_contains_shell_metas`: does `s` contain a character that requires
+/// quoting to re-read as a single literal word?
+fn contains_shell_metas(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '|' | '&' | ';' | '(' | ')'
+            | '<' | '>' | '!' | '{' | '}' | '*' | '[' | '?' | ']' | '^' | '$' | '`' => {
+                return true;
+            }
+            '~' if i == 0 || chars[i - 1] == '=' || chars[i - 1] == ':' => {
+                return true;
+            }
+            '#' if i == 0 => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// ANSI-C `$'…'` quoting of `v` (escaping `\`, `'`, and control chars). Shared
 /// by `${v@Q}` (control-char branch) and `printf %q`.
 pub(crate) fn ansi_c_quote(v: &str) -> String {
@@ -1422,5 +1461,50 @@ mod tests {
         };
         let r = expand_modifier("HUCK_TEST_PE_CASE_UNSET", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod xtrace_quote_tests {
+    use super::xtrace_quote;
+    #[test]
+    fn bare_safe_words() {
+        for s in ["hello", "a-b", "a/b", "a.b", "a:b", "a=b", "a,b", "a%b", "a+b", "a@b", "a_b", "aZ9", "a#b", "a~b"] {
+            assert_eq!(xtrace_quote(s), s, "{s} should be bare");
+        }
+    }
+    #[test]
+    fn empty_is_two_quotes() {
+        assert_eq!(xtrace_quote(""), "''");
+    }
+    #[test]
+    fn metas_get_single_quoted() {
+        assert_eq!(xtrace_quote("a b"), "'a b'");
+        assert_eq!(xtrace_quote("; foo"), "'; foo'");
+        assert_eq!(xtrace_quote("["), "'['");
+        assert_eq!(xtrace_quote("]"), "']'");
+        assert_eq!(xtrace_quote("a!b"), "'a!b'");
+        assert_eq!(xtrace_quote("a^b"), "'a^b'");
+        assert_eq!(xtrace_quote("a*b"), "'a*b'");
+        assert_eq!(xtrace_quote("a$b"), "'a$b'");
+        assert_eq!(xtrace_quote("%s\\n"), "'%s\\n'");
+    }
+    #[test]
+    fn leading_tilde_and_hash_are_meta_but_not_mid_word() {
+        assert_eq!(xtrace_quote("~x"), "'~x'");
+        assert_eq!(xtrace_quote("#x"), "'#x'");
+        assert_eq!(xtrace_quote("a~b"), "a~b");
+        assert_eq!(xtrace_quote("a#b"), "a#b");
+        assert_eq!(xtrace_quote("x=~y"), "'x=~y'");
+        assert_eq!(xtrace_quote("a:~b"), "'a:~b'");
+    }
+    #[test]
+    fn single_quote_in_value_is_escaped() {
+        assert_eq!(xtrace_quote("it's"), "'it'\\''s'");
+    }
+    #[test]
+    fn control_chars_use_ansi_c() {
+        assert_eq!(xtrace_quote("a\tb"), "$'a\\tb'");
+        assert_eq!(xtrace_quote("a\nb"), "$'a\\nb'");
     }
 }

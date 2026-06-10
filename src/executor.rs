@@ -2688,6 +2688,11 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
                     st = 1;
                     break;
                 }
+                if shell.shell_options.xtrace {
+                    let val = shell.lookup_var(name).unwrap_or_default();
+                    xtrace_emit(&format!("{}{name}={}", ps4(shell),
+                              crate::param_expansion::xtrace_quote(&val)));
+                }
             }
             // bash: a bare assignment's status is the last command substitution
             // in its RHS (or 0 if none). A readonly/apply error keeps st=1.
@@ -2797,6 +2802,50 @@ pub(crate) fn call_function_body(
     call_function(name, body, args, shell, &mut sink)
 }
 
+fn ps4(shell: &Shell) -> String {
+    shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string())
+}
+
+/// Emit one xtrace line (the trailing newline is added) to fd 2 in a SINGLE
+/// `write(2)`. Pipeline stages run in separate processes (a forked in-process
+/// stage and the parent tracing an external stage) and share fd 2; a multi-write
+/// `eprintln!` lets a sibling's bytes wedge between the prefix and the body
+/// (`+ + echo a` / `cat`). A single write of the whole line keeps each trace
+/// line intact (stages may still REORDER, which is best-effort per spec).
+fn xtrace_emit(line: &str) {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    let bytes = buf.as_bytes();
+    // Ignore partial write / EINTR: trace lines are small (< PIPE_BUF = 4096, the
+    // POSIX pipe-atomicity threshold) and best-effort; a short write at most
+    // truncates one line. Single write keeps a line intact against concurrent
+    // fd-2 writers (forked pipeline stages).
+    unsafe {
+        let _ = libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len());
+    }
+}
+
+/// Join (prefix ++ program ++ args), each xtrace-quoted, into one trace-line body.
+fn xtrace_command_line(prefix: &[String], program: &str, args: &[String]) -> String {
+    use crate::param_expansion::xtrace_quote;
+    let mut parts: Vec<String> = prefix.iter().map(|w| xtrace_quote(w)).collect();
+    parts.push(xtrace_quote(program));
+    parts.extend(args.iter().map(|a| xtrace_quote(a)));
+    parts.join(" ")
+}
+
+/// If `w` is an array-literal RHS (`(a b c)`), return its elements for
+/// best-effort xtrace rendering. `None` for ordinary scalar RHS words.
+fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::ArrayLiteralElement]> {
+    for part in &w.0 {
+        if let crate::lexer::WordPart::ArrayLiteral(elems) = part {
+            return Some(elems);
+        }
+    }
+    None
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     crate::traps::fire_debug_trap(shell);
 
@@ -2832,6 +2881,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // (builtins + $PATH still resolve). `-v`/`-V` introspection is left to the
     // `command` builtin (not intercepted here).
     let mut bypass_functions = false;
+    let mut command_prefix: Vec<String> = Vec::new();
     while resolved.program == "command" {
         // Scan leading flags in resolved.args.
         let mut idx = 0;
@@ -2861,6 +2911,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         match resolved.args.get(idx) {
             None => return ExecOutcome::Continue(0), // `command` / `command -p` alone
             Some(_) => {
+                command_prefix.push("command".to_string());
+                command_prefix.extend(resolved.args[..idx].iter().cloned());
                 let new_program = resolved.args[idx].clone();
                 let new_args = resolved.args[idx + 1..].to_vec();
                 resolved.program = new_program;
@@ -2891,31 +2943,65 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // xtrace (`set -x`): print the expanded command to stderr, prefixed by
     // `$PS4` (default `+ `), BEFORE dispatch so a hanging command is traced
     // first. Use the already-expanded `resolved.program`/`resolved.args` (do
-    // NOT re-expand). For a pure-assignment command (empty program) render
-    // `name=value` from the just-applied values (read back via lookup_var). The
-    // inline-assignment PREFIX on `VAR=v cmd` is omitted (minor divergence).
+    // NOT re-expand). Each inline assignment on `VAR=v cmd` is traced on its
+    // own preceding line (bash-style), read back via lookup_var. Then the
+    // command line itself: program + args (or decl_args for declare/local/
+    // etc.), every word xtrace-quoted, with the `command` prefix preserved.
+    // An empty program (redirect-only command) emits no command line.
     if shell.shell_options.xtrace {
-        let ps4 = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
-        let mut line = String::new();
-        if resolved.program.is_empty() {
-            let mut first = true;
-            for a in &cmd.inline_assignments {
-                if !first {
-                    line.push(' ');
-                }
-                first = false;
-                let n = a.target.name();
-                let v = shell.lookup_var(n).unwrap_or_default();
-                line.push_str(&format!("{n}={v}"));
-            }
-        } else {
-            line.push_str(&resolved.program);
-            for a in &resolved.args {
-                line.push(' ');
-                line.push_str(a);
-            }
+        let p4 = ps4(shell);
+        // Inline-assignment prefix: each on its own preceding line (bash).
+        for a in &cmd.inline_assignments {
+            let name = a.target.name();
+            let val = shell.lookup_var(name).unwrap_or_default();
+            xtrace_emit(&format!("{p4}{name}={}", crate::param_expansion::xtrace_quote(&val)));
         }
-        eprintln!("{ps4}{line}");
+        if !resolved.program.is_empty() {
+            let body = if let Some(dargs) = &resolved.decl_args {
+                let mut parts: Vec<String> = command_prefix
+                    .iter()
+                    .map(|w| crate::param_expansion::xtrace_quote(w))
+                    .collect();
+                parts.push(crate::param_expansion::xtrace_quote(&resolved.program));
+                for da in dargs {
+                    match da {
+                        crate::command::DeclArg::Plain(s) => {
+                            parts.push(crate::param_expansion::xtrace_quote(s))
+                        }
+                        crate::command::DeclArg::Assign(a) => {
+                            let name = a.target.name();
+                            if let Some(elems) = array_literal_elements(&a.value) {
+                                // Array-literal RHS: best-effort `name=(e1 e2 ...)`
+                                // (spec: arrays best-effort, must not crash;
+                                // expand_assignment would panic on the literal).
+                                let mut rendered: Vec<String> = Vec::with_capacity(elems.len());
+                                for el in elems {
+                                    let v = match crate::command::word_literal_text(&el.value) {
+                                        Some(t) => t.to_string(),
+                                        None => crate::expand::expand_assignment(&el.value, shell),
+                                    };
+                                    rendered.push(crate::param_expansion::xtrace_quote(&v));
+                                }
+                                parts.push(format!("{name}=({})", rendered.join(" ")));
+                            } else {
+                                let rhs = match crate::command::word_literal_text(&a.value) {
+                                    Some(t) => t.to_string(),
+                                    None => crate::expand::expand_assignment(&a.value, shell),
+                                };
+                                parts.push(format!(
+                                    "{name}={}",
+                                    crate::param_expansion::xtrace_quote(&rhs)
+                                ));
+                            }
+                        }
+                    }
+                }
+                parts.join(" ")
+            } else {
+                xtrace_command_line(&command_prefix, &resolved.program, &resolved.args)
+            };
+            xtrace_emit(&format!("{p4}{body}"));
+        }
     }
 
     // Determine whether the assignments should persist after the command.
@@ -4693,6 +4779,11 @@ fn spawn_external_with_fds(
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
     let resolved = resolve(exec, shell)
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
+
+    if shell.shell_options.xtrace {
+        xtrace_emit(&format!("{}{}", ps4(shell),
+                  xtrace_command_line(&[], &resolved.program, &resolved.args)));
+    }
 
     // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
     // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
