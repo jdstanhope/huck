@@ -521,6 +521,13 @@ impl Drop for CompoundRedirectScope {
 /// failure prints `huck: <target>: <err>` and returns `Continue(1)` WITHOUT
 /// running `run_inner`. (Shared by `run_redirected` for compounds and by the
 /// function-call branch.)
+/// True if `cmd` carries any explicit stdin/stdout/stderr redirect — the gate
+/// for wrapping a body-running command (function / eval / source) in
+/// `with_redirect_scope`.
+fn has_any_redirect(cmd: &ExecCommand) -> bool {
+    cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some()
+}
+
 fn with_redirect_scope<F>(
     stdin: &Option<Redirect>,
     stdout: &Option<Redirect>,
@@ -3098,15 +3105,20 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
         let name = resolved.program.clone();
         let args = resolved.args;
-        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+        if has_any_redirect(cmd) {
             with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
                 move |shell, inner_sink| call_function(&name, body, args, shell, inner_sink))
         } else {
             call_function(&name, body, args, shell, sink)
         }
+    // eval/source must run their commands with the ENCLOSING sink (so `$(eval …)`
+    // / `$(source …)` captures the output) and honour redirects — like a function
+    // call. The generic builtin path below routes them through run_builtin, which
+    // resets to a fresh Terminal sink (leaking the output and re-entering job
+    // control inside a substitution → the nvm ls-remote hang), so intercept here.
     } else if resolved.program == "eval" {
         let args = resolved.args;
-        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+        if has_any_redirect(cmd) {
             with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
                 move |shell, inner_sink| builtins::eval_in_sink(&args, shell, inner_sink))
         } else {
@@ -3114,7 +3126,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
-        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+        if has_any_redirect(cmd) {
             with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
                 move |shell, inner_sink| builtins::source_in_sink(&args, shell, inner_sink))
         } else {

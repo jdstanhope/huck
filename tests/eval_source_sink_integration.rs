@@ -57,3 +57,10 @@ fn eval_redirect_to_file() {
     let _ = std::fs::remove_file("/tmp/v132r.txt");
     assert_eq!(got, "R\n", "file: {got:?}");
 }
+#[test]
+fn eval_stdin_redirect() {
+    // stdin redirect on eval flows to the eval'd command (via with_redirect_scope).
+    let (o, _e, _c) = run("printf 'IN\\n' > /tmp/v132in.txt\nx=$(eval 'cat' < /tmp/v132in.txt); echo \"[$x]\"\n");
+    let _ = std::fs::remove_file("/tmp/v132in.txt");
+    assert_eq!(o, "[IN]\n", "o: {o:?}");
+}
