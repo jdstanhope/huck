@@ -56,3 +56,10 @@ fn inline_assignment_separate_lines() {
     let j = t.iter().position(|l| l == "+ echo hi").expect("echo line");
     assert!(i < j, "FOO before echo; stderr: {e}");
 }
+
+#[test]
+fn array_literal_decl_does_not_crash() {
+    let (_o, e, c) = run("set -x\nf() { local arr=(a b c); }; f\n");
+    assert_ne!(c, 101, "must not panic; stderr: {e}"); // 101 = Rust panic abort
+    assert!(trace_lines(&e).iter().any(|l| l == "+ local arr=(a b c)"), "stderr: {e}");
+}

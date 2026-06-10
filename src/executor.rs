@@ -2810,6 +2810,17 @@ fn xtrace_command_line(prefix: &[String], program: &str, args: &[String]) -> Str
     parts.join(" ")
 }
 
+/// If `w` is an array-literal RHS (`(a b c)`), return its elements for
+/// best-effort xtrace rendering. `None` for ordinary scalar RHS words.
+fn array_literal_elements(w: &crate::lexer::Word) -> Option<&[crate::lexer::ArrayLiteralElement]> {
+    for part in &w.0 {
+        if let crate::lexer::WordPart::ArrayLiteral(elems) = part {
+            return Some(elems);
+        }
+    }
+    None
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     crate::traps::fire_debug_trap(shell);
 
@@ -2907,9 +2918,11 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // xtrace (`set -x`): print the expanded command to stderr, prefixed by
     // `$PS4` (default `+ `), BEFORE dispatch so a hanging command is traced
     // first. Use the already-expanded `resolved.program`/`resolved.args` (do
-    // NOT re-expand). For a pure-assignment command (empty program) render
-    // `name=value` from the just-applied values (read back via lookup_var). The
-    // inline-assignment PREFIX on `VAR=v cmd` is omitted (minor divergence).
+    // NOT re-expand). Each inline assignment on `VAR=v cmd` is traced on its
+    // own preceding line (bash-style), read back via lookup_var. Then the
+    // command line itself: program + args (or decl_args for declare/local/
+    // etc.), every word xtrace-quoted, with the `command` prefix preserved.
+    // An empty program (redirect-only command) emits no command line.
     if shell.shell_options.xtrace {
         let p4 = ps4(shell);
         // Inline-assignment prefix: each on its own preceding line (bash).
@@ -2932,14 +2945,29 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                         }
                         crate::command::DeclArg::Assign(a) => {
                             let name = a.target.name();
-                            let rhs = match crate::command::word_literal_text(&a.value) {
-                                Some(t) => t.to_string(),
-                                None => crate::expand::expand_assignment(&a.value, shell),
-                            };
-                            parts.push(format!(
-                                "{name}={}",
-                                crate::param_expansion::xtrace_quote(&rhs)
-                            ));
+                            if let Some(elems) = array_literal_elements(&a.value) {
+                                // Array-literal RHS: best-effort `name=(e1 e2 ...)`
+                                // (spec: arrays best-effort, must not crash;
+                                // expand_assignment would panic on the literal).
+                                let mut rendered: Vec<String> = Vec::with_capacity(elems.len());
+                                for el in elems {
+                                    let v = match crate::command::word_literal_text(&el.value) {
+                                        Some(t) => t.to_string(),
+                                        None => crate::expand::expand_assignment(&el.value, shell),
+                                    };
+                                    rendered.push(crate::param_expansion::xtrace_quote(&v));
+                                }
+                                parts.push(format!("{name}=({})", rendered.join(" ")));
+                            } else {
+                                let rhs = match crate::command::word_literal_text(&a.value) {
+                                    Some(t) => t.to_string(),
+                                    None => crate::expand::expand_assignment(&a.value, shell),
+                                };
+                                parts.push(format!(
+                                    "{name}={}",
+                                    crate::param_expansion::xtrace_quote(&rhs)
+                                ));
+                            }
                         }
                     }
                 }
