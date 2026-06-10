@@ -1,6 +1,7 @@
 use std::env;
 use std::io::Write;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::command::DeclArg;
 use crate::shell_state::{Shell, SHOPT_TABLE};
@@ -3852,7 +3853,7 @@ fn builtin_history(
             ExecOutcome::Continue(0)
         }
         Some("-c") => {
-            shell.history.clear();
+            Rc::make_mut(&mut shell.history).clear();
             ExecOutcome::Continue(0)
         }
         Some(other) => {
@@ -5961,7 +5962,7 @@ fn builtin_hash(
     let names = &args[i..];
 
     if reset {
-        shell.command_hash.clear();
+        Rc::make_mut(&mut shell.command_hash).clear();
         return ExecOutcome::Continue(0);
     }
 
@@ -5972,7 +5973,7 @@ fn builtin_hash(
         }
         let mut exit: i32 = 0;
         for name in names {
-            if shell.command_hash.remove(name).is_none() {
+            if Rc::make_mut(&mut shell.command_hash).remove(name).is_none() {
                 eprintln!("huck: hash: {name}: not found");
                 exit = 1;
             }
@@ -5992,7 +5993,7 @@ fn builtin_hash(
             return ExecOutcome::Continue(1);
         }
         let path = explicit_path.unwrap(); // safe: set_path implies Some
-        shell.command_hash.insert(
+        Rc::make_mut(&mut shell.command_hash).insert(
             name.clone(),
             (std::path::PathBuf::from(path), 0u32),
         );
@@ -6059,7 +6060,7 @@ fn builtin_hash(
         }
         match search_path_for(name, shell) {
             Some(path) => {
-                shell.command_hash.insert(name.clone(), (path, 0u32));
+                Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
             }
             None => {
                 eprintln!("huck: hash: {name}: not found");
@@ -8267,8 +8268,8 @@ mod history_tests {
     #[test]
     fn history_lists_numbered_entries() {
         let mut shell = Shell::new();
-        shell.history.add("first cmd".to_string());
-        shell.history.add("second cmd".to_string());
+        Rc::make_mut(&mut shell.history).add("first cmd".to_string());
+        Rc::make_mut(&mut shell.history).add("second cmd".to_string());
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("history", &[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8281,7 +8282,7 @@ mod history_tests {
     #[test]
     fn history_dash_c_clears() {
         let mut shell = Shell::new();
-        shell.history.add("doomed".to_string());
+        Rc::make_mut(&mut shell.history).add("doomed".to_string());
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("history", &["-c".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));

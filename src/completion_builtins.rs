@@ -3,6 +3,7 @@
 //! `completion_spec` module.
 
 use std::io::Write;
+use std::rc::Rc;
 
 use crate::builtins::ExecOutcome;
 use crate::completion_spec::{Action, CompOptions, CompletionCtx, CompletionSpec};
@@ -288,19 +289,21 @@ fn print_complete(
 }
 
 fn remove_complete(names: &[String], parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
-    let specs = &mut shell.completion_specs;
     let mut status = 0;
     if parsed.is_default {
-        specs.default_spec = None;
+        Rc::make_mut(&mut shell.completion_specs).default_spec = None;
     }
     if parsed.is_empty {
-        specs.empty_spec = None;
+        Rc::make_mut(&mut shell.completion_specs).empty_spec = None;
     }
     if names.is_empty() && !parsed.is_default && !parsed.is_empty {
-        specs.by_command.clear();
+        Rc::make_mut(&mut shell.completion_specs).by_command.clear();
     } else {
         for n in names {
-            if specs.by_command.remove(n).is_none() && !parsed.is_default && !parsed.is_empty {
+            if Rc::make_mut(&mut shell.completion_specs).by_command.remove(n).is_none()
+                && !parsed.is_default
+                && !parsed.is_empty
+            {
                 eprintln!("huck: complete: {n}: no completion specification");
                 status = 1;
             }
@@ -322,14 +325,13 @@ fn register_complete(parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
         return ExecOutcome::Continue(1);
     }
     if parsed.is_default {
-        shell.completion_specs.default_spec = Some(parsed.spec.clone());
+        Rc::make_mut(&mut shell.completion_specs).default_spec = Some(parsed.spec.clone());
     }
     if parsed.is_empty {
-        shell.completion_specs.empty_spec = Some(parsed.spec.clone());
+        Rc::make_mut(&mut shell.completion_specs).empty_spec = Some(parsed.spec.clone());
     }
     for n in &parsed.positional {
-        shell
-            .completion_specs
+        Rc::make_mut(&mut shell.completion_specs)
             .by_command
             .insert(n.clone(), parsed.spec.clone());
     }
@@ -536,7 +538,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
     // Named: mutate registry.
     let mut status = 0;
     for n in &names {
-        match shell.completion_specs.by_command.get_mut(n) {
+        match Rc::make_mut(&mut shell.completion_specs).by_command.get_mut(n) {
             Some(spec) => apply_compopt_options(&mut spec.options, &option_set),
             None => {
                 eprintln!("huck: compopt: {n}: no completion specification");
