@@ -57,6 +57,8 @@ fn loop_of_builtins_unterminated_piped() {
     assert_eq!(out, "123", "out: {out:?}");
 }
 
+// NOTE: the external_ordering_* tests require /usr/bin/printf (GNU coreutils
+// external) — present on Linux/macOS/BSD but absent on some minimal/musl images.
 #[test]
 fn external_ordering_piped() {
     let (out, _e, _c) = run("printf x; /usr/bin/printf y | cat\n");
