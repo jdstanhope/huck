@@ -301,6 +301,12 @@ pub struct Shell {
     /// the shell — M-116). bash runs completion functions without job control.
     pub in_completion: bool,
 
+    /// xtrace (`set -x`) nesting depth: the PS4 first character is repeated
+    /// `xtrace_depth + 1` times. Incremented inside a command substitution
+    /// (the `run_substitution` clone) and around `eval`. Functions and plain
+    /// subshells do NOT change it (matching bash).
+    pub xtrace_depth: usize,
+
     /// Persistent shell-option flags toggled by `set -e`/`-u`/`-o NAME`.
     /// See `ShellOptions` for the field list.
     pub shell_options: ShellOptions,
@@ -410,6 +416,7 @@ impl Shell {
             is_interactive: std::io::stdin().is_terminal(),
             in_subshell: false,
             in_completion: false,
+            xtrace_depth: 0,
             shell_options: ShellOptions::default(),
             shopt_options: ShoptOptions::default(),
             traps: std::collections::HashMap::new(),
