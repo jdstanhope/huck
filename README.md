@@ -18,6 +18,9 @@ Actively developed, one coherent feature at a time. Current scope:
 
 - **~2,900 tests** (unit + integration) and **49 bash-diff harnesses**, all
   green; `cargo clippy --all-targets` clean.
+- Command-substitution-heavy scripts run at near-bash speed: per-`$()` Shell
+  clone is O(1) via copy-on-write (Rc + make_mut); 2000× `$(true)` after
+  loading nvm: ~0.7 s vs ~46 s pre-fix; `nvm ls` wall-clock now matches bash.
 - Sources `~/.bashrc`-class startup files and the system `bash-completion`
   framework without errors.
 - Known gaps and deliberate divergences are tracked exhaustively in
