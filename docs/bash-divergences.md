@@ -27,10 +27,10 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 1 | Open bug to fix (M-114). |
+| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-118). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 24 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -45,6 +45,14 @@ huck behaves wrong without a design reason; should be fixed.
 - **bash**: treats `x=(…)` specially even as an argument and does not error.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
+
+### M-118: builtin writing to a pipe drops the trailing non-newline-terminated chunk
+- **Status**: `[deferred]` (found v128)
+- **Severity**: high (silent data loss; corrupts captured/piped multi-line output)
+- **huck**: when a builtin that emits output via the StdoutSink runs as a stage in a PIPELINE, any output AFTER the final `\n` (a trailing line with no newline terminator) is dropped. `printf "%s" "a$(printf '\n')b" | cat` → `a\n` (loses `b`); `printf "a\nb" | od -c` → `a \n`; `echo -n "a$NL b" | cat` likewise. `printf "x\ny\nz" | cat` → `x\ny\n` (drops `z`). Affects `printf` and `echo -n` (any builtin emitting a final unterminated line). NOT triggered when the format string supplies the trailing `\n` (`printf "a\nb\n"` is intact), nor in the non-pipe / redirect-to-file paths (those are byte-correct), nor for `echo` (it appends its own `\n`). Deterministic.
+- **bash**: writes the builtin's complete output to the pipe verbatim, including the final unterminated line (`printf "%s" "a${NL}b" | cat` → `a\nb`).
+- **Impact**: surfaced in `nvm ls`. nvm's `nvm_print_versions` builds `remote_versions="$(printf '%s' "${1-}" | tr '\n' '|')"`; the multi-line installed/remote version list loses its LAST entry (`v24.15.0\nv24.16.0` → `v24.15.0|`), so the awk renders the second installed-version row with the wrong (current `->`) marker — huck prints `->     v24.15.0` twice where bash prints `->     v24.15.0` then `       v24.16.0`. Distinct from the v128/L-28 job-notice noise (which is fixed; 0 notices in both shells) and from the v126/v127 `→ ∞` alias-dup (no `∞` involved here).
+- **Next**: inspect the builtin-stdout-in-pipeline write path (the StdoutSink → pipe-fd flush in `run_multi_stage`/the builtin pipeline branch); likely a line-buffered split on `\n` that drops a trailing partial line, or a missing final flush of the residual buffer. Own iteration.
 
 
 ---
@@ -193,7 +201,6 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-05**: `[N] PID` spawn notification shows only the last pipeline stage's PID; bash shows all.
 - **L-06**: `jobs` column width is fixed at 24; bash uses terminal width.
 - **L-07**: `wait` polls (50ms) rather than blocking — small latency / minor CPU usage.
-- **L-28: job-control notifications for `&` jobs started inside a running function** — `[low]` (found v124). huck prints `[N] pid` start lines and `[N] Done … &` completion lines for background (`&`) jobs that a FUNCTION spawns while it runs (e.g. nvm's `nvm_print_alias_path &`), cluttering output. bash suppresses job-change notifications while a function/compound command is executing, reporting them (if at all) only at the next interactive prompt. Surfaced by `nvm ls`, which backgrounds many helpers. Cosmetic; job results are correct. **Related (found v126):** the same `nvm_print_alias_path &` path also DUPLICATES the last couple of alias lines in `nvm ls` output, the duplicate showing a stale `(-> ∞)` (e.g. `lts/krypton -> v24.16.0` printed once correctly, then again as `… (-> ∞)`). Likely a background-job output-ordering/dup bug in huck's `&`/job handling — distinct from the notification noise but the same subsystem; deferred to the same fix.
 - **L-27: history expansion runs on piped (non-interactive) stdin** — `[low]`. huck applies `!`-history expansion to commands read from piped stdin (`printf 'echo hi!there\n' | huck` → `huck: !there: event not found`), whereas bash disables history expansion when non-interactive (piped stdin or a script) and prints `hi!there`. huck's file-arg path (`huck script.sh`) and `source` are unaffected — they match bash. Root: the REPL/piped-stdin reader (`src/shell.rs` `read_logical_command`) runs the history scanner regardless of interactivity; bash gates `histexpand` on an interactive shell. Surfaced repeatedly while testing `[!…]`/`[^…]` glob fragments (which contain `!`) via piped stdin; the v116 bracket-negation harness and integration tests run fragments as file-args to avoid it. Low impact: interactive use and scripts/`source` (the common paths) are correct; only literal piped-to-stdin command streams containing `!` diverge.
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
