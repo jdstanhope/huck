@@ -2811,7 +2811,7 @@ fn ps4(shell: &Shell) -> String {
     let Some(first) = chars.next() else { return String::new(); };
     let rest: String = chars.collect();
     let level = shell.xtrace_depth + 1;
-    let mut out = String::with_capacity(level + rest.len());
+    let mut out = String::with_capacity(level * first.len_utf8() + rest.len());
     for _ in 0..level { out.push(first); }
     out.push_str(&rest);
     out
