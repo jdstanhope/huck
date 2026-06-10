@@ -43,8 +43,16 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
     }
 }
 
-pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
-    let mut sink = StdoutSink::Terminal;
+/// Runs a top-level sequence, sending the terminal pipeline-stage's stdout to
+/// the given `sink`. `execute` is the Terminal-sink wrapper; command
+/// substitution / `$()` capture supply a `Capture` sink so a captured `eval`
+/// or `source` (via the `*_in_sink` plumbing) lands in the right buffer.
+pub fn execute_with_sink(
+    seq: &Sequence,
+    shell: &mut Shell,
+    source: &str,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
     // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.
@@ -55,10 +63,10 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
         if seq.rest.is_empty() {
             // Single-pipeline or subshell backgrounded — existing paths.
             if let Command::Pipeline(p) = &seq.first {
-                return run_background_sequence(p, shell, &mut sink, source);
+                return run_background_sequence(p, shell, sink, source);
             }
             if let Command::Subshell { .. } = &seq.first {
-                return run_background_subshell(&seq.first, shell, &mut sink, source);
+                return run_background_subshell(&seq.first, shell, sink, source);
             }
         } else if seq
             .rest
@@ -77,10 +85,17 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
                 background: false,
             };
             let subshell = Command::Subshell { body: Box::new(inner) };
-            return run_background_subshell(&subshell, shell, &mut sink, source);
+            return run_background_subshell(&subshell, shell, sink, source);
         }
     }
-    execute_sequence_body(seq, shell, &mut sink)
+    execute_sequence_body(seq, shell, sink)
+}
+
+/// Runs a top-level sequence with stdout going to the terminal. Thin wrapper
+/// over `execute_with_sink` with a Terminal sink.
+pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
+    let mut sink = StdoutSink::Terminal;
+    execute_with_sink(seq, shell, source, &mut sink)
 }
 
 /// Runs a sequence with stdout captured to a buffer. Used by command

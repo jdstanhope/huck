@@ -4695,7 +4695,11 @@ fn set_escape_value(v: &str) -> String {
 /// Returns the exit status of the last command in the re-parsed
 /// line. `exit N` / function-return / etc. propagate via the
 /// returned ExecOutcome.
-fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
+pub(crate) fn eval_in_sink(
+    args: &[String],
+    shell: &mut Shell,
+    sink: &mut crate::executor::StdoutSink,
+) -> ExecOutcome {
     if args.is_empty() {
         return ExecOutcome::Continue(0);
     }
@@ -4707,9 +4711,14 @@ fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
     // `+ eval '…'` line was already emitted at the outer depth before dispatch.
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
-    let r = crate::shell::process_line(&joined, shell, true);
+    let r = crate::shell::process_line_in_sink(&joined, shell, true, sink);
     shell.xtrace_depth = saved;
     r
+}
+
+fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    eval_in_sink(args, shell, &mut sink)
 }
 
 struct HelpEntry {
@@ -5267,7 +5276,11 @@ fn builtin_help(
     ExecOutcome::Continue(exit)
 }
 
-fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
+pub(crate) fn source_in_sink(
+    args: &[String],
+    shell: &mut Shell,
+    sink: &mut crate::executor::StdoutSink,
+) -> ExecOutcome {
     if args.is_empty() {
         eprintln!("huck: .: usage: . filename [arguments]");
         return ExecOutcome::Continue(2);
@@ -5301,13 +5314,18 @@ fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
     };
 
     shell.source_depth += 1;
-    let result = run_sourced_contents(&contents, &path, shell);
+    let result = run_sourced_contents_in_sink(&contents, &path, shell, sink);
     shell.source_depth -= 1;
 
     if let Some(saved) = saved_positional {
         shell.positional_args = saved;
     }
     result
+}
+
+fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    source_in_sink(args, shell, &mut sink)
 }
 
 fn resolve_source_path(
@@ -5350,10 +5368,11 @@ fn is_unterminated(e: &crate::command::ParseError) -> bool {
     )
 }
 
-pub(crate) fn run_sourced_contents(
+pub(crate) fn run_sourced_contents_in_sink(
     contents: &str,
     path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
+    sink: &mut crate::executor::StdoutSink,
 ) -> ExecOutcome {
     let mut last_status = shell.last_status();
 
@@ -5461,7 +5480,7 @@ pub(crate) fn run_sourced_contents(
                     prev_end = unit_end_abs;
 
                     let span = &contents[unit_start_abs..unit_end_abs];
-                    let outcome = crate::executor::execute(&seq, shell, span);
+                    let outcome = crate::executor::execute_with_sink(&seq, shell, span, sink);
 
                     match outcome {
                         ExecOutcome::Continue(c) => {
@@ -5558,6 +5577,15 @@ pub(crate) fn run_sourced_contents(
         }
     }
     ExecOutcome::Continue(last_status)
+}
+
+pub(crate) fn run_sourced_contents(
+    contents: &str,
+    path: &std::path::Path,
+    shell: &mut crate::shell_state::Shell,
+) -> ExecOutcome {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    run_sourced_contents_in_sink(contents, path, shell, &mut sink)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
