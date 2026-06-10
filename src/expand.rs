@@ -1173,6 +1173,7 @@ pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
     let mut cloned = shell.clone();
     let (output, status) = executor::execute_capturing(seq, &mut cloned);
     shell.set_last_status(status);
+    shell.set_last_cmd_sub_status(Some(status));   // for bare-assignment exit status (v126)
     strip_trailing_newlines(&output)
 }
 
@@ -1811,6 +1812,13 @@ mod tests {
         }]);
         let _ = expand(&word, &mut shell);
         assert_eq!(shell.last_status(), 7);
+    }
+
+    #[test]
+    fn run_substitution_records_last_cmd_sub_status() {
+        let mut shell = Shell::new();
+        let _ = run_substitution(&exit_sequence(7), &mut shell);
+        assert_eq!(shell.last_cmd_sub_status(), Some(7));
     }
 
     #[test]

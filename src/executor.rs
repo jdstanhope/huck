@@ -2663,6 +2663,8 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
         SimpleCommand::Assign(items) => {
+            // Reset so only THIS assignment's RHS command substitutions count.
+            shell.set_last_cmd_sub_status(None);
             let mut st = 0;
             for a in items {
                 let name = a.target.name();
@@ -2675,6 +2677,11 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
                     st = 1;
                     break;
                 }
+            }
+            // bash: a bare assignment's status is the last command substitution
+            // in its RHS (or 0 if none). A readonly/apply error keeps st=1.
+            if st == 0 {
+                st = shell.last_cmd_sub_status().unwrap_or(0);
             }
             ExecOutcome::Continue(st)
         }

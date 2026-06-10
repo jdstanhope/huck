@@ -233,6 +233,10 @@ impl ShoptOptions {
 pub struct Shell {
     vars: HashMap<String, Variable>,
     last_status: i32,
+    /// Exit status of the most recent command substitution; gives a bare
+    /// assignment command (`VAR=$(cmd)`) bash's exit status. Set by
+    /// `run_substitution`; read+reset by the `SimpleCommand::Assign` arm.
+    last_cmd_sub_status: Option<i32>,
     /// Current frame of positional parameters. Populated only by
     /// function calls (Task 5); empty at the top level.
     pub positional_args: Vec<String>,
@@ -378,6 +382,7 @@ impl Shell {
         let shell = Self {
             vars,
             last_status: 0,
+            last_cmd_sub_status: None,
             positional_args: Vec::new(),
             getopts_sp: 0,
             getopts_optind_cache: 0,
@@ -1177,6 +1182,13 @@ impl Shell {
 
     pub fn set_last_status(&mut self, status: i32) {
         self.last_status = status;
+    }
+
+    pub(crate) fn set_last_cmd_sub_status(&mut self, s: Option<i32>) {
+        self.last_cmd_sub_status = s;
+    }
+    pub(crate) fn last_cmd_sub_status(&self) -> Option<i32> {
+        self.last_cmd_sub_status
     }
 
     /// Returns and clears the pending fatal-PE-error flag.
