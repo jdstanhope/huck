@@ -1498,7 +1498,7 @@ fn run_background_subshell(
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
             let id = shell.jobs.add(pid, vec![pid], display);
-            if shell.is_interactive {
+            if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
                 eprintln!("[{id}] {pid}");
             }
             ExecOutcome::Continue(0)
@@ -2023,7 +2023,7 @@ fn run_background_sequence(
     let last_pid = *spawned_pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
     let id = shell.jobs.add(pgid, spawned_pids, display);
-    if shell.is_interactive {
+    if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         eprintln!("[{id}] {last_pid}");
     }
     ExecOutcome::Continue(0)
