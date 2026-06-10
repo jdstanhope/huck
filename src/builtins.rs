@@ -562,7 +562,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 any_error = true;
                 continue;
             }
-            shell.functions.remove(arg);
+            shell.remove_function(arg);
             continue;
         }
         match parse_subscripted_arg(arg) {
@@ -9002,7 +9002,7 @@ mod command_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "myfn".to_string()];
         let outcome = run_builtin("command", &args, &mut buf, &mut shell);
@@ -9622,7 +9622,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["myfn"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out.trim_end(), "myfn is a function");
@@ -9667,7 +9667,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["-t", "myfn"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out.trim_end(), "function");
@@ -9713,7 +9713,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         // Without -f: would find the function.
         let (oc, _) = run(&["-f", "myfn"], &mut shell);
         // With -f: function ignored, no other match → not found.
@@ -10088,8 +10088,8 @@ mod declare_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("fn1".to_string(), body.clone());
-        shell.functions.insert("fn2".to_string(), body);
+        shell.define_function("fn1".to_string(), body.clone());
+        shell.define_function("fn2".to_string(), body);
         let (oc, out) = run(&["-f"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         // Sorted; both present.
@@ -10117,7 +10117,7 @@ mod declare_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("fn1".to_string(), body);
+        shell.define_function("fn1".to_string(), body);
         let (oc, out) = run(&["-F", "fn1"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out, "declare -f fn1\n");

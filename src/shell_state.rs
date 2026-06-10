@@ -250,7 +250,13 @@ pub struct Shell {
     /// User-defined functions. Populated by `Command::FunctionDef`
     /// execution; looked up by `run_exec_single` when dispatching a
     /// simple command.
-    pub functions: HashMap<String, Box<crate::command::Command>>,
+    ///
+    /// Wrapped in `Rc` for copy-on-write: `clone()` (used for every
+    /// `$(…)` subshell isolation) is O(1) — just a refcount bump. A
+    /// write (`define_function`/`remove_function`) calls `Rc::make_mut`,
+    /// which copies the map only when the `Rc` is shared. huck is
+    /// single-threaded so `Rc` (not `Arc`) is correct here.
+    pub functions: std::rc::Rc<HashMap<String, Box<crate::command::Command>>>,
     /// User-defined aliases. `name` → expansion text. Populated by
     /// the `alias` builtin; consumed by `expand_aliases_in_tokens`
     /// during interactive REPL input.
@@ -386,7 +392,7 @@ impl Shell {
             positional_args: Vec::new(),
             getopts_sp: 0,
             getopts_optind_cache: 0,
-            functions: HashMap::new(),
+            functions: std::rc::Rc::new(HashMap::new()),
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
@@ -854,6 +860,18 @@ impl Shell {
                 integer: false,
             },
         );
+    }
+
+    /// Defines (or replaces) a shell function. Copy-on-write: if the function
+    /// table is shared (e.g. with a command-substitution clone), this copies it
+    /// first so the mutation does not leak across the isolation boundary.
+    pub(crate) fn define_function(&mut self, name: String, body: Box<crate::command::Command>) {
+        std::rc::Rc::make_mut(&mut self.functions).insert(name, body);
+    }
+
+    /// Removes a shell function. Returns true if it existed. Copy-on-write.
+    pub(crate) fn remove_function(&mut self, name: &str) -> bool {
+        std::rc::Rc::make_mut(&mut self.functions).remove(name).is_some()
     }
 
     /// Replaces (or creates) `name` as an indexed array with the given
@@ -1356,6 +1374,27 @@ mod tests {
         assert_eq!(arr.get(&1).map(String::as_str), Some("1"));
         assert_eq!(arr.get(&2).map(String::as_str), Some("0"));
         assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn shell_clone_shares_functions_and_cow_isolates_defines() {
+        use std::rc::Rc;
+        let mut a = Shell::new();
+        // Use the same minimal body shape as the builtins tests.
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        a.define_function("f".to_string(), body.clone());
+        assert_eq!(Rc::strong_count(&a.functions), 1);
+        let b = a.clone();
+        // After clone both shells share the same Rc — O(1) clone, NOT a deep copy.
+        assert_eq!(Rc::strong_count(&a.functions), 2);
+        // COW: defining a new function in `a` must NOT affect `b`.
+        a.define_function("g".to_string(), body);
+        assert!(a.functions.contains_key("g"));
+        assert!(!b.functions.contains_key("g")); // isolation preserved
+        // After make_mut the two Rcs are now independent.
+        assert_eq!(Rc::strong_count(&a.functions), 1);
     }
 
     #[test]
