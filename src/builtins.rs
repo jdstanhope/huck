@@ -5972,8 +5972,9 @@ fn builtin_hash(
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
+        let h = Rc::make_mut(&mut shell.command_hash);
         for name in names {
-            if Rc::make_mut(&mut shell.command_hash).remove(name).is_none() {
+            if h.remove(name).is_none() {
                 eprintln!("huck: hash: {name}: not found");
                 exit = 1;
             }

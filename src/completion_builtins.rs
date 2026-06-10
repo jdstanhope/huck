@@ -290,17 +290,18 @@ fn print_complete(
 
 fn remove_complete(names: &[String], parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
     let mut status = 0;
+    let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
-        Rc::make_mut(&mut shell.completion_specs).default_spec = None;
+        specs.default_spec = None;
     }
     if parsed.is_empty {
-        Rc::make_mut(&mut shell.completion_specs).empty_spec = None;
+        specs.empty_spec = None;
     }
     if names.is_empty() && !parsed.is_default && !parsed.is_empty {
-        Rc::make_mut(&mut shell.completion_specs).by_command.clear();
+        specs.by_command.clear();
     } else {
         for n in names {
-            if Rc::make_mut(&mut shell.completion_specs).by_command.remove(n).is_none()
+            if specs.by_command.remove(n).is_none()
                 && !parsed.is_default
                 && !parsed.is_empty
             {
@@ -324,16 +325,15 @@ fn register_complete(parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
         eprintln!("huck: complete: nothing to complete");
         return ExecOutcome::Continue(1);
     }
+    let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
-        Rc::make_mut(&mut shell.completion_specs).default_spec = Some(parsed.spec.clone());
+        specs.default_spec = Some(parsed.spec.clone());
     }
     if parsed.is_empty {
-        Rc::make_mut(&mut shell.completion_specs).empty_spec = Some(parsed.spec.clone());
+        specs.empty_spec = Some(parsed.spec.clone());
     }
     for n in &parsed.positional {
-        Rc::make_mut(&mut shell.completion_specs)
-            .by_command
-            .insert(n.clone(), parsed.spec.clone());
+        specs.by_command.insert(n.clone(), parsed.spec.clone());
     }
     ExecOutcome::Continue(0)
 }

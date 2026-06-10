@@ -1019,7 +1019,6 @@ mod tests {
 
     #[test]
     fn helper_holds_rc_refcell_shell() {
-        use std::rc::Rc;
         use std::cell::RefCell;
         let shell = Rc::new(RefCell::new(Shell::new()));
         let helper = HuckHelper::new(Rc::clone(&shell));

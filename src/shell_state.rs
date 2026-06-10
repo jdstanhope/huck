@@ -267,6 +267,8 @@ pub struct Shell {
     pub sigchld_flag: Arc<AtomicBool>,
     pub sigint_flag: Arc<AtomicBool>,
     pub shell_pgid: i32,
+    /// Command history. `Rc` so cloning the Shell (per command substitution) is
+    /// O(1); the rare mutation (append/load/clear) uses `Rc::make_mut` (COW).
     pub history: Rc<crate::history::History>,
     /// Shell PID, cached at startup via `getpid()`. Used for `$$`.
     pub shell_pid: i32,
