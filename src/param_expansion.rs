@@ -1498,6 +1498,7 @@ mod xtrace_quote_tests {
         assert_eq!(xtrace_quote("a~b"), "a~b");
         assert_eq!(xtrace_quote("a#b"), "a#b");
         assert_eq!(xtrace_quote("x=~y"), "'x=~y'");
+        assert_eq!(xtrace_quote("a:~b"), "'a:~b'");
     }
     #[test]
     fn single_quote_in_value_is_escaped() {
