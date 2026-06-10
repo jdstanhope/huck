@@ -43,8 +43,16 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
     }
 }
 
-pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
-    let mut sink = StdoutSink::Terminal;
+/// Runs a top-level sequence, sending the terminal pipeline-stage's stdout to
+/// the given `sink`. `execute` is the Terminal-sink wrapper; command
+/// substitution / `$()` capture supply a `Capture` sink so a captured `eval`
+/// or `source` (via the `*_in_sink` plumbing) lands in the right buffer.
+pub fn execute_with_sink(
+    seq: &Sequence,
+    shell: &mut Shell,
+    source: &str,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
     // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.
@@ -55,10 +63,10 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
         if seq.rest.is_empty() {
             // Single-pipeline or subshell backgrounded — existing paths.
             if let Command::Pipeline(p) = &seq.first {
-                return run_background_sequence(p, shell, &mut sink, source);
+                return run_background_sequence(p, shell, sink, source);
             }
             if let Command::Subshell { .. } = &seq.first {
-                return run_background_subshell(&seq.first, shell, &mut sink, source);
+                return run_background_subshell(&seq.first, shell, sink, source);
             }
         } else if seq
             .rest
@@ -77,10 +85,17 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
                 background: false,
             };
             let subshell = Command::Subshell { body: Box::new(inner) };
-            return run_background_subshell(&subshell, shell, &mut sink, source);
+            return run_background_subshell(&subshell, shell, sink, source);
         }
     }
-    execute_sequence_body(seq, shell, &mut sink)
+    execute_sequence_body(seq, shell, sink)
+}
+
+/// Runs a top-level sequence with stdout going to the terminal. Thin wrapper
+/// over `execute_with_sink` with a Terminal sink.
+pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
+    let mut sink = StdoutSink::Terminal;
+    execute_with_sink(seq, shell, source, &mut sink)
 }
 
 /// Runs a sequence with stdout captured to a buffer. Used by command
@@ -506,6 +521,13 @@ impl Drop for CompoundRedirectScope {
 /// failure prints `huck: <target>: <err>` and returns `Continue(1)` WITHOUT
 /// running `run_inner`. (Shared by `run_redirected` for compounds and by the
 /// function-call branch.)
+/// True if `cmd` carries any explicit stdin/stdout/stderr redirect — the gate
+/// for wrapping a body-running command (function / eval / source) in
+/// `with_redirect_scope`.
+fn has_any_redirect(cmd: &ExecCommand) -> bool {
+    cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some()
+}
+
 fn with_redirect_scope<F>(
     stdin: &Option<Redirect>,
     stdout: &Option<Redirect>,
@@ -3083,11 +3105,32 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
         let name = resolved.program.clone();
         let args = resolved.args;
-        if cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some() {
+        if has_any_redirect(cmd) {
             with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
                 move |shell, inner_sink| call_function(&name, body, args, shell, inner_sink))
         } else {
             call_function(&name, body, args, shell, sink)
+        }
+    // eval/source must run their commands with the ENCLOSING sink (so `$(eval …)`
+    // / `$(source …)` captures the output) and honour redirects — like a function
+    // call. The generic builtin path below routes them through run_builtin, which
+    // resets to a fresh Terminal sink (leaking the output and re-entering job
+    // control inside a substitution → the nvm ls-remote hang), so intercept here.
+    } else if resolved.program == "eval" {
+        let args = resolved.args;
+        if has_any_redirect(cmd) {
+            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+                move |shell, inner_sink| builtins::eval_in_sink(&args, shell, inner_sink))
+        } else {
+            builtins::eval_in_sink(&args, shell, sink)
+        }
+    } else if resolved.program == "source" || resolved.program == "." {
+        let args = resolved.args;
+        if has_any_redirect(cmd) {
+            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+                move |shell, inner_sink| builtins::source_in_sink(&args, shell, inner_sink))
+        } else {
+            builtins::source_in_sink(&args, shell, sink)
         }
     } else if builtins::is_builtin(&resolved.program) {
         let mut files = match open_stage_files(&resolved, shell) {

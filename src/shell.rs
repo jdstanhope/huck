@@ -552,7 +552,12 @@ pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
+pub fn process_line_in_sink(
+    line: &str,
+    shell: &mut Shell,
+    expand_aliases: bool,
+    sink: &mut crate::executor::StdoutSink,
+) -> ExecOutcome {
     let tokens = match lexer::tokenize_with_opts(
         line,
         lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) },
@@ -576,13 +581,20 @@ pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> Exec
     };
 
     match command::parse(tokens) {
-        Ok(Some(sequence)) => executor::execute(&sequence, shell, line),
+        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
             eprintln!("huck: syntax error: {}", parse_error_message(e));
             ExecOutcome::Continue(2)
         }
     }
+}
+
+/// Terminal-sink wrapper around [`process_line_in_sink`] — the entry point for
+/// callers (REPL, traps, helpers) that run at top level (stdout → terminal).
+pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    process_line_in_sink(line, shell, expand_aliases, &mut sink)
 }
 
 pub(crate) fn parse_error_message(error: ParseError) -> String {

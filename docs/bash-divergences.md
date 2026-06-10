@@ -27,7 +27,7 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 1 | Open bugs to fix (M-114). |
+| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-119). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
@@ -45,6 +45,26 @@ huck behaves wrong without a design reason; should be fixed.
 - **bash**: treats `x=(…)` specially even as an argument and does not error.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
+
+### M-119: a captured pipeline whose output exceeds the OS pipe buffer deadlocks
+- **Status**: `[deferred]` (found v132)
+- **Severity**: medium-high (HANGS the shell, but only for large captured pipelines)
+- **huck**: `x="$(producer | filter)"` HANGS when the captured output exceeds the
+  ~64 KiB pipe buffer. Minimal repro: `x="$(seq 1 500000 | cat)"` deadlocks;
+  `x="$(seq 1 500000)"` (no pipe) and `x="$(seq 1 1000 | cat)"` (small) both work.
+  Root: huck's command-substitution capture for a PIPELINE drains the final
+  stage's stdout into the in-memory buffer only AFTER the whole pipeline has
+  exited, so when the pipe fills (producer blocks on write) nothing reads the
+  read-end → classic reader/writer deadlock.
+- **bash**: reads the capture pipe concurrently with the pipeline running.
+- **Context**: surfaced via `nvm ls-remote`, whose
+  `VERSION_LIST="$(nvm_download … | command sed …)"` pipes the ~200 KiB
+  `index.tab` through a filter inside a capture. NOT the same as v132's eval/source
+  sink fix (a captured non-pipeline external like `$(eval 'seq 1 500000')` works
+  after v132); this is the orthogonal large-pipeline-in-capture drain ordering and
+  is the remaining `nvm ls-remote` blocker.
+- **Next**: drain the capture pipe concurrently with (not after) the pipeline —
+  the v133 target.
 
 
 ---
