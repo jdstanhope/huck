@@ -1,6 +1,7 @@
 use std::env;
 use std::io::Write;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::command::DeclArg;
 use crate::shell_state::{Shell, SHOPT_TABLE};
@@ -562,7 +563,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 any_error = true;
                 continue;
             }
-            shell.functions.remove(arg);
+            shell.remove_function(arg);
             continue;
         }
         match parse_subscripted_arg(arg) {
@@ -3852,7 +3853,7 @@ fn builtin_history(
             ExecOutcome::Continue(0)
         }
         Some("-c") => {
-            shell.history.clear();
+            Rc::make_mut(&mut shell.history).clear();
             ExecOutcome::Continue(0)
         }
         Some(other) => {
@@ -5961,7 +5962,7 @@ fn builtin_hash(
     let names = &args[i..];
 
     if reset {
-        shell.command_hash.clear();
+        Rc::make_mut(&mut shell.command_hash).clear();
         return ExecOutcome::Continue(0);
     }
 
@@ -5971,8 +5972,9 @@ fn builtin_hash(
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
+        let h = Rc::make_mut(&mut shell.command_hash);
         for name in names {
-            if shell.command_hash.remove(name).is_none() {
+            if h.remove(name).is_none() {
                 eprintln!("huck: hash: {name}: not found");
                 exit = 1;
             }
@@ -5992,7 +5994,7 @@ fn builtin_hash(
             return ExecOutcome::Continue(1);
         }
         let path = explicit_path.unwrap(); // safe: set_path implies Some
-        shell.command_hash.insert(
+        Rc::make_mut(&mut shell.command_hash).insert(
             name.clone(),
             (std::path::PathBuf::from(path), 0u32),
         );
@@ -6059,7 +6061,7 @@ fn builtin_hash(
         }
         match search_path_for(name, shell) {
             Some(path) => {
-                shell.command_hash.insert(name.clone(), (path, 0u32));
+                Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
             }
             None => {
                 eprintln!("huck: hash: {name}: not found");
@@ -8267,8 +8269,8 @@ mod history_tests {
     #[test]
     fn history_lists_numbered_entries() {
         let mut shell = Shell::new();
-        shell.history.add("first cmd".to_string());
-        shell.history.add("second cmd".to_string());
+        Rc::make_mut(&mut shell.history).add("first cmd".to_string());
+        Rc::make_mut(&mut shell.history).add("second cmd".to_string());
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("history", &[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8281,7 +8283,7 @@ mod history_tests {
     #[test]
     fn history_dash_c_clears() {
         let mut shell = Shell::new();
-        shell.history.add("doomed".to_string());
+        Rc::make_mut(&mut shell.history).add("doomed".to_string());
         let mut out: Vec<u8> = Vec::new();
         let outcome = run_builtin("history", &["-c".to_string()], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9002,7 +9004,7 @@ mod command_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "myfn".to_string()];
         let outcome = run_builtin("command", &args, &mut buf, &mut shell);
@@ -9622,7 +9624,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["myfn"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out.trim_end(), "myfn is a function");
@@ -9667,7 +9669,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["-t", "myfn"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out.trim_end(), "function");
@@ -9713,7 +9715,7 @@ mod type_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("myfn".to_string(), body);
+        shell.define_function("myfn".to_string(), body);
         // Without -f: would find the function.
         let (oc, _) = run(&["-f", "myfn"], &mut shell);
         // With -f: function ignored, no other match → not found.
@@ -10088,8 +10090,8 @@ mod declare_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("fn1".to_string(), body.clone());
-        shell.functions.insert("fn2".to_string(), body);
+        shell.define_function("fn1".to_string(), body.clone());
+        shell.define_function("fn2".to_string(), body);
         let (oc, out) = run(&["-f"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         // Sorted; both present.
@@ -10117,7 +10119,7 @@ mod declare_tests {
         let body = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        shell.functions.insert("fn1".to_string(), body);
+        shell.define_function("fn1".to_string(), body);
         let (oc, out) = run(&["-F", "fn1"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(out, "declare -f fn1\n");

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -250,7 +251,13 @@ pub struct Shell {
     /// User-defined functions. Populated by `Command::FunctionDef`
     /// execution; looked up by `run_exec_single` when dispatching a
     /// simple command.
-    pub functions: HashMap<String, Box<crate::command::Command>>,
+    ///
+    /// Wrapped in `Rc` for copy-on-write: `clone()` (used for every
+    /// `$(…)` subshell isolation) is O(1) — just a refcount bump. A
+    /// write (`define_function`/`remove_function`) calls `Rc::make_mut`,
+    /// which copies the map only when the `Rc` is shared. huck is
+    /// single-threaded so `Rc` (not `Arc`) is correct here.
+    pub functions: Rc<HashMap<String, Box<crate::command::Command>>>,
     /// User-defined aliases. `name` → expansion text. Populated by
     /// the `alias` builtin; consumed by `expand_aliases_in_tokens`
     /// during interactive REPL input.
@@ -260,7 +267,9 @@ pub struct Shell {
     pub sigchld_flag: Arc<AtomicBool>,
     pub sigint_flag: Arc<AtomicBool>,
     pub shell_pgid: i32,
-    pub history: crate::history::History,
+    /// Command history. `Rc` so cloning the Shell (per command substitution) is
+    /// O(1); the rare mutation (append/load/clear) uses `Rc::make_mut` (COW).
+    pub history: Rc<crate::history::History>,
     /// Shell PID, cached at startup via `getpid()`. Used for `$$`.
     pub shell_pid: i32,
     /// PID of the most-recently-backgrounded pipeline's last stage. Used for `$!`.
@@ -351,7 +360,7 @@ pub struct Shell {
     /// Maps a bare name to (resolved path, hit count). Hit count
     /// is currently always 0 — no executor integration yet (see
     /// M-34 in docs/bash-divergences.md).
-    pub command_hash: std::collections::HashMap<String, (std::path::PathBuf, u32)>,
+    pub command_hash: Rc<std::collections::HashMap<String, (std::path::PathBuf, u32)>>,
 
     /// Directory stack maintained by the `pushd`/`popd`/`dirs`
     /// builtins. Top is index 0 — always synced with `$PWD` at
@@ -359,7 +368,7 @@ pub struct Shell {
     pub dir_stack: Vec<std::path::PathBuf>,
 
     /// Programmable-completion registry (filled by the `complete` builtin).
-    pub completion_specs: CompletionSpecs,
+    pub completion_specs: Rc<CompletionSpecs>,
     /// Ephemeral slot used by `compopt` inside a `-F` function to mutate
     /// the live spec. Set by `dispatch::resolve` before invoking `-F`;
     /// taken back out afterward.
@@ -386,13 +395,13 @@ impl Shell {
             positional_args: Vec::new(),
             getopts_sp: 0,
             getopts_optind_cache: 0,
-            functions: HashMap::new(),
+            functions: Rc::new(HashMap::new()),
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
             shell_pgid: unsafe { libc::getpgrp() },
-            history: crate::history::History::new(),
+            history: Rc::new(crate::history::History::new()),
             shell_pid,
             last_bg_pid: None,
             shell_argv0,
@@ -411,9 +420,9 @@ impl Shell {
             source_depth: 0,
             local_scopes: Vec::new(),
             loop_depth: 0,
-            command_hash: std::collections::HashMap::new(),
+            command_hash: Rc::new(std::collections::HashMap::new()),
             dir_stack: Vec::new(),
-            completion_specs: CompletionSpecs::default(),
+            completion_specs: Rc::new(CompletionSpecs::default()),
             current_completion_spec: None,
         };
         // Make the trap_pending Arc visible to async-signal-safe
@@ -854,6 +863,18 @@ impl Shell {
                 integer: false,
             },
         );
+    }
+
+    /// Defines (or replaces) a shell function. Copy-on-write: if the function
+    /// table is shared (e.g. with a command-substitution clone), this copies it
+    /// first so the mutation does not leak across the isolation boundary.
+    pub(crate) fn define_function(&mut self, name: String, body: Box<crate::command::Command>) {
+        Rc::make_mut(&mut self.functions).insert(name, body);
+    }
+
+    /// Removes a shell function. Returns true if it existed. Copy-on-write.
+    pub(crate) fn remove_function(&mut self, name: &str) -> bool {
+        Rc::make_mut(&mut self.functions).remove(name).is_some()
     }
 
     /// Replaces (or creates) `name` as an indexed array with the given
@@ -1356,6 +1377,47 @@ mod tests {
         assert_eq!(arr.get(&1).map(String::as_str), Some("1"));
         assert_eq!(arr.get(&2).map(String::as_str), Some("0"));
         assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn shell_clone_shares_functions_and_cow_isolates_defines() {
+        let mut a = Shell::new();
+        // Use the same minimal body shape as the builtins tests.
+        let body = Box::new(crate::command::Command::Simple(
+            crate::command::SimpleCommand::Assign(vec![]),
+        ));
+        a.define_function("f".to_string(), body.clone());
+        assert_eq!(Rc::strong_count(&a.functions), 1);
+        let b = a.clone();
+        // After clone both shells share the same Rc — O(1) clone, NOT a deep copy.
+        assert_eq!(Rc::strong_count(&a.functions), 2);
+        // COW: defining a new function in `a` must NOT affect `b`.
+        a.define_function("g".to_string(), body);
+        assert!(a.functions.contains_key("g"));
+        assert!(!b.functions.contains_key("g")); // isolation preserved
+        // After make_mut the two Rcs are now independent.
+        assert_eq!(Rc::strong_count(&a.functions), 1);
+    }
+
+    #[test]
+    fn shell_clone_shares_command_hash_history_completion_specs() {
+        let mut a = Shell::new();
+        let b = a.clone();
+        // All three Rc fields are shared after clone — O(1), not deep copies.
+        assert_eq!(Rc::strong_count(&a.command_hash), 2);
+        assert_eq!(Rc::strong_count(&a.history), 2);
+        assert_eq!(Rc::strong_count(&a.completion_specs), 2);
+
+        // COW: a mutation on `a` must not affect `b`.
+        Rc::make_mut(&mut a.command_hash).insert(
+            "myls".to_string(),
+            (std::path::PathBuf::from("/bin/ls"), 0),
+        );
+        assert!(a.command_hash.contains_key("myls"), "a should have myls");
+        assert!(!b.command_hash.contains_key("myls"), "b must not see a's mutation");
+        // After make_mut the two command_hash Rcs are now independent.
+        assert_eq!(Rc::strong_count(&a.command_hash), 1);
+        assert_eq!(Rc::strong_count(&b.command_hash), 1);
     }
 
     #[test]

@@ -428,7 +428,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             }
         }
         Command::FunctionDef { name, body } => {
-            shell.functions.insert(name.clone(), body.clone());
+            shell.define_function(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
         Command::DoubleBracket { expr, inline_assignments } => {

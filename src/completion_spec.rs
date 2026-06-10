@@ -692,9 +692,9 @@ mod tests {
         let body: Box<crate::command::Command> = Box::new(crate::command::Command::Simple(
             crate::command::SimpleCommand::Assign(vec![]),
         ));
-        sh.functions.insert("alpha".to_string(), body.clone());
-        sh.functions.insert("alpine".to_string(), body.clone());
-        sh.functions.insert("beta".to_string(), body);
+        sh.define_function("alpha".to_string(), body.clone());
+        sh.define_function("alpine".to_string(), body.clone());
+        sh.define_function("beta".to_string(), body);
 
         let spec = CompletionSpec {
             actions: vec![Action::Function],

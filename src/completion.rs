@@ -1019,7 +1019,6 @@ mod tests {
 
     #[test]
     fn helper_holds_rc_refcell_shell() {
-        use std::rc::Rc;
         use std::cell::RefCell;
         let shell = Rc::new(RefCell::new(Shell::new()));
         let helper = HuckHelper::new(Rc::clone(&shell));
@@ -1039,17 +1038,19 @@ mod tests {
     #[test]
     fn dispatch_variable_context_bypasses_spec() {
         use std::cell::RefCell;
-        use std::rc::Rc;
         let shell = Rc::new(RefCell::new(Shell::new()));
         shell.borrow_mut().set("MY_VAR", "x".to_string());
         // Register a spec for some command — it should NOT fire on $var.
-        shell.borrow_mut().completion_specs.by_command.insert(
-            "echo".to_string(),
-            crate::completion_spec::CompletionSpec {
-                wordlist: Some("should_not_appear".to_string()),
-                ..Default::default()
-            },
-        );
+        {
+            let mut s = shell.borrow_mut();
+            Rc::make_mut(&mut s.completion_specs).by_command.insert(
+                "echo".to_string(),
+                crate::completion_spec::CompletionSpec {
+                    wordlist: Some("should_not_appear".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let mut s = shell.borrow_mut();
         let (start, cands) = dispatch::resolve("echo $MY_V", 10, &mut s);
         assert_eq!(start, 6);
@@ -1069,7 +1070,7 @@ mod tests {
     #[test]
     fn dispatch_arg_position_uses_spec() {
         let mut shell = Shell::new();
-        shell.completion_specs.by_command.insert(
+        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
             "myc".to_string(),
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("alpha alpine beta".to_string()),
@@ -1109,7 +1110,7 @@ mod tests {
             },
             ..Default::default()
         };
-        shell.completion_specs.by_command.insert("mycmd".to_string(), spec);
+        Rc::make_mut(&mut shell.completion_specs).by_command.insert("mycmd".to_string(), spec);
 
         let (_, cands) = dispatch::resolve("mycmd alpha", 11, &mut shell);
         std::env::set_current_dir(prior_cwd).unwrap();
@@ -1121,10 +1122,11 @@ mod tests {
     #[test]
     fn dispatch_d_default_spec_applies_when_no_match() {
         let mut shell = Shell::new();
-        shell.completion_specs.default_spec = Some(crate::completion_spec::CompletionSpec {
-            wordlist: Some("dfault".to_string()),
-            ..Default::default()
-        });
+        Rc::make_mut(&mut shell.completion_specs).default_spec =
+            Some(crate::completion_spec::CompletionSpec {
+                wordlist: Some("dfault".to_string()),
+                ..Default::default()
+            });
         let (_, cands) = dispatch::resolve("randomcmd df", 12, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(names, vec!["dfault"]);
@@ -1170,7 +1172,7 @@ mod tests {
         let prior = std::env::current_dir().unwrap();
         std::env::set_current_dir(tempdir.path()).unwrap();
 
-        shell.completion_specs.by_command.insert(
+        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
             "mycmd".to_string(),
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("subd".to_string()),
@@ -1208,7 +1210,7 @@ mod tests {
         // Quoted command name like "git" or 'git' should reach its
         // registered spec — the registry is keyed by the unquoted name.
         let mut shell = Shell::new();
-        shell.completion_specs.by_command.insert(
+        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
             "mycmd".to_string(),
             crate::completion_spec::CompletionSpec {
                 wordlist: Some("alpha".to_string()),

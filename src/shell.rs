@@ -281,7 +281,7 @@ pub fn run(args: &[String]) -> i32 {
 
     {
         let mut shell = shell_cell.borrow_mut();
-        shell.history.load();
+        Rc::make_mut(&mut shell.history).load();
         for (_, command) in shell.history.entries() {
             let _ = editor.add_history_entry(command);
         }
@@ -319,7 +319,7 @@ pub fn run(args: &[String]) -> i32 {
                 {
                     let mut shell = shell_cell.borrow_mut();
                     if !history.trim().is_empty() {
-                        shell.history.add(history.clone());
+                        Rc::make_mut(&mut shell.history).add(history.clone());
                         let _ = editor.add_history_entry(history.as_str());
                     }
                 }
