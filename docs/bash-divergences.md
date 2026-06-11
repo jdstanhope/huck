@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 21 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 28 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -94,10 +94,6 @@ group.
 ### Globbing
 
 - **M-53: `**` globstar** — `[deferred]` low. huck: `**` ≡ `*`. bash: `shopt -s globstar` makes `**` match across `/`.
-
-### History
-
-- **M-59: `HISTSIZE` / `HISTFILESIZE` env vars** — `[deferred]` medium. huck: compile-time `HISTORY_MAX = 1000`. bash: reads env vars.
 
 ---
 

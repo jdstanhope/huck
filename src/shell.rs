@@ -295,9 +295,13 @@ pub fn run(args: &[String]) -> i32 {
         if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
             crate::traps::fire_exit_trap(&mut shell);
             shell.hangup_jobs();
-            shell.history.save();
+            shell.save_history();
             return exit_code;
         }
+        // v139: re-apply the in-memory cap now that ~/.huckrc may have set HISTSIZE
+        // (history was loaded before rc). Nets out to bash's rc-then-history effect.
+        let cap = shell.resolve_histsize();
+        Rc::make_mut(&mut shell.history).set_max(cap);
     }
 
     loop {
@@ -311,7 +315,7 @@ pub fn run(args: &[String]) -> i32 {
             if let Some(exit_code) = fire_prompt_command(&mut shell) {
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
-                shell.history.save();
+                shell.save_history();
                 return exit_code;
             }
         }
@@ -320,7 +324,7 @@ pub fn run(args: &[String]) -> i32 {
                 {
                     let mut shell = shell_cell.borrow_mut();
                     if !history.trim().is_empty() {
-                        Rc::make_mut(&mut shell.history).add(history.clone());
+                        shell.record_history(history.clone());
                         let _ = editor.add_history_entry(history.as_str());
                     }
                 }
@@ -338,7 +342,7 @@ pub fn run(args: &[String]) -> i32 {
                         let mut shell = shell_cell.borrow_mut();
                         crate::traps::fire_exit_trap(&mut shell);
                         shell.hangup_jobs();
-                        shell.history.save();
+                        shell.save_history();
                         return code;
                     }
                     ExecOutcome::Continue(status) => {
@@ -353,7 +357,7 @@ pub fn run(args: &[String]) -> i32 {
                         {
                             crate::traps::fire_exit_trap(&mut shell);
                             shell.hangup_jobs();
-                            shell.history.save();
+                            shell.save_history();
                             return fatal_status;
                         }
                     }
@@ -374,7 +378,7 @@ pub fn run(args: &[String]) -> i32 {
                 let mut shell = shell_cell.borrow_mut();
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
-                shell.history.save();
+                shell.save_history();
                 return shell.last_status();
             }
             ReadResult::EofMidCommand => {
@@ -382,7 +386,7 @@ pub fn run(args: &[String]) -> i32 {
                 let mut shell = shell_cell.borrow_mut();
                 crate::traps::fire_exit_trap(&mut shell);
                 shell.hangup_jobs();
-                shell.history.save();
+                shell.save_history();
                 return 2;
             }
             ReadResult::ReadError(msg) => {

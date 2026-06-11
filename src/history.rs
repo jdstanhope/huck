@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-const HISTORY_MAX: usize = 1000;
+pub(crate) const HISTORY_MAX: usize = 1000;
 
 /// A history-expansion failure. The shell prints these and refuses to
 /// run the offending line.
@@ -32,7 +32,7 @@ impl std::fmt::Display for HistError {
 pub struct History {
     entries: Vec<String>,
     base_number: usize,
-    max: usize,
+    max: Option<usize>,
     file: Option<PathBuf>,
 }
 
@@ -41,18 +41,33 @@ impl History {
         Self {
             entries: Vec::new(),
             base_number: 1,
-            max: HISTORY_MAX,
+            max: Some(HISTORY_MAX),
             file: resolve_histfile(),
         }
     }
 
-    /// Appends a command, evicting the oldest entries past the cap.
+    /// Appends a command, evicting the oldest entries past the cap (no eviction
+    /// when `max` is `None` = unlimited).
     pub fn add(&mut self, line: String) {
         self.entries.push(line);
-        while self.entries.len() > self.max {
-            self.entries.remove(0);
-            self.base_number += 1;
+        self.enforce_max();
+    }
+
+    /// Evicts oldest entries until the list fits `self.max` (no-op when `None`).
+    fn enforce_max(&mut self) {
+        if let Some(cap) = self.max {
+            while self.entries.len() > cap {
+                self.entries.remove(0);
+                self.base_number += 1;
+            }
         }
+    }
+
+    /// Sets the in-memory cap and immediately evicts entries past it. (v139)
+    /// Called by `Shell::record_history` to apply the live `$HISTSIZE`.
+    pub fn set_max(&mut self, max: Option<usize>) {
+        self.max = max;
+        self.enforce_max();
     }
 
     /// Looks up an entry by its absolute display number.
@@ -114,8 +129,10 @@ impl History {
             Ok(contents) => {
                 let mut lines: Vec<String> =
                     contents.lines().map(unescape_for_load).collect();
-                if lines.len() > self.max {
-                    lines.drain(0..lines.len() - self.max);
+                if let Some(cap) = self.max
+                    && lines.len() > cap
+                {
+                    lines.drain(0..lines.len() - cap);
                 }
                 self.entries = lines;
                 self.base_number = 1;
@@ -127,20 +144,33 @@ impl History {
         }
     }
 
-    /// Writes `entries` to the histfile, one command per line, overwriting.
-    /// Embedded `\` and `\n` are escape-encoded so multi-line entries
-    /// round-trip losslessly. A write error prints a warning; it never
-    /// aborts the shell.
-    pub fn save(&self) {
+    /// Writes the last `file_cap` entries to the histfile, one command per
+    /// line, overwriting (all when `None`, empty when `Some(0)`). Embedded
+    /// `\` and `\n` are escape-encoded so multi-line entries round-trip
+    /// losslessly. A write error prints a warning; it never aborts the
+    /// shell. (v139)
+    pub fn save_capped(&self, file_cap: Option<usize>) {
         let Some(path) = &self.file else { return };
+        let start = match file_cap {
+            Some(cap) => self.entries.len().saturating_sub(cap),
+            None => 0,
+        };
         let mut out = String::new();
-        for entry in &self.entries {
+        for entry in &self.entries[start..] {
             out.push_str(&escape_for_save(entry));
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
             eprintln!("huck: warning: could not write history file: {e}");
         }
+    }
+
+    /// Test-only helper: write all in-memory entries (capped by the in-memory
+    /// `max`). Production save paths go through `Shell::save_history` →
+    /// `save_capped` with the live `$HISTFILESIZE` (v139).
+    #[cfg(test)]
+    pub fn save(&self) {
+        self.save_capped(self.max);
     }
 }
 
@@ -427,7 +457,57 @@ mod tests {
     use super::*;
 
     fn empty() -> History {
-        History { entries: Vec::new(), base_number: 1, max: 1000, file: None }
+        History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None }
+    }
+
+    #[test]
+    fn set_max_some_evicts_to_cap() {
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
+        for c in ["c1", "c2", "c3", "c4", "c5"] { h.add(c.to_string()); }
+        h.set_max(Some(3));
+        let got: Vec<(usize, &str)> = h.entries().collect();
+        assert_eq!(got, vec![(3, "c3"), (4, "c4"), (5, "c5")]);
+    }
+
+    #[test]
+    fn set_max_none_keeps_all() {
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(2), file: None };
+        h.set_max(None);
+        for c in ["c1", "c2", "c3", "c4"] { h.add(c.to_string()); }
+        let got: Vec<(usize, &str)> = h.entries().collect();
+        assert_eq!(got, vec![(1, "c1"), (2, "c2"), (3, "c3"), (4, "c4")]);
+    }
+
+    #[test]
+    fn set_max_zero_empties() {
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(10), file: None };
+        h.add("c1".to_string());
+        h.set_max(Some(0));
+        assert_eq!(h.last(), None);
+        h.add("c2".to_string()); // add under cap 0 keeps nothing
+        assert_eq!(h.last(), None);
+    }
+
+    #[test]
+    fn save_capped_writes_last_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        let mut h = History { entries: Vec::new(), base_number: 1, max: None, file: Some(path.clone()) };
+        for c in ["c1", "c2", "c3"] { h.add(c.to_string()); }
+        h.save_capped(Some(2));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "c2\nc3\n");
+    }
+
+    #[test]
+    fn save_capped_none_writes_all_and_zero_writes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        let mut h = History { entries: Vec::new(), base_number: 1, max: None, file: Some(path.clone()) };
+        for c in ["c1", "c2"] { h.add(c.to_string()); }
+        h.save_capped(None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "c1\nc2\n");
+        h.save_capped(Some(0));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     #[test]
@@ -454,7 +534,7 @@ mod tests {
 
     #[test]
     fn cap_eviction_bumps_base_number() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: 3, file: None };
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(3), file: None };
         for cmd in ["c1", "c2", "c3", "c4", "c5"] {
             h.add(cmd.to_string());
         }
@@ -504,7 +584,7 @@ mod tests {
         let writer = History {
             entries: vec!["one".to_string(), "two".to_string(), "three".to_string()],
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path.clone()),
         };
         writer.save();
@@ -512,7 +592,7 @@ mod tests {
         let mut reader = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path.clone()),
         };
         reader.load();
@@ -527,7 +607,7 @@ mod tests {
         let mut h = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path),
         };
         h.load();
@@ -543,7 +623,7 @@ mod tests {
         let mut h = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 3,
+            max: Some(3),
             file: Some(path),
         };
         h.load();
@@ -553,7 +633,7 @@ mod tests {
 
     #[test]
     fn load_and_save_no_op_when_file_is_none() {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: 1000, file: None };
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
         h.load();
         h.save();
         assert_eq!(h.last(), None);
@@ -567,7 +647,7 @@ mod tests {
             let mut h = History {
                 entries: Vec::new(),
                 base_number: 1,
-                max: 1000,
+                max: Some(1000),
                 file: Some(path.clone()),
             };
             h.add("cat <<EOF\nhello\nworld\nEOF".to_string());
@@ -576,7 +656,7 @@ mod tests {
         let mut h2 = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path.clone()),
         };
         h2.load();
@@ -592,7 +672,7 @@ mod tests {
             let mut h = History {
                 entries: Vec::new(),
                 base_number: 1,
-                max: 1000,
+                max: Some(1000),
                 file: Some(path.clone()),
             };
             h.add(r"echo a\b".to_string());
@@ -601,7 +681,7 @@ mod tests {
         let mut h2 = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path.clone()),
         };
         h2.load();
@@ -617,7 +697,7 @@ mod tests {
         let mut h = History {
             entries: Vec::new(),
             base_number: 1,
-            max: 1000,
+            max: Some(1000),
             file: Some(path.clone()),
         };
         h.load();
@@ -626,7 +706,7 @@ mod tests {
     }
 
     fn hist_with(cmds: &[&str]) -> History {
-        let mut h = History { entries: Vec::new(), base_number: 1, max: 1000, file: None };
+        let mut h = History { entries: Vec::new(), base_number: 1, max: Some(1000), file: None };
         for c in cmds {
             h.add(c.to_string());
         }
