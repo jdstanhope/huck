@@ -2004,6 +2004,58 @@ fn split_into_names(
         .collect()
 }
 
+/// Splits `line` into ALL IFS fields (the unbounded form used by `read -a` /
+/// mapfile element splitting). Mirrors bash word-splitting: leading IFS-ws is
+/// stripped; a non-ws IFS char delimits (a leading one yields a leading empty
+/// field, an adjacent pair yields an empty field between, but a TRAILING one
+/// yields no trailing empty field); ws-IFS runs collapse. Empty IFS -> the whole
+/// line as one field (none for an empty line).
+#[allow(dead_code)] // Wired into read -a in Task 2
+fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
+    let ifs_bytes: Vec<u8> = ifs.bytes().collect();
+    if ifs_bytes.is_empty() {
+        return if line.is_empty() { Vec::new() } else { vec![line.to_string()] };
+    }
+    let is_ws = |b: u8| ifs_bytes.contains(&b) && matches!(b, b' ' | b'\t' | b'\n');
+    let is_nonws = |b: u8| ifs_bytes.contains(&b) && !matches!(b, b' ' | b'\t' | b'\n');
+    let is_any = |b: u8| ifs_bytes.contains(&b);
+    let bytes = line.as_bytes();
+    let mut fields: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && is_ws(bytes[i]) {
+        i += 1;
+    }
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && !is_any(bytes[i]) {
+            i += 1;
+        }
+        fields.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+        if i >= bytes.len() {
+            break;
+        }
+        // Consume one separator. Non-ws IFS: exactly one + trailing ws-IFS.
+        // ws-IFS: collapse the run, then optionally one non-ws IFS + trailing ws.
+        if is_nonws(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() && is_nonws(bytes[i]) {
+                i += 1;
+                while i < bytes.len() && is_ws(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    fields
+}
+
 #[cfg(unix)]
 unsafe fn silent_disable_echo() -> Option<libc::termios> {
     use std::os::unix::io::AsRawFd;
@@ -9331,6 +9383,28 @@ mod read_tests {
                 ("Y".to_string(), "b:c".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn split_read_fields_default_ws() {
+        assert_eq!(split_read_fields("a b c", " \t\n"), vec!["a", "b", "c"]);
+        assert_eq!(split_read_fields("  x   y  ", " \t\n"), vec!["x", "y"]); // trim + collapse
+        assert_eq!(split_read_fields("", " \t\n"), Vec::<String>::new());   // empty -> none
+    }
+
+    #[test]
+    fn split_read_fields_nonws_ifs() {
+        assert_eq!(split_read_fields("a:b:c", ":"), vec!["a", "b", "c"]);
+        assert_eq!(split_read_fields("x:y:", ":"), vec!["x", "y"]);       // trailing delim: NO empty
+        assert_eq!(split_read_fields(":x", ":"), vec!["", "x"]);          // leading delim: empty first
+        assert_eq!(split_read_fields("x::y", ":"), vec!["x", "", "y"]);   // adjacent: empty between
+    }
+
+    #[test]
+    fn split_read_fields_mixed_and_empty_ifs() {
+        assert_eq!(split_read_fields("x : y", " :"), vec!["x", "y"]);     // ws around nonws collapses
+        assert_eq!(split_read_fields("a b c", ""), vec!["a b c"]);        // empty IFS -> one field
+        assert_eq!(split_read_fields("", ""), Vec::<String>::new());      // empty IFS + empty -> none
     }
 }
 
