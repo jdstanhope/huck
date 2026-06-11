@@ -4085,9 +4085,10 @@ fn run_multi_stage(
     // (e.g., if the last stage had an explicit stdout redirect, prev_pipe_read
     // might still hold a stale value from a stage with a broken pipe — but that
     // shouldn't happen in a well-formed pipeline).
-    // The capture_read_fd is intentionally kept open until after wait.
+    // Keep the capture_read_fd open here — it is drained immediately below,
+    // BEFORE the wait (M-119), so it must survive this bulk-close.
     for fd in parent_held.iter().copied() {
-        // Don't close the capture_read_fd; we need it after wait.
+        // Don't close the capture_read_fd; it is drained just below (pre-wait).
         if Some(fd) != capture_read_fd {
             unsafe { libc::close(fd); }
         }
