@@ -79,6 +79,25 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
                 i += 1;
                 continue;
             }
+            // $((...)) arithmetic.
+            if bytes[i + 1] == b'(' && i + 2 < bytes.len() && bytes[i + 2] == b'(' {
+                match scan_arith_close(bytes, i + 3) {
+                    Some((body_end, next_i)) => {
+                        let body = &template[i + 3..body_end];
+                        if let Ok(expr) = crate::arith::parse(body)
+                            && let Ok(n) = crate::arith::eval(&expr, shell)
+                        {
+                            out.push_str(&n.to_string());
+                        }
+                        i = next_i;
+                        continue;
+                    }
+                    None => {
+                        out.push_str(&template[i..]);
+                        break;
+                    }
+                }
+            }
             if bytes[i + 1] == b'{' {
                 // ${NAME}
                 let start = i + 2;
@@ -122,6 +141,28 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
         }
     }
     out
+}
+
+/// Finds the matching `))` for a `$((…))` whose `$((` ends at `start`.
+/// Returns `(body_end_exclusive, next_index_after_closing)`. Mirrors the
+/// lexer's `scan_arith_block` close rule (a `)` at depth 0 followed by `)`).
+fn scan_arith_close(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut k = start;
+    let mut depth: i32 = 0;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 && k + 1 < bytes.len() && bytes[k + 1] == b')' {
+                    return Some((k, k + 2));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 // ── Per-escape helpers ─────────────────────────────────────────
@@ -371,5 +412,21 @@ mod tests {
             expand_prompt("${___DEFINITELY_UNSET_PROMPT___}>", &mut shell),
             ">"
         );
+    }
+
+    #[test]
+    fn expand_arith_simple() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$((40+2))", &mut shell), "42");
+    }
+    #[test]
+    fn expand_arith_nested_parens() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("[$(( (1+2)*3 ))]", &mut shell), "[9]");
+    }
+    #[test]
+    fn expand_arith_unterminated_is_literal() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$((1+2", &mut shell), "$((1+2");
     }
 }
