@@ -2010,7 +2010,6 @@ fn split_into_names(
 /// field, an adjacent pair yields an empty field between, but a TRAILING one
 /// yields no trailing empty field); ws-IFS runs collapse. Empty IFS -> the whole
 /// line as one field (none for an empty line).
-#[allow(dead_code)] // Wired into read -a in Task 2
 fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
     let ifs_bytes: Vec<u8> = ifs.bytes().collect();
     if ifs_bytes.is_empty() {
@@ -2115,7 +2114,7 @@ impl std::io::Read for RawStdinReader {
     }
 }
 
-/// `read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]`. Regular
+/// `read [-r] [-p PROMPT] [-s] [-d DELIM] [-a ARRAY] [NAME ...]`. Regular
 /// builtin. Reads one logical line from stdin and assigns fields to
 /// NAME(s) per IFS field-splitting. With no NAME, assigns the whole
 /// line to `REPLY`. `-r` disables backslash processing. `-p` writes
@@ -2133,6 +2132,7 @@ fn builtin_read(
     let mut silent = false;
     let mut prompt: Option<String> = None;
     let mut delim: u8 = b'\n';
+    let mut array_name: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2180,6 +2180,20 @@ fn builtin_read(
                     delim = d_val.bytes().next().unwrap_or(0u8);
                     break;
                 }
+                b'a' => {
+                    let v: String = if j + 1 < bytes.len() {
+                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: read: -a: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        args[i].clone()
+                    };
+                    array_name = Some(v);
+                    break;
+                }
                 c => {
                     eprintln!("huck: read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
@@ -2197,6 +2211,12 @@ fn builtin_read(
             eprintln!("huck: read: `{name}': not a valid identifier");
             return ExecOutcome::Continue(1);
         }
+    }
+    if let Some(arr) = &array_name
+        && !is_valid_name(arr)
+    {
+        eprintln!("huck: read: `{arr}': not a valid identifier");
+        return ExecOutcome::Continue(1);
     }
 
     // Prompt — only when stdin is a tty (matches bash).
@@ -2264,6 +2284,15 @@ fn builtin_read(
 
     // Assignment.
     let ifs = shell.ifs();
+    if let Some(arr) = array_name {
+        let fields = split_read_fields(&line, &ifs);
+        let map: std::collections::BTreeMap<usize, String> =
+            fields.into_iter().enumerate().collect();
+        if shell.replace_array(&arr, map).is_err() {
+            return ExecOutcome::Continue(1); // replace_array printed the readonly message
+        }
+        return ExecOutcome::Continue(0);
+    }
     let assignments: Vec<(String, String)> = if names.is_empty() {
         vec![("REPLY".to_string(), line)]
     } else {
@@ -5073,14 +5102,15 @@ static HELP_ENTRIES: &[HelpEntry] = &[
     },
     HelpEntry {
         name: "read",
-        synopsis: "read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]",
+        synopsis: "read [-r] [-p PROMPT] [-s] [-d DELIM] [-a ARRAY] [NAME ...]",
         description: "Read a line from standard input.\n\
                       With no NAME, store the line in REPLY. With one NAME, strip leading\n\
                       and trailing IFS-whitespace and assign. With multiple NAMES, IFS-split;\n\
                       the last NAME gets the unsplit remainder.\n\
                       -r raw (no backslash escape processing). -p PROMPT writes a prompt\n\
                       to stderr (tty only). -s suppresses echo (passwords). -d DELIM uses\n\
-                      DELIM as the line terminator.",
+                      DELIM as the line terminator.\n\
+                      -a ARRAY assigns the IFS-split words to the indexed array ARRAY.",
     },
     HelpEntry {
         name: "readonly",
