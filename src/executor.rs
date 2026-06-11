@@ -2548,6 +2548,12 @@ fn stderr_dups_to_stdout(cmd: &ExecCommand, shell: &mut Shell) -> bool {
 /// Create a pipe, write `bytes` to the write end, close it, return the
 /// read end's raw fd. Used to feed a heredoc/here-string body to an
 /// in-process builtin's stdin.
+/// Blocking-write variant: writes the body into a pipe before returning the read
+/// end. Safe ONLY where the consumer drains synchronously without backpressure
+/// (the in-process builtin stdin path). For compound/pipeline/captured consumers
+/// that can backpressure, use `spawn_heredoc_writer` (a body > the pipe buffer
+/// would otherwise deadlock — M-120). Task-2 sites still call this; v134 converts
+/// the deadlock-prone ones.
 fn write_pipe_for_stdin(bytes: &[u8]) -> Result<RawFd, ()> {
     let mut fds: [libc::c_int; 2] = [-1, -1];
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -2619,10 +2625,12 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
                 libc::write(w, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
             };
             if n < 0 {
-                match io::Error::last_os_error().raw_os_error() {
-                    Some(libc::EINTR) => continue,
-                    _ => break, // EPIPE (consumer gone) or other: done.
-                }
+                // Read errno directly (async-signal-safe; no Rust io::Error
+                // wrapper between fork and _exit). EINTR → retry; EPIPE (consumer
+                // gone) or anything else → stop, body delivery is moot.
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR { continue; }
+                break;
             }
             if n == 0 { break; }
             off += n as usize;
