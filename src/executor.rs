@@ -43,6 +43,26 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
     }
 }
 
+/// Consumes a pending SIGINT and decides whether to abort. Returns
+/// `Some(ExecOutcome::Interrupted)` when an untrapped SIGINT is pending; `None`
+/// when none is pending OR when a user `INT` trap (handler or ignore-form) is
+/// installed — the existing trap dispatch then handles it and execution
+/// continues, matching bash. (v138)
+pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
+    use std::sync::atomic::Ordering;
+    if shell
+        .sigint_flag
+        .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        if shell.trap_sigids.contains_key(&libc::SIGINT) {
+            return None;
+        }
+        return Some(ExecOutcome::Interrupted);
+    }
+    None
+}
+
 /// Runs a top-level sequence, sending the terminal pipeline-stage's stdout to
 /// the given `sink`. `execute` is the Terminal-sink wrapper; command
 /// substitution / `$()` capture supply a `Capture` sink so a captured `eval`
@@ -137,6 +157,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
+        ExecOutcome::Interrupted => 130,
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
@@ -154,10 +175,13 @@ fn run_andor_group(
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
     let mut status = run_command(first, shell, sink);
+    if let Some(o) = check_interrupt(shell) {
+        return o;
+    }
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_)
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
     ) {
         return status;
     }
@@ -195,10 +219,13 @@ fn run_andor_group(
         };
         if should_run {
             status = run_command(command, shell, sink);
+            if let Some(o) = check_interrupt(shell) {
+                return o;
+            }
             if matches!(
                 status,
                 ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                    | ExecOutcome::FunctionReturn(_)
+                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
             ) {
                 return status;
             }
@@ -308,6 +335,7 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
                     | ExecOutcome::LoopBreak(_, _)
                     | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_)
+                    | ExecOutcome::Interrupted
             ) {
                 return last_status;
             }
@@ -751,7 +779,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) => {
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
@@ -778,6 +806,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -847,6 +876,7 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1033,6 +1063,7 @@ fn run_arith_for_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1173,6 +1204,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
             }
             ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
             ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
         }
 
@@ -1245,6 +1277,7 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
                 ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
                 ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
+                ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
             },
         }
@@ -1273,7 +1306,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_)
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
     ) {
         return cond;
     }
@@ -1287,7 +1320,7 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_)
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
         ) {
             return elif_cond;
         }
@@ -2784,6 +2817,7 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
         ExecOutcome::LoopBreak(_, st) => shell.set_pipestatus(&[st]),
         ExecOutcome::LoopContinue(_) => shell.set_pipestatus(&[0]),
         ExecOutcome::Exit(_) | ExecOutcome::FunctionReturn(_) => {}
+        ExecOutcome::Interrupted => {}
     }
     outcome
 }
@@ -4804,6 +4838,7 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
             ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
             ExecOutcome::FunctionReturn(n) => n,
+            ExecOutcome::Interrupted => 130,
         };
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or

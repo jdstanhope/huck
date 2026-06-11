@@ -15,6 +15,10 @@ pub enum ExecOutcome {
     LoopBreak(u32, i32),    // (level: 1-based capped to loop_depth, terminal $?: 0 normal / 1 malformed-arg)
     LoopContinue(u32),
     FunctionReturn(i32),
+    /// v138: an untrapped SIGINT was observed — abort the running command list.
+    /// Propagates like `Exit` until a top-level consumer (REPL reprompts with
+    /// `$?`=130 and does NOT exit; `-c`/script exits 130).
+    Interrupted,
 }
 
 pub const BUILTIN_NAMES: &[&str] = &[
@@ -5504,6 +5508,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
                             last_status = 0;
                         }
+                        ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
                     }
 
                     // A command may have flipped `shopt extglob`, which changes
