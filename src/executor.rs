@@ -2607,7 +2607,10 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
     }
     if pid == 0 {
         // CHILD: async-signal-safe only. Close read end; write the body; _exit.
-        unsafe { libc::close(r); }
+        // v137: keep SIGPIPE ignored here (the process is otherwise SIG_DFL now)
+        // so the writer retains its manual EPIPE handling and closes cleanly,
+        // preserving v134 large-heredoc behavior exactly.
+        unsafe { libc::close(r); libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
         let mut off = 0usize;
         while off < bytes.len() {
             let n = unsafe {
