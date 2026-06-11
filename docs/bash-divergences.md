@@ -27,10 +27,10 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-120). |
+| Bugs (Tier 1) | 1 | Open bugs to fix (M-114). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 26 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -45,33 +45,6 @@ huck behaves wrong without a design reason; should be fixed.
 - **bash**: treats `x=(…)` specially even as an argument and does not error.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
-
-### M-120: a large heredoc body feeding a pipeline/compound deadlocks
-- **Status**: `[deferred]` (found v133)
-- **Severity**: medium-high (HANGS the shell; the actual `nvm ls-remote` blocker)
-- **huck**: a heredoc whose body exceeds the ~64 KiB pipe buffer, attached to a
-  MULTI-STAGE pipeline or a compound (brace-group/`while`) that backpressures,
-  DEADLOCKS. Minimal repro (bash → `200001`, huck → HANG):
-  `V="$(printf 'x%.0s' $(seq 1 200000))"; { wc -c; } << EOF` / `$V` / `EOF`. A
-  small heredoc body, or the same body to a SIMPLE command, both work — so it's a
-  pipe-buffer backpressure issue, not heredoc parsing.
-- **bash**: writes the heredoc body without stalling the pipeline (the body pipe
-  is drained concurrently with the consumer running).
-- **Root**: the parent does a BLOCKING `write_all` of the heredoc body into the
-  heredoc pipe inside the per-stage spawn loop (`src/executor.rs` ~4070 in
-  `run_multi_stage`, ~2039 in `run_background_sequence`). When the consumer stage
-  backpressures (its own inter-stage/output pipe fills) before downstream stages
-  are spawned/draining, the parent's `write_all` blocks → deadlock. Predates v133
-  (the `run_multi_stage` rewrite); orthogonal to v133's captured-pipeline-drain fix.
-- **Context**: the REAL `nvm ls-remote` hang — nvm.sh:1631 feeds the ~200 KiB
-  `index.tab` (`$VERSION_LIST`) into `{ command awk … | while read …; done; } << EOF`.
-  v132 (eval/source sink) and v133 (captured-pipeline drain) each fixed a real but
-  DIFFERENT bug on the path; this heredoc-write deadlock is the current blocker.
-- **Next**: write the heredoc body without stalling the pipeline — a background
-  writer thread, or `O_NONBLOCK` + poll/interleave, or write after all stages are
-  spawned. Own iteration (v134), and VERIFY `nvm ls-remote` completes end-to-end
-  before claiming.
-
 
 ---
 
@@ -222,6 +195,8 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-27: history expansion runs on piped (non-interactive) stdin** — `[low]`. huck applies `!`-history expansion to commands read from piped stdin (`printf 'echo hi!there\n' | huck` → `huck: !there: event not found`), whereas bash disables history expansion when non-interactive (piped stdin or a script) and prints `hi!there`. huck's file-arg path (`huck script.sh`) and `source` are unaffected — they match bash. Root: the REPL/piped-stdin reader (`src/shell.rs` `read_logical_command`) runs the history scanner regardless of interactivity; bash gates `histexpand` on an interactive shell. Surfaced repeatedly while testing `[!…]`/`[^…]` glob fragments (which contain `!`) via piped stdin; the v116 bracket-negation harness and integration tests run fragments as file-args to avoid it. Low impact: interactive use and scripts/`source` (the common paths) are correct; only literal piped-to-stdin command streams containing `!` diverge.
 
 - **L-29: command substitution / arithmetic / `$LINENO` not expanded in `$PS4` (and prompts)** — `[deferred]`, low. bash expands `$PS4` fully (prompt escapes + `$VAR` + `$(...)` + `$((...))` + `$LINENO`) before the xtrace depth-repeat. huck (v131) reuses `prompt::expand_prompt`, which handles Tier-A escapes (`\h`/`\u`/`\w`/…) and `$VAR`/`${VAR}` but NOT command substitution, arithmetic, or `$LINENO` (huck has no `LINENO` variable). So `PS4='[$(date)] '`, `PS4='$((x+1)) '`, and `PS4='$LINENO '` trace with those forms unexpanded (or `$LINENO`→empty). The same limitation affects PS1/PS2 (the shared `expand_prompt`). Resolving it means giving `expand_prompt` a command/arith-substitution pass (and adding `$LINENO` line-tracking) — a broader prompt-expansion enhancement. Relatedly (same low tier): a `PS4=…` assignment command traces its OWN line with the post-assignment PS4 value, whereas bash uses the pre-assignment value (huck's bare-assignment xtrace emits after applying the assignment); narrow and cosmetic. Low impact: the common `PS4='+ '`/`$VAR` cases and depth-repeat work.
+
+- **L-31: the `read` builtin issues one `libc::read` syscall per byte** — `[deferred]`, low (perf, not a hang). `read`/`read -r` reads stdin one byte at a time (`src/builtins.rs` ~line 2027), so consuming a large body via `read` is O(n) syscalls — slow on big inputs (e.g. a 200KB heredoc piped into `while read`). NOT a deadlock (it completes); off the `nvm ls-remote` path (nvm feeds the big index.tab to `awk`, which reads in blocks). Fix: buffer `read`'s stdin (read a chunk, scan for the delimiter, push back the remainder) — but `read` must not over-consume past its delimiter from a shared fd, so the buffering needs care. Found v134.
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
 - **Status**: intentional (v29)
