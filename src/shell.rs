@@ -214,6 +214,7 @@ fn run_program(
         ExecOutcome::FunctionReturn(n) => n,
         ExecOutcome::Continue(s) => shell.take_pending_fatal_pe_error().unwrap_or(s),
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
+        ExecOutcome::Interrupted => 130,
     };
     crate::traps::fire_exit_trap(&mut shell);
     shell.hangup_jobs();
@@ -360,6 +361,11 @@ pub fn run(args: &[String]) -> i32 {
                     | ExecOutcome::FunctionReturn(_) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
+                    }
+                    ExecOutcome::Interrupted => {
+                        let mut shell = shell_cell.borrow_mut();
+                        shell.set_last_status(130);
+                        eprintln!();
                     }
                 }
             }
