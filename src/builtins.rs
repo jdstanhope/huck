@@ -27,7 +27,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shopt", "shift", "getopts", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly", "read", "printf", "type", "hash",
+    "readonly", "read", "mapfile", "readarray", "printf", "type", "hash",
     "pushd", "popd", "dirs",
     "declare", "typeset",
     "eval",
@@ -121,6 +121,7 @@ pub fn run_builtin(
         "readonly" => builtin_readonly(args, out, shell),
         "declare" | "typeset" => builtin_declare(args, out, shell),
         "read" => builtin_read(args, out, shell),
+        "mapfile" | "readarray" => builtin_mapfile(args, shell),
         "printf" => builtin_printf(args, out, shell),
         "test" | "[" => builtin_test(name, args, shell),
         "break" => builtin_break(args, shell),
@@ -1848,6 +1849,32 @@ fn builtin_declare_decl(
 /// caller treats this as `read` exit status 1). Returns
 /// `Ok(Some(partial))` when EOF hits AFTER at least one byte but
 /// before the delim (caller still assigns and returns status 0).
+/// Reads one record up to (not including) `delim`. Returns `(content, had_delim)`;
+/// `had_delim` is false for a final unterminated record at EOF. `None` only when
+/// nothing remains. Raw bytes — no backslash processing (mapfile reads raw lines).
+fn read_one_record<R: std::io::Read>(
+    r: &mut R,
+    delim: u8,
+) -> std::io::Result<Option<(String, bool)>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut any = false;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = r.read(&mut byte)?;
+        if n == 0 {
+            if !any {
+                return Ok(None);
+            }
+            return Ok(Some((String::from_utf8_lossy(&out).into_owned(), false)));
+        }
+        any = true;
+        if byte[0] == delim {
+            return Ok(Some((String::from_utf8_lossy(&out).into_owned(), true)));
+        }
+        out.push(byte[0]);
+    }
+}
+
 fn read_one_line<R: std::io::Read>(
     r: &mut R,
     raw: bool,
@@ -2004,6 +2031,57 @@ fn split_into_names(
         .collect()
 }
 
+/// Splits `line` into ALL IFS fields (the unbounded form used by `read -a` /
+/// mapfile element splitting). Mirrors bash word-splitting: leading IFS-ws is
+/// stripped; a non-ws IFS char delimits (a leading one yields a leading empty
+/// field, an adjacent pair yields an empty field between, but a TRAILING one
+/// yields no trailing empty field); ws-IFS runs collapse. Empty IFS -> the whole
+/// line as one field (none for an empty line).
+fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
+    let ifs_bytes: Vec<u8> = ifs.bytes().collect();
+    if ifs_bytes.is_empty() {
+        return if line.is_empty() { Vec::new() } else { vec![line.to_string()] };
+    }
+    let is_ws = |b: u8| ifs_bytes.contains(&b) && matches!(b, b' ' | b'\t' | b'\n');
+    let is_nonws = |b: u8| ifs_bytes.contains(&b) && !matches!(b, b' ' | b'\t' | b'\n');
+    let is_any = |b: u8| ifs_bytes.contains(&b);
+    let bytes = line.as_bytes();
+    let mut fields: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && is_ws(bytes[i]) {
+        i += 1;
+    }
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && !is_any(bytes[i]) {
+            i += 1;
+        }
+        fields.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+        if i >= bytes.len() {
+            break;
+        }
+        // Consume one separator. Non-ws IFS: exactly one + trailing ws-IFS.
+        // ws-IFS: collapse the run, then optionally one non-ws IFS + trailing ws.
+        if is_nonws(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && is_ws(bytes[i]) {
+                i += 1;
+            }
+            if i < bytes.len() && is_nonws(bytes[i]) {
+                i += 1;
+                while i < bytes.len() && is_ws(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    fields
+}
+
 #[cfg(unix)]
 unsafe fn silent_disable_echo() -> Option<libc::termios> {
     use std::os::unix::io::AsRawFd;
@@ -2063,7 +2141,153 @@ impl std::io::Read for RawStdinReader {
     }
 }
 
-/// `read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]`. Regular
+/// `mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]`
+/// (alias `readarray`). Reads delimiter-separated records from stdin into the
+/// indexed array ARRAY (default MAPFILE). Core option set (v140); `-u`/`-C`/`-c`
+/// are not implemented.
+fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let mut delim: u8 = b'\n';
+    let mut strip_t = false;
+    let mut count: usize = 0; // 0 = unlimited
+    let mut skip: usize = 0;
+    let mut origin: Option<usize> = None;
+    let mut i = 0;
+
+    // Parse a numeric option value (rest-of-arg or next arg).
+    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char) -> Result<usize, ()> {
+        let s = if j + 1 < bytes.len() {
+            String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+        } else {
+            *i += 1;
+            if *i >= args.len() {
+                eprintln!("huck: mapfile: -{opt}: option requires an argument");
+                return Err(());
+            }
+            args[*i].clone()
+        };
+        match s.trim().parse::<usize>() {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                eprintln!("huck: mapfile: {s}: invalid number");
+                Err(())
+            }
+        }
+    }
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        let bytes = arg.as_bytes();
+        let mut j = 1;
+        let mut consumed_rest = false;
+        while j < bytes.len() {
+            match bytes[j] {
+                b't' => strip_t = true,
+                b'd' => {
+                    let s = if j + 1 < bytes.len() {
+                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: mapfile: -d: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        args[i].clone()
+                    };
+                    delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
+                    consumed_rest = true;
+                }
+                b'n' => match num_val(args, &mut i, j, bytes, 'n') {
+                    Ok(n) => { count = n; consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                b's' => match num_val(args, &mut i, j, bytes, 's') {
+                    Ok(n) => { skip = n; consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                b'O' => match num_val(args, &mut i, j, bytes, 'O') {
+                    Ok(n) => { origin = Some(n); consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                c => {
+                    eprintln!("huck: mapfile: -{}: invalid option", c as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+            if consumed_rest {
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+
+    let array_name = args.get(i).cloned().unwrap_or_else(|| "MAPFILE".to_string());
+    if !is_valid_name(&array_name) {
+        eprintln!("huck: mapfile: `{array_name}': not a valid array name");
+        return ExecOutcome::Continue(1);
+    }
+
+    let mut handle = RawStdinReader::new();
+    // Skip the first `skip` records.
+    for _ in 0..skip {
+        match read_one_record(&mut handle, delim) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("huck: mapfile: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    }
+    // Collect up to `count` (0 = unlimited) records.
+    let mut elements: Vec<String> = Vec::new();
+    loop {
+        if count != 0 && elements.len() >= count {
+            break;
+        }
+        match read_one_record(&mut handle, delim) {
+            Ok(Some((content, had_delim))) => {
+                let mut val = content;
+                if had_delim && !strip_t {
+                    val.push(delim as char);
+                }
+                elements.push(val);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("huck: mapfile: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    }
+
+    match origin {
+        None => {
+            let map: std::collections::BTreeMap<usize, String> =
+                elements.into_iter().enumerate().collect();
+            if shell.replace_array(&array_name, map).is_err() {
+                return ExecOutcome::Continue(1);
+            }
+        }
+        Some(o) => {
+            for (k, val) in elements.into_iter().enumerate() {
+                if shell.set_array_element(&array_name, o + k, val).is_err() {
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
+/// `read [-r] [-p PROMPT] [-s] [-d DELIM] [-a ARRAY] [NAME ...]`. Regular
 /// builtin. Reads one logical line from stdin and assigns fields to
 /// NAME(s) per IFS field-splitting. With no NAME, assigns the whole
 /// line to `REPLY`. `-r` disables backslash processing. `-p` writes
@@ -2081,6 +2305,7 @@ fn builtin_read(
     let mut silent = false;
     let mut prompt: Option<String> = None;
     let mut delim: u8 = b'\n';
+    let mut array_name: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -2128,6 +2353,20 @@ fn builtin_read(
                     delim = d_val.bytes().next().unwrap_or(0u8);
                     break;
                 }
+                b'a' => {
+                    let v: String = if j + 1 < bytes.len() {
+                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: read: -a: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        args[i].clone()
+                    };
+                    array_name = Some(v);
+                    break;
+                }
                 c => {
                     eprintln!("huck: read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
@@ -2145,6 +2384,12 @@ fn builtin_read(
             eprintln!("huck: read: `{name}': not a valid identifier");
             return ExecOutcome::Continue(1);
         }
+    }
+    if let Some(arr) = &array_name
+        && !is_valid_name(arr)
+    {
+        eprintln!("huck: read: `{arr}': not a valid identifier");
+        return ExecOutcome::Continue(1);
     }
 
     // Prompt — only when stdin is a tty (matches bash).
@@ -2212,6 +2457,15 @@ fn builtin_read(
 
     // Assignment.
     let ifs = shell.ifs();
+    if let Some(arr) = array_name {
+        let fields = split_read_fields(&line, &ifs);
+        let map: std::collections::BTreeMap<usize, String> =
+            fields.into_iter().enumerate().collect();
+        if shell.replace_array(&arr, map).is_err() {
+            return ExecOutcome::Continue(1); // replace_array printed the readonly message
+        }
+        return ExecOutcome::Continue(0);
+    }
     let assignments: Vec<(String, String)> = if names.is_empty() {
         vec![("REPLY".to_string(), line)]
     } else {
@@ -5020,15 +5274,29 @@ static HELP_ENTRIES: &[HelpEntry] = &[
         description: "Print the current working directory.",
     },
     HelpEntry {
+        name: "mapfile",
+        synopsis: "mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]",
+        description: "Read lines from standard input into an indexed array (default MAPFILE).\n\
+                      -t strips the trailing delimiter; -d sets the delimiter (default newline);\n\
+                      -n reads at most COUNT lines (0 = all); -O assigns from index ORIGIN\n\
+                      (without clearing); -s discards the first SKIP lines.",
+    },
+    HelpEntry {
+        name: "readarray",
+        synopsis: "readarray [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]",
+        description: "Synonym for mapfile.",
+    },
+    HelpEntry {
         name: "read",
-        synopsis: "read [-r] [-p PROMPT] [-s] [-d DELIM] [NAME ...]",
+        synopsis: "read [-r] [-p PROMPT] [-s] [-d DELIM] [-a ARRAY] [NAME ...]",
         description: "Read a line from standard input.\n\
                       With no NAME, store the line in REPLY. With one NAME, strip leading\n\
                       and trailing IFS-whitespace and assign. With multiple NAMES, IFS-split;\n\
                       the last NAME gets the unsplit remainder.\n\
                       -r raw (no backslash escape processing). -p PROMPT writes a prompt\n\
                       to stderr (tty only). -s suppresses echo (passwords). -d DELIM uses\n\
-                      DELIM as the line terminator.",
+                      DELIM as the line terminator.\n\
+                      -a ARRAY assigns the IFS-split words to the indexed array ARRAY.",
     },
     HelpEntry {
         name: "readonly",
@@ -9283,6 +9551,33 @@ mod read_tests {
         assert_eq!(r.as_deref(), Some("foo"));
     }
 
+    // ── read_one_record ────────────────────────────────────────
+
+    #[test]
+    fn read_one_record_newline_delim() {
+        let mut r = std::io::Cursor::new(b"a\nb\n".to_vec());
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("b".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), None);
+    }
+
+    #[test]
+    fn read_one_record_unterminated_last() {
+        let mut r = std::io::Cursor::new(b"a\nb".to_vec());
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("b".to_string(), false)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), None);
+    }
+
+    #[test]
+    fn read_one_record_custom_delim_keeps_other_bytes() {
+        let mut r = std::io::Cursor::new(b"a:b:c\n".to_vec());
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("b".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("c\n".to_string(), false)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), None);
+    }
+
     // ── split_into_names ───────────────────────────────────────
 
     #[test]
@@ -9331,6 +9626,28 @@ mod read_tests {
                 ("Y".to_string(), "b:c".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn split_read_fields_default_ws() {
+        assert_eq!(split_read_fields("a b c", " \t\n"), vec!["a", "b", "c"]);
+        assert_eq!(split_read_fields("  x   y  ", " \t\n"), vec!["x", "y"]); // trim + collapse
+        assert_eq!(split_read_fields("", " \t\n"), Vec::<String>::new());   // empty -> none
+    }
+
+    #[test]
+    fn split_read_fields_nonws_ifs() {
+        assert_eq!(split_read_fields("a:b:c", ":"), vec!["a", "b", "c"]);
+        assert_eq!(split_read_fields("x:y:", ":"), vec!["x", "y"]);       // trailing delim: NO empty
+        assert_eq!(split_read_fields(":x", ":"), vec!["", "x"]);          // leading delim: empty first
+        assert_eq!(split_read_fields("x::y", ":"), vec!["x", "", "y"]);   // adjacent: empty between
+    }
+
+    #[test]
+    fn split_read_fields_mixed_and_empty_ifs() {
+        assert_eq!(split_read_fields("x : y", " :"), vec!["x", "y"]);     // ws around nonws collapses
+        assert_eq!(split_read_fields("a b c", ""), vec!["a b c"]);        // empty IFS -> one field
+        assert_eq!(split_read_fields("", ""), Vec::<String>::new());      // empty IFS + empty -> none
     }
 }
 
