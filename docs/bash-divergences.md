@@ -27,7 +27,7 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-119). |
+| Bugs (Tier 1) | 2 | Open bugs to fix (M-114, M-120). |
 | Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 25 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
@@ -46,25 +46,31 @@ huck behaves wrong without a design reason; should be fixed.
 - **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
 - **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
 
-### M-119: a captured pipeline whose output exceeds the OS pipe buffer deadlocks
-- **Status**: `[deferred]` (found v132)
-- **Severity**: medium-high (HANGS the shell, but only for large captured pipelines)
-- **huck**: `x="$(producer | filter)"` HANGS when the captured output exceeds the
-  ~64 KiB pipe buffer. Minimal repro: `x="$(seq 1 500000 | cat)"` deadlocks;
-  `x="$(seq 1 500000)"` (no pipe) and `x="$(seq 1 1000 | cat)"` (small) both work.
-  Root: huck's command-substitution capture for a PIPELINE drains the final
-  stage's stdout into the in-memory buffer only AFTER the whole pipeline has
-  exited, so when the pipe fills (producer blocks on write) nothing reads the
-  read-end → classic reader/writer deadlock.
-- **bash**: reads the capture pipe concurrently with the pipeline running.
-- **Context**: surfaced via `nvm ls-remote`, whose
-  `VERSION_LIST="$(nvm_download … | command sed …)"` pipes the ~200 KiB
-  `index.tab` through a filter inside a capture. NOT the same as v132's eval/source
-  sink fix (a captured non-pipeline external like `$(eval 'seq 1 500000')` works
-  after v132); this is the orthogonal large-pipeline-in-capture drain ordering and
-  is the remaining `nvm ls-remote` blocker.
-- **Next**: drain the capture pipe concurrently with (not after) the pipeline —
-  the v133 target.
+### M-120: a large heredoc body feeding a pipeline/compound deadlocks
+- **Status**: `[deferred]` (found v133)
+- **Severity**: medium-high (HANGS the shell; the actual `nvm ls-remote` blocker)
+- **huck**: a heredoc whose body exceeds the ~64 KiB pipe buffer, attached to a
+  MULTI-STAGE pipeline or a compound (brace-group/`while`) that backpressures,
+  DEADLOCKS. Minimal repro (bash → `200001`, huck → HANG):
+  `V="$(printf 'x%.0s' $(seq 1 200000))"; { wc -c; } << EOF` / `$V` / `EOF`. A
+  small heredoc body, or the same body to a SIMPLE command, both work — so it's a
+  pipe-buffer backpressure issue, not heredoc parsing.
+- **bash**: writes the heredoc body without stalling the pipeline (the body pipe
+  is drained concurrently with the consumer running).
+- **Root**: the parent does a BLOCKING `write_all` of the heredoc body into the
+  heredoc pipe inside the per-stage spawn loop (`src/executor.rs` ~4070 in
+  `run_multi_stage`, ~2039 in `run_background_sequence`). When the consumer stage
+  backpressures (its own inter-stage/output pipe fills) before downstream stages
+  are spawned/draining, the parent's `write_all` blocks → deadlock. Predates v133
+  (the `run_multi_stage` rewrite); orthogonal to v133's captured-pipeline-drain fix.
+- **Context**: the REAL `nvm ls-remote` hang — nvm.sh:1631 feeds the ~200 KiB
+  `index.tab` (`$VERSION_LIST`) into `{ command awk … | while read …; done; } << EOF`.
+  v132 (eval/source sink) and v133 (captured-pipeline drain) each fixed a real but
+  DIFFERENT bug on the path; this heredoc-write deadlock is the current blocker.
+- **Next**: write the heredoc body without stalling the pipeline — a background
+  writer thread, or `O_NONBLOCK` + poll/interleave, or write after all stages are
+  spawned. Own iteration (v134), and VERIFY `nvm ls-remote` completes end-to-end
+  before claiming.
 
 
 ---
