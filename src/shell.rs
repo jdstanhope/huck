@@ -523,6 +523,12 @@ fn install_job_control_signals() {
             eprintln!("huck: warning: could not ignore signal {sig}");
         }
     }
+    // Rust's runtime sets SIGPIPE to SIG_IGN at startup; restore the OS default
+    // so huck (and the stages it forks) die on a broken pipe like bash, instead
+    // of getting EPIPE back from write(2) and looping. bash runs with SIGPIPE at
+    // SIG_DFL everywhere; an interactive shell survives because its stdout is the
+    // terminal, never a pipe. (v137)
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
 }
 
 /// Fires `$PROMPT_COMMAND` if set, non-empty, and the shell is
