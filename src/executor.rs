@@ -2798,7 +2798,8 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
                 }
                 if shell.shell_options.xtrace {
                     let val = shell.lookup_var(name).unwrap_or_default();
-                    xtrace_emit(&format!("{}{name}={}", ps4(shell),
+                    let p4 = ps4(shell);
+                    xtrace_emit(&format!("{p4}{name}={}",
                               crate::param_expansion::xtrace_quote(&val)));
                 }
             }
@@ -2911,7 +2912,7 @@ pub(crate) fn call_function_body(
     call_function(name, body, args, shell, &mut sink)
 }
 
-fn ps4(shell: &Shell) -> String {
+fn ps4(shell: &mut Shell) -> String {
     // bash expands $PS4 (prompt escapes + $VAR, via the PS1/PS2 expander), THEN
     // replicates the FIRST char of the EXPANDED value once per nesting level.
     let raw = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
@@ -4951,7 +4952,8 @@ fn spawn_external_with_fds(
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
 
     if shell.shell_options.xtrace {
-        xtrace_emit(&format!("{}{}", ps4(shell),
+        let p4 = ps4(shell);
+        xtrace_emit(&format!("{p4}{}",
                   xtrace_command_line(&[], &resolved.program, &resolved.args)));
     }
 

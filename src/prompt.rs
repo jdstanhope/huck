@@ -10,7 +10,7 @@ use crate::shell_state::Shell;
 /// \u \h \H \w \W \$ \n \r \\ \? \j \! \# \e \033 \a \[ \] and
 /// $VAR / ${VAR} interpolation. Unknown \X passes through
 /// literally.
-pub fn expand_prompt(template: &str, shell: &Shell) -> String {
+pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
     let mut out = String::new();
     let bytes = template.as_bytes();
     let mut i = 0;
@@ -239,21 +239,21 @@ mod tests {
 
     #[test]
     fn literal_text_passes_through() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("hello ", &shell), "hello ");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("hello ", &mut shell), "hello ");
     }
 
     #[test]
     fn expand_user() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\u", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\u", &mut shell);
         assert!(!out.is_empty(), "\\u should resolve to something");
     }
 
     #[test]
     fn expand_hostname_short() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\h", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\h", &mut shell);
         assert!(
             !out.contains('.'),
             "short hostname must not contain '.': {out:?}"
@@ -265,14 +265,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HOME", "/h/me".to_string());
         shell.set("PWD", "/h/me/x".to_string());
-        assert_eq!(expand_prompt("\\w", &shell), "~/x");
+        assert_eq!(expand_prompt("\\w", &mut shell), "~/x");
     }
 
     #[test]
     fn expand_cwd_basename() {
         let mut shell = Shell::new();
         shell.set("PWD", "/a/b/c".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "c");
+        assert_eq!(expand_prompt("\\W", &mut shell), "c");
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
         // taking the basename. `PWD=/foo/` → `\W` = `foo`.
         let mut shell = Shell::new();
         shell.set("PWD", "/foo/".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "foo");
+        assert_eq!(expand_prompt("\\W", &mut shell), "foo");
     }
 
     #[test]
@@ -289,13 +289,13 @@ mod tests {
         // PWD=/ → \W is `/` (the root itself; no basename).
         let mut shell = Shell::new();
         shell.set("PWD", "/".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "/");
+        assert_eq!(expand_prompt("\\W", &mut shell), "/");
     }
 
     #[test]
     fn expand_dollar_user_vs_root() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\$", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\$", &mut shell);
         let expected = if unsafe { libc::geteuid() } == 0 {
             "#"
         } else {
@@ -306,69 +306,69 @@ mod tests {
 
     #[test]
     fn expand_n_r_backslash() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\n", &shell), "\n");
-        assert_eq!(expand_prompt("\\r", &shell), "\r");
-        assert_eq!(expand_prompt("\\\\", &shell), "\\");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\n", &mut shell), "\n");
+        assert_eq!(expand_prompt("\\r", &mut shell), "\r");
+        assert_eq!(expand_prompt("\\\\", &mut shell), "\\");
     }
 
     #[test]
     fn expand_status() {
         let mut shell = Shell::new();
         shell.set_last_status(42);
-        assert_eq!(expand_prompt("\\?", &shell), "42");
+        assert_eq!(expand_prompt("\\?", &mut shell), "42");
     }
 
     #[test]
     fn expand_jobs_count_zero() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\j", &shell), "0");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\j", &mut shell), "0");
     }
 
     #[test]
     fn expand_escape_e_and_033() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\e", &shell), "\x1B");
-        assert_eq!(expand_prompt("\\033", &shell), "\x1B");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\e", &mut shell), "\x1B");
+        assert_eq!(expand_prompt("\\033", &mut shell), "\x1B");
     }
 
     #[test]
     fn expand_bell() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\a", &shell), "\x07");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\a", &mut shell), "\x07");
     }
 
     #[test]
     fn expand_bracket_markers() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\[X\\]", &shell), "\x01X\x02");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\[X\\]", &mut shell), "\x01X\x02");
     }
 
     #[test]
     fn expand_dollar_var_with_braces() {
         let mut shell = Shell::new();
         shell.set("XYZ_PROMPT", "hi".to_string());
-        assert_eq!(expand_prompt("${XYZ_PROMPT}", &shell), "hi");
+        assert_eq!(expand_prompt("${XYZ_PROMPT}", &mut shell), "hi");
     }
 
     #[test]
     fn expand_dollar_var_bare() {
         let mut shell = Shell::new();
         shell.set("XYZ_PROMPT", "hi".to_string());
-        assert_eq!(expand_prompt("$XYZ_PROMPT ", &shell), "hi ");
+        assert_eq!(expand_prompt("$XYZ_PROMPT ", &mut shell), "hi ");
     }
 
     #[test]
     fn expand_unknown_escape_preserved() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\z", &shell), "\\z");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\z", &mut shell), "\\z");
     }
 
     #[test]
     fn expand_undefined_var_empty() {
-        let shell = Shell::new();
+        let mut shell = Shell::new();
         assert_eq!(
-            expand_prompt("${___DEFINITELY_UNSET_PROMPT___}>", &shell),
+            expand_prompt("${___DEFINITELY_UNSET_PROMPT___}>", &mut shell),
             ">"
         );
     }

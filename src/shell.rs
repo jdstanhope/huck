@@ -416,7 +416,7 @@ fn read_logical_command(
 
     loop {
         let expanded = {
-            let shell = cell.borrow();
+            let mut shell = cell.borrow_mut();
             let (var_name, default) = if pending.is_none() {
                 ("PS1", DEFAULT_PS1)
             } else {
@@ -425,7 +425,7 @@ fn read_logical_command(
             let template = shell
                 .lookup_var(var_name)
                 .unwrap_or_else(|| default.to_string());
-            crate::prompt::expand_prompt(&template, &shell)
+            crate::prompt::expand_prompt(&template, &mut shell)
         };
 
         match editor.readline(&expanded) {
