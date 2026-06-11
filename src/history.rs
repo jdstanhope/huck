@@ -64,8 +64,7 @@ impl History {
     }
 
     /// Sets the in-memory cap and immediately evicts entries past it. (v139)
-    // Wired into the Shell's HISTSIZE resolution in a later v139 task.
-    #[allow(dead_code)]
+    /// Called by `Shell::record_history` to apply the live `$HISTSIZE`.
     pub fn set_max(&mut self, max: Option<usize>) {
         self.max = max;
         self.enforce_max();
@@ -166,7 +165,10 @@ impl History {
         }
     }
 
-    /// Back-compat: write all in-memory entries (capped by the in-memory `max`).
+    /// Test-only helper: write all in-memory entries (capped by the in-memory
+    /// `max`). Production save paths go through `Shell::save_history` →
+    /// `save_capped` with the live `$HISTFILESIZE` (v139).
+    #[cfg(test)]
     pub fn save(&self) {
         self.save_capped(self.max);
     }

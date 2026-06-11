@@ -555,8 +555,6 @@ impl Shell {
     /// Resolves `$HISTFILESIZE` to the history-file cap. `None` = no truncation.
     /// unset -> effective HISTSIZE; negative/non-numeric -> inhibit; else n.
     /// (v139, M-59)
-    // Wired in a later v139 task (Task 3 removes this allow).
-    #[allow(dead_code)]
     pub fn resolve_histfilesize(&self) -> Option<usize> {
         match self.lookup_var("HISTFILESIZE") {
             Some(v) => match v.trim().parse::<i64>() {
@@ -566,6 +564,19 @@ impl Shell {
             },
             None => self.resolve_histsize(),
         }
+    }
+
+    /// Records a command in history, applying the current `$HISTSIZE` cap. (v139)
+    pub fn record_history(&mut self, line: String) {
+        let cap = self.resolve_histsize();
+        let h = std::rc::Rc::make_mut(&mut self.history);
+        h.set_max(cap);
+        h.add(line);
+    }
+
+    /// Saves history to the histfile, applying the `$HISTFILESIZE` cap. (v139)
+    pub fn save_history(&self) {
+        self.history.save_capped(self.resolve_histfilesize());
     }
 
     /// True if the named variable/parameter is currently **set** (a
