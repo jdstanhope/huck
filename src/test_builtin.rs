@@ -3,6 +3,8 @@
 //! `evaluate` implements the POSIX argument-count algorithm. Operator
 //! application lives in `apply_unary` / `apply_binary`.
 
+use std::os::unix::fs::MetadataExt;
+
 /// Evaluates a `test` expression. `var_is_set(name)` answers `-v NAME`.
 /// `Ok(true)` / `Ok(false)` are the result; `Err(message)` is a usage error.
 pub fn evaluate_with(args: &[String], var_is_set: &dyn Fn(&str) -> bool) -> Result<bool, String> {
@@ -90,6 +92,7 @@ fn is_unary_op(s: &str) -> bool {
         // It also serves as the binary AND combinator in operator
         // position; the grammar parser (v75) disambiguates by context.
         "-a" | "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" | "-L" | "-z" | "-n" | "-v"
+            | "-p" | "-S" | "-b" | "-c" | "-O" | "-G" | "-N" | "-k" | "-u" | "-g" | "-t"
     )
 }
 
@@ -156,8 +159,24 @@ fn apply_unary(
         "-r" => Ok(access(operand, libc::R_OK)),
         "-w" => Ok(access(operand, libc::W_OK)),
         "-x" => Ok(access(operand, libc::X_OK)),
+        "-p" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFIFO).unwrap_or(false)),
+        "-S" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFSOCK).unwrap_or(false)),
+        "-b" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFBLK).unwrap_or(false)),
+        "-c" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFCHR).unwrap_or(false)),
+        "-k" => Ok(file_mode(operand).map(|m| m & libc::S_ISVTX != 0).unwrap_or(false)),
+        "-u" => Ok(file_mode(operand).map(|m| m & libc::S_ISUID != 0).unwrap_or(false)),
+        "-g" => Ok(file_mode(operand).map(|m| m & libc::S_ISGID != 0).unwrap_or(false)),
+        "-O" => Ok(std::fs::metadata(operand).map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false)),
+        "-G" => Ok(std::fs::metadata(operand).map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false)),
+        "-N" => Ok(std::fs::metadata(operand).map(|m| m.mtime() > m.atime()).unwrap_or(false)),
+        "-t" => Ok(operand.parse::<i32>().map(|fd| unsafe { libc::isatty(fd) } == 1).unwrap_or(false)),
         _ => Err(format!("{op}: unknown operator")),
     }
+}
+
+/// mode bits of `path` (follows symlinks), or None if it can't be stat'd.
+fn file_mode(path: &str) -> Option<u32> {
+    std::fs::metadata(path).ok().map(|m| m.mode())
 }
 
 /// True if the calling process can access `path` with `mode`
