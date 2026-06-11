@@ -974,17 +974,14 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
-            WordPart::AssignPrefix { .. } => {
-                unreachable!(
-                    "WordPart::AssignPrefix is parser-internal and must not reach expand(); \
-                     try_split_assignment is supposed to consume it"
-                );
+            WordPart::AssignPrefix { target, append } => {
+                let mut lhs = render_assign_target(target, shell);
+                lhs.push_str(if *append { "+=" } else { "=" });
+                current.push_str(&lhs, true);
             }
-            WordPart::ArrayLiteral(_) => {
-                unreachable!(
-                    "WordPart::ArrayLiteral is parser-internal and must not reach expand(); \
-                     try_split_assignment is supposed to consume it"
-                );
+            WordPart::ArrayLiteral(elems) => {
+                let rendered = reconstruct_array_literal(elems, shell);
+                current.push_str(&rendered, true);
             }
         }
     }
@@ -996,6 +993,49 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
         result.push(current);
     }
     result
+}
+
+/// Render an `AssignTarget` LHS back to text: `name` or `name[<subscript>]`.
+fn render_assign_target(target: &crate::command::AssignTarget, shell: &mut Shell) -> String {
+    use crate::command::AssignTarget;
+    match target {
+        AssignTarget::Bare(name) => name.clone(),
+        AssignTarget::Indexed { name, subscript } => {
+            format!("{name}[{}]", expand_assignment(subscript, shell))
+        }
+    }
+}
+
+/// Render ONE array-literal element value for re-parse via `eval`/`declare`.
+/// bash expands the literal word ONCE here (quote removal + variable/glob/etc.
+/// expansion) and reconstructs WITHOUT re-quoting, so the re-parser word-splits
+/// on the resulting text (`eval x=("a b" c)` -> elements `a` `b` `c`). We mirror
+/// that: a purely-literal value verbatim (the common `a`/`b` fast path), else
+/// the expanded text verbatim — NO re-quoting.
+fn render_elem_value(v: &crate::lexer::Word, shell: &mut Shell) -> String {
+    match crate::command::word_literal_text(v) {
+        Some(t) => t.to_string(),
+        None => expand_assignment(v, shell),
+    }
+}
+
+/// Reconstruct an array literal to re-parseable `(e1 e2 [k]=v …)` text.
+pub(crate) fn reconstruct_array_literal(
+    elems: &[crate::lexer::ArrayLiteralElement],
+    shell: &mut Shell,
+) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+    for e in elems {
+        match &e.subscript {
+            Some(sub) => parts.push(format!(
+                "[{}]={}",
+                expand_assignment(sub, shell),
+                render_elem_value(&e.value, shell)
+            )),
+            None => parts.push(render_elem_value(&e.value, shell)),
+        }
+    }
+    format!("({})", parts.join(" "))
 }
 
 /// Expands a `Word` for assignment context: word-splitting is suppressed and
@@ -1089,17 +1129,12 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 let joined = shell.positional_args.join(" ");
                 result.push_str(&joined);
             }
-            WordPart::AssignPrefix { .. } => {
-                unreachable!(
-                    "WordPart::AssignPrefix is parser-internal and must not reach expand_assignment(); \
-                     try_split_assignment is supposed to consume it"
-                );
+            WordPart::AssignPrefix { target, append } => {
+                result.push_str(&render_assign_target(target, shell));
+                result.push_str(if *append { "+=" } else { "=" });
             }
-            WordPart::ArrayLiteral(_) => {
-                unreachable!(
-                    "WordPart::ArrayLiteral is parser-internal and must not reach expand_assignment(); \
-                     try_split_assignment is supposed to consume it"
-                );
+            WordPart::ArrayLiteral(elems) => {
+                result.push_str(&reconstruct_array_literal(elems, shell));
             }
         }
     }

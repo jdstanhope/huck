@@ -3054,15 +3054,11 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                                 // Array-literal RHS: best-effort `name=(e1 e2 ...)`
                                 // (spec: arrays best-effort, must not crash;
                                 // expand_assignment would panic on the literal).
-                                let mut rendered: Vec<String> = Vec::with_capacity(elems.len());
-                                for el in elems {
-                                    let v = match crate::command::word_literal_text(&el.value) {
-                                        Some(t) => t.to_string(),
-                                        None => crate::expand::expand_assignment(&el.value, shell),
-                                    };
-                                    rendered.push(crate::param_expansion::xtrace_quote(&v));
-                                }
-                                parts.push(format!("{name}=({})", rendered.join(" ")));
+                                // Route through the shared reconstructor so the
+                                // render matches the eval/declare re-parse path.
+                                let rendered =
+                                    crate::expand::reconstruct_array_literal(elems, shell);
+                                parts.push(format!("{name}={rendered}"));
                             } else {
                                 let rhs = match crate::command::word_literal_text(&a.value) {
                                     Some(t) => t.to_string(),
