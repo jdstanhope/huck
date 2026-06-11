@@ -42,3 +42,24 @@ fn forked_producer_no_broken_pipe_spam() {
     assert_eq!(out, "line1\n", "out={out:?}");
     assert!(!err.contains("Broken pipe"), "stderr leaked Broken pipe: {err:?}");
 }
+
+// A subshell `( ... )` producer is a forked stage; it too must die silently.
+#[test]
+fn subshell_producer_status_141_silent() {
+    let (out, err, code) = huck_c(
+        "( for i in $(seq 1 5000); do echo $i; done ) | { read x; }; echo \"stages=${PIPESTATUS[*]}\"",
+    );
+    assert_eq!(code, 0, "stderr={err:?}");
+    assert_eq!(out, "stages=141 0\n", "out={out:?}");
+    assert_eq!(err, "", "err={err:?}");
+}
+
+// A shell function producer (runs in the forked stage) must die silently too.
+#[test]
+fn function_producer_no_spam() {
+    let (out, err, _c) = huck_c(
+        "f(){ local i=0; while [ \"$i\" -lt 5000 ]; do echo \"$i\"; i=$((i+1)); done; }; f | head -2",
+    );
+    assert_eq!(out, "0\n1\n", "out={out:?}");
+    assert!(!err.contains("Broken pipe"), "err={err:?}");
+}

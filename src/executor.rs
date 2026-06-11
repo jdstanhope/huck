@@ -4729,6 +4729,12 @@ pub fn fork_and_run_in_subshell(
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
             libc::signal(libc::SIGTTIN, libc::SIG_DFL);
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            // v137: a forked pipeline stage / subshell dies on a broken pipe
+            // like bash. Redundant with the startup reset in the common case,
+            // but also correct for the PIPE-trap case: bash resets a trapped
+            // signal to default inside a subshell, so a forked stage must not
+            // inherit a top-level PIPE handler.
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             // 2. Join the pgrp (or become pgrp leader if pgid_target == 0).
             libc::setpgid(0, pgid_target);
             // 3. dup2 the stdio fds to 0/1/2.
