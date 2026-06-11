@@ -538,6 +538,36 @@ impl Shell {
         }
     }
 
+    /// Resolves `$HISTSIZE` to the in-memory history cap. `None` = unlimited.
+    /// unset/empty/non-numeric -> default 1000; negative -> unlimited; else n.
+    /// (v139, M-59)
+    pub fn resolve_histsize(&self) -> Option<usize> {
+        match self.lookup_var("HISTSIZE") {
+            Some(v) => match v.trim().parse::<i64>() {
+                Ok(n) if n < 0 => None,
+                Ok(n) => Some(n as usize),
+                Err(_) => Some(crate::history::HISTORY_MAX),
+            },
+            None => Some(crate::history::HISTORY_MAX),
+        }
+    }
+
+    /// Resolves `$HISTFILESIZE` to the history-file cap. `None` = no truncation.
+    /// unset -> effective HISTSIZE; negative/non-numeric -> inhibit; else n.
+    /// (v139, M-59)
+    // Wired in a later v139 task (Task 3 removes this allow).
+    #[allow(dead_code)]
+    pub fn resolve_histfilesize(&self) -> Option<usize> {
+        match self.lookup_var("HISTFILESIZE") {
+            Some(v) => match v.trim().parse::<i64>() {
+                Ok(n) if n < 0 => None,
+                Ok(n) => Some(n as usize),
+                Err(_) => None,
+            },
+            None => self.resolve_histsize(),
+        }
+    }
+
     /// True if the named variable/parameter is currently **set** (a
     /// set-but-empty variable counts as set; unset is false). Backs
     /// `[[ -v NAME ]]` and `test -v NAME`. Supports scalar names and
@@ -2198,5 +2228,36 @@ mod shopt_tests {
         let mut sh = Shell::new();
         sh.shell_options.noclobber = true;
         assert!(sh.dollar_dash_value().contains('C'));
+    }
+
+    #[test]
+    fn resolve_histsize_bash_semantics() {
+        let mut s = Shell::new();
+        assert_eq!(s.resolve_histsize(), Some(1000)); // unset -> default
+        s.set("HISTSIZE", "".to_string());
+        assert_eq!(s.resolve_histsize(), Some(1000)); // empty -> default
+        s.set("HISTSIZE", "abc".to_string());
+        assert_eq!(s.resolve_histsize(), Some(1000)); // non-numeric -> default
+        s.set("HISTSIZE", "0".to_string());
+        assert_eq!(s.resolve_histsize(), Some(0)); // zero -> empty
+        s.set("HISTSIZE", "200".to_string());
+        assert_eq!(s.resolve_histsize(), Some(200)); // positive -> cap
+        s.set("HISTSIZE", "-1".to_string());
+        assert_eq!(s.resolve_histsize(), None); // negative -> unlimited
+    }
+
+    #[test]
+    fn resolve_histfilesize_bash_semantics() {
+        let mut s = Shell::new();
+        s.set("HISTSIZE", "200".to_string());
+        assert_eq!(s.resolve_histfilesize(), Some(200)); // unset -> effective HISTSIZE
+        s.set("HISTFILESIZE", "50".to_string());
+        assert_eq!(s.resolve_histfilesize(), Some(50)); // positive -> cap
+        s.set("HISTFILESIZE", "0".to_string());
+        assert_eq!(s.resolve_histfilesize(), Some(0)); // zero -> empty file
+        s.set("HISTFILESIZE", "-1".to_string());
+        assert_eq!(s.resolve_histfilesize(), None); // negative -> inhibit
+        s.set("HISTFILESIZE", "abc".to_string());
+        assert_eq!(s.resolve_histfilesize(), None); // non-numeric -> inhibit
     }
 }
