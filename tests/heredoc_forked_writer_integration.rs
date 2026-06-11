@@ -28,25 +28,25 @@ fn run_guarded(script: &str, secs: u64) -> Option<(String, String, i32)> {
               out.status.code().unwrap_or(-1)))
     }
 }
-fn with_bigV(frag: &str) -> String {
+fn with_big_v(frag: &str) -> String {
     format!("V=$(printf 'x%.0s' $(seq 1 200000))\n{frag}\n")
 }
 
 #[test]
 fn compound_heredoc_large_body() {
-    let (o, _e, _c) = run_guarded(&with_bigV("{ wc -c; } << EOF\n$V\nEOF"), 10)
+    let (o, _e, _c) = run_guarded(&with_big_v("{ wc -c; } << EOF\n$V\nEOF"), 10)
         .expect("HUNG: compound heredoc deadlocked");
     assert_eq!(o.trim(), "200001", "o: {o:?}");
 }
 #[test]
 fn compound_awk_while_heredoc_nvm_shape() {
-    let (o, _e, _c) = run_guarded(&with_bigV("{ command awk '{print}' | wc -l; } << EOF\n$V\nEOF"), 10)
+    let (o, _e, _c) = run_guarded(&with_big_v("{ command awk '{print}' | wc -l; } << EOF\n$V\nEOF"), 10)
         .expect("HUNG: awk|while compound heredoc deadlocked");
     assert_eq!(o.trim(), "1", "o: {o:?}");
 }
 #[test]
 fn compound_herestring_large_body() {
-    let (o, _e, _c) = run_guarded(&with_bigV("{ wc -c; } <<< \"$V\""), 10)
+    let (o, _e, _c) = run_guarded(&with_big_v("{ wc -c; } <<< \"$V\""), 10)
         .expect("HUNG: compound herestring deadlocked");
     assert_eq!(o.trim(), "200001", "o: {o:?}");
 }
