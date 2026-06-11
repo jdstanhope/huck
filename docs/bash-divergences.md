@@ -62,10 +62,10 @@ huck behaves wrong without a design reason; should be fixed.
   `run_multi_stage`, ~2039 in `run_background_sequence`). When the consumer stage
   backpressures (its own inter-stage/output pipe fills) before downstream stages
   are spawned/draining, the parent's `write_all` blocks → deadlock. Predates v133
-  (the `run_multi_stage` rewrite); orthogonal to the M-119 capture-drain fix.
+  (the `run_multi_stage` rewrite); orthogonal to v133's captured-pipeline-drain fix.
 - **Context**: the REAL `nvm ls-remote` hang — nvm.sh:1631 feeds the ~200 KiB
   `index.tab` (`$VERSION_LIST`) into `{ command awk … | while read …; done; } << EOF`.
-  v132 (eval/source sink) and v133 (M-119 capture drain) each fixed a real but
+  v132 (eval/source sink) and v133 (captured-pipeline drain) each fixed a real but
   DIFFERENT bug on the path; this heredoc-write deadlock is the current blocker.
 - **Next**: write the heredoc body without stalling the pipeline — a background
   writer thread, or `O_NONBLOCK` + poll/interleave, or write after all stages are
