@@ -609,7 +609,9 @@ impl Shell {
     /// a parse error or any side-effecting / command-substitution form,
     /// which the `-v` element check treats as "not set". Pure-operator
     /// arms mirror `crate::arith::eval` (which needs `&mut Shell` for the
-    /// assignment/inc-dec arms we deliberately reject here).
+    /// assignment/inc-dec arms we deliberately reject here). The `match` on
+    /// `ArithExpr` is EXHAUSTIVE, so a new arith operator is a compile error
+    /// here — drift from `arith::eval` is caught by the compiler, not silent.
     fn read_only_arith(&self, sub: &str) -> Option<i64> {
         use crate::arith::ArithExpr as E;
         fn ev(e: &E, sh: &Shell) -> Option<i64> {
@@ -657,8 +659,18 @@ impl Shell {
                 E::BitAnd(a, b) => ev(a, sh)? & ev(b, sh)?,
                 E::BitOr(a, b) => ev(a, sh)? | ev(b, sh)?,
                 E::BitXor(a, b) => ev(a, sh)? ^ ev(b, sh)?,
-                E::Shl(a, b) => ev(a, sh)?.wrapping_shl(ev(b, sh)? as u32),
-                E::Shr(a, b) => ev(a, sh)?.wrapping_shr(ev(b, sh)? as u32),
+                // Shift count out of range → invalid (matches arith::eval, which
+                // errors here; for a `-v` subscript that means "not set").
+                E::Shl(a, b) => {
+                    let (l, r) = (ev(a, sh)?, ev(b, sh)?);
+                    if !(0..64).contains(&r) { return None; }
+                    l.wrapping_shl(r as u32)
+                }
+                E::Shr(a, b) => {
+                    let (l, r) = (ev(a, sh)?, ev(b, sh)?);
+                    if !(0..64).contains(&r) { return None; }
+                    l.wrapping_shr(r as u32)
+                }
                 E::Pow(a, b) => {
                     let exp = ev(b, sh)?;
                     if exp < 0 { return None; }
