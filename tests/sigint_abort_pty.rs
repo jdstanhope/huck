@@ -78,10 +78,27 @@ fn ctrl_c_aborts_shell_function_loop_and_shell_survives() {
     }
 
     // Case B: a shell-function busy loop, then Ctrl-C.
-    let _ = session.send("f(){ while true; do :; done; }\r");
-    let _ = session.send("f\r");
-    // Let the loop spin for a bit.
-    std::thread::sleep(Duration::from_millis(300));
+    // The function prints a unique marker right before entering the loop so the
+    // harness can wait for the loop to actually be running before sending Ctrl-C
+    // — a deterministic readiness gate instead of a flaky fixed sleep. The marker
+    // is built with arithmetic (`LOOP_$((10+11))` → `LOOP_21`) so what the PTY
+    // echoes for the typed line ("LOOP_$((10+11))") does NOT match the marker we
+    // wait for ("LOOP_21"); only the function's actual runtime output — emitted
+    // immediately before the loop starts — satisfies the gate.
+    //
+    // The definition and the call are sent on a SINGLE line (`…; }; f`). Sending
+    // them as two back-to-back `\r` lines lets the second line race the still
+    // in-flight first line in the interactive reader; once the call pins a core
+    // in the busy loop, that race can swallow the marker output entirely. One
+    // line makes the marker reliably reach the PTY before the loop spins.
+    let _ = session.send("f(){ echo LOOP_$((10+11)); while true; do :; done; }; f\r");
+    // Wait until the loop has started (marker printed) before interrupting.
+    if session.expect("LOOP_21").is_err() {
+        drop(session);
+        panic!("sigint_abort_pty: function loop never signalled readiness (LOOP_21)");
+    }
+    // A short settle so the loop is firmly spinning when Ctrl-C lands.
+    std::thread::sleep(Duration::from_millis(150));
     let _ = session.send("\x03");
     let _ = session.send("echo back $?\r");
     let responsive = session.expect("back 130").is_ok();
