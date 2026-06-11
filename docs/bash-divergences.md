@@ -27,9 +27,9 @@ stays in sync.
 
 | Tier | Count | Notes |
 | --- | --- | --- |
-| Bugs (Tier 1) | 1 | Open bugs to fix (M-114). |
+| Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 21 | Deferred bash-compat backlog, ranked by severity within each group. |
-| Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
+| Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 26 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
@@ -38,13 +38,7 @@ stays in sync.
 
 huck behaves wrong without a design reason; should be fixed.
 
-### M-114: array literal as a command argument (`eval x=(…)` unescaped) panics
-- **Status**: `[deferred]` (found v117)
-- **Severity**: medium (a panic/abort, but off the common path)
-- **huck**: an array literal `name=(…)` as a command ARGUMENT (not a leading assignment) — e.g. `eval x=(a b)` with UNESCAPED parens — reaches `expand()` as a parser-internal `WordPart::ArrayLiteral` and panics (`internal error: … must not reach expand(); try_split_assignment is supposed to consume it`, `src/expand.rs`). `try_split_assignment` only consumes the literal when it's the command's leading assignment.
-- **bash**: treats `x=(…)` specially even as an argument and does not error.
-- **Workaround / why low-urgency**: the real `_upvars` (and most code) ESCAPE the parens (`eval $2=\(…\)`), which lexes as a plain word and works; quoted `eval "x=(a b)"` also works. Only literal unescaped `cmd name=(…)` triggers it.
-- **Next**: make a command-argument `ArrayLiteral` expand to its reconstructed `name=(…)` text (or otherwise not reach `expand()`). Own iteration.
+_None currently open._
 
 ---
 
@@ -94,7 +88,7 @@ group.
   set variables whose name begins with `prefix`) are not implemented —
   the lexer's `${!` branch handles only the scalar-indirect form (M-91).
   Not used by the bashrc / bash-completion; deferred. M-91 follow-on.
-- **M-102: array-literal element word-splitting** — `[deferred]` medium. huck: an array literal whose element is an unquoted command substitution or variable expansion — `a=($(cmd))`, `a=($(echo "x y" z))`, `a=($var)` — produces ONE element containing the whole result string. bash: the multi-word result is word-split on `$IFS` into SEVERAL array elements (`a=($(echo a b c))` → 3 elements). Pre-existing (NOT introduced by v106); surfaced while writing the v106 M-101 array-literal tests (which therefore use single-word globs to sidestep it). Fix needs the array-literal element builder to run IFS field-splitting on each unquoted expansion result, reusing `emit_split_fields` (M-05).
+- **M-102: array-literal element word-splitting** — `[deferred]` medium. huck: an array literal whose element is an unquoted command substitution or variable expansion — `a=($(cmd))`, `a=($(echo "x y" z))`, `a=($var)` — produces ONE element containing the whole result string. bash: the multi-word result is word-split on `$IFS` into SEVERAL array elements (`a=($(echo a b c))` → 3 elements). Pre-existing (NOT introduced by v106); surfaced while writing the v106 M-101 array-literal tests (which therefore use single-word globs to sidestep it). Fix needs the array-literal element builder to run IFS field-splitting on each unquoted expansion result, reusing `emit_split_fields` (M-05). The v136 `eval x=($v …)` reconstruction path shares this best-effort element-splitting behavior (it matches bash's lossy eval re-parse for the common cases).
 - **M-107: `FUNCNAME` inside function bodies** — `[deferred]` low. huck: `$FUNCNAME` (and `${FUNCNAME[…]}`) is empty inside a function; bash sets it to the call-stack array (`FUNCNAME[0]` = the current function name). Surfaced as the blank `:` in bash_completion's `bash_completion: : \`-n'` diagnostic (`$FUNCNAME` empty), though that branch is no longer reached once `getopts` works (M-106). bash_completion reads `${FUNCNAME[…]}` in a few other diagnostics. Fix needs a per-call function-name stack exposed as the `FUNCNAME` array (huck already pushes `function_arg0` in `call_function` — the array surface from M-82 makes the variable wiring feasible).
 
 ### Globbing
@@ -170,6 +164,13 @@ Things huck deliberately does differently from bash. Document and keep.
 - **Severity**: low
 - **huck**: invalid UTF-8 from `$(cmd)` → `U+FFFD` replacement.
 - **bash**: byte-faithful.
+
+### I-16: `name=(…)` array literal as a non-declaration/non-eval command argument
+- **Status**: `[intentional]`
+- **Severity**: low (v136)
+- **huck**: the lexer accepts an array literal `name=(…)` as a command ARGUMENT and `expand()` reconstructs the argument to its `name=(…)` text — so `echo x=(a b)` prints `x=(a b)`.
+- **bash**: a parse-time syntax error (`echo x=(a b)` → `syntax error near unexpected token '('`).
+- **Why**: replicating bash's parse-time gating would need command-context-aware lexing; the reconstruction is harmless and is what makes `eval x=(a b)` / `declare`-style array-literal args work (v136 resolved the prior panic via this reconstruction).
 
 ---
 
