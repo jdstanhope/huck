@@ -17,7 +17,7 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
     while i < bytes.len() {
         // Fast path: copy any run of non-special bytes.
         let mut j = i;
-        while j < bytes.len() && bytes[j] != b'\\' && bytes[j] != b'$' {
+        while j < bytes.len() && bytes[j] != b'\\' && bytes[j] != b'$' && bytes[j] != b'`' {
             j += 1;
         }
         if j > i {
@@ -28,7 +28,20 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
             }
         }
 
-        if bytes[i] == b'\\' {
+        if bytes[i] == b'`' {
+            // Backtick command substitution.
+            match scan_backtick_close(bytes, i + 1) {
+                Some(close) => {
+                    let body = template[i + 1..close].to_string();
+                    out.push_str(&run_prompt_cmdsub(&body, shell));
+                    i = close + 1;
+                }
+                None => {
+                    out.push_str(&template[i..]);
+                    break;
+                }
+            }
+        } else if bytes[i] == b'\\' {
             // Escape sequence.
             if i + 1 >= bytes.len() {
                 // Trailing backslash — keep literal.
@@ -89,6 +102,21 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
                         {
                             out.push_str(&n.to_string());
                         }
+                        i = next_i;
+                        continue;
+                    }
+                    None => {
+                        out.push_str(&template[i..]);
+                        break;
+                    }
+                }
+            }
+            // $(...) command substitution.
+            if bytes[i + 1] == b'(' {
+                match scan_cmdsub_close(bytes, i + 2) {
+                    Some((body_end, next_i)) => {
+                        let body = template[i + 2..body_end].to_string();
+                        out.push_str(&run_prompt_cmdsub(&body, shell));
                         i = next_i;
                         continue;
                     }
@@ -163,6 +191,69 @@ fn scan_arith_close(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
         k += 1;
     }
     None
+}
+
+/// Finds the matching `)` for a `$(…)` whose `$(` ends at `start` (depth starts
+/// at 1). Quote-aware so a `)` inside `'…'`/`"…"` does not close early.
+/// Returns `(body_end_exclusive, next_index_after_close)`.
+fn scan_cmdsub_close(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut k = start;
+    let mut depth: i32 = 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    while k < bytes.len() {
+        let b = bytes[k];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'"' {
+                in_double = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((k, k + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Finds the next unescaped backtick after `start`. Returns its index.
+fn scan_backtick_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut k = start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b'`' => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// Parses `body` as a command and runs it as a command substitution, returning
+/// its output (trailing newlines already stripped by `run_substitution`). On a
+/// lex/parse error returns an empty string.
+fn run_prompt_cmdsub(body: &str, shell: &mut Shell) -> String {
+    match crate::lexer::tokenize(body) {
+        Ok(toks) => match crate::command::parse(toks) {
+            Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 // ── Per-escape helpers ─────────────────────────────────────────
@@ -428,5 +519,45 @@ mod tests {
     fn expand_arith_unterminated_is_literal() {
         let mut shell = Shell::new();
         assert_eq!(expand_prompt("$((1+2", &mut shell), "$((1+2");
+    }
+
+    #[test]
+    fn expand_cmdsub_simple() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo hi)", &mut shell), "hi");
+    }
+    #[test]
+    fn expand_cmdsub_nested_and_mixed() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("a$(echo $(echo x))b", &mut shell), "axb");
+    }
+    #[test]
+    fn expand_cmdsub_strips_trailing_newlines() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(printf 'a\\n\\n')", &mut shell), "a");
+    }
+    #[test]
+    fn expand_cmdsub_paren_in_quotes() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo \")\")", &mut shell), ")");
+    }
+    #[test]
+    fn expand_backtick() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("`echo y`", &mut shell), "y");
+    }
+    #[test]
+    fn expand_cmdsub_unterminated_is_literal() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo", &mut shell), "$(echo");
+    }
+    #[test]
+    fn expand_cmdsub_passes_ansi_and_markers_through() {
+        // \[ \] -> \x01 \x02, ANSI escape literal, cmdsub in the middle.
+        let mut shell = Shell::new();
+        assert_eq!(
+            expand_prompt("\\[\\e[31m\\]$(echo R)\\[\\e[0m\\]", &mut shell),
+            "\x01\x1b[31m\x02R\x01\x1b[0m\x02"
+        );
     }
 }
