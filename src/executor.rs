@@ -4094,6 +4094,21 @@ fn run_multi_stage(
     }
     parent_held.retain(|&fd| Some(fd) == capture_read_fd);
 
+    // Drain the capture pipe BEFORE waiting (M-119): the final stage blocks on
+    // write() once it fills the pipe buffer, so nothing draining during the wait
+    // deadlocks. Reading to EOF here overlaps with the stages writing. Capture
+    // sink => interactive == false, so the terminal-handoff/stopped blocks below
+    // are no-ops in this case.
+    if let Some(r) = capture_read_fd.take() {
+        if let StdoutSink::Capture(buf) = sink {
+            let mut f = unsafe { File::from_raw_fd(r) };
+            let _ = io::copy(&mut f, *buf);
+            // f drops here, closing r.
+        } else {
+            unsafe { libc::close(r); }
+        }
+    }
+
     // Give the terminal to the pipeline's process group if interactive.
     if interactive && let Some(pgid) = first_pid {
         give_terminal_to(pgid);
@@ -4107,21 +4122,10 @@ fn run_multi_stage(
         if let PipelineWaitResult::Stopped(sig) = &last_status {
             let sig = *sig;
             // Intentionally do NOT set $PIPESTATUS here: bash does not set it
-            // for a stopped (Ctrl-Z) pipeline. Capture fd cleanup before the
-            // early return.
-            if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
+            // for a stopped (Ctrl-Z) pipeline. (The capture fd, if any, was
+            // already drained and taken above — capture sink => non-interactive,
+            // so this stopped path never carries a live capture fd.)
             return ExecOutcome::Continue(128 + sig);
-        }
-    }
-
-    // ---- Read capture sink --------------------------------------------------
-    if let Some(r) = capture_read_fd.take() {
-        if let StdoutSink::Capture(buf) = sink {
-            let mut f = unsafe { File::from_raw_fd(r) };
-            let _ = io::copy(&mut f, *buf);
-            // f drops here, closing r.
-        } else {
-            unsafe { libc::close(r); }
         }
     }
 
