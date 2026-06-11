@@ -1848,6 +1848,34 @@ fn builtin_declare_decl(
 /// caller treats this as `read` exit status 1). Returns
 /// `Ok(Some(partial))` when EOF hits AFTER at least one byte but
 /// before the delim (caller still assigns and returns status 0).
+/// Reads one record up to (not including) `delim`. Returns `(content, had_delim)`;
+/// `had_delim` is false for a final unterminated record at EOF. `None` only when
+/// nothing remains. Raw bytes — no backslash processing (mapfile reads raw lines).
+// Wired into mapfile in Task 4
+#[allow(dead_code)]
+fn read_one_record<R: std::io::Read>(
+    r: &mut R,
+    delim: u8,
+) -> std::io::Result<Option<(String, bool)>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut any = false;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = r.read(&mut byte)?;
+        if n == 0 {
+            if !any {
+                return Ok(None);
+            }
+            return Ok(Some((String::from_utf8_lossy(&out).into_owned(), false)));
+        }
+        any = true;
+        if byte[0] == delim {
+            return Ok(Some((String::from_utf8_lossy(&out).into_owned(), true)));
+        }
+        out.push(byte[0]);
+    }
+}
+
 fn read_one_line<R: std::io::Read>(
     r: &mut R,
     raw: bool,
@@ -9363,6 +9391,33 @@ mod read_tests {
         let mut c = Cursor::new(b"foo\0bar".as_slice());
         let r = read_one_line(&mut c, false, 0u8).unwrap();
         assert_eq!(r.as_deref(), Some("foo"));
+    }
+
+    // ── read_one_record ────────────────────────────────────────
+
+    #[test]
+    fn read_one_record_newline_delim() {
+        let mut r = std::io::Cursor::new(b"a\nb\n".to_vec());
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("b".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), None);
+    }
+
+    #[test]
+    fn read_one_record_unterminated_last() {
+        let mut r = std::io::Cursor::new(b"a\nb".to_vec());
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), Some(("b".to_string(), false)));
+        assert_eq!(read_one_record(&mut r, b'\n').unwrap(), None);
+    }
+
+    #[test]
+    fn read_one_record_custom_delim_keeps_other_bytes() {
+        let mut r = std::io::Cursor::new(b"a:b:c\n".to_vec());
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("a".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("b".to_string(), true)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), Some(("c\n".to_string(), false)));
+        assert_eq!(read_one_record(&mut r, b':').unwrap(), None);
     }
 
     // ── split_into_names ───────────────────────────────────────
