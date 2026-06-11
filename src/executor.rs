@@ -2798,7 +2798,8 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
                 }
                 if shell.shell_options.xtrace {
                     let val = shell.lookup_var(name).unwrap_or_default();
-                    xtrace_emit(&format!("{}{name}={}", ps4(shell),
+                    let p4 = ps4(shell);
+                    xtrace_emit(&format!("{p4}{name}={}",
                               crate::param_expansion::xtrace_quote(&val)));
                 }
             }
@@ -2911,11 +2912,21 @@ pub(crate) fn call_function_body(
     call_function(name, body, args, shell, &mut sink)
 }
 
-fn ps4(shell: &Shell) -> String {
+fn ps4(shell: &mut Shell) -> String {
     // bash expands $PS4 (prompt escapes + $VAR, via the PS1/PS2 expander), THEN
     // replicates the FIRST char of the EXPANDED value once per nesting level.
     let raw = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
+    // Rendering a prompt must be transparent to $? (bash saves/restores it).
+    let saved_status = shell.last_status();
+    let saved_cmd_sub = shell.last_cmd_sub_status();
+    // Suppress xtrace WHILE expanding PS4: bash does not trace commands run by a
+    // PS4 command substitution, and tracing them here would recurse into ps4().
+    let saved_xtrace = shell.shell_options.xtrace;
+    shell.shell_options.xtrace = false;
     let expanded = crate::prompt::expand_prompt(&raw, shell);
+    shell.shell_options.xtrace = saved_xtrace;
+    shell.set_last_status(saved_status);
+    shell.set_last_cmd_sub_status(saved_cmd_sub);
     let mut chars = expanded.chars();
     let Some(first) = chars.next() else { return String::new(); };
     let rest: String = chars.collect();
@@ -4951,7 +4962,8 @@ fn spawn_external_with_fds(
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
 
     if shell.shell_options.xtrace {
-        xtrace_emit(&format!("{}{}", ps4(shell),
+        let p4 = ps4(shell);
+        xtrace_emit(&format!("{p4}{}",
                   xtrace_command_line(&[], &resolved.program, &resolved.args)));
     }
 
@@ -5070,6 +5082,27 @@ mod tests {
     use super::*;
     use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
+
+    #[test]
+    fn ps4_cmdsub_preserves_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(7);
+        shell.set("PS4", "$(false)+ ".to_string());
+        let _ = ps4(&mut shell);
+        assert_eq!(shell.last_status(), 7, "rendering PS4 must not clobber $?");
+    }
+
+    #[test]
+    fn ps4_cmdsub_under_xtrace_does_not_recurse() {
+        let mut shell = Shell::new();
+        shell.shell_options.xtrace = true;
+        shell.set("PS4", "$(true) ".to_string());
+        // Without the xtrace-suppression fix, expanding PS4 runs `true` which is
+        // traced -> re-enters ps4() -> infinite recursion -> stack overflow.
+        let _ = ps4(&mut shell);
+        // Reaching here (no abort) IS the assertion. Also confirm xtrace restored:
+        assert!(shell.shell_options.xtrace, "xtrace must be restored after ps4");
+    }
 
     #[test]
     fn open_writable_guard_creates_new_file() {

@@ -10,14 +10,14 @@ use crate::shell_state::Shell;
 /// \u \h \H \w \W \$ \n \r \\ \? \j \! \# \e \033 \a \[ \] and
 /// $VAR / ${VAR} interpolation. Unknown \X passes through
 /// literally.
-pub fn expand_prompt(template: &str, shell: &Shell) -> String {
+pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
     let mut out = String::new();
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         // Fast path: copy any run of non-special bytes.
         let mut j = i;
-        while j < bytes.len() && bytes[j] != b'\\' && bytes[j] != b'$' {
+        while j < bytes.len() && bytes[j] != b'\\' && bytes[j] != b'$' && bytes[j] != b'`' {
             j += 1;
         }
         if j > i {
@@ -28,7 +28,20 @@ pub fn expand_prompt(template: &str, shell: &Shell) -> String {
             }
         }
 
-        if bytes[i] == b'\\' {
+        if bytes[i] == b'`' {
+            // Backtick command substitution.
+            match scan_backtick_close(bytes, i + 1) {
+                Some(close) => {
+                    let body = template[i + 1..close].to_string();
+                    out.push_str(&run_prompt_cmdsub(&body, shell));
+                    i = close + 1;
+                }
+                None => {
+                    out.push_str(&template[i..]);
+                    break;
+                }
+            }
+        } else if bytes[i] == b'\\' {
             // Escape sequence.
             if i + 1 >= bytes.len() {
                 // Trailing backslash — keep literal.
@@ -79,6 +92,40 @@ pub fn expand_prompt(template: &str, shell: &Shell) -> String {
                 i += 1;
                 continue;
             }
+            // $((...)) arithmetic.
+            if bytes[i + 1] == b'(' && i + 2 < bytes.len() && bytes[i + 2] == b'(' {
+                match scan_arith_close(bytes, i + 3) {
+                    Some((body_end, next_i)) => {
+                        let body = &template[i + 3..body_end];
+                        if let Ok(expr) = crate::arith::parse(body)
+                            && let Ok(n) = crate::arith::eval(&expr, shell)
+                        {
+                            out.push_str(&n.to_string());
+                        }
+                        i = next_i;
+                        continue;
+                    }
+                    None => {
+                        out.push_str(&template[i..]);
+                        break;
+                    }
+                }
+            }
+            // $(...) command substitution.
+            if bytes[i + 1] == b'(' {
+                match scan_cmdsub_close(bytes, i + 2) {
+                    Some((body_end, next_i)) => {
+                        let body = template[i + 2..body_end].to_string();
+                        out.push_str(&run_prompt_cmdsub(&body, shell));
+                        i = next_i;
+                        continue;
+                    }
+                    None => {
+                        out.push_str(&template[i..]);
+                        break;
+                    }
+                }
+            }
             if bytes[i + 1] == b'{' {
                 // ${NAME}
                 let start = i + 2;
@@ -122,6 +169,91 @@ pub fn expand_prompt(template: &str, shell: &Shell) -> String {
         }
     }
     out
+}
+
+/// Finds the matching `))` for a `$((…))` whose `$((` ends at `start`.
+/// Returns `(body_end_exclusive, next_index_after_closing)`. Mirrors the
+/// lexer's `scan_arith_block` close rule (a `)` at depth 0 followed by `)`).
+fn scan_arith_close(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut k = start;
+    let mut depth: i32 = 0;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 && k + 1 < bytes.len() && bytes[k + 1] == b')' {
+                    return Some((k, k + 2));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Finds the matching `)` for a `$(…)` whose `$(` ends at `start` (depth starts
+/// at 1). Quote-aware so a `)` inside `'…'`/`"…"` does not close early.
+/// Returns `(body_end_exclusive, next_index_after_close)`.
+fn scan_cmdsub_close(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut k = start;
+    let mut depth: i32 = 1;
+    let mut in_single = false;
+    let mut in_double = false;
+    while k < bytes.len() {
+        let b = bytes[k];
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'"' {
+                in_double = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((k, k + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Finds the next unescaped backtick after `start`. Returns its index.
+fn scan_backtick_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut k = start;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b'`' => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// Parses `body` as a command and runs it as a command substitution, returning
+/// its output (trailing newlines already stripped by `run_substitution`). On a
+/// lex/parse error returns an empty string.
+fn run_prompt_cmdsub(body: &str, shell: &mut Shell) -> String {
+    match crate::lexer::tokenize(body) {
+        Ok(toks) => match crate::command::parse(toks) {
+            Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 // ── Per-escape helpers ─────────────────────────────────────────
@@ -239,21 +371,21 @@ mod tests {
 
     #[test]
     fn literal_text_passes_through() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("hello ", &shell), "hello ");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("hello ", &mut shell), "hello ");
     }
 
     #[test]
     fn expand_user() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\u", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\u", &mut shell);
         assert!(!out.is_empty(), "\\u should resolve to something");
     }
 
     #[test]
     fn expand_hostname_short() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\h", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\h", &mut shell);
         assert!(
             !out.contains('.'),
             "short hostname must not contain '.': {out:?}"
@@ -265,14 +397,14 @@ mod tests {
         let mut shell = Shell::new();
         shell.set("HOME", "/h/me".to_string());
         shell.set("PWD", "/h/me/x".to_string());
-        assert_eq!(expand_prompt("\\w", &shell), "~/x");
+        assert_eq!(expand_prompt("\\w", &mut shell), "~/x");
     }
 
     #[test]
     fn expand_cwd_basename() {
         let mut shell = Shell::new();
         shell.set("PWD", "/a/b/c".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "c");
+        assert_eq!(expand_prompt("\\W", &mut shell), "c");
     }
 
     #[test]
@@ -281,7 +413,7 @@ mod tests {
         // taking the basename. `PWD=/foo/` → `\W` = `foo`.
         let mut shell = Shell::new();
         shell.set("PWD", "/foo/".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "foo");
+        assert_eq!(expand_prompt("\\W", &mut shell), "foo");
     }
 
     #[test]
@@ -289,13 +421,13 @@ mod tests {
         // PWD=/ → \W is `/` (the root itself; no basename).
         let mut shell = Shell::new();
         shell.set("PWD", "/".to_string());
-        assert_eq!(expand_prompt("\\W", &shell), "/");
+        assert_eq!(expand_prompt("\\W", &mut shell), "/");
     }
 
     #[test]
     fn expand_dollar_user_vs_root() {
-        let shell = Shell::new();
-        let out = expand_prompt("\\$", &shell);
+        let mut shell = Shell::new();
+        let out = expand_prompt("\\$", &mut shell);
         let expected = if unsafe { libc::geteuid() } == 0 {
             "#"
         } else {
@@ -306,70 +438,126 @@ mod tests {
 
     #[test]
     fn expand_n_r_backslash() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\n", &shell), "\n");
-        assert_eq!(expand_prompt("\\r", &shell), "\r");
-        assert_eq!(expand_prompt("\\\\", &shell), "\\");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\n", &mut shell), "\n");
+        assert_eq!(expand_prompt("\\r", &mut shell), "\r");
+        assert_eq!(expand_prompt("\\\\", &mut shell), "\\");
     }
 
     #[test]
     fn expand_status() {
         let mut shell = Shell::new();
         shell.set_last_status(42);
-        assert_eq!(expand_prompt("\\?", &shell), "42");
+        assert_eq!(expand_prompt("\\?", &mut shell), "42");
     }
 
     #[test]
     fn expand_jobs_count_zero() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\j", &shell), "0");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\j", &mut shell), "0");
     }
 
     #[test]
     fn expand_escape_e_and_033() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\e", &shell), "\x1B");
-        assert_eq!(expand_prompt("\\033", &shell), "\x1B");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\e", &mut shell), "\x1B");
+        assert_eq!(expand_prompt("\\033", &mut shell), "\x1B");
     }
 
     #[test]
     fn expand_bell() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\a", &shell), "\x07");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\a", &mut shell), "\x07");
     }
 
     #[test]
     fn expand_bracket_markers() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\[X\\]", &shell), "\x01X\x02");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\[X\\]", &mut shell), "\x01X\x02");
     }
 
     #[test]
     fn expand_dollar_var_with_braces() {
         let mut shell = Shell::new();
         shell.set("XYZ_PROMPT", "hi".to_string());
-        assert_eq!(expand_prompt("${XYZ_PROMPT}", &shell), "hi");
+        assert_eq!(expand_prompt("${XYZ_PROMPT}", &mut shell), "hi");
     }
 
     #[test]
     fn expand_dollar_var_bare() {
         let mut shell = Shell::new();
         shell.set("XYZ_PROMPT", "hi".to_string());
-        assert_eq!(expand_prompt("$XYZ_PROMPT ", &shell), "hi ");
+        assert_eq!(expand_prompt("$XYZ_PROMPT ", &mut shell), "hi ");
     }
 
     #[test]
     fn expand_unknown_escape_preserved() {
-        let shell = Shell::new();
-        assert_eq!(expand_prompt("\\z", &shell), "\\z");
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("\\z", &mut shell), "\\z");
     }
 
     #[test]
     fn expand_undefined_var_empty() {
-        let shell = Shell::new();
+        let mut shell = Shell::new();
         assert_eq!(
-            expand_prompt("${___DEFINITELY_UNSET_PROMPT___}>", &shell),
+            expand_prompt("${___DEFINITELY_UNSET_PROMPT___}>", &mut shell),
             ">"
+        );
+    }
+
+    #[test]
+    fn expand_arith_simple() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$((40+2))", &mut shell), "42");
+    }
+    #[test]
+    fn expand_arith_nested_parens() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("[$(( (1+2)*3 ))]", &mut shell), "[9]");
+    }
+    #[test]
+    fn expand_arith_unterminated_is_literal() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$((1+2", &mut shell), "$((1+2");
+    }
+
+    #[test]
+    fn expand_cmdsub_simple() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo hi)", &mut shell), "hi");
+    }
+    #[test]
+    fn expand_cmdsub_nested_and_mixed() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("a$(echo $(echo x))b", &mut shell), "axb");
+    }
+    #[test]
+    fn expand_cmdsub_strips_trailing_newlines() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(printf 'a\\n\\n')", &mut shell), "a");
+    }
+    #[test]
+    fn expand_cmdsub_paren_in_quotes() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo \")\")", &mut shell), ")");
+    }
+    #[test]
+    fn expand_backtick() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("`echo y`", &mut shell), "y");
+    }
+    #[test]
+    fn expand_cmdsub_unterminated_is_literal() {
+        let mut shell = Shell::new();
+        assert_eq!(expand_prompt("$(echo", &mut shell), "$(echo");
+    }
+    #[test]
+    fn expand_cmdsub_passes_ansi_and_markers_through() {
+        // \[ \] -> \x01 \x02, ANSI escape literal, cmdsub in the middle.
+        let mut shell = Shell::new();
+        assert_eq!(
+            expand_prompt("\\[\\e[31m\\]$(echo R)\\[\\e[0m\\]", &mut shell),
+            "\x01\x1b[31m\x02R\x01\x1b[0m\x02"
         );
     }
 }
