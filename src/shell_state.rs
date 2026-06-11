@@ -560,6 +560,134 @@ impl Shell {
         self.vars.contains_key(name)
     }
 
+    /// `-v` target for `test`/`[[ ]]`: a bare name / positional / special
+    /// param, OR an array element `name[sub]` (M-14b). Element form:
+    /// associative arrays use `sub` as a literal key; indexed arrays
+    /// arith-evaluate `sub` to an index (matching `${arr[i]}`). Anything
+    /// that isn't the `name[sub]` shape falls through to `is_set`.
+    ///
+    /// Subscript arithmetic is done by a READ-ONLY evaluator
+    /// (`read_only_arith` below) because this method only has `&self`
+    /// (`builtin_test`'s predicate is `&Shell`). It reuses
+    /// `crate::arith::parse` for the AST and `array_max_index` for
+    /// negative-index wrapping (so `arr[-1]` is the last element, matching
+    /// `${arr[-1]}`). Side-effecting forms (`++`/`--`/assignment) and
+    /// command substitutions inside a `-v` subscript are not supported and
+    /// yield false — a rare edge.
+    pub fn element_or_var_is_set(&self, target: &str) -> bool {
+        if let Some((name, sub)) = crate::expand::split_name_subscript(target) {
+            if self.get_associative(&name).is_some() {
+                return self.lookup_associative_element(&name, &sub).is_some();
+            }
+            let n = match self.read_only_arith(&sub) {
+                Some(n) => n,
+                None => return false,
+            };
+            let idx = if n >= 0 {
+                n as usize
+            } else {
+                // Negative subscript wraps from the end (bash `arr[-1]` =
+                // last element), matching `eval_subscript`/`${arr[-n]}`.
+                match self.array_max_index(&name) {
+                    Some(max) => {
+                        let wrapped = max as i64 + 1 + n;
+                        if wrapped < 0 {
+                            return false;
+                        }
+                        wrapped as usize
+                    }
+                    None => return false,
+                }
+            };
+            return self.lookup_array_element(&name, idx).is_some();
+        }
+        self.is_set(target)
+    }
+
+    /// Read-only arithmetic evaluation of an array subscript string, backed
+    /// by `&self` (variable lookups only — no mutation). Returns `None` for
+    /// a parse error or any side-effecting / command-substitution form,
+    /// which the `-v` element check treats as "not set". Pure-operator
+    /// arms mirror `crate::arith::eval` (which needs `&mut Shell` for the
+    /// assignment/inc-dec arms we deliberately reject here). The `match` on
+    /// `ArithExpr` is EXHAUSTIVE, so a new arith operator is a compile error
+    /// here — drift from `arith::eval` is caught by the compiler, not silent.
+    fn read_only_arith(&self, sub: &str) -> Option<i64> {
+        use crate::arith::ArithExpr as E;
+        fn ev(e: &E, sh: &Shell) -> Option<i64> {
+            Some(match e {
+                E::Num(n) => *n,
+                E::Var(name) => {
+                    let raw = sh.lookup_var(name).unwrap_or_default();
+                    if raw.is_empty() {
+                        0
+                    } else {
+                        raw.parse::<i64>().ok()?
+                    }
+                }
+                E::Neg(a) => ev(a, sh)?.wrapping_neg(),
+                E::Not(a) => i64::from(ev(a, sh)? == 0),
+                E::BitNot(a) => !ev(a, sh)?,
+                E::Add(a, b) => ev(a, sh)?.wrapping_add(ev(b, sh)?),
+                E::Sub(a, b) => ev(a, sh)?.wrapping_sub(ev(b, sh)?),
+                E::Mul(a, b) => ev(a, sh)?.wrapping_mul(ev(b, sh)?),
+                E::Div(a, b) => {
+                    let r = ev(b, sh)?;
+                    if r == 0 { return None; }
+                    ev(a, sh)?.wrapping_div(r)
+                }
+                E::Mod(a, b) => {
+                    let r = ev(b, sh)?;
+                    if r == 0 { return None; }
+                    ev(a, sh)?.wrapping_rem(r)
+                }
+                E::Eq(a, b) => i64::from(ev(a, sh)? == ev(b, sh)?),
+                E::Ne(a, b) => i64::from(ev(a, sh)? != ev(b, sh)?),
+                E::Lt(a, b) => i64::from(ev(a, sh)? < ev(b, sh)?),
+                E::Le(a, b) => i64::from(ev(a, sh)? <= ev(b, sh)?),
+                E::Gt(a, b) => i64::from(ev(a, sh)? > ev(b, sh)?),
+                E::Ge(a, b) => i64::from(ev(a, sh)? >= ev(b, sh)?),
+                E::And(a, b) => i64::from(ev(a, sh)? != 0 && ev(b, sh)? != 0),
+                E::Or(a, b) => i64::from(ev(a, sh)? != 0 || ev(b, sh)? != 0),
+                E::Ternary(c, t, f) => {
+                    if ev(c, sh)? != 0 { ev(t, sh)? } else { ev(f, sh)? }
+                }
+                E::Comma(a, b) => {
+                    ev(a, sh)?;
+                    ev(b, sh)?
+                }
+                E::BitAnd(a, b) => ev(a, sh)? & ev(b, sh)?,
+                E::BitOr(a, b) => ev(a, sh)? | ev(b, sh)?,
+                E::BitXor(a, b) => ev(a, sh)? ^ ev(b, sh)?,
+                // Shift count out of range → invalid (matches arith::eval, which
+                // errors here; for a `-v` subscript that means "not set").
+                E::Shl(a, b) => {
+                    let (l, r) = (ev(a, sh)?, ev(b, sh)?);
+                    if !(0..64).contains(&r) { return None; }
+                    l.wrapping_shl(r as u32)
+                }
+                E::Shr(a, b) => {
+                    let (l, r) = (ev(a, sh)?, ev(b, sh)?);
+                    if !(0..64).contains(&r) { return None; }
+                    l.wrapping_shr(r as u32)
+                }
+                E::Pow(a, b) => {
+                    let exp = ev(b, sh)?;
+                    if exp < 0 { return None; }
+                    ev(a, sh)?.wrapping_pow(exp as u32)
+                }
+                // Side-effecting / unsupported in a read-only subscript.
+                E::Assign { .. }
+                | E::PreInc(_)
+                | E::PreDec(_)
+                | E::PostInc(_)
+                | E::PostDec(_) => return None,
+            })
+        }
+        let expr = crate::arith::parse(sub).ok()?;
+        ev(&expr, self)
+    }
+
     /// Marks an existing variable as exported. If it doesn't exist, creates
     /// it with an empty value, already exported.
     pub fn export(&mut self, name: &str) {

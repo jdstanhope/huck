@@ -400,6 +400,17 @@ pub enum TestUnaryOp {
     VarSet,          // -v  (variable is set)
     /// `[[ -o NAME ]]` — true iff the `set -o` option NAME is enabled.
     OptEnabled,      // -o
+    IsFifo,          // -p
+    IsSocket,        // -S
+    IsBlockDev,      // -b
+    IsCharDev,       // -c
+    OwnedByEuid,     // -O
+    OwnedByEgid,     // -G
+    NewerThanRead,   // -N
+    IsSticky,        // -k
+    IsSetuid,        // -u
+    IsSetgid,        // -g
+    IsTerminal,      // -t
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -2006,6 +2017,17 @@ fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
         "-z" => Some(TestUnaryOp::StringEmpty),
         "-v" => Some(TestUnaryOp::VarSet),
         "-o" => Some(TestUnaryOp::OptEnabled),
+        "-p" => Some(TestUnaryOp::IsFifo),
+        "-S" => Some(TestUnaryOp::IsSocket),
+        "-b" => Some(TestUnaryOp::IsBlockDev),
+        "-c" => Some(TestUnaryOp::IsCharDev),
+        "-O" => Some(TestUnaryOp::OwnedByEuid),
+        "-G" => Some(TestUnaryOp::OwnedByEgid),
+        "-N" => Some(TestUnaryOp::NewerThanRead),
+        "-k" => Some(TestUnaryOp::IsSticky),
+        "-u" => Some(TestUnaryOp::IsSetuid),
+        "-g" => Some(TestUnaryOp::IsSetgid),
+        "-t" => Some(TestUnaryOp::IsTerminal),
         _ => None,
     }
 }

@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 1 | Open bugs to fix (M-114). |
-| Missing features (Tier 2) | 24 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 21 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 26 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -58,14 +58,6 @@ group.
 - **M-09a: Relaxed function-name characters** — `[deferred]` low. huck restricts function names to POSIX identifiers (`[A-Za-z_][A-Za-z0-9_]*`) in BOTH the `name() body` and `function name body` forms. Bash 5 accepts `.`, `-`, `+`, `:` and other non-POSIX-identifier characters when the function is defined via the keyword form (`function foo.bar { :; }`). Rarely used in practice.
 - **M-09b: Definition-attached redirections** — `[deferred]` low. Both function-definition forms (`name() body > file` and `function name body > file`) currently reject trailing redirections. Bash allows attaching redirections to the function definition itself, taking effect at every call. Affects both forms equally.
 
-### Compound commands
-
-- **M-14b: `[[ -v arr[i] ]]` array-element form** — `[deferred]` low. `-v` supports
-  scalar names and positional parameters; the array-element subscript form
-  (`-v arr[1]`) is not parsed — the name falls through to a plain-name lookup
-  (→ false). bash checks the specific element. Rarely used; bash-completion's
-  `-v` uses are plain names.
-
 ### Parameter expansion modifiers
 
 - **M-15b: operand quote/escape context not propagated** — `[deferred]` low. Two pre-existing divergences (NOT introduced by v84) when a `${...}` is itself inside double quotes: (a) single quotes in its operand are stripped by huck but kept literal by bash (`"${y:-'a|b'}"` → bash `'a|b'`, huck `a|b`); (b) a backslash-escaped char in an operand drops the backslash where bash keeps it (`"${y:-\*}"` → bash `\*`, huck `*`). Root cause: `parse_braced_operand` receives only the extracted operand body, not the enclosing quote context.
@@ -88,8 +80,6 @@ group.
 
 ### Builtins (other)
 
-- **M-26: `test -v VAR`** — `[deferred]` medium. huck: not implemented. bash: tests if a variable is set.
-- **M-27: Other `test` operators** (`-p`/`-S`/`-b`/`-c`/`-O`/`-G`/`-N`/`-k`/`-u`/`-g`/`-t`) — `[deferred]` medium. huck: only `-e`/`-f`/`-d`/`-r`/`-w`/`-x`/`-s`/`-L`. bash: full set.
 - **M-32: `cd -P` / `-L`** — `[deferred]` medium. huck: flags rejected. bash: physical/logical mode.
 - **M-33: `pwd -P` / `-L`** — `[deferred]` low. huck: flags silently passed through. bash: physical/logical.
 - **M-36b: system-data completion actions** — `[deferred]` low. `compgen -A

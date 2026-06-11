@@ -1334,7 +1334,7 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
         TestExpr::Unary { op, operand } => {
             let s = expand_assignment(operand, shell);
             if matches!(op, TestUnaryOp::VarSet) {
-                return Ok(shell.is_set(&s));
+                return Ok(shell.element_or_var_is_set(&s));
             }
             if matches!(op, TestUnaryOp::OptEnabled) {
                 return Ok(crate::builtins::option_get(shell, &s).unwrap_or(false));
@@ -1406,6 +1406,17 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
         TestUnaryOp::IsExecutable => test_builtin::evaluate(&["-x".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::IsNonEmpty   => test_builtin::evaluate(&["-s".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::IsSymlink    => test_builtin::evaluate(&["-L".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsFifo       => test_builtin::evaluate(&["-p".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsSocket     => test_builtin::evaluate(&["-S".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsBlockDev   => test_builtin::evaluate(&["-b".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsCharDev    => test_builtin::evaluate(&["-c".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::OwnedByEuid  => test_builtin::evaluate(&["-O".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::OwnedByEgid  => test_builtin::evaluate(&["-G".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::NewerThanRead => test_builtin::evaluate(&["-N".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsSticky     => test_builtin::evaluate(&["-k".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsSetuid     => test_builtin::evaluate(&["-u".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsSetgid     => test_builtin::evaluate(&["-g".to_string(), s.to_string()]).unwrap_or(false),
+        TestUnaryOp::IsTerminal   => test_builtin::evaluate(&["-t".to_string(), s.to_string()]).unwrap_or(false),
         TestUnaryOp::VarSet       => unreachable!("VarSet handled in eval_test_expr"),
         TestUnaryOp::OptEnabled   => unreachable!("OptEnabled handled in eval_test_expr"),
     }
