@@ -108,7 +108,6 @@ fn is_binary_op(s: &str) -> bool {
 /// file is treated as the oldest possible mtime; `-ef` requires both files
 /// to exist (bash 5.2 semantics).
 pub(crate) fn compare_files(op: &str, lhs: &str, rhs: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
     let lm = std::fs::metadata(lhs);
     let rm = std::fs::metadata(rhs);
     let nanos = |m: &std::fs::Metadata| (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
@@ -168,7 +167,15 @@ fn apply_unary(
         "-g" => Ok(file_mode(operand).map(|m| m & libc::S_ISGID != 0).unwrap_or(false)),
         "-O" => Ok(std::fs::metadata(operand).map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false)),
         "-G" => Ok(std::fs::metadata(operand).map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false)),
-        "-N" => Ok(std::fs::metadata(operand).map(|m| m.mtime() > m.atime()).unwrap_or(false)),
+        "-N" => Ok(std::fs::metadata(operand)
+            .map(|m| {
+                // Full-timespec comparison (bash compares struct timespec; match
+                // the nanosecond precision of `-nt`/`-ot`).
+                let mt = (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
+                let at = (m.atime() as i128) * 1_000_000_000 + (m.atime_nsec() as i128);
+                mt > at
+            })
+            .unwrap_or(false)),
         "-t" => Ok(operand.parse::<i32>().map(|fd| unsafe { libc::isatty(fd) } == 1).unwrap_or(false)),
         _ => Err(format!("{op}: unknown operator")),
     }
