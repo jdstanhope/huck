@@ -2916,7 +2916,12 @@ fn ps4(shell: &mut Shell) -> String {
     // bash expands $PS4 (prompt escapes + $VAR, via the PS1/PS2 expander), THEN
     // replicates the FIRST char of the EXPANDED value once per nesting level.
     let raw = shell.lookup_var("PS4").unwrap_or_else(|| "+ ".to_string());
+    // Rendering a prompt must be transparent to $? (bash saves/restores it).
+    let saved_status = shell.last_status();
+    let saved_cmd_sub = shell.last_cmd_sub_status();
     let expanded = crate::prompt::expand_prompt(&raw, shell);
+    shell.set_last_status(saved_status);
+    shell.set_last_cmd_sub_status(saved_cmd_sub);
     let mut chars = expanded.chars();
     let Some(first) = chars.next() else { return String::new(); };
     let rest: String = chars.collect();
@@ -5072,6 +5077,15 @@ mod tests {
     use super::*;
     use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
+
+    #[test]
+    fn ps4_cmdsub_preserves_last_status() {
+        let mut shell = Shell::new();
+        shell.set_last_status(7);
+        shell.set("PS4", "$(false)+ ".to_string());
+        let _ = ps4(&mut shell);
+        assert_eq!(shell.last_status(), 7, "rendering PS4 must not clobber $?");
+    }
 
     #[test]
     fn open_writable_guard_creates_new_file() {
