@@ -461,7 +461,13 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                         if libc::WIFEXITED(raw_status) {
                             libc::WEXITSTATUS(raw_status)
                         } else if libc::WIFSIGNALED(raw_status) {
-                            128 + libc::WTERMSIG(raw_status)
+                            let sig = libc::WTERMSIG(raw_status);
+                            if sig == libc::SIGINT {
+                                shell
+                                    .sigint_flag
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            128 + sig
                         } else {
                             1
                         }
@@ -482,7 +488,13 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 let code = if libc::WIFEXITED(raw_status) {
                     libc::WEXITSTATUS(raw_status)
                 } else if libc::WIFSIGNALED(raw_status) {
-                    128 + libc::WTERMSIG(raw_status)
+                    let sig = libc::WTERMSIG(raw_status);
+                    if sig == libc::SIGINT {
+                        shell
+                            .sigint_flag
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    128 + sig
                 } else {
                     1
                 };
@@ -3484,7 +3496,13 @@ fn run_subprocess(
                         let code = if libc::WIFEXITED(raw_status) {
                             libc::WEXITSTATUS(raw_status)
                         } else if libc::WIFSIGNALED(raw_status) {
-                            128 + libc::WTERMSIG(raw_status)
+                            let sig = libc::WTERMSIG(raw_status);
+                            if sig == libc::SIGINT {
+                                shell
+                                    .sigint_flag
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            128 + sig
                         } else {
                             1
                         };
@@ -4297,7 +4315,13 @@ fn wait_pipeline_raw(
                     let s = if libc::WIFEXITED(raw) {
                         libc::WEXITSTATUS(raw)
                     } else {
-                        128 + libc::WTERMSIG(raw)
+                        let sig = libc::WTERMSIG(raw);
+                        if sig == libc::SIGINT {
+                            shell
+                                .sigint_flag
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        128 + sig
                     };
                     if let Some(idx) = pid_per_stage.iter().position(|p| *p == Some(r)) {
                         stage_status[idx] = Some(s);
@@ -4322,7 +4346,13 @@ fn wait_pipeline_raw(
                 if libc::WIFEXITED(raw) {
                     *slot = Some(libc::WEXITSTATUS(raw));
                 } else if libc::WIFSIGNALED(raw) {
-                    *slot = Some(128 + libc::WTERMSIG(raw));
+                    let sig = libc::WTERMSIG(raw);
+                    if sig == libc::SIGINT {
+                        shell
+                            .sigint_flag
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    *slot = Some(128 + sig);
                 }
                 break;
             }
