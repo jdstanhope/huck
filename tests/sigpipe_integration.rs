@@ -3,6 +3,9 @@
 //! EPIPE and spamming "Broken pipe". Tests run the huck binary as a subprocess
 //! (resetting SIGPIPE in the test process would not affect a spawned child).
 use std::process::{Command, Stdio};
+use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
+use std::time::{Duration, Instant};
 
 fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
 
@@ -62,4 +65,61 @@ fn function_producer_no_spam() {
     );
     assert_eq!(out, "0\n1\n", "out={out:?}");
     assert!(!err.contains("Broken pipe"), "err={err:?}");
+}
+
+// A producer in huck's MAIN process (huck's own stdout is the pipe) must die on
+// SIGPIPE when the reader closes — terminate, no infinite loop, no spam.
+//
+// NOTE: huck (like bash) is *killed by* SIGPIPE here — it does not install a
+// handler that exit(141)s. So the process is signal-terminated by signal 13,
+// and `ExitStatus::code()` is `None` (the familiar 141 = 128+13 is only what an
+// *observing parent shell* records in `$?`). Verified byte-for-byte against
+// bash: both die by signal 13 with empty stderr.
+#[test]
+fn main_process_producer_terminates_on_broken_pipe() {
+    let mut child = Command::new(huck_bin())
+        .arg("-c").arg("while true; do printf 'x\\n'; done")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn huck");
+
+    // Read one byte, then close the read end so huck's next write gets SIGPIPE.
+    {
+        let mut so = child.stdout.take().unwrap();
+        let mut one = [0u8; 1];
+        so.read_exact(&mut one).expect("read first byte");
+        assert_eq!(&one, b"x");
+        // `so` dropped here -> read end closed.
+    }
+
+    // Watchdog: huck must exit on its own within a few seconds.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") { break st; }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("huck did not terminate on a broken pipe (infinite loop)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "expected termination by SIGPIPE (signal 13, i.e. $? 141 in a parent); got {status:?}"
+    );
+
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).ok();
+    assert!(!err.contains("Broken pipe"), "stderr leaked Broken pipe: {err:?}");
+}
+
+// Restoring SIG_DFL at startup makes SIGPIPE trappable again (was rejected with
+// "cannot reset ignored signal").
+#[test]
+fn trap_pipe_is_now_settable() {
+    let (out, err, code) = huck_c("trap 'echo handler' PIPE; echo set-ok");
+    assert_eq!(out, "set-ok\n", "out={out:?}");
+    assert_eq!(code, 0, "code={code}");
+    assert!(!err.contains("cannot reset ignored signal"), "err={err:?}");
 }
