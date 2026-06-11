@@ -83,3 +83,11 @@ fn while_read_loop_aborts() {
     assert_eq!(out, "1\n", "out={out:?}");
     assert_eq!(code, 130);
 }
+
+#[test]
+fn command_substitution_aborts() {
+    // SIGINT inside $(...) aborts; the trailing command must not run.
+    let (out, _e, code) = huck_c("x=$(echo a; kill -INT $$; echo b); echo \"[$x]\"; echo after");
+    assert!(!out.contains("after"), "must abort before `after`; out={out:?}");
+    assert_eq!(code, 130, "out={out:?}");
+}

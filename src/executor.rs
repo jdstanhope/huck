@@ -157,7 +157,18 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
-        ExecOutcome::Interrupted => 130,
+        ExecOutcome::Interrupted => {
+            // An untrapped SIGINT aborted the substitution body. The
+            // interrupt was consumed (flag cleared) by the body's own
+            // `check_interrupt`; re-raise it on the shared `sigint_flag` so
+            // the enclosing command list observes it and aborts too —
+            // matching bash, where `x=$(... kill -INT $$ ...); echo after`
+            // never runs `after`. (v138)
+            shell
+                .sigint_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            130
+        }
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
 }
