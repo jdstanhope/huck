@@ -27,7 +27,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shopt", "shift", "getopts", ".", "source", "local",
     ":", "true", "false", "command",
-    "readonly", "read", "printf", "type", "hash",
+    "readonly", "read", "mapfile", "readarray", "printf", "type", "hash",
     "pushd", "popd", "dirs",
     "declare", "typeset",
     "eval",
@@ -121,6 +121,7 @@ pub fn run_builtin(
         "readonly" => builtin_readonly(args, out, shell),
         "declare" | "typeset" => builtin_declare(args, out, shell),
         "read" => builtin_read(args, out, shell),
+        "mapfile" | "readarray" => builtin_mapfile(args, shell),
         "printf" => builtin_printf(args, out, shell),
         "test" | "[" => builtin_test(name, args, shell),
         "break" => builtin_break(args, shell),
@@ -1851,8 +1852,6 @@ fn builtin_declare_decl(
 /// Reads one record up to (not including) `delim`. Returns `(content, had_delim)`;
 /// `had_delim` is false for a final unterminated record at EOF. `None` only when
 /// nothing remains. Raw bytes — no backslash processing (mapfile reads raw lines).
-// Wired into mapfile in Task 4
-#[allow(dead_code)]
 fn read_one_record<R: std::io::Read>(
     r: &mut R,
     delim: u8,
@@ -2140,6 +2139,152 @@ impl std::io::Read for RawStdinReader {
             return Err(e);
         }
     }
+}
+
+/// `mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]`
+/// (alias `readarray`). Reads delimiter-separated records from stdin into the
+/// indexed array ARRAY (default MAPFILE). Core option set (v140); `-u`/`-C`/`-c`
+/// are not implemented.
+fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    let mut delim: u8 = b'\n';
+    let mut strip_t = false;
+    let mut count: usize = 0; // 0 = unlimited
+    let mut skip: usize = 0;
+    let mut origin: Option<usize> = None;
+    let mut i = 0;
+
+    // Parse a numeric option value (rest-of-arg or next arg).
+    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char) -> Result<usize, ()> {
+        let s = if j + 1 < bytes.len() {
+            String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+        } else {
+            *i += 1;
+            if *i >= args.len() {
+                eprintln!("huck: mapfile: -{opt}: option requires an argument");
+                return Err(());
+            }
+            args[*i].clone()
+        };
+        match s.trim().parse::<usize>() {
+            Ok(n) => Ok(n),
+            Err(_) => {
+                eprintln!("huck: mapfile: {s}: invalid number");
+                Err(())
+            }
+        }
+    }
+
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg.len() < 2 {
+            break;
+        }
+        let bytes = arg.as_bytes();
+        let mut j = 1;
+        let mut consumed_rest = false;
+        while j < bytes.len() {
+            match bytes[j] {
+                b't' => strip_t = true,
+                b'd' => {
+                    let s = if j + 1 < bytes.len() {
+                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
+                    } else {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("huck: mapfile: -d: option requires an argument");
+                            return ExecOutcome::Continue(2);
+                        }
+                        args[i].clone()
+                    };
+                    delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
+                    consumed_rest = true;
+                }
+                b'n' => match num_val(args, &mut i, j, bytes, 'n') {
+                    Ok(n) => { count = n; consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                b's' => match num_val(args, &mut i, j, bytes, 's') {
+                    Ok(n) => { skip = n; consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                b'O' => match num_val(args, &mut i, j, bytes, 'O') {
+                    Ok(n) => { origin = Some(n); consumed_rest = true; }
+                    Err(()) => return ExecOutcome::Continue(2),
+                },
+                c => {
+                    eprintln!("huck: mapfile: -{}: invalid option", c as char);
+                    return ExecOutcome::Continue(2);
+                }
+            }
+            if consumed_rest {
+                break;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+
+    let array_name = args.get(i).cloned().unwrap_or_else(|| "MAPFILE".to_string());
+    if !is_valid_name(&array_name) {
+        eprintln!("huck: mapfile: `{array_name}': not a valid array name");
+        return ExecOutcome::Continue(1);
+    }
+
+    let mut handle = RawStdinReader::new();
+    // Skip the first `skip` records.
+    for _ in 0..skip {
+        match read_one_record(&mut handle, delim) {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("huck: mapfile: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    }
+    // Collect up to `count` (0 = unlimited) records.
+    let mut elements: Vec<String> = Vec::new();
+    loop {
+        if count != 0 && elements.len() >= count {
+            break;
+        }
+        match read_one_record(&mut handle, delim) {
+            Ok(Some((content, had_delim))) => {
+                let mut val = content;
+                if had_delim && !strip_t {
+                    val.push(delim as char);
+                }
+                elements.push(val);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("huck: mapfile: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    }
+
+    match origin {
+        None => {
+            let map: std::collections::BTreeMap<usize, String> =
+                elements.into_iter().enumerate().collect();
+            if shell.replace_array(&array_name, map).is_err() {
+                return ExecOutcome::Continue(1);
+            }
+        }
+        Some(o) => {
+            for (k, val) in elements.into_iter().enumerate() {
+                if shell.set_array_element(&array_name, o + k, val).is_err() {
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        }
+    }
+    ExecOutcome::Continue(0)
 }
 
 /// `read [-r] [-p PROMPT] [-s] [-d DELIM] [-a ARRAY] [NAME ...]`. Regular
@@ -5127,6 +5272,19 @@ static HELP_ENTRIES: &[HelpEntry] = &[
         name: "pwd",
         synopsis: "pwd",
         description: "Print the current working directory.",
+    },
+    HelpEntry {
+        name: "mapfile",
+        synopsis: "mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]",
+        description: "Read lines from standard input into an indexed array (default MAPFILE).\n\
+                      -t strips the trailing delimiter; -d sets the delimiter (default newline);\n\
+                      -n reads at most COUNT lines (0 = all); -O assigns from index ORIGIN\n\
+                      (without clearing); -s discards the first SKIP lines.",
+    },
+    HelpEntry {
+        name: "readarray",
+        synopsis: "readarray [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]",
+        description: "Synonym for mapfile.",
     },
     HelpEntry {
         name: "read",

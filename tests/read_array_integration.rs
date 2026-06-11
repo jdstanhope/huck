@@ -52,3 +52,47 @@ fn read_a_readonly_array_returns_1() {
         huck_c(r#"readonly arr=(keep); read -a arr <<< "a b"; echo "rc:$? arr:${arr[*]}""#);
     assert_eq!(out, "rc:1 arr:keep\n", "read should fail and not modify array; out={out:?}");
 }
+
+#[test]
+fn mapfile_t_strips_newline() {
+    let (out, _c) = huck_c("mapfile -t arr <<< $'x\\ny\\nz'; echo \"${#arr[@]}|${arr[1]}\"");
+    assert_eq!(out, "3|y\n", "out={out:?}");
+}
+
+#[test]
+fn mapfile_keeps_newline_without_t() {
+    let (out, _c) = huck_c("mapfile arr <<< $'a\\nb'; printf '%q %q\\n' \"${arr[0]}\" \"${arr[1]}\"");
+    assert_eq!(out, "$'a\\n' $'b\\n'\n", "out={out:?}");
+}
+
+#[test]
+fn mapfile_n_limit() {
+    let (out, _c) = huck_c("mapfile -n 2 -t arr <<< $'a\\nb\\nc\\nd'; echo \"${arr[*]}|${#arr[@]}\"");
+    assert_eq!(out, "a b|2\n", "out={out:?}");
+}
+
+#[test]
+fn mapfile_s_skip() {
+    let (out, _c) = huck_c("mapfile -s 1 -t arr <<< $'a\\nb\\nc'; echo \"${arr[*]}\"");
+    assert_eq!(out, "b c\n", "out={out:?}");
+}
+
+#[test]
+fn mapfile_d_delim() {
+    let (out, _c) = huck_c("mapfile -d : -t arr <<< 'a:b:c'; echo \"${#arr[@]}|${arr[1]}\"");
+    assert_eq!(out, "3|b\n", "out={out:?}");
+}
+
+#[test]
+fn mapfile_o_origin_no_clear() {
+    let (out, _c) = huck_c("mapfile -O 2 -t arr <<< $'x\\ny'; echo \"${!arr[*]}|${arr[*]}\"");
+    assert_eq!(out, "2 3|x y\n", "out={out:?}");
+}
+
+#[test]
+fn readarray_synonym_and_default_name() {
+    let (out, _c) = huck_c("readarray -t arr <<< $'p\\nq'; echo \"${arr[*]}\"");
+    assert_eq!(out, "p q\n", "out={out:?}");
+    let (out2, _c2) = huck_c("mapfile -t <<< $'a\\nb'; echo \"${MAPFILE[*]}\"");
+    assert_eq!(out2, "a b\n", "out2={out2:?}");
+}
