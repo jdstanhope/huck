@@ -51,8 +51,10 @@ Run the standard iteration loop without being asked:
 ## Conventions
 
 - **Commit trailer**: every commit ends with
-  `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
-  The "(1M context)" parenthetical is canonical; do not remove it.
+  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+  The "(1M context)" parenthetical is canonical; do not remove it. (Update
+  the model version to match whichever Claude model is doing the work; was
+  4.7 through v136, 4.8 from v137.)
 - **Bash-diff harnesses** under `tests/scripts/*_diff_check.sh` run
   the same fragments through bash and huck and assert byte-identical
   output. Adding a `<feature>_diff_check.sh` is the gold standard
