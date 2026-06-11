@@ -60,3 +60,26 @@ fn legit_130_status_does_not_abort() {
     assert_eq!(out, "still-here\n", "out={out:?}");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn loop_aborts_and_unwinds_sequence() {
+    // The loop aborts AND the trailing `echo after` must not run.
+    let (out, _e, code) = huck_c("for i in 1 2 3; do echo $i; kill -INT $$; done; echo after");
+    assert_eq!(out, "1\n", "out={out:?}");
+    assert_eq!(code, 130);
+}
+
+#[test]
+fn while_read_loop_aborts() {
+    // The loop must abort after the first iteration AND `echo after` must not
+    // run. The loop reads from a heredoc (not a `seq | while` pipe): a piped
+    // loop runs in a forked subshell, so `kill -INT $$` targets the PARENT and
+    // never reaches the subshell's flag — bash itself runs all 3 iterations
+    // there. Feeding via heredoc keeps the loop in the main shell, which is the
+    // path the between-iteration `check_interrupt` guards (bash-identical: `1`,
+    // rc 130).
+    let (out, _e, code) =
+        huck_c("while read x; do echo $x; kill -INT $$; done <<EOF\n1\n2\n3\nEOF\necho after");
+    assert_eq!(out, "1\n", "out={out:?}");
+    assert_eq!(code, 130);
+}

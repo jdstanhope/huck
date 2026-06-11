@@ -764,15 +764,10 @@ fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> 
 }
 
 fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    use std::sync::atomic::Ordering;
     let mut last = ExecOutcome::Continue(0);
     loop {
-        if shell
-            .sigint_flag
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = check_interrupt(shell) {
+            return o;
         }
         shell.err_suppressed_depth += 1;
         let cond = execute_sequence_body(&clause.condition, shell, sink);
@@ -828,7 +823,6 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
 }
 
 fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    use std::sync::atomic::Ordering;
 
     // Expand the word list once — the same path command arguments take.
     // The no-`in` form (`has_in == false`) iterates the positional
@@ -848,12 +842,8 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
 
     let mut last = ExecOutcome::Continue(0);
     for value in values {
-        if shell
-            .sigint_flag
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = check_interrupt(shell) {
+            return o;
         }
         if shell.try_set(&clause.var, value).is_err() {
             eprintln!("huck: {}: readonly variable", clause.var);
@@ -1008,7 +998,6 @@ fn run_arith_for_inner(
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
-    use std::sync::atomic::Ordering;
 
     // 1. Eval init once (if present).
     if let Some(init) = &clause.init
@@ -1021,12 +1010,8 @@ fn run_arith_for_inner(
     let mut last = ExecOutcome::Continue(0);
     loop {
         // SIGINT check (mirrors run_for).
-        if shell
-            .sigint_flag
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = check_interrupt(shell) {
+            return o;
         }
 
         // 2. Eval cond. Empty cond = always true (matches bash).
@@ -1103,7 +1088,6 @@ fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &m
 }
 
 fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
-    use std::sync::atomic::Ordering;
 
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
     let items: Vec<String> = match &clause.words {
@@ -1182,12 +1166,8 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
         }
 
         // 3d. SIGINT check (mirror run_for).
-        if shell
-            .sigint_flag
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = check_interrupt(shell) {
+            return o;
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.

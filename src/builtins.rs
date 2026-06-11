@@ -3079,7 +3079,9 @@ fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shel
 
 fn wait_all(shell: &mut Shell) -> ExecOutcome {
     while shell.jobs.has_pending() {
-        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        if let Some(o) = crate::executor::check_interrupt(shell) {
+            return o;
+        }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
@@ -3106,7 +3108,9 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
         if let Some(code) = terminal {
             return ExecOutcome::Continue(code);
         }
-        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        if let Some(o) = crate::executor::check_interrupt(shell) {
+            return o;
+        }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
@@ -3120,7 +3124,9 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
 fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
     let mut first = true;
     loop {
-        if check_sigint(shell) { return ExecOutcome::Continue(130); }
+        if let Some(o) = crate::executor::check_interrupt(shell) {
+            return o;
+        }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
@@ -3222,8 +3228,8 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
             return ExecOutcome::Continue(127);
         }
 
-        if check_sigint(shell) {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = crate::executor::check_interrupt(shell) {
+            return o;
         }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
@@ -3281,8 +3287,8 @@ fn wait_any_of(
     }
 
     loop {
-        if check_sigint(shell) {
-            return ExecOutcome::Continue(130);
+        if let Some(o) = crate::executor::check_interrupt(shell) {
+            return o;
         }
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
@@ -3334,23 +3340,6 @@ fn check_targets_terminal(targets: &[WaitTarget], shell: &Shell) -> Option<(i32,
         }
     }
     None
-}
-
-fn check_sigint(shell: &Shell) -> bool {
-    if shell.sigint_flag
-        .compare_exchange(
-            true,
-            false,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_ok()
-    {
-        eprintln!();
-        true
-    } else {
-        false
-    }
 }
 
 fn print_killable_table(out: &mut dyn Write) {
