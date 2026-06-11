@@ -52,3 +52,26 @@ fn missing_file_all_false() {
         assert_eq!(run(&s).0, "F\n", "op {op}");
     }
 }
+
+#[test]
+fn v_plain_name_regression() {
+    assert_eq!(run("x=1; [ -v x ] && echo T || echo F; [ -v NOPE ] && echo T || echo F\n").0, "T\nF\n");
+    assert_eq!(run("x=1; [[ -v x ]] && echo T || echo F\n").0, "T\n");
+}
+#[test]
+fn v_indexed_array_element() {
+    assert_eq!(run("arr=(a b c); [[ -v arr[1] ]] && echo T || echo F; [[ -v arr[9] ]] && echo T || echo F\n").0, "T\nF\n");
+    assert_eq!(run("arr=(a b c); [ -v 'arr[1]' ] && echo T || echo F\n").0, "T\n");
+}
+#[test]
+fn v_indexed_array_arith_subscript() {
+    assert_eq!(run("arr=(a b c); i=2; [[ -v arr[i] ]] && echo T || echo F; [[ -v arr[i+5] ]] && echo T || echo F\n").0, "T\nF\n");
+}
+#[test]
+fn v_associative_element() {
+    assert_eq!(run("declare -A m; m[key]=1; [[ -v m[key] ]] && echo T || echo F; [[ -v m[nope] ]] && echo T || echo F\n").0, "T\nF\n");
+}
+#[test]
+fn v_subscript_on_unset_base() {
+    assert_eq!(run("[[ -v nope_arr[0] ]] && echo T || echo F\n").0, "F\n");
+}

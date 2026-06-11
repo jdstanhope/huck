@@ -6209,7 +6209,7 @@ fn builtin_test(name: &str, args: &[String], shell: &Shell) -> ExecOutcome {
     } else {
         args
     };
-    match crate::test_builtin::evaluate_with(eval_args, &|n| shell.is_set(n)) {
+    match crate::test_builtin::evaluate_with(eval_args, &|n| shell.element_or_var_is_set(n)) {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {

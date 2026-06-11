@@ -1334,7 +1334,7 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
         TestExpr::Unary { op, operand } => {
             let s = expand_assignment(operand, shell);
             if matches!(op, TestUnaryOp::VarSet) {
-                return Ok(shell.is_set(&s));
+                return Ok(shell.element_or_var_is_set(&s));
             }
             if matches!(op, TestUnaryOp::OptEnabled) {
                 return Ok(crate::builtins::option_get(shell, &s).unwrap_or(false));
