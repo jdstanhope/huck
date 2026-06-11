@@ -546,6 +546,7 @@ where
     let _ = io::stdout().flush();
 
     let mut scope = CompoundRedirectScope::new();
+    let mut heredoc_writer: Option<libc::pid_t> = None;
 
     // --- stdin (fd 0) ---
     if let Some(r) = stdin {
@@ -565,17 +566,17 @@ where
             }
             Redirect::Heredoc { body, .. } => {
                 let bytes = expand_assignment(body, shell).into_bytes();
-                match write_pipe_for_stdin(&bytes) {
-                    Ok(fd) => fd,
-                    Err(()) => return ExecOutcome::Continue(1),
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => { heredoc_writer = Some(pid); rfd }
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
                 }
             }
             Redirect::HereString(body) => {
                 let mut bytes = expand_assignment(body, shell).into_bytes();
                 bytes.push(b'\n');
-                match write_pipe_for_stdin(&bytes) {
-                    Ok(fd) => fd,
-                    Err(()) => return ExecOutcome::Continue(1),
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => { heredoc_writer = Some(pid); rfd }
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
                 }
             }
             // `<&N` on a compound is out of scope; only `<file`/heredoc/
@@ -628,6 +629,13 @@ where
     };
     let outcome = run_inner(shell, inner_sink);
     let _ = io::stdout().flush();
+    // Reap the forked heredoc/herestring writer now that the inner body has run
+    // (the consumer has drained and closed its read end, so the writer has
+    // finished). ECHILD or any error is fine — the writer is a transient helper.
+    if let Some(pid) = heredoc_writer {
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0); }
+    }
     drop(scope);
     outcome
 }
@@ -2581,6 +2589,48 @@ fn write_pipe_for_stdin(bytes: &[u8]) -> Result<RawFd, ()> {
     }
     unsafe { libc::close(w) };
     Ok(r)
+}
+
+/// Feed `bytes` (an expanded heredoc/herestring body) to a child's stdin WITHOUT
+/// the parent ever blocking on a full pipe. Forks a writer process that owns the
+/// pipe's write end, writes the whole body, then `_exit`s. The parent closes the
+/// write end immediately, so no later in-process forked stage inherits it (a
+/// writer *thread* would fail there — CLOEXEC only fires on exec, and InProcess
+/// stages fork without exec). Returns the READ end (→ consumer stdin) and the
+/// writer PID (reap it at the consumer's wait point; ECHILD is fine).
+fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error> {
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (r, w) = (fds[0], fds[1]);
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(r); libc::close(w); }
+        return Err(e);
+    }
+    if pid == 0 {
+        // CHILD: async-signal-safe only. Close read end; write the body; _exit.
+        unsafe { libc::close(r); }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = unsafe {
+                libc::write(w, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
+            };
+            if n < 0 {
+                match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    _ => break, // EPIPE (consumer gone) or other: done.
+                }
+            }
+            if n == 0 { break; }
+            off += n as usize;
+        }
+        unsafe { libc::close(w); libc::_exit(0); }
+    }
+    unsafe { libc::close(w); }
+    Ok((r, pid))
 }
 
 fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFiles, ()> {
