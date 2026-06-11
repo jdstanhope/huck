@@ -428,7 +428,10 @@ fn read_logical_command(
             // Rendering a prompt must be transparent to $? (bash saves/restores it).
             let saved_status = shell.last_status();
             let saved_cmd_sub = shell.last_cmd_sub_status();
+            let saved_xtrace = shell.shell_options.xtrace;
+            shell.shell_options.xtrace = false;
             let s = crate::prompt::expand_prompt(&template, &mut shell);
+            shell.shell_options.xtrace = saved_xtrace;
             shell.set_last_status(saved_status);
             shell.set_last_cmd_sub_status(saved_cmd_sub);
             s

@@ -2919,7 +2919,12 @@ fn ps4(shell: &mut Shell) -> String {
     // Rendering a prompt must be transparent to $? (bash saves/restores it).
     let saved_status = shell.last_status();
     let saved_cmd_sub = shell.last_cmd_sub_status();
+    // Suppress xtrace WHILE expanding PS4: bash does not trace commands run by a
+    // PS4 command substitution, and tracing them here would recurse into ps4().
+    let saved_xtrace = shell.shell_options.xtrace;
+    shell.shell_options.xtrace = false;
     let expanded = crate::prompt::expand_prompt(&raw, shell);
+    shell.shell_options.xtrace = saved_xtrace;
     shell.set_last_status(saved_status);
     shell.set_last_cmd_sub_status(saved_cmd_sub);
     let mut chars = expanded.chars();
@@ -5085,6 +5090,18 @@ mod tests {
         shell.set("PS4", "$(false)+ ".to_string());
         let _ = ps4(&mut shell);
         assert_eq!(shell.last_status(), 7, "rendering PS4 must not clobber $?");
+    }
+
+    #[test]
+    fn ps4_cmdsub_under_xtrace_does_not_recurse() {
+        let mut shell = Shell::new();
+        shell.shell_options.xtrace = true;
+        shell.set("PS4", "$(true) ".to_string());
+        // Without the xtrace-suppression fix, expanding PS4 runs `true` which is
+        // traced -> re-enters ps4() -> infinite recursion -> stack overflow.
+        let _ = ps4(&mut shell);
+        // Reaching here (no abort) IS the assertion. Also confirm xtrace restored:
+        assert!(shell.shell_options.xtrace, "xtrace must be restored after ps4");
     }
 
     #[test]
