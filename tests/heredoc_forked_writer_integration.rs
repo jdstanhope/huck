@@ -55,3 +55,28 @@ fn small_compound_heredoc_no_regression() {
     let (o, _e, _c) = run_guarded("{ cat; } << EOF\nyo\nEOF\n", 10).expect("hung");
     assert_eq!(o, "yo\n", "o: {o:?}");
 }
+
+#[test]
+fn pipeline_heredoc_large_body() {
+    let (o, _e, _c) = run_guarded(&with_big_v("cat << EOF | wc -c\n$V\nEOF"), 10)
+        .expect("HUNG: pipeline heredoc deadlocked");
+    assert_eq!(o.trim(), "200001", "o: {o:?}");
+}
+#[test]
+fn captured_single_heredoc_large_body() {
+    let (o, _e, _c) = run_guarded(&with_big_v("r=$(cat << EOF\n$V\nEOF\n); echo ${#r}"), 10)
+        .expect("HUNG: captured single-command heredoc deadlocked");
+    assert_eq!(o.trim(), "200000", "o: {o:?}");
+}
+#[test]
+fn small_pipeline_heredoc_no_regression() {
+    let (o, _e, _c) = run_guarded("cat << EOF | wc -c\nhi\nEOF\n", 10).expect("hung");
+    assert_eq!(o.trim(), "3", "o: {o:?}");
+}
+#[test]
+fn dollar_bang_unaffected_by_heredoc() {
+    let (o, _e, _c) = run_guarded("sleep 0.2 & p=$!; cat << EOF >/dev/null\nx\nEOF\necho \"$p $!\"\n", 10).expect("hung");
+    let parts: Vec<&str> = o.split_whitespace().collect();
+    assert_eq!(parts.len(), 2, "o: {o:?}");
+    assert_eq!(parts[0], parts[1], "heredoc writer changed $!; o: {o:?}");
+}

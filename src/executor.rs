@@ -1567,14 +1567,12 @@ fn run_background_sequence(
     //
     // Background stdin default: /dev/null for stage 0 (no explicit redirect,
     // no previous pipe) so the job doesn't compete for the terminal.
-    use std::os::fd::FromRawFd;
 
     let n = pipeline.commands.len();
     let mut spawned_pids: Vec<i32> = Vec::with_capacity(n);
     let mut first_pid: Option<i32> = None;
     let mut prev_pipe_read: Option<RawFd> = None;
     let mut parent_held: Vec<RawFd> = Vec::new();
-    let mut heredoc_pairs: Vec<(RawFd, Vec<u8>)> = Vec::new(); // (write_fd, bytes)
 
     // Open /dev/null once for the first stage's default stdin.
     let devnull_fd: RawFd = {
@@ -1673,9 +1671,9 @@ fn run_background_sequence(
         };
 
         // ---- Stdin fd ---------------------------------------------------------
-        let mut heredoc_write_fd: Option<RawFd> = None;
-        let mut heredoc_body_bytes: Option<Vec<u8>> = None;
-
+        // A heredoc/herestring stdin is fed by a forked writer process (M-120);
+        // the read end becomes this stage's stdin and the parent holds no write
+        // end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.stdin {
                 Some(Redirect::Read(word)) => {
@@ -1709,14 +1707,15 @@ fn run_background_sequence(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    heredoc_body_bytes = Some(expand_assignment(body, shell).into_bytes());
-                    match make_pipe() {
-                        Ok((r, w)) => {
-                            heredoc_write_fd = Some(w);
-                            r
-                        }
+                    // Forked writer (M-120): the read end is this stage's stdin;
+                    // the writer process is an internal helper collected by the
+                    // existing SIGCHLD reaper — never a job, never $!, so it is
+                    // NOT added to spawned_pids/first_pid.
+                    let bytes = expand_assignment(body, shell).into_bytes();
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((r, _pid)) => r,
                         Err(e) => {
-                            eprintln!("huck: pipe: {e}");
+                            eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1729,17 +1728,14 @@ fn run_background_sequence(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    // Here-string: expand with no split/glob + trailing newline.
+                    // Here-string: expand with no split/glob + trailing newline,
+                    // then feed via a forked writer (M-120; see Heredoc above).
                     let mut bytes = expand_assignment(body, shell).into_bytes();
                     bytes.push(b'\n');
-                    heredoc_body_bytes = Some(bytes);
-                    match make_pipe() {
-                        Ok((r, w)) => {
-                            heredoc_write_fd = Some(w);
-                            r
-                        }
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((r, _pid)) => r,
                         Err(e) => {
-                            eprintln!("huck: pipe: {e}");
+                            eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1767,7 +1763,6 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1782,7 +1777,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1795,7 +1789,6 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1808,7 +1801,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1831,7 +1823,6 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1847,7 +1838,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1861,7 +1851,6 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1875,7 +1864,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1904,7 +1892,6 @@ fn run_background_sequence(
                     eprintln!("huck: pipe: {e}");
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
                     cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -1920,12 +1907,11 @@ fn run_background_sequence(
         // ---- Classify and spawn ----------------------------------------------
         let pgid_target = first_pid.unwrap_or(0);
 
-        let mut fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
+        let fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
             .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
             .collect();
-        if let Some(w) = heredoc_write_fd {
-            fds_to_close_in_child.push(w);
-        }
+        // (Any heredoc pipe write end lives in the forked writer process, not
+        // here, so there is nothing extra to add to fds_to_close_in_child.)
 
         // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
         // allocate; not async-signal-safe). External stages handle this inside
@@ -1940,7 +1926,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1957,7 +1942,6 @@ fn run_background_sequence(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1997,7 +1981,6 @@ fn run_background_sequence(
                 for fd in [stdout_fd, stdin_fd, stderr_fd] {
                     if fd > 2 { parent_held.retain(|&x| x != fd); }
                 }
-                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 return ExecOutcome::Continue(1);
@@ -2016,10 +1999,8 @@ fn run_background_sequence(
             }
         }
 
-        // Write heredoc body after child is spawned.
-        if let (Some(w), Some(bytes)) = (heredoc_write_fd.take(), heredoc_body_bytes.take()) {
-            heredoc_pairs.push((w, bytes));
-        }
+        // (A heredoc/herestring body, if any, is written by the forked writer
+        // process; the parent holds no write end and nothing to record here.)
 
         // Track pgrp + pid.
         if first_pid.is_none() {
@@ -2043,12 +2024,9 @@ fn run_background_sequence(
         unsafe { libc::close(fd); }
     }
 
-    // Write heredoc bodies and close write-ends so children see EOF.
-    for (w, bytes) in heredoc_pairs {
-        let mut write_file = unsafe { File::from_raw_fd(w) };
-        let _ = write_file.write_all(&bytes);
-        // write_file drops here, closing w.
-    }
+    // (Heredoc/herestring bodies are written by their forked writer processes,
+    // reaped by the existing SIGCHLD reaper — they are internal helpers, not
+    // part of this backgrounded job.)
 
     let Some(pgid) = first_pid else {
         // No actual children spawned (all-Assign pipeline). Treat as
@@ -3364,7 +3342,13 @@ fn run_subprocess(
         process.process_group(0);
     }
 
-    let mut pending_stdin_bytes: Option<Vec<u8>> = None;
+    // A heredoc/herestring body is fed by a forked writer process (M-120): the
+    // parent never blocks writing a body larger than the pipe buffer, which is
+    // what deadlocked the captured single-command case `r=$(cat << big)`. The
+    // writer's read end becomes the child's stdin; its pid is reaped after the
+    // child's status is obtained. It is never a job and never sets $!.
+    let mut heredoc_writer_pid: Option<libc::pid_t> = None;
+    use std::os::fd::FromRawFd;
     match files.stdin {
         Some(StdinInput::File(file)) => {
             process.stdin(Stdio::from(file));
@@ -3374,15 +3358,25 @@ fn run_subprocess(
             // path (run_exec_single / run_subprocess), so expanding here is
             // correct: $var references see the stage's inline assignments.
             let bytes = expand_assignment(&body, shell).into_bytes();
-            process.stdin(Stdio::piped());
-            pending_stdin_bytes = Some(bytes);
+            match spawn_heredoc_writer(&bytes) {
+                Ok((rfd, pid)) => {
+                    heredoc_writer_pid = Some(pid);
+                    process.stdin(Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(rfd) }));
+                }
+                Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
+            }
         }
         Some(StdinInput::DeferredHereString(body)) => {
             // Here-string: expand with no split/glob, append trailing newline.
             let mut bytes = expand_assignment(&body, shell).into_bytes();
             bytes.push(b'\n');
-            process.stdin(Stdio::piped());
-            pending_stdin_bytes = Some(bytes);
+            match spawn_heredoc_writer(&bytes) {
+                Ok((rfd, pid)) => {
+                    heredoc_writer_pid = Some(pid);
+                    process.stdin(Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(rfd) }));
+                }
+                Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
+            }
         }
         None => {}
     }
@@ -3409,18 +3403,13 @@ fn run_subprocess(
     flush_stdout();
     match process.spawn() {
         Ok(mut child) => {
-            // Write heredoc bytes into the child's piped stdin, then drop
-            // the handle so the child sees EOF and can proceed.
-            if let Some(bytes) = pending_stdin_bytes
-                && let Some(mut child_stdin) = child.stdin.take()
-            {
-                let _ = child_stdin.write_all(&bytes);
-                // child_stdin drops here, closing the pipe.
-            }
+            // The heredoc/herestring body (if any) is written by the forked
+            // writer process whose read end is the child's stdin; nothing to
+            // write here. The writer pid is reaped after the child's status.
 
             let pid = child.id() as i32;
 
-            if interactive {
+            let outcome = if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
                 unsafe {
@@ -3497,7 +3486,14 @@ fn run_subprocess(
                         ExecOutcome::Continue(1)
                     }
                 }
+            };
+            // Reap the forked heredoc/herestring writer now the consumer has
+            // exited (M-120). It is an internal helper — not a job, not $!.
+            if let Some(wpid) = heredoc_writer_pid {
+                let mut st = 0;
+                unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
+            outcome
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             eprintln!("huck: command not found: {}", cmd.program);
@@ -3579,6 +3575,11 @@ fn run_multi_stage(
     // All raw fds the parent currently holds (for the child's
     // parent_fds_to_close list so it doesn't inherit stale pipe ends).
     let mut parent_held: Vec<RawFd> = Vec::new();
+
+    // PIDs of forked heredoc/herestring writer processes (M-120); reaped at the
+    // pipeline wait point. They are internal helpers — never jobs, never $!,
+    // never part of $PIPESTATUS.
+    let mut heredoc_writers: Vec<libc::pid_t> = Vec::new();
 
     for (i, stage_cmd) in commands.iter().enumerate() {
         let is_last = i == n - 1;
@@ -3680,14 +3681,11 @@ fn run_multi_stage(
         // For InProcess compound stages, there are no explicit redirects at the
         // stage level; the child handles them internally via run_command.
 
-        // We may need to create a heredoc pipe and write its body after spawning.
-        // The body is expanded NOW (while inline assignments are applied) so that
-        // $var references in the body see the stage's own inline assignments (v24
-        // deferred-heredoc contract). The bytes are stored here and written to the
-        // pipe write-end after the child is spawned.
-        let mut heredoc_write_fd: Option<RawFd> = None;
-        let mut heredoc_body_bytes: Option<Vec<u8>> = None;
-
+        // A heredoc/herestring stdin is fed by a forked writer process (M-120):
+        // the body is expanded NOW (while inline assignments are applied so that
+        // $var references see the stage's own inline assignments — v24 deferred-
+        // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
+        // becomes this stage's stdin. The parent never holds the pipe write end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
             match &exec.stdin {
                 Some(Redirect::Read(word)) => {
@@ -3727,17 +3725,18 @@ fn run_multi_stage(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    // Expand the body NOW while inline assignments are still applied.
-                    // Store the bytes; write them to the pipe after the child is spawned.
-                    heredoc_body_bytes = Some(expand_assignment(body, shell).into_bytes());
-                    // Create a pipe: child reads from r; parent writes body to w.
-                    match make_pipe() {
-                        Ok((r, w)) => {
-                            heredoc_write_fd = Some(w);
+                    // Expand the body NOW while inline assignments are still applied,
+                    // then hand it to a forked writer process (M-120): a body larger
+                    // than the pipe buffer must not block the parent before the
+                    // consumer drains. The parent never holds the write end.
+                    let bytes = expand_assignment(body, shell).into_bytes();
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((r, pid)) => {
+                            heredoc_writers.push(pid);
                             r
                         }
                         Err(e) => {
-                            eprintln!("huck: pipe: {e}");
+                            eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -3751,18 +3750,17 @@ fn run_multi_stage(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    // Expand NOW (inline assignments still applied) + trailing newline.
+                    // Expand NOW (inline assignments still applied) + trailing newline,
+                    // then feed via a forked writer (M-120).
                     let mut bytes = expand_assignment(body, shell).into_bytes();
                     bytes.push(b'\n');
-                    heredoc_body_bytes = Some(bytes);
-                    // Create a pipe: child reads from r; parent writes body to w.
-                    match make_pipe() {
-                        Ok((r, w)) => {
-                            heredoc_write_fd = Some(w);
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((r, pid)) => {
+                            heredoc_writers.push(pid);
                             r
                         }
                         Err(e) => {
-                            eprintln!("huck: pipe: {e}");
+                            eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -3795,7 +3793,6 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3809,7 +3806,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3821,7 +3817,6 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3833,7 +3828,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3855,7 +3849,6 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -3870,7 +3863,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -3883,7 +3875,6 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -3896,7 +3887,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -3927,7 +3917,6 @@ fn run_multi_stage(
                     eprintln!("huck: pipe: {e}");
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                    if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
@@ -3946,7 +3935,6 @@ fn run_multi_stage(
                             eprintln!("huck: pipe: {e}");
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                            if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -3965,16 +3953,12 @@ fn run_multi_stage(
         // parent_fds_to_close: all fds the parent currently holds that the
         // child must close (so it doesn't hold downstream pipe write-ends open,
         // which would prevent EOF propagation). We exclude the fds being passed
-        // to this stage as stdio (those are the child's to keep). We also
-        // include the heredoc_write_fd so the child doesn't hold its own
-        // stdin-pipe write-end open.
-        let mut fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
+        // to this stage as stdio (those are the child's to keep). The heredoc
+        // pipe's write end lives in the forked writer process, not here, so
+        // there is nothing extra to add.
+        let fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
             .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
             .collect();
-        if let Some(w) = heredoc_write_fd {
-            // The child must close the write-end of its own heredoc pipe.
-            fds_to_close_in_child.push(w);
-        }
 
         // Resolve Dup targets pre-fork for InProcess stages (Word expansion may
         // allocate; not async-signal-safe). External stages handle this inside
@@ -3989,7 +3973,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(r) = capture_read_fd {
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
@@ -4009,7 +3992,6 @@ fn run_multi_stage(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                                 if let Some(r) = capture_read_fd {
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
@@ -4084,7 +4066,6 @@ fn run_multi_stage(
                         if let Some(p) = pos { parent_held.remove(p); }
                     }
                 }
-                if let Some(w) = heredoc_write_fd { unsafe { libc::close(w); } }
                 // Exclude capture_read_fd from the drain: it will be closed
                 // explicitly below, avoiding a double-close.
                 if let Some(r) = capture_read_fd {
@@ -4120,16 +4101,8 @@ fn run_multi_stage(
             }
         }
 
-        // ---- Write heredoc body to child's stdin pipe -----------------------
-        // The body was pre-expanded (while inline assignments were applied) and
-        // stored in `heredoc_body_bytes`. Write it now so the child's stdin
-        // doesn't block. Dropping `write_file` closes the write-end, signalling
-        // EOF to the child.
-        if let (Some(w), Some(bytes)) = (heredoc_write_fd.take(), heredoc_body_bytes.take()) {
-            let mut write_file = unsafe { File::from_raw_fd(w) };
-            let _ = write_file.write_all(&bytes);
-            // write_file drops here, closing w — child sees EOF.
-        }
+        // (A heredoc/herestring body, if any, is written by the forked writer
+        // process spawned above; the parent holds no write end here.)
 
         // ---- Track pid -------------------------------------------------------
         if interactive && first_pid.is_none() {
@@ -4175,6 +4148,14 @@ fn run_multi_stage(
 
     // ---- Wait for all stages ------------------------------------------------
     let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, interactive);
+
+    // Reap any forked heredoc/herestring writer processes (M-120). They are not
+    // pipeline stages, so they are excluded from $PIPESTATUS and the wait above;
+    // ECHILD or any error is fine — they are transient helpers.
+    for wpid in heredoc_writers {
+        let mut st = 0;
+        unsafe { libc::waitpid(wpid, &mut st, 0); }
+    }
 
     if interactive {
         give_terminal_to(shell.shell_pgid);
