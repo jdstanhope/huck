@@ -983,8 +983,21 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 let rendered = reconstruct_array_literal(elems, shell);
                 current.push_str(&rendered, true);
             }
-            WordPart::ProcessSub { .. } => {
-                // realized in Task 3 (process substitution)
+            WordPart::ProcessSub { sequence, dir } => {
+                match crate::procsub::realize(sequence, dir.clone(), shell) {
+                    Ok((path, ps)) => {
+                        shell.procsub_pending.push(ps);
+                        // The realized path (/dev/fd/N or a FIFO) is a single
+                        // non-splitting, non-glob field — mirror the
+                        // `CommandSub { quoted: true }` treatment.
+                        current.push_str(&path, true);
+                        has_emitted = true;
+                    }
+                    Err(e) => {
+                        eprintln!("huck: process substitution: {e}");
+                        // Emit nothing; the field stays empty if no other parts.
+                    }
+                }
             }
         }
     }
@@ -1140,7 +1153,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 result.push_str(&reconstruct_array_literal(elems, shell));
             }
             WordPart::ProcessSub { .. } => {
-                // realized in Task 3 (process substitution)
+                // Process substitution is meaningful only in command-argument /
+                // redirect-target expansion (the main expand() path). Realizing
+                // it here (assignment context, no command to consume the fd)
+                // would leak an fd and a child process with no benefit. No-op.
             }
         }
     }
@@ -1160,8 +1176,9 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::AllArgs { quoted, .. } => *quoted,
         WordPart::Tilde(_) => false,
         WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => false,
-        // ProcessSub is always unquoted (quoted contexts produce literal text)
-        WordPart::ProcessSub { .. } => false,
+        // ProcessSub expands to a single /dev/fd/N path — treated as quoted
+        // (no IFS-splitting, no glob expansion of the realized path).
+        WordPart::ProcessSub { .. } => true,
     }
 }
 
