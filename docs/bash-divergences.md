@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 33 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -82,7 +82,6 @@ group.
   decisive completion source; deferred to avoid new filesystem/libc lookups.
 - **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
 - **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-121: `export -f` (export shell functions)** — `[deferred]` medium. As of v146 huck HAS an AST→source serializer (`src/generate.rs`), and `declare -f NAME` now prints the real function body through it in a NORMALIZED form (re-parseable, semantically equivalent — NOT byte-identical to bash's pretty-printer; different whitespace/layout). What remains for `export -f` is serializing each function body into a `BASH_FUNC_name%%=() { … }` env var for child shells plus the child-side `BASH_FUNC_*` import; that is not implemented. v145 makes `export -f NAME` a rc-0 no-op (it does NOT create/export an empty variable). EDGE: `export -f` with NO operands lists exported VARIABLES (via the shared listing) rather than exported functions as bash does. The remaining follow-on is to ride the `generate` un-parser into `export -f` + child `BASH_FUNC_*` import.
 - **M-122: bare `declare` (no args) omits function definitions** — `[deferred]` medium (v146). bash's bare `declare` (no flags, no names) prints ALL variables AND every function's body (equivalent to the variable listing followed by `declare -f`). huck's bare `declare` lists only variables. `declare -f` (no name) DOES print all function bodies (wired in v146), so the building block exists — the gap is that the bare-`declare` listing path doesn't append the `generate::function_to_source` output for each function after the variables. Low-risk follow-on now that the serializer exists.
 - **M-92: prefix-name `${!prefix@}` / `${!prefix*}`** — `[deferred]` low.
   The variable-NAME-listing forms of `${!…}` (expand to the names of all

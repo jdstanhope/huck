@@ -835,6 +835,20 @@ fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     ExecOutcome::Continue(0)
 }
 
+/// Lists exported functions (sorted) as `generate` body + `declare -fx NAME`.
+fn list_exported_functions(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+    for name in shell.exported_function_names() {
+        if let Some(body) = shell.functions.get(&name)
+            && (writeln!(out, "{}", crate::generate::function_to_source(&name, body)).is_err()
+                || writeln!(out, "declare -fx {name}").is_err())
+        {
+            eprintln!("huck: export: write error");
+            return ExecOutcome::Continue(1);
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
 /// If we're inside a function call AND `name` hasn't been snapshotted
 /// in the current local frame yet, snapshot the current Variable (or
 /// None if unset). The unwinding in `call_function` will restore it on
@@ -994,6 +1008,28 @@ fn builtin_declare(
         i += 1;
     }
     let names = &args[i..];
+
+    // Function export: `declare -fx [NAME...]`. With no names, list exported
+    // functions; with names, mark each existing function exported. A missing
+    // function falls through to the normal function-listing path's error.
+    if function_mode && want_export && !function_names_only {
+        if names.is_empty() {
+            return list_exported_functions(out, shell);
+        }
+        let mut all_present = true;
+        for name in names {
+            if shell.functions.contains_key(name.as_str()) {
+                shell.mark_function_exported(name);
+            } else {
+                all_present = false;
+            }
+        }
+        if all_present {
+            return ExecOutcome::Continue(0);
+        }
+        // At least one name missing: fall through to emit the standard
+        // "not found" diagnostic for the missing names.
+    }
 
     // Function-mode listing.
     if function_mode {
@@ -1213,9 +1249,13 @@ fn builtin_export_decl(
         if unexport {
             return ExecOutcome::Continue(0);
         }
-        // List for bare `export` or explicit `-p`. `-a` (mise accommodation) and
-        // `-f` (deferred function export) suppress the listing: rc 0, no output.
-        if !saw_p && (saw_a || func) {
+        // `-f` with no operands lists exported functions. `-a` (mise
+        // accommodation) suppresses the var listing: rc 0, no output.
+        // Otherwise list exported variables (bare `export` or `-p`).
+        if func && !saw_p {
+            return list_exported_functions(out, shell);
+        }
+        if saw_a && !saw_p {
             return ExecOutcome::Continue(0);
         }
         return list_exported(out, shell);
@@ -1224,6 +1264,20 @@ fn builtin_export_decl(
     let mut any_error = false;
     for arg in operands {
         if func {
+            let name: &str = match arg {
+                DeclArg::Plain(s) => s.as_str(),
+                DeclArg::Assign(a) => a.target.name(),
+            };
+            if unexport {
+                // export -nf NAME: remove the export mark (lenient — no-op if not
+                // exported, matching bash's -n).
+                shell.unmark_function_exported(name);
+            } else if shell.functions.contains_key(name) {
+                shell.mark_function_exported(name);
+            } else {
+                eprintln!("huck: export: {name}: not a function");
+                any_error = true;
+            }
             continue;
         }
         match arg {
@@ -1677,6 +1731,36 @@ fn builtin_declare_decl(
     if want_associative && want_integer {
         eprintln!("huck: declare: integer associative arrays not yet supported");
         return ExecOutcome::Continue(1);
+    }
+
+    // Function export: `declare -fx [NAME...]`. With no names, list exported
+    // functions; with names, mark each existing function exported (mirrors
+    // `export -f`). A missing function is silent with rc 1.
+    if function_mode && want_export && !function_names_only {
+        let plain_names: Vec<String> = names
+            .iter()
+            .filter_map(|a| match a {
+                DeclArg::Plain(s) => Some(s.clone()),
+                DeclArg::Assign(_) => None,
+            })
+            .collect();
+        if plain_names.is_empty() {
+            return list_exported_functions(out, shell);
+        }
+        let mut any_error = false;
+        for name in &plain_names {
+            if shell.functions.contains_key(name.as_str()) {
+                shell.mark_function_exported(name);
+            } else {
+                // bash: declare -f on a missing function is silent, rc 1.
+                any_error = true;
+            }
+        }
+        return if any_error {
+            ExecOutcome::Continue(1)
+        } else {
+            ExecOutcome::Continue(0)
+        };
     }
 
     // Function-mode listing: only Plain names accepted.
@@ -7073,6 +7157,49 @@ mod tests {
     }
 
     #[test]
+    fn export_nf_unexports_function() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("uf(){ echo hi; }", &mut shell, false);
+        shell.mark_function_exported("uf");
+        assert!(shell.is_function_exported("uf"));
+        let mut out = Vec::new();
+        // export -nf uf  -> remove the export mark
+        let oc = builtin_export_decl(&[dp("-n"), dp("-f"), dp("uf")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
+        assert!(
+            !shell.is_function_exported("uf"),
+            "export -nf must un-export the function"
+        );
+    }
+
+    #[test]
+    fn declare_fx_marks_via_runtime_path() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("dfn(){ echo hi; }", &mut shell, false);
+        assert!(!shell.is_function_exported("dfn"));
+        // `declare -fx NAME` must mark it exported (runtime declaration path).
+        let _ = crate::shell::process_line("declare -fx dfn", &mut shell, false);
+        assert!(
+            shell.is_function_exported("dfn"),
+            "declare -fx did not mark via the runtime path"
+        );
+    }
+
+    #[test]
+    fn declare_fx_no_names_lists_via_runtime_path() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("dfn2(){ echo hi; }", &mut shell, false);
+        shell.mark_function_exported("dfn2");
+        // capture stdout of `declare -fx`: route through builtin_declare_decl directly.
+        let mut out = Vec::new();
+        let oc = builtin_declare_decl(&[dp("-fx")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("dfn2 ()"), "{s}");
+        assert!(s.contains("declare -fx dfn2"), "{s}");
+    }
+
+    #[test]
     fn export_p_lists_in_declare_x_format() {
         let mut shell = Shell::new();
         shell.export_set("EXP_A", "1".to_string());
@@ -7157,10 +7284,43 @@ mod tests {
     fn export_f_does_not_create_variable() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
+        // `export -f somefunc` for a nonexistent function: rc 1, no variable.
         let oc = builtin_export_decl(&[dp("-f"), dp("somefunc")], &mut out, &mut shell);
-        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
         assert!(shell.get("somefunc").is_none(), "must NOT create a variable");
         assert!(!shell.is_exported("somefunc"));
+    }
+
+    #[test]
+    fn export_f_marks_existing_function() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("myfn(){ echo hi; }", &mut shell, false);
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-f"), dp("myfn")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_function_exported("myfn"));
+    }
+
+    #[test]
+    fn export_f_not_a_function_rc1() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-f"), dp("nope")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)), "{oc:?}");
+        assert!(!shell.is_function_exported("nope"));
+    }
+
+    #[test]
+    fn export_f_no_operands_lists_functions() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("af(){ echo hi; }", &mut shell, false);
+        shell.mark_function_exported("af");
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("af ()"), "{s}");
+        assert!(s.contains("declare -fx af"), "{s}");
     }
 
     #[test]
