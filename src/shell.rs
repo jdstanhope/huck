@@ -558,22 +558,35 @@ fn install_job_control_signals() {
 /// `\?` and the next user command's `$?` both reflect
 /// PROMPT_COMMAND's exit code (matches bash). Non-interactive
 /// shells skip entirely.
+///
+/// An indexed-array `PROMPT_COMMAND` runs each NON-EMPTY element in
+/// ascending index order (bash 5.1+); the first element that exits the
+/// shell short-circuits the rest. A scalar runs as a single command.
 pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
     if !shell.is_interactive {
         return None;
     }
-    let pc = match shell.lookup_var("PROMPT_COMMAND") {
-        Some(s) if !s.is_empty() => s,
-        _ => return None,
-    };
-    match process_line(&pc, shell, true) {
-        ExecOutcome::Exit(code) => Some(code),
-        ExecOutcome::Continue(status) => {
-            shell.set_last_status(status);
-            None
+    // Collect owned strings first so the immutable borrow ends before the
+    // `&mut shell` process_line calls below.
+    let commands: Vec<String> = if let Some(map) = shell.get_array("PROMPT_COMMAND") {
+        map.values().filter(|s| !s.is_empty()).cloned().collect()
+    } else {
+        match shell.lookup_var("PROMPT_COMMAND") {
+            Some(s) if !s.is_empty() => vec![s.to_string()],
+            _ => return None,
         }
-        _ => None,
+    };
+    if commands.is_empty() {
+        return None;
     }
+    for cmd in commands {
+        match process_line(&cmd, shell, true) {
+            ExecOutcome::Exit(code) => return Some(code),
+            ExecOutcome::Continue(status) => shell.set_last_status(status),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Tokenizes, parses, and executes a single input line.
@@ -771,6 +784,47 @@ mod prompt_command_tests {
         assert_eq!(fire_prompt_command(&mut shell), None);
         // last_status unchanged since PC didn't run.
         assert_eq!(shell.last_status(), 42);
+    }
+
+    fn arr(elems: &[&str]) -> std::collections::BTreeMap<usize, String> {
+        elems.iter().enumerate().map(|(i, s)| (i, s.to_string())).collect()
+    }
+
+    #[test]
+    fn array_runs_all_elements_in_order() {
+        let mut shell = interactive_shell();
+        // literal element strings — NOT pre-expanded; each runs as a command later.
+        shell
+            .replace_array("PROMPT_COMMAND", arr(&["ORDER=${ORDER}a", "ORDER=${ORDER}b"]))
+            .unwrap();
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.get("ORDER"), Some("ab"), "both elements ran, in order");
+    }
+
+    #[test]
+    fn array_skips_empty_elements() {
+        let mut shell = interactive_shell();
+        shell.replace_array("PROMPT_COMMAND", arr(&["MA=1", "", "MB=1"])).unwrap();
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.get("MA"), Some("1"));
+        assert_eq!(shell.get("MB"), Some("1"));
+    }
+
+    #[test]
+    fn array_propagates_exit_and_stops() {
+        let mut shell = interactive_shell();
+        shell.replace_array("PROMPT_COMMAND", arr(&["MA=1", "exit 7", "MB=1"])).unwrap();
+        assert_eq!(fire_prompt_command(&mut shell), Some(7));
+        assert_eq!(shell.get("MA"), Some("1"), "element before exit ran");
+        assert_eq!(shell.get("MB"), None, "element after exit did NOT run");
+    }
+
+    #[test]
+    fn array_last_status_reflects_last_element() {
+        let mut shell = interactive_shell();
+        shell.replace_array("PROMPT_COMMAND", arr(&["true", "false"])).unwrap();
+        assert_eq!(fire_prompt_command(&mut shell), None);
+        assert_eq!(shell.last_status(), 1, "last element (false) sets $?");
     }
 }
 
