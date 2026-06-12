@@ -205,27 +205,10 @@ fn case_item_to_source(item: &CaseItem, indent: usize) -> String {
 fn pattern_word_to_source(w: &Word) -> String {
     w.0.iter()
         .map(|part| match part {
-            WordPart::Literal { text, quoted: false } => escape_pattern_bareword(text),
+            WordPart::Literal { text, quoted: false } => escape_bareword(text),
             other => part_to_source(other),
         })
         .collect()
-}
-
-/// Backslash-escape characters special outside quotes EXCEPT glob
-/// metacharacters (`* ? [ ] { }`), which a `case` pattern must keep literal.
-fn escape_pattern_bareword(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '$' | ';' | '&' | '|' | '<' | '>' | '('
-            | ')' | '`' | '~' | '#' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 fn testexpr_to_source(e: &TestExpr) -> String {
@@ -532,10 +515,16 @@ fn quote_if(quoted: bool, body: String) -> String {
 }
 
 /// Backslash-escape characters that are special OUTSIDE quotes so a bareword
-/// `Literal` round-trips as a single unquoted part. An empty UNQUOTED literal
-/// carries no content (it appears e.g. as the synthetic prefix fragment before
-/// an `ArrayLiteral` in `a=(…)`), so it renders to nothing — emitting `''`
-/// would mean a *quoted* empty word, which is the `quoted` branch's job.
+/// `Literal` round-trips as a single unquoted part. Glob/brace metacharacters
+/// (`* ? [ ] { }`) are deliberately NOT escaped: an unquoted `Literal` is
+/// glob-intended (the AST stores escaped/quoted forms as `quoted: true`, handled
+/// by the quoted branch), so escaping `*` to `\*` would both change its meaning
+/// and break the round-trip (re-parse turns `\*` into a quoted literal). This is
+/// the single bareword escaper, shared by ordinary words and `case` patterns
+/// (both want glob metachars preserved). An empty UNQUOTED literal carries no
+/// content (it appears e.g. as the synthetic prefix fragment before an
+/// `ArrayLiteral` in `a=(…)`), so it renders to nothing — emitting `''` would
+/// mean a *quoted* empty word, which is the `quoted` branch's job.
 fn escape_bareword(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -544,7 +533,7 @@ fn escape_bareword(text: &str) -> String {
     for c in text.chars() {
         match c {
             ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '$' | ';' | '&' | '|' | '<' | '>' | '('
-            | ')' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' => {
+            | ')' | '`' | '~' | '#' => {
                 out.push('\\');
                 out.push(c);
             }

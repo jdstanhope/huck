@@ -30,6 +30,41 @@ fn declare_f_reparse_executes_if_case() {
 }
 
 #[test]
+fn declare_f_glob_arg_still_globs() {
+    // A glob in a function body must STILL glob after declare -f round-trip.
+    let out = huck_c(
+        "cd /tmp && mkdir -p hgt && : >hgt/sa && : >hgt/sb && \
+         f(){ cd /tmp/hgt && echo s*; }; \
+         direct=$(f); eval \"$(declare -f f)\"; round=$(f); \
+         rm -rf /tmp/hgt; \
+         [ \"$direct\" = \"$round\" ] && [ \"$direct\" = \"sa sb\" ] && echo MATCH || echo \"DIFF d=[$direct] r=[$round]\"",
+    );
+    assert!(out.contains("MATCH"), "glob lost across declare -f: {out:?}");
+}
+
+#[test]
+fn declare_f_escaped_glob_stays_literal() {
+    // An ESCAPED star must STAY literal across round-trip (must NOT start globbing).
+    let out = huck_c(
+        "cd /tmp && mkdir -p hgt2 && : >hgt2/sa && \
+         g(){ cd /tmp/hgt2 && echo s\\*; }; \
+         direct=$(g); eval \"$(declare -f g)\"; round=$(g); \
+         rm -rf /tmp/hgt2; \
+         [ \"$direct\" = \"$round\" ] && [ \"$direct\" = \"s*\" ] && echo MATCH || echo \"DIFF d=[$direct] r=[$round]\"",
+    );
+    assert!(out.contains("MATCH"), "escaped star changed meaning: {out:?}");
+}
+
+#[test]
+fn declare_f_test_builtin_clean() {
+    // The `[` builtin should render cleanly (not `\[`) and re-parse + run.
+    let out = huck_c("f(){ if [ -n \"$1\" ]; then echo yes; fi; }; declare -f f");
+    assert!(!out.contains("\\["), "test builtin over-escaped: {out:?}");
+    let run = huck_c("f(){ if [ -n \"$1\" ]; then echo yes; fi; }; eval \"$(declare -f f)\"; f x");
+    assert_eq!(run, "yes\n", "re-parsed [ test broke: {run:?}");
+}
+
+#[test]
 fn declare_f_missing_silent() {
     // bash: declare -f on a missing function prints nothing.
     let out = huck_c("declare -f nosuchfn");
