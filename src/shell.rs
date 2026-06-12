@@ -437,7 +437,12 @@ fn read_logical_command(
             s
         };
 
-        match editor.readline(&expanded) {
+        // rustyline measures prompt width from the `raw` half of a (raw, styled)
+        // Prompt and ignores `\x01`/`\x02` markers; pass the visible-only string for
+        // measurement and the full styled string for display (B-01). For a marker-free
+        // prompt the two are identical, so plain prompts are unaffected.
+        let measured = crate::prompt::prompt_raw(&expanded);
+        match editor.readline(&(measured, expanded)) {
             Ok(raw) => {
                 // History expansion runs per physical line, as before.
                 let line = {
