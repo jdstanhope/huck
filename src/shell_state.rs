@@ -384,10 +384,47 @@ pub struct Shell {
     pub current_completion_spec: Option<CompletionSpec>,
 }
 
+/// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
+/// Reconstructs `"{name} {value}"` (= `name () { body }`) and parses it, accepting
+/// ONLY a single `FunctionDef` whose name matches, with NOTHING after the `}` and
+/// no background. NEVER executes the value. Returns `None` to skip (parse error,
+/// trailing tokens, non-function, name mismatch, invalid name) — Shellshock-safe.
+fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command::Command>> {
+    // name must be a plain identifier (huck functions are POSIX identifiers).
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .map(|c| c == '_' || c.is_ascii_alphabetic())
+            .unwrap_or(false)
+        || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let src = format!("{name} {value}");
+    let tokens = crate::lexer::tokenize(&src).ok()?;
+    let seq = crate::command::parse(tokens).ok()??;
+    if !seq.rest.is_empty() || seq.background {
+        return None;
+    }
+    match seq.first {
+        crate::command::Command::FunctionDef { name: n, body } if n == name => Some(body),
+        _ => None,
+    }
+}
+
 impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
+        let mut bash_funcs: Vec<(String, String)> = Vec::new();
         for (key, value) in std::env::vars() {
+            if let Some(fname) = key
+                .strip_prefix("BASH_FUNC_")
+                .and_then(|s| s.strip_suffix("%%"))
+            {
+                bash_funcs.push((fname.to_string(), value)); // function encoding, not a variable
+                continue;
+            }
             vars.insert(key, Variable {
                 value: VarValue::Scalar(value),
                 exported: true,
@@ -397,7 +434,7 @@ impl Shell {
         }
         let shell_pid = unsafe { libc::getpid() };
         let shell_argv0 = std::env::args().next().unwrap_or_else(|| "huck".to_string());
-        let shell = Self {
+        let mut shell = Self {
             vars,
             last_status: 0,
             last_cmd_sub_status: None,
@@ -439,6 +476,14 @@ impl Shell {
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
         crate::traps::init_pending_bitmask(std::sync::Arc::clone(&shell.trap_pending));
+        // Import functions encoded in BASH_FUNC_<name>%% env vars. Parse-only
+        // (single matching FunctionDef, never executed) — Shellshock-safe.
+        for (fname, value) in bash_funcs {
+            if let Some(body) = parse_imported_function(&fname, &value) {
+                shell.define_function(fname.clone(), body);
+                shell.mark_function_exported(&fname);
+            }
+        }
         shell
     }
 
@@ -1559,6 +1604,40 @@ mod tests {
             crate::command::Command::FunctionDef { body, .. } => body,
             other => panic!("expected FunctionDef, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn import_accepts_clean_function() {
+        let body = parse_imported_function("g", "() { echo hi; }");
+        assert!(body.is_some(), "clean function body should parse");
+        match *body.unwrap() {
+            crate::command::Command::BraceGroup(_) => {}
+            other => panic!("expected brace-group body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_rejects_trailing_command() {
+        // Shellshock: a trailing command after the `}` must NOT be accepted.
+        assert!(parse_imported_function("x", "() { :; }; touch /tmp/PWN").is_none());
+    }
+
+    #[test]
+    fn import_rejects_bare_command() {
+        assert!(parse_imported_function("x", "echo not_a_function").is_none());
+    }
+
+    #[test]
+    fn import_rejects_parse_error() {
+        assert!(parse_imported_function("x", "() { if; }").is_none());
+    }
+
+    #[test]
+    fn import_accepts_simple_and_rejects_invalid_name() {
+        assert!(parse_imported_function("x", "() { :; }").is_some());
+        assert!(parse_imported_function("bad name", "() { :; }").is_none());
+        // a value smuggling its OWN name (so reconstruction isn't a lone FunctionDef) → rejected.
+        assert!(parse_imported_function("x", "y () { :; }").is_none());
     }
 
     #[test]
