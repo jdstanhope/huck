@@ -82,7 +82,7 @@ group.
   decisive completion source; deferred to avoid new filesystem/libc lookups.
 - **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
 - **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-48: `export -p`/`-n`** — `[deferred]` medium. huck: flags treated as variable names. bash: `-p` lists, `-n` unexports.
+- **M-121: `export -f` (export shell functions)** — `[deferred]` medium. huck stores functions as parsed AST and has no AST→source serializer (even `declare -f NAME` is a stub printing `declare -f NAME`, not the body), so `export -f` — which serializes each function body into a `BASH_FUNC_name%%=() { … }` env var for child shells — is not implemented. v145 makes `export -f NAME` a rc-0 no-op (it does NOT create/export an empty variable). EDGE: `export -f` with NO operands lists exported VARIABLES (via the shared listing) rather than exported functions as bash does. The agreed follow-on is an iteration that generates the function body from the AST in a NORMALIZED format (a real un-parser, which also yields a proper `declare -f`), after which `export -f` + child `BASH_FUNC_*` import ride on it.
 - **M-92: prefix-name `${!prefix@}` / `${!prefix*}`** — `[deferred]` low.
   The variable-NAME-listing forms of `${!…}` (expand to the names of all
   set variables whose name begins with `prefix`) are not implemented —
