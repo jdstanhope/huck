@@ -3434,6 +3434,7 @@ fn run_subprocess(
     process.args(&cmd.args);
     process.env_clear();
     process.envs(shell.exported_env());
+    process.envs(shell.exported_function_env());
 
     // Reset job-control signals to SIG_DFL in every child (foreground and
     // background). The shell SIG_IGNs these, and SIG_IGN is inherited across
@@ -5045,6 +5046,7 @@ fn spawn_external_with_fds(
     process.args(&resolved.args);
     process.env_clear();
     process.envs(shell.exported_env());
+    process.envs(shell.exported_function_env());
 
     // Reset job-control signals to SIG_DFL before exec.
     unsafe { process.pre_exec(reset_job_control_signals_in_child); }

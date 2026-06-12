@@ -1078,6 +1078,21 @@ impl Shell {
         v
     }
 
+    /// `(BASH_FUNC_<name>%%, "() { body }")` pairs for each exported function still
+    /// defined — injected into child process environments.
+    pub fn exported_function_env(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for name in self.exported_function_names() {
+            if let Some(body) = self.functions.get(&name) {
+                out.push((
+                    format!("BASH_FUNC_{name}%%"),
+                    crate::generate::exported_function_value(body),
+                ));
+            }
+        }
+        out
+    }
+
     /// Removes a shell function. Returns true if it existed. Copy-on-write.
     /// Also clears any `export -f` mark so `unset -f` un-exports.
     pub(crate) fn remove_function(&mut self, name: &str) -> bool {
@@ -1544,6 +1559,20 @@ mod tests {
             crate::command::Command::FunctionDef { body, .. } => body,
             other => panic!("expected FunctionDef, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exported_function_env_pairs() {
+        let mut sh = Shell::new();
+        sh.define_function("ef".to_string(), test_fn_body());
+        sh.mark_function_exported("ef");
+        let env = sh.exported_function_env();
+        let (_, v) = env
+            .iter()
+            .find(|(k, _)| k == "BASH_FUNC_ef%%")
+            .expect("BASH_FUNC_ef%% present");
+        assert!(v.starts_with("() "), "value should be () {{...}}: {v:?}");
+        assert!(v.contains("echo hi"), "{v:?}");
     }
 
     #[test]

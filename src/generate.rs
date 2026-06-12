@@ -17,6 +17,12 @@ pub fn function_to_source(name: &str, body: &Command) -> String {
     command_to_source(&Command::FunctionDef { name: name.to_string(), body: Box::new(body.clone()) }, 0)
 }
 
+/// The BASH_FUNC env-var VALUE form: `() {\n    <body>\n}` (no name prefix).
+/// A child shell parses it after prepending the function name.
+pub fn exported_function_value(body: &Command) -> String {
+    format!("() {}", command_to_source(body, 0))
+}
+
 /// Render any command at nesting depth `indent` (4 spaces/level).
 pub fn command_to_source(cmd: &Command, indent: usize) -> String {
     match cmd {
@@ -696,6 +702,26 @@ mod tests {
         let s2 = sequence_to_source(&b, 0);
         (s1, s2)
     }
+    #[test]
+    fn exported_function_value_form() {
+        use crate::{command, lexer};
+        let seq = command::parse(lexer::tokenize("f(){ echo hi; }").unwrap())
+            .unwrap()
+            .unwrap();
+        let body = match seq.first {
+            command::Command::FunctionDef { body, .. } => body,
+            _ => panic!(),
+        };
+        let v = exported_function_value(&body);
+        assert!(v.starts_with("() "), "{v}");
+        assert!(v.contains("echo hi"), "{v}");
+        // re-parseable when prefixed with a name:
+        let reparse = command::parse(lexer::tokenize(&format!("f {v}")).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reparse.first, command::Command::FunctionDef { .. }));
+    }
+
     fn assert_rt(src: &str) {
         let (s1, s2) = rt(src);
         assert_eq!(s1, s2, "not idempotent for {src:?}\n s1={s1:?}\n s2={s2:?}");
