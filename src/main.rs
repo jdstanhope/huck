@@ -9,6 +9,7 @@ mod completion_spec;
 mod continuation;
 mod executor;
 mod expand;
+mod generate;
 mod glob_match;
 mod history;
 mod job_spec;

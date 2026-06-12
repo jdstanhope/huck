@@ -746,7 +746,7 @@ fn builtin_readonly(
 
 /// Backslash-escape `"`, `\`, `$`, and backtick for safe embedding
 /// inside a double-quoted value (used by `format_declare_line`).
-fn escape_double_quote_value(s: &str) -> String {
+pub(crate) fn escape_double_quote_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -876,33 +876,53 @@ fn declare_list_all_vars(
     ExecOutcome::Continue(0)
 }
 
-/// Emit `declare -f NAME` lines for each named function (or every
-/// function, sorted, when `names` is empty). For v64 the function
-/// body is NOT printed — `-f` and `-F` produce identical output.
+/// Emit function definitions for each named function (or every
+/// function, sorted, when `names` is empty).
+///
+/// When `names_only` (the `-F` form) is set, print just the
+/// `declare -f NAME` header line. Otherwise (the `-f` form) print the
+/// full function body, serialized from the AST by `generate` in a
+/// NORMALIZED, re-parseable format (not byte-identical to bash's
+/// pretty-printer, but semantically equivalent — see M-121).
 fn declare_list_functions(
     names: &[String],
-    _names_only: bool,
+    names_only: bool,
     out: &mut dyn std::io::Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     if names.is_empty() {
-        let mut fnames: Vec<&String> = shell.functions.keys().collect();
+        let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
         fnames.sort();
-        for n in fnames {
-            let _ = writeln!(out, "declare -f {n}");
+        for n in &fnames {
+            emit_function(n, names_only, out, shell);
         }
         return ExecOutcome::Continue(0);
     }
     let mut exit: i32 = 0;
     for name in names {
         if shell.functions.contains_key(name) {
-            let _ = writeln!(out, "declare -f {name}");
+            emit_function(name, names_only, out, shell);
         } else {
             // bash: `declare -f`/`-F` on a missing function is silent (rc 1).
             exit = 1;
         }
     }
     ExecOutcome::Continue(exit)
+}
+
+/// Emit a single existing function: the `-F` header for `names_only`,
+/// otherwise the full normalized body via `generate::function_to_source`.
+fn emit_function(
+    name: &str,
+    names_only: bool,
+    out: &mut dyn std::io::Write,
+    shell: &Shell,
+) {
+    if names_only {
+        let _ = writeln!(out, "declare -f {name}");
+    } else if let Some(body) = shell.functions.get(name) {
+        let _ = writeln!(out, "{}", crate::generate::function_to_source(name, body));
+    }
 }
 
 /// `declare`/`typeset` — variable-attribute builtin (Tier A: wires to
@@ -10565,9 +10585,11 @@ mod declare_tests {
         shell.define_function("fn2".to_string(), body);
         let (oc, out) = run(&["-f"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
-        // Sorted; both present.
-        assert!(out.contains("declare -f fn1"));
-        assert!(out.contains("declare -f fn2"));
+        // v146: `-f` prints the normalized function body via `generate`, so
+        // each function shows its `NAME ()` header (not the old `declare -f`
+        // stub line). Sorted; both present.
+        assert!(out.contains("fn1 ()"), "got {out:?}");
+        assert!(out.contains("fn2 ()"), "got {out:?}");
         assert!(
             out.find("fn1").unwrap() < out.find("fn2").unwrap(),
             "expected sorted; got {out:?}",
