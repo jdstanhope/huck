@@ -289,6 +289,31 @@ fn convert_prompt_markers(s: &str) -> String {
     out
 }
 
+/// The "raw" (visible-only) form of an expanded prompt: everything inside a
+/// `\x01`…`\x02` non-printing span (and the marker chars themselves) is removed,
+/// leaving just the text/glyphs the terminal actually renders.
+///
+/// rustyline 18 measures prompt width from the `Prompt::raw()` string and ignores
+/// the `\x01`/`\x02` markers, so a prompt whose colors / OSC sequences are wrapped
+/// in markers (e.g. oh-my-posh) is over-measured (it counts OSC-8 hyperlink URLs and
+/// the OSC-0 window title as visible). Passing `(prompt_raw(styled), styled)` to
+/// `readline` makes rustyline measure the visible width while still displaying the
+/// full styled prompt (B-01). An unbalanced `\x01` (no closing `\x02`) skips to the
+/// end; a stray `\x02` is dropped. A prompt with no markers is returned unchanged.
+pub fn prompt_raw(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut skip = false;
+    for c in s.chars() {
+        match c {
+            '\x01' => skip = true,
+            '\x02' => skip = false,
+            _ if skip => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // ── Per-escape helpers ─────────────────────────────────────────
 
 fn user() -> String {
@@ -406,6 +431,49 @@ mod tests {
     fn literal_text_passes_through() {
         let mut shell = Shell::new();
         assert_eq!(expand_prompt("hello ", &mut shell), "hello ");
+    }
+
+    #[test]
+    fn prompt_raw_strips_marker_spans() {
+        // \x01 <ANSI> \x02 X \x01 <ANSI> \x02  ->  "X"
+        assert_eq!(
+            prompt_raw("\x01\x1b[31m\x02X\x01\x1b[0m\x02"),
+            "X"
+        );
+    }
+
+    #[test]
+    fn prompt_raw_strips_osc_inside_markers() {
+        // An OSC-8 hyperlink and OSC-0 title wrapped in markers vanish; the
+        // visible glyph between them survives.
+        let styled = "\x01\x1b]0;title\x07\x02G\x01\x1b]8;;http://x\x1b\\\x02";
+        assert_eq!(prompt_raw(styled), "G");
+    }
+
+    #[test]
+    fn prompt_raw_keeps_marker_free_prompt() {
+        assert_eq!(prompt_raw("huck> "), "huck> ");
+        // Visible powerline glyph + text outside any markers is kept verbatim.
+        assert_eq!(prompt_raw("\u{e0b6} john "), "\u{e0b6} john ");
+    }
+
+    #[test]
+    fn prompt_raw_unbalanced_start_skips_to_end() {
+        assert_eq!(prompt_raw("ab\x01rest with no close"), "ab");
+    }
+
+    #[test]
+    fn prompt_raw_bare_end_marker_dropped() {
+        assert_eq!(prompt_raw("a\x02b"), "ab");
+    }
+
+    #[test]
+    fn prompt_raw_output_has_no_control_or_escape() {
+        let styled = "\x01\x1b[38;2;1;2;3m\x02\u{e0b0} john \x01\x1b]8;;u\x1b\\\x02";
+        let raw = prompt_raw(styled);
+        assert!(!raw.contains('\x01') && !raw.contains('\x02'));
+        assert!(!raw.contains('\x1b'));
+        assert_eq!(raw, "\u{e0b0} john ");
     }
 
     #[test]
