@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 29 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 30 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -191,6 +191,8 @@ Things huck deliberately does differently from bash. Document and keep.
 
 - **L-34: `mapfile`/`read` unimplemented flags + two `mapfile` edges** — `[deferred]`/`[low]` (v140). v140 ships `mapfile`/`readarray` with `-t -d -n -O -s` (+ default `MAPFILE`) and `read -a`. NOT YET implemented: `mapfile -u FD`/`-C callback`/`-c quantum`, and `read -n`/`-N`/`-t`/`-u` (nchars/timeout/fd). `-C`/`-c` need callback eval; `-u` needs reading from an arbitrary fd; rare in practice, deferred. Two minor edges in the shipped set: (a) a malformed numeric option arg (`mapfile -n xyz`) exits rc 2 with `huck: mapfile: xyz: invalid number`, vs bash rc 1 `invalid line count` (program-name-prefix class + a pathological-input rc); (b) a high-byte raw delimiter `-d $'\xff'` doesn't split (the `0xFF` becomes U+FFFD through huck's UTF-8 `String` word model and never matches the stream byte) — inherited from the general non-UTF-8-byte limitation (L-04/L-11 class), not specific to mapfile; multi-byte UTF-8 delimiters split on the first byte like bash. All common usage matches bash (12/12 bash-diff harness).
 
+- **L-35: `command builtin <decl>` (a `command`-led nest wrapping a declaration builtin) errors instead of running** — `[intentional]`, low (v142). v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led nests around a declaration builtin (`builtin builtin local x=5`, `builtin command local x=5` both run and print the assignment). But the symmetric `command builtin local x=5` (a `command`-led nest wrapping `builtin <decl>`) surfaces post-resolve with `decl_args` already discarded, so huck prints `huck: builtin: local: declaration builtins must not be wrapped by \`command builtin\`` and returns rc 1, whereas bash runs it (prints `x=5`). Maximally pathological — no real script nests `command builtin` around a declaration builtin; huck errors cleanly (rc 1, no panic) rather than running it. Matching bash would require carrying `decl_args` through the `command`-led resolution path.
+
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
 - **Status**: intentional (v29)
 - **Severity**: low
@@ -276,8 +278,8 @@ than silently producing invalid UTF-8.
 
 - **Status**: `[intentional]`, all low (v99)
 - **Severity**: low
-- **huck**: three edges in the v99 `command CMD` bare form (M-85): (a) `command -p CMD` resolves CMD via the CURRENT `$PATH`, not bash's guaranteed default PATH (`getconf PATH` / a "standard utilities" path); huck has no separate default-PATH search, so `-p` is accepted but effectively a no-op over the live `$PATH`. (b) `command declare -a a=(x y z)` (a compound array RHS reached via `command`): bash REJECTS it as a syntax error, but huck ACCEPTS it (the pre-resolve declaration-builtin reconstruction assigns the array) — a no-panic SUPERSET. Scalar `command export X=1` matches bash. (c) A user FUNCTION named `command` (`command() { …; }`) cannot shadow the builtin in huck — the interception is unconditional and runs BEFORE function lookup — whereas bash lets the function take precedence.
-- **bash**: (a) `-p` searches a guaranteed default PATH; (b) `command declare -a a=(…)` is a syntax error; (c) a function named `command` shadows the builtin.
+- **huck**: three edges in the v99 `command CMD` bare form (M-85): (a) `command -p CMD` resolves CMD via the CURRENT `$PATH`, not bash's guaranteed default PATH (`getconf PATH` / a "standard utilities" path); huck has no separate default-PATH search, so `-p` is accepted but effectively a no-op over the live `$PATH`. (b) `command declare -a a=(x y z)` (a compound array RHS reached via `command`): bash REJECTS it as a syntax error, but huck ACCEPTS it (the pre-resolve declaration-builtin reconstruction assigns the array) — a no-panic SUPERSET. Scalar `command export X=1` matches bash. (c) A user FUNCTION named `command` (`command() { …; }`) cannot shadow the builtin in huck — the interception is unconditional and runs BEFORE function lookup — whereas bash lets the function take precedence. The same holds for a function named `builtin` (added v142): the `builtin` pre-resolve interception also runs before function lookup, so `builtin() { …; }` cannot shadow the `builtin` builtin either.
+- **bash**: (a) `-p` searches a guaranteed default PATH; (b) `command declare -a a=(…)` is a syntax error; (c) a function named `command` (or `builtin`) shadows the corresponding builtin.
 - **Why intentional**: (a) huck has no built-in default-PATH constant; the live `$PATH` covers every real use of `-p` (recovering a real command past a shadowing function). (b) accepting the array assignment is strictly more permissive and panic-free — the only divergence is huck succeeding where bash errors on a pathological input. (c) POSIX discourages naming a function `command`; the unconditional interception is what makes the bare form reliably bypass functions in the first place.
 - **Workaround**: (a) none needed — set `$PATH` explicitly if a default-PATH search is required; (b) avoid `command declare -a` for array RHS; (c) do not name a function `command`.
 
