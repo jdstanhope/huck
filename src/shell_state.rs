@@ -258,6 +258,9 @@ pub struct Shell {
     /// which copies the map only when the `Rc` is shared. huck is
     /// single-threaded so `Rc` (not `Arc`) is correct here.
     pub functions: Rc<HashMap<String, Box<crate::command::Command>>>,
+    /// Names of functions marked `export -f`. Parallel to `functions` (no attribute
+    /// slot). Re-defining a function keeps its export mark.
+    pub exported_functions: std::collections::HashSet<String>,
     /// User-defined aliases. `name` → expansion text. Populated by
     /// the `alias` builtin; consumed by `expand_aliases_in_tokens`
     /// during interactive REPL input.
@@ -402,6 +405,7 @@ impl Shell {
             getopts_sp: 0,
             getopts_optind_cache: 0,
             functions: Rc::new(HashMap::new()),
+            exported_functions: std::collections::HashSet::new(),
             aliases: std::collections::HashMap::new(),
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
@@ -1048,8 +1052,36 @@ impl Shell {
         Rc::make_mut(&mut self.functions).insert(name, body);
     }
 
+    /// Marks `name` as an exported function (`export -f NAME`).
+    pub(crate) fn mark_function_exported(&mut self, name: &str) {
+        self.exported_functions.insert(name.to_string());
+    }
+
+    /// Removes the export mark from `name` (e.g. `export -nf`).
+    /// (Used by later v147 tasks; kept as part of the export-function API.)
+    #[allow(dead_code)]
+    pub(crate) fn unmark_function_exported(&mut self, name: &str) {
+        self.exported_functions.remove(name);
+    }
+
+    /// True if `name` is marked exported via `export -f`.
+    /// (Used by later v147 tasks; kept as part of the export-function API.)
+    #[allow(dead_code)]
+    pub fn is_function_exported(&self, name: &str) -> bool {
+        self.exported_functions.contains(name)
+    }
+
+    /// Sorted names of all functions currently marked exported.
+    pub fn exported_function_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.exported_functions.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
     /// Removes a shell function. Returns true if it existed. Copy-on-write.
+    /// Also clears any `export -f` mark so `unset -f` un-exports.
     pub(crate) fn remove_function(&mut self, name: &str) -> bool {
+        self.exported_functions.remove(name);
         Rc::make_mut(&mut self.functions).remove(name).is_some()
     }
 
@@ -1502,6 +1534,36 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(test)]
+    fn test_fn_body() -> Box<crate::command::Command> {
+        let seq = crate::command::parse(crate::lexer::tokenize("f(){ echo hi; }").unwrap())
+            .unwrap()
+            .unwrap();
+        match seq.first {
+            crate::command::Command::FunctionDef { body, .. } => body,
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mark_and_query_exported_function() {
+        let mut sh = Shell::new();
+        sh.define_function("f".to_string(), test_fn_body());
+        assert!(!sh.is_function_exported("f"));
+        sh.mark_function_exported("f");
+        assert!(sh.is_function_exported("f"));
+        assert_eq!(sh.exported_function_names(), vec!["f".to_string()]);
+    }
+
+    #[test]
+    fn remove_function_unexports() {
+        let mut sh = Shell::new();
+        sh.define_function("f".to_string(), test_fn_body());
+        sh.mark_function_exported("f");
+        assert!(sh.remove_function("f"));
+        assert!(!sh.is_function_exported("f"), "unset -f must un-export");
+    }
 
     #[test]
     fn is_set_true_for_set_var_even_when_empty() {
