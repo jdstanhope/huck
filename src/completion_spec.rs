@@ -391,9 +391,10 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
 }
 
 fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
+    let home = shell.get("HOME").unwrap_or("").to_string();
     match action {
-        Action::File => list_dir_with_path_prefix(prefix, false),
-        Action::Directory => list_dir_with_path_prefix(prefix, true),
+        Action::File => list_dir_with_path_prefix(prefix, false, &home),
+        Action::Directory => list_dir_with_path_prefix(prefix, true, &home),
         Action::Command => {
             // Reuse src/completion.rs::complete_command which already
             // walks PATH + builtins. Use `display` (raw name); the
@@ -563,13 +564,16 @@ fn list_dir_filtered(dir: &str, prefix: &str, dirs_only: bool) -> Vec<String> {
 /// caller's input. This is what bash's `compgen -A file` /
 /// `compgen -A directory` does: a prefix of `src/comp` reads `src/`
 /// and prefix-matches basenames against `comp`.
-fn list_dir_with_path_prefix(prefix: &str, dirs_only: bool) -> Vec<String> {
+fn list_dir_with_path_prefix(prefix: &str, dirs_only: bool, home: &str) -> Vec<String> {
     let (dir, base) = match prefix.rfind('/') {
         Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
         None => ("", prefix),
     };
-    let scan_dir = if dir.is_empty() { "." } else { dir };
-    let bare_results = list_dir_filtered(scan_dir, base, dirs_only);
+    let scan_raw = if dir.is_empty() { "." } else { dir };
+    // _filedir passes a literal `~/…`; expand it for the read_dir, but
+    // re-prepend the ORIGINAL `dir` so candidates come back as `~/projects`.
+    let scan_dir = crate::completion::expand_tilde_prefix(scan_raw, home);
+    let bare_results = list_dir_filtered(&scan_dir, base, dirs_only);
     bare_results
         .into_iter()
         .map(|name| format!("{dir}{name}"))
@@ -955,5 +959,21 @@ mod tests {
         assert!(got.iter().any(|s| s == "subdir/alpha.txt"), "{got:?}");
         // And NOT match unrelated files (no bare "alpha.txt" without prefix).
         assert!(got.iter().all(|s| s.starts_with("subdir/")), "{got:?}");
+    }
+
+    #[test]
+    fn directory_action_tilde_expands_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("projects")).unwrap();
+        std::fs::create_dir(home.path().join("pub")).unwrap();
+        let mut sh = Shell::new();
+        sh.set("HOME", home.path().to_str().unwrap().to_string());
+
+        let res = enumerate_action(Action::Directory, "~/", &sh);
+        assert!(res.contains(&"~/projects".to_string()), "{res:?}");
+        assert!(res.contains(&"~/pub".to_string()), "{res:?}");
+
+        let res2 = enumerate_action(Action::Directory, "~/pro", &sh);
+        assert_eq!(res2, vec!["~/projects".to_string()], "{res2:?}");
     }
 }

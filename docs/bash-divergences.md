@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 30 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 31 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -192,6 +192,8 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-34: `mapfile`/`read` unimplemented flags + two `mapfile` edges** — `[deferred]`/`[low]` (v140). v140 ships `mapfile`/`readarray` with `-t -d -n -O -s` (+ default `MAPFILE`) and `read -a`. NOT YET implemented: `mapfile -u FD`/`-C callback`/`-c quantum`, and `read -n`/`-N`/`-t`/`-u` (nchars/timeout/fd). `-C`/`-c` need callback eval; `-u` needs reading from an arbitrary fd; rare in practice, deferred. Two minor edges in the shipped set: (a) a malformed numeric option arg (`mapfile -n xyz`) exits rc 2 with `huck: mapfile: xyz: invalid number`, vs bash rc 1 `invalid line count` (program-name-prefix class + a pathological-input rc); (b) a high-byte raw delimiter `-d $'\xff'` doesn't split (the `0xFF` becomes U+FFFD through huck's UTF-8 `String` word model and never matches the stream byte) — inherited from the general non-UTF-8-byte limitation (L-04/L-11 class), not specific to mapfile; multi-byte UTF-8 delimiters split on the first byte like bash. All common usage matches bash (12/12 bash-diff harness).
 
 - **L-35: `command builtin <decl>` (a `command`-led nest wrapping a declaration builtin) errors instead of running** — `[intentional]`, low (v142). v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led nests around a declaration builtin (`builtin builtin local x=5`, `builtin command local x=5` both run and print the assignment). But any nest where a `command` wrapper sits immediately outside `builtin <decl>` — `command builtin local x=5`, and also the builtin-led `builtin command builtin local x=5` (the outer `builtin` is peeled, leaving `command builtin local`) — surfaces post-resolve with `decl_args` already discarded, so huck prints `huck: builtin: local: declaration builtins must not be wrapped by \`command builtin\`` and returns rc 1, whereas bash runs it (prints `x=5`). Maximally pathological — no real script nests `command builtin` around a declaration builtin; huck errors cleanly (rc 1, no panic) rather than running it. Matching bash would require carrying `decl_args` through the `command`-led resolution path.
+
+- **L-36: `complete -o nospace` is a no-op (no default trailing space after completion)** — `[deferred]`, low (v143). huck never appends the trailing space bash adds after completing a final (non-directory) word — rustyline (`CompletionType::List`) inserts the replacement verbatim; the only append is `/` for directories. So `complete -o nospace` has nothing to suppress (it parses into `CompOptions.nospace` but is unread at tab-dispatch). Honoring nospace meaningfully would first require implementing bash's default trailing-space behavior. Low impact: the directory-descend flow is unaffected (`cd dir/<TAB>` already adds no space).
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
 - **Status**: intentional (v29)

@@ -19,9 +19,16 @@ pub enum CompletionContext {
 }
 
 /// Classifies the completion context at byte offset `pos` in `line`.
-/// Returns the byte offset where replacement begins and the context
-/// (whose prefix has backslash-escapes resolved).
+/// Returns the basename replacement offset and the context.
 pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
+    let (_, start, ctx) = analyze_full(line, pos);
+    (start, ctx)
+}
+
+/// Like `analyze`, but also returns the start of the WHOLE word
+/// (`word_start`) — the anchor the programmable-completion path uses to
+/// replace the entire `cur` word with full-path candidates.
+pub(crate) fn analyze_full(line: &str, pos: usize) -> (usize, usize, CompletionContext) {
     let head = &line[..pos];
 
     let mut word_start = 0usize;
@@ -110,6 +117,7 @@ pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
         if name.chars().all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
             let name_off = dollar + 1 + if brace { 1 } else { 0 };
             return (
+                word_start,
                 word_start + name_off,
                 CompletionContext::Variable { prefix: name.to_string() },
             );
@@ -119,17 +127,18 @@ pub fn analyze(line: &str, pos: usize) -> (usize, CompletionContext) {
     if let Some(slash) = word.rfind('/') {
         let dir = unescape(&word[..=slash]);
         let prefix = unescape(&word[slash + 1..]);
-        return (word_start + slash + 1, CompletionContext::File { dir, prefix });
+        return (word_start, word_start + slash + 1, CompletionContext::File { dir, prefix });
     }
 
     if !is_command_pos {
         return (
             word_start,
+            word_start,
             CompletionContext::File { dir: String::new(), prefix: unescape(word) },
         );
     }
 
-    (word_start, CompletionContext::Command { prefix: unescape(word) })
+    (word_start, word_start, CompletionContext::Command { prefix: unescape(word) })
 }
 
 /// True if `word` looks like a `NAME=value` assignment prefix.
@@ -269,6 +278,15 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
     candidates
 }
 
+/// Replaces a leading `~/` with `home/` (the only tilde form `_filedir`
+/// emits to `compgen`). Other inputs pass through unchanged.
+pub(crate) fn expand_tilde_prefix(s: &str, home: &str) -> String {
+    match s.strip_prefix("~/") {
+        Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+        _ => s.to_string(),
+    }
+}
+
 /// Resolves the directory to scan. `~/` is expanded against `home`.
 fn resolve_dir(dir: &str, home: &str) -> Option<PathBuf> {
     if dir.is_empty() {
@@ -379,7 +397,7 @@ pub(crate) mod dispatch {
         // run_spec_with_empty_fallback. Belt-and-suspenders alongside
         // builtin_compgen's own save/restore.
         shell.current_completion_spec = None;
-        let (start, context) = analyze(line, pos);
+        let (word_start, start, context) = analyze_full(line, pos);
 
         // Path 1: variable context — always wins, no spec lookup.
         if let CompletionContext::Variable { prefix } = &context {
@@ -419,14 +437,14 @@ pub(crate) mod dispatch {
         match spec_opt {
             Some(spec) => {
                 let cands = run_spec_with_empty_fallback(&spec, line, pos, &cmd_name, shell);
-                if cands.is_empty() {
-                    // No spec hit AND no fallback flag set → empty result.
-                    return (start, Vec::new());
-                }
-                (start, cands)
+                // Programmable completion replaces the WHOLE cur word with
+                // full-path candidates (bash's model) -> anchor at word_start,
+                // not the basename offset. Fixes `cd projects/projects`.
+                (word_start, cands)
             }
             None => {
-                // No spec at all → existing file completion.
+                // No spec at all -> existing default file completion
+                // (basenames, anchored after the last '/').
                 let home = shell.get("HOME").unwrap_or("").to_string();
                 (start, complete_file(dir, prefix, &home))
             }
@@ -488,11 +506,12 @@ pub(crate) mod dispatch {
         };
 
         // Filename rendering.
+        let home = shell.get("HOME").unwrap_or("").to_string();
         let candidates: Vec<Candidate> = if effective_options.filenames {
             after_fallback
                 .into_iter()
                 .map(|name| {
-                    let is_dir = std::fs::metadata(&name)
+                    let is_dir = std::fs::metadata(expand_tilde_prefix(&name, &home))
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
                     let display = if is_dir {
@@ -500,7 +519,12 @@ pub(crate) mod dispatch {
                     } else {
                         name.clone()
                     };
-                    let mut replacement = escape_filename(&name);
+                    // Preserve a leading `~/` UNescaped (tilde-expansion intent);
+                    // escaping it would yield `cd \~/projects` (a literal `~` dir).
+                    let mut replacement = match name.strip_prefix("~/") {
+                        Some(rest) => format!("~/{}", escape_filename(rest)),
+                        None => escape_filename(&name),
+                    };
                     if is_dir {
                         replacement.push('/');
                     }
@@ -526,9 +550,16 @@ pub(crate) mod dispatch {
 
     fn file_completion_strings(prefix: &str, shell: &Shell) -> Vec<String> {
         let home = shell.get("HOME").unwrap_or("").to_string();
-        complete_file("", prefix, &home)
+        // Split the cur word into (dir, base) and re-prepend dir so the
+        // empty-fallback yields FULL cur-relative paths, consistent with the
+        // word_start anchor (matches compgen / bash's `-o default`).
+        let (dir, base) = match prefix.rfind('/') {
+            Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+            None => ("", prefix),
+        };
+        complete_file(dir, base, &home)
             .into_iter()
-            .map(|c| c.replacement)
+            .map(|c| format!("{dir}{}", c.replacement))
             .collect()
     }
 
@@ -553,7 +584,7 @@ pub(crate) mod dispatch {
                 let home = shell.get("HOME").unwrap_or("").to_string();
                 complete_file(&dir, &prefix, &home)
                     .into_iter()
-                    .map(|c| c.replacement)
+                    .map(|c| format!("{dir}{}", c.replacement))
                     .collect()
             }
         }
@@ -843,6 +874,116 @@ mod tests {
     fn analyze_escaped_dollar_is_not_variable() {
         let (_, ctx) = analyze("echo \\$HOM", 10);
         assert!(matches!(ctx, CompletionContext::File { .. }));
+    }
+
+    #[test]
+    fn analyze_full_reports_word_start_for_slash_word() {
+        // `cd projects/sub`: whole word starts at 3; basename anchor after the slash.
+        let (word_start, start, ctx) = analyze_full("cd projects/sub", 15);
+        assert_eq!(word_start, 3);
+        assert_eq!(start, 12); // just past "projects/"
+        assert_eq!(
+            ctx,
+            CompletionContext::File { dir: "projects/".to_string(), prefix: "sub".to_string() }
+        );
+    }
+
+    #[test]
+    fn analyze_full_word_start_equals_start_without_slash() {
+        let (word_start, start, _) = analyze_full("cd pr", 5);
+        assert_eq!(word_start, 3);
+        assert_eq!(start, 3);
+    }
+
+    #[test]
+    fn spec_completion_anchors_at_word_start() {
+        // A `complete -F _fake cd` returning FULL-PATH candidates must replace the
+        // whole `projects/` word (anchor at word_start=3), not the after-slash
+        // suffix — otherwise rustyline double-pastes -> `cd projects/projects`.
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line(
+            "_fake() { COMPREPLY=(projects/alpha projects/beta); }",
+            &mut sh,
+            false,
+        );
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "cd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                function: Some("_fake".to_string()),
+                ..Default::default()
+            },
+        );
+        let (start, cands) = dispatch::resolve("cd projects/", 12, &mut sh);
+        assert_eq!(start, 3, "must anchor at the start of `projects/`");
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(reps.contains(&"projects/alpha"), "{reps:?}");
+        assert!(reps.contains(&"projects/beta"), "{reps:?}");
+    }
+
+    #[test]
+    fn spec_default_fallback_yields_full_relative_paths() {
+        // `complete -o default -F _empty cd`: when the function yields nothing, the
+        // empty-fallback must return FULL cur-relative paths (not basenames), so the
+        // word_start anchor replaces the whole `<dir>/<base>` correctly.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        let base = dir.path().to_str().unwrap(); // absolute => no chdir needed
+        let mut sh = Shell::new();
+        let _ = crate::shell::process_line("_empty() { COMPREPLY=(); }", &mut sh, false);
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "cd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                function: Some("_empty".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    default: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let line = format!("cd {base}/al");
+        let pos = line.len();
+        let (start, cands) = dispatch::resolve(&line, pos, &mut sh);
+        assert_eq!(start, 3, "anchor at the start of the path word");
+        let reps: Vec<String> = cands.iter().map(|c| c.replacement.clone()).collect();
+        assert!(
+            reps.iter().any(|r| r == &format!("{base}/alpha/")),
+            "expected full path {base}/alpha/, got {reps:?}"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_prefix_handles_leading_tilde_slash() {
+        assert_eq!(expand_tilde_prefix("~/projects", "/home/x"), "/home/x/projects");
+        assert_eq!(expand_tilde_prefix("~/", "/home/x"), "/home/x/");
+        assert_eq!(expand_tilde_prefix("projects/", "/home/x"), "projects/"); // no tilde
+        assert_eq!(expand_tilde_prefix("~/p", ""), "~/p"); // empty home -> unchanged
+    }
+
+    #[test]
+    fn spec_filenames_appends_slash_to_tilde_dir() {
+        // A `-o filenames` candidate `~/projects` (a real dir under HOME) must get a
+        // trailing `/` so `cd ~/<TAB>` can descend. COMPREPLY is single-quoted so the
+        // shell does NOT tilde-expand it — the candidate stays literal `~/projects`.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("projects")).unwrap();
+        let mut sh = Shell::new();
+        sh.set("HOME", home.path().to_str().unwrap().to_string());
+        let _ = crate::shell::process_line("_t() { COMPREPLY=('~/projects'); }", &mut sh, false);
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "cd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                function: Some("_t".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    filenames: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (_start, cands) = dispatch::resolve("cd ~/", 5, &mut sh);
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(reps.contains(&"~/projects/"), "tilde dir should get trailing slash: {reps:?}");
     }
 
     #[test]
