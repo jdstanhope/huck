@@ -746,7 +746,7 @@ fn builtin_readonly(
 
 /// Backslash-escape `"`, `\`, `$`, and backtick for safe embedding
 /// inside a double-quoted value (used by `format_declare_line`).
-fn escape_double_quote_value(s: &str) -> String {
+pub(crate) fn escape_double_quote_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
