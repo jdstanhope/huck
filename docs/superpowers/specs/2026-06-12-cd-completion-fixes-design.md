@@ -139,7 +139,10 @@ fn expand_tilde_prefix(s: &str, home: &str) -> String {
   `std::fs::metadata(expand_tilde_prefix(&name, &home))` (home from the shell). The
   emitted `replacement`/`display` keep the original `~/…` text; only the is-dir
   probe uses the expanded path. This lets `cd ~/<TAB>` → `cd ~/projects/` → TAB
-  descends.
+  descends. NOTE: `escape_filename` escapes `~`, so the `filenames` rendering must
+  preserve a LEADING `~/` unescaped (escape only the remainder) — otherwise the
+  candidate becomes `\~/projects` (a literal `~` dir). The default path is
+  unaffected (it escapes basenames, which never start with `~/`).
 
 `expand_tilde_prefix` lives once (e.g. in `completion.rs`, re-exported to
 `completion_spec.rs`, or duplicated minimally — implementer's call to keep it DRY).
