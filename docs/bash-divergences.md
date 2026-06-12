@@ -28,9 +28,9 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 31 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 33 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -88,7 +88,6 @@ group.
   set variables whose name begins with `prefix`) are not implemented —
   the lexer's `${!` branch handles only the scalar-indirect form (M-91).
   Not used by the bashrc / bash-completion; deferred. M-91 follow-on.
-- **M-102: array-literal element word-splitting** — `[deferred]` medium. huck: an array literal whose element is an unquoted command substitution or variable expansion — `a=($(cmd))`, `a=($(echo "x y" z))`, `a=($var)` — produces ONE element containing the whole result string. bash: the multi-word result is word-split on `$IFS` into SEVERAL array elements (`a=($(echo a b c))` → 3 elements). Pre-existing (NOT introduced by v106); surfaced while writing the v106 M-101 array-literal tests (which therefore use single-word globs to sidestep it). Fix needs the array-literal element builder to run IFS field-splitting on each unquoted expansion result, reusing `emit_split_fields` (M-05). The v136 `eval x=($v …)` reconstruction path shares this best-effort element-splitting behavior (it matches bash's lossy eval re-parse for the common cases).
 - **M-107: `FUNCNAME` inside function bodies** — `[deferred]` low. huck: `$FUNCNAME` (and `${FUNCNAME[…]}`) is empty inside a function; bash sets it to the call-stack array (`FUNCNAME[0]` = the current function name). Surfaced as the blank `:` in bash_completion's `bash_completion: : \`-n'` diagnostic (`$FUNCNAME` empty), though that branch is no longer reached once `getopts` works (M-106). bash_completion reads `${FUNCNAME[…]}` in a few other diagnostics. Fix needs a per-call function-name stack exposed as the `FUNCNAME` array (huck already pushes `function_arg0` in `call_function` — the array surface from M-82 makes the variable wiring feasible).
 
 ### Globbing
@@ -194,6 +193,10 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-35: `command builtin <decl>` (a `command`-led nest wrapping a declaration builtin) errors instead of running** — `[intentional]`, low (v142). v142 adds the `builtin NAME [args]` builtin. huck correctly peels `builtin`-led nests around a declaration builtin (`builtin builtin local x=5`, `builtin command local x=5` both run and print the assignment). But any nest where a `command` wrapper sits immediately outside `builtin <decl>` — `command builtin local x=5`, and also the builtin-led `builtin command builtin local x=5` (the outer `builtin` is peeled, leaving `command builtin local`) — surfaces post-resolve with `decl_args` already discarded, so huck prints `huck: builtin: local: declaration builtins must not be wrapped by \`command builtin\`` and returns rc 1, whereas bash runs it (prints `x=5`). Maximally pathological — no real script nests `command builtin` around a declaration builtin; huck errors cleanly (rc 1, no panic) rather than running it. Matching bash would require carrying `decl_args` through the `command`-led resolution path.
 
 - **L-36: `complete -o nospace` is a no-op (no default trailing space after completion)** — `[deferred]`, low (v143). huck never appends the trailing space bash adds after completing a final (non-directory) word — rustyline (`CompletionType::List`) inserts the replacement verbatim; the only append is `/` for directories. So `complete -o nospace` has nothing to suppress (it parses into `CompOptions.nospace` but is unread at tab-dispatch). Honoring nospace meaningfully would first require implementing bash's default trailing-space behavior. Low impact: the directory-descend flow is unaffected (`cd dir/<TAB>` already adds no space).
+
+- **L-37: indexed subscripted array element with a literal brace** — `[deferred]`, low (v144). v144 brace-expands BARE array-literal elements. An INDEXED subscripted element whose value contains a literal brace — `a=([2]=x{a,b})` — keeps the value literal in huck (`a[2]="x{a,b}"`), whereas bash brace-expands the whole `[i]=…` word into BARE literals dropping the subscript (`[0]="[2]=xa" [1]="[2]=xb"`). ASSOCIATIVE subscripts (`declare -A m=([k]=x{a,b})`) keep the brace literal in BOTH shells (huck matches bash). Pathological; bash's own indexed-vs-associative behavior here is surprising. Low impact.
+
+- **L-38: brace expansion ordering vs parameters and scalar assignments** — `[deferred]`, low (v144; pre-existing, command-word path). Two related spots where huck's brace expansion diverges from bash's textual-first model: (a) a brace FOLLOWING a parameter — `v1=A v2=B; echo $v{1,2}` — bash expands `$v{1,2}`→`$v1 $v2` textually FIRST → `A B`, huck expands `$v` first → `1 2`; (b) a scalar assignment RHS — `v={1,2}; echo "$v"` — bash assigns the literal `{1,2}` (no brace expansion on a scalar assignment RHS), huck brace-expands the assignment word (`v=1 v=2`) leaving `v=2` (`x={a,b}` → `b`). Both pre-existing (NOT introduced by v144's array-element brace expansion, which is correct); surfaced during v144 review. Low/rare.
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
 - **Status**: intentional (v29)
