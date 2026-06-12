@@ -247,13 +247,46 @@ fn scan_backtick_close(bytes: &[u8], start: usize) -> Option<usize> {
 /// its output (trailing newlines already stripped by `run_substitution`). On a
 /// lex/parse error returns an empty string.
 fn run_prompt_cmdsub(body: &str, shell: &mut Shell) -> String {
-    match crate::lexer::tokenize(body) {
+    let raw = match crate::lexer::tokenize(body) {
         Ok(toks) => match crate::command::parse(toks) {
             Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
             _ => String::new(),
         },
         Err(_) => String::new(),
+    };
+    convert_prompt_markers(&raw)
+}
+
+/// Converts readline non-printing markers `\[`/`\]` emitted INSIDE a prompt
+/// command substitution (e.g. by oh-my-posh's `$(_omp_get_primary)`) into
+/// rustyline's zero-width delimiters `\x01`/`\x02`, so the wrapped ANSI escape
+/// bytes are excluded from the prompt-width calculation. Without this, the line
+/// editor counts the ANSI bytes as visible columns and pushes the cursor right.
+/// Matches bash, which honors `\[ \]` from a cmdsub-expanded PS1. Other
+/// backslash escapes in the output are left untouched (bash does not re-decode
+/// `\w`/`\h`/etc. in a cmdsub-expanded prompt).
+fn convert_prompt_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    out.push('\x01');
+                    continue;
+                }
+                Some(']') => {
+                    chars.next();
+                    out.push('\x02');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
     }
+    out
 }
 
 // ── Per-escape helpers ─────────────────────────────────────────
@@ -559,5 +592,23 @@ mod tests {
             expand_prompt("\\[\\e[31m\\]$(echo R)\\[\\e[0m\\]", &mut shell),
             "\x01\x1b[31m\x02R\x01\x1b[0m\x02"
         );
+    }
+
+    #[test]
+    fn cmdsub_output_readline_markers_converted() {
+        // The oh-my-posh case: `\[ \]` markers come OUT of the prompt cmdsub and
+        // must convert to \x01/\x02 so the wrapped ANSI is excluded from width.
+        let mut shell = Shell::new();
+        let out = expand_prompt("$(printf '%s' '\\[X\\]')", &mut shell);
+        assert_eq!(out, "\x01X\x02", "{out:?}");
+    }
+
+    #[test]
+    fn cmdsub_output_markers_with_ansi_excluded_from_width() {
+        // `\[<ESC>...m\]john\[<ESC>0m\]` from a cmdsub -> markers around ANSI.
+        let mut shell = Shell::new();
+        let out = expand_prompt("$(printf '%s' '\\[\\e[31m\\]john\\[\\e[0m\\]')", &mut shell);
+        // printf '%s' keeps the literal text; only the readline \[ \] convert.
+        assert_eq!(out, "\x01\\e[31m\x02john\x01\\e[0m\x02", "{out:?}");
     }
 }
