@@ -480,56 +480,11 @@ fn is_valid_name(s: &str) -> bool {
 }
 
 fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if args.is_empty() {
-        let mut entries: Vec<(String, String)> = shell
-            .exported_env()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        entries.sort();
-        for (name, value) in entries {
-            if let Err(e) = writeln!(out, "export {name}={value}") {
-                eprintln!("huck: export: {e}");
-                return ExecOutcome::Continue(1);
-            }
-        }
-        return ExecOutcome::Continue(0);
-    }
-    let mut any_error = false;
-    for arg in args {
-        match arg.find('=') {
-            Some(idx) => {
-                let name = &arg[..idx];
-                let value = &arg[idx + 1..];
-                if !is_valid_name(name) {
-                    eprintln!("huck: export: '{arg}': not a valid identifier");
-                    any_error = true;
-                    continue;
-                }
-                if shell.is_readonly(name) {
-                    eprintln!("huck: export: {name}: readonly variable");
-                    any_error = true;
-                    continue;
-                }
-                shell.export_set(name, value.to_string());
-            }
-            None => {
-                if !is_valid_name(arg) {
-                    eprintln!("huck: export: '{arg}': not a valid identifier");
-                    any_error = true;
-                    continue;
-                }
-                // Bare `export NAME` (no `=`) is exempt from the
-                // readonly check: bash allows flipping the export flag
-                // on a readonly variable without changing its value.
-                shell.export(arg);
-            }
-        }
-    }
-    if any_error {
-        ExecOutcome::Continue(1)
-    } else {
-        ExecOutcome::Continue(0)
-    }
+    // The `builtin export` / `command export` path: args are already-expanded
+    // strings (never compound assignments). Map to DeclArg::Plain and delegate
+    // so the flag/listing/unexport logic lives in one place.
+    let decl: Vec<DeclArg> = args.iter().map(|s| DeclArg::Plain(s.clone())).collect();
+    builtin_export_decl(&decl, out, shell)
 }
 
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
@@ -864,6 +819,22 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     format!("declare {flag_str} {name}{value_part}")
 }
 
+/// Lists every EXPORTED variable, sorted by name, as bash's
+/// `declare -x NAME="value"` (reuses `format_declare_line` for attr order +
+/// value quoting). Used by bare `export` / `export -p`.
+fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+    let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
+        shell.iter_vars().filter(|(_, v)| v.exported).collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, var) in entries {
+        if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
+            eprintln!("huck: export: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    }
+    ExecOutcome::Continue(0)
+}
+
 /// If we're inside a function call AND `name` hasn't been snapshotted
 /// in the current local frame yet, snapshot the current Variable (or
 /// None if unset). The unwinding in `call_function` will restore it on
@@ -1177,25 +1148,11 @@ fn builtin_export_decl(
     out: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
-    if args.is_empty() {
-        let mut entries: Vec<(String, String)> = shell
-            .exported_env()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        entries.sort();
-        for (name, value) in entries {
-            if let Err(e) = writeln!(out, "export {name}={value}") {
-                eprintln!("huck: export: {e}");
-                return ExecOutcome::Continue(1);
-            }
-        }
-        return ExecOutcome::Continue(0);
-    }
-    // Consume leading flags from Plain args. huck tracks no allexport/array
-    // attribute, so `-a` is a no-op; `-p`/`-n`/`-f` are likewise accepted and
-    // ignored here (bash's listing/unexport/function modes are not modeled).
-    // `--` stops flag parsing. This lets `export -a chpwd_functions` (emitted
-    // by `mise activate bash`) succeed instead of erroring on `-a`.
+    // Parse leading flags. `-a` is a huck-specific no-op (mise emits
+    // `export -a chpwd_functions`); `-p` lists (only when no operands);
+    // `-n` unexports; `-f` is function export (DEFERRED).
+    let mut unexport = false;
+    let mut func = false;
     let mut idx = 0;
     while idx < args.len() {
         match &args[idx] {
@@ -1205,28 +1162,47 @@ fn builtin_export_decl(
                     break;
                 }
                 if s.starts_with('-') && s.len() > 1 {
-                    if s[1..].chars().all(|c| matches!(c, 'a' | 'p' | 'n' | 'f')) {
-                        idx += 1;
-                        continue;
+                    for c in s[1..].chars() {
+                        match c {
+                            'p' | 'a' => {}
+                            'n' => unexport = true,
+                            'f' => func = true,
+                            _ => {
+                                eprintln!("huck: export: -{c}: invalid option");
+                                eprintln!(
+                                    "export: usage: export [-fn] [name[=value] ...] or export -p"
+                                );
+                                return ExecOutcome::Continue(2);
+                            }
+                        }
                     }
-                    eprintln!("huck: export: {s}: invalid option");
-                    return ExecOutcome::Continue(1);
+                    idx += 1;
+                    continue;
                 }
                 break;
             }
             DeclArg::Assign(_) => break,
         }
     }
-    // Flags consumed but nothing left to export (e.g. bare `export -a`):
-    // bash returns rc 0 with no output, NOT the full export listing.
-    let args = &args[idx..];
+    let operands = &args[idx..];
+
+    if operands.is_empty() {
+        if unexport {
+            return ExecOutcome::Continue(0);
+        }
+        return list_exported(out, shell);
+    }
+
     let mut any_error = false;
-    for arg in args {
+    for arg in operands {
+        if func {
+            continue;
+        }
         match arg {
             DeclArg::Plain(s) => match s.find('=') {
-                Some(idx) => {
-                    let name = &s[..idx];
-                    let value = &s[idx + 1..];
+                Some(eq) => {
+                    let name = &s[..eq];
+                    let value = &s[eq + 1..];
                     if !is_valid_name(name) {
                         eprintln!("huck: export: '{s}': not a valid identifier");
                         any_error = true;
@@ -1237,7 +1213,12 @@ fn builtin_export_decl(
                         any_error = true;
                         continue;
                     }
-                    shell.export_set(name, value.to_string());
+                    if unexport {
+                        shell.set(name, value.to_string());
+                        shell.unexport(name);
+                    } else {
+                        shell.export_set(name, value.to_string());
+                    }
                 }
                 None => {
                     if !is_valid_name(s) {
@@ -1245,7 +1226,11 @@ fn builtin_export_decl(
                         any_error = true;
                         continue;
                     }
-                    shell.export(s);
+                    if unexport {
+                        shell.unexport(s);
+                    } else {
+                        shell.export(s);
+                    }
                 }
             },
             DeclArg::Assign(a) => {
@@ -1254,13 +1239,9 @@ fn builtin_export_decl(
                     any_error = true;
                     continue;
                 }
-                // Subscripted assignment in `export` is unusual; bash
-                // rejects element-write through export. Mirror that.
                 if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
                     let name = a.target.name();
-                    eprintln!(
-                        "huck: export: `{name}': not a valid identifier"
-                    );
+                    eprintln!("huck: export: `{name}': not a valid identifier");
                     any_error = true;
                     continue;
                 }
@@ -1274,7 +1255,11 @@ fn builtin_export_decl(
                     any_error = true;
                     continue;
                 }
-                shell.export(&name);
+                if unexport {
+                    shell.unexport(&name);
+                } else {
+                    shell.export(&name);
+                }
             }
         }
     }
@@ -7053,6 +7038,114 @@ mod tests {
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert_eq!(shell.get("1BAD"), None);
         assert_eq!(shell.get("GOOD"), Some("y"));
+    }
+
+    fn dp(s: &str) -> DeclArg {
+        DeclArg::Plain(s.to_string())
+    }
+
+    #[test]
+    fn export_p_lists_in_declare_x_format() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_A", "1".to_string());
+        shell.export_set("EXP_B", "two".to_string());
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-p")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("declare -x EXP_A=\"1\""), "{s}");
+        assert!(s.contains("declare -x EXP_B=\"two\""), "{s}");
+        assert!(!s.contains("export EXP_A=1"), "old format must be gone: {s}");
+    }
+
+    #[test]
+    fn bare_export_uses_declare_x_format() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_C", "z".to_string());
+        let mut out = Vec::new();
+        let _ = builtin_export_decl(&[], &mut out, &mut shell);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("declare -x EXP_C=\"z\""), "{s}");
+    }
+
+    #[test]
+    fn export_n_unexports_keeps_value() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_D", "keep".to_string());
+        assert!(shell.is_exported("EXP_D"));
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-n"), dp("EXP_D")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.is_exported("EXP_D"), "must be unexported");
+        assert_eq!(shell.get("EXP_D"), Some("keep"), "value kept");
+    }
+
+    #[test]
+    fn export_n_with_assignment_sets_then_unexports() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_E", "1".to_string());
+        let mut out = Vec::new();
+        let _ = builtin_export_decl(&[dp("-n"), dp("EXP_E=2")], &mut out, &mut shell);
+        assert!(!shell.is_exported("EXP_E"));
+        assert_eq!(shell.get("EXP_E"), Some("2"));
+    }
+
+    #[test]
+    fn export_n_unset_name_is_noop() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-n"), dp("NOPE_X")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(!shell.is_exported("NOPE_X"));
+    }
+
+    #[test]
+    fn export_invalid_flag_rc2() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-z")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(2)), "{oc:?}");
+    }
+
+    #[test]
+    fn export_p_with_operand_exports_it_no_listing() {
+        let mut shell = Shell::new();
+        shell.set("EXP_F", "v".to_string());
+        assert!(!shell.is_exported("EXP_F"));
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-p"), dp("EXP_F")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(
+            shell.is_exported("EXP_F"),
+            "operand with -p should be exported (bash)"
+        );
+        assert!(
+            String::from_utf8(out).unwrap().is_empty(),
+            "no listing when operands present"
+        );
+    }
+
+    #[test]
+    fn export_f_does_not_create_variable() {
+        let mut shell = Shell::new();
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-f"), dp("somefunc")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.get("somefunc").is_none(), "must NOT create a variable");
+        assert!(!shell.is_exported("somefunc"));
+    }
+
+    #[test]
+    fn builtin_export_string_path_delegates() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_G", "g".to_string());
+        let mut out = Vec::new();
+        let _ = builtin_export(&["-p".to_string()], &mut out, &mut shell);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("declare -x EXP_G=\"g\"")
+        );
     }
 
     #[test]
