@@ -1268,7 +1268,11 @@ fn builtin_export_decl(
                 DeclArg::Plain(s) => s.as_str(),
                 DeclArg::Assign(a) => a.target.name(),
             };
-            if shell.functions.contains_key(name) {
+            if unexport {
+                // export -nf NAME: remove the export mark (lenient — no-op if not
+                // exported, matching bash's -n).
+                shell.unmark_function_exported(name);
+            } else if shell.functions.contains_key(name) {
                 shell.mark_function_exported(name);
             } else {
                 eprintln!("huck: export: {name}: not a function");
@@ -7150,6 +7154,22 @@ mod tests {
 
     fn dp(s: &str) -> DeclArg {
         DeclArg::Plain(s.to_string())
+    }
+
+    #[test]
+    fn export_nf_unexports_function() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("uf(){ echo hi; }", &mut shell, false);
+        shell.mark_function_exported("uf");
+        assert!(shell.is_function_exported("uf"));
+        let mut out = Vec::new();
+        // export -nf uf  -> remove the export mark
+        let oc = builtin_export_decl(&[dp("-n"), dp("-f"), dp("uf")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
+        assert!(
+            !shell.is_function_exported("uf"),
+            "export -nf must un-export the function"
+        );
     }
 
     #[test]

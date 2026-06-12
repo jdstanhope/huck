@@ -1103,8 +1103,6 @@ impl Shell {
     }
 
     /// Removes the export mark from `name` (e.g. `export -nf`).
-    /// (Used by later v147 tasks; kept as part of the export-function API.)
-    #[allow(dead_code)]
     pub(crate) fn unmark_function_exported(&mut self, name: &str) {
         self.exported_functions.remove(name);
     }
