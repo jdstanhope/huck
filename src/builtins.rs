@@ -26,7 +26,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shopt", "shift", "getopts", ".", "source", "local",
-    ":", "true", "false", "command",
+    ":", "true", "false", "command", "builtin",
     "readonly", "read", "mapfile", "readarray", "printf", "type", "hash",
     "pushd", "popd", "dirs",
     "declare", "typeset",
@@ -113,6 +113,9 @@ pub fn run_builtin(
         "true" => builtin_true(args, shell),
         "false" => builtin_false(args, shell),
         "command" => builtin_command(args, out, shell),
+        // `builtin` is normally consumed by the executor's strip loop before
+        // dispatch; this guards a bare `builtin` that reaches run_builtin.
+        "builtin" => ExecOutcome::Continue(0),
         "type" => builtin_type(args, out, shell),
         "hash" => builtin_hash(args, out, shell),
         "pushd" => builtin_pushd(args, out, shell),
