@@ -308,9 +308,15 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 /// trailing offset is `input.len()` on success, or the error byte offset on
 /// failure. This lets the source reader execute the complete units that lexed
 /// before the failure and re-lex the truncated trailing unit.
-pub fn tokenize_partial(
+/// Core tokenizer body. `brace_expand` controls whether unquoted braces are
+/// expanded into multiple Words (`true` for normal command words) or left as
+/// literal text in a single Word (`false` for array-literal elements, which are
+/// brace-expanded later). See the `tokenize_partial` / `tokenize_no_brace`
+/// wrappers.
+fn tokenize_partial_inner(
     input: &str,
     opts: LexerOptions,
+    brace_expand: bool,
 ) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
     let mut tokens: Vec<Token> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
@@ -368,7 +374,7 @@ pub fn tokenize_partial(
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
                 let kw = single_unquoted_literal(&parts).map(str::to_owned);
-                let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                 for _ in 0..n { offsets.push(token_start); }
                 match kw.as_deref() {
                     Some("[[") => dbracket_depth += 1,
@@ -532,7 +538,7 @@ pub fn tokenize_partial(
             '|' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -548,7 +554,7 @@ pub fn tokenize_partial(
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -572,7 +578,7 @@ pub fn tokenize_partial(
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -597,7 +603,7 @@ pub fn tokenize_partial(
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -619,7 +625,7 @@ pub fn tokenize_partial(
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -630,7 +636,7 @@ pub fn tokenize_partial(
             '<' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -672,7 +678,7 @@ pub fn tokenize_partial(
             '>' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts))?;
+                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
                     for _ in 0..n { offsets.push(token_start); }
                     has_token = false;
                 }
@@ -864,7 +870,7 @@ pub fn tokenize_partial(
 
     if has_token {
         flush_literal(&mut parts, &mut current, false);
-        let n = emit_word_with_braces(&mut tokens, parts)?;
+        let n = emit_word_with_braces(&mut tokens, parts, brace_expand)?;
         for _ in 0..n { offsets.push(token_start); }
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
@@ -897,6 +903,29 @@ pub fn tokenize_partial(
             );
             (tokens, offsets, Some((e, off)))
         }
+    }
+}
+
+/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
+/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
+/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
+/// trailing offset is `input.len()` on success, or the error byte offset on
+/// failure. This lets the source reader execute the complete units that lexed
+/// before the failure and re-lex the truncated trailing unit.
+pub fn tokenize_partial(
+    input: &str,
+    opts: LexerOptions,
+) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
+    tokenize_partial_inner(input, opts, true)
+}
+
+/// Tokenizes WITHOUT brace expansion (used for array-literal elements, whose
+/// braces are expanded later by `brace_expand_parts` so adjacent expansions
+/// are preserved as real WordParts).
+fn tokenize_no_brace(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
+    match tokenize_partial_inner(input, opts, false) {
+        (tokens, _, None) => Ok(tokens),
+        (_, _, Some((e, _))) => Err(e),
     }
 }
 
@@ -1200,7 +1229,12 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
 fn emit_word_with_braces(
     tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,
+    brace_expand: bool,
 ) -> Result<usize, LexError> {
+    if !brace_expand {
+        tokens.push(Token::Word(Word(parts)));
+        return Ok(1);
+    }
     let products = brace_expand_parts(parts)?;
     let count = products.len();
     for p in products {
@@ -2596,8 +2630,12 @@ fn read_array_element_word(
             }
         }
     }
-    // Re-tokenize the collected text as a single Word.
-    let toks = tokenize_with_opts(&buf, opts)?;
+    // Re-tokenize the collected text as a single Word. Brace expansion is
+    // suppressed here so an element like `x{1,2}$v` stays ONE Word with the
+    // brace as literal text and `$v` as a real expansion part; the brace is
+    // expanded later by `brace_expand_parts` in `read_array_literal`, which
+    // sentinel-protects the expansion.
+    let toks = tokenize_no_brace(&buf, opts)?;
     let mut words: Vec<Word> = Vec::new();
     for t in toks {
         if let Token::Word(w) = t {
@@ -6826,6 +6864,41 @@ mod array_parse_tests {
         assert_eq!(els.len(), 2);
         assert!(els[0].subscript.is_some());
         assert!(els[1].subscript.is_none());
+    }
+
+    #[test]
+    fn array_literal_brace_adjacent_var_keeps_expansion() {
+        // `a=(x{1,2}$v)` must brace-expand AND keep $v as a real variable part
+        // (one element per brace product, each with the Variable preserved).
+        let assigns = parse_assignments("a=(x{1,2}$v)");
+        let els = array_lit(&assigns[0].value);
+        assert_eq!(els.len(), 2);
+        // each element must still contain a Variable/expansion part (NOT a single
+        // literal "x1$v") — assert no element is a lone Literal containing '$'.
+        for e in els {
+            let lone_literal_with_dollar = e.value.0.len() == 1
+                && matches!(&e.value.0[0], WordPart::Literal { text, .. } if text.contains('$'));
+            assert!(!lone_literal_with_dollar, "expansion was flattened to literal: {:?}", e.value.0);
+        }
+    }
+
+    #[test]
+    fn array_literal_brace_adjacent_cmdsub_keeps_expansion() {
+        let assigns = parse_assignments("a=(x{1,2}$(echo Q))");
+        let els = array_lit(&assigns[0].value);
+        assert_eq!(els.len(), 2);
+        for e in els {
+            let lone_literal_with_dollar = e.value.0.len() == 1
+                && matches!(&e.value.0[0], WordPart::Literal { text, .. } if text.contains('$'));
+            assert!(!lone_literal_with_dollar, "cmdsub flattened to literal: {:?}", e.value.0);
+        }
+    }
+
+    #[test]
+    fn array_literal_pure_brace_still_expands() {
+        // regression: pure-literal brace unchanged.
+        let assigns = parse_assignments("a=({1..3} z)");
+        assert_eq!(array_lit(&assigns[0].value).len(), 4);
     }
 }
 
