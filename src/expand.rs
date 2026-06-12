@@ -983,6 +983,9 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 let rendered = reconstruct_array_literal(elems, shell);
                 current.push_str(&rendered, true);
             }
+            WordPart::ProcessSub { .. } => {
+                // realized in Task 3 (process substitution)
+            }
         }
     }
 
@@ -1136,6 +1139,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
             WordPart::ArrayLiteral(elems) => {
                 result.push_str(&reconstruct_array_literal(elems, shell));
             }
+            WordPart::ProcessSub { .. } => {
+                // realized in Task 3 (process substitution)
+            }
         }
     }
     result
@@ -1154,6 +1160,8 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::AllArgs { quoted, .. } => *quoted,
         WordPart::Tilde(_) => false,
         WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => false,
+        // ProcessSub is always unquoted (quoted contexts produce literal text)
+        WordPart::ProcessSub { .. } => false,
     }
 }
 

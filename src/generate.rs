@@ -509,6 +509,13 @@ fn part_to_source(part: &WordPart) -> String {
             if *append { "+" } else { "" }
         ),
         WordPart::ArrayLiteral(elems) => array_literal_to_source(elems),
+        WordPart::ProcessSub { sequence, dir } => {
+            let prefix = match dir {
+                crate::lexer::ProcDir::In  => "<(",
+                crate::lexer::ProcDir::Out => ">(",
+            };
+            format!("{}{})", prefix, sequence_to_source(sequence, 0).trim_end())
+        }
     }
 }
 

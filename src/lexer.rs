@@ -195,6 +195,18 @@ pub struct ArrayLiteralElement {
     pub value: Word,
 }
 
+/// Direction of a process substitution: `<(cmd)` reads from the process,
+/// `>(cmd)` writes to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcDir {
+    /// `<(cmd)` — the command's stdout is available as a `/dev/fd/N` path
+    /// that the surrounding command can open for reading.
+    In,
+    /// `>(cmd)` — the command's stdin is available as a `/dev/fd/N` path
+    /// that the surrounding command can open for writing.
+    Out,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
@@ -202,6 +214,10 @@ pub enum WordPart {
     Var { name: String, quoted: bool },
     LastStatus { quoted: bool },
     CommandSub { sequence: crate::command::Sequence, quoted: bool },
+    /// Process substitution `<(cmd)` / `>(cmd)`. Only produced when UNQUOTED
+    /// (inside double/single quotes `<(`/`>(` are literal). Expands to a
+    /// `/dev/fd/N` (or FIFO) path at runtime.
+    ProcessSub { sequence: crate::command::Sequence, dir: ProcDir },
     Arith { body: Word, quoted: bool },
     ParamExpansion {
         name: String,
@@ -669,11 +685,24 @@ fn tokenize_partial_inner(
                             token_idx: placeholder_idx,
                         });
                     }
+                    offsets.push(c_off);
+                    in_assignment_value = false;
+                } else if chars.peek() == Some(&'(') {
+                    // `<(cmd)` — process substitution. Consume the `(` and scan the
+                    // inner command body exactly like `$(…)`. The result is a word
+                    // part on the CURRENT word (not a standalone redirect operator).
+                    chars.next(); // consume '('
+                    let sequence = scan_paren_substitution(&mut chars, opts)?;
+                    if !has_token {
+                        token_start = c_off;
+                    }
+                    has_token = true;
+                    parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
                 } else {
                     tokens.push(Token::Op(Operator::RedirIn));
+                    offsets.push(c_off);
+                    in_assignment_value = false;
                 }
-                offsets.push(c_off);
-                in_assignment_value = false;
             }
             '>' => {
                 if has_token {
@@ -685,17 +714,34 @@ fn tokenize_partial_inner(
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirAppend));
+                    offsets.push(c_off);
+                    in_assignment_value = false;
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::DupOut));
+                    offsets.push(c_off);
+                    in_assignment_value = false;
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirClobber));
+                    offsets.push(c_off);
+                    in_assignment_value = false;
+                } else if chars.peek() == Some(&'(') {
+                    // `>(cmd)` — process substitution. Consume the `(` and scan the
+                    // inner command body exactly like `$(…)`. The result is a word
+                    // part on the CURRENT word (not a standalone redirect operator).
+                    chars.next(); // consume '('
+                    let sequence = scan_paren_substitution(&mut chars, opts)?;
+                    if !has_token {
+                        token_start = c_off;
+                    }
+                    has_token = true;
+                    parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
+                    offsets.push(c_off);
+                    in_assignment_value = false;
                 }
-                offsets.push(c_off);
-                in_assignment_value = false;
             }
             '1' if !has_token && chars.peek() == Some(&'>') => {
                 chars.next();
@@ -6899,6 +6945,56 @@ mod array_parse_tests {
         // regression: pure-literal brace unchanged.
         let assigns = parse_assignments("a=({1..3} z)");
         assert_eq!(array_lit(&assigns[0].value).len(), 4);
+    }
+
+    // --- process substitution lexer tests ---
+
+    #[test]
+    fn process_sub_in_is_a_word_part() {
+        let toks = tokenize("cat <(echo hi)").unwrap();
+        let words: Vec<&Word> = toks.iter().filter_map(|t| match t {
+            Token::Word(w) => Some(w), _ => None,
+        }).collect();
+        assert_eq!(words.len(), 2, "cat + one process-sub word");
+        match &words[1].0[..] {
+            [WordPart::ProcessSub { dir: ProcDir::In, .. }] => {}
+            other => panic!("expected ProcessSub In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_sub_out_direction() {
+        let toks = tokenize("tee >(cat)").unwrap();
+        let w = toks.iter().find_map(|t| match t {
+            Token::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
+            _ => None,
+        }).expect("a process-sub word");
+        assert!(matches!(w.0[0], WordPart::ProcessSub { dir: ProcDir::Out, .. }));
+    }
+
+    #[test]
+    fn quoted_process_sub_is_literal() {
+        let toks = tokenize("echo \"<(echo hi)\"").unwrap();
+        let has = toks.iter().any(|t| matches!(t,
+            Token::Word(w) if w.0.iter().any(|p| matches!(p, WordPart::ProcessSub { .. }))));
+        assert!(!has, "quoted <( must stay literal");
+    }
+
+    #[test]
+    fn lone_redirect_still_redirect() {
+        let toks = tokenize("cat < file").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirIn))),
+            "`< file` is still a redirect");
+    }
+
+    #[test]
+    fn nested_process_sub_balances() {
+        let toks = tokenize("cat <(cat <(echo deep))").unwrap();
+        let outer = toks.iter().find_map(|t| match t {
+            Token::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
+            _ => None,
+        }).expect("outer process sub");
+        assert!(matches!(outer.0[0], WordPart::ProcessSub { dir: ProcDir::In, .. }));
     }
 }
 
