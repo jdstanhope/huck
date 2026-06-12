@@ -2,7 +2,9 @@
 //! Output is a single consistent style (NOT byte-identical to bash); correctness
 //! is round-trip idempotence (see tests). Built across v146 Tasks 1-3.
 #![allow(dead_code)] // entry points wired in Task 4; some helpers land in Tasks 2-3
-use crate::command::{Command, Sequence};
+use crate::command::{
+    Assignment, Command, Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
+};
 use crate::lexer::{
     CaseDirection, ParamModifier, SubscriptKind, SubstAnchor, TildeSpec, TransformOp, Word,
     WordPart,
@@ -14,47 +16,166 @@ pub fn function_to_source(name: &str, body: &Command) -> String {
 }
 
 /// Render any command at nesting depth `indent` (4 spaces/level).
-pub fn command_to_source(cmd: &Command, _indent: usize) -> String {
+pub fn command_to_source(cmd: &Command, indent: usize) -> String {
     match cmd {
-        Command::Simple(crate::command::SimpleCommand::Exec(e)) => exec_to_source(e),
-        // A simple command parses as a single-stage, non-negated pipeline.
-        // Unwrap it here so word-level round-trip works; Task 2/3 flesh out
-        // the rest (negation, multi-stage, connectors, compound commands).
-        Command::Pipeline(p)
-            if !p.negate
-                && p.commands.len() == 1
-                && matches!(
-                    p.commands[0],
-                    Command::Simple(crate::command::SimpleCommand::Exec(_))
-                ) =>
-        {
-            command_to_source(&p.commands[0], _indent)
-        }
-        _ => String::new(), // Tasks 2-3 fill these; OK for word-level round-trip
+        Command::Pipeline(p) => pipeline_to_source(p, indent),
+        Command::Simple(s) => simple_to_source(s),
+        _ => String::new(), // TEMPORARY: compounds land in Task 3
     }
 }
 
-/// Render a command list. Implemented enough here for command-substitution
-/// round-trip (single simple command); Task 2 completes connectors/redirects.
+fn pipeline_to_source(p: &Pipeline, indent: usize) -> String {
+    let mut s = if p.negate {
+        "! ".to_string()
+    } else {
+        String::new()
+    };
+    let stages: Vec<String> = p
+        .commands
+        .iter()
+        .map(|c| command_to_source(c, indent))
+        .collect();
+    s.push_str(&stages.join(" | "));
+    s
+}
+
+fn simple_to_source(s: &SimpleCommand) -> String {
+    match s {
+        SimpleCommand::Assign(assigns) => assigns
+            .iter()
+            .map(assignment_to_source)
+            .collect::<Vec<_>>()
+            .join(" "),
+        SimpleCommand::Exec(e) => exec_to_source(e),
+    }
+}
+
+/// Render a command list: connectors, backgrounding, and the leading command.
 fn sequence_to_source(seq: &Sequence, indent: usize) -> String {
-    command_to_source(&seq.first, indent) // Task 2 adds rest/background
+    let mut out = command_to_source(&seq.first, indent);
+    for (conn, cmd) in &seq.rest {
+        match conn {
+            Connector::Semi => {
+                out.push_str(";\n");
+                out.push_str(&pad(indent));
+            }
+            Connector::And => out.push_str(" && "),
+            Connector::Or => out.push_str(" || "),
+            Connector::Amp => {
+                out.push_str(" &\n");
+                out.push_str(&pad(indent));
+            }
+        }
+        out.push_str(&command_to_source(cmd, indent));
+    }
+    if seq.background {
+        out.push_str(" &");
+    }
+    out
 }
 
 fn pad(indent: usize) -> String {
     "    ".repeat(indent)
 }
 
-fn exec_to_source(e: &crate::command::ExecCommand) -> String {
+fn exec_to_source(e: &ExecCommand) -> String {
     let mut parts: Vec<String> = Vec::new();
+    for a in &e.inline_assignments {
+        parts.push(assignment_to_source(a));
+    }
     parts.push(word_to_source(&e.program));
     for w in &e.args {
         parts.push(word_to_source(w));
     }
-    parts.join(" ")
+    let mut s = parts.join(" ");
+    if let Some(r) = &e.stdin {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
+    }
+    if let Some(r) = &e.stdout {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
+    }
+    if let Some(r) = &e.stderr {
+        s.push(' ');
+        s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
+    }
+    s
+}
+
+fn assignment_to_source(a: &Assignment) -> String {
+    format!(
+        "{}{}={}",
+        assign_target_to_source(&a.target),
+        if a.append { "+" } else { "" },
+        word_to_source(&a.value)
+    )
+}
+
+/// Which standard fd a redirect attaches to, so we know whether to emit a
+/// leading `2` for stderr. Stdin/stdout use the bare operator.
+enum RedirDefault {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+fn redirect_to_source(r: &Redirect, which: RedirDefault) -> String {
+    let fd_prefix = match which {
+        RedirDefault::Stderr => "2",
+        RedirDefault::Stdin | RedirDefault::Stdout => "",
+    };
+    match r {
+        Redirect::Read(w) => format!("< {}", word_to_source(w)),
+        Redirect::Truncate(w) => format!("{fd_prefix}> {}", word_to_source(w)),
+        Redirect::Append(w) => format!("{fd_prefix}>> {}", word_to_source(w)),
+        Redirect::Clobber(w) => format!("{fd_prefix}>| {}", word_to_source(w)),
+        Redirect::Dup { fd, source } => format!("{fd}>&{}", word_to_source(source)),
+        Redirect::HereString(w) => format!("<<< {}", word_to_source(w)),
+        Redirect::Heredoc {
+            body,
+            expand,
+            strip_tabs,
+        } => {
+            // DECISION: full heredoc round-trip via a fixed delimiter. The body
+            // word is rendered verbatim (tabs already stripped at lex time for
+            // `<<-`). Quote the delimiter when !expand so the re-parse keeps the
+            // literal (non-expanding) mode. Emit `<<DELIM\n<body>\nDELIM`.
+            let delim = "EOF_GEN";
+            let opener = if *strip_tabs { "<<-" } else { "<<" };
+            let d = if *expand {
+                delim.to_string()
+            } else {
+                format!("'{delim}'")
+            };
+            // The body is raw text: each Literal part is emitted verbatim (NOT
+            // bareword-escaped/quoted) and the body already carries its trailing
+            // newline, so the closing delimiter follows directly. Expansion parts
+            // ($VAR, $(...)) render through their normal source form so an
+            // expanding heredoc keeps them.
+            format!("{opener}{d}\n{}{delim}", heredoc_body_to_source(body))
+        }
+    }
 }
 
 fn word_to_source(w: &Word) -> String {
     w.0.iter().map(part_to_source).collect()
+}
+
+/// Render a heredoc body Word as raw text: `Literal` parts are emitted
+/// verbatim (no quoting/escaping — heredoc bodies are literal lines), while
+/// expansion parts ($VAR, $(...), etc.) use their normal source form so an
+/// expanding heredoc preserves them. The body already carries its trailing
+/// newline from the lexer.
+fn heredoc_body_to_source(w: &Word) -> String {
+    let mut out = String::new();
+    for part in &w.0 {
+        match part {
+            WordPart::Literal { text, .. } => out.push_str(text),
+            other => out.push_str(&part_to_source(other)),
+        }
+    }
+    out
 }
 
 fn part_to_source(part: &WordPart) -> String {
@@ -115,10 +236,13 @@ fn quote_if(quoted: bool, body: String) -> String {
 }
 
 /// Backslash-escape characters that are special OUTSIDE quotes so a bareword
-/// `Literal` round-trips as a single unquoted part. Empty → `''`.
+/// `Literal` round-trips as a single unquoted part. An empty UNQUOTED literal
+/// carries no content (it appears e.g. as the synthetic prefix fragment before
+/// an `ArrayLiteral` in `a=(…)`), so it renders to nothing — emitting `''`
+/// would mean a *quoted* empty word, which is the `quoted` branch's job.
 fn escape_bareword(text: &str) -> String {
     if text.is_empty() {
-        return "''".to_string();
+        return String::new();
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -384,5 +508,83 @@ mod tests {
     #[test]
     fn rt_mixed() {
         assert_rt("echo pre$HOME\"post $x\"$(id)");
+    }
+
+    // ── Task 2: command-list serialization ──
+    #[test]
+    fn rt_args() {
+        assert_rt_ast_eq("ls -l /tmp");
+    }
+    #[test]
+    fn rt_assign_prefix() {
+        assert_rt("FOO=bar BAZ=1 cmd a b");
+    }
+    #[test]
+    fn rt_bare_assign() {
+        assert_rt("x=1");
+    }
+    #[test]
+    fn rt_append_assign() {
+        assert_rt("x+=tail");
+    }
+    #[test]
+    fn rt_array_assign() {
+        assert_rt("a=(1 2 3)");
+    }
+    #[test]
+    fn rt_indexed_assign() {
+        assert_rt("a[2]=v");
+    }
+    #[test]
+    fn rt_pipeline() {
+        assert_rt_ast_eq("a | b | c");
+    }
+    #[test]
+    fn rt_negated_pipeline() {
+        assert_rt_ast_eq("! grep x f");
+    }
+    #[test]
+    fn rt_semi() {
+        assert_rt_ast_eq("a; b; c");
+    }
+    #[test]
+    fn rt_and_or() {
+        assert_rt_ast_eq("a && b || c");
+    }
+    #[test]
+    fn rt_background() {
+        assert_rt("sleep 1 &");
+    }
+    #[test]
+    fn rt_redir_trunc() {
+        assert_rt("echo hi > out");
+    }
+    #[test]
+    fn rt_redir_append() {
+        assert_rt("echo hi >> out");
+    }
+    #[test]
+    fn rt_redir_read() {
+        assert_rt("cat < in");
+    }
+    #[test]
+    fn rt_redir_clobber() {
+        assert_rt("echo hi >| out");
+    }
+    #[test]
+    fn rt_redir_dup() {
+        assert_rt("cmd 2>&1");
+    }
+    #[test]
+    fn rt_redir_dup_file() {
+        assert_rt("cmd > out 2>&1");
+    }
+    #[test]
+    fn rt_herestring() {
+        assert_rt("cat <<< word");
+    }
+    #[test]
+    fn rt_heredoc() {
+        assert_rt("cat <<EOF\nhi\nEOF");
     }
 }
