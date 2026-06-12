@@ -38,7 +38,7 @@ stays in sync.
 
 huck behaves wrong without a design reason; should be fixed.
 
-- **B-01: prompt width undercounted for powerline glyphs / ambiguous-width chars** — `[deferred]` medium. With a powerline prompt (e.g. oh-my-posh after `source ~/.bashrc`), the input cursor lands several columns INSIDE the rendered prompt, so typed text overwrites the tail of the prompt. v148 fixed the two width-OVERcount causes (array `PROMPT_COMMAND` now fires `_omp_hook`; `\[ \]` cmdsub markers → `\x01/\x02` so ANSI is excluded). The residual is an UNDERcount: rustyline 18's prompt-width calc (`editor.readline(&expanded)` in `src/shell.rs:440`, prompt built by `prompt::expand_prompt`) measures the powerline separators (`U+E0Bx` private-use glyphs) and ambiguous-width chars (e.g. `≢` U+2262) as narrower than the user's nerd-font renders them. Needs verifying whether rustyline honors the `\x01/\x02` non-printing markers at all, and a width strategy for PUA/ambiguous glyphs (custom highlighter / width override). Font/terminal-dependent.
+_None currently open._
 
 ---
 
