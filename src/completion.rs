@@ -278,6 +278,15 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
     candidates
 }
 
+/// Replaces a leading `~/` with `home/` (the only tilde form `_filedir`
+/// emits to `compgen`). Other inputs pass through unchanged.
+pub(crate) fn expand_tilde_prefix(s: &str, home: &str) -> String {
+    match s.strip_prefix("~/") {
+        Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+        _ => s.to_string(),
+    }
+}
+
 /// Resolves the directory to scan. `~/` is expanded against `home`.
 fn resolve_dir(dir: &str, home: &str) -> Option<PathBuf> {
     if dir.is_empty() {
@@ -497,11 +506,12 @@ pub(crate) mod dispatch {
         };
 
         // Filename rendering.
+        let home = shell.get("HOME").unwrap_or("").to_string();
         let candidates: Vec<Candidate> = if effective_options.filenames {
             after_fallback
                 .into_iter()
                 .map(|name| {
-                    let is_dir = std::fs::metadata(&name)
+                    let is_dir = std::fs::metadata(expand_tilde_prefix(&name, &home))
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
                     let display = if is_dir {
@@ -509,7 +519,12 @@ pub(crate) mod dispatch {
                     } else {
                         name.clone()
                     };
-                    let mut replacement = escape_filename(&name);
+                    // Preserve a leading `~/` UNescaped (tilde-expansion intent);
+                    // escaping it would yield `cd \~/projects` (a literal `~` dir).
+                    let mut replacement = match name.strip_prefix("~/") {
+                        Some(rest) => format!("~/{}", escape_filename(rest)),
+                        None => escape_filename(&name),
+                    };
                     if is_dir {
                         replacement.push('/');
                     }
@@ -935,6 +950,40 @@ mod tests {
             reps.iter().any(|r| r == &format!("{base}/alpha/")),
             "expected full path {base}/alpha/, got {reps:?}"
         );
+    }
+
+    #[test]
+    fn expand_tilde_prefix_handles_leading_tilde_slash() {
+        assert_eq!(expand_tilde_prefix("~/projects", "/home/x"), "/home/x/projects");
+        assert_eq!(expand_tilde_prefix("~/", "/home/x"), "/home/x/");
+        assert_eq!(expand_tilde_prefix("projects/", "/home/x"), "projects/"); // no tilde
+        assert_eq!(expand_tilde_prefix("~/p", ""), "~/p"); // empty home -> unchanged
+    }
+
+    #[test]
+    fn spec_filenames_appends_slash_to_tilde_dir() {
+        // A `-o filenames` candidate `~/projects` (a real dir under HOME) must get a
+        // trailing `/` so `cd ~/<TAB>` can descend. COMPREPLY is single-quoted so the
+        // shell does NOT tilde-expand it — the candidate stays literal `~/projects`.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("projects")).unwrap();
+        let mut sh = Shell::new();
+        sh.set("HOME", home.path().to_str().unwrap().to_string());
+        let _ = crate::shell::process_line("_t() { COMPREPLY=('~/projects'); }", &mut sh, false);
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "cd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                function: Some("_t".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    filenames: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (_start, cands) = dispatch::resolve("cd ~/", 5, &mut sh);
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(reps.contains(&"~/projects/"), "tilde dir should get trailing slash: {reps:?}");
     }
 
     #[test]
