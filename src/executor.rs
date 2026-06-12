@@ -3013,7 +3013,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             .args
             .first()
             .and_then(word_static_text)
-            .map(|s| builtins::is_declaration_command(&s))
+            .map(|s| {
+                builtins::is_declaration_command(&s) || s == "builtin" || s == "command"
+            })
             .unwrap_or(false)
     {
         let inner = ExecCommand {
@@ -3100,6 +3102,19 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 // loop: collapse `builtin builtin …`
             }
         }
+    }
+    // A declaration builtin can still surface here via a `command`-led nest
+    // (`command builtin local`): the command strip loop reduced command→builtin,
+    // this loop builtin→the declaration, and decl_args was discarded at resolve
+    // time. Rather than panic in run_builtin, report it. (Maximally pathological;
+    // a documented divergence — bash runs it. The `builtin`-led forms are handled
+    // by the pre-resolve interception with decl_args rebuilt.)
+    if require_builtin && builtins::is_declaration_command(&resolved.program) {
+        eprintln!(
+            "huck: builtin: {}: declaration builtins must not be wrapped by `command builtin`",
+            resolved.program
+        );
+        return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
         eprintln!("huck: builtin: {}: not a shell builtin", resolved.program);
