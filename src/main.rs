@@ -17,6 +17,7 @@ mod jobs;
 mod lexer;
 mod param_expansion;
 mod prompt;
+mod procsub;
 mod shell;
 mod shell_state;
 mod test_builtin;
