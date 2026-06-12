@@ -1729,6 +1729,36 @@ fn builtin_declare_decl(
         return ExecOutcome::Continue(1);
     }
 
+    // Function export: `declare -fx [NAME...]`. With no names, list exported
+    // functions; with names, mark each existing function exported (mirrors
+    // `export -f`). A missing function is silent with rc 1.
+    if function_mode && want_export && !function_names_only {
+        let plain_names: Vec<String> = names
+            .iter()
+            .filter_map(|a| match a {
+                DeclArg::Plain(s) => Some(s.clone()),
+                DeclArg::Assign(_) => None,
+            })
+            .collect();
+        if plain_names.is_empty() {
+            return list_exported_functions(out, shell);
+        }
+        let mut any_error = false;
+        for name in &plain_names {
+            if shell.functions.contains_key(name.as_str()) {
+                shell.mark_function_exported(name);
+            } else {
+                // bash: declare -f on a missing function is silent, rc 1.
+                any_error = true;
+            }
+        }
+        return if any_error {
+            ExecOutcome::Continue(1)
+        } else {
+            ExecOutcome::Continue(0)
+        };
+    }
+
     // Function-mode listing: only Plain names accepted.
     if function_mode {
         let plain_names: Vec<String> = names
@@ -7120,6 +7150,33 @@ mod tests {
 
     fn dp(s: &str) -> DeclArg {
         DeclArg::Plain(s.to_string())
+    }
+
+    #[test]
+    fn declare_fx_marks_via_runtime_path() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("dfn(){ echo hi; }", &mut shell, false);
+        assert!(!shell.is_function_exported("dfn"));
+        // `declare -fx NAME` must mark it exported (runtime declaration path).
+        let _ = crate::shell::process_line("declare -fx dfn", &mut shell, false);
+        assert!(
+            shell.is_function_exported("dfn"),
+            "declare -fx did not mark via the runtime path"
+        );
+    }
+
+    #[test]
+    fn declare_fx_no_names_lists_via_runtime_path() {
+        let mut shell = Shell::new();
+        let _ = crate::shell::process_line("dfn2(){ echo hi; }", &mut shell, false);
+        shell.mark_function_exported("dfn2");
+        // capture stdout of `declare -fx`: route through builtin_declare_decl directly.
+        let mut out = Vec::new();
+        let oc = builtin_declare_decl(&[dp("-fx")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("dfn2 ()"), "{s}");
+        assert!(s.contains("declare -fx dfn2"), "{s}");
     }
 
     #[test]
