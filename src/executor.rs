@@ -3003,6 +3003,30 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         return run_exec_single(&inner, shell, sink);
     }
 
+    // `builtin <decl-builtin> …` (v142): a declaration builtin reached via `builtin`
+    // (e.g. `builtin local x=1`). Rewrite to the inner declaration command and
+    // recurse so the normal flow builds correct decl_args + dispatches
+    // run_declaration_builtin (declaration builtins can't be function-shadowed, so
+    // the bypass is moot — same rationale as the `command` block above).
+    if word_static_text(&cmd.program).as_deref() == Some("builtin")
+        && cmd
+            .args
+            .first()
+            .and_then(word_static_text)
+            .map(|s| builtins::is_declaration_command(&s))
+            .unwrap_or(false)
+    {
+        let inner = ExecCommand {
+            inline_assignments: cmd.inline_assignments.clone(),
+            program: cmd.args[0].clone(),
+            args: cmd.args[1..].to_vec(),
+            stdin: cmd.stdin.clone(),
+            stdout: cmd.stdout.clone(),
+            stderr: cmd.stderr.clone(),
+        };
+        return run_exec_single(&inner, shell, sink);
+    }
+
     let mut resolved = match resolve(cmd, shell) {
         Ok(r) => r,
         Err(code) => return ExecOutcome::Continue(code),
@@ -3056,6 +3080,30 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                 // loop: collapse `command command …`
             }
         }
+    }
+
+    // `builtin NAME args` (v142): run NAME as a shell BUILTIN ONLY, suppressing
+    // function/alias lookup; error if NAME is not a builtin. Sibling to `command`.
+    // (A declaration target is intercepted pre-resolve and never reaches here.)
+    let mut require_builtin = false;
+    while resolved.program == "builtin" {
+        match resolved.args.first() {
+            None => return ExecOutcome::Continue(0), // `builtin` alone
+            Some(_) => {
+                let new_program = resolved.args[0].clone();
+                let new_args = resolved.args[1..].to_vec();
+                resolved.program = new_program;
+                resolved.args = new_args;
+                resolved.decl_args = None;
+                bypass_functions = true;
+                require_builtin = true;
+                // loop: collapse `builtin builtin …`
+            }
+        }
+    }
+    if require_builtin && !builtins::is_builtin(&resolved.program) {
+        eprintln!("huck: builtin: {}: not a shell builtin", resolved.program);
+        return ExecOutcome::Continue(1);
     }
 
     // Apply inline assignments (e.g. FOO=bar in `FOO=bar cmd args`) before
