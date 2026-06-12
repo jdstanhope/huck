@@ -698,6 +698,7 @@ fn tokenize_partial_inner(
                     }
                     has_token = true;
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
+                    in_assignment_value = false;
                 } else {
                     tokens.push(Token::Op(Operator::RedirIn));
                     offsets.push(c_off);
@@ -737,6 +738,7 @@ fn tokenize_partial_inner(
                     }
                     has_token = true;
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
+                    in_assignment_value = false;
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                     offsets.push(c_off);
@@ -6995,6 +6997,19 @@ mod array_parse_tests {
             _ => None,
         }).expect("outer process sub");
         assert!(matches!(outer.0[0], WordPart::ProcessSub { dir: ProcDir::In, .. }));
+    }
+
+    #[test]
+    fn redirect_from_process_sub_tokenizes() {
+        // `wc < <(cmd)` -> Word("wc"), Op(RedirIn), Word(ProcessSub{In})
+        let toks = tokenize("wc < <(printf hi)").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirIn))),
+            "the standalone `<` is still a redirect operator");
+        let last_word = toks.iter().rev().find_map(|t| match t {
+            Token::Word(w) => Some(w), _ => None,
+        }).expect("a trailing word");
+        assert!(matches!(last_word.0.first(), Some(WordPart::ProcessSub { dir: ProcDir::In, .. })),
+            "the `<(printf hi)` is a process-sub word");
     }
 }
 
