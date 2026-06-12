@@ -1153,6 +1153,8 @@ fn builtin_export_decl(
     // `-n` unexports; `-f` is function export (DEFERRED).
     let mut unexport = false;
     let mut func = false;
+    let mut saw_p = false;
+    let mut saw_a = false;
     let mut idx = 0;
     while idx < args.len() {
         match &args[idx] {
@@ -1164,7 +1166,8 @@ fn builtin_export_decl(
                 if s.starts_with('-') && s.len() > 1 {
                     for c in s[1..].chars() {
                         match c {
-                            'p' | 'a' => {}
+                            'p' => saw_p = true,
+                            'a' => saw_a = true, // huck-specific no-op (mise `export -a chpwd_functions`)
                             'n' => unexport = true,
                             'f' => func = true,
                             _ => {
@@ -1188,6 +1191,11 @@ fn builtin_export_decl(
 
     if operands.is_empty() {
         if unexport {
+            return ExecOutcome::Continue(0);
+        }
+        // List for bare `export` or explicit `-p`. `-a` (mise accommodation) and
+        // `-f` (deferred function export) suppress the listing: rc 0, no output.
+        if !saw_p && (saw_a || func) {
             return ExecOutcome::Continue(0);
         }
         return list_exported(out, shell);
@@ -7133,6 +7141,26 @@ mod tests {
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.get("somefunc").is_none(), "must NOT create a variable");
         assert!(!shell.is_exported("somefunc"));
+    }
+
+    #[test]
+    fn export_a_bare_no_listing() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_HIDE", "1".to_string());
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-a")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(String::from_utf8(out).unwrap().is_empty(), "export -a must NOT list");
+    }
+
+    #[test]
+    fn export_f_bare_no_listing() {
+        let mut shell = Shell::new();
+        shell.export_set("EXP_HIDE2", "1".to_string());
+        let mut out = Vec::new();
+        let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(String::from_utf8(out).unwrap().is_empty(), "export -f must NOT list vars");
     }
 
     #[test]
