@@ -12,6 +12,11 @@ use crate::lexer::ProcDir;
 use crate::command::{Command, Sequence};
 use crate::shell_state::Shell;
 
+// `Clone` is derived only because `Shell` derives `Clone` and holds a
+// `Vec<ProcSub>`. A `ProcSub` owns a live fd + child pid, so a cloned copy must
+// NEVER be cleaned up independently: the sole runtime `Shell` clone site
+// (`run_substitution`) resets `procsub_pending` to empty, so no clone ever carries
+// a live `ProcSub`. Do not call `cleanup` on a cloned `ProcSub`.
 #[derive(Debug, Clone)]
 pub struct ProcSub {
     pub pid: i32,

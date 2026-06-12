@@ -701,7 +701,14 @@ where
     // Drain any redirect-target process substitutions (e.g. `cmd < <(inner)`).
     // Argument procsubs were already drained by run_exec_single inside run_inner;
     // this covers the redirect-word slice [procsub_base .. run_exec_base).
+    // Drain BEFORE restoring the redirect scope: cleanup closes the parent pipe fd
+    // (signaling EOF to the inner process-sub children) and waitpid-reaps them, which
+    // must happen before the saved fd 0/1/2 are restored.
     drain_procsubs(shell, procsub_base);
+    debug_assert_eq!(
+        shell.procsub_pending.len(), procsub_base,
+        "process-substitution leak: a return path in with_redirect_scope skipped drain_procsubs"
+    );
     drop(scope);
     outcome
 }
@@ -3460,6 +3467,10 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         restore_inline_assignments(snap, shell);
     }
     drain_procsubs(shell, procsub_base);
+    debug_assert_eq!(
+        shell.procsub_pending.len(), procsub_base,
+        "process-substitution leak: a return path in run_exec_single skipped drain_procsubs"
+    );
     outcome
 }
 
