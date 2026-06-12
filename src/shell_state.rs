@@ -425,6 +425,17 @@ impl Shell {
                 bash_funcs.push((fname.to_string(), value)); // function encoding, not a variable
                 continue;
             }
+            // bash does NOT import the interactive prompt strings PS1/PS2 from the
+            // environment — a non-interactive bash leaves them empty (cf. PS0/PS4,
+            // which ARE imported). huck follows suit, and additionally declines them
+            // for interactive shells too: inheriting an env-exported
+            // PS1='$(some_fn)' from a polluted parent (an IDE/terminal integration
+            // that exports PS1) would make a fresh huck run a function it hasn't
+            // defined ("command not found"). PS1/PS2 are set by the shell or a
+            // sourced rc, never inherited.
+            if matches!(key.as_str(), "PS1" | "PS2") {
+                continue;
+            }
             vars.insert(key, Variable {
                 value: VarValue::Scalar(value),
                 exported: true,
