@@ -3,7 +3,9 @@
 //! is round-trip idempotence (see tests). Built across v146 Tasks 1-3.
 #![allow(dead_code)] // entry points wired in Task 4; some helpers land in Tasks 2-3
 use crate::command::{
-    Assignment, Command, Connector, ExecCommand, Pipeline, Redirect, Sequence, SimpleCommand,
+    Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, ForClause,
+    IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp, TestExpr,
+    TestUnaryOp, WhileClause,
 };
 use crate::lexer::{
     CaseDirection, ParamModifier, SubscriptKind, SubstAnchor, TildeSpec, TransformOp, Word,
@@ -12,7 +14,7 @@ use crate::lexer::{
 
 /// Render a function definition for `declare -f`: `NAME ()\n<body>`.
 pub fn function_to_source(name: &str, body: &Command) -> String {
-    format!("{name} ()\n{}", command_to_source(body, 0))
+    command_to_source(&Command::FunctionDef { name: name.to_string(), body: Box::new(body.clone()) }, 0)
 }
 
 /// Render any command at nesting depth `indent` (4 spaces/level).
@@ -20,7 +22,279 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
     match cmd {
         Command::Pipeline(p) => pipeline_to_source(p, indent),
         Command::Simple(s) => simple_to_source(s),
-        _ => String::new(), // TEMPORARY: compounds land in Task 3
+        Command::If(c) => if_to_source(c, indent),
+        Command::While(c) => while_to_source(c, indent),
+        Command::For(c) => for_to_source(c, indent),
+        Command::ArithFor(c) => arith_for_to_source(c, indent),
+        Command::Select(c) => select_to_source(c, indent),
+        Command::Case(c) => case_to_source(c, indent),
+        Command::BraceGroup(seq) => format!(
+            "{{\n{}{}}}",
+            body_block(seq, indent + 1),
+            pad(indent)
+        ),
+        Command::Subshell { body } => format!(
+            "(\n{}{})",
+            body_block(body, indent + 1),
+            pad(indent)
+        ),
+        Command::Arith(word) => format!("(({}))", word_to_source(word)),
+        Command::DoubleBracket {
+            expr,
+            inline_assignments,
+        } => {
+            let mut s = String::new();
+            for a in inline_assignments {
+                s.push_str(&assignment_to_source(a));
+                s.push(' ');
+            }
+            s.push_str(&format!("[[ {} ]]", testexpr_to_source(expr)));
+            s
+        }
+        Command::FunctionDef { name, body } => {
+            format!("{name} ()\n{}", command_to_source(body, indent))
+        }
+        Command::Redirected {
+            inner,
+            stdin,
+            stdout,
+            stderr,
+        } => {
+            let mut s = command_to_source(inner, indent);
+            if let Some(r) = stdin {
+                s.push(' ');
+                s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
+            }
+            if let Some(r) = stdout {
+                s.push(' ');
+                s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
+            }
+            if let Some(r) = stderr {
+                s.push(' ');
+                s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
+            }
+            s
+        }
+    }
+}
+
+/// Render a compound-command body as one indented, `;`-terminated region:
+/// `<pad(indent)><sequence>;\n`. The body's own multi-command separators are
+/// handled by `sequence_to_source`; this just positions + terminates it.
+fn body_block(seq: &Sequence, indent: usize) -> String {
+    format!("{}{};\n", pad(indent), sequence_to_source(seq, indent))
+}
+
+/// Render a condition/header sequence inline (no indentation, no trailing
+/// terminator) for use on a keyword line like `if <cond>; then`.
+fn inline_seq(seq: &Sequence) -> String {
+    sequence_to_source(seq, 0)
+}
+
+fn if_to_source(c: &IfClause, indent: usize) -> String {
+    let mut s = format!("if {}; then\n", inline_seq(&c.condition));
+    s.push_str(&body_block(&c.then_body, indent + 1));
+    for e in &c.elif_branches {
+        s.push_str(&pad(indent));
+        s.push_str(&format!("elif {}; then\n", inline_seq(&e.condition)));
+        s.push_str(&body_block(&e.body, indent + 1));
+    }
+    if let Some(eb) = &c.else_body {
+        s.push_str(&pad(indent));
+        s.push_str("else\n");
+        s.push_str(&body_block(eb, indent + 1));
+    }
+    s.push_str(&pad(indent));
+    s.push_str("fi");
+    s
+}
+
+fn while_to_source(c: &WhileClause, indent: usize) -> String {
+    let kw = if c.until { "until" } else { "while" };
+    let mut s = format!("{kw} {}; do\n", inline_seq(&c.condition));
+    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&pad(indent));
+    s.push_str("done");
+    s
+}
+
+fn for_to_source(c: &ForClause, indent: usize) -> String {
+    let mut header = format!("for {}", c.var);
+    if c.has_in {
+        header.push_str(" in");
+        for w in &c.words {
+            header.push(' ');
+            header.push_str(&word_to_source(w));
+        }
+    }
+    let mut s = format!("{header}; do\n");
+    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&pad(indent));
+    s.push_str("done");
+    s
+}
+
+fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> String {
+    let sec = |w: &Option<crate::lexer::Word>| w.as_ref().map(word_to_source).unwrap_or_default();
+    let mut s = format!(
+        "for (({}; {}; {})); do\n",
+        sec(&c.init),
+        sec(&c.cond),
+        sec(&c.step)
+    );
+    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&pad(indent));
+    s.push_str("done");
+    s
+}
+
+fn select_to_source(c: &SelectClause, indent: usize) -> String {
+    let mut header = format!("select {}", c.var);
+    if let Some(words) = &c.words {
+        header.push_str(" in");
+        for w in words {
+            header.push(' ');
+            header.push_str(&word_to_source(w));
+        }
+    }
+    let mut s = format!("{header}; do\n");
+    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&pad(indent));
+    s.push_str("done");
+    s
+}
+
+fn case_to_source(c: &CaseClause, indent: usize) -> String {
+    let mut s = format!("case {} in\n", word_to_source(&c.subject));
+    for item in &c.items {
+        s.push_str(&case_item_to_source(item, indent + 1));
+    }
+    s.push_str(&pad(indent));
+    s.push_str("esac");
+    s
+}
+
+fn case_item_to_source(item: &CaseItem, indent: usize) -> String {
+    let patterns = item
+        .patterns
+        .iter()
+        .map(pattern_word_to_source)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut s = format!("{}{patterns})\n", pad(indent));
+    if let Some(body) = &item.body {
+        s.push_str(&body_block(body, indent + 1));
+    }
+    let term = match item.terminator {
+        CaseTerminator::Break => ";;",
+        CaseTerminator::FallThrough => ";&",
+        CaseTerminator::ContinueMatch => ";;&",
+    };
+    s.push_str(&pad(indent));
+    s.push_str(term);
+    s.push('\n');
+    s
+}
+
+/// Render a `case` pattern Word. Like `word_to_source`, but unquoted `Literal`
+/// parts keep their glob metacharacters (`* ? [ ]`) UNescaped — a case pattern
+/// is a glob, so escaping `*` to `\*` would change its meaning AND break the
+/// round-trip (re-parse turns `\*` into a quoted literal). Other shell-special
+/// characters (whitespace, `)`, `;`, `&`, `|`, …) are still escaped so the
+/// pattern re-parses as one word.
+fn pattern_word_to_source(w: &Word) -> String {
+    w.0.iter()
+        .map(|part| match part {
+            WordPart::Literal { text, quoted: false } => escape_pattern_bareword(text),
+            other => part_to_source(other),
+        })
+        .collect()
+}
+
+/// Backslash-escape characters special outside quotes EXCEPT glob
+/// metacharacters (`* ? [ ] { }`), which a `case` pattern must keep literal.
+fn escape_pattern_bareword(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '$' | ';' | '&' | '|' | '<' | '>' | '('
+            | ')' | '`' | '~' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn testexpr_to_source(e: &TestExpr) -> String {
+    match e {
+        TestExpr::Unary { op, operand } => {
+            format!("{} {}", unary_op_token(*op), word_to_source(operand))
+        }
+        TestExpr::Binary { op, lhs, rhs } => format!(
+            "{} {} {}",
+            word_to_source(lhs),
+            binary_op_token(*op),
+            word_to_source(rhs)
+        ),
+        TestExpr::Regex { lhs, pattern } => {
+            format!("{} =~ {}", word_to_source(lhs), word_to_source(pattern))
+        }
+        TestExpr::Not(inner) => format!("! {}", testexpr_to_source(inner)),
+        TestExpr::And(a, b) => {
+            format!("{} && {}", testexpr_to_source(a), testexpr_to_source(b))
+        }
+        TestExpr::Or(a, b) => format!("{} || {}", testexpr_to_source(a), testexpr_to_source(b)),
+    }
+}
+
+/// Invert the `try_unary_op` parse table (src/command.rs).
+fn unary_op_token(op: TestUnaryOp) -> &'static str {
+    match op {
+        TestUnaryOp::FileExists => "-e",
+        TestUnaryOp::IsRegFile => "-f",
+        TestUnaryOp::IsDir => "-d",
+        TestUnaryOp::IsReadable => "-r",
+        TestUnaryOp::IsWritable => "-w",
+        TestUnaryOp::IsExecutable => "-x",
+        TestUnaryOp::IsNonEmpty => "-s",
+        TestUnaryOp::IsSymlink => "-L",
+        TestUnaryOp::StringNonEmpty => "-n",
+        TestUnaryOp::StringEmpty => "-z",
+        TestUnaryOp::VarSet => "-v",
+        TestUnaryOp::OptEnabled => "-o",
+        TestUnaryOp::IsFifo => "-p",
+        TestUnaryOp::IsSocket => "-S",
+        TestUnaryOp::IsBlockDev => "-b",
+        TestUnaryOp::IsCharDev => "-c",
+        TestUnaryOp::OwnedByEuid => "-O",
+        TestUnaryOp::OwnedByEgid => "-G",
+        TestUnaryOp::NewerThanRead => "-N",
+        TestUnaryOp::IsSticky => "-k",
+        TestUnaryOp::IsSetuid => "-u",
+        TestUnaryOp::IsSetgid => "-g",
+        TestUnaryOp::IsTerminal => "-t",
+    }
+}
+
+/// Invert the binary-operator parse table (src/command.rs `parse_test_atom`).
+fn binary_op_token(op: TestBinaryOp) -> &'static str {
+    match op {
+        TestBinaryOp::StringEq => "==",
+        TestBinaryOp::StringNe => "!=",
+        TestBinaryOp::StringLt => "<",
+        TestBinaryOp::StringGt => ">",
+        TestBinaryOp::IntEq => "-eq",
+        TestBinaryOp::IntNe => "-ne",
+        TestBinaryOp::IntLt => "-lt",
+        TestBinaryOp::IntGt => "-gt",
+        TestBinaryOp::IntLe => "-le",
+        TestBinaryOp::IntGe => "-ge",
+        TestBinaryOp::NewerThan => "-nt",
+        TestBinaryOp::OlderThan => "-ot",
+        TestBinaryOp::SameFile => "-ef",
     }
 }
 
@@ -141,10 +415,11 @@ fn redirect_to_source(r: &Redirect, which: RedirDefault) -> String {
             // word is rendered verbatim (tabs already stripped at lex time for
             // `<<-`). Quote the delimiter when !expand so the re-parse keeps the
             // literal (non-expanding) mode. Emit `<<DELIM\n<body>\nDELIM`.
-            let delim = "EOF_GEN";
+            let body_text = heredoc_body_to_source(body);
+            let delim = pick_heredoc_delim(&body_text);
             let opener = if *strip_tabs { "<<-" } else { "<<" };
             let d = if *expand {
-                delim.to_string()
+                delim.clone()
             } else {
                 format!("'{delim}'")
             };
@@ -153,8 +428,29 @@ fn redirect_to_source(r: &Redirect, which: RedirDefault) -> String {
             // newline, so the closing delimiter follows directly. Expansion parts
             // ($VAR, $(...)) render through their normal source form so an
             // expanding heredoc keeps them.
-            format!("{opener}{d}\n{}{delim}", heredoc_body_to_source(body))
+            format!("{opener}{d}\n{body_text}{delim}")
         }
+    }
+}
+
+/// Choose a heredoc closing delimiter that does NOT appear as a standalone
+/// body line, so the round-trip re-parses the same body. Start with `EOF_GEN`
+/// and bump a numeric suffix (`EOF_GEN_1`, `EOF_GEN_2`, …) until no body line
+/// equals the candidate. A heredoc terminator must match the whole line, so we
+/// compare against each line of the body verbatim.
+fn pick_heredoc_delim(body_text: &str) -> String {
+    let collides = |cand: &str| body_text.lines().any(|line| line == cand);
+    let base = "EOF_GEN";
+    if !collides(base) {
+        return base.to_string();
+    }
+    let mut n = 1u32;
+    loop {
+        let cand = format!("{base}_{n}");
+        if !collides(&cand) {
+            return cand;
+        }
+        n += 1;
     }
 }
 
@@ -586,5 +882,91 @@ mod tests {
     #[test]
     fn rt_heredoc() {
         assert_rt("cat <<EOF\nhi\nEOF");
+    }
+
+    // ── Task 3: compound commands + TestExpr ──
+    #[test]
+    fn rt_if() {
+        assert_rt("if a; then b; fi");
+    }
+    #[test]
+    fn rt_if_else() {
+        assert_rt("if a; then b; else c; fi");
+    }
+    #[test]
+    fn rt_if_elif() {
+        assert_rt("if a; then b; elif c; then d; else e; fi");
+    }
+    #[test]
+    fn rt_while() {
+        assert_rt("while a; do b; done");
+    }
+    #[test]
+    fn rt_until() {
+        assert_rt("until a; do b; done");
+    }
+    #[test]
+    fn rt_for() {
+        assert_rt("for x in 1 2 3; do echo $x; done");
+    }
+    #[test]
+    fn rt_for_noin() {
+        assert_rt("for x; do echo $x; done");
+    }
+    #[test]
+    fn rt_arith_for() {
+        assert_rt("for ((i=0; i<3; i++)); do echo $i; done");
+    }
+    #[test]
+    fn rt_select() {
+        assert_rt("select x in a b; do echo $x; done");
+    }
+    #[test]
+    fn rt_case() {
+        assert_rt("case $x in a) echo A;; b|c) echo BC;; esac");
+    }
+    #[test]
+    fn rt_case_fallthrough() {
+        assert_rt("case $x in a) echo A;& *) echo D;; esac");
+    }
+    #[test]
+    fn rt_subshell() {
+        assert_rt("(a; b)");
+    }
+    #[test]
+    fn rt_brace_group() {
+        assert_rt("{ a; b; }");
+    }
+    #[test]
+    fn rt_arith_cmd() {
+        assert_rt("((x + 1))");
+    }
+    #[test]
+    fn rt_dbracket_unary() {
+        assert_rt("[[ -f /etc/passwd ]]");
+    }
+    #[test]
+    fn rt_dbracket_binary() {
+        assert_rt("[[ $x == y ]]");
+    }
+    #[test]
+    fn rt_dbracket_regex() {
+        assert_rt("[[ $x =~ ^a ]]");
+    }
+    #[test]
+    fn rt_dbracket_logic() {
+        assert_rt("[[ -n $x && $y == z ]]");
+    }
+    #[test]
+    fn rt_redirected_compound() {
+        assert_rt("while a; do b; done > out");
+    }
+    #[test]
+    fn rt_nested() {
+        assert_rt("if a; then for x in 1 2; do echo $x; done; fi");
+    }
+    #[test]
+    fn rt_heredoc_collision() {
+        assert_rt("cat <<EOF\nEOF_GEN\nhi\nEOF");
     }
 }
