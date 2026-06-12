@@ -1214,6 +1214,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
 /// substituted command's exit status into the parent shell's `$?`.
 pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
     let mut cloned = shell.clone();
+    cloned.procsub_pending = Vec::new(); // a clone must not inherit/duplicate the parent's pending process substitutions
     cloned.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
     let (output, status) = executor::execute_capturing(seq, &mut cloned);
     shell.set_last_status(status);

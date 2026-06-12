@@ -65,7 +65,7 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
         &inner, shell,
         inner_stdin, inner_stdout, libc::STDERR_FILENO,
         shell.shell_pgid, &child_close_list, None, None,
-    )?;
+    ).inspect_err(|_| unsafe { libc::close(read_fd); libc::close(write_fd); })?;
 
     // Parent closes the end the inner owns (the inner has its own copy via dup2).
     let inner_end = match dir { ProcDir::In => write_fd, ProcDir::Out => read_fd };
@@ -75,19 +75,18 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
     Ok((path, ProcSub { pid, parent_fd, fifo_path: None }))
 }
 
-/// FIFO fallback (untested on this platform — used only when /dev/fd is absent).
+/// FIFO fallback (used only when /dev/fd is absent — unreachable on Linux/macOS).
 ///
-/// When `/dev/fd` is not available (some embedded/minimal Linux setups), we create
-/// a named FIFO under TMPDIR instead. The open-ordering is carefully chosen to avoid
-/// deadlock: the inner process opens its FIFO end inside its forked subshell (which
-/// runs concurrently with the parent), while the parent returns the FIFO path for the
-/// outer command to open later. Because the inner process and the outer command both
-/// open the FIFO (from opposite ends) independently — not in lockstep here — there is
-/// still a potential deadlock if only one end ever opens; this is inherent in FIFO
-/// semantics and matches the limitation of all other shells on such platforms.
+/// Correct rendezvous: the parent does NOT pre-open the FIFO. Instead the inner
+/// sequence is wrapped in a redirect so the CHILD opens its FIFO end (blocking until
+/// the outer command opens the other end). The outer command receives the FIFO path
+/// and opens it, unblocking the child. This avoids the ENXIO that a parent-side
+/// O_WRONLY|O_NONBLOCK open produces when no reader exists yet.
 fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Result<(String, ProcSub)> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::command::Redirect;
+    use crate::lexer::{Word, WordPart};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
     let pid = unsafe { libc::getpid() };
@@ -100,60 +99,43 @@ fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Resu
         return Err(io::Error::last_os_error());
     }
 
-    // For <(cmd): inner writes to the FIFO on stdout; parent reads the FIFO path.
-    // For >(cmd): inner reads from the FIFO on stdin; parent writes the FIFO path.
-    //
-    // The inner process opens the FIFO inside the forked subshell. The open will
-    // block until the outer command opens the other end, which is correct: the outer
-    // command receives the FIFO path and opens it, unblocking the inner open.
-    let (inner_flags, _inner_stdio_fd) = match dir {
-        ProcDir::In  => (libc::O_WRONLY, libc::STDOUT_FILENO),
-        ProcDir::Out => (libc::O_RDONLY, libc::STDIN_FILENO),
+    // Build a Word that holds the FIFO path as a single literal part.
+    let path_word = Word(vec![WordPart::Literal {
+        text: fifo_path.to_str().unwrap().to_string(),
+        quoted: true,
+    }]);
+
+    // Wrap the inner sequence in a redirect so the CHILD opens its FIFO end:
+    //   <(cmd) → cmd > FIFO  (child opens O_WRONLY, blocks until outer opens O_RDONLY)
+    //   >(cmd) → cmd < FIFO  (child opens O_RDONLY, blocks until outer opens O_WRONLY)
+    let (redirect_stdin, redirect_stdout) = match dir {
+        ProcDir::In  => (None,                                Some(Redirect::Truncate(path_word))),
+        ProcDir::Out => (Some(Redirect::Read(path_word)),     None),
+    };
+    let inner_body = Command::Subshell { body: Box::new(seq.clone()) };
+    let inner = Command::Redirected {
+        inner: Box::new(inner_body),
+        stdin: redirect_stdin,
+        stdout: redirect_stdout,
+        stderr: None,
     };
 
-    // Build a synthetic sequence that opens the FIFO on the appropriate stdio fd and
-    // then runs the user's sequence. We do this by constructing a wrapper Command that
-    // opens the FIFO, dup2s it, then execs the body. Since we cannot express
-    // "open FIFO then exec" directly in our Command AST, we pass the already-opened
-    // FIFO fd as the stdio replacement. Open the FIFO here in the parent (non-blocking
-    // to avoid blocking the parent), then pass it as the stdio fd to fork_and_run.
-    //
-    // O_NONBLOCK prevents the parent's open from blocking. The child will block on its
-    // own FIFO open (see note above) — but since we're passing an already-opened fd,
-    // the child actually inherits the parent's fd via dup2, sidestepping child-open.
-    let open_flags = inner_flags | libc::O_NONBLOCK;
-    let fifo_fd = unsafe { libc::open(fifo_cstr.as_ptr(), open_flags) };
-    if fifo_fd < 0 {
-        let _ = std::fs::remove_file(&fifo_path);
-        return Err(io::Error::last_os_error());
-    }
-    // Re-enable blocking on the fd now that open succeeded (for correct pipe semantics).
-    unsafe {
-        let flags = libc::fcntl(fifo_fd, libc::F_GETFL);
-        libc::fcntl(fifo_fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
-
-    let inner = Command::Subshell { body: Box::new(seq.clone()) };
+    // Fork: child inherits stdio (the wrapped redirect overrides the relevant one
+    // inside the child). Parent holds no fd — the FIFO path is passed to the outer.
     let child_close_list: &[RawFd] = &[];
-    let (inner_stdin, inner_stdout) = match dir {
-        ProcDir::In  => (libc::STDIN_FILENO, fifo_fd),
-        ProcDir::Out => (fifo_fd, libc::STDOUT_FILENO),
-    };
     let pid_child = crate::executor::fork_and_run_in_subshell(
         &inner, shell,
-        inner_stdin, inner_stdout, libc::STDERR_FILENO,
+        libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO,
         shell.shell_pgid, child_close_list, None, None,
-    )?;
-
-    // Parent closes the fifo_fd — the child has inherited a dup2'd copy.
-    unsafe { libc::close(fifo_fd); }
+    ).inspect_err(|_| { let _ = std::fs::remove_file(&fifo_path); })?;
 
     let path = fifo_path.to_str().unwrap().to_string();
     Ok((path, ProcSub { pid: pid_child, parent_fd: -1, fifo_path: Some(fifo_path) }))
 }
 
 /// Tear down one realized process substitution: close the parent fd, unlink any FIFO,
-/// reap the inner pid (finished once the pipe is closed).
+/// wait for the inner process to exit (waitpid blocks until exit — the inner may still
+/// be running when cleanup is called).
 pub fn cleanup(ps: ProcSub) {
     if ps.parent_fd >= 0 {
         unsafe { libc::close(ps.parent_fd); }
