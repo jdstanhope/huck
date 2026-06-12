@@ -6,14 +6,17 @@ fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
 
 /// Builds a fresh temp fixture dir, runs `script` in it (cwd = fixture),
 /// returns (stdout, exit_code).
+///
+/// Uses `tempfile::tempdir()` for an `mkdtemp`-unique path; an earlier
+/// `{pid}_{nanos}` scheme could collide on macOS (coarser effective
+/// clock resolution than nanos) and two parallel tests would share
+/// the fixture directory.
 fn run_in_fixture(script: &str) -> (String, i32) {
-    let dir = std::env::temp_dir().join(format!(
-        "huck_egpath_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let td = tempfile::Builder::new()
+        .prefix("huck_egpath_")
+        .tempdir()
+        .expect("tempdir");
+    let dir = td.path();
     for f in ["a", "b", "ab", "aab", "abc", "cd", "xy", ".hidden"] {
         std::fs::write(dir.join(f), b"").unwrap();
     }
@@ -23,12 +26,11 @@ fn run_in_fixture(script: &str) -> (String, i32) {
     std::fs::create_dir(dir.join("dir2")).unwrap();
     std::fs::write(dir.join("dir2/foo.txt"), b"").unwrap();
     let mut child = Command::new(huck_bin())
-        .current_dir(&dir)
+        .current_dir(dir)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().expect("spawn huck");
     child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
 }
 

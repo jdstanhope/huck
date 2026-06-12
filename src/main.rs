@@ -23,6 +23,17 @@ mod shell_state;
 mod test_builtin;
 mod traps;
 
+/// Shared test-only synchronization primitives. Tests across multiple
+/// modules mutate process-global state (CWD, env, FDs); without a shared
+/// lock they race under `cargo test`'s default parallel runner. The
+/// pattern is `let _g = test_support::CWD_LOCK.lock().unwrap();` at the
+/// top of any test that calls `std::env::set_current_dir`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+    pub(crate) static CWD_LOCK: Mutex<()> = Mutex::new(());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(shell::run(&args));

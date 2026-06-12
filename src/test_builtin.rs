@@ -158,13 +158,16 @@ fn apply_unary(
         "-r" => Ok(access(operand, libc::R_OK)),
         "-w" => Ok(access(operand, libc::W_OK)),
         "-x" => Ok(access(operand, libc::X_OK)),
-        "-p" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFIFO).unwrap_or(false)),
-        "-S" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFSOCK).unwrap_or(false)),
-        "-b" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFBLK).unwrap_or(false)),
-        "-c" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT == libc::S_IFCHR).unwrap_or(false)),
-        "-k" => Ok(file_mode(operand).map(|m| m & libc::S_ISVTX != 0).unwrap_or(false)),
-        "-u" => Ok(file_mode(operand).map(|m| m & libc::S_ISUID != 0).unwrap_or(false)),
-        "-g" => Ok(file_mode(operand).map(|m| m & libc::S_ISGID != 0).unwrap_or(false)),
+        // libc mode constants are `mode_t`, which is `u32` on Linux but `u16`
+        // on macOS/BSD. `file_mode()` already returns `u32`; cast the constants
+        // for cross-platform builds (a no-op on Linux).
+        "-p" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFIFO as u32).unwrap_or(false)),
+        "-S" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFSOCK as u32).unwrap_or(false)),
+        "-b" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFBLK as u32).unwrap_or(false)),
+        "-c" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFCHR as u32).unwrap_or(false)),
+        "-k" => Ok(file_mode(operand).map(|m| m & libc::S_ISVTX as u32 != 0).unwrap_or(false)),
+        "-u" => Ok(file_mode(operand).map(|m| m & libc::S_ISUID as u32 != 0).unwrap_or(false)),
+        "-g" => Ok(file_mode(operand).map(|m| m & libc::S_ISGID as u32 != 0).unwrap_or(false)),
         "-O" => Ok(std::fs::metadata(operand).map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false)),
         "-G" => Ok(std::fs::metadata(operand).map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false)),
         "-N" => Ok(std::fs::metadata(operand)

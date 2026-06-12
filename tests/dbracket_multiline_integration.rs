@@ -67,19 +67,17 @@ fn test_builtin_v_set_and_unset() {
 use std::fs;
 
 fn run_in_dir(setup: &dyn Fn(&std::path::Path), script: &str) -> (String, i32) {
-    let dir = std::env::temp_dir().join(format!(
-        "huck_v87_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    setup(&dir);
+    // mkdtemp-unique path; an earlier `{pid}_{nanos}` scheme could
+    // collide on macOS (coarser effective clock resolution than nanos)
+    // and let parallel tests share a fixture directory.
+    let td = tempfile::Builder::new()
+        .prefix("huck_v87_")
+        .tempdir()
+        .expect("tempdir");
+    let dir = td.path();
+    setup(dir);
     let mut child = Command::new(huck_bin())
-        .current_dir(&dir)
+        .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -92,7 +90,6 @@ fn run_in_dir(setup: &dyn Fn(&std::path::Path), script: &str) -> (String, i32) {
         .write_all(script.as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
-    let _ = fs::remove_dir_all(&dir);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),

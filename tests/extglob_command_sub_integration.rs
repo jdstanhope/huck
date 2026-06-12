@@ -11,23 +11,22 @@ fn huck_bin() -> &'static str {
 
 /// Writes the script to a temp file and runs `huck <file>`.
 /// Returns (stdout, stderr, exit_code).
+///
+/// Uses `tempfile::NamedTempFile` for an `mkstemp`-unique path; an
+/// earlier `{pid}_{nanos}` scheme could collide on macOS, where the
+/// effective clock resolution is coarser than nanos and parallel
+/// tests could share a path and read each other's scripts.
 fn run(script: &str) -> (String, String, i32) {
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = dir.join(format!("huck_xgcs_{pid}_{nanos}.sh"));
-    {
-        let mut f = std::fs::File::create(&path).expect("create temp script");
-        f.write_all(script.as_bytes()).expect("write temp script");
-    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix("huck_xgcs_")
+        .suffix(".sh")
+        .tempfile()
+        .expect("create temp script");
+    tmp.write_all(script.as_bytes()).expect("write temp script");
     let out = Command::new(huck_bin())
-        .arg(&path)
+        .arg(tmp.path())
         .output()
         .expect("spawn huck");
-    let _ = std::fs::remove_file(&path);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -67,15 +66,15 @@ fn clean_script_unaffected() {
 }
 
 fn in_tmp(files: &[&str], script: &str) -> (String, String, i32) {
-    let dir = std::env::temp_dir().join(format!("huck_egA_{}", std::process::id()));
-    let _ = fs::create_dir_all(&dir);
+    // Per-call unique tempdir: a PID-only name collides when the test
+    // runner schedules these in parallel, and the first one's
+    // remove_dir_all then drops the other one's cwd out from under it.
+    let td = tempfile::tempdir().expect("tempdir");
     for f in files {
-        let _ = fs::write(dir.join(f), "");
+        let _ = fs::write(td.path().join(f), "");
     }
-    let full = format!("cd '{}'\nshopt -s extglob\n{}", dir.display(), script);
-    let r = run(&full);
-    let _ = fs::remove_dir_all(&dir);
-    r
+    let full = format!("cd '{}'\nshopt -s extglob\n{}", td.path().display(), script);
+    run(&full)
 }
 
 #[test]

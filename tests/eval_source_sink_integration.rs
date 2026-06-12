@@ -28,7 +28,11 @@ fn eval_multi_command_captured() {
 #[test]
 fn eval_pipe_inside_capture() {
     let (o, _e, _c) = run("x=$(eval 'seq 1 100 | wc -l'); echo \"[$x]\"\n");
-    assert_eq!(o.trim(), "[100]", "o: {o:?}");
+    // BSD `wc -l` (macOS) pads its output with leading spaces; GNU
+    // `wc -l` (Linux) doesn't. The padding survives `$()` and lands
+    // inside the brackets, so compare the inner numeric value.
+    let inner = o.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    assert_eq!(inner, "100", "o: {o:?}");
 }
 #[test]
 fn source_captured_in_subst() {

@@ -5,6 +5,16 @@ fn huck_binary() -> String {
     env!("CARGO_BIN_EXE_huck").to_string()
 }
 
+/// Resolved form of `p` — what huck's `cd`/`pushd` will end up using
+/// after canonicalizing symlinks via `env::current_dir()`. On Linux
+/// `/tmp` stays `/tmp`; on macOS it becomes `/private/tmp`.
+fn canonical(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|e| panic!("canonicalize {p}: {e}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn run_capture(script: &str) -> (String, String, i32) {
     let mut child = Command::new(huck_binary())
         .stdin(Stdio::piped())
@@ -29,9 +39,10 @@ fn run_capture(script: &str) -> (String, String, i32) {
 #[test]
 fn pushd_dir_then_dirs() {
     let (out, _, _) = run_capture("pushd /tmp\ndirs\nexit\n");
-    // After pushd, dirs output starts with /tmp.
+    // After pushd, dirs output starts with the resolved /tmp.
+    let tmp = canonical("/tmp");
     assert!(
-        out.lines().any(|l| l.starts_with("/tmp")),
+        out.lines().any(|l| l.starts_with(tmp.as_str())),
         "stdout: {out:?}",
     );
 }
@@ -55,9 +66,11 @@ fn pushd_no_args_swaps_top_two() {
     let (out, _, _) = run_capture(
         "pushd /tmp\npushd /var\npushd\necho \"AT $PWD\"\nexit\n",
     );
+    let tmp = canonical("/tmp");
+    let want = format!("AT {tmp}");
     assert!(
-        out.lines().any(|l| l == "AT /tmp"),
-        "expected pwd == /tmp after swap; stdout: {out:?}",
+        out.lines().any(|l| l == want),
+        "expected pwd == {tmp} after swap; stdout: {out:?}",
     );
 }
 

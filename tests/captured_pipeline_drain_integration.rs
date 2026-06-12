@@ -69,7 +69,12 @@ fn small_captured_pipeline_still_works() {
 fn large_producer_small_final_output() {
     let r = run_guarded("x=$(seq 1 500000 | wc -l); echo \"[$x]\"\n", 10);
     let (o, _e, _c) = r.expect("hung");
-    assert_eq!(o.trim(), "[500000]", "o: {o:?}");
+    // BSD `wc -l` (macOS) pads its output with leading spaces; GNU `wc -l`
+    // (Linux) doesn't. The padding survives `$()` and lands inside the
+    // brackets, so compare the inner numeric value with the spaces
+    // trimmed rather than asserting exact bracket contents.
+    let inner = o.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    assert_eq!(inner, "500000", "o: {o:?}");
 }
 
 #[test]

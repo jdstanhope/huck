@@ -79,7 +79,7 @@ fn dbracket_int_bad() {
 
 #[test]
 fn dbracket_file_test_existing() {
-    let (out, _) = run("[[ -f /etc/hostname ]] && echo ok\nexit\n");
+    let (out, _) = run("[[ -f /etc/hosts ]] && echo ok\nexit\n");
     assert!(out.lines().any(|l| l.trim() == "ok"), "got: {out}");
 }
 
@@ -128,7 +128,7 @@ fn dbracket_no_word_splitting() {
 
 #[test]
 fn dbracket_in_if() {
-    let (out, _) = run("if [[ -f /etc/hostname ]]; then echo ok; fi\nexit\n");
+    let (out, _) = run("if [[ -f /etc/hosts ]]; then echo ok; fi\nexit\n");
     assert!(out.lines().any(|l| l.trim() == "ok"), "got: {out}");
 }
 

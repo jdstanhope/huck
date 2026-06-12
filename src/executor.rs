@@ -2712,7 +2712,12 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
                 // Read errno directly (async-signal-safe; no Rust io::Error
                 // wrapper between fork and _exit). EINTR → retry; EPIPE (consumer
                 // gone) or anything else → stop, body delivery is moot.
+                // Symbol differs by platform: glibc/musl/Android expose
+                // `__errno_location`, the BSDs and Apple expose `__error`.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 let errno = unsafe { *libc::__errno_location() };
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let errno = unsafe { *libc::__error() };
                 if errno == libc::EINTR { continue; }
                 break;
             }
@@ -5302,6 +5307,7 @@ mod tests {
     use super::*;
     use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
+    use crate::test_support::CWD_LOCK;
 
     #[test]
     fn ps4_cmdsub_preserves_last_status() {
@@ -5677,6 +5683,7 @@ mod tests {
 
     #[test]
     fn redirect_target_does_not_glob() {
+        let _g = CWD_LOCK.lock().unwrap();
         // Create a temp dir with a real file matching the literal pattern name.
         let tmp = tempfile::tempdir().unwrap();
         // The file is named literally "starfile" — `*` should not glob to it.
@@ -6682,6 +6689,18 @@ mod tests {
 
     /// Smoke-test for `with_redirect_scope` via `run_redirected`: a brace
     /// group redirected to a file writes its output there (not to stdout).
+    ///
+    /// Cross-process FD-1 race: while this test has FD 1 dup2'd to the
+    /// target file, `cargo test`'s libtest runner may print sibling test
+    /// progress lines (`"test foo ... ok\n"`) to the same FD 1 from a
+    /// peer thread, and those land in our file too. We can't serialize
+    /// against libtest (it doesn't take our lock) and we can't redirect
+    /// libtest's writes (they go to the inherited real FD 1). So the
+    /// assertion verifies the actual claim — that the redirected
+    /// `echo HI` output is present as an exact line — and tolerates any
+    /// libtest noise that may have leaked in alongside it. (In real
+    /// shell use no other thread writes to FD 1 during the redirect
+    /// window; the noise is a `cargo test` artifact only.)
     #[test]
     fn compound_stdout_redirect_writes_to_file() {
         let dir = std::env::temp_dir()
@@ -6698,7 +6717,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&p)
             .expect("redirect target file should exist");
-        assert_eq!(content.trim(), "HI");
+        assert!(
+            content.lines().any(|l| l == "HI"),
+            "redirected `echo HI` should appear as a line in the file, got {content:?}",
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

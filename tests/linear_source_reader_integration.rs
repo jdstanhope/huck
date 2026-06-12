@@ -8,23 +8,24 @@ fn huck_bin() -> &'static str {
 
 /// Writes the script to a temp file and runs `huck <file>`.
 /// Returns (stdout, stderr, exit_code).
+///
+/// The path is `mkstemp`-unique (via `tempfile::NamedTempFile`); a
+/// previous `{pid}_{nanos}` scheme collided on macOS, where the
+/// CLOCK_REALTIME effective resolution is coarser than nanos and two
+/// parallel tests could share a path — one truncating the other's
+/// script mid-flight, causing wrong-script reads and confusing
+/// "wrong expected output" assertion failures.
 fn run(script: &str) -> (String, String, i32) {
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = dir.join(format!("huck_lsr_{pid}_{nanos}.sh"));
-    {
-        let mut f = std::fs::File::create(&path).expect("create temp script");
-        f.write_all(script.as_bytes()).expect("write temp script");
-    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix("huck_lsr_")
+        .suffix(".sh")
+        .tempfile()
+        .expect("create temp script");
+    tmp.write_all(script.as_bytes()).expect("write temp script");
     let out = Command::new(huck_bin())
-        .arg(&path)
+        .arg(tmp.path())
         .output()
         .expect("spawn huck");
-    let _ = std::fs::remove_file(&path);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
