@@ -17,7 +17,8 @@ fn huck(script: &str) -> String {
 #[test] fn nested_process_sub() { assert_eq!(huck("cat <(cat <(echo deep))"), "deep\n"); }
 #[test] fn quoted_is_literal() { assert_eq!(huck("echo \"<(echo hi)\""), "<(echo hi)\n"); }
 #[test] fn procsub_arg_in_pipeline() {
-    // arg procsub on a pipeline stage — parent fd must be drained after wait
+    // arg procsub on an external-command stage: resolve() runs in the parent, so the
+    // procsub is pushed to the parent's procsub_pending and must be drained after wait
     assert_eq!(huck("cat <(echo a) | cat"), "a\n");
 }
 #[test] fn procsub_redirect_in_pipeline() {
