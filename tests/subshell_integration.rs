@@ -134,14 +134,16 @@ fn subshell_with_here_string_inside() {
 
 #[test]
 fn subshell_backgrounded_does_not_block_parent() {
-    // Pre-fix: (sleep 0.5) & ran synchronously, parent waited 0.5s.
+    // Pre-fix: (sleep 1) & ran synchronously, parent waited the full second.
     // Post-fix: subshell is real bg; parent returns immediately.
+    // Use /bin/sleep (present on Linux + macOS; macOS has no /usr/bin/sleep)
+    // and an integer second (BSD `sleep` rejects fractional seconds).
     let start = std::time::Instant::now();
-    let (_, _) = run("(/usr/bin/sleep 0.5) &\nwait\nexit\n");
+    let (_, _) = run("(/bin/sleep 1) &\nwait\nexit\n");
     let elapsed = start.elapsed();
-    // The wait DOES block for 0.5s — but that's expected. The bug-evidence
+    // The wait DOES block for 1s — but that's expected. The bug-evidence
     // is "is $! set?" — verify that instead.
-    let (out, _) = run("(/usr/bin/sleep 0.1) &\necho [$!]\nwait\nexit\n");
+    let (out, _) = run("(/bin/sleep 1) &\necho [$!]\nwait\nexit\n");
     let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).unwrap_or_else(|| panic!("got: {out}"));
     let inner = &bracketed[1..bracketed.len()-1];
     let pid: i32 = inner.parse().expect("integer pid");

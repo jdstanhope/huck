@@ -584,6 +584,7 @@ fn list_dir_with_path_prefix(prefix: &str, dirs_only: bool, home: &str) -> Vec<S
 mod tests {
     use super::*;
     use crate::shell_state::Shell;
+    use crate::test_support::CWD_LOCK;
 
     #[test]
     fn action_parse_round_trips_all_24() {
@@ -937,6 +938,7 @@ mod tests {
 
     #[test]
     fn action_file_handles_dir_prefix() {
+        let _g = CWD_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let subdir = dir.path().join("subdir");
         std::fs::create_dir(&subdir).unwrap();

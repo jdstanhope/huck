@@ -2133,10 +2133,10 @@ mod tests {
 
     // ---- glob_expand_fields filesystem tests (v10 Task 7) ----------------------
 
-    use std::sync::Mutex;
-
-    // CWD is process-global; serialize tests that mutate it.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    // CWD is process-global; serialize tests that mutate it. The lock is
+    // shared crate-wide so completion / executor / builtins tests that
+    // also chdir take the same one.
+    use crate::test_support::CWD_LOCK;
 
     fn touch(dir: &std::path::Path, name: &str) {
         std::fs::write(dir.join(name), b"").unwrap();

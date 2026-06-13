@@ -95,8 +95,11 @@ fn dollar_bang_unset_initially_is_empty() {
 
 #[test]
 fn dollar_bang_set_after_backgrounded_external() {
-    // /usr/bin/sleep is universally available on Linux.
-    let (out, _) = run("/usr/bin/sleep 0.1 &\necho \"[$!]\"\nwait\nexit\n");
+    // /bin/sleep is present on both Linux and macOS (macOS doesn't ship
+    // /usr/bin/sleep). BSD `sleep` doesn't accept fractional seconds,
+    // but `1` works on both — the test only cares that an external
+    // background spawn sets $!, not how long it sleeps.
+    let (out, _) = run("/bin/sleep 1 &\necho \"[$!]\"\nwait\nexit\n");
     // Output should contain "[N]" where N is a positive integer.
     let bracketed = out.lines().find(|l| l.starts_with('[') && l.ends_with(']')).expect("[pid] line");
     let inner = &bracketed[1..bracketed.len()-1];
@@ -108,8 +111,10 @@ fn dollar_bang_set_after_backgrounded_external() {
 fn dollar_bang_is_last_stage_of_pipeline() {
     // Spawn a pipeline where the first stage prints its own pid (via $$).
     // $! should be the LAST stage's pid (the cat), not the first stage's.
+    // Use /bin/ paths — present on both Linux and macOS (the latter
+    // doesn't ship /usr/bin/{sh,cat}).
     let (out, _) = run(
-        "/usr/bin/sh -c 'echo $$' | /usr/bin/cat &\nLAST=$!\nwait\necho \"[$LAST]\"\nexit\n"
+        "/bin/sh -c 'echo $$' | /bin/cat &\nLAST=$!\nwait\necho \"[$LAST]\"\nexit\n"
     );
     let bracketed = out.lines().find(|l| l.starts_with('[')).expect("bracketed");
     let last_pid: i32 = bracketed[1..bracketed.len()-1].parse().expect("int");

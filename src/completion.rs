@@ -733,6 +733,7 @@ pub(crate) mod dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::CWD_LOCK;
 
     #[test]
     fn analyze_empty_line_is_command() {
@@ -1237,6 +1238,7 @@ mod tests {
 
     #[test]
     fn dispatch_o_default_falls_back_on_empty() {
+        let _g = CWD_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("alphafile"), b"").unwrap();
         let prior_cwd = std::env::current_dir().unwrap();
@@ -1295,6 +1297,7 @@ mod tests {
 
     #[test]
     fn dispatch_resolve_starts_with_clean_current_spec() {
+        let _g = CWD_LOCK.lock().unwrap();
         // Simulate a leaked spec from a prior compgen -F (without going
         // through the actual compgen path). Without the defensive clear
         // at the top of dispatch::resolve, the .take() inside
