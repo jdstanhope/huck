@@ -5282,9 +5282,9 @@ mod tests {
     #[test]
     fn parse_with_lines_stamps_exec_command_lines() {
         let src = "echo a\necho b\necho c"; // 3 commands on lines 1,2,3
-        let (toks, offs) = crate::lexer::tokenize_with_offsets(src, crate::lexer::LexerOptions::default()).unwrap();
-        // offsets.len() == tokens.len() + 1; drop the trailing sentinel.
-        let lines: Vec<u32> = offs[..toks.len()].iter().map(|&o| crate::lexer::line_at_offset(src, o)).collect();
+        let (toks, _offs, lex_lines) = crate::lexer::tokenize_with_offsets(src, crate::lexer::LexerOptions::default()).unwrap();
+        // lex_lines.len() == tokens.len() + 1 (includes sentinel); drop it.
+        let lines: Vec<u32> = lex_lines[..toks.len()].to_vec();
         let seq = parse_with_lines(toks, lines).unwrap().unwrap();
         assert_eq!(collect_exec_lines(&seq), vec![1, 2, 3]);
     }

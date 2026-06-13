@@ -5769,7 +5769,7 @@ pub(crate) fn run_sourced_contents_in_sink(
         // Partial tokenize: keep the tokens produced BEFORE any lex error so the
         // complete units (e.g. an earlier `shopt -s extglob`) can run first; the
         // truncated trailing unit is re-lexed with the now-current extglob.
-        let (tokens, offsets, terr) = crate::lexer::tokenize_partial(
+        let (tokens, offsets, lex_lines, terr) = crate::lexer::tokenize_partial(
             &contents[start..],
             crate::lexer::LexerOptions { extglob },
         );
@@ -5789,12 +5789,12 @@ pub(crate) fn run_sourced_contents_in_sink(
             }
             break;
         }
-        // Compute per-token source lines from the offsets in a single O(n) pass.
-        // Offsets are relative to &contents[start..]; add `start` to get absolute
-        // byte positions in `contents` so line numbers reflect real file line numbers.
-        // offsets.len() == total + 1; slice to total to match token count.
-        let abs: Vec<usize> = offsets[..total].iter().map(|&o| start + o).collect();
-        let token_lines = crate::lexer::lines_for_offsets(contents, &abs);
+        // The lexer's line numbers are 1-based relative to &contents[start..].
+        // Add the base line offset (number of newlines before `start` in the file)
+        // so each token line reflects its true position in the file.
+        // lex_lines.len() == total + 1 (includes sentinel); slice to total.
+        let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
+        let token_lines: Vec<u32> = lex_lines[..total].iter().map(|&l| l + base_line).collect();
         let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {

@@ -602,16 +602,16 @@ pub fn process_line_in_sink(
     sink: &mut crate::executor::StdoutSink,
 ) -> ExecOutcome {
     let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) };
-    let (tokens, offsets) = match lexer::tokenize_with_offsets(line, opts) {
-        Ok((tokens, offsets)) => (tokens, offsets),
+    let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
+        Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
             eprintln!("huck: syntax error{}", lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
     };
-    // Compute per-token source lines from the offsets in a single O(n) pass.
-    // offsets.len() == tokens.len() + 1; slice to tokens.len() to match token count.
-    let lines: Vec<u32> = lexer::lines_for_offsets(line, &offsets[..tokens.len()]);
+    // Per-token source lines stamped directly by the lexer (true O(n), no second pass).
+    // lex_lines.len() == tokens.len() + 1 (includes sentinel); slice to token count.
+    let lines: Vec<u32> = lex_lines[..tokens.len()].to_vec();
     let (tokens, lines) = if expand_aliases {
         match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
             Ok(t) => {
