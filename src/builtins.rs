@@ -5769,7 +5769,7 @@ pub(crate) fn run_sourced_contents_in_sink(
         // Partial tokenize: keep the tokens produced BEFORE any lex error so the
         // complete units (e.g. an earlier `shopt -s extglob`) can run first; the
         // truncated trailing unit is re-lexed with the now-current extglob.
-        let (tokens, offsets, terr) = crate::lexer::tokenize_partial(
+        let (tokens, offsets, lex_lines, terr) = crate::lexer::tokenize_partial(
             &contents[start..],
             crate::lexer::LexerOptions { extglob },
         );
@@ -5789,7 +5789,13 @@ pub(crate) fn run_sourced_contents_in_sink(
             }
             break;
         }
-        let mut iter = tokens.into_iter().peekable();
+        // The lexer's line numbers are 1-based relative to &contents[start..].
+        // Add the base line offset (number of newlines before `start` in the file)
+        // so each token line reflects its true position in the file.
+        // lex_lines.len() == total + 1 (includes sentinel); slice to total.
+        let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
+        let token_lines: Vec<u32> = lex_lines[..total].iter().map(|&l| l + base_line).collect();
+        let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {
             while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) {
@@ -9627,7 +9633,7 @@ mod command_tests {
         // Register a function directly. The body shape is irrelevant for
         // resolution; any Command value works. Use a no-op assignment list.
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let mut buf: Vec<u8> = Vec::new();
@@ -10296,7 +10302,7 @@ mod type_tests {
     fn type_default_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["myfn"], &mut shell);
@@ -10341,7 +10347,7 @@ mod type_tests {
     fn type_t_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["-t", "myfn"], &mut shell);
@@ -10387,7 +10393,7 @@ mod type_tests {
     fn type_f_skips_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         // Without -f: would find the function.
@@ -10762,7 +10768,7 @@ mod declare_tests {
     fn declare_f_lists_functions() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("fn1".to_string(), body.clone());
         shell.define_function("fn2".to_string(), body);
@@ -10793,7 +10799,7 @@ mod declare_tests {
     fn declare_f_named_function_found() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("fn1".to_string(), body);
         let (oc, out) = run(&["-F", "fn1"], &mut shell);

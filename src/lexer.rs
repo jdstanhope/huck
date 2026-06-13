@@ -25,22 +25,26 @@ pub enum LexError {
     UnterminatedExtglob,
 }
 
-/// A char cursor over a `&str` that also tracks the byte offset of the next
-/// char to be produced. Drop-in for the `Peekable<Chars>` the lexer used:
-/// implements `Iterator<Item = char>`, a `peek()` returning `Option<&char>`,
-/// `Clone`, and (via `Iterator`) `by_ref()`. `offset()` is the byte position
-/// of the char that the next `next()`/`peek()` will yield (or `s.len()` at end).
+/// A char cursor over a `&str` that also tracks the byte offset and 1-based
+/// line number of the next char to be produced. Drop-in for the
+/// `Peekable<Chars>` the lexer used: implements `Iterator<Item = char>`, a
+/// `peek()` returning `Option<&char>`, `Clone`, and (via `Iterator`) `by_ref()`.
+/// `offset()` is the byte position of the char that the next `next()`/`peek()`
+/// will yield (or `s.len()` at end). `line()` is the 1-based line of that same
+/// char — it advances to the next line immediately after a `'\n'` is consumed,
+/// exactly mirroring how `offset()` advances after each byte.
 #[derive(Clone)]
 pub struct CharCursor<'a> {
     s: &'a str,
     pos: usize,
+    line: u32,
     peeked: Option<char>,
     peeked_len: usize,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, peeked: None, peeked_len: 0 }
+        CharCursor { s, pos: 0, line: 1, peeked: None, peeked_len: 0 }
     }
 
     /// Peek the next char without consuming it.
@@ -59,6 +63,12 @@ impl<'a> CharCursor<'a> {
     pub fn offset(&self) -> usize {
         self.pos
     }
+
+    /// 1-based line of the next char to be produced (mirrors `offset()`).
+    /// After consuming a `'\n'`, this reflects the NEXT line.
+    pub fn line(&self) -> u32 {
+        self.line
+    }
 }
 
 impl Iterator for CharCursor<'_> {
@@ -67,9 +77,11 @@ impl Iterator for CharCursor<'_> {
         if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
+            if c == '\n' { self.line += 1; }
             Some(c)
         } else if let Some(c) = self.s[self.pos..].chars().next() {
             self.pos += c.len_utf8();
+            if c == '\n' { self.line += 1; }
             Some(c)
         } else {
             None
@@ -287,16 +299,23 @@ pub struct LexerOptions {
     pub extglob: bool,
 }
 
+/// Raw output of the partial tokenizer: `tokens`, parallel byte `offsets` and
+/// 1-based `lines` (with a trailing sentinel), and an optional trailing lex
+/// error + the byte offset where lexing failed.
+type PartialTokens = (Vec<Token>, Vec<usize>, Vec<u32>, Option<(LexError, usize)>);
+/// Successful tokenization with positions: `tokens` plus parallel `offsets` and
+/// `lines`. See [`tokenize_with_offsets`].
+type TokensWithPos = (Vec<Token>, Vec<usize>, Vec<u32>);
+
 /// Back-compat entry: lexes with all options off (current behavior).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_with_opts(input, LexerOptions::default())
 }
 
 /// Tokenize, returning each token's start byte offset (and a trailing sentinel
-/// `offsets[tokens.len()] == input.len()`). On error, returns the LexError and
+/// `offsets[tokens.len()] == input.len()`), and the per-token 1-based source
+/// line numbers (same length as `offsets`). On error, returns the LexError and
 /// the byte offset where lexing failed.
-// Consumed by the linear source reader (a later v104 task); the offset sidecar
-// lands first behind this thin public wrapper.
 // Retained as a thin `Result`-returning wrapper over `tokenize_partial` and
 // exercised by the offset unit tests; the source reader now calls
 // `tokenize_partial` directly, so it is otherwise unused in non-test builds.
@@ -304,17 +323,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 pub fn tokenize_with_offsets(
     input: &str,
     opts: LexerOptions,
-) -> Result<(Vec<Token>, Vec<usize>), (LexError, usize)> {
+) -> Result<TokensWithPos, (LexError, usize)> {
     match tokenize_partial(input, opts) {
-        (tokens, offsets, None) => Ok((tokens, offsets)),
-        (_, _, Some((e, off))) => Err((e, off)),
+        (tokens, offsets, lines, None) => Ok((tokens, offsets, lines)),
+        (_, _, _, Some((e, off))) => Err((e, off)),
     }
 }
 
 pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
     match tokenize_partial(input, opts) {
-        (tokens, _offsets, None) => Ok(tokens),
-        (_, _, Some((e, _off))) => Err(e),
+        (tokens, _offsets, _lines, None) => Ok(tokens),
+        (_, _, _, Some((e, _off))) => Err(e),
     }
 }
 
@@ -333,14 +352,20 @@ fn tokenize_partial_inner(
     input: &str,
     opts: LexerOptions,
     brace_expand: bool,
-) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
+) -> PartialTokens {
     let mut tokens: Vec<Token> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
+    let mut lines: Vec<u32> = Vec::new();
+    // Lockstep push: always push offset and line together so they can never diverge.
+    macro_rules! push_pos {
+        ($off:expr, $ln:expr) => {{ offsets.push($off); lines.push($ln); }};
+    }
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
     let mut quoted_current = String::new();
     let mut has_token = false;
     let mut token_start: usize = 0;
+    let mut token_start_line: u32 = 1;
     let mut in_assignment_value = false;
     // `[[ … ]]` context tracking for the `=~` regex operand. `dbracket_depth`
     // counts open `[[`; `expect_regex` is armed right after an `=~` keyword
@@ -367,9 +392,10 @@ fn tokenize_partial_inner(
                     // The operand's first byte. Push the Word directly (NOT via
                     // emit_word_with_braces) so no brace expansion applies.
                     let operand_start = chars.offset();
+                    let operand_line = chars.line();
                     let parts = scan_regex_operand(&mut chars, opts)?;
                     tokens.push(Token::Word(Word(parts)));
-                    offsets.push(operand_start);
+                    push_pos!(operand_start, operand_line);
                     has_token = false;
                     continue;
                 }
@@ -378,6 +404,7 @@ fn tokenize_partial_inner(
             }
         }
         let c_off = chars.offset();
+        let c_line = chars.line();
         let c = match chars.next() {
             Some(c) => c,
             None => break,
@@ -391,7 +418,7 @@ fn tokenize_partial_inner(
                 );
                 let kw = single_unquoted_literal(&parts).map(str::to_owned);
                 let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                for _ in 0..n { offsets.push(token_start); }
+                for _ in 0..n { push_pos!(token_start, token_start_line); }
                 match kw.as_deref() {
                     Some("[[") => dbracket_depth += 1,
                     Some("]]") => dbracket_depth = dbracket_depth.saturating_sub(1),
@@ -408,7 +435,7 @@ fn tokenize_partial_inner(
                     collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens, opts)?;
                 }
                 tokens.push(Token::Newline);
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
             }
             continue;
         }
@@ -420,6 +447,7 @@ fn tokenize_partial_inner(
         // word arms read the value captured at the word's true first char.
         if !has_token {
             token_start = c_off;
+            token_start_line = c_line;
         }
 
         // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
@@ -555,7 +583,7 @@ fn tokenize_partial_inner(
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
@@ -564,14 +592,14 @@ fn tokenize_partial_inner(
                 } else {
                     tokens.push(Token::Op(Operator::Pipe));
                 }
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
@@ -588,14 +616,14 @@ fn tokenize_partial_inner(
                 } else {
                     tokens.push(Token::Op(Operator::Background));
                 }
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 let op = if chars.peek() == Some(&';') {
@@ -613,14 +641,14 @@ fn tokenize_partial_inner(
                     Operator::Semi
                 };
                 tokens.push(Token::Op(op));
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 // Detect `((` (contiguous, no whitespace). The peek/next
@@ -635,25 +663,25 @@ fn tokenize_partial_inner(
                 } else {
                     tokens.push(Token::Op(Operator::LParen));
                 }
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 tokens.push(Token::Op(Operator::RParen));
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '<' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'<') {
@@ -685,7 +713,7 @@ fn tokenize_partial_inner(
                             token_idx: placeholder_idx,
                         });
                     }
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `<(cmd)` — process substitution. Consume the `(` and scan the
@@ -695,13 +723,14 @@ fn tokenize_partial_inner(
                     let sequence = scan_paren_substitution(&mut chars, opts)?;
                     if !has_token {
                         token_start = c_off;
+                        token_start_line = c_line;
                     }
                     has_token = true;
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
                     in_assignment_value = false;
                 } else {
                     tokens.push(Token::Op(Operator::RedirIn));
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 }
             }
@@ -709,23 +738,23 @@ fn tokenize_partial_inner(
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { offsets.push(token_start); }
+                    for _ in 0..n { push_pos!(token_start, token_start_line); }
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirAppend));
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     tokens.push(Token::Op(Operator::DupOut));
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
                     tokens.push(Token::Op(Operator::RedirClobber));
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `>(cmd)` — process substitution. Consume the `(` and scan the
@@ -735,13 +764,14 @@ fn tokenize_partial_inner(
                     let sequence = scan_paren_substitution(&mut chars, opts)?;
                     if !has_token {
                         token_start = c_off;
+                        token_start_line = c_line;
                     }
                     has_token = true;
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
                     in_assignment_value = false;
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
-                    offsets.push(c_off);
+                    push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 }
             }
@@ -759,7 +789,7 @@ fn tokenize_partial_inner(
                 } else {
                     tokens.push(Token::Op(Operator::RedirOut));
                 }
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '2' if !has_token && chars.peek() == Some(&'>') => {
@@ -776,7 +806,7 @@ fn tokenize_partial_inner(
                 } else {
                     tokens.push(Token::Op(Operator::RedirErr));
                 }
-                offsets.push(c_off);
+                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
@@ -919,7 +949,7 @@ fn tokenize_partial_inner(
     if has_token {
         flush_literal(&mut parts, &mut current, false);
         let n = emit_word_with_braces(&mut tokens, parts, brace_expand)?;
-        for _ in 0..n { offsets.push(token_start); }
+        for _ in 0..n { push_pos!(token_start, token_start_line); }
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
     if !pending_heredocs.is_empty() {
@@ -930,26 +960,28 @@ fn tokenize_partial_inner(
 
     match result {
         Ok(()) => {
-            offsets.push(input.len()); // sentinel, ONLY on success
+            push_pos!(input.len(), chars.line()); // sentinel, ONLY on success
             debug_assert_eq!(
                 offsets.len(),
                 tokens.len() + 1,
                 "offset sidecar must have one entry per token plus a sentinel"
             );
-            (tokens, offsets, None)
+            debug_assert_eq!(offsets.len(), lines.len(), "offsets/lines out of lockstep");
+            (tokens, offsets, lines, None)
         }
         Err(e) => {
             // Partial: keep the tokens produced before the error and push the
             // error byte offset as the trailing sentinel, preserving the
             // `offsets.len() == tokens.len() + 1` invariant.
             let off = chars.offset();
-            offsets.push(off);
+            push_pos!(off, chars.line());
             debug_assert_eq!(
                 offsets.len(),
                 tokens.len() + 1,
                 "offset sidecar must have one entry per token plus a sentinel"
             );
-            (tokens, offsets, Some((e, off)))
+            debug_assert_eq!(offsets.len(), lines.len(), "offsets/lines out of lockstep");
+            (tokens, offsets, lines, Some((e, off)))
         }
     }
 }
@@ -963,7 +995,7 @@ fn tokenize_partial_inner(
 pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
-) -> (Vec<Token>, Vec<usize>, Option<(LexError, usize)>) {
+) -> PartialTokens {
     tokenize_partial_inner(input, opts, true)
 }
 
@@ -972,8 +1004,8 @@ pub fn tokenize_partial(
 /// are preserved as real WordParts).
 fn tokenize_no_brace(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
     match tokenize_partial_inner(input, opts, false) {
-        (tokens, _, None) => Ok(tokens),
-        (_, _, Some((e, _))) => Err(e),
+        (tokens, _, _, None) => Ok(tokens),
+        (_, _, _, Some((e, _))) => Err(e),
     }
 }
 
@@ -3237,9 +3269,38 @@ fn is_user_name_continue(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
 }
 
+/// 1-based line number of byte offset `off` within `src`
+/// (1 + the count of '\n' bytes before `off`). Clamps `off` to `src.len()`.
+/// Used in tests and for isolated single-offset lookups.
+#[allow(dead_code)]
+pub fn line_at_offset(src: &str, off: usize) -> u32 {
+    1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_at_offset_counts_newlines() {
+        let s = "a\nbb\nccc";
+        assert_eq!(line_at_offset(s, 0), 1);   // 'a'
+        assert_eq!(line_at_offset(s, 2), 2);   // first 'b'
+        assert_eq!(line_at_offset(s, 5), 3);   // first 'c'
+        assert_eq!(line_at_offset(s, 999), 3); // clamped
+    }
+
+    #[test]
+    fn char_cursor_tracks_line() {
+        let mut c = CharCursor::new("a\nbb\nc");
+        assert_eq!(c.line(), 1);
+        assert_eq!(c.next(), Some('a')); assert_eq!(c.line(), 1);
+        assert_eq!(c.next(), Some('\n')); assert_eq!(c.line(), 2); // after the newline
+        assert_eq!(c.next(), Some('b')); assert_eq!(c.line(), 2);
+        c.next(); c.next(); // 'b','\n'
+        assert_eq!(c.line(), 3);
+        assert_eq!(c.next(), Some('c')); assert_eq!(c.line(), 3);
+    }
 
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
@@ -3385,7 +3446,7 @@ mod tests {
     #[test]
     fn offsets_align_with_token_starts() {
         // "echo hi\nls" -> Word(echo)@0 Word(hi)@5 Newline@7 Word(ls)@8, sentinel@10
-        let (toks, offs) = tokenize_with_offsets("echo hi\nls", LexerOptions::default()).unwrap();
+        let (toks, offs, _lns) = tokenize_with_offsets("echo hi\nls", LexerOptions::default()).unwrap();
         assert_eq!(offs.len(), toks.len() + 1);
         assert_eq!(offs[toks.len()], 10); // sentinel = input.len()
         assert_eq!(offs[0], 0);
@@ -3403,7 +3464,7 @@ mod tests {
         // Leading whitespace before the first word; operators; a quoted word.
         //          0123456789012345678901
         let src = "  echo a && ls 'x y'\n";
-        let (toks, offs) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
+        let (toks, offs, _lns) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
         assert_eq!(offs.len(), toks.len() + 1);
         // First word "echo" starts at byte 2 (after two spaces).
         assert_eq!(offs[0], 2);
@@ -3428,7 +3489,7 @@ mod tests {
     #[test]
     fn offsets_support_line_lookup() {
         let src = "echo a\necho b\nbad)\n";
-        let (toks, offs) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
+        let (toks, offs, _lns) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
         // The `)` operator is on line 3; line = 1 + newlines before its offset.
         let rp = toks.iter().position(|t| matches!(t, Token::Op(Operator::RParen))).unwrap();
         let line = 1 + src.as_bytes()[..offs[rp]].iter().filter(|&&b| b == b'\n').count();
@@ -3446,7 +3507,7 @@ mod tests {
     #[test]
     fn tokenize_with_opts_output_unchanged() {
         let a = tokenize_with_opts("if true; then echo hi; fi", LexerOptions::default()).unwrap();
-        let (b, _o) = tokenize_with_offsets("if true; then echo hi; fi", LexerOptions::default()).unwrap();
+        let (b, _o, _l) = tokenize_with_offsets("if true; then echo hi; fi", LexerOptions::default()).unwrap();
         assert_eq!(a, b);
     }
 
@@ -4225,6 +4286,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -4294,6 +4356,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -4328,6 +4391,7 @@ mod tests {
                         stdin: None,
                         stdout: None,
                         stderr: None,
+                        line: 0,
                     }))],
                 }),
                 rest: vec![],
@@ -6627,7 +6691,7 @@ mod array_parse_tests {
             other => panic!("expected Pipeline, got {other:?}"),
         };
         match &pipeline.commands[0] {
-            Command::Simple(SimpleCommand::Assign(items)) => items.clone(),
+            Command::Simple(SimpleCommand::Assign(items, _)) => items.clone(),
             Command::Simple(SimpleCommand::Exec(e)) => e.inline_assignments.clone(),
             other => panic!("expected SimpleCommand, got {other:?}"),
         }

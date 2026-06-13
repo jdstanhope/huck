@@ -1668,14 +1668,14 @@ fn run_background_sequence(
         let is_last = i == n - 1;
 
         // ---- Assign-only stages: no-op ----------------------------------------
-        if let Command::Simple(SimpleCommand::Assign(items)) = stage_cmd {
+        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // Drop incoming pipe (no-op stage produces no output).
             if let Some(r) = prev_pipe_read.take() {
                 parent_held.retain(|&fd| fd != r);
                 unsafe { libc::close(r); }
             }
             // Run via fork so it's isolated (assignments don't affect parent).
-            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone()));
+            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
             let pgid_target = first_pid.unwrap_or(0);
             let stdin_fd = devnull_fd; // stage 0 default (overridden below if not first)
             // For a no-op assign stage, stdout is irrelevant but we still need
@@ -2842,7 +2842,11 @@ fn status_code(status: &ExitStatus) -> i32 {
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
-        SimpleCommand::Assign(items) => {
+        SimpleCommand::Assign(items, line) => {
+            // Stamp $LINENO before expanding RHS so it reflects this assignment's line.
+            if *line != 0 {
+                shell.current_lineno = *line;
+            }
             // Reset so only THIS assignment's RHS command substitutions count.
             shell.set_last_cmd_sub_status(None);
             let mut st = 0;
@@ -3078,6 +3082,12 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
 }
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    // Stamp $LINENO from the parse-time source line before any expansion.
+    // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
+    // from clobbering a real current line.
+    if cmd.line != 0 {
+        shell.current_lineno = cmd.line;
+    }
     // Snapshot the procsub stack. Any process substitutions realized during
     // argument expansion (resolve()) or redirect expansion are recorded in
     // shell.procsub_pending. We drain [procsub_base..] on every exit path so
@@ -3106,6 +3116,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             stdin: cmd.stdin.clone(),
             stdout: cmd.stdout.clone(),
             stderr: cmd.stderr.clone(),
+            line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
@@ -3134,6 +3145,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             stdin: cmd.stdin.clone(),
             stdout: cmd.stdout.clone(),
             stderr: cmd.stderr.clone(),
+            line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
@@ -3849,7 +3861,7 @@ fn run_multi_stage(
         let is_last = i == n - 1;
 
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
-        if let Command::Simple(SimpleCommand::Assign(items)) = stage_cmd {
+        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // In a pipeline, assignment-only stages are a no-op: they don't
             // produce output and are run as InProcess. But since assignments
             // in a subshell don't affect the parent, they're truly inert.
@@ -3860,7 +3872,7 @@ fn run_multi_stage(
                 unsafe { libc::close(r); }
             }
             // Run the assignments via fork so they're isolated.
-            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone()));
+            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
             let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
             let stdin_fd = libc::STDIN_FILENO;
             let stdout_fd = if !is_last {
@@ -5392,6 +5404,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5416,6 +5429,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5443,6 +5457,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         })
     }
 
@@ -5594,7 +5609,7 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
-                ]))],
+                ], 0))],
             }),
             rest: vec![],
             background: true,
@@ -5649,6 +5664,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5668,7 +5684,7 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
-                ]))],
+                ], 0))],
             }),
             rest: vec![],
             background: false,
@@ -5733,6 +5749,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5752,6 +5769,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5853,6 +5871,7 @@ mod tests {
                 stdin: None,
                 stdout: None,
                 stderr: None,
+                line: 0,
             }))],
         });
         let mut body = continue_seq();
@@ -5885,6 +5904,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -6062,6 +6082,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -6181,6 +6202,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6205,6 +6227,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6222,6 +6245,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6307,6 +6331,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         }))
     }
 
@@ -6321,6 +6346,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         }))
     }
 
@@ -6382,7 +6408,7 @@ mod tests {
         let shell = Shell::new();
         let cmd = Command::Simple(SimpleCommand::Assign(vec![
             bare_assign("FOO", lit_word("bar")),
-        ]));
+        ], 0));
         assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
     }
 
@@ -6422,6 +6448,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), Some("cat".to_string()));
     }
@@ -6437,6 +6464,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         // Quoted literal → None (could be a function or builtin masked by quoting).
         assert_eq!(exec.program_static_text(), None);
@@ -6453,6 +6481,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
     }
@@ -6472,6 +6501,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
     }

@@ -695,7 +695,7 @@ mod tests {
         let mut sh = Shell::new();
         // Use a minimal valid empty function body — Simple(Assign(vec![])).
         let body: Box<crate::command::Command> = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         sh.define_function("alpha".to_string(), body.clone());
         sh.define_function("alpine".to_string(), body.clone());

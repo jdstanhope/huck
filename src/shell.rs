@@ -601,29 +601,35 @@ pub fn process_line_in_sink(
     expand_aliases: bool,
     sink: &mut crate::executor::StdoutSink,
 ) -> ExecOutcome {
-    let tokens = match lexer::tokenize_with_opts(
-        line,
-        lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) },
-    ) {
-        Ok(tokens) => tokens,
-        Err(e) => {
+    let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) };
+    let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
+        Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
+        Err((e, _off)) => {
             eprintln!("huck: syntax error{}", lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
     };
-    let tokens = if expand_aliases {
+    // Per-token source lines stamped directly by the lexer (true O(n), no second pass).
+    // lex_lines.len() == tokens.len() + 1 (includes sentinel); slice to token count.
+    let lines: Vec<u32> = lex_lines[..tokens.len()].to_vec();
+    let (tokens, lines) = if expand_aliases {
         match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
-            Ok(t) => t,
+            Ok(t) => {
+                // If alias expansion changed the token count, fall back to zeros
+                // rather than corrupting the line index.
+                let l = if t.len() == lines.len() { lines } else { vec![0; t.len()] };
+                (t, l)
+            }
             Err(e) => {
                 eprintln!("huck: syntax error{}", lex_error_message(e));
                 return ExecOutcome::Continue(2);
             }
         }
     } else {
-        tokens
+        (tokens, lines)
     };
 
-    match command::parse(tokens) {
+    match command::parse_with_lines(tokens, lines) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {

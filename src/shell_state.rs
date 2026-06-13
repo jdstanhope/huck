@@ -387,6 +387,11 @@ pub struct Shell {
     /// after the current command (see src/procsub.rs). Snapshot/drained by the
     /// executor around each command.
     pub procsub_pending: Vec<crate::procsub::ProcSub>,
+
+    /// Line number of the currently-executing command (POSIX `$LINENO`).
+    /// Stamped by the executor at the top of `run_exec_single` from
+    /// `ExecCommand.line`. Zero means "unknown / not yet set".
+    pub current_lineno: u32,
 }
 
 /// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
@@ -489,6 +494,7 @@ impl Shell {
             completion_specs: Rc::new(CompletionSpecs::default()),
             current_completion_spec: None,
             procsub_pending: Vec::new(),
+            current_lineno: 0,
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -560,6 +566,7 @@ impl Shell {
             ),
             "-" => return Some(self.dollar_dash_value()),
             "?" => return Some(self.last_status().to_string()),
+            "LINENO" => return Some(self.current_lineno.to_string()),
             _ => {}
         }
         if name == "#" {
@@ -1804,7 +1811,7 @@ mod tests {
         let mut a = Shell::new();
         // Use the same minimal body shape as the builtins tests.
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         a.define_function("f".to_string(), body.clone());
         assert_eq!(Rc::strong_count(&a.functions), 1);
