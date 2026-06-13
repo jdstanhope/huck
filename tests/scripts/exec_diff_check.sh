@@ -28,7 +28,7 @@ check "passes args"             'exec printf "%s-%s\n" a b'
 check "exit code is true"       'exec true'
 check "exit code is false"      'exec false; echo NOT_REACHED'
 check "inherits exported var"   'export V=xyz; exec sh -c "echo $V"'
-check "inline assign exported"  'V=abc exec sh -c "echo $V"'
+check "inline assign exported"  "V=abc exec sh -c 'echo \$V'"
 check "-a sets argv0"           'exec -a MYNAME sh -c "echo \$0"'
 check "-- ends options"         'exec -- echo dashdash'
 check "in a subshell"           '(exec echo sub); echo parent-alive'

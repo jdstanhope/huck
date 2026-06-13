@@ -3687,9 +3687,16 @@ const EXEC_RESET_SIGNALS: [libc::c_int; 3] =
 /// any change here persists in the shell on the (rare) exec-failure path — so
 /// the caller restores them via `restore_exec_signals` if exec returns.
 unsafe fn reset_exec_signals_saving() -> [libc::sighandler_t; 3] {
-    let mut prev = [0 as libc::sighandler_t; 3];
+    // Default each slot to SIG_DFL so that on the (practically impossible — these
+    // were SIG_IGN'd at startup) SIG_ERR return, restore becomes a no-op instead
+    // of passing SIG_ERR back to signal() (POSIX-undefined). Mirrors the SIG_ERR
+    // guard in install_job_control_signals.
+    let mut prev = [libc::SIG_DFL; 3];
     for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
-        prev[i] = unsafe { libc::signal(sig, libc::SIG_DFL) };
+        let old = unsafe { libc::signal(sig, libc::SIG_DFL) };
+        if old != libc::SIG_ERR {
+            prev[i] = old;
+        }
     }
     prev
 }
