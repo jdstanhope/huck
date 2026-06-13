@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 36 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -61,7 +61,6 @@ group.
 
 - **M-20: `n<>file` read-write open** — `[deferred]` low. huck: not implemented. bash: opens fd for read+write.
 - **M-51: `|&` pipe stdout+stderr** — `[deferred]` low. huck: parse error. bash: shorthand for `2>&1 |`.
-- **M-123: bare redirect-only command (`>file`)** — `[deferred]` medium. A command consisting only of redirections with NO program word and NO assignment (`>file`, `2>err`, `<in`) is a **parse error** in huck (`syntax error: expected a command`); bash performs the redirections for their side effects (notably `>file` truncating/creating a file — a common idiom) and exits 0. The sibling case WITH an assignment (`VAR=val 2>err`) DOES parse and now executes correctly (the assignment/redirect-only `ExecCommand` path); the gap is purely the parser rejecting an all-redirect command with no assignment. Fix lives in `build_simple_command` (command.rs): allow an empty program word + empty assignments when redirects are present, producing the same empty-program `ExecCommand` the executor already handles.
 
 ### Quoting
 

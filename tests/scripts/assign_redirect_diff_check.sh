@@ -13,6 +13,9 @@
 #   - a failed redirect open still leaves the assignment applied, status reflects
 #     the failure.
 #
+# Also covers the bare redirect-only command (`>file`, no assignment) — M-123:
+# bash performs the redirection for its side effect (truncate/create) and exits 0.
+#
 # NOT covered (known, separate divergences — keep out of a byte-compare):
 #   - readonly-assignment error text ("huck:" vs "bash: line N:" prefix) and
 #     bash aborting a non-interactive shell on a readonly assignment;
@@ -42,6 +45,14 @@ check "two assigns then real cmd"  'v=1 2>&1; w=2; echo "$v $w"'
 check "redirect truncates file"    'f=$(mktemp); echo junk > "$f"; v=1 > "$f"; echo "[$(cat "$f")]"; echo "v=$v"; rm -f "$f"'
 check "redirect appends to file"   'f=$(mktemp); printf head > "$f"; v=1 >> "$f"; printf tail >> "$f"; echo "[$(cat "$f")]"; rm -f "$f"'
 check "assign visible to later cmd" 'PATHX=/x 2>/dev/null; echo "$PATHX"'
+# M-123: bare redirect-only command (no assignment, no program word).
+check "bare >f truncates"          'f=$(mktemp); echo junk > "$f"; > "$f"; echo "rc=$? [$(cat "$f")]"; rm -f "$f"'
+check "bare >f creates"            'f=$(mktemp); rm -f "$f"; > "$f"; echo "rc=$? exists=$([ -f "$f" ] && echo y)"; rm -f "$f"'
+check "bare >>f appends/creates"   'f=$(mktemp); printf abc > "$f"; >> "$f"; echo "[$(cat "$f")]"; rm -f "$f"'
+check "bare 2>f redirect-only"     '2>/dev/null; echo rc=$?'
+check "bare <f reads (no effect)"  'f=$(mktemp); echo data > "$f"; < "$f"; echo "rc=$? [$(cat "$f")]"; rm -f "$f"'
+check "bare >f in && chain"        'f=$(mktemp); > "$f" && echo ok; rm -f "$f"'
+check "bare >f as pipeline stage"  'f=$(mktemp); echo X > "$f"; cat | > "$f"; echo "[$(cat "$f")]"; rm -f "$f"'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
