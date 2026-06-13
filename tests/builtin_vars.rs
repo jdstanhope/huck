@@ -83,3 +83,18 @@ fn shlvl_increments_from_env() {
         .args(["-c", "echo $SHLVL"]).env("SHLVL", "5").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "6");
 }
+
+#[test]
+fn compgen_v_lists_dynamic_specials() {
+    let out = huck("compgen -v");
+    for v in ["RANDOM", "SECONDS", "LINENO", "BASHPID", "UID", "BASH_VERSION", "BASH_SOURCE"] {
+        assert!(out.lines().any(|l| l == v), "compgen -v should list {v}; got:\n{out}");
+    }
+}
+
+#[test]
+fn compgen_v_omits_funcname_at_top_level() {
+    // bash omits FUNCNAME from top-level compgen -v; huck should too (not in registry, unset at top level)
+    let out = huck("compgen -v");
+    assert!(!out.lines().any(|l| l == "FUNCNAME"), "FUNCNAME should NOT be listed at top level");
+}

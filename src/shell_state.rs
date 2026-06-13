@@ -509,6 +509,12 @@ fn random_next(state: &std::cell::Cell<u64>) -> u32 {
     ((s >> 33) as u32) & 0x7fff
 }
 
+/// Special variables that are valid/known but not always present in the vars table
+/// (computed dynamics + the sometimes-unset call-stack arrays). Surfaced in variable-name
+/// completion and `compgen -v` so they complete like bash even when unset.
+pub const DYNAMIC_SPECIAL_VARS: &[&str] =
+    &["RANDOM", "SECONDS", "EPOCHSECONDS", "BASHPID", "LINENO", "BASH_SOURCE", "BASH_LINENO"];
+
 impl Shell {
     pub fn new() -> Self {
         let mut vars = HashMap::new();
@@ -1803,6 +1809,16 @@ impl Shell {
     /// Iterates the names of all variables (exported or not).
     pub fn var_names(&self) -> impl Iterator<Item = &str> {
         self.vars.keys().map(|s| s.as_str())
+    }
+
+    /// Variable names for completion / `compgen -v`: the vars table plus the known
+    /// dynamic/special names not always stored. Deduped (sorted).
+    pub fn completion_var_names(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = self.vars.keys().cloned().collect();
+        for &n in DYNAMIC_SPECIAL_VARS {
+            set.insert(n.to_string());
+        }
+        set.into_iter().collect()
     }
 
     /// Sends SIGHUP to every live job not marked for nohup. Called

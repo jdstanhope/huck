@@ -401,7 +401,7 @@ pub(crate) mod dispatch {
 
         // Path 1: variable context — always wins, no spec lookup.
         if let CompletionContext::Variable { prefix } = &context {
-            let var_names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
+            let var_names: Vec<String> = shell.completion_var_names();
             return (start, complete_variable(prefix, &var_names));
         }
 
@@ -567,7 +567,7 @@ pub(crate) mod dispatch {
         let (_, ctx) = analyze(line, pos);
         match ctx {
             CompletionContext::Variable { prefix } => {
-                let names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
+                let names: Vec<String> = shell.completion_var_names();
                 complete_variable(&prefix, &names)
                     .into_iter()
                     .map(|c| c.replacement)
