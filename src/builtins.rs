@@ -5675,7 +5675,16 @@ pub(crate) fn source_in_sink(
     };
 
     shell.source_depth += 1;
+    shell.call_stack.push(crate::shell_state::Frame {
+        funcname: "source".to_string(),
+        source: path.to_string_lossy().into_owned(),
+        call_line: shell.current_lineno,
+        kind: crate::shell_state::FrameKind::Source,
+    });
+    shell.sync_call_arrays();
     let result = run_sourced_contents_in_sink(&contents, &path, shell, sink);
+    shell.call_stack.pop();
+    shell.sync_call_arrays();
     shell.source_depth -= 1;
 
     if let Some(saved) = saved_positional {

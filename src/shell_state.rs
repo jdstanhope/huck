@@ -12,7 +12,6 @@ use crate::jobs::JobTable;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameKind {
     Function,
-    #[allow(dead_code)] // wired in Task 4
     Source,
     Main,
 }
@@ -1182,11 +1181,17 @@ impl Shell {
         }
         self.set_indexed_var("BASH_SOURCE", sources);
         self.set_indexed_var("BASH_LINENO", linenos);
-        // FUNCNAME is unset when the top frame is the base `main` (Task 3 adds Main frames).
-        if matches!(self.call_stack.last().map(|f| &f.kind), Some(FrameKind::Main)) {
-            self.vars.remove("FUNCNAME");
-        } else {
+        // FUNCNAME is unset when there are no Function frames (only Main/Source frames present).
+        // bash omits FUNCNAME entirely at top-level script and during a top-level `source`,
+        // but shows [source, func, ..., main] when source is called inside a function.
+        let has_function_frame = self
+            .call_stack
+            .iter()
+            .any(|f| f.kind == FrameKind::Function);
+        if has_function_frame {
             self.set_indexed_var("FUNCNAME", funcnames);
+        } else {
+            self.vars.remove("FUNCNAME");
         }
     }
 
