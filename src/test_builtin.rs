@@ -131,6 +131,11 @@ pub(crate) fn compare_files(op: &str, lhs: &str, rhs: &str) -> bool {
 }
 
 /// Applies a unary operator to its operand.
+// The `libc::S_IF*`/`S_IS*` constants are `mode_t` — `u32` on Linux but `u16` on
+// macOS/BSD. They are cast `as u32` (to match `file_mode()`'s `u32`) for a
+// cross-platform build; that cast is a no-op on Linux, where clippy then flags it
+// as unnecessary. The cast is required on macOS, so suppress the Linux-only lint.
+#[allow(clippy::unnecessary_cast)]
 fn apply_unary(
     op: &str,
     operand: &str,
