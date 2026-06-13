@@ -3078,6 +3078,12 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
 }
 
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    // Stamp $LINENO from the parse-time source line before any expansion.
+    // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
+    // from clobbering a real current line.
+    if cmd.line != 0 {
+        shell.current_lineno = cmd.line;
+    }
     // Snapshot the procsub stack. Any process substitutions realized during
     // argument expansion (resolve()) or redirect expansion are recorded in
     // shell.procsub_pending. We drain [procsub_base..] on every exit path so
