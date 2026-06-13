@@ -299,6 +299,14 @@ pub struct LexerOptions {
     pub extglob: bool,
 }
 
+/// Raw output of the partial tokenizer: `tokens`, parallel byte `offsets` and
+/// 1-based `lines` (with a trailing sentinel), and an optional trailing lex
+/// error + the byte offset where lexing failed.
+type PartialTokens = (Vec<Token>, Vec<usize>, Vec<u32>, Option<(LexError, usize)>);
+/// Successful tokenization with positions: `tokens` plus parallel `offsets` and
+/// `lines`. See [`tokenize_with_offsets`].
+type TokensWithPos = (Vec<Token>, Vec<usize>, Vec<u32>);
+
 /// Back-compat entry: lexes with all options off (current behavior).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_with_opts(input, LexerOptions::default())
@@ -315,7 +323,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 pub fn tokenize_with_offsets(
     input: &str,
     opts: LexerOptions,
-) -> Result<(Vec<Token>, Vec<usize>, Vec<u32>), (LexError, usize)> {
+) -> Result<TokensWithPos, (LexError, usize)> {
     match tokenize_partial(input, opts) {
         (tokens, offsets, lines, None) => Ok((tokens, offsets, lines)),
         (_, _, _, Some((e, off))) => Err((e, off)),
@@ -344,7 +352,7 @@ fn tokenize_partial_inner(
     input: &str,
     opts: LexerOptions,
     brace_expand: bool,
-) -> (Vec<Token>, Vec<usize>, Vec<u32>, Option<(LexError, usize)>) {
+) -> PartialTokens {
     let mut tokens: Vec<Token> = Vec::new();
     let mut offsets: Vec<usize> = Vec::new();
     let mut lines: Vec<u32> = Vec::new();
@@ -987,7 +995,7 @@ fn tokenize_partial_inner(
 pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
-) -> (Vec<Token>, Vec<usize>, Vec<u32>, Option<(LexError, usize)>) {
+) -> PartialTokens {
     tokenize_partial_inner(input, opts, true)
 }
 
