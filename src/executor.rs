@@ -2847,33 +2847,7 @@ fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> 
             if *line != 0 {
                 shell.current_lineno = *line;
             }
-            // Reset so only THIS assignment's RHS command substitutions count.
-            shell.set_last_cmd_sub_status(None);
-            let mut st = 0;
-            for a in items {
-                let name = a.target.name();
-                if shell.is_readonly(name) {
-                    eprintln!("huck: {name}: readonly variable");
-                    st = 1;
-                    break;
-                }
-                if apply_one_assignment(a, shell).is_err() {
-                    st = 1;
-                    break;
-                }
-                if shell.shell_options.xtrace {
-                    let val = shell.lookup_var(name).unwrap_or_default();
-                    let p4 = ps4(shell);
-                    xtrace_emit(&format!("{p4}{name}={}",
-                              crate::param_expansion::xtrace_quote(&val)));
-                }
-            }
-            // bash: a bare assignment's status is the last command substitution
-            // in its RHS (or 0 if none). A readonly/apply error keeps st=1.
-            if st == 0 {
-                st = shell.last_cmd_sub_status().unwrap_or(0);
-            }
-            ExecOutcome::Continue(st)
+            ExecOutcome::Continue(run_assignment_list(items, shell))
         }
     };
     // $PIPESTATUS reflects this leaf command's exit status. break/continue
@@ -3087,6 +3061,42 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
     }
 }
 
+/// Apply a list of assignments to the current shell (persistent), bash-style:
+/// per-assignment readonly check, then `apply_one_assignment`, with the exit
+/// status taken from the last RHS command substitution (or 0; a readonly/apply
+/// error keeps status 1). Shared by `SimpleCommand::Assign` (a bare assignment)
+/// and the assignment/redirect-only `ExecCommand` (empty program word, e.g.
+/// `VAR=val 2>err`).
+fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) -> i32 {
+    // Reset so only THESE assignments' RHS command substitutions count.
+    shell.set_last_cmd_sub_status(None);
+    let mut st = 0;
+    for a in items {
+        let name = a.target.name();
+        if shell.is_readonly(name) {
+            eprintln!("huck: {name}: readonly variable");
+            st = 1;
+            break;
+        }
+        if apply_one_assignment(a, shell).is_err() {
+            st = 1;
+            break;
+        }
+        if shell.shell_options.xtrace {
+            let val = shell.lookup_var(name).unwrap_or_default();
+            let p4 = ps4(shell);
+            xtrace_emit(&format!("{p4}{name}={}",
+                      crate::param_expansion::xtrace_quote(&val)));
+        }
+    }
+    // bash: a bare assignment's status is the last command substitution in its
+    // RHS (or 0 if none). A readonly/apply error keeps st=1.
+    if st == 0 {
+        st = shell.last_cmd_sub_status().unwrap_or(0);
+    }
+    st
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     // Stamp $LINENO from the parse-time source line before any expansion.
     // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
@@ -3156,6 +3166,37 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
         return run_exec_single(&inner, shell, sink);
+    }
+
+    // Assignment/redirect-only command: no program word, just inline assignments
+    // and/or redirects (e.g. `VAR=val 2>err`). bash applies the assignments to
+    // the CURRENT shell (persistent, unlike the scoped prefix-assignments of a
+    // real command) and performs the redirects for side effects, then exits 0
+    // (1 on a readonly assignment) — it is NOT "command not found". The parser
+    // emits an ExecCommand with an empty program Word for these; resolve() would
+    // otherwise reject the empty program name. (A bare redirect with no
+    // assignment, `>file`, is currently a parse error — tracked separately.)
+    if cmd.program.0.is_empty() {
+        // bash processes the assignments with the ORIGINAL (un-redirected) fds:
+        // RHS command substitutions and any readonly-variable error use the
+        // inherited stderr, NOT the command's own `2>…`. It then performs the
+        // redirections for their side effects only (e.g. `>f` truncation). So
+        // apply the assignments first, then open the redirects with a no-op
+        // body. A redirect that fails to open still leaves the assignment
+        // applied but makes the status reflect the open failure (bash:
+        // `x=1 </missing` → `x` is set, rc 1) — with_redirect_scope returns the
+        // open failure before running the body, so its status wins.
+        let st = run_assignment_list(&cmd.inline_assignments, shell);
+        let outcome = with_redirect_scope(
+            &cmd.stdin,
+            &cmd.stdout,
+            &cmd.stderr,
+            shell,
+            sink,
+            move |_shell, _sink| ExecOutcome::Continue(st),
+        );
+        drain_procsubs(shell, procsub_base);
+        return outcome;
     }
 
     let mut resolved = match resolve(cmd, shell) {
