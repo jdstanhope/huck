@@ -12,9 +12,8 @@ use crate::jobs::JobTable;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameKind {
     Function,
-    #[allow(dead_code)] // wired in Task 2-4
+    #[allow(dead_code)] // wired in Task 4
     Source,
-    #[allow(dead_code)] // wired in Task 2-4
     Main,
 }
 

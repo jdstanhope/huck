@@ -188,11 +188,17 @@ fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32> {
 /// runs the program through the shared `run_sourced_contents` engine, fires the
 /// EXIT trap, and hangs up jobs. Does NOT touch interactive history or the
 /// line editor.
+///
+/// When `push_main_frame` is true (script-file mode), a base `FrameKind::Main`
+/// frame is pushed before executing and popped after, so that BASH_SOURCE and
+/// BASH_LINENO are populated at the top level and FUNCNAME gains the `main`
+/// entry inside functions. For `-c` and other non-file modes pass `false`.
 fn run_program(
     contents: &str,
     argv0: Option<String>,
     args: Vec<String>,
     label: &str,
+    push_main_frame: bool,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
@@ -202,11 +208,27 @@ fn run_program(
     }
     shell.positional_args = args;
 
+    if push_main_frame {
+        shell.call_stack.push(crate::shell_state::Frame {
+            funcname: "main".to_string(),
+            source: label.to_string(),
+            call_line: 0,
+            kind: crate::shell_state::FrameKind::Main,
+        });
+        shell.sync_call_arrays();
+    }
+
     let outcome = crate::builtins::run_sourced_contents(
         contents,
         std::path::Path::new(label),
         &mut shell,
     );
+
+    if push_main_frame {
+        shell.call_stack.pop();
+        shell.sync_call_arrays();
+    }
+
     let code = match outcome {
         ExecOutcome::Exit(n) => n,
         // run_sourced_contents normalizes FunctionReturn -> Continue, so this arm is
@@ -247,7 +269,7 @@ pub fn run(args: &[String]) -> i32 {
             let label = argv0
                 .clone()
                 .unwrap_or_else(|| shell_cell.borrow().shell_argv0.clone());
-            return run_program(&command, argv0, args, &label, &shell_cell);
+            return run_program(&command, argv0, args, &label, false, &shell_cell);
         }
         RunMode::File { path, args } => {
             let contents = match std::fs::read_to_string(&path) {
@@ -263,7 +285,7 @@ pub fn run(args: &[String]) -> i32 {
                 }
             };
             let label = path.display().to_string();
-            return run_program(&contents, Some(label.clone()), args, &label, &shell_cell);
+            return run_program(&contents, Some(label.clone()), args, &label, true, &shell_cell);
         }
         RunMode::Interactive => {}
     }
