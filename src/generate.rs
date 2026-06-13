@@ -509,6 +509,13 @@ fn part_to_source(part: &WordPart) -> String {
             if *append { "+" } else { "" }
         ),
         WordPart::ArrayLiteral(elems) => array_literal_to_source(elems),
+        WordPart::ProcessSub { sequence, dir } => {
+            let prefix = match dir {
+                crate::lexer::ProcDir::In  => "<(",
+                crate::lexer::ProcDir::Out => ">(",
+            };
+            format!("{}{})", prefix, sequence_to_source(sequence, 0).trim_end())
+        }
     }
 }
 
@@ -983,5 +990,32 @@ mod tests {
     #[test]
     fn rt_heredoc_collision() {
         assert_rt("cat <<EOF\nEOF_GEN\nhi\nEOF");
+    }
+
+    #[test]
+    fn renders_process_substitution_both_directions() {
+        use crate::{command, lexer};
+
+        // input direction: <(...)
+        let seq_in = command::parse(lexer::tokenize("f() { cat <(echo a); }").expect("lex"))
+            .expect("parse")
+            .expect("non-empty");
+        let body_in = match seq_in.first {
+            command::Command::FunctionDef { body, .. } => body,
+            _ => panic!("expected FunctionDef"),
+        };
+        let rendered_in = function_to_source("f", &body_in);
+        assert!(rendered_in.contains("<(echo a)"), "got: {rendered_in}");
+
+        // output direction: >(...)
+        let seq_out = command::parse(lexer::tokenize("g() { tee >(cat); }").expect("lex"))
+            .expect("parse")
+            .expect("non-empty");
+        let body_out = match seq_out.first {
+            command::Command::FunctionDef { body, .. } => body,
+            _ => panic!("expected FunctionDef"),
+        };
+        let rendered_out = function_to_source("g", &body_out);
+        assert!(rendered_out.contains(">(cat)"), "got: {rendered_out}");
     }
 }

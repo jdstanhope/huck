@@ -382,6 +382,11 @@ pub struct Shell {
     /// the live spec. Set by `dispatch::resolve` before invoking `-F`;
     /// taken back out afterward.
     pub current_completion_spec: Option<CompletionSpec>,
+
+    /// Live process substitutions whose inner process + fd must be cleaned up
+    /// after the current command (see src/procsub.rs). Snapshot/drained by the
+    /// executor around each command.
+    pub procsub_pending: Vec<crate::procsub::ProcSub>,
 }
 
 /// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
@@ -483,6 +488,7 @@ impl Shell {
             dir_stack: Vec::new(),
             completion_specs: Rc::new(CompletionSpecs::default()),
             current_completion_spec: None,
+            procsub_pending: Vec::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.

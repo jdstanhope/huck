@@ -983,6 +983,22 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 let rendered = reconstruct_array_literal(elems, shell);
                 current.push_str(&rendered, true);
             }
+            WordPart::ProcessSub { sequence, dir } => {
+                match crate::procsub::realize(sequence, dir.clone(), shell) {
+                    Ok((path, ps)) => {
+                        shell.procsub_pending.push(ps);
+                        // The realized path (/dev/fd/N or a FIFO) is a single
+                        // non-splitting, non-glob field — mirror the
+                        // `CommandSub { quoted: true }` treatment.
+                        current.push_str(&path, true);
+                        has_emitted = true;
+                    }
+                    Err(e) => {
+                        eprintln!("huck: process substitution: {e}");
+                        // Emit nothing; the field stays empty if no other parts.
+                    }
+                }
+            }
         }
     }
 
@@ -1136,6 +1152,12 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
             WordPart::ArrayLiteral(elems) => {
                 result.push_str(&reconstruct_array_literal(elems, shell));
             }
+            WordPart::ProcessSub { .. } => {
+                // Process substitution is meaningful only in command-argument /
+                // redirect-target expansion (the main expand() path). Realizing
+                // it here (assignment context, no command to consume the fd)
+                // would leak an fd and a child process with no benefit. No-op.
+            }
         }
     }
     result
@@ -1154,6 +1176,9 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         WordPart::AllArgs { quoted, .. } => *quoted,
         WordPart::Tilde(_) => false,
         WordPart::AssignPrefix { .. } | WordPart::ArrayLiteral(_) => false,
+        // ProcessSub expands to a single /dev/fd/N path — treated as quoted
+        // (no IFS-splitting, no glob expansion of the realized path).
+        WordPart::ProcessSub { .. } => true,
     }
 }
 
@@ -1206,6 +1231,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
 /// substituted command's exit status into the parent shell's `$?`.
 pub fn run_substitution(seq: &Sequence, shell: &mut Shell) -> String {
     let mut cloned = shell.clone();
+    cloned.procsub_pending = Vec::new(); // a clone must not inherit/duplicate the parent's pending process substitutions
     cloned.xtrace_depth += 1; // PS4 depth-repeat: $() / backticks add a level (bash)
     let (output, status) = executor::execute_capturing(seq, &mut cloned);
     shell.set_last_status(status);
