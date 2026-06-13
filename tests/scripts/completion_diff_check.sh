@@ -124,6 +124,24 @@ check_strip_warning "compgen -F reads COMP_WORDS (via dollar args)" \
 check "compgen -W respects IFS" \
       'IFS=: compgen -W "a:b:c" -- ""'
 
+# 13. `complete -o nosort/noquote/plusdirs` registration succeeds (these were
+#     previously rejected as invalid completion options). The compspec install
+#     itself is silent + rc 0 in both shells; the `-p` print form is divergent
+#     (see note below) so we assert the install, not the dump.
+check "complete -o nosort accepts" \
+      'complete -o nosort -W "x y z" foo && echo ok'
+check "complete -o noquote accepts" \
+      'complete -o noquote -W "x" foo && echo ok'
+check "complete -o plusdirs accepts" \
+      'complete -o plusdirs -W "x" foo && echo ok'
+check "complete uv-style line accepts" \
+      '_uv() { :; }; complete -F _uv -o nosort -o bashdefault -o default uv && echo ok'
+check "complete +o nosort accepts" \
+      'complete -o nosort -W x foo; complete +o nosort foo && echo ok'
+# NOTE: a bogus `-o` arg is rejected in both shells (rc 2) but the message text
+# differs (bash "invalid option name" vs huck "invalid completion option"), so
+# it is not byte-comparable here.
+
 # NOTE: complete -p re-input form is intentionally divergent (huck uses
 # a deterministic flag ordering; bash's varies). Not exercised here.
 

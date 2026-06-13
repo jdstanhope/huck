@@ -41,6 +41,14 @@ pub struct CompOptions {
     pub filenames: bool,
     pub bashdefault: bool,
     pub dirnames: bool,
+    /// `-o nosort`: do not sort the completion results — preserve the order the
+    /// compspec (function / wordlist / action) produced them in.
+    pub nosort: bool,
+    /// `-o noquote`: do not quote shell metacharacters in filename completions.
+    pub noquote: bool,
+    /// `-o plusdirs`: in addition to the compspec's matches, also complete
+    /// directory names for the current word and append them to the results.
+    pub plusdirs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +239,14 @@ pub fn resolve_spec(
         for s in out.iter_mut() {
             *s = format!("{s}{suffix}");
         }
+    }
+
+    // -o plusdirs: append directory-name completions for the current word.
+    // bash adds these AFTER the compspec's own matches and does NOT apply the
+    // -P/-S/-X decorations to them, so this runs last.
+    if spec.options.plusdirs {
+        let mut dirs = enumerate_action(Action::Directory, &ctx.cur_word, shell);
+        out.append(&mut dirs);
     }
 
     out
