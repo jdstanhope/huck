@@ -98,3 +98,15 @@ fn compgen_v_omits_funcname_at_top_level() {
     let out = huck("compgen -v");
     assert!(!out.lines().any(|l| l == "FUNCNAME"), "FUNCNAME should NOT be listed at top level");
 }
+
+#[test]
+fn export_random_reseeds_and_stores_no_ghost() {
+    // export with a quoted value goes through export_set; it must reseed (deterministic), not store a ghost.
+    let a = huck(r#"export "RANDOM=7"; echo $RANDOM $RANDOM"#);
+    let b = huck(r#"export "RANDOM=7"; echo $RANDOM $RANDOM"#);
+    assert_eq!(a, b, "export RANDOM=7 must reseed deterministically");
+    // no ghost: declare -p RANDOM must NOT print a stored value of 7
+    let dp = huck(r#"export "RANDOM=7"; declare -p RANDOM 2>&1"#);
+    assert!(!dp.contains("RANDOM=\"7\"") && !dp.contains("RANDOM='7'"),
+        "RANDOM must not be stored as a ghost var; got: {dp}");
+}

@@ -722,11 +722,10 @@ impl Shell {
     }
 
     /// Sets a variable's value, preserving its existing `exported` flag (or
-    /// creating it as unexported if it didn't exist). When the existing
-    /// value is an `Indexed` array, only element 0 is overwritten — the
-    /// rest of the map is preserved (matches bash: `a=v` on an indexed
-    /// array overwrites a[0]).
-    pub fn set(&mut self, name: &str, value: String) {
+    /// If `name` is a reseed/reset-on-assignment dynamic special (`RANDOM`/`SECONDS`),
+    /// apply the side effect and return `true` (caller must NOT store it as a var —
+    /// these are computed in `lookup_var`). Returns `false` for ordinary names.
+    fn reseed_special_on_assign(&mut self, name: &str, value: &str) -> bool {
         match name {
             "RANDOM" => {
                 if let Ok(n) = value.parse::<u64>() {
@@ -734,7 +733,7 @@ impl Shell {
                         n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
                     );
                 }
-                return;
+                true
             }
             "SECONDS" => {
                 if let Ok(n) = value.parse::<u64>() {
@@ -742,10 +741,18 @@ impl Shell {
                         .checked_sub(std::time::Duration::from_secs(n))
                         .unwrap_or_else(std::time::Instant::now);
                 }
-                return;
+                true
             }
-            _ => {}
+            _ => false,
         }
+    }
+
+    /// creating it as unexported if it didn't exist). When the existing
+    /// value is an `Indexed` array, only element 0 is overwritten — the
+    /// rest of the map is preserved (matches bash: `a=v` on an indexed
+    /// array overwrites a[0]).
+    pub fn set(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => install_scalar_value(existing, value),
             None => {
@@ -964,6 +971,7 @@ impl Shell {
     /// reject writes to readonly vars must check `is_readonly` first
     /// (see `builtin_export` and `apply_inline_assignments`).
     pub fn export_set(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => {
                 install_scalar_value(existing, value);
@@ -1098,25 +1106,7 @@ impl Shell {
             return Err(());
         }
         // Intercept dynamic builtin variables: reseed RANDOM or reset SECONDS.
-        match name {
-            "RANDOM" => {
-                if let Ok(n) = value.parse::<u64>() {
-                    self.random_state.set(
-                        n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
-                    );
-                }
-                return Ok(());
-            }
-            "SECONDS" => {
-                if let Ok(n) = value.parse::<u64>() {
-                    self.seconds_base = std::time::Instant::now()
-                        .checked_sub(std::time::Duration::from_secs(n))
-                        .unwrap_or_else(std::time::Instant::now);
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
+        if self.reseed_special_on_assign(name, &value) { return Ok(()); }
         // Determine whether the integer-coerce path applies: only on
         // an existing integer-flagged Scalar. Indexed variables (even
         // if integer-flagged) take the array-element-0 overwrite path
