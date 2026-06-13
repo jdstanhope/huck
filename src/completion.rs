@@ -521,9 +521,14 @@ pub(crate) mod dispatch {
                     };
                     // Preserve a leading `~/` UNescaped (tilde-expansion intent);
                     // escaping it would yield `cd \~/projects` (a literal `~` dir).
-                    let mut replacement = match name.strip_prefix("~/") {
-                        Some(rest) => format!("~/{}", escape_filename(rest)),
-                        None => escape_filename(&name),
+                    // `-o noquote` suppresses metacharacter escaping entirely.
+                    let mut replacement = if effective_options.noquote {
+                        name.clone()
+                    } else {
+                        match name.strip_prefix("~/") {
+                            Some(rest) => format!("~/{}", escape_filename(rest)),
+                            None => escape_filename(&name),
+                        }
                     };
                     if is_dir {
                         replacement.push('/');
@@ -538,13 +543,16 @@ pub(crate) mod dispatch {
                 .collect()
         };
 
-        // Sort + dedupe by replacement (stable).
+        // Dedupe by replacement (stable, preserves first-seen order), then sort
+        // unless `-o nosort` asked to keep the compspec's own ordering.
         let mut seen = std::collections::HashSet::new();
         let mut deduped: Vec<Candidate> = candidates
             .into_iter()
             .filter(|c| seen.insert(c.replacement.clone()))
             .collect();
-        deduped.sort_by(|a, b| a.display.cmp(&b.display));
+        if !effective_options.nosort {
+            deduped.sort_by(|a, b| a.display.cmp(&b.display));
+        }
         deduped
     }
 
@@ -919,6 +927,42 @@ mod tests {
         let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(reps.contains(&"projects/alpha"), "{reps:?}");
         assert!(reps.contains(&"projects/beta"), "{reps:?}");
+    }
+
+    #[test]
+    fn spec_default_sorts_wordlist_results() {
+        // Without `-o nosort`, a `-W` wordlist's results are sorted.
+        let mut sh = Shell::new();
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "foo".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("banana apple cherry".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_start, cands) = dispatch::resolve("foo ", 4, &mut sh);
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(reps, vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn spec_nosort_preserves_wordlist_order() {
+        // `-o nosort` keeps the compspec's own ordering (here, wordlist order).
+        let mut sh = Shell::new();
+        std::rc::Rc::make_mut(&mut sh.completion_specs).by_command.insert(
+            "foo".to_string(),
+            crate::completion_spec::CompletionSpec {
+                wordlist: Some("banana apple cherry".to_string()),
+                options: crate::completion_spec::CompOptions {
+                    nosort: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (_start, cands) = dispatch::resolve("foo ", 4, &mut sh);
+        let reps: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(reps, vec!["banana", "apple", "cherry"]);
     }
 
     #[test]

@@ -172,10 +172,9 @@ fn apply_option(opts: &mut CompOptions, name: &str, off: bool) -> Result<(), Fla
         "filenames" => opts.filenames = value,
         "bashdefault" => opts.bashdefault = value,
         "dirnames" => opts.dirnames = value,
-        // Recognized-but-rejected: parse error per spec.
-        "nosort" | "noquote" | "plusdirs" => {
-            return Err(FlagError::InvalidOption(name.to_string()));
-        }
+        "nosort" => opts.nosort = value,
+        "noquote" => opts.noquote = value,
+        "plusdirs" => opts.plusdirs = value,
         _ => return Err(FlagError::InvalidOption(name.to_string())),
     }
     Ok(())
@@ -375,6 +374,9 @@ fn format_spec_for_print(
         filenames,
         bashdefault,
         dirnames,
+        nosort,
+        noquote,
+        plusdirs,
     } = spec.options;
     if default {
         parts.push("-o default".to_string());
@@ -390,6 +392,15 @@ fn format_spec_for_print(
     }
     if dirnames {
         parts.push("-o dirnames".to_string());
+    }
+    if noquote {
+        parts.push("-o noquote".to_string());
+    }
+    if nosort {
+        parts.push("-o nosort".to_string());
+    }
+    if plusdirs {
+        parts.push("-o plusdirs".to_string());
     }
     if let Some(n) = name {
         parts.push("--".to_string());
@@ -683,8 +694,32 @@ mod tests {
     #[test]
     fn complete_invalid_option_errors() {
         let mut sh = Shell::new();
-        let (_, code) = run_complete(&["-o", "nosort", "--", "foo"], &mut sh);
+        let (_, code) = run_complete(&["-o", "bogus", "--", "foo"], &mut sh);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn complete_nosort_noquote_plusdirs_accepted() {
+        // These three `-o` options are accepted (previously rejected). They
+        // install into CompOptions and the compspec registers successfully.
+        let mut sh = Shell::new();
+        let (_, code) = run_complete(
+            &["-o", "nosort", "-o", "noquote", "-o", "plusdirs", "-W", "x", "--", "foo"],
+            &mut sh,
+        );
+        assert_eq!(code, 0);
+        let opts = sh.completion_specs.by_command["foo"].options;
+        assert!(opts.nosort && opts.noquote && opts.plusdirs);
+    }
+
+    #[test]
+    fn complete_plus_o_nosort_clears_it() {
+        let mut sh = Shell::new();
+        let (_, c1) = run_complete(&["-o", "nosort", "-W", "x", "--", "foo"], &mut sh);
+        assert_eq!(c1, 0);
+        let (_, c2) = run_complete(&["+o", "nosort", "--", "foo"], &mut sh);
+        assert_eq!(c2, 0);
+        assert!(!sh.completion_specs.by_command["foo"].options.nosort);
     }
 
     #[test]
