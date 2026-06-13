@@ -8,6 +8,30 @@ use std::sync::atomic::AtomicBool;
 use crate::completion_spec::{CompletionSpec, CompletionSpecs};
 use crate::jobs::JobTable;
 
+/// What kind of call-stack frame this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameKind {
+    Function,
+    #[allow(dead_code)] // wired in Task 2-4
+    Source,
+    #[allow(dead_code)] // wired in Task 2-4
+    Main,
+}
+
+/// One entry in the unified call stack (`Shell.call_stack`).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Function name, "source", or "main".
+    pub funcname: String,
+    /// File where this frame's code is defined (def-source). Unused until Task 2.
+    #[allow(dead_code)] // wired in Task 2-4
+    pub source: String,
+    /// Line in the caller where this frame was invoked (0 for base).
+    #[allow(dead_code)] // wired in Task 2-4
+    pub call_line: u32,
+    pub kind: FrameKind,
+}
+
 /// Storage for a shell variable. Scalar covers ordinary strings;
 /// Indexed is a sparse map of usize subscripts to element values
 /// (sorted by key — BTreeMap so `${a[@]}` and `${!a[@]}` walk in
@@ -279,9 +303,15 @@ pub struct Shell {
     pub last_bg_pid: Option<i32>,
     /// The shell's argv[0], cached at startup. Used for `$0` at the top level.
     pub shell_argv0: String,
-    /// Stack of function names pushed/popped around each `call_function`.
-    /// `$0` returns the top of this stack when inside a function.
-    pub function_arg0: Vec<String>,
+    /// Unified call stack. Each `call_function` pushes a `Frame` with
+    /// `kind == FrameKind::Function`. Replaces the old `function_arg0: Vec<String>`.
+    /// `$0` returns the innermost Function frame name, or `shell_argv0` at top level.
+    pub call_stack: Vec<Frame>,
+    /// Map of function-name → defining source file path. Populated when a
+    /// function is defined (Task 2). Used to fill `Frame.source` and ultimately
+    /// `BASH_SOURCE`. (wired in Task 2-4)
+    #[allow(dead_code)]
+    pub function_source: std::collections::HashMap<String, String>,
     /// `Some(status)` after a fatal parameter-expansion error fires
     /// inside an `expand_*` call. The executor peeks this to bail the
     /// current simple command; the REPL loop drains it via
@@ -473,7 +503,8 @@ impl Shell {
             shell_pid,
             last_bg_pid: None,
             shell_argv0,
-            function_arg0: Vec::new(),
+            call_stack: Vec::new(),
+            function_source: std::collections::HashMap::new(),
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             in_subshell: false,
@@ -548,6 +579,14 @@ impl Shell {
         self.shopt_options.get("nocasematch").unwrap_or(false)
     }
 
+    /// Returns the innermost real-function frame name (skips `Source`/`Main` frames).
+    /// Used for `$0` inside a function. Returns `None` at top level.
+    pub fn current_function_name(&self) -> Option<String> {
+        self.call_stack.iter().rev()
+            .find(|f| f.kind == FrameKind::Function)
+            .map(|f| f.funcname.clone())
+    }
+
     /// Variable lookup for expansion. Recognises positional names
     /// (`"1"`-`"9"`/`"10"`/..., and `"#"`) before falling back to the
     /// regular variable HashMap. Returns an owned `String` because
@@ -556,7 +595,7 @@ impl Shell {
         // Special parameters (v26).
         match name {
             "0" => return Some(
-                self.function_arg0.last().cloned().unwrap_or_else(|| self.shell_argv0.clone())
+                self.current_function_name().unwrap_or_else(|| self.shell_argv0.clone())
             ),
             "$" => return Some(self.shell_pid.to_string()),
             "!" => return Some(
@@ -1114,29 +1153,30 @@ impl Shell {
         );
     }
 
-    /// Rebuild the dynamic `FUNCNAME` array from the live function call stack.
+    /// Insert an indexed array variable into `vars`.
+    fn set_indexed_var(&mut self, name: &str, elements: BTreeMap<usize, String>) {
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Indexed(elements),
+            exported: false,
+            readonly: false,
+            integer: false,
+        });
+    }
+
+    /// Rebuild FUNCNAME/BASH_SOURCE/BASH_LINENO from `call_stack`.
+    /// (Task 1: FUNCNAME only. BASH_SOURCE/BASH_LINENO wired in Tasks 2-4.)
     /// `FUNCNAME[0]` is the currently-executing function, `[1]` its caller, etc.
-    /// (the reverse of `function_arg0`'s push order). When the stack is empty
-    /// (top level) `FUNCNAME` is unset, matching bash. Called by `call_function`
-    /// after every push/pop of `function_arg0`.
-    pub(crate) fn sync_funcname(&mut self) {
-        if self.function_arg0.is_empty() {
+    /// When the stack is empty (top level) `FUNCNAME` is unset, matching bash.
+    /// Called by `call_function` after every push/pop of `call_stack`.
+    pub(crate) fn sync_call_arrays(&mut self) {
+        if self.call_stack.is_empty() {
             self.vars.remove("FUNCNAME");
             return;
         }
-        let n = self.function_arg0.len();
-        let elements: BTreeMap<usize, String> = (0..n)
-            .map(|k| (k, self.function_arg0[n - 1 - k].clone()))
-            .collect();
-        self.vars.insert(
-            "FUNCNAME".to_string(),
-            Variable {
-                value: VarValue::Indexed(elements),
-                exported: false,
-                readonly: false,
-                integer: false,
-            },
-        );
+        let n = self.call_stack.len();
+        let funcnames: BTreeMap<usize, String> =
+            (0..n).map(|i| (i, self.call_stack[n - 1 - i].funcname.clone())).collect();
+        self.set_indexed_var("FUNCNAME", funcnames);
     }
 
     /// Defines (or replaces) a shell function. Copy-on-write: if the function
@@ -1772,12 +1812,21 @@ mod tests {
         assert_eq!(arr.len(), 3);
     }
 
+    fn make_func_frame(name: &str) -> Frame {
+        Frame {
+            funcname: name.to_string(),
+            source: "environment".to_string(),
+            call_line: 0,
+            kind: FrameKind::Function,
+        }
+    }
+
     #[test]
-    fn sync_funcname_builds_reversed_stack() {
+    fn sync_call_arrays_builds_reversed_stack() {
         let mut sh = Shell::new();
-        sh.function_arg0.push("outer".to_string());
-        sh.function_arg0.push("inner".to_string());
-        sh.sync_funcname();
+        sh.call_stack.push(make_func_frame("outer"));
+        sh.call_stack.push(make_func_frame("inner"));
+        sh.sync_call_arrays();
         let arr = sh.get_array("FUNCNAME").expect("FUNCNAME array");
         assert_eq!(arr.get(&0).map(String::as_str), Some("inner")); // [0] = current
         assert_eq!(arr.get(&1).map(String::as_str), Some("outer")); // [1] = caller
@@ -1786,22 +1835,22 @@ mod tests {
     }
 
     #[test]
-    fn sync_funcname_empty_stack_unsets() {
+    fn sync_call_arrays_empty_stack_unsets() {
         let mut sh = Shell::new();
-        sh.function_arg0.push("f".to_string());
-        sh.sync_funcname();
+        sh.call_stack.push(make_func_frame("f"));
+        sh.sync_call_arrays();
         assert!(sh.get_array("FUNCNAME").is_some());
-        sh.function_arg0.pop();
-        sh.sync_funcname();
+        sh.call_stack.pop();
+        sh.sync_call_arrays();
         assert!(sh.get_array("FUNCNAME").is_none(), "empty stack unsets FUNCNAME");
         assert_eq!(sh.lookup_var("FUNCNAME"), None);
     }
 
     #[test]
-    fn sync_funcname_single_frame() {
+    fn sync_call_arrays_single_frame() {
         let mut sh = Shell::new();
-        sh.function_arg0.push("solo".to_string());
-        sh.sync_funcname();
+        sh.call_stack.push(make_func_frame("solo"));
+        sh.sync_call_arrays();
         assert_eq!(sh.lookup_var("FUNCNAME"), Some("solo".to_string()));
         assert_eq!(sh.get_array("FUNCNAME").expect("array").len(), 1);
     }
@@ -2003,7 +2052,7 @@ mod tests {
         assert!(shell.shell_pid > 0, "shell_pid should be positive");
         assert!(!shell.shell_argv0.is_empty(), "shell_argv0 should be non-empty");
         assert_eq!(shell.last_bg_pid, None);
-        assert!(shell.function_arg0.is_empty());
+        assert!(shell.call_stack.is_empty());
     }
 
     #[test]
@@ -2037,19 +2086,19 @@ mod tests {
     fn lookup_var_zero_in_function_returns_function_name() {
         let mut shell = Shell::new();
         shell.shell_argv0 = "my-shell".to_string();
-        shell.function_arg0.push("myfunc".to_string());
+        shell.call_stack.push(make_func_frame("myfunc"));
         assert_eq!(shell.lookup_var("0"), Some("myfunc".to_string()));
     }
 
     #[test]
     fn lookup_var_zero_nested_returns_innermost() {
         let mut shell = Shell::new();
-        shell.function_arg0.push("outer".to_string());
-        shell.function_arg0.push("inner".to_string());
+        shell.call_stack.push(make_func_frame("outer"));
+        shell.call_stack.push(make_func_frame("inner"));
         assert_eq!(shell.lookup_var("0"), Some("inner".to_string()));
-        shell.function_arg0.pop();
+        shell.call_stack.pop();
         assert_eq!(shell.lookup_var("0"), Some("outer".to_string()));
-        shell.function_arg0.pop();
+        shell.call_stack.pop();
         assert!(shell.lookup_var("0").is_some());  // falls through to shell_argv0
     }
 

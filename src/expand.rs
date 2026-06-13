@@ -217,9 +217,7 @@ fn expand_positional_substring(
     let mut values: Vec<String> = Vec::with_capacity(shell.positional_args.len() + 1);
     values.push(
         shell
-            .function_arg0
-            .last()
-            .cloned()
+            .current_function_name()
             .unwrap_or_else(|| shell.shell_argv0.clone()),
     );
     values.extend(shell.positional_args.iter().cloned());
