@@ -2919,6 +2919,8 @@ pub(crate) fn call_function(
     let saved_getopts_optind_cache = std::mem::replace(&mut shell.getopts_optind_cache, 0);
     shell.positional_args = args;
     shell.function_arg0.push(name.to_string());
+    // Keep the dynamic FUNCNAME array in lockstep with the call stack (v151).
+    shell.sync_funcname();
     shell.local_scopes.push(std::collections::HashMap::new());
 
     let result = run_command(&body, shell, sink);
@@ -2945,6 +2947,7 @@ pub(crate) fn call_function(
     }
 
     shell.function_arg0.pop();
+    shell.sync_funcname();
     shell.positional_args = saved;
     shell.loop_depth = saved_loop_depth;
     shell.getopts_sp = saved_getopts_sp;
