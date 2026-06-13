@@ -45,3 +45,41 @@ fn bashpid_top_level_equals_dollar_and_differs_in_subshell() {
         "diff"
     );
 }
+
+#[test]
+fn ids_match_bash() {
+    for v in ["UID", "EUID", "PPID"] {
+        let frag = format!("echo ${}", v);
+        let b = std::process::Command::new("bash").args(["-c", &frag]).output().unwrap();
+        assert_eq!(huck(&frag).trim(), String::from_utf8_lossy(&b.stdout).trim(), "{v}");
+    }
+}
+
+#[test]
+fn bash_version_and_huck_version() {
+    assert_eq!(huck("[ -n \"$BASH_VERSION\" ] && echo yes").trim(), "yes");
+    assert_eq!(huck("echo ${BASH_VERSINFO[0]}").trim(), "5");
+    assert_eq!(huck("echo $HUCK_VERSION").trim(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn platform_and_host_present() {
+    for v in ["HOSTNAME", "HOSTTYPE", "OSTYPE", "MACHTYPE", "BASH"] {
+        assert!(!huck(&format!("echo ${}", v)).trim().is_empty(), "{v} empty");
+    }
+    assert!(!huck("echo ${GROUPS[0]}").trim().is_empty());
+}
+
+#[test]
+fn uid_is_readonly() {
+    let real = huck("echo $UID");
+    let after = huck("UID=99999 2>/dev/null; echo $UID");
+    assert_eq!(after.trim(), real.trim(), "UID must be readonly (unchanged)");
+}
+
+#[test]
+fn shlvl_increments_from_env() {
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_huck"))
+        .args(["-c", "echo $SHLVL"]).env("SHLVL", "5").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "6");
+}

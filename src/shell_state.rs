@@ -429,6 +429,48 @@ pub struct Shell {
     pub seconds_base: std::time::Instant,
 }
 
+// ---- Static builtin variable helpers (platform strings, libc wrappers) ----
+
+#[cfg(target_os = "linux")]
+const BUILTIN_OSTYPE: &str = "linux-gnu";
+#[cfg(target_os = "macos")]
+const BUILTIN_OSTYPE: &str = "darwin";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const BUILTIN_OSTYPE: &str = "unknown";
+
+fn builtin_machtype() -> String {
+    let arch = std::env::consts::ARCH;
+    #[cfg(target_os = "linux")]
+    { format!("{arch}-pc-linux-gnu") }
+    #[cfg(target_os = "macos")]
+    { format!("{arch}-apple-darwin") }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { format!("{arch}-unknown") }
+}
+
+fn builtin_current_groups() -> Vec<u32> {
+    unsafe {
+        let n = libc::getgroups(0, std::ptr::null_mut());
+        if n <= 0 { return Vec::new(); }
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let m = libc::getgroups(n, buf.as_mut_ptr());
+        if m < 0 { return Vec::new(); }
+        buf.truncate(m as usize);
+        buf.into_iter().collect()
+    }
+}
+
+fn builtin_hostname() -> String {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+// ---- (end static builtin helpers) ------------------------------------------
+
 /// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
 /// Reconstructs `"{name} {value}"` (= `name () { body }`) and parses it, accepting
 /// ONLY a single `FunctionDef` whose name matches, with NOTHING after the `}` and
@@ -561,6 +603,10 @@ impl Shell {
                 shell.mark_function_exported(&fname);
             }
         }
+        // Install static builtin variables AFTER env-load and BASH_FUNC import
+        // so they overwrite any inherited env values (e.g. a parent shell's
+        // exported UID, SHLVL, etc.).
+        shell.install_builtin_vars();
         shell
     }
 
@@ -1169,6 +1215,82 @@ impl Shell {
         names.sort();
         names
     }
+
+    // ---- Static builtin variable installation (Shell::new) -----------------
+
+    /// Install a scalar builtin variable, overwriting any inherited env value.
+    fn install_var(&mut self, name: &str, value: String, readonly: bool) {
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Scalar(value),
+            exported: false,
+            readonly,
+            integer: false,
+        });
+    }
+
+    /// Install an indexed array builtin variable.
+    fn install_indexed(&mut self, name: &str, elems: Vec<String>, readonly: bool) {
+        let map: BTreeMap<usize, String> = elems.into_iter().enumerate().collect();
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Indexed(map),
+            exported: false,
+            readonly,
+            integer: false,
+        });
+    }
+
+    /// Called once from `Shell::new` (after env-load + BASH_FUNC import) to
+    /// populate the static builtin variables that are always present.
+    fn install_builtin_vars(&mut self) {
+        // IDs (readonly)
+        unsafe {
+            self.install_var("UID",  libc::getuid().to_string(),  true);
+            self.install_var("EUID", libc::geteuid().to_string(), true);
+            self.install_var("PPID", libc::getppid().to_string(), true);
+        }
+        // Groups (readonly indexed array)
+        self.install_indexed(
+            "GROUPS",
+            builtin_current_groups().iter().map(|g| g.to_string()).collect(),
+            true,
+        );
+        // Host / platform strings
+        self.install_var("HOSTNAME", builtin_hostname(), false);
+        self.install_var("HOSTTYPE", std::env::consts::ARCH.to_string(), false);
+        self.install_var("OSTYPE",   BUILTIN_OSTYPE.to_string(), false);
+        self.install_var("MACHTYPE", builtin_machtype(), false);
+        // huck / bash identity
+        self.install_var(
+            "BASH",
+            std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "huck".into()),
+            false,
+        );
+        self.install_var("BASH_VERSION", "5.2.0(1)-release".to_string(), false);
+        self.install_indexed(
+            "BASH_VERSINFO",
+            vec![
+                "5".into(), "2".into(), "0".into(), "1".into(),
+                "release".into(), builtin_machtype(),
+            ],
+            true,
+        );
+        self.install_var("HUCK_VERSION", env!("CARGO_PKG_VERSION").to_string(), false);
+        // SHLVL: read inherited value (already in vars from env-load), add 1.
+        let lvl = self.vars
+            .get("SHLVL")
+            .and_then(|v| v.value.scalar_view().parse::<i64>().ok())
+            .unwrap_or(0);
+        self.vars.insert("SHLVL".to_string(), Variable {
+            value: VarValue::Scalar((lvl + 1).max(1).to_string()),
+            exported: true,
+            readonly: false,
+            integer: false,
+        });
+    }
+
+    // ---- (end static builtin vars) -----------------------------------------
 
     /// Returns a reference to the indexed array stored under `name`,
     /// or `None` if the variable is unset or a scalar.
