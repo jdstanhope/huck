@@ -1880,7 +1880,33 @@ fn parse_simple_stage(
         }
     }
 
-    let prog = program.ok_or(ParseError::MissingCommand)?;
+    let prog = match program {
+        Some(p) => p,
+        None => {
+            // No program word and (since args are only pushed after a program
+            // word is seen) no arguments. If redirections are present, this is a
+            // bare redirect-only command (`>file`, `2>err`, `<in`): bash performs
+            // the redirections for their side effects — `>file` truncates/creates
+            // it — and exits 0 (M-123). Build the empty-program ExecCommand the
+            // executor already handles for the `VAR=val 2>err` sibling case. With
+            // no redirections either, the command is genuinely empty: keep
+            // MissingCommand so the caller can treat an exhausted iterator as a
+            // line continuation and a pending one as a real "expected a command".
+            if stdin.is_none() && stdout.is_none() && stderr.is_none() {
+                return Err(ParseError::MissingCommand);
+            }
+            let cmd = Command::Simple(SimpleCommand::Exec(ExecCommand {
+                inline_assignments: Vec::new(),
+                program: Word(Vec::new()),
+                args: Vec::new(),
+                stdin,
+                stdout,
+                stderr,
+                line: first_line,
+            }));
+            return Ok((cmd, pipe_follows));
+        }
+    };
     let cmd = Command::Simple(finalize_stage(prog, args, stdin, stdout, stderr, first_line));
     Ok((cmd, pipe_follows))
 }
@@ -2636,9 +2662,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_redirect_without_program_is_missing_command() {
+    fn parse_bare_redirect_only_is_empty_exec() {
+        // M-123: a bare redirect-only command (`>f`, no program word and no
+        // assignment) parses to an empty-program ExecCommand carrying the
+        // redirect. The executor performs the redirection for its side effect
+        // (truncating/creating the file) and exits 0, matching bash.
+        let seq = parse(vec![Token::Op(Operator::RedirOut), w_tok("f")])
+            .unwrap()
+            .expect("redirect-only command should parse");
+        let cmds = &first_pipeline(&seq).commands;
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Command::Simple(SimpleCommand::Exec(ec)) => {
+                assert!(ec.program.0.is_empty(), "program word should be empty");
+                assert!(ec.args.is_empty());
+                assert!(ec.inline_assignments.is_empty());
+                assert_eq!(ec.stdout, Some(Redirect::Truncate(ww("f"))));
+                assert!(ec.stdin.is_none() && ec.stderr.is_none());
+            }
+            other => panic!("expected empty-program Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_no_program_no_redirect_is_missing_command() {
+        // No program, no assignment, AND no redirect with tokens still pending
+        // (a leading `;`) stays a genuine MissingCommand — only the redirect-only
+        // case is diverted to an empty-program Exec.
         assert_eq!(
-            parse(vec![Token::Op(Operator::RedirOut), w_tok("f")]),
+            parse(vec![Token::Op(Operator::Semi), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
