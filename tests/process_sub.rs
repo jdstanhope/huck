@@ -16,3 +16,17 @@ fn huck(script: &str) -> String {
 }
 #[test] fn nested_process_sub() { assert_eq!(huck("cat <(cat <(echo deep))"), "deep\n"); }
 #[test] fn quoted_is_literal() { assert_eq!(huck("echo \"<(echo hi)\""), "<(echo hi)\n"); }
+#[test] fn procsub_arg_in_pipeline() {
+    // arg procsub on a pipeline stage — parent fd must be drained after wait
+    assert_eq!(huck("cat <(echo a) | cat"), "a\n");
+}
+#[test] fn procsub_redirect_in_pipeline() {
+    // redirect-target procsub on a pipeline stage: stdin override takes effect
+    assert_eq!(huck("echo ignored | cat < <(echo fromsub)"), "fromsub\n");
+}
+#[test] fn pipeline_procsub_no_zombies() {
+    // many pipeline procsubs must not leave zombies (the shell reaps them)
+    let out = huck("for i in 1 2 3 4 5; do cat <(echo x) | cat >/dev/null; done; ps -o stat= --ppid $$ 2>/dev/null | grep -c defunct || echo 0");
+    let last = out.lines().last().unwrap_or("0").trim();
+    assert_eq!(last, "0", "expected 0 zombies, full output: {out:?}");
+}

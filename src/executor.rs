@@ -1656,6 +1656,14 @@ fn run_background_sequence(
     };
     parent_held.push(devnull_fd);
 
+    // Snapshot the procsub stack. Word expansion in the spawn loop may realize
+    // process substitutions (pushing onto shell.procsub_pending). We must drain
+    // [procsub_base..] on every exit path so the parent fd is closed and the
+    // inner child is reaped. For background jobs we use a non-blocking reap after
+    // spawning (see drain_procsubs_nonblocking below) so we don't stall the
+    // background path on a long-running inner producer.
+    let procsub_base = shell.procsub_pending.len();
+
     for (i, stage_cmd) in pipeline.commands.iter().enumerate() {
         let is_last = i == n - 1;
 
@@ -1682,6 +1690,7 @@ fn run_background_sequence(
                     }
                     Err(e) => {
                         eprintln!("huck: pipe: {e}");
+                        drain_procsubs(shell, procsub_base);
                         cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                         return ExecOutcome::Continue(1);
@@ -1714,6 +1723,7 @@ fn run_background_sequence(
                 Err(e) => {
                     eprintln!("huck: fork: {e}");
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
+                    drain_procsubs(shell, procsub_base);
                     cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
@@ -1733,6 +1743,7 @@ fn run_background_sequence(
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
+                drain_procsubs(shell, procsub_base);
                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 return ExecOutcome::Continue(1);
@@ -1754,6 +1765,7 @@ fn run_background_sequence(
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -1765,6 +1777,7 @@ fn run_background_sequence(
                         Err(e) => {
                             eprintln!("huck: {path}: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -1786,6 +1799,7 @@ fn run_background_sequence(
                         Err(e) => {
                             eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -1806,6 +1820,7 @@ fn run_background_sequence(
                         Err(e) => {
                             eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
@@ -1832,6 +1847,7 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1846,6 +1862,7 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1858,6 +1875,7 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1870,6 +1888,7 @@ fn run_background_sequence(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1893,6 +1912,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1908,6 +1928,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1921,6 +1942,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1934,6 +1956,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -1962,6 +1985,7 @@ fn run_background_sequence(
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                    drain_procsubs(shell, procsub_base);
                     cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
@@ -1995,6 +2019,7 @@ fn run_background_sequence(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -2011,6 +2036,7 @@ fn run_background_sequence(
                                 eprintln!("huck: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -2050,6 +2076,7 @@ fn run_background_sequence(
                 for fd in [stdout_fd, stdin_fd, stderr_fd] {
                     if fd > 2 { parent_held.retain(|&x| x != fd); }
                 }
+                drain_procsubs(shell, procsub_base);
                 cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 return ExecOutcome::Continue(1);
@@ -2104,6 +2131,8 @@ fn run_background_sequence(
         // user input shape, but we handle it defensively.
         shell.jobs.add_synthetic_done(display, 0);
         crate::jobs::reap_and_notify(shell);
+        // Non-blocking drain: close parent fds so any inner child sees EOF.
+        drain_procsubs_nonblocking(shell, procsub_base);
         return ExecOutcome::Continue(0);
     };
 
@@ -2114,6 +2143,11 @@ fn run_background_sequence(
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         eprintln!("[{id}] {last_pid}");
     }
+    // Non-blocking drain: close parent fds and attempt WNOHANG reap of inner
+    // procsub children. We don't block here because a long-running inner producer
+    // (e.g. `cmd < <(long-running-gen) &`) should not make the background job
+    // synchronous. Any child not yet exited is left to SIGCHLD/exit cleanup.
+    drain_procsubs_nonblocking(shell, procsub_base);
     ExecOutcome::Continue(0)
 }
 
@@ -3009,6 +3043,32 @@ fn drain_procsubs(shell: &mut Shell, base: usize) {
     }
 }
 
+/// Non-blocking variant of `drain_procsubs` for use after spawning a background
+/// job. Closes the parent fd and unlinks the FIFO for each pending procsub, then
+/// attempts a WNOHANG reap of the inner child. If the child has not yet exited
+/// (uncommon: the inner producer is still running), we skip the blocking wait and
+/// leave reaping to the shell's general SIGCHLD handler or exit cleanup. The
+/// entries are always popped so they never leak into later commands' drains.
+fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
+    while shell.procsub_pending.len() > base {
+        if let Some(ps) = shell.procsub_pending.pop() {
+            // Close the parent end so the inner child sees EOF / SIGPIPE.
+            if ps.parent_fd >= 0 {
+                unsafe { libc::close(ps.parent_fd); }
+            }
+            // Remove the FIFO file if present.
+            if let Some(ref p) = ps.fifo_path {
+                let _ = std::fs::remove_file(p);
+            }
+            // Best-effort non-blocking reap. If the inner child is still running
+            // (e.g. a long-running producer used with a background consumer),
+            // skip the wait — it will be reaped by SIGCHLD handling or shell exit.
+            let mut status = 0;
+            unsafe { libc::waitpid(ps.pid, &mut status, libc::WNOHANG); }
+        }
+    }
+}
+
 fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     // Snapshot the procsub stack. Any process substitutions realized during
     // argument expansion (resolve()) or redirect expansion are recorded in
@@ -3768,6 +3828,15 @@ fn run_multi_stage(
     // never part of $PIPESTATUS.
     let mut heredoc_writers: Vec<libc::pid_t> = Vec::new();
 
+    // Snapshot the procsub stack before any stage word expansion. Process
+    // substitutions realized during argument/redirect expansion (in expand_single
+    // or expand calls inside the spawn loop) push onto shell.procsub_pending.
+    // We must drain [procsub_base..] on every exit path — the parent fd must
+    // stay open until all stages have run (so it is drained AFTER
+    // wait_pipeline_raw, not per-stage), but on error paths we drain early so
+    // the inner child gets EOF/SIGPIPE and exits.
+    let procsub_base = shell.procsub_pending.len();
+
     for (i, stage_cmd) in commands.iter().enumerate() {
         let is_last = i == n - 1;
 
@@ -3798,6 +3867,7 @@ fn run_multi_stage(
                     Err(e) => {
                         eprintln!("huck: pipe: {e}");
                         // Clean up all held fds.
+                        drain_procsubs(shell, procsub_base);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                         return ExecOutcome::Continue(1);
                     }
@@ -3813,6 +3883,7 @@ fn run_multi_stage(
                             }
                             Err(e) => {
                                 eprintln!("huck: pipe: {e}");
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3840,6 +3911,7 @@ fn run_multi_stage(
                 }
                 Err(e) => {
                     eprintln!("huck: fork: {e}");
+                    drain_procsubs(shell, procsub_base);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
                 }
@@ -3858,6 +3930,7 @@ fn run_multi_stage(
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
+                drain_procsubs(shell, procsub_base);
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 return ExecOutcome::Continue(1);
             }
@@ -3888,6 +3961,7 @@ fn run_multi_stage(
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
                         }
@@ -3898,6 +3972,7 @@ fn run_multi_stage(
                         Err(e) => {
                             eprintln!("huck: {path}: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
                         }
@@ -3925,6 +4000,7 @@ fn run_multi_stage(
                         Err(e) => {
                             eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
                         }
@@ -3949,6 +4025,7 @@ fn run_multi_stage(
                         Err(e) => {
                             eprintln!("huck: heredoc: {e}");
                             restore_inline_assignments(snap, shell);
+                            drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
                         }
@@ -3980,6 +4057,7 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -3993,6 +4071,7 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4004,6 +4083,7 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4015,6 +4095,7 @@ fn run_multi_stage(
                                 eprintln!("huck: {path}: {e}");
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4037,6 +4118,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4051,6 +4133,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4063,6 +4146,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4075,6 +4159,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4105,6 +4190,7 @@ fn run_multi_stage(
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                    drain_procsubs(shell, procsub_base);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
                 }
@@ -4123,6 +4209,7 @@ fn run_multi_stage(
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
+                            drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                             return ExecOutcome::Continue(1);
                         }
@@ -4164,6 +4251,7 @@ fn run_multi_stage(
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
                                 }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4183,6 +4271,7 @@ fn run_multi_stage(
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
                                 }
+                                drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
                             }
@@ -4258,6 +4347,7 @@ fn run_multi_stage(
                 if let Some(r) = capture_read_fd {
                     parent_held.retain(|&fd| fd != r);
                 }
+                drain_procsubs(shell, procsub_base);
                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                 if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
                 return ExecOutcome::Continue(1);
@@ -4352,6 +4442,7 @@ fn run_multi_stage(
             // for a stopped (Ctrl-Z) pipeline. (The capture fd, if any, was
             // already drained and taken above — capture sink => non-interactive,
             // so this stopped path never carries a live capture fd.)
+            drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(128 + sig);
         }
     }
@@ -4368,6 +4459,11 @@ fn run_multi_stage(
         }
         PipelineWaitResult::Stopped(sig) => 128 + sig,
     };
+    // Drain any process substitutions realized during stage word expansion.
+    // We drain here (after wait_pipeline_raw + heredoc_writers reap), not
+    // per-stage, because the parent_fd must stay open until all stages that
+    // reference /dev/fd/N have run.
+    drain_procsubs(shell, procsub_base);
     ExecOutcome::Continue(status)
 }
 
