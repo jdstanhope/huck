@@ -3106,6 +3106,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             stdin: cmd.stdin.clone(),
             stdout: cmd.stdout.clone(),
             stderr: cmd.stderr.clone(),
+            line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
@@ -3134,6 +3135,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             stdin: cmd.stdin.clone(),
             stdout: cmd.stdout.clone(),
             stderr: cmd.stderr.clone(),
+            line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
@@ -5392,6 +5394,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5416,6 +5419,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5443,6 +5447,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         })
     }
 
@@ -5649,6 +5654,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5733,6 +5739,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5752,6 +5759,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -5853,6 +5861,7 @@ mod tests {
                 stdin: None,
                 stdout: None,
                 stderr: None,
+                line: 0,
             }))],
         });
         let mut body = continue_seq();
@@ -5885,6 +5894,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -6062,6 +6072,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -6181,6 +6192,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6205,6 +6217,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6222,6 +6235,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
@@ -6307,6 +6321,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         }))
     }
 
@@ -6321,6 +6336,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         }))
     }
 
@@ -6422,6 +6438,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), Some("cat".to_string()));
     }
@@ -6437,6 +6454,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         // Quoted literal → None (could be a function or builtin masked by quoting).
         assert_eq!(exec.program_static_text(), None);
@@ -6453,6 +6471,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
     }
@@ -6472,6 +6491,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
     }

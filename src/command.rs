@@ -233,6 +233,7 @@ fn finalize_stage(
             stdin,
             stdout,
             stderr,
+            line: 0,
         });
     }
     let mut remaining = remaining.into_iter();
@@ -245,6 +246,7 @@ fn finalize_stage(
         stdin,
         stdout,
         stderr,
+        line: 0,
     })
 }
 
@@ -329,6 +331,9 @@ pub struct ExecCommand {
     pub stdin: Option<Redirect>,
     pub stdout: Option<Redirect>,
     pub stderr: Option<Redirect>,
+    /// 1-based source line of the command's first token (0 = unknown).
+    /// Set at parse time; the executor uses it for $LINENO.
+    pub line: u32,
 }
 
 impl ExecCommand {
@@ -2370,6 +2375,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
+            line: 0,
         })
     }
 
@@ -2772,6 +2778,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+            line: 0,
                 }))],
             }),
             rest: vec![],

@@ -3237,9 +3237,25 @@ fn is_user_name_continue(c: char) -> bool {
     c == '_' || c.is_ascii_alphanumeric()
 }
 
+/// 1-based line number of byte offset `off` within `src`
+/// (1 + the count of '\n' bytes before `off`). Clamps `off` to `src.len()`.
+#[allow(dead_code)] // used by later LINENO tasks
+pub fn line_at_offset(src: &str, off: usize) -> u32 {
+    1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_at_offset_counts_newlines() {
+        let s = "a\nbb\nccc";
+        assert_eq!(line_at_offset(s, 0), 1);   // 'a'
+        assert_eq!(line_at_offset(s, 2), 2);   // first 'b'
+        assert_eq!(line_at_offset(s, 5), 3);   // first 'c'
+        assert_eq!(line_at_offset(s, 999), 3); // clamped
+    }
 
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
@@ -4225,6 +4241,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -4294,6 +4311,7 @@ mod tests {
                     stdin: None,
                     stdout: None,
                     stderr: None,
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -4328,6 +4346,7 @@ mod tests {
                         stdin: None,
                         stdout: None,
                         stderr: None,
+                        line: 0,
                     }))],
                 }),
                 rest: vec![],
