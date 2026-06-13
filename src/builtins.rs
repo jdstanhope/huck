@@ -5789,7 +5789,7 @@ pub(crate) fn run_sourced_contents_in_sink(
             }
             break;
         }
-        let mut iter = tokens.into_iter().peekable();
+        let mut iter = crate::command::TokenCursor::new(tokens, vec![0; total]);
 
         loop {
             while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) {

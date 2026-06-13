@@ -594,14 +594,51 @@ pub enum ParseError {
     ArithForHeader(String),
 }
 
+/// A token stream the parser consumes, carrying each token's 1-based source
+/// line in parallel. Replaces `Peekable<vec::IntoIter<Token>>`: same
+/// `peek`/`next`/`len`, plus `current_line()` (the line of the NEXT
+/// token to be returned). Lines are `0` ("unknown") unless built with real lines.
+pub struct TokenCursor {
+    iter: std::iter::Peekable<std::vec::IntoIter<Token>>,
+    lines: Vec<u32>,
+    pos: usize,
+}
+impl TokenCursor {
+    pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
+        debug_assert!(lines.is_empty() || lines.len() == tokens.len(),
+            "lines must parallel tokens");
+        Self { iter: tokens.into_iter().peekable(), lines, pos: 0 }
+    }
+    /// Line of the next token to be returned (0 if unknown / past end).
+    #[allow(dead_code)]
+    pub fn current_line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(0)
+    }
+    pub fn peek(&mut self) -> Option<&Token> {
+        self.iter.peek()
+    }
+}
+impl Iterator for TokenCursor {
+    type Item = Token;
+    fn next(&mut self) -> Option<Token> {
+        let t = self.iter.next();
+        if t.is_some() { self.pos += 1; }
+        t
+    }
+}
+impl ExactSizeIterator for TokenCursor {
+    fn len(&self) -> usize { self.iter.len() }
+}
+
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    let mut iter = tokens.into_iter().peekable();
-    skip_newlines(&mut iter);
-    if iter.peek().is_none() {
+    let n = tokens.len();
+    let mut cur = TokenCursor::new(tokens, vec![0; n]);
+    skip_newlines(&mut cur);
+    if cur.peek().is_none() {
         return Ok(None);
     }
-    let seq = parse_sequence(&mut iter, &[])?;
-    if iter.peek().is_some() {
+    let seq = parse_sequence(&mut cur, &[])?;
+    if cur.peek().is_some() {
         // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
         // sequence — `parse_sequence` peek-breaks on those (see below).
         return Err(ParseError::UnexpectedToken);
@@ -616,8 +653,8 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
 /// stage (which `parse_command` returns without checking for a trailing `|`).
 /// Returns `raw` unchanged when no `|` follows — so non-pipeline elements are
 /// byte-identical to before.
-fn parse_command_then_pipeline<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_command_then_pipeline(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     let raw = parse_command(iter)?;
     if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
@@ -657,8 +694,8 @@ fn parse_command_then_pipeline<I: Iterator<Item = Token>>(
 /// `&` at top level only). Stops — without consuming — when the next
 /// token is a keyword in `stop_at`. `stop_at` is empty only at the top
 /// level; a non-empty `stop_at` means we are inside a compound command.
-fn parse_sequence<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_sequence(
+    iter: &mut TokenCursor,
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
     parse_sequence_opts(iter, stop_at, false)
@@ -668,8 +705,8 @@ fn parse_sequence<I: Iterator<Item = Token>>(
 /// (and consuming) the next top-level newline or EOF. Skips leading blank-line
 /// newlines. Returns `Ok(None)` when only newlines / EOF remain. Used by the
 /// non-interactive script reader.
-pub fn parse_one_unit<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+pub fn parse_one_unit(
+    iter: &mut TokenCursor,
 ) -> Result<Option<Sequence>, ParseError> {
     while matches!(iter.peek(), Some(Token::Newline)) {
         iter.next();
@@ -685,8 +722,8 @@ pub fn parse_one_unit<I: Iterator<Item = Token>>(
 /// [`parse_one_unit`] for the non-interactive script reader); otherwise a
 /// top-level newline is a Semi-like continue connector (the historical
 /// behavior — all existing callers go through the `false` wrapper).
-fn parse_sequence_opts<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_sequence_opts(
+    iter: &mut TokenCursor,
     stop_at: &[Keyword],
     stop_at_top_newline: bool,
 ) -> Result<Sequence, ParseError> {
@@ -801,8 +838,8 @@ fn parse_sequence_opts<I: Iterator<Item = Token>>(
 /// position (odd count → negate), parses the inner command, and attaches the
 /// negation flag. Detected only here (command position), so `[ ! -e x ]` keeps
 /// `!` as an argument of `[`.
-fn parse_command<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_command(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     let mut bangs = 0usize;
     while iter.peek().map(is_bang_word).unwrap_or(false) {
@@ -826,8 +863,8 @@ fn parse_command<I: Iterator<Item = Token>>(
 }
 
 /// Parses a single sequence element: a subshell, compound command, or pipeline.
-fn parse_command_inner<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_command_inner(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     skip_newlines(iter);
 
@@ -968,9 +1005,9 @@ fn is_function_body_shape(body: &Command) -> bool {
 
 /// Parses `name() compound-command`. The caller has consumed the name
 /// (`name_word`) and verified the next token is `(`.
-fn parse_function_def<I: Iterator<Item = Token>>(
+fn parse_function_def(
     name_word: Word,
-    iter: &mut std::iter::Peekable<I>,
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     let name = valid_identifier_text(&name_word).ok_or(ParseError::FunctionName)?;
     // Consume `(`.
@@ -995,8 +1032,8 @@ fn parse_function_def<I: Iterator<Item = Token>>(
 /// verified the next token is the `function` keyword (still in the
 /// iterator). Consumes the keyword, the name, optional `()`, and
 /// the compound body.
-fn parse_function_keyword_def<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_function_keyword_def(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     // Consume `function` keyword.
     iter.next();
@@ -1033,15 +1070,15 @@ fn parse_function_keyword_def<I: Iterator<Item = Token>>(
 
 /// Consumes a run of `Newline` tokens. Newlines are soft separators —
 /// they are skipped wherever a command is expected but not yet present.
-fn skip_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) {
+fn skip_newlines(iter: &mut TokenCursor) {
     while matches!(iter.peek(), Some(Token::Newline)) {
         iter.next();
     }
 }
 
 /// Consumes one token and checks it is the expected keyword.
-fn expect_keyword<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn expect_keyword(
+    iter: &mut TokenCursor,
     expected: Keyword,
     on_missing: ParseError,
 ) -> Result<(), ParseError> {
@@ -1064,8 +1101,8 @@ fn expect_keyword<I: Iterator<Item = Token>>(
 /// practice — the REPL's completeness classifier intercepts any buffer
 /// ending in a bare `|`/`&&`/`||` before `parse` is reached, so this
 /// path is unreachable through the shell.
-fn parse_compound_section<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_compound_section(
+    iter: &mut TokenCursor,
     stop_at: &[Keyword],
     unterminated: ParseError,
 ) -> Result<Sequence, ParseError> {
@@ -1076,8 +1113,8 @@ fn parse_compound_section<I: Iterator<Item = Token>>(
 }
 
 /// Parses `if LIST; then LIST; [elif LIST; then LIST;]... [else LIST;] fi`.
-fn parse_if<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_if(
+    iter: &mut TokenCursor,
 ) -> Result<IfClause, ParseError> {
     expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
     let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
@@ -1213,8 +1250,8 @@ fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError
 /// `Token::ArithBlock`. This function consumes the ArithBlock, the
 /// separators before `do`, the `do` keyword, the body, and the `done`
 /// keyword.
-fn parse_arith_for_clause<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_arith_for_clause(
+    iter: &mut TokenCursor,
 ) -> Result<ArithForClause, ParseError> {
     let header_text = match iter.next() {
         Some(Token::ArithBlock(text)) => text,
@@ -1240,8 +1277,8 @@ fn parse_arith_for_clause<I: Iterator<Item = Token>>(
 /// Dispatches `for` to either the POSIX form (`for VAR in WORDS; do ...`)
 /// or the bash arith form (`for ((init;cond;step)) do ...`). Consumes
 /// the `for` keyword itself.
-fn parse_for_command<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_for_command(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
 
@@ -1260,8 +1297,8 @@ fn parse_for_command<I: Iterator<Item = Token>>(
 
 /// Parses `for NAME [in WORD...] sep do LIST done` AFTER the `for`
 /// keyword has already been consumed by the caller.
-fn parse_for_after_keyword<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_for_after_keyword(
+    iter: &mut TokenCursor,
 ) -> Result<ForClause, ParseError> {
     // Loop variable. End-of-input means the command is incomplete (the
     // v19 classifier maps UnterminatedLoop to "read more"); a present
@@ -1316,8 +1353,8 @@ fn parse_for_after_keyword<I: Iterator<Item = Token>>(
 /// has already been consumed by the caller. Mirrors `parse_for_after_keyword`
 /// but builds a `SelectClause` with `words: Option<Vec<Word>>` to distinguish
 /// the no-`in` form (None) from an explicit `in` clause (Some, possibly empty).
-fn parse_select_command<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_select_command(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     // Loop variable. End-of-input means the command is incomplete.
     let var = match iter.next() {
@@ -1367,8 +1404,8 @@ fn parse_select_command<I: Iterator<Item = Token>>(
 }
 
 /// Parses `case WORD in [clause]... esac`. The caller has peeked `case`.
-fn parse_case<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_case(
+    iter: &mut TokenCursor,
 ) -> Result<CaseClause, ParseError> {
     expect_keyword(iter, Keyword::Case, ParseError::UnterminatedCase)?;
     skip_newlines(iter);
@@ -1396,8 +1433,8 @@ fn parse_case<I: Iterator<Item = Token>>(
 }
 
 /// Parses one `[(] pattern [| pattern]... ) [body] [terminator]` clause.
-fn parse_case_item<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_case_item(
+    iter: &mut TokenCursor,
 ) -> Result<CaseItem, ParseError> {
     // Optional leading `(`.
     if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
@@ -1458,8 +1495,8 @@ fn parse_case_item<I: Iterator<Item = Token>>(
 }
 
 /// Parses `{ LIST }`. The caller has peeked the leading `{`.
-fn parse_brace_group<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_brace_group(
+    iter: &mut TokenCursor,
 ) -> Result<Sequence, ParseError> {
     expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
     let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
@@ -1474,8 +1511,8 @@ fn parse_brace_group<I: Iterator<Item = Token>>(
 /// - `Err(ParseError::EmptySubshell)` if the body is empty (bare `()`).
 /// - `Err(ParseError::UnterminatedSubshell)` if no closing `)` is found.
 /// - `Ok(Command::Subshell { body })` otherwise.
-fn parse_subshell<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_subshell(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     // Consume `(`.
     iter.next();
@@ -1501,8 +1538,8 @@ fn parse_subshell<I: Iterator<Item = Token>>(
 /// but:
 /// - breaks on `Token::Op(Operator::RParen)` (consuming it) instead of keywords.
 /// - returns `Err(UnterminatedSubshell)` if the token stream ends before `)`.
-fn parse_subshell_sequence<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_subshell_sequence(
+    iter: &mut TokenCursor,
 ) -> Result<Sequence, ParseError> {
     // Parse first command. It may itself be a subshell, compound command, etc.
     // — and, if followed by `|`, the rest of the pipeline.
@@ -1580,8 +1617,8 @@ fn parse_subshell_sequence<I: Iterator<Item = Token>>(
 
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
 /// The caller has already peeked the leading `while`/`until`.
-fn parse_while<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_while(
+    iter: &mut TokenCursor,
 ) -> Result<WhileClause, ParseError> {
     let until = match iter.next().as_ref().and_then(keyword_of) {
         Some(Keyword::While) => false,
@@ -1624,8 +1661,8 @@ fn is_redirect_op(op: &Operator) -> bool {
 /// filling the stdin/stdout/stderr slots (last-wins). Stops at the first
 /// non-redirect token. The `bool` is true iff at least one redirect was
 /// consumed. The op→slot mapping is identical to `parse_simple_stage`'s.
-fn parse_trailing_redirects<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_trailing_redirects(
+    iter: &mut TokenCursor,
 ) -> Result<RedirSlots, ParseError> {
     let mut stdin: Option<Redirect> = None;
     let mut stdout: Option<Redirect> = None;
@@ -1689,9 +1726,9 @@ fn parse_trailing_redirects<I: Iterator<Item = Token>>(
 /// or more redirects immediately follow its terminator; otherwise returns the
 /// command unchanged. Applied to compound arms only (simple commands consume
 /// their own redirects inline in `parse_simple_stage`).
-fn maybe_wrap_redirects<I: Iterator<Item = Token>>(
+fn maybe_wrap_redirects(
     cmd: Command,
-    iter: &mut std::iter::Peekable<I>,
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     let (stdin, stdout, stderr, saw) = parse_trailing_redirects(iter)?;
     if saw {
@@ -1709,10 +1746,10 @@ fn maybe_wrap_redirects<I: Iterator<Item = Token>>(
 /// The first word may be supplied as `first` (already consumed by the
 /// caller for function-def lookahead). When `first` is `None` the
 /// function reads the initial word from the iterator.
-fn parse_simple_stage<I: Iterator<Item = Token>>(
+fn parse_simple_stage(
     first: Option<Word>,
     prefix_tokens: Vec<Token>,
-    iter: &mut std::iter::Peekable<I>,
+    iter: &mut TokenCursor,
 ) -> Result<(Command, bool), ParseError> {
     let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
@@ -1846,8 +1883,8 @@ fn parse_simple_stage<I: Iterator<Item = Token>>(
 /// Returns the parsed `Command` and whether a further `|` was consumed
 /// (true only for simple stages that ended on `|`; compound stages never
 /// consume a trailing `|` — the outer loop checks for it).
-fn parse_next_stage<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_next_stage(
+    iter: &mut TokenCursor,
 ) -> Result<(Command, bool), ParseError> {
     // Standalone arith block: `((expr))` at pipeline-stage position
     // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
@@ -1898,10 +1935,10 @@ fn parse_next_stage<I: Iterator<Item = Token>>(
     }
 }
 
-fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
+fn parse_pipeline_with_first(
     first: Option<Word>,
     prefix_tokens: Vec<Token>,
-    iter: &mut std::iter::Peekable<I>,
+    iter: &mut TokenCursor,
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<Command> = Vec::new();
 
@@ -1941,8 +1978,8 @@ fn parse_pipeline_with_first<I: Iterator<Item = Token>>(
     Ok(Pipeline { negate: false, commands })
 }
 
-fn parse_pipeline<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_pipeline(
+    iter: &mut TokenCursor,
 ) -> Result<Pipeline, ParseError> {
     parse_pipeline_with_first(None, vec![], iter)
 }
@@ -1955,7 +1992,7 @@ fn parse_pipeline<I: Iterator<Item = Token>>(
 /// body (i.e. we should stop trying to parse more at this precedence level).
 /// This means we've hit `]]` (DoubleBracketClose keyword), `)` (RParen for
 /// grouped sub-expressions), or end of input.
-fn is_test_expr_stop<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) -> bool {
+fn is_test_expr_stop(iter: &mut TokenCursor) -> bool {
     match iter.peek() {
         None => true,
         Some(tok) => keyword_of(tok) == Some(Keyword::DoubleBracketClose)
@@ -1971,8 +2008,8 @@ fn is_test_expr_stop<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I
 /// `parse_test_atom` below. `<` / `>` arrive as `Op(RedirIn)` / `Op(RedirOut)`;
 /// every other operator arrives as a `Word` because the lexer has no dedicated
 /// token for it.
-fn next_is_test_binary_operator<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn next_is_test_binary_operator(
+    iter: &mut TokenCursor,
 ) -> bool {
     match iter.peek() {
         Some(Token::Op(Operator::RedirIn)) | Some(Token::Op(Operator::RedirOut)) => true,
@@ -1987,7 +2024,7 @@ fn next_is_test_binary_operator<I: Iterator<Item = Token>>(
 
 /// Skips zero or more `Token::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
-fn skip_test_newlines<I: Iterator<Item = Token>>(iter: &mut std::iter::Peekable<I>) {
+fn skip_test_newlines(iter: &mut TokenCursor) {
     while matches!(iter.peek(), Some(Token::Newline)) {
         iter.next();
     }
@@ -2051,8 +2088,8 @@ fn is_bang_word(tok: &Token) -> bool {
 /// `ParseError::UnterminatedDoubleBracket` so the REPL requests a
 /// continuation line, and on a present-but-wrong token (`]]`/an operator,
 /// i.e. a genuine missing operand) returns `ParseError::TestExprMissingOperand`.
-fn next_test_word<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn next_test_word(
+    iter: &mut TokenCursor,
 ) -> Result<Word, ParseError> {
     match iter.peek() {
         None => return Err(ParseError::UnterminatedDoubleBracket),
@@ -2071,8 +2108,8 @@ fn next_test_word<I: Iterator<Item = Token>>(
 }
 
 /// Lowest precedence: `||`.
-fn parse_test_or<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_test_or(
+    iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_and(iter)?;
     skip_test_newlines(iter);
@@ -2087,8 +2124,8 @@ fn parse_test_or<I: Iterator<Item = Token>>(
 }
 
 /// Next precedence: `&&`.
-fn parse_test_and<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_test_and(
+    iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_not(iter)?;
     skip_test_newlines(iter);
@@ -2103,8 +2140,8 @@ fn parse_test_and<I: Iterator<Item = Token>>(
 }
 
 /// Next precedence: `!` (right-associative).
-fn parse_test_not<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_test_not(
+    iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     if iter.peek().map(is_bang_word).unwrap_or(false) {
         iter.next(); // consume `!`
@@ -2115,8 +2152,8 @@ fn parse_test_not<I: Iterator<Item = Token>>(
 }
 
 /// Highest precedence: `( expr )` grouping or a single test atom.
-fn parse_test_primary<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_test_primary(
+    iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     // Grouping: `( expr )`.
     if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
@@ -2135,8 +2172,8 @@ fn parse_test_primary<I: Iterator<Item = Token>>(
 
 /// Parses a single test — either a unary test (`-f path`) or a
 /// binary/regex test (`lhs op rhs`).
-fn parse_test_atom<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_test_atom(
+    iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     // End of input mid-expression → unterminated (request continuation).
     if iter.peek().is_none() {
@@ -2275,14 +2312,14 @@ fn parse_test_atom<I: Iterator<Item = Token>>(
 ///
 /// Consumes `[[`, parses the test expression tree via Pratt precedence,
 /// then consumes `]]`. Returns `Command::DoubleBracket { expr, inline_assignments }`.
-fn parse_double_bracket<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_double_bracket(
+    iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     parse_double_bracket_with_assigns(iter, Vec::new())
 }
 
-fn parse_double_bracket_with_assigns<I: Iterator<Item = Token>>(
-    iter: &mut std::iter::Peekable<I>,
+fn parse_double_bracket_with_assigns(
+    iter: &mut TokenCursor,
     inline_assignments: Vec<Assignment>,
 ) -> Result<Command, ParseError> {
     // Consume `[[`.
@@ -2337,7 +2374,8 @@ mod tests {
     #[test]
     fn parse_one_unit_splits_on_top_level_newline() {
         let toks = crate::lexer::tokenize("echo a\necho b\n").unwrap();
-        let mut it = toks.into_iter().peekable();
+        let n = toks.len();
+        let mut it = TokenCursor::new(toks, vec![0; n]);
         let u1 = parse_one_unit(&mut it).unwrap().expect("unit 1");
         assert!(u1.rest.is_empty());
         let u2 = parse_one_unit(&mut it).unwrap().expect("unit 2");
@@ -2349,7 +2387,8 @@ mod tests {
     fn parse_one_unit_keeps_semicolon_list_and_andor_together() {
         // `a; b && c` on one line is ONE unit (semicolon and && do not split).
         let toks = crate::lexer::tokenize("a; b && c\n").unwrap();
-        let mut it = toks.into_iter().peekable();
+        let n = toks.len();
+        let mut it = TokenCursor::new(toks, vec![0; n]);
         let u = parse_one_unit(&mut it).unwrap().expect("unit");
         assert_eq!(u.rest.len(), 2); // (Semi, b), (And, c)
         assert!(parse_one_unit(&mut it).unwrap().is_none());
@@ -2358,7 +2397,8 @@ mod tests {
     #[test]
     fn parse_one_unit_keeps_multiline_if_as_one_unit() {
         let toks = crate::lexer::tokenize("if true\nthen echo hi\nfi\necho after\n").unwrap();
-        let mut it = toks.into_iter().peekable();
+        let n = toks.len();
+        let mut it = TokenCursor::new(toks, vec![0; n]);
         let u1 = parse_one_unit(&mut it).unwrap().expect("if unit");
         // u1.first should be the If compound (tuple variant Command::If(_)).
         assert!(matches!(u1.first, Command::If(_)));
