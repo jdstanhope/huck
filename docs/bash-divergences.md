@@ -28,9 +28,9 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 33 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 34 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -88,7 +88,6 @@ group.
   set variables whose name begins with `prefix`) are not implemented —
   the lexer's `${!` branch handles only the scalar-indirect form (M-91).
   Not used by the bashrc / bash-completion; deferred. M-91 follow-on.
-- **M-107: `FUNCNAME` inside function bodies** — `[deferred]` low. huck: `$FUNCNAME` (and `${FUNCNAME[…]}`) is empty inside a function; bash sets it to the call-stack array (`FUNCNAME[0]` = the current function name). Surfaced as the blank `:` in bash_completion's `bash_completion: : \`-n'` diagnostic (`$FUNCNAME` empty), though that branch is no longer reached once `getopts` works (M-106). bash_completion reads `${FUNCNAME[…]}` in a few other diagnostics. Fix needs a per-call function-name stack exposed as the `FUNCNAME` array (huck already pushes `function_arg0` in `call_function` — the array surface from M-82 makes the variable wiring feasible).
 
 ### Globbing
 
@@ -198,6 +197,7 @@ Things huck deliberately does differently from bash. Document and keep.
 
 - **L-38: brace expansion ordering vs parameters and scalar assignments** — `[deferred]`, low (v144; pre-existing, command-word path). Two related spots where huck's brace expansion diverges from bash's textual-first model: (a) a brace FOLLOWING a parameter — `v1=A v2=B; echo $v{1,2}` — bash expands `$v{1,2}`→`$v1 $v2` textually FIRST → `A B`, huck expands `$v` first → `1 2`; (b) a scalar assignment RHS — `v={1,2}; echo "$v"` — bash assigns the literal `{1,2}` (no brace expansion on a scalar assignment RHS), huck brace-expands the assignment word (`v=1 v=2`) leaving `v=2` (`x={a,b}` → `b`). Both pre-existing (NOT introduced by v144's array-element brace expansion, which is correct); surfaced during v144 review. Low/rare.
 - **L-39: process-substitution edge cases** — `[deferred]`, low (v150). The v150 process substitution `<(…)`/`>(…)` covers command-argument and redirect-target usage (foreground + pipelines + compound commands + background). Three residual edge gaps: (a) **assignment-RHS context** — `x=<(cmd)` is NOT realized (the `expand_assignment` path is a no-op for `ProcessSub`); bash assigns `/dev/fd/N`. Realizing there would fork a child with no command to consume the fd. (b) **setup-failure path** — if `pipe()`/`fork()` fails while realizing a process sub, huck prints an error and emits an EMPTY field, so the outer command still runs (with an empty arg / failing-open redirect); bash aborts the command on process-sub setup failure. Only reachable under fd/process exhaustion. (c) **background long-running inner producer** — `cmd < <(slow_producer) &` reaps the inner via `waitpid(WNOHANG)` after spawning the bg job (to avoid blocking `&`), so a still-running inner producer leaves a bounded zombie until SIGCHLD/shell-exit (its fd IS closed — no fd leak). Also: the FIFO fallback (`/dev/fd` absent) is verified by inspection only — unreachable on Linux/macOS, which both provide `/dev/fd`.
+- **L-40: `BASH_SOURCE` / `BASH_LINENO` call-stack arrays** — `[deferred]`, low (v151 follow-on). v151 added the dynamic `FUNCNAME` array (M-107). bash keeps two companion arrays in lockstep with `FUNCNAME`: `BASH_SOURCE[i]` = the source file where frame `i`'s function was defined, and `BASH_LINENO[i]` = the line number from which frame `i` was called. huck implements neither. `BASH_SOURCE` needs per-function definition-site (source file) tracking; `BASH_LINENO` needs a `LINENO` huck doesn't have (blocked by L-29). Rarely used outside error-reporting frameworks; the `FUNCNAME` surface (the common case) is covered.
 
 ### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
 - **Status**: intentional (v29)

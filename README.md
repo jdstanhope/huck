@@ -118,7 +118,7 @@ exhaustive list, tiered by severity). In summary:
 - Some `set`/`declare` modes: `set -n` (noexec), `-b`, `-h`,
   job-control `monitor`; `declare -l`/`-u`/`-n` (lowercase/uppercase/nameref);
   integer/exported arrays.
-- Misc: `$"…"` locale quoting, `cd -P`/`-L`, `pwd -P`/`-L`, `FUNCNAME`,
+- Misc: `$"…"` locale quoting, `cd -P`/`-L`, `pwd -P`/`-L`,
   `history -d`/`-w`/`-r`/`-a` and `history N`, `HISTSIZE`/`HISTFILESIZE`, the
   full signal-name table and `kill -<negative-PID>`, and `test -v` (the `[[ ]]`
   form works).
