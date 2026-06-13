@@ -3377,6 +3377,19 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     let persistent = builtins::is_special_builtin(&resolved.program)
         || (!bypass_functions && shell.functions.contains_key(&resolved.program));
 
+    // `exec`: a special builtin that does NOT fork. With a command operand it
+    // replaces the shell process image; with only redirections it applies them
+    // permanently to the shell's own fds. Neither fits the in-process-builtin or
+    // fork-an-external models, so intercept here — after the inline assignments
+    // are applied and exported (so they reach the replacement's environment) and
+    // after xtrace, but before the dispatch machinery. Its inline assignments
+    // persist (special builtin), so no restore on return.
+    if resolved.program == "exec" {
+        let outcome = run_exec_builtin(&resolved, cmd, shell);
+        drain_procsubs(shell, procsub_base);
+        return outcome;
+    }
+
     // 1. Control builtins always win — they cannot be shadowed by functions.
     // 2. User-defined function lookup.
     // 3. Regular builtin.
@@ -3599,6 +3612,242 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         "process-substitution leak: a return path in run_exec_single skipped drain_procsubs"
     );
     outcome
+}
+
+/// Parsed `exec` options. `operand_start` is the index in `exec`'s args where
+/// the command operand (and its args) begin; `args.len()` means none.
+struct ExecFlags {
+    /// `-c`: run the command with an empty environment.
+    clear_env: bool,
+    /// `-l`: prepend a `-` to argv[0] (login-shell convention).
+    login: bool,
+    /// `-a NAME`: use NAME as argv[0].
+    argv0: Option<String>,
+    operand_start: usize,
+}
+
+/// Parses leading `-c`/`-l`/`-a NAME` flags from `exec`'s arguments. Stops at
+/// the first non-flag word or `--`. Returns an error message on a bad flag.
+fn parse_exec_flags(args: &[String]) -> Result<ExecFlags, String> {
+    let mut f = ExecFlags { clear_env: false, login: false, argv0: None, operand_start: args.len() };
+    let mut i = 0;
+    'outer: while i < args.len() {
+        let arg = &args[i];
+        if arg == "--" {
+            f.operand_start = i + 1;
+            return Ok(f);
+        }
+        let Some(body) = arg.strip_prefix('-') else {
+            f.operand_start = i;
+            return Ok(f);
+        };
+        if body.is_empty() {
+            // A bare `-` is a command operand, not a flag.
+            f.operand_start = i;
+            return Ok(f);
+        }
+        let chars: Vec<char> = body.chars().collect();
+        let mut j = 0;
+        while j < chars.len() {
+            match chars[j] {
+                'c' => f.clear_env = true,
+                'l' => f.login = true,
+                'a' => {
+                    // `-a NAME`: the rest of this word, else the next word.
+                    let rest: String = chars[j + 1..].iter().collect();
+                    if rest.is_empty() {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("exec: -a: option requires an argument".to_string());
+                        }
+                        f.argv0 = Some(args[i].clone());
+                    } else {
+                        f.argv0 = Some(rest);
+                    }
+                    i += 1;
+                    continue 'outer;
+                }
+                other => return Err(format!("exec: -{other}: invalid option")),
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    Ok(f)
+}
+
+/// Job-control signals huck `SIG_IGN`s at the shell level (see
+/// `install_job_control_signals`). They must be reset to `SIG_DFL` for an
+/// `exec` replacement, since `SIG_IGN` is inherited across `execve`.
+const EXEC_RESET_SIGNALS: [libc::c_int; 3] =
+    [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU];
+
+/// Set the job-control signals to `SIG_DFL` for the about-to-exec replacement,
+/// returning their prior handlers. Because `CommandExt::exec` does NOT fork,
+/// any change here persists in the shell on the (rare) exec-failure path — so
+/// the caller restores them via `restore_exec_signals` if exec returns.
+unsafe fn reset_exec_signals_saving() -> [libc::sighandler_t; 3] {
+    let mut prev = [0 as libc::sighandler_t; 3];
+    for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
+        prev[i] = unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
+    prev
+}
+
+unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
+    for (i, &sig) in EXEC_RESET_SIGNALS.iter().enumerate() {
+        unsafe { libc::signal(sig, prev[i]); }
+    }
+}
+
+/// Applies `cmd`'s stdin/stdout/stderr redirects to the SHELL's own fds and
+/// keeps them (no restore) — `exec`'s permanent-redirect semantics. Mirrors the
+/// open logic of `with_redirect_scope` but, on full success, discards the saved
+/// originals instead of restoring them. A redirect that fails to open prints a
+/// diagnostic, rolls back any already-applied redirects (the scope's Drop), and
+/// returns `Err` (atomic: all-or-nothing).
+fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(), ()> {
+    use std::os::unix::io::IntoRawFd;
+    let mut scope = CompoundRedirectScope::new();
+
+    if let Some(r) = &cmd.stdin {
+        let new_fd: RawFd = match r {
+            Redirect::Read(word) => {
+                let path = match expand_single(word, shell) {
+                    Ok(p) => p,
+                    Err(()) => return Err(()),
+                };
+                match File::open(&path) {
+                    Ok(file) => file.into_raw_fd(),
+                    Err(e) => {
+                        eprintln!("huck: {path}: {e}");
+                        return Err(());
+                    }
+                }
+            }
+            Redirect::Heredoc { body, .. } => {
+                let bytes = expand_assignment(body, shell).into_bytes();
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, _pid)) => rfd,
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(()); }
+                }
+            }
+            Redirect::HereString(body) => {
+                let mut bytes = expand_assignment(body, shell).into_bytes();
+                bytes.push(b'\n');
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, _pid)) => rfd,
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(()); }
+                }
+            }
+            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_) | Redirect::Dup { .. } => {
+                eprintln!("huck: exec: unsupported stdin redirect");
+                return Err(());
+            }
+        };
+        if scope.redirect(new_fd, libc::STDIN_FILENO).is_err() {
+            unsafe { libc::close(new_fd); }
+            return Err(());
+        }
+        unsafe { libc::close(new_fd); }
+    }
+    if let Some(r) = &cmd.stdout
+        && apply_out_redirect(r, libc::STDOUT_FILENO, &mut scope, shell).is_err()
+    {
+        return Err(());
+    }
+    if let Some(r) = &cmd.stderr
+        && apply_out_redirect(r, libc::STDERR_FILENO, &mut scope, shell).is_err()
+    {
+        return Err(());
+    }
+
+    // Success: make the redirections permanent — close the saved originals so
+    // Drop has nothing to restore (and no fd leaks).
+    for (_target, saved) in scope.saved.drain(..) {
+        unsafe { libc::close(saved); }
+    }
+    Ok(())
+}
+
+/// The `exec` special builtin. With a command operand, replaces the shell
+/// process image (no fork) via `CommandExt::exec`, which only returns on
+/// failure. With only redirections, applies them permanently to the shell's
+/// fds and returns 0. Inline assignments preceding `exec` were already applied
+/// and exported by the caller, so they reach the replacement's environment.
+fn run_exec_builtin(
+    resolved: &ResolvedCommand,
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+) -> ExecOutcome {
+    let flags = match parse_exec_flags(&resolved.args) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("huck: {msg}");
+            return ExecOutcome::Continue(2);
+        }
+    };
+
+    // POSIX order: perform the redirections first. For `exec` they are PERMANENT
+    // (no restore). bash does NOT exit on a failed `exec` redirect (unlike a
+    // failed exec COMMAND below) — it prints the error and returns failure, so
+    // the shell continues. Match that with Continue(1).
+    let exit_or_continue = |code: i32, shell: &Shell| {
+        if shell.is_interactive { ExecOutcome::Continue(code) } else { ExecOutcome::Exit(code) }
+    };
+    if has_any_redirect(cmd) {
+        flush_stdout();
+        if apply_redirects_permanently(cmd, shell).is_err() {
+            return ExecOutcome::Continue(1);
+        }
+    }
+
+    let operands = &resolved.args[flags.operand_start..];
+    if operands.is_empty() {
+        // Redirect-only (or bare) `exec`: redirections done, status 0.
+        return ExecOutcome::Continue(0);
+    }
+
+    let name = &operands[0];
+    let prog_path = match builtins::search_path_for(name, shell) {
+        Some(p) => p,
+        None => {
+            let (msg, code) = if name.contains('/') && std::path::Path::new(name).exists() {
+                ("cannot execute: Permission denied", 126)
+            } else {
+                ("not found", 127)
+            };
+            eprintln!("huck: exec: {name}: {msg}");
+            return exit_or_continue(code, shell);
+        }
+    };
+
+    flush_stdout();
+    use std::os::unix::process::CommandExt;
+    let mut process = ProcessCommand::new(&prog_path);
+    process.args(&operands[1..]);
+    // argv[0]: `-a NAME` overrides; `-l` prepends `-`; default is the name as given.
+    let base0 = flags.argv0.clone().unwrap_or_else(|| name.clone());
+    process.arg0(if flags.login { format!("-{base0}") } else { base0 });
+    process.env_clear();
+    if !flags.clear_env {
+        process.envs(shell.exported_env());
+        process.envs(shell.exported_function_env());
+    }
+
+    // Reset job-control signals to default for the replacement (huck SIG_IGNs
+    // them and that is inherited across execve), saving them so a failed exec
+    // restores the shell's own handlers (exec() does not fork).
+    let saved = unsafe { reset_exec_signals_saving() };
+    let err = process.exec();
+    unsafe { restore_exec_signals(saved); }
+
+    let code = match err.raw_os_error() {
+        Some(libc::ENOENT) => 127,
+        _ => 126, // EACCES / ENOEXEC / EISDIR / etc.: "cannot execute".
+    };
+    eprintln!("huck: exec: {name}: {err}");
+    exit_or_continue(code, shell)
 }
 
 /// `stdout_dup_target` / `stderr_dup_target`: if `Some(fd)`, a pre_exec closure
@@ -5370,6 +5619,60 @@ mod tests {
     use crate::command::{Command, ExecCommand, IfClause, Pipeline, Sequence, SimpleCommand};
     use crate::lexer::{Word, WordPart};
     use crate::test_support::CWD_LOCK;
+
+    fn exec_args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_exec_flags_plain_command() {
+        let f = parse_exec_flags(&exec_args(&["echo", "hi"])).unwrap();
+        assert!(!f.clear_env && !f.login && f.argv0.is_none());
+        assert_eq!(f.operand_start, 0);
+    }
+
+    #[test]
+    fn parse_exec_flags_c_l_and_a_separate() {
+        let f = parse_exec_flags(&exec_args(&["-c", "-l", "-a", "NAME", "prog"])).unwrap();
+        assert!(f.clear_env && f.login);
+        assert_eq!(f.argv0.as_deref(), Some("NAME"));
+        assert_eq!(f.operand_start, 4);
+    }
+
+    #[test]
+    fn parse_exec_flags_clustered_and_inline_a() {
+        // `-cla NAME` clusters -c, -l, and -a with NAME as the next word.
+        let f = parse_exec_flags(&exec_args(&["-cla", "NAME", "prog"])).unwrap();
+        assert!(f.clear_env && f.login);
+        assert_eq!(f.argv0.as_deref(), Some("NAME"));
+        assert_eq!(f.operand_start, 2);
+        // `-aZERO prog`: argv0 is the inline remainder of the word.
+        let f2 = parse_exec_flags(&exec_args(&["-aZERO", "prog"])).unwrap();
+        assert_eq!(f2.argv0.as_deref(), Some("ZERO"));
+        assert_eq!(f2.operand_start, 1);
+    }
+
+    #[test]
+    fn parse_exec_flags_double_dash_and_bare_dash() {
+        let f = parse_exec_flags(&exec_args(&["--", "-prog"])).unwrap();
+        assert_eq!(f.operand_start, 1);
+        // A bare `-` is an operand, not a flag.
+        let f2 = parse_exec_flags(&exec_args(&["-"])).unwrap();
+        assert_eq!(f2.operand_start, 0);
+    }
+
+    #[test]
+    fn parse_exec_flags_errors() {
+        assert!(parse_exec_flags(&exec_args(&["-Z"])).is_err());
+        assert!(parse_exec_flags(&exec_args(&["-a"])).is_err()); // -a needs an argument
+    }
+
+    #[test]
+    fn parse_exec_flags_no_command_only_flags() {
+        let f = parse_exec_flags(&exec_args(&["-c"])).unwrap();
+        assert!(f.clear_env);
+        assert_eq!(f.operand_start, 1); // == args.len(): no operand
+    }
 
     #[test]
     fn ps4_cmdsub_preserves_last_status() {

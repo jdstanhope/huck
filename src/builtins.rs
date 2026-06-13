@@ -26,7 +26,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "wait", "fg", "bg", "kill", "disown", "history", "test", "[",
     "break", "continue", "return", "trap", "alias", "unalias",
     "set", "shopt", "shift", "getopts", ".", "source", "local",
-    ":", "true", "false", "command", "builtin",
+    ":", "true", "false", "command", "builtin", "exec",
     "readonly", "read", "mapfile", "readarray", "printf", "type", "hash",
     "pushd", "popd", "dirs",
     "declare", "typeset",
@@ -56,7 +56,7 @@ pub fn is_declaration_command(name: &str) -> bool {
 /// huck adds `exec`.
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
-        ":" | "." | "break" | "continue" | "eval" | "exit" | "export" | "readonly" | "return"
+        ":" | "." | "break" | "continue" | "eval" | "exec" | "exit" | "export" | "readonly" | "return"
         | "set" | "shift" | "source" | "trap" | "unset"
     )
 }
@@ -116,6 +116,14 @@ pub fn run_builtin(
         // `builtin` is normally consumed by the executor's strip loop before
         // dispatch; this guards a bare `builtin` that reaches run_builtin.
         "builtin" => ExecOutcome::Continue(0),
+        // `exec` is intercepted by the executor (run_exec_single) before dispatch
+        // — it replaces the process image / applies permanent redirects, which
+        // this (name, args, out, shell) signature can't express. Guard against a
+        // future refactor routing it here so it degrades instead of panicking.
+        "exec" => {
+            eprintln!("huck: exec: not supported in this context");
+            ExecOutcome::Continue(1)
+        }
         "type" => builtin_type(args, out, shell),
         "hash" => builtin_hash(args, out, shell),
         "pushd" => builtin_pushd(args, out, shell),
@@ -6078,7 +6086,7 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     }
 }
 
-fn search_path_for(name: &str, shell: &Shell) -> Option<std::path::PathBuf> {
+pub(crate) fn search_path_for(name: &str, shell: &Shell) -> Option<std::path::PathBuf> {
     if name.contains('/') {
         let p = std::path::PathBuf::from(name);
         if is_executable_file(&p) { Some(p) } else { None }

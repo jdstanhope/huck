@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 36 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -61,6 +61,7 @@ group.
 
 - **M-20: `n<>file` read-write open** — `[deferred]` low. huck: not implemented. bash: opens fd for read+write.
 - **M-51: `|&` pipe stdout+stderr** — `[deferred]` low. huck: parse error. bash: shorthand for `2>&1 |`.
+- **M-124: arbitrary-fd (fd>2) redirections** — `[deferred]` medium. huck's `ExecCommand` AST models only stdin/stdout/stderr (fds 0/1/2), so `n>file` / `n<file` / `n>&m` for `n>2` (e.g. `cmd 3>log`, `exec 3<input`, `2>&3`) are not representable. Most visible now that v155 added `exec`: the common `exec 3<file` / `exec {fd}>file` private-fd idioms do not work (the bare `exec` redirect modes for fds 0/1/2 — `exec >log 2>&1`, `exec <in` — do work). Would require generalizing the redirect slots to an fd-indexed map across the lexer/parser/executor.
 
 ### Quoting
 
