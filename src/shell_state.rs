@@ -23,11 +23,9 @@ pub enum FrameKind {
 pub struct Frame {
     /// Function name, "source", or "main".
     pub funcname: String,
-    /// File where this frame's code is defined (def-source). Unused until Task 2.
-    #[allow(dead_code)] // wired in Task 2-4
+    /// File where this frame's code is defined (def-source).
     pub source: String,
     /// Line in the caller where this frame was invoked (0 for base).
-    #[allow(dead_code)] // wired in Task 2-4
     pub call_line: u32,
     pub kind: FrameKind,
 }
@@ -308,9 +306,8 @@ pub struct Shell {
     /// `$0` returns the innermost Function frame name, or `shell_argv0` at top level.
     pub call_stack: Vec<Frame>,
     /// Map of function-name → defining source file path. Populated when a
-    /// function is defined (Task 2). Used to fill `Frame.source` and ultimately
-    /// `BASH_SOURCE`. (wired in Task 2-4)
-    #[allow(dead_code)]
+    /// function is defined. Used to fill `Frame.source` and ultimately
+    /// `BASH_SOURCE`.
     pub function_source: std::collections::HashMap<String, String>,
     /// `Some(status)` after a fatal parameter-expansion error fires
     /// inside an `expand_*` call. The executor peeks this to bail the
@@ -1164,25 +1161,43 @@ impl Shell {
     }
 
     /// Rebuild FUNCNAME/BASH_SOURCE/BASH_LINENO from `call_stack`.
-    /// (Task 1: FUNCNAME only. BASH_SOURCE/BASH_LINENO wired in Tasks 2-4.)
     /// `FUNCNAME[0]` is the currently-executing function, `[1]` its caller, etc.
-    /// When the stack is empty (top level) `FUNCNAME` is unset, matching bash.
+    /// When the stack is empty (top level) all three arrays are unset, matching bash.
     /// Called by `call_function` after every push/pop of `call_stack`.
     pub(crate) fn sync_call_arrays(&mut self) {
         if self.call_stack.is_empty() {
             self.vars.remove("FUNCNAME");
+            self.vars.remove("BASH_SOURCE");
+            self.vars.remove("BASH_LINENO");
             return;
         }
         let n = self.call_stack.len();
-        let funcnames: BTreeMap<usize, String> =
-            (0..n).map(|i| (i, self.call_stack[n - 1 - i].funcname.clone())).collect();
-        self.set_indexed_var("FUNCNAME", funcnames);
+        let mut funcnames = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        let mut linenos = BTreeMap::new();
+        for i in 0..n {
+            let f = &self.call_stack[n - 1 - i]; // i=0 -> top/current frame
+            funcnames.insert(i, f.funcname.clone());
+            sources.insert(i, f.source.clone());
+            linenos.insert(i, f.call_line.to_string());
+        }
+        self.set_indexed_var("BASH_SOURCE", sources);
+        self.set_indexed_var("BASH_LINENO", linenos);
+        // FUNCNAME is unset when the top frame is the base `main` (Task 3 adds Main frames).
+        if matches!(self.call_stack.last().map(|f| &f.kind), Some(FrameKind::Main)) {
+            self.vars.remove("FUNCNAME");
+        } else {
+            self.set_indexed_var("FUNCNAME", funcnames);
+        }
     }
 
     /// Defines (or replaces) a shell function. Copy-on-write: if the function
     /// table is shared (e.g. with a command-substitution clone), this copies it
     /// first so the mutation does not leak across the isolation boundary.
     pub(crate) fn define_function(&mut self, name: String, body: Box<crate::command::Command>) {
+        let def_src = self.call_stack.last().map(|f| f.source.clone())
+            .unwrap_or_else(|| "environment".to_string());
+        self.function_source.insert(name.clone(), def_src);
         Rc::make_mut(&mut self.functions).insert(name, body);
     }
 
@@ -1229,6 +1244,7 @@ impl Shell {
     /// Also clears any `export -f` mark so `unset -f` un-exports.
     pub(crate) fn remove_function(&mut self, name: &str) -> bool {
         self.exported_functions.remove(name);
+        self.function_source.remove(name);
         Rc::make_mut(&mut self.functions).remove(name).is_some()
     }
 
