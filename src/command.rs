@@ -196,6 +196,7 @@ fn finalize_stage(
     stdin: Option<Redirect>,
     stdout: Option<Redirect>,
     stderr: Option<Redirect>,
+    line: u32,
 ) -> SimpleCommand {
     let no_redirs = stdin.is_none() && stdout.is_none() && stderr.is_none();
 
@@ -233,7 +234,7 @@ fn finalize_stage(
             stdin,
             stdout,
             stderr,
-            line: 0,
+            line,
         });
     }
     let mut remaining = remaining.into_iter();
@@ -246,7 +247,7 @@ fn finalize_stage(
         stdin,
         stdout,
         stderr,
-        line: 0,
+        line,
     })
 }
 
@@ -630,20 +631,29 @@ impl ExactSizeIterator for TokenCursor {
     fn len(&self) -> usize { self.iter.len() }
 }
 
-pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    let n = tokens.len();
-    let mut cur = TokenCursor::new(tokens, vec![0; n]);
-    skip_newlines(&mut cur);
+fn parse_cursor(cur: &mut TokenCursor) -> Result<Option<Sequence>, ParseError> {
+    skip_newlines(cur);
     if cur.peek().is_none() {
         return Ok(None);
     }
-    let seq = parse_sequence(&mut cur, &[])?;
+    let seq = parse_sequence(cur, &[])?;
     if cur.peek().is_some() {
         // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
         // sequence — `parse_sequence` peek-breaks on those (see below).
         return Err(ParseError::UnexpectedToken);
     }
     Ok(Some(seq))
+}
+
+pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
+    let n = tokens.len();
+    let mut cur = TokenCursor::new(tokens, vec![0; n]);
+    parse_cursor(&mut cur)
+}
+
+pub fn parse_with_lines(tokens: Vec<Token>, lines: Vec<u32>) -> Result<Option<Sequence>, ParseError> {
+    let mut cur = TokenCursor::new(tokens, lines);
+    parse_cursor(&mut cur)
 }
 
 /// Parses one sequence ELEMENT: a command, plus — if a `|` immediately
@@ -915,6 +925,8 @@ fn parse_command_inner(
             // Non-keyword, non-LParen: may be a function definition
             // `name() compound`, or a plain pipeline. Need two-token lookahead.
             if matches!(iter.peek(), Some(Token::Word(_))) {
+                // Capture the line of the first word BEFORE consuming it.
+                let word_line = iter.current_line();
                 // Consume the word; peek for `(`.
                 let Some(Token::Word(w)) = iter.next() else { unreachable!() };
                 if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
@@ -960,7 +972,7 @@ fn parse_command_inner(
                     // parse_pipeline_with_first with the original iter.
                     if extra_clones.is_empty() {
                         return Ok(Command::Pipeline(
-                            parse_pipeline_with_first(Some(w_clone), vec![], iter)?
+                            parse_pipeline_with_first(Some(w_clone), vec![], iter, word_line)?
                         ));
                     }
                     // Multi-assign case (e.g. `A=1 B=2 cmd`): extra assignment
@@ -972,11 +984,11 @@ fn parse_command_inner(
                     let prefix: Vec<Token> =
                         extra_clones.into_iter().map(Token::Word).collect();
                     return Ok(Command::Pipeline(
-                        parse_pipeline_with_first(Some(w_clone), prefix, iter)?
+                        parse_pipeline_with_first(Some(w_clone), prefix, iter, word_line)?
                     ));
                 }
                 // Not a function def — pipeline with `w` as the first word.
-                Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), vec![], iter)?))
+                Ok(Command::Pipeline(parse_pipeline_with_first(Some(w), vec![], iter, word_line)?))
             } else {
                 Ok(Command::Pipeline(parse_pipeline(iter)?))
             }
@@ -1746,10 +1758,13 @@ fn maybe_wrap_redirects(
 /// The first word may be supplied as `first` (already consumed by the
 /// caller for function-def lookahead). When `first` is `None` the
 /// function reads the initial word from the iterator.
+/// `first_line` is the 1-based source line of the command's first token
+/// (captured by the caller before consuming that token).
 fn parse_simple_stage(
     first: Option<Word>,
     prefix_tokens: Vec<Token>,
     iter: &mut TokenCursor,
+    first_line: u32,
 ) -> Result<(Command, bool), ParseError> {
     let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
@@ -1867,7 +1882,7 @@ fn parse_simple_stage(
     }
 
     let prog = program.ok_or(ParseError::MissingCommand)?;
-    let cmd = Command::Simple(finalize_stage(prog, args, stdin, stdout, stderr));
+    let cmd = Command::Simple(finalize_stage(prog, args, stdin, stdout, stderr, first_line));
     Ok((cmd, pipe_follows))
 }
 
@@ -1921,15 +1936,18 @@ fn parse_next_stage(
             // Non-keyword: may be a function definition `name() compound` or
             // a plain simple stage. Need two-token lookahead.
             if matches!(iter.peek(), Some(Token::Word(_))) {
+                // Capture line before consuming the first word.
+                let word_line = iter.current_line();
                 let Some(Token::Word(w)) = iter.next() else { unreachable!() };
                 if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
                     let cmd = parse_function_def(w, iter)?;
                     return Ok((cmd, false));
                 }
                 // Not a function def — simple stage with `w` as the first word.
-                parse_simple_stage(Some(w), vec![], iter)
+                parse_simple_stage(Some(w), vec![], iter, word_line)
             } else {
-                parse_simple_stage(None, vec![], iter)
+                let first_line = iter.current_line();
+                parse_simple_stage(None, vec![], iter, first_line)
             }
         }
     }
@@ -1939,6 +1957,7 @@ fn parse_pipeline_with_first(
     first: Option<Word>,
     prefix_tokens: Vec<Token>,
     iter: &mut TokenCursor,
+    first_line: u32,
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<Command> = Vec::new();
 
@@ -1947,7 +1966,7 @@ fn parse_pipeline_with_first(
     // pass it along). The first stage is always a simple command because
     // `parse_command` dispatches compound commands before calling us, so
     // we only arrive here for simple-command pipelines.
-    let (first_cmd, mut pipe_follows) = parse_simple_stage(first, prefix_tokens, iter)?;
+    let (first_cmd, mut pipe_follows) = parse_simple_stage(first, prefix_tokens, iter, first_line)?;
     commands.push(first_cmd);
 
     // For each subsequent stage (after `|`), dispatch via `parse_next_stage`
@@ -1981,7 +2000,8 @@ fn parse_pipeline_with_first(
 fn parse_pipeline(
     iter: &mut TokenCursor,
 ) -> Result<Pipeline, ParseError> {
-    parse_pipeline_with_first(None, vec![], iter)
+    let first_line = iter.current_line();
+    parse_pipeline_with_first(None, vec![], iter, first_line)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -5238,5 +5258,35 @@ mod tests {
     fn dbracket_missing_operand_with_close_is_error() {
         let toks = crate::lexer::tokenize("[[ a == ]]").unwrap();
         assert!(matches!(parse(toks), Err(ParseError::TestExprMissingOperand)));
+    }
+
+    /// Walk a Sequence collecting `ExecCommand.line` values in source order.
+    fn collect_exec_lines(seq: &Sequence) -> Vec<u32> {
+        fn from_cmd(cmd: &Command, out: &mut Vec<u32>) {
+            match cmd {
+                Command::Pipeline(p) => {
+                    for c in &p.commands { from_cmd(c, out); }
+                }
+                Command::Simple(SimpleCommand::Exec(e)) => out.push(e.line),
+                Command::Simple(SimpleCommand::Assign(_)) => {}
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        from_cmd(&seq.first, &mut out);
+        for (_, cmd) in &seq.rest {
+            from_cmd(cmd, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn parse_with_lines_stamps_exec_command_lines() {
+        let src = "echo a\necho b\necho c"; // 3 commands on lines 1,2,3
+        let (toks, offs) = crate::lexer::tokenize_with_offsets(src, crate::lexer::LexerOptions::default()).unwrap();
+        // offsets.len() == tokens.len() + 1; drop the trailing sentinel.
+        let lines: Vec<u32> = offs[..toks.len()].iter().map(|&o| crate::lexer::line_at_offset(src, o)).collect();
+        let seq = parse_with_lines(toks, lines).unwrap().unwrap();
+        assert_eq!(collect_exec_lines(&seq), vec![1, 2, 3]);
     }
 }

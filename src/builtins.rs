@@ -5789,7 +5789,14 @@ pub(crate) fn run_sourced_contents_in_sink(
             }
             break;
         }
-        let mut iter = crate::command::TokenCursor::new(tokens, vec![0; total]);
+        // Compute per-token source lines from the offsets. Offsets are relative
+        // to &contents[start..]; add `start` to get absolute byte positions in
+        // `contents` so that line numbers reflect the real file line numbers.
+        // offsets.len() == total + 1; slice to total to match token count.
+        let token_lines: Vec<u32> = offsets[..total].iter()
+            .map(|&o| crate::lexer::line_at_offset(contents, start + o))
+            .collect();
+        let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {
             while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) {
