@@ -417,6 +417,16 @@ pub struct Shell {
     /// Stamped by the executor at the top of `run_exec_single` from
     /// `ExecCommand.line`. Zero means "unknown / not yet set".
     pub current_lineno: u32,
+
+    /// LCG state for `$RANDOM`. Uses interior mutability so `lookup_var`
+    /// (&self) can advance the state on each read. Seeded at startup from
+    /// PID + nanoseconds; reseedable via `RANDOM=n`.
+    pub random_state: std::cell::Cell<u64>,
+
+    /// Monotonic baseline for `$SECONDS`. Elapsed seconds since this
+    /// instant gives the current `$SECONDS` value. Resettable via
+    /// `SECONDS=n` (sets base to `now - n`).
+    pub seconds_base: std::time::Instant,
 }
 
 /// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
@@ -446,6 +456,15 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
         crate::command::Command::FunctionDef { name: n, body } if n == name => Some(body),
         _ => None,
     }
+}
+
+/// Advance the LCG and return the next RANDOM value (0..=32767).
+fn random_next(state: &std::cell::Cell<u64>) -> u32 {
+    let s = state.get()
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    state.set(s);
+    ((s >> 33) as u32) & 0x7fff
 }
 
 impl Shell {
@@ -521,6 +540,15 @@ impl Shell {
             current_completion_spec: None,
             procsub_pending: Vec::new(),
             current_lineno: 0,
+            random_state: std::cell::Cell::new({
+                let pid = shell_pid as u64;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                pid.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(nanos) | 1
+            }),
+            seconds_base: std::time::Instant::now(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -601,6 +629,16 @@ impl Shell {
             "-" => return Some(self.dollar_dash_value()),
             "?" => return Some(self.last_status().to_string()),
             "LINENO" => return Some(self.current_lineno.to_string()),
+            "RANDOM" => return Some(random_next(&self.random_state).to_string()),
+            "SECONDS" => return Some(self.seconds_base.elapsed().as_secs().to_string()),
+            "EPOCHSECONDS" => return Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    .to_string()
+            ),
+            "BASHPID" => return Some((unsafe { libc::getpid() }).to_string()),
             _ => {}
         }
         if name == "#" {
@@ -637,6 +675,25 @@ impl Shell {
     /// rest of the map is preserved (matches bash: `a=v` on an indexed
     /// array overwrites a[0]).
     pub fn set(&mut self, name: &str, value: String) {
+        match name {
+            "RANDOM" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.random_state.set(
+                        n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
+                    );
+                }
+                return;
+            }
+            "SECONDS" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.seconds_base = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(n))
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+                return;
+            }
+            _ => {}
+        }
         match self.vars.get_mut(name) {
             Some(existing) => install_scalar_value(existing, value),
             None => {
@@ -987,6 +1044,26 @@ impl Shell {
     pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
         if self.is_readonly(name) {
             return Err(());
+        }
+        // Intercept dynamic builtin variables: reseed RANDOM or reset SECONDS.
+        match name {
+            "RANDOM" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.random_state.set(
+                        n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
+                    );
+                }
+                return Ok(());
+            }
+            "SECONDS" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.seconds_base = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(n))
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         // Determine whether the integer-coerce path applies: only on
         // an existing integer-flagged Scalar. Indexed variables (even
