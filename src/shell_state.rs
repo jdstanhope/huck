@@ -417,7 +417,59 @@ pub struct Shell {
     /// Stamped by the executor at the top of `run_exec_single` from
     /// `ExecCommand.line`. Zero means "unknown / not yet set".
     pub current_lineno: u32,
+
+    /// LCG state for `$RANDOM`. Uses interior mutability so `lookup_var`
+    /// (&self) can advance the state on each read. Seeded at startup from
+    /// PID + nanoseconds; reseedable via `RANDOM=n`.
+    pub random_state: std::cell::Cell<u64>,
+
+    /// Monotonic baseline for `$SECONDS`. Elapsed seconds since this
+    /// instant gives the current `$SECONDS` value. Resettable via
+    /// `SECONDS=n` (sets base to `now - n`).
+    pub seconds_base: std::time::Instant,
 }
+
+// ---- Static builtin variable helpers (platform strings, libc wrappers) ----
+
+#[cfg(target_os = "linux")]
+const BUILTIN_OSTYPE: &str = "linux-gnu";
+#[cfg(target_os = "macos")]
+const BUILTIN_OSTYPE: &str = "darwin";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const BUILTIN_OSTYPE: &str = "unknown";
+
+fn builtin_machtype() -> String {
+    let arch = std::env::consts::ARCH;
+    #[cfg(target_os = "linux")]
+    { format!("{arch}-pc-linux-gnu") }
+    #[cfg(target_os = "macos")]
+    { format!("{arch}-apple-darwin") }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { format!("{arch}-unknown") }
+}
+
+fn builtin_current_groups() -> Vec<u32> {
+    unsafe {
+        let n = libc::getgroups(0, std::ptr::null_mut());
+        if n <= 0 { return Vec::new(); }
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let m = libc::getgroups(n, buf.as_mut_ptr());
+        if m < 0 { return Vec::new(); }
+        buf.truncate(m as usize);
+        buf.into_iter().collect()
+    }
+}
+
+fn builtin_hostname() -> String {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+// ---- (end static builtin helpers) ------------------------------------------
 
 /// Securely parse a `BASH_FUNC_<name>%%` env value into a function body.
 /// Reconstructs `"{name} {value}"` (= `name () { body }`) and parses it, accepting
@@ -447,6 +499,21 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
         _ => None,
     }
 }
+
+/// Advance the LCG and return the next RANDOM value (0..=32767).
+fn random_next(state: &std::cell::Cell<u64>) -> u32 {
+    let s = state.get()
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    state.set(s);
+    ((s >> 33) as u32) & 0x7fff
+}
+
+/// Special variables that are valid/known but not always present in the vars table
+/// (computed dynamics + the sometimes-unset call-stack arrays). Surfaced in variable-name
+/// completion and `compgen -v` so they complete like bash even when unset.
+pub const DYNAMIC_SPECIAL_VARS: &[&str] =
+    &["RANDOM", "SECONDS", "EPOCHSECONDS", "BASHPID", "LINENO", "BASH_SOURCE", "BASH_LINENO"];
 
 impl Shell {
     pub fn new() -> Self {
@@ -521,6 +588,15 @@ impl Shell {
             current_completion_spec: None,
             procsub_pending: Vec::new(),
             current_lineno: 0,
+            random_state: std::cell::Cell::new({
+                let pid = shell_pid as u64;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                pid.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(nanos) | 1
+            }),
+            seconds_base: std::time::Instant::now(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -533,6 +609,10 @@ impl Shell {
                 shell.mark_function_exported(&fname);
             }
         }
+        // Install static builtin variables AFTER env-load and BASH_FUNC import
+        // so they overwrite any inherited env values (e.g. a parent shell's
+        // exported UID, SHLVL, etc.).
+        shell.install_builtin_vars();
         shell
     }
 
@@ -601,6 +681,16 @@ impl Shell {
             "-" => return Some(self.dollar_dash_value()),
             "?" => return Some(self.last_status().to_string()),
             "LINENO" => return Some(self.current_lineno.to_string()),
+            "RANDOM" => return Some(random_next(&self.random_state).to_string()),
+            "SECONDS" => return Some(self.seconds_base.elapsed().as_secs().to_string()),
+            "EPOCHSECONDS" => return Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    .to_string()
+            ),
+            "BASHPID" => return Some((unsafe { libc::getpid() }).to_string()),
             _ => {}
         }
         if name == "#" {
@@ -632,11 +722,37 @@ impl Shell {
     }
 
     /// Sets a variable's value, preserving its existing `exported` flag (or
+    /// If `name` is a reseed/reset-on-assignment dynamic special (`RANDOM`/`SECONDS`),
+    /// apply the side effect and return `true` (caller must NOT store it as a var —
+    /// these are computed in `lookup_var`). Returns `false` for ordinary names.
+    fn reseed_special_on_assign(&mut self, name: &str, value: &str) -> bool {
+        match name {
+            "RANDOM" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.random_state.set(
+                        n.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234) | 1,
+                    );
+                }
+                true
+            }
+            "SECONDS" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    self.seconds_base = std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(n))
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// creating it as unexported if it didn't exist). When the existing
     /// value is an `Indexed` array, only element 0 is overwritten — the
     /// rest of the map is preserved (matches bash: `a=v` on an indexed
     /// array overwrites a[0]).
     pub fn set(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => install_scalar_value(existing, value),
             None => {
@@ -855,6 +971,7 @@ impl Shell {
     /// reject writes to readonly vars must check `is_readonly` first
     /// (see `builtin_export` and `apply_inline_assignments`).
     pub fn export_set(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => {
                 install_scalar_value(existing, value);
@@ -988,6 +1105,8 @@ impl Shell {
         if self.is_readonly(name) {
             return Err(());
         }
+        // Intercept dynamic builtin variables: reseed RANDOM or reset SECONDS.
+        if self.reseed_special_on_assign(name, &value) { return Ok(()); }
         // Determine whether the integer-coerce path applies: only on
         // an existing integer-flagged Scalar. Indexed variables (even
         // if integer-flagged) take the array-element-0 overwrite path
@@ -1092,6 +1211,82 @@ impl Shell {
         names.sort();
         names
     }
+
+    // ---- Static builtin variable installation (Shell::new) -----------------
+
+    /// Install a scalar builtin variable, overwriting any inherited env value.
+    fn install_var(&mut self, name: &str, value: String, readonly: bool) {
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Scalar(value),
+            exported: false,
+            readonly,
+            integer: false,
+        });
+    }
+
+    /// Install an indexed array builtin variable.
+    fn install_indexed(&mut self, name: &str, elems: Vec<String>, readonly: bool) {
+        let map: BTreeMap<usize, String> = elems.into_iter().enumerate().collect();
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Indexed(map),
+            exported: false,
+            readonly,
+            integer: false,
+        });
+    }
+
+    /// Called once from `Shell::new` (after env-load + BASH_FUNC import) to
+    /// populate the static builtin variables that are always present.
+    fn install_builtin_vars(&mut self) {
+        // IDs (readonly)
+        unsafe {
+            self.install_var("UID",  libc::getuid().to_string(),  true);
+            self.install_var("EUID", libc::geteuid().to_string(), true);
+            self.install_var("PPID", libc::getppid().to_string(), true);
+        }
+        // Groups (readonly indexed array)
+        self.install_indexed(
+            "GROUPS",
+            builtin_current_groups().iter().map(|g| g.to_string()).collect(),
+            true,
+        );
+        // Host / platform strings
+        self.install_var("HOSTNAME", builtin_hostname(), false);
+        self.install_var("HOSTTYPE", std::env::consts::ARCH.to_string(), false);
+        self.install_var("OSTYPE",   BUILTIN_OSTYPE.to_string(), false);
+        self.install_var("MACHTYPE", builtin_machtype(), false);
+        // huck / bash identity
+        self.install_var(
+            "BASH",
+            std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "huck".into()),
+            false,
+        );
+        self.install_var("BASH_VERSION", "5.2.0(1)-release".to_string(), false);
+        self.install_indexed(
+            "BASH_VERSINFO",
+            vec![
+                "5".into(), "2".into(), "0".into(), "1".into(),
+                "release".into(), builtin_machtype(),
+            ],
+            true,
+        );
+        self.install_var("HUCK_VERSION", env!("CARGO_PKG_VERSION").to_string(), false);
+        // SHLVL: read inherited value (already in vars from env-load), add 1.
+        let lvl = self.vars
+            .get("SHLVL")
+            .and_then(|v| v.value.scalar_view().parse::<i64>().ok())
+            .unwrap_or(0);
+        self.vars.insert("SHLVL".to_string(), Variable {
+            value: VarValue::Scalar((lvl + 1).max(1).to_string()),
+            exported: true,
+            readonly: false,
+            integer: false,
+        });
+    }
+
+    // ---- (end static builtin vars) -----------------------------------------
 
     /// Returns a reference to the indexed array stored under `name`,
     /// or `None` if the variable is unset or a scalar.
@@ -1604,6 +1799,16 @@ impl Shell {
     /// Iterates the names of all variables (exported or not).
     pub fn var_names(&self) -> impl Iterator<Item = &str> {
         self.vars.keys().map(|s| s.as_str())
+    }
+
+    /// Variable names for completion / `compgen -v`: the vars table plus the known
+    /// dynamic/special names not always stored. Deduped (sorted).
+    pub fn completion_var_names(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = self.vars.keys().cloned().collect();
+        for &n in DYNAMIC_SPECIAL_VARS {
+            set.insert(n.to_string());
+        }
+        set.into_iter().collect()
     }
 
     /// Sends SIGHUP to every live job not marked for nohup. Called

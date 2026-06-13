@@ -418,9 +418,9 @@ fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> 
         }
         Action::Variable => {
             let mut names: Vec<String> = shell
-                .var_names()
+                .completion_var_names()
+                .into_iter()
                 .filter(|n| n.starts_with(prefix))
-                .map(|s| s.to_string())
                 .collect();
             names.sort();
             names.dedup();
