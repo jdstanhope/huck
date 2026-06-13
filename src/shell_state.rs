@@ -1107,6 +1107,31 @@ impl Shell {
         );
     }
 
+    /// Rebuild the dynamic `FUNCNAME` array from the live function call stack.
+    /// `FUNCNAME[0]` is the currently-executing function, `[1]` its caller, etc.
+    /// (the reverse of `function_arg0`'s push order). When the stack is empty
+    /// (top level) `FUNCNAME` is unset, matching bash. Called by `call_function`
+    /// after every push/pop of `function_arg0`.
+    pub(crate) fn sync_funcname(&mut self) {
+        if self.function_arg0.is_empty() {
+            self.vars.remove("FUNCNAME");
+            return;
+        }
+        let n = self.function_arg0.len();
+        let elements: BTreeMap<usize, String> = (0..n)
+            .map(|k| (k, self.function_arg0[n - 1 - k].clone()))
+            .collect();
+        self.vars.insert(
+            "FUNCNAME".to_string(),
+            Variable {
+                value: VarValue::Indexed(elements),
+                exported: false,
+                readonly: false,
+                integer: false,
+            },
+        );
+    }
+
     /// Defines (or replaces) a shell function. Copy-on-write: if the function
     /// table is shared (e.g. with a command-substitution clone), this copies it
     /// first so the mutation does not leak across the isolation boundary.
@@ -1738,6 +1763,40 @@ mod tests {
         assert_eq!(arr.get(&1).map(String::as_str), Some("1"));
         assert_eq!(arr.get(&2).map(String::as_str), Some("0"));
         assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn sync_funcname_builds_reversed_stack() {
+        let mut sh = Shell::new();
+        sh.function_arg0.push("outer".to_string());
+        sh.function_arg0.push("inner".to_string());
+        sh.sync_funcname();
+        let arr = sh.get_array("FUNCNAME").expect("FUNCNAME array");
+        assert_eq!(arr.get(&0).map(String::as_str), Some("inner")); // [0] = current
+        assert_eq!(arr.get(&1).map(String::as_str), Some("outer")); // [1] = caller
+        assert_eq!(arr.len(), 2);
+        assert_eq!(sh.lookup_var("FUNCNAME"), Some("inner".to_string()));
+    }
+
+    #[test]
+    fn sync_funcname_empty_stack_unsets() {
+        let mut sh = Shell::new();
+        sh.function_arg0.push("f".to_string());
+        sh.sync_funcname();
+        assert!(sh.get_array("FUNCNAME").is_some());
+        sh.function_arg0.pop();
+        sh.sync_funcname();
+        assert!(sh.get_array("FUNCNAME").is_none(), "empty stack unsets FUNCNAME");
+        assert_eq!(sh.lookup_var("FUNCNAME"), None);
+    }
+
+    #[test]
+    fn sync_funcname_single_frame() {
+        let mut sh = Shell::new();
+        sh.function_arg0.push("solo".to_string());
+        sh.sync_funcname();
+        assert_eq!(sh.lookup_var("FUNCNAME"), Some("solo".to_string()));
+        assert_eq!(sh.get_array("FUNCNAME").expect("array").len(), 1);
     }
 
     #[test]
