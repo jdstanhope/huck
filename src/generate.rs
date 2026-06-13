@@ -304,7 +304,7 @@ fn pipeline_to_source(p: &Pipeline, indent: usize) -> String {
 
 fn simple_to_source(s: &SimpleCommand) -> String {
     match s {
-        SimpleCommand::Assign(assigns) => assigns
+        SimpleCommand::Assign(assigns, _) => assigns
             .iter()
             .map(assignment_to_source)
             .collect::<Vec<_>>()

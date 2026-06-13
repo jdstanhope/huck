@@ -1811,7 +1811,7 @@ mod tests {
         let mut a = Shell::new();
         // Use the same minimal body shape as the builtins tests.
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         a.define_function("f".to_string(), body.clone());
         assert_eq!(Rc::strong_count(&a.functions), 1);

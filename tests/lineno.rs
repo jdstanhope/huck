@@ -25,3 +25,9 @@ fn huck(script: &str) -> String {
     // bash -c $'i=0\nwhile [ $i -lt 1 ]; do echo $LINENO; i=1; done' → 2
     assert_eq!(huck("i=0\nwhile [ $i -lt 1 ]; do echo $LINENO; i=1; done"), "2\n");
 }
+#[test] fn assignment_rhs_line() {
+    // x=$LINENO on line 2 -> 2
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_huck"))
+        .args(["-c", "echo a\nx=$LINENO\necho $x"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n2\n");
+}

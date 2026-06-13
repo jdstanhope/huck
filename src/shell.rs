@@ -609,10 +609,9 @@ pub fn process_line_in_sink(
             return ExecOutcome::Continue(2);
         }
     };
-    // Compute per-token source lines from the offsets (offsets.len() == tokens.len() + 1).
-    let lines: Vec<u32> = offsets[..tokens.len()].iter()
-        .map(|&o| lexer::line_at_offset(line, o))
-        .collect();
+    // Compute per-token source lines from the offsets in a single O(n) pass.
+    // offsets.len() == tokens.len() + 1; slice to tokens.len() to match token count.
+    let lines: Vec<u32> = lexer::lines_for_offsets(line, &offsets[..tokens.len()]);
     let (tokens, lines) = if expand_aliases {
         match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
             Ok(t) => {

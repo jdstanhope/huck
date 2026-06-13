@@ -5789,13 +5789,12 @@ pub(crate) fn run_sourced_contents_in_sink(
             }
             break;
         }
-        // Compute per-token source lines from the offsets. Offsets are relative
-        // to &contents[start..]; add `start` to get absolute byte positions in
-        // `contents` so that line numbers reflect the real file line numbers.
+        // Compute per-token source lines from the offsets in a single O(n) pass.
+        // Offsets are relative to &contents[start..]; add `start` to get absolute
+        // byte positions in `contents` so line numbers reflect real file line numbers.
         // offsets.len() == total + 1; slice to total to match token count.
-        let token_lines: Vec<u32> = offsets[..total].iter()
-            .map(|&o| crate::lexer::line_at_offset(contents, start + o))
-            .collect();
+        let abs: Vec<usize> = offsets[..total].iter().map(|&o| start + o).collect();
+        let token_lines = crate::lexer::lines_for_offsets(contents, &abs);
         let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {
@@ -9634,7 +9633,7 @@ mod command_tests {
         // Register a function directly. The body shape is irrelevant for
         // resolution; any Command value works. Use a no-op assignment list.
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let mut buf: Vec<u8> = Vec::new();
@@ -10303,7 +10302,7 @@ mod type_tests {
     fn type_default_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["myfn"], &mut shell);
@@ -10348,7 +10347,7 @@ mod type_tests {
     fn type_t_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         let (oc, out) = run(&["-t", "myfn"], &mut shell);
@@ -10394,7 +10393,7 @@ mod type_tests {
     fn type_f_skips_function() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("myfn".to_string(), body);
         // Without -f: would find the function.
@@ -10769,7 +10768,7 @@ mod declare_tests {
     fn declare_f_lists_functions() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("fn1".to_string(), body.clone());
         shell.define_function("fn2".to_string(), body);
@@ -10800,7 +10799,7 @@ mod declare_tests {
     fn declare_f_named_function_found() {
         let mut shell = Shell::new();
         let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![]),
+            crate::command::SimpleCommand::Assign(vec![], 0),
         ));
         shell.define_function("fn1".to_string(), body);
         let (oc, out) = run(&["-F", "fn1"], &mut shell);

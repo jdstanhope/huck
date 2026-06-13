@@ -3239,9 +3239,30 @@ fn is_user_name_continue(c: char) -> bool {
 
 /// 1-based line number of byte offset `off` within `src`
 /// (1 + the count of '\n' bytes before `off`). Clamps `off` to `src.len()`.
-#[allow(dead_code)] // used by later LINENO tasks
+/// Used in tests and for isolated single-offset lookups; bulk callers use
+/// `lines_for_offsets` instead.
+#[allow(dead_code)]
 pub fn line_at_offset(src: &str, off: usize) -> u32 {
     1 + src.as_bytes()[..off.min(src.len())].iter().filter(|&&b| b == b'\n').count() as u32
+}
+
+/// 1-based line numbers for a list of byte offsets into `src`, computed in a
+/// single O(n) pass. `offsets` MUST be sorted ascending (lexer tokens are
+/// emitted left-to-right). Each offset is clamped to `src.len()`.
+pub fn lines_for_offsets(src: &str, offsets: &[usize]) -> Vec<u32> {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(offsets.len());
+    let mut cur_line: u32 = 1;
+    let mut scan: usize = 0;
+    for &off in offsets {
+        let off = off.min(bytes.len());
+        while scan < off {
+            if bytes[scan] == b'\n' { cur_line += 1; }
+            scan += 1;
+        }
+        out.push(cur_line);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3255,6 +3276,16 @@ mod tests {
         assert_eq!(line_at_offset(s, 2), 2);   // first 'b'
         assert_eq!(line_at_offset(s, 5), 3);   // first 'c'
         assert_eq!(line_at_offset(s, 999), 3); // clamped
+    }
+
+    #[test]
+    fn lines_for_offsets_single_pass_matches_per_offset() {
+        let s = "a\nbb\nccc\nd";
+        let offs = vec![0usize, 2, 5, 9, 999];
+        let got = lines_for_offsets(s, &offs);
+        let want: Vec<u32> = offs.iter().map(|&o| line_at_offset(s, o)).collect();
+        assert_eq!(got, want);
+        assert_eq!(got, vec![1, 2, 3, 4, 4]);
     }
 
     /// Builds a Token that holds a single-Literal Word.
@@ -6646,7 +6677,7 @@ mod array_parse_tests {
             other => panic!("expected Pipeline, got {other:?}"),
         };
         match &pipeline.commands[0] {
-            Command::Simple(SimpleCommand::Assign(items)) => items.clone(),
+            Command::Simple(SimpleCommand::Assign(items, _)) => items.clone(),
             Command::Simple(SimpleCommand::Exec(e)) => e.inline_assignments.clone(),
             other => panic!("expected SimpleCommand, got {other:?}"),
         }

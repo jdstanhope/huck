@@ -1668,14 +1668,14 @@ fn run_background_sequence(
         let is_last = i == n - 1;
 
         // ---- Assign-only stages: no-op ----------------------------------------
-        if let Command::Simple(SimpleCommand::Assign(items)) = stage_cmd {
+        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // Drop incoming pipe (no-op stage produces no output).
             if let Some(r) = prev_pipe_read.take() {
                 parent_held.retain(|&fd| fd != r);
                 unsafe { libc::close(r); }
             }
             // Run via fork so it's isolated (assignments don't affect parent).
-            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone()));
+            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
             let pgid_target = first_pid.unwrap_or(0);
             let stdin_fd = devnull_fd; // stage 0 default (overridden below if not first)
             // For a no-op assign stage, stdout is irrelevant but we still need
@@ -2842,7 +2842,11 @@ fn status_code(status: &ExitStatus) -> i32 {
 fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let outcome = match cmd {
         SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
-        SimpleCommand::Assign(items) => {
+        SimpleCommand::Assign(items, line) => {
+            // Stamp $LINENO before expanding RHS so it reflects this assignment's line.
+            if *line != 0 {
+                shell.current_lineno = *line;
+            }
             // Reset so only THIS assignment's RHS command substitutions count.
             shell.set_last_cmd_sub_status(None);
             let mut st = 0;
@@ -3857,7 +3861,7 @@ fn run_multi_stage(
         let is_last = i == n - 1;
 
         // ---- Assign-only stages: no-op, just pass stdin through as empty ----
-        if let Command::Simple(SimpleCommand::Assign(items)) = stage_cmd {
+        if let Command::Simple(SimpleCommand::Assign(items, aline)) = stage_cmd {
             // In a pipeline, assignment-only stages are a no-op: they don't
             // produce output and are run as InProcess. But since assignments
             // in a subshell don't affect the parent, they're truly inert.
@@ -3868,7 +3872,7 @@ fn run_multi_stage(
                 unsafe { libc::close(r); }
             }
             // Run the assignments via fork so they're isolated.
-            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone()));
+            let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
             let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
             let stdin_fd = libc::STDIN_FILENO;
             let stdout_fd = if !is_last {
@@ -5605,7 +5609,7 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("HUCK_TEST_BG_ASSIGN", lit_word("v")),
-                ]))],
+                ], 0))],
             }),
             rest: vec![],
             background: true,
@@ -5680,7 +5684,7 @@ mod tests {
                 negate: false,
                 commands: vec![Command::Simple(SimpleCommand::Assign(vec![
                     bare_assign("BG_X", Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }])),
-                ]))],
+                ], 0))],
             }),
             rest: vec![],
             background: false,
@@ -6404,7 +6408,7 @@ mod tests {
         let shell = Shell::new();
         let cmd = Command::Simple(SimpleCommand::Assign(vec![
             bare_assign("FOO", lit_word("bar")),
-        ]));
+        ], 0));
         assert!(matches!(classify_stage(&cmd, &shell), StageKind::InProcess(_)));
     }
 

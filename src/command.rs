@@ -220,7 +220,7 @@ fn finalize_stage(
     let remaining: Vec<Word> = iter.collect();
 
     if remaining.is_empty() && no_redirs && !inline.is_empty() {
-        return SimpleCommand::Assign(inline);
+        return SimpleCommand::Assign(inline, line);
     }
     // No trailing program word, but redirects (or zero words at all). Produce
     // an Exec with an empty program word; the executor treats this as a
@@ -360,8 +360,8 @@ impl ExecCommand {
 pub enum SimpleCommand {
     /// `A=1 B=2 …` with no following command — every assignment
     /// persists in the shell. Single-element vec is the v22-style
-    /// single-assignment case.
-    Assign(Vec<Assignment>),
+    /// single-assignment case. The `u32` is the 1-based source line (0 = unknown).
+    Assign(Vec<Assignment>, u32),
     Exec(ExecCommand),
 }
 
@@ -611,7 +611,6 @@ impl TokenCursor {
         Self { iter: tokens.into_iter().peekable(), lines, pos: 0 }
     }
     /// Line of the next token to be returned (0 if unknown / past end).
-    #[allow(dead_code)]
     pub fn current_line(&self) -> u32 {
         self.lines.get(self.pos).copied().unwrap_or(0)
     }
@@ -2734,7 +2733,7 @@ mod tests {
             target: AssignTarget::Bare(name.to_string()),
             value,
             append: false,
-        }])
+        }], 0)
     }
 
     #[test]
@@ -2851,7 +2850,7 @@ mod tests {
         let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
         assert_eq!(first_pipeline(&seq).commands.len(), 1);
         match &first_pipeline(&seq).commands[0] {
-            Command::Simple(SimpleCommand::Assign(items)) => {
+            Command::Simple(SimpleCommand::Assign(items, _)) => {
                 assert_eq!(items.len(), 1);
                 let a = &items[0];
                 assert_eq!(a.target.name(), "FOO");
@@ -4094,7 +4093,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 1);
-        let Command::Simple(SimpleCommand::Assign(items)) = &p.commands[0] else {
+        let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else {
             panic!("expected Simple(Assign(Vec)), got {:?}", p.commands[0])
         };
         assert_eq!(items.len(), 2);
@@ -4107,7 +4106,7 @@ mod tests {
         let tokens = crate::lexer::tokenize("FOO=bar").unwrap();
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
-        let Command::Simple(SimpleCommand::Assign(items)) = &p.commands[0] else { panic!() };
+        let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!() };
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].target.name(), "FOO");
     }
@@ -5005,7 +5004,7 @@ mod tests {
         let Command::Pipeline(p) = &parsed.first else {
             panic!("expected Pipeline, got {:?}", parsed.first);
         };
-        let Command::Simple(SimpleCommand::Assign(assigns)) = &p.commands[0] else {
+        let Command::Simple(SimpleCommand::Assign(assigns, _)) = &p.commands[0] else {
             panic!("expected Simple/Assign, got {:?}", p.commands[0]);
         };
         assert_eq!(assigns.len(), 1);
@@ -5268,7 +5267,7 @@ mod tests {
                     for c in &p.commands { from_cmd(c, out); }
                 }
                 Command::Simple(SimpleCommand::Exec(e)) => out.push(e.line),
-                Command::Simple(SimpleCommand::Assign(_)) => {}
+                Command::Simple(SimpleCommand::Assign(_, _)) => {}
                 _ => {}
             }
         }
