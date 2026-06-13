@@ -1369,4 +1369,38 @@ mod tests {
             "quoted command name should map to its registered spec",
         );
     }
+
+    #[test]
+    fn bash_source_lineno_tab_complete_when_set() {
+        use crate::shell_state::{Frame, FrameKind};
+        let mut sh = Shell::new();
+        sh.call_stack.push(Frame {
+            funcname: "f".into(),
+            source: "lib.sh".into(),
+            call_line: 3,
+            kind: FrameKind::Function,
+        });
+        sh.sync_call_arrays();
+        let names: Vec<String> = sh.var_names().map(|s| s.to_string()).collect();
+        let bash_cands: Vec<String> = complete_variable("BASH_", &names)
+            .into_iter()
+            .map(|c| c.replacement.to_string())
+            .collect();
+        assert!(
+            bash_cands.iter().any(|c| c.contains("BASH_SOURCE")),
+            "BASH_SOURCE should complete, got {bash_cands:?}"
+        );
+        assert!(
+            bash_cands.iter().any(|c| c.contains("BASH_LINENO")),
+            "BASH_LINENO should complete, got {bash_cands:?}"
+        );
+        let fn_cands: Vec<String> = complete_variable("FUNC", &names)
+            .into_iter()
+            .map(|c| c.replacement.to_string())
+            .collect();
+        assert!(
+            fn_cands.iter().any(|c| c.contains("FUNCNAME")),
+            "FUNCNAME should complete, got {fn_cands:?}"
+        );
+    }
 }

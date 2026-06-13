@@ -2922,9 +2922,15 @@ pub(crate) fn call_function(
     let saved_getopts_sp = std::mem::replace(&mut shell.getopts_sp, 0);
     let saved_getopts_optind_cache = std::mem::replace(&mut shell.getopts_optind_cache, 0);
     shell.positional_args = args;
-    shell.function_arg0.push(name.to_string());
+    let frame = crate::shell_state::Frame {
+        funcname: name.to_string(),
+        source: shell.function_source.get(name).cloned().unwrap_or_else(|| "environment".to_string()),
+        call_line: shell.current_lineno,
+        kind: crate::shell_state::FrameKind::Function,
+    };
+    shell.call_stack.push(frame);
     // Keep the dynamic FUNCNAME array in lockstep with the call stack (v151).
-    shell.sync_funcname();
+    shell.sync_call_arrays();
     shell.local_scopes.push(std::collections::HashMap::new());
 
     let result = run_command(&body, shell, sink);
@@ -2950,8 +2956,8 @@ pub(crate) fn call_function(
         }
     }
 
-    shell.function_arg0.pop();
-    shell.sync_funcname();
+    shell.call_stack.pop();
+    shell.sync_call_arrays();
     shell.positional_args = saved;
     shell.loop_depth = saved_loop_depth;
     shell.getopts_sp = saved_getopts_sp;
@@ -6562,9 +6568,9 @@ mod tests {
     fn call_function_pops_arg0_after_return() {
         let mut shell = Shell::new();
         exec_script("myfunc() { :; }\nmyfunc\n", &mut shell);
-        assert!(shell.function_arg0.is_empty(),
-            "function_arg0 should be empty after function returns, got: {:?}",
-            shell.function_arg0);
+        assert!(shell.call_stack.is_empty(),
+            "call_stack should be empty after function returns, got: {:?}",
+            shell.call_stack);
     }
 
     #[test]
