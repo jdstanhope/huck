@@ -751,16 +751,8 @@ impl Drop for RedirectScope {
     }
 }
 
-/// Applies stdin/stdout/stderr redirects at the real-fd level (saved/restored
-/// via `RedirectScope`), forcing a `Terminal` inner sink when a stdout
-/// redirect is present so the redirect wins over an outer capture, then runs
-/// `run_inner(shell, inner_sink)` and returns its status. A redirect-open
-/// failure prints `huck: <target>: <err>` and returns `Continue(1)` WITHOUT
-/// running `run_inner`. (Shared by `run_redirected` for compounds and by the
-/// function-call branch.)
-/// True if `cmd` carries any explicit stdin/stdout/stderr redirect — the gate
-/// for wrapping a body-running command (function / eval / source) in
-/// `with_redirect_scope`.
+/// True if `cmd` carries any explicit redirect — the gate for wrapping a
+/// body-running command (function / eval / source) in `with_redirect_scope`.
 fn has_any_redirect(cmd: &ExecCommand) -> bool {
     !cmd.redirects.is_empty()
 }
@@ -789,11 +781,11 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
 /// and the cross-direction combos the bridge drops). The bridge consumes:
 ///   fd 0: File{ReadOnly}, Heredoc, HereString
 ///   fd 1/2: File{Truncate|Append|Clobber}, Dup{output:true}
-/// A redirection is "extra" iff it is NOT one the bridge consumed for its slot.
-/// Last-wins per slot matches the bridge, so only the LAST bridge-consumed entry
-/// per fd is excluded; an earlier one shadowed by a later same-slot entry is
-/// itself dropped by the bridge and need not be re-applied (it would be a no-op
-/// or, worse, double-applied — so we exclude all bridge-eligible entries).
+/// A redirection is "extra" iff it is NOT one the bridge consumes. ALL
+/// bridge-consumed entries are excluded — including earlier same-fd entries that
+/// the bridge itself shadowed (they would be a no-op or, worse, double-applied
+/// by the extra scope, so we drop every bridge-eligible entry regardless of
+/// position).
 fn builtin_extra_redirects(redirs: &[Redirection]) -> Vec<Redirection> {
     redirs
         .iter()
@@ -823,6 +815,13 @@ fn bridge_consumes(r: &Redirection) -> bool {
     }
 }
 
+/// Applies redirects at the real-fd level (saved/restored via `RedirectScope`),
+/// forcing a `Terminal` inner sink when a stdout redirect is present so the
+/// redirect wins over an outer capture, then runs `run_inner(shell, inner_sink)`
+/// and returns its status. Redirects are applied in source order. A
+/// redirect-open failure prints `huck: <target>: <err>` and returns
+/// `Continue(1)` WITHOUT running `run_inner`. Shared by `run_redirected` for
+/// compound commands and by the function / eval / source call branches.
 fn with_redirect_scope<F>(
     redirs: &[Redirection],
     shell: &mut Shell,
@@ -3582,6 +3581,13 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // close, `<>` ReadWrite — via a RedirectScope around the call so
         // `echo x >&3`, `3>&1`, etc. work in-process. No double-application: the
         // extra set is disjoint from the bridge's (see builtin_extra_redirects).
+        // NOTE (interim, additive builtin path): the extra redirects (fd>2 / dup-in /
+        // close / <>) are applied to the real fds BEFORE the legacy bridge opens the
+        // fd-0/1/2 files (open_stage_files), so SOURCE ORDER between a bridge fd and an
+        // extra fd is not preserved — e.g. `>file 3>&1` makes fd 3 dup the PRE-redirect
+        // fd 1 rather than the file. Unobservable for typical builtins (they don't use
+        // fd>2); fully resolved when the bridge is deleted in Task 7 (everything then
+        // flows through one ordered RedirectScope).
         let mut extra_scope = RedirectScope::new();
         let extra = builtin_extra_redirects(&cmd.redirects);
         for r in &extra {
@@ -3610,7 +3616,12 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         if files.stdout.is_none() {
             match builtin_stdout_dup_file(cmd, shell) {
                 Ok(f) => files.stdout = f,
-                Err(()) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(1); }
+                Err(()) => {
+                    extra_scope.reap_heredoc_writers();
+                    drop(extra_scope);
+                    drain_procsubs(shell, procsub_base);
+                    return ExecOutcome::Continue(1);
+                }
             }
         }
         // `2>&1` on a builtin: follow wherever the builtin's stdout actually
@@ -3683,6 +3694,13 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // does NOT cover (fd>2, `<&` dup-in, `N>&-` close, `<>`) via a
         // RedirectScope so `echo x >&3` etc. work in-process. The extra set is
         // disjoint from the bridge's slots, so no double-application.
+        // NOTE (interim, additive builtin path): the extra redirects (fd>2 / dup-in /
+        // close / <>) are applied to the real fds BEFORE the legacy bridge opens the
+        // fd-0/1/2 files (open_stage_files), so SOURCE ORDER between a bridge fd and an
+        // extra fd is not preserved — e.g. `>file 3>&1` makes fd 3 dup the PRE-redirect
+        // fd 1 rather than the file. Unobservable for typical builtins (they don't use
+        // fd>2); fully resolved when the bridge is deleted in Task 7 (everything then
+        // flows through one ordered RedirectScope).
         let mut extra_scope = RedirectScope::new();
         let extra = builtin_extra_redirects(&cmd.redirects);
         for r in &extra {
