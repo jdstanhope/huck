@@ -31,6 +31,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "pushd", "popd", "dirs",
     "declare", "typeset",
     "eval",
+    "let",
     "help",
     "complete", "compgen", "compopt",
 ];
@@ -103,6 +104,7 @@ pub fn run_builtin(
         "getopts" => builtin_getopts(args, shell),
         "." | "source" => builtin_source(args, shell),
         "eval" => builtin_eval(args, shell),
+        "let" => builtin_let(args, shell),
         "help" => builtin_help(args, out, shell),
         "complete" => crate::completion_builtins::builtin_complete(args, out, shell),
         "compgen" => crate::completion_builtins::builtin_compgen(args, out, shell),
@@ -5142,6 +5144,29 @@ pub(crate) fn eval_in_sink(
 fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
     eval_in_sink(args, shell, &mut sink)
+}
+
+/// `let EXPR...` — evaluate each argument as an arithmetic expression,
+/// left-to-right, applying any side effects (assignments mutate shell vars).
+/// Exit status is 0 if the LAST expression's value is non-zero, 1 if it is
+/// zero — like `(( ))`. With no args, bash prints an error and exits 1.
+/// Not a special builtin.
+fn builtin_let(args: &[String], shell: &mut Shell) -> ExecOutcome {
+    if args.is_empty() {
+        eprintln!("huck: let: expression expected");
+        return ExecOutcome::Continue(1);
+    }
+    let mut last: i64 = 0;
+    for a in args {
+        match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
+            Ok(v) => last = v,
+            Err(e) => {
+                eprintln!("huck: let: {a}: {e}");
+                return ExecOutcome::Continue(1);
+            }
+        }
+    }
+    ExecOutcome::Continue(if last != 0 { 0 } else { 1 })
 }
 
 struct HelpEntry {
