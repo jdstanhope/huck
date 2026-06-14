@@ -775,10 +775,9 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
     })
 }
 
-/// For the builtin in-process path: returns the redirections in `redirs` that
-/// the legacy 0/1/2 bridge does NOT handle, so they can be applied via an
-/// additional `RedirectScope` (fd>2, `<&` dup-in, `N>&-` close, `<>` ReadWrite,
-/// and the cross-direction combos the bridge drops). The bridge consumes:
+/// Returns the redirections NOT consumed by the legacy 0/1/2 bridge (fd>2,
+/// `<&` dup-in, `N>&-` close, `<>` ReadWrite, and the cross-direction combos
+/// the bridge drops). The bridge consumes:
 ///   fd 0: File{ReadOnly}, Heredoc, HereString
 ///   fd 1/2: File{Truncate|Append|Clobber}, Dup{output:true}
 /// A redirection is "extra" iff it is NOT one the bridge consumes. ALL
@@ -786,6 +785,8 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
 /// the bridge itself shadowed (they would be a no-op or, worse, double-applied
 /// by the extra scope, so we drop every bridge-eligible entry regardless of
 /// position).
+/// Used by both the builtin in-process path (via `RedirectScope`) and the
+/// pipeline-external additive path (`build_child_extra_ops`).
 fn builtin_extra_redirects(redirs: &[Redirection]) -> Vec<Redirection> {
     redirs
         .iter()
@@ -4088,6 +4089,42 @@ enum ChildRedirOp {
     Close { target: i32 },
 }
 
+/// Replay an ordered child-redirection op list onto the real fds. Async-signal-safe
+/// (only dup2/close/fcntl — no allocation), so it is callable from a pre_exec hook.
+/// `source == target` means a parent-opened file landed exactly on its target fd:
+/// skip the dup2 and clear FD_CLOEXEC so it survives exec.
+unsafe fn replay_redir_ops(ops: &[ChildRedirOp]) -> std::io::Result<()> {
+    for op in ops {
+        match *op {
+            ChildRedirOp::Dup { target, source } => {
+                if source == target {
+                    // dup2(fd, fd) is a no-op that does NOT clear
+                    // FD_CLOEXEC — but a parent-opened file landed
+                    // exactly on `target` and was CLOEXEC'd, so it would
+                    // vanish on exec. Clear CLOEXEC so it survives.
+                    let flags = unsafe { libc::fcntl(target, libc::F_GETFD) };
+                    if flags < 0 || unsafe { libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if unsafe { libc::dup2(source, target) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            ChildRedirOp::Close { target } => {
+                // Lenient: closing an already-closed fd (EBADF) matches
+                // bash; only a non-EBADF error aborts the spawn.
+                if unsafe { libc::close(target) } < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EBADF) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The parent-side result of lowering `cmd.redirects` into an ordered replay
 /// list for an external (forked) command. `ops` is applied IN ORDER in the
 /// child's `pre_exec`. `held` keeps the parent-opened files / heredoc read-ends
@@ -4107,7 +4144,7 @@ fn set_cloexec(fd: RawFd) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         }
     }
 }
@@ -4322,7 +4359,7 @@ fn build_child_extra_ops(
 /// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
 fn run_subprocess(
     cmd: &ResolvedCommand,
-    plan: ChildRedirPlan,
+    mut plan: ChildRedirPlan,
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
@@ -4345,39 +4382,9 @@ fn run_subprocess(
     // Replay the ordered redirect ops in the child (AFTER the signal-reset
     // pre_exec). All ops are pure dup2/close (async-signal-safe). On any failure
     // return Err so spawn() fails cleanly.
-    let ops = plan.ops.clone();
+    let ops = std::mem::take(&mut plan.ops);
     unsafe {
-        process.pre_exec(move || {
-            for op in &ops {
-                match *op {
-                    ChildRedirOp::Dup { target, source } => {
-                        if source == target {
-                            // dup2(fd, fd) is a no-op that does NOT clear
-                            // FD_CLOEXEC — but a parent-opened file landed
-                            // exactly on `target` and was CLOEXEC'd, so it would
-                            // vanish on exec. Clear CLOEXEC so it survives.
-                            let flags = libc::fcntl(target, libc::F_GETFD);
-                            if flags < 0 || libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                        } else if libc::dup2(source, target) < 0 {
-                            return Err(io::Error::last_os_error());
-                        }
-                    }
-                    ChildRedirOp::Close { target } => {
-                        // Lenient: closing an already-closed fd (EBADF) matches
-                        // bash; only a non-EBADF error aborts the spawn.
-                        if libc::close(target) < 0 {
-                            let e = io::Error::last_os_error();
-                            if e.raw_os_error() != Some(libc::EBADF) {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        });
+        process.pre_exec(move || replay_redir_ops(&ops));
     }
 
     if interactive {
@@ -6001,40 +6008,20 @@ fn spawn_external_with_fds(
         }
     }
 
+    // Collect the target fds that extra_ops will set up in the child, so we
+    // can exclude them from fds_to_close below (Fix B: a dup2 then close on
+    // the same fd would silently defeat the redirect).
+    let extra_targets: Vec<RawFd> = extra_ops.iter().map(|op| match *op {
+        ChildRedirOp::Dup { target, .. } | ChildRedirOp::Close { target } => target,
+    }).collect();
+
     // Replay the extra (fd>2 / dup-in / close / ReadWrite) ops in source order,
     // AFTER the bridge stdio + dup-target pre_execs above. Pure dup2/close, so
     // async-signal-safe. Runs even when the bridge dup pre_exec is absent.
     if !extra_ops.is_empty() {
-        let ops = extra_ops.clone();
+        let ops = extra_ops;
         unsafe {
-            process.pre_exec(move || {
-                for op in &ops {
-                    match *op {
-                        ChildRedirOp::Dup { target, source } => {
-                            if source == target {
-                                // See run_subprocess: clear FD_CLOEXEC instead of
-                                // a no-op dup2 when a CLOEXEC'd file landed on the
-                                // target fd.
-                                let flags = libc::fcntl(target, libc::F_GETFD);
-                                if flags < 0 || libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                                    return Err(io::Error::last_os_error());
-                                }
-                            } else if libc::dup2(source, target) < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                        }
-                        ChildRedirOp::Close { target } => {
-                            if libc::close(target) < 0 {
-                                let e = io::Error::last_os_error();
-                                if e.raw_os_error() != Some(libc::EBADF) {
-                                    return Err(e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            });
+            process.pre_exec(move || replay_redir_ops(&ops));
         }
     }
 
@@ -6084,8 +6071,13 @@ fn spawn_external_with_fds(
 
     // In the child's pre_exec, close every parent-held pipe fd that this
     // child shouldn't inherit (so downstream readers see EOF).
+    // Exclude any fd that extra_ops already claimed as a redirect target: a
+    // dup2 into that fd followed by close(fd) would silently defeat the redirect.
     // The closure must be async-signal-safe; libc::close is.
-    let fds_to_close: Vec<RawFd> = parent_fds_to_close.to_vec();
+    let fds_to_close: Vec<RawFd> = parent_fds_to_close.iter()
+        .copied()
+        .filter(|fd| !extra_targets.contains(fd))
+        .collect();
     unsafe {
         process.pre_exec(move || {
             for &fd in &fds_to_close {

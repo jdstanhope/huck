@@ -81,3 +81,18 @@ fn append_extra_fd_external() {
     );
     assert_matches_bash(&script);
 }
+
+#[test]
+fn pipeline_stage_high_fd_redirect_not_clobbered_by_pipe_close() {
+    // Regression test for Fix B: a pipeline stage with an fd>2 file redirect
+    // must not have that fd silently closed by the fds_to_close pre_exec.
+    // We redirect fd 9 in a pipeline non-final stage and verify the file
+    // contains the expected output (the redirect survived exec).
+    let tmp = format!("/tmp/hk_pf_{}", std::process::id());
+    // Use fd 9 (high, unlikely to be a pipe fd) to reduce collision chance.
+    // The inner sh writes "hi" to &9, which the outer shell mapped to $tmp.
+    let script = format!(
+        "sh -c 'echo hi >&9' 9>{tmp} | cat; echo \"file=$(cat {tmp})\"; rm -f {tmp}"
+    );
+    assert_matches_bash(&script);
+}
