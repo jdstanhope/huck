@@ -3448,6 +3448,7 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
+            shell.reap_coproc(r);
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3477,6 +3478,7 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
+            shell.reap_coproc(r);
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3493,6 +3495,7 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
+            shell.reap_coproc(r);
             if libc::WIFSTOPPED(status) {
                 // Still alive; keep polling.
                 first = false;
@@ -3597,6 +3600,7 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
+            shell.reap_coproc(r);
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3621,6 +3625,9 @@ fn wait_any_of(
         return ExecOutcome::Continue(status);
     }
 
+    // Probe each target once; collect any pid that was reaped inline here so
+    // we can call reap_coproc after the closure (can't hold two &mut borrows).
+    let mut inlined_reaped_pid: Option<i32> = None;
     let any_active = targets.iter().any(|t| match t {
         WaitTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
         WaitTarget::Pid(pid) => {
@@ -3628,12 +3635,16 @@ fn wait_any_of(
             let r = unsafe { libc::waitpid(*pid, &mut s, libc::WNOHANG | libc::WUNTRACED) };
             if r > 0 {
                 shell.jobs.reap(r, s);
+                inlined_reaped_pid = Some(r);
                 true
             } else {
                 r == 0
             }
         }
     });
+    if let Some(r) = inlined_reaped_pid {
+        shell.reap_coproc(r);
+    }
     if !any_active {
         if let Some(name) = &pid_var {
             shell.set(name, String::new());
@@ -3656,6 +3667,7 @@ fn wait_any_of(
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
+            shell.reap_coproc(r);
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

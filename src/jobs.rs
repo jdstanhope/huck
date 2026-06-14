@@ -300,6 +300,8 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
             break;
         }
         shell.jobs.reap(pid as i32, raw_status);
+        // If the reaped child is a live coproc, close its fds + unset NAME/NAME_PID.
+        shell.reap_coproc(pid as i32);
     }
 }
 

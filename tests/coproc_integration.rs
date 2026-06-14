@@ -98,3 +98,22 @@ fn coproc_sets_pid_and_bang() {
     );
     assert_matches_bash(script);
 }
+
+#[test]
+fn coproc_autounset_after_exit() {
+    // A coproc that exits immediately (`:` is a no-op). We save COPROC_PID
+    // before the array is unset, wait for the child, then probe COPROC[0].
+    // After `wait`, bash has reaped the child and unset COPROC / COPROC_PID.
+    // We capture bash's exact output and assert huck matches it.
+    //
+    // Timing note: `wait "$pid"` forces a blocking reap of that specific PID,
+    // so at the `echo` point both bash and huck have unset COPROC. The test
+    // uses `${COPROC[0]-unset}` to distinguish unset-array (→ "unset") from
+    // set-but-empty (→ "").
+    let script = r#"coproc { :; }; pid=$COPROC_PID; wait "$pid" 2>/dev/null; echo "[${COPROC[0]-unset}]""#;
+    assert_matches_bash(script);
+
+    // Sanity: a still-running coproc must NOT be prematurely unset.
+    let script_running = r#"coproc cat; echo "[${COPROC[0]:+set}]""#;
+    assert_matches_bash(script_running);
+}

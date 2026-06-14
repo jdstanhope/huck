@@ -1036,7 +1036,6 @@ impl Shell {
     /// Called from the reap path when child `pid` has exited: if it is a live
     /// coproc, close its held fds, unset NAME + NAME_PID, and drop the record.
     /// bash unsets the coproc variables once the coprocess is reaped.
-    #[allow(dead_code)]
     pub fn reap_coproc(&mut self, pid: libc::pid_t) {
         let Some(idx) = self.coprocs.iter().position(|c| c.pid == pid) else { return; };
         let c = self.coprocs.remove(idx);
