@@ -9,7 +9,8 @@
 # NOT byte-compared (known divergences): failure DIAGNOSTICS differ in wording
 # ("huck: exec: NAME: not found" vs "bash: line N: NAME: No such file or
 # directory"), so failure cases here suppress stderr and assert only the exit
-# status. fd>2 redirects (`exec 3<file`) are unsupported by huck's command AST.
+# status. v156 task 6: arbitrary fd redirections (fd>2, {var}, close) are now
+# supported; the new "mode 2 continued" cases below cover them.
 set -u
 HUCK_BIN="${HUCK_BIN:-$(pwd)/target/debug/huck}"
 [[ -x "$HUCK_BIN" ]] || { echo "build huck first: $HUCK_BIN" >&2; exit 1; }
@@ -40,6 +41,13 @@ check "bare exec is noop rc0"   'exec; echo "still-here rc=$?"'
 check ">file then writes"       'f=$(mktemp); exec > "$f"; echo line1; echo line2; exec 1>&2; cat "$f" 1>&2; rm -f "$f"'
 check ">>file appends"          'f=$(mktemp); printf head > "$f"; exec >> "$f"; echo body; exec 1>&2; cat "$f" 1>&2; rm -f "$f"'
 check "<file becomes stdin"     'f=$(mktemp); printf "a\nb\n" > "$f"; exec < "$f"; read x; read y; echo "$x$y" 1>&2; rm -f "$f"'
+
+# --- mode 2 continued: arbitrary fd redirections (v156 task 6) ---
+check "exec 3>f hold+write+close"  'exec 3>/tmp/huck_t6a; echo held >&3; exec 3>&-; cat /tmp/huck_t6a; rm -f /tmp/huck_t6a'
+check "exec 3<f read via fd"       'exec 3</etc/hostname; read h <&3; echo "$h"; exec 3<&-'
+check "exec {fd}>f var-alloc"      'exec {fd}>/tmp/huck_t6b; [ "$fd" -ge 10 ] && echo okfd; echo z >&"$fd"; exec {fd}>&-; cat /tmp/huck_t6b; rm -f /tmp/huck_t6b'
+check "exec close is permanent"    'exec 5>/tmp/huck_t6c; exec 5>&-; { echo x >&5; } 2>/dev/null; echo "closed_rc=$?"; rm -f /tmp/huck_t6c'
+check "exec fd-swap via file"      'exec 6>/tmp/huck_t6d; exec 3>&6; echo s >&3; exec 3>&- 6>&-; cat /tmp/huck_t6d; rm -f /tmp/huck_t6d'
 
 # --- failure: status only (stderr suppressed; wording diverges) ---
 check "missing command exits 127" '(exec /no/such/cmd_xyz) 2>/dev/null; echo "rc=$?"'

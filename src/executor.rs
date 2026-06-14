@@ -1053,72 +1053,6 @@ fn run_redirected(
     })
 }
 
-/// Apply a stdout/stderr-class redirect (`>`/`>>`/`>&N`/`2>&N`) onto
-/// `target_fd`, recording the swap in `scope`. On open/resolve failure prints
-/// the bash-style error and returns `Err(Continue(1))`.
-fn apply_out_redirect(
-    r: &Redirect,
-    target_fd: RawFd,
-    scope: &mut RedirectScope,
-    shell: &mut Shell,
-) -> Result<(), ExecOutcome> {
-    use std::os::unix::io::IntoRawFd;
-    match r {
-        Redirect::Truncate(word) | Redirect::Append(word) | Redirect::Clobber(word) => {
-            let path = match expand_single(word, shell) {
-                Ok(p) => p,
-                Err(()) => return Err(ExecOutcome::Continue(1)),
-            };
-            let resolved = if matches!(r, Redirect::Append(_)) {
-                ResolvedRedirect::Append(path)
-            } else if matches!(r, Redirect::Clobber(_)) {
-                // `>|` forces truncate, overriding noclobber.
-                ResolvedRedirect::Truncate(path)
-            } else if shell.shell_options.noclobber {
-                ResolvedRedirect::NoclobberTruncate(path)
-            } else {
-                ResolvedRedirect::Truncate(path)
-            };
-            let file = match open_resolved(&resolved) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("huck: {}: {e}", resolved_path(&resolved));
-                    return Err(ExecOutcome::Continue(1));
-                }
-            };
-            let new_fd = file.into_raw_fd();
-            if scope.redirect(new_fd, target_fd).is_err() {
-                unsafe { libc::close(new_fd) };
-                return Err(ExecOutcome::Continue(1));
-            }
-            unsafe { libc::close(new_fd) };
-            Ok(())
-        }
-        Redirect::Dup { source, .. } => {
-            // `>&N` / `2>&N`: duplicate the source fd onto target_fd. Resolve
-            // the source AFTER any earlier fd swaps so e.g. `>file 2>&1` makes
-            // stderr follow the already-redirected stdout (last-wins ordering
-            // matches the parser slot fill).
-            let src = match resolve_fd_target(source, shell) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    eprintln!("huck: {e}");
-                    return Err(ExecOutcome::Continue(1));
-                }
-            };
-            if scope.redirect(src, target_fd).is_err() {
-                return Err(ExecOutcome::Continue(1));
-            }
-            Ok(())
-        }
-        Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_) => {
-            // The parser never routes these to the stdout/stderr slots.
-            eprintln!("huck: unsupported output redirect on compound");
-            Err(ExecOutcome::Continue(1))
-        }
-    }
-}
-
 /// Runs a `while`/`until` loop. The body runs while the condition's
 /// exit status satisfies the loop's polarity. `break` ends the loop;
 /// `continue` jumps to the next condition test; `exit` propagates; a
@@ -4071,68 +4005,45 @@ unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
 /// diagnostic, rolls back any already-applied redirects (the scope's Drop), and
 /// returns `Err` (atomic: all-or-nothing).
 fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(), ()> {
-    use std::os::unix::io::IntoRawFd;
     let mut scope = RedirectScope::new();
 
-    // TEMPORARY bridge to 0/1/2 slots (v156 task 2).
-    let (cmd_stdin, cmd_stdout, cmd_stderr) = crate::command::legacy_slots(&cmd.redirects);
-    if let Some(r) = &cmd_stdin {
-        let new_fd: RawFd = match r {
-            Redirect::Read(word) => {
-                let path = match expand_single(word, shell) {
-                    Ok(p) => p,
-                    Err(()) => return Err(()),
-                };
-                match File::open(&path) {
-                    Ok(file) => file.into_raw_fd(),
-                    Err(e) => {
-                        eprintln!("huck: {path}: {e}");
-                        return Err(());
-                    }
-                }
-            }
-            Redirect::Heredoc { body, .. } => {
-                let bytes = expand_assignment(body, shell).into_bytes();
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, _pid)) => rfd,
-                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(()); }
-                }
-            }
-            Redirect::HereString(body) => {
-                let mut bytes = expand_assignment(body, shell).into_bytes();
-                bytes.push(b'\n');
-                match spawn_heredoc_writer(&bytes) {
-                    Ok((rfd, _pid)) => rfd,
-                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(()); }
-                }
-            }
-            Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_) | Redirect::Dup { .. } => {
-                eprintln!("huck: exec: unsupported stdin redirect");
-                return Err(());
-            }
-        };
-        if scope.redirect(new_fd, libc::STDIN_FILENO).is_err() {
-            unsafe { libc::close(new_fd); }
-            return Err(());
+    // Apply each redirection in source order via the ordered RedirectScope
+    // applier. `apply` already dispatches `RedirFd::Var` to `apply_var`, so
+    // a single call handles numeric fds, dup, close, heredoc, and `{var}`.
+    // On failure, `scope` Drop rolls back any already-applied redirects
+    // atomically (temporary semantics) and we return Err(()) to the caller.
+    for redir in &cmd.redirects {
+        if scope.apply(redir, shell).is_err() {
+            return Err(()); // scope Drop restores partial → atomic rollback
         }
-        unsafe { libc::close(new_fd); }
-    }
-    if let Some(r) = &cmd_stdout
-        && apply_out_redirect(r, libc::STDOUT_FILENO, &mut scope, shell).is_err()
-    {
-        return Err(());
-    }
-    if let Some(r) = &cmd_stderr
-        && apply_out_redirect(r, libc::STDERR_FILENO, &mut scope, shell).is_err()
-    {
-        return Err(());
     }
 
-    // Success: make the redirections permanent — close the saved originals so
-    // Drop has nothing to restore (and no fd leaks).
+    // SUCCESS → make the redirections permanent.
+    //
+    // For `{var}` redirections `apply_var` leaves the high fd OPEN and does
+    // NOT register it in `scope.saved`, so it already persists beyond this
+    // function — no special-casing needed.
+    //
+    // For heredoc writers: reap them NOW (before forget) so the writer
+    // process doesn't become a zombie. The write end was installed onto the
+    // target fd; the writer will finish and exit once its data is consumed.
+    scope.reap_heredoc_writers();
+
+    // Close each saved-original fd (or skip -1 = "was closed before us") so
+    // Drop's restore loop has nothing to do. Draining first means Drop sees an
+    // empty `saved` vec even if it somehow runs.
     for (_target, saved) in scope.saved.drain(..) {
-        unsafe { libc::close(saved); }
+        if saved >= 0 {
+            unsafe { libc::close(saved); }
+        }
+        // saved == -1 means the target fd was previously free/closed — there is
+        // no original fd to restore, so we leave the target fd open (permanent).
     }
+
+    // Belt-and-suspenders: forget the scope so its Drop never runs the
+    // (now-empty) restore loop, and the (already-drained) heredoc_writers
+    // vec is not re-reaped.
+    std::mem::forget(scope);
     Ok(())
 }
 
