@@ -72,9 +72,19 @@ fn dbracket_int_gt() {
 }
 
 #[test]
-fn dbracket_int_bad() {
+fn dbracket_int_arith_operand() {
+    // In `[[ ]]` the integer-comparison ops arith-evaluate their operands:
+    // a bare name resolves to its value (an unset name -> 0), so `abc -eq 5`
+    // is `0 -eq 5` -> false -> rc 1 (matches bash). It is NOT a "bad integer".
     let (out, _) = run("[[ abc -eq 5 ]]\necho $?\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "2"), "got: {out}");
+    assert!(out.lines().any(|l| l.trim() == "1"), "got: {out}");
+}
+
+#[test]
+fn dbracket_int_bare_name_resolves() {
+    // A bare variable name on either side resolves to its numeric value.
+    let (out, _) = run("x=10\n[[ x -eq 10 ]] && echo yes\nexit\n");
+    assert!(out.lines().any(|l| l.trim() == "yes"), "got: {out}");
 }
 
 #[test]
