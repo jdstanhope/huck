@@ -300,8 +300,12 @@ pub fn reap_completed(shell: &mut crate::shell_state::Shell) {
             break;
         }
         shell.jobs.reap(pid as i32, raw_status);
-        // If the reaped child is a live coproc, close its fds + unset NAME/NAME_PID.
-        shell.reap_coproc(pid as i32);
+        // If the reaped child is a live coproc that actually exited, close its
+        // fds + unset NAME/NAME_PID. A WIFSTOPPED (WUNTRACED) report means the
+        // coproc is merely stopped and still alive — do NOT reap it.
+        if !libc::WIFSTOPPED(raw_status) {
+            shell.reap_coproc(pid as i32);
+        }
     }
 }
 

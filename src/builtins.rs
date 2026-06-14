@@ -3448,7 +3448,9 @@ fn wait_all(shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
-            shell.reap_coproc(r);
+            if !libc::WIFSTOPPED(status) {
+                shell.reap_coproc(r);
+            }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3478,7 +3480,9 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
-            shell.reap_coproc(r);
+            if !libc::WIFSTOPPED(status) {
+                shell.reap_coproc(r);
+            }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3495,13 +3499,14 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
-            shell.reap_coproc(r);
             if libc::WIFSTOPPED(status) {
-                // Still alive; keep polling.
+                // Still alive; keep polling. Do NOT reap_coproc (would close a
+                // live coproc's fds + unset NAME while it's merely stopped).
                 first = false;
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
+            shell.reap_coproc(r);
             let code = if libc::WIFEXITED(status) {
                 libc::WEXITSTATUS(status)
             } else if libc::WIFSIGNALED(status) {
@@ -3600,7 +3605,9 @@ fn wait_any_pending(pid_var: Option<String>, shell: &mut Shell) -> ExecOutcome {
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
-            shell.reap_coproc(r);
+            if !libc::WIFSTOPPED(status) {
+                shell.reap_coproc(r);
+            }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -3627,6 +3634,8 @@ fn wait_any_of(
 
     // Probe each target once; collect any pid that was reaped inline here so
     // we can call reap_coproc after the closure (can't hold two &mut borrows).
+    // Only record the pid for coproc reaping when it actually exited (not a
+    // mere WIFSTOPPED stop, which leaves the coproc alive).
     let mut inlined_reaped_pid: Option<i32> = None;
     let any_active = targets.iter().any(|t| match t {
         WaitTarget::Job(id) => shell.jobs.iter().any(|j| j.id == *id),
@@ -3635,7 +3644,9 @@ fn wait_any_of(
             let r = unsafe { libc::waitpid(*pid, &mut s, libc::WNOHANG | libc::WUNTRACED) };
             if r > 0 {
                 shell.jobs.reap(r, s);
-                inlined_reaped_pid = Some(r);
+                if !libc::WIFSTOPPED(s) {
+                    inlined_reaped_pid = Some(r);
+                }
                 true
             } else {
                 r == 0
@@ -3667,7 +3678,9 @@ fn wait_any_of(
         let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if r > 0 {
             shell.jobs.reap(r, status);
-            shell.reap_coproc(r);
+            if !libc::WIFSTOPPED(status) {
+                shell.reap_coproc(r);
+            }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
