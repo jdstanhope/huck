@@ -3143,6 +3143,41 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // otherwise reject the empty program name. (A bare redirect with no
     // assignment, `>file`, is currently a parse error — tracked separately.)
     if cmd.program.0.is_empty() {
+        // `$(< file)` special case: a command substitution whose body is JUST a
+        // stdin read-only redirect reads the file directly as the substitution
+        // output (bash). This only applies in a CAPTURE context — outside one
+        // (`< file` at a terminal sink) it falls through to the normal
+        // redirect-only behavior, which produces no output. Conditions: empty
+        // program, no inline assignments, exactly one redirect that is a stdin
+        // `File{ReadOnly}` (fd 0), and the current sink is a Capture buffer.
+        if cmd.inline_assignments.is_empty()
+            && cmd.redirects.len() == 1
+            && matches!(sink, StdoutSink::Capture(_))
+        {
+            let redir = &cmd.redirects[0];
+            if let RedirOp::File { mode: crate::command::FileMode::ReadOnly, target } = &redir.op
+                && redir.target_fd() == Some(0)
+            {
+                let path = match expand_single(target, shell) {
+                    Ok(p) => p,
+                    Err(()) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(1); }
+                };
+                let outcome = match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        if let StdoutSink::Capture(buf) = sink {
+                            buf.extend_from_slice(&bytes);
+                        }
+                        ExecOutcome::Continue(0)
+                    }
+                    Err(e) => {
+                        eprintln!("huck: {path}: {e}");
+                        ExecOutcome::Continue(1)
+                    }
+                };
+                drain_procsubs(shell, procsub_base);
+                return outcome;
+            }
+        }
         // bash processes the assignments with the ORIGINAL (un-redirected) fds:
         // RHS command substitutions and any readonly-variable error use the
         // inherited stderr, NOT the command's own `2>…`. It then performs the
