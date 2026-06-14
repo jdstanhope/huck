@@ -3803,48 +3803,21 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         drop(extra_scope);
         outcome
     } else {
-        let files = match open_stage_files(&resolved, shell) {
-            Ok(f) => f,
-            Err(()) => {
+        // v156 task 4: lower the FULL ordered redirect list (on the original
+        // ExecCommand, not the bridged ResolvedCommand) into a child replay plan.
+        // Files are opened (and heredoc writers forked) in the parent here; the
+        // child replays the dup2/close ops in source order. This handles fd>2,
+        // `<&` dup-in, `N>&-` close, and `<>` uniformly with fds 0/1/2.
+        match build_child_redir_plan(&cmd.redirects, shell) {
+            Ok(plan) => run_subprocess(&resolved, plan, shell, sink),
+            Err(code) => {
                 if !persistent {
                     restore_inline_assignments(snap, shell);
                 }
                 drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
+                return ExecOutcome::Continue(code);
             }
-        };
-        // Resolve Dup targets pre-fork (expansion may allocate; not async-signal-safe).
-        // TEMPORARY bridge to 0/1/2 slots (v156 task 2).
-        let (_cmd_bin, cmd_bout, cmd_berr) = crate::command::legacy_slots(&cmd.redirects);
-        let stdout_dup_target = match &cmd_bout {
-            Some(Redirect::Dup { source, .. }) => {
-                match resolve_fd_target(source, shell) {
-                    Ok(fd) => Some(fd),
-                    Err(e) => {
-                        eprintln!("huck: {e}");
-                        if !persistent { restore_inline_assignments(snap, shell); }
-                        drain_procsubs(shell, procsub_base);
-                        return ExecOutcome::Continue(1);
-                    }
-                }
-            }
-            _ => None,
-        };
-        let stderr_dup_target = match &cmd_berr {
-            Some(Redirect::Dup { source, .. }) => {
-                match resolve_fd_target(source, shell) {
-                    Ok(fd) => Some(fd),
-                    Err(e) => {
-                        eprintln!("huck: {e}");
-                        if !persistent { restore_inline_assignments(snap, shell); }
-                        drain_procsubs(shell, procsub_base);
-                        return ExecOutcome::Continue(1);
-                    }
-                }
-            }
-            _ => None,
-        };
-        run_subprocess(&resolved, files, shell, sink, stdout_dup_target, stderr_dup_target)
+        }
     };
 
     if !persistent {
@@ -4103,17 +4076,255 @@ fn run_exec_builtin(
     exit_or_continue(code, shell)
 }
 
-/// `stdout_dup_target` / `stderr_dup_target`: if `Some(fd)`, a pre_exec closure
-/// applies `dup2(fd, 1)` and/or `dup2(fd, 2)` in the child after stdio setup.
-/// Used for `Redirect::Dup` (e.g. `2>&1`). Resolution happens in the parent
-/// (pre-fork) so these are always resolved i32, never a Word.
+/// A single pure-fd operation replayed in a child `pre_exec` (v156 task 4).
+/// Both variants use only async-signal-safe libc calls (`dup2`/`close`). File
+/// opens and heredoc-writer forks happen in the PARENT before the spawn; the
+/// resulting source fd is inherited across fork and named here by number.
+#[derive(Clone, Copy)]
+enum ChildRedirOp {
+    /// `dup2(source, target)` — wire `target` to whatever `source` points at.
+    Dup { target: i32, source: i32 },
+    /// `close(target)` — for `N>&-` / `N<&-`.
+    Close { target: i32 },
+}
+
+/// The parent-side result of lowering `cmd.redirects` into an ordered replay
+/// list for an external (forked) command. `ops` is applied IN ORDER in the
+/// child's `pre_exec`. `held` keeps the parent-opened files / heredoc read-ends
+/// alive (and FD_CLOEXEC'd, so they vanish on the child's exec while the dup2'd
+/// targets survive) until after `spawn`. `heredoc_writers` are forked body
+/// writers to reap after the child finishes.
+struct ChildRedirPlan {
+    ops: Vec<ChildRedirOp>,
+    held: Vec<std::os::fd::OwnedFd>,
+    heredoc_writers: Vec<libc::pid_t>,
+}
+
+/// Set FD_CLOEXEC on a raw fd so it does NOT leak into the exec'd program. The
+/// child's `dup2(source, target)` clears CLOEXEC on `target`, so the redirect
+/// survives exec while the parent-opened source fd is closed automatically.
+fn set_cloexec(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Relocate a freshly-opened parent fd to a high number (>= 10) with FD_CLOEXEC,
+/// returning the new fd and closing the original. This keeps parent-opened
+/// redirect *source* fds out of the low 0..9 range that explicit redirect
+/// *targets* (e.g. `3>&1 2>&3`) operate on, so a source fd never collides with a
+/// fd the child is still swapping (matches how bash relocates redirect fds).
+/// On fcntl failure the original fd is returned unchanged (best-effort).
+fn relocate_high_cloexec(fd: RawFd) -> RawFd {
+    unsafe {
+        let new = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+        if new < 0 {
+            // Could not relocate (e.g. EMFILE) — fall back to the original fd
+            // with CLOEXEC set; collisions are unlikely in the common case.
+            set_cloexec(fd);
+            return fd;
+        }
+        libc::close(fd);
+        new
+    }
+}
+
+/// Lower `redirects` (in source order) into a `ChildRedirPlan` for an external
+/// command: open files / spawn heredoc writers in the PARENT, resolve dup
+/// sources, and emit an ordered `dup2`/`close` op list the child replays. On
+/// any error a diagnostic is printed and `Err(1)` is returned (the held fds and
+/// heredoc writers built so far are dropped/leaked-cleanly via `held`).
+/// `RedirFd::Var` is rejected here (task 5).
+fn build_child_redir_plan(
+    redirects: &[Redirection],
+    shell: &mut Shell,
+) -> Result<ChildRedirPlan, i32> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    let mut plan = ChildRedirPlan { ops: Vec::new(), held: Vec::new(), heredoc_writers: Vec::new() };
+    for redir in redirects {
+        let Some(target) = redir.target_fd() else {
+            // RedirFd::Var: allocate-a-free-fd is task 5.
+            eprintln!("huck: ambiguous redirect");
+            return Err(1);
+        };
+        let target = target as i32;
+        match &redir.op {
+            RedirOp::File { mode, target: word } => {
+                let path = match expand_single(word, shell) {
+                    Ok(p) => p,
+                    Err(()) => return Err(1),
+                };
+                let file: File = match mode {
+                    FileMode::ReadOnly => match File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                    },
+                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
+                        let resolved = match mode {
+                            FileMode::Append => ResolvedRedirect::Append(path),
+                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
+                            _ if shell.shell_options.noclobber => {
+                                ResolvedRedirect::NoclobberTruncate(path)
+                            }
+                            _ => ResolvedRedirect::Truncate(path),
+                        };
+                        match open_resolved(&resolved) {
+                            Ok(f) => f,
+                            Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                        }
+                    }
+                    FileMode::ReadWrite => {
+                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                            Ok(f) => f,
+                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                        }
+                    }
+                };
+                // Relocate above fd 9 so the source never collides with a low
+                // explicit-redirect target (e.g. `2>file 3>&2`).
+                let raw = relocate_high_cloexec(file.into_raw_fd());
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                plan.ops.push(ChildRedirOp::Dup { target, source: raw });
+                plan.held.push(owned);
+            }
+            RedirOp::Dup { source, .. } => {
+                // `>&w` / `<&w`: resolve the source fd in the parent. The fd
+                // refers to a descriptor the child inherits (e.g. `&1`), so the
+                // number is valid in the child after fork.
+                let src = match resolve_fd_target(source, shell) {
+                    Ok(fd) => fd,
+                    Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                };
+                plan.ops.push(ChildRedirOp::Dup { target, source: src });
+            }
+            RedirOp::Close => {
+                plan.ops.push(ChildRedirOp::Close { target });
+            }
+            RedirOp::Heredoc { body, .. } => {
+                let bytes = expand_assignment(body, shell).into_bytes();
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => {
+                        plan.heredoc_writers.push(pid);
+                        let rfd = relocate_high_cloexec(rfd);
+                        let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
+                        plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
+                        plan.held.push(owned);
+                    }
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                }
+            }
+            RedirOp::HereString(w) => {
+                let mut bytes = expand_assignment(w, shell).into_bytes();
+                bytes.push(b'\n');
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => {
+                        plan.heredoc_writers.push(pid);
+                        let rfd = relocate_high_cloexec(rfd);
+                        let owned = unsafe { OwnedFd::from_raw_fd(rfd) };
+                        plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
+                        plan.held.push(owned);
+                    }
+                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                }
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Additive (pipeline-stage) variant of `build_child_redir_plan`: lowers ONLY
+/// the redirects the legacy 0/1/2 bridge does NOT consume (fd>2 File/Dup/Close,
+/// `<&` dup-in, `N>&-` close, `<>` ReadWrite) into a replay list, opening files
+/// in the PARENT. The bridge-consumed 0/1/2 file/dup ops are applied by the
+/// caller's existing pipe/stdio mechanism BEFORE this replay; the extra ops then
+/// add the higher / cross-direction fds on top. Source ordering between a
+/// bridge-consumed 0/1/2 op and an extra op is NOT preserved (same additive
+/// limitation as the in-process builtin path). Heredoc/here-string on an fd>2 of
+/// a *pipeline-stage* external is the one case not handled here (it would need a
+/// reaped writer threaded through the pipeline wait point) — the legacy bridge
+/// already dropped it, so this is not a regression; the common single-command
+/// path covers it via `build_child_redir_plan` / `run_subprocess`.
+fn build_child_extra_ops(
+    redirects: &[Redirection],
+    shell: &mut Shell,
+) -> Result<(Vec<ChildRedirOp>, Vec<std::os::fd::OwnedFd>), i32> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    let extra = builtin_extra_redirects(redirects);
+    let mut ops: Vec<ChildRedirOp> = Vec::new();
+    let mut held: Vec<OwnedFd> = Vec::new();
+    for redir in &extra {
+        let Some(target) = redir.target_fd() else {
+            eprintln!("huck: ambiguous redirect");
+            return Err(1);
+        };
+        let target = target as i32;
+        match &redir.op {
+            RedirOp::File { mode, target: word } => {
+                let path = match expand_single(word, shell) {
+                    Ok(p) => p,
+                    Err(()) => return Err(1),
+                };
+                let file: File = match mode {
+                    FileMode::ReadOnly => match File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                    },
+                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
+                        let resolved = match mode {
+                            FileMode::Append => ResolvedRedirect::Append(path),
+                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
+                            _ if shell.shell_options.noclobber => ResolvedRedirect::NoclobberTruncate(path),
+                            _ => ResolvedRedirect::Truncate(path),
+                        };
+                        match open_resolved(&resolved) {
+                            Ok(f) => f,
+                            Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                        }
+                    }
+                    FileMode::ReadWrite => {
+                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                            Ok(f) => f,
+                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                        }
+                    }
+                };
+                let raw = relocate_high_cloexec(file.into_raw_fd());
+                ops.push(ChildRedirOp::Dup { target, source: raw });
+                held.push(unsafe { OwnedFd::from_raw_fd(raw) });
+            }
+            RedirOp::Dup { source, .. } => {
+                let src = match resolve_fd_target(source, shell) {
+                    Ok(fd) => fd,
+                    Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                };
+                ops.push(ChildRedirOp::Dup { target, source: src });
+            }
+            RedirOp::Close => ops.push(ChildRedirOp::Close { target }),
+            RedirOp::Heredoc { .. } | RedirOp::HereString(_) => {
+                // Documented additive gap (see fn doc): an fd>2 heredoc on a
+                // pipeline-stage external. The bridge dropped this already.
+            }
+        }
+    }
+    Ok((ops, held))
+}
+
+/// v156 task 4: the single (non-pipeline) external command path. `plan` is the
+/// ordered `dup2`/`close` replay list lowered from `cmd.redirects` by
+/// `build_child_redir_plan` in the PARENT (files already opened, heredoc writers
+/// already forked). The child replays `plan.ops` IN SOURCE ORDER in a `pre_exec`
+/// after the signal-reset hook, so e.g. `3>&1 1>&2 2>&3` performs the fd swap
+/// correctly. fds 0/1/2 and fd>2 are all handled uniformly by the replay; this
+/// function no longer wires `.stdin/.stdout/.stderr` from opened files (only the
+/// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
 fn run_subprocess(
     cmd: &ResolvedCommand,
-    files: StageFiles,
+    plan: ChildRedirPlan,
     shell: &mut Shell,
     sink: &mut StdoutSink,
-    stdout_dup_target: Option<i32>,
-    stderr_dup_target: Option<i32>,
 ) -> ExecOutcome {
     let interactive =
         matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
@@ -4131,91 +4342,73 @@ fn run_subprocess(
     use std::os::unix::process::CommandExt;
     unsafe { process.pre_exec(reset_job_control_signals_in_child); }
 
-    // If there are Dup redirects, add a second pre_exec to apply dup2 in the
-    // child after stdio is configured but before exec. stdout-dup BEFORE
-    // stderr-dup matches canonical `>file 2>&1` semantics.
-    if stdout_dup_target.is_some() || stderr_dup_target.is_some() {
-        unsafe {
-            process.pre_exec(move || {
-                if let Some(fd) = stdout_dup_target && libc::dup2(fd, 1) < 0 {
-                    return Err(io::Error::last_os_error());
+    // Replay the ordered redirect ops in the child (AFTER the signal-reset
+    // pre_exec). All ops are pure dup2/close (async-signal-safe). On any failure
+    // return Err so spawn() fails cleanly.
+    let ops = plan.ops.clone();
+    unsafe {
+        process.pre_exec(move || {
+            for op in &ops {
+                match *op {
+                    ChildRedirOp::Dup { target, source } => {
+                        if source == target {
+                            // dup2(fd, fd) is a no-op that does NOT clear
+                            // FD_CLOEXEC — but a parent-opened file landed
+                            // exactly on `target` and was CLOEXEC'd, so it would
+                            // vanish on exec. Clear CLOEXEC so it survives.
+                            let flags = libc::fcntl(target, libc::F_GETFD);
+                            if flags < 0 || libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        } else if libc::dup2(source, target) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    ChildRedirOp::Close { target } => {
+                        // Lenient: closing an already-closed fd (EBADF) matches
+                        // bash; only a non-EBADF error aborts the spawn.
+                        if libc::close(target) < 0 {
+                            let e = io::Error::last_os_error();
+                            if e.raw_os_error() != Some(libc::EBADF) {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
-                if let Some(fd) = stderr_dup_target && libc::dup2(fd, 2) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+            }
+            Ok(())
+        });
     }
 
     if interactive {
         process.process_group(0);
     }
 
-    // A heredoc/herestring body is fed by a forked writer process (M-120): the
-    // parent never blocks writing a body larger than the pipe buffer, which is
-    // what deadlocked the captured single-command case `r=$(cat << big)`. The
-    // writer's read end becomes the child's stdin; its pid is reaped after the
-    // child's status is obtained. It is never a job and never sets $!.
-    let mut heredoc_writer_pid: Option<libc::pid_t> = None;
-    use std::os::fd::FromRawFd;
-    match files.stdin {
-        Some(StdinInput::File(file)) => {
-            process.stdin(Stdio::from(file));
-        }
-        Some(StdinInput::DeferredHeredoc(body)) => {
-            // Inline assignments were applied before open_stage_files in this
-            // path (run_exec_single / run_subprocess), so expanding here is
-            // correct: $var references see the stage's inline assignments.
-            let bytes = expand_assignment(&body, shell).into_bytes();
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    heredoc_writer_pid = Some(pid);
-                    process.stdin(Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(rfd) }));
-                }
-                Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
-            }
-        }
-        Some(StdinInput::DeferredHereString(body)) => {
-            // Here-string: expand with no split/glob, append trailing newline.
-            let mut bytes = expand_assignment(&body, shell).into_bytes();
-            bytes.push(b'\n');
-            match spawn_heredoc_writer(&bytes) {
-                Ok((rfd, pid)) => {
-                    heredoc_writer_pid = Some(pid);
-                    process.stdin(Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(rfd) }));
-                }
-                Err(e) => { eprintln!("huck: heredoc: {e}"); return ExecOutcome::Continue(1); }
-            }
-        }
-        None => {}
-    }
+    // The heredoc/herestring writers were forked by build_child_redir_plan; their
+    // read-ends are in `plan.held` (FD_CLOEXEC, inherited across fork, replayed by
+    // the ops above) and their pids are reaped after the child's status.
     let want_capture = matches!(sink, StdoutSink::Capture(_));
-    if let Some(file) = files.stdout {
-        process.stdout(Stdio::from(file));
-    } else if stdout_dup_target.is_some() {
-        // Dup redirect on stdout: inherit the parent's stdout (the dup2 pre_exec
-        // will redirect to the target fd in the child). Stdio::inherit() avoids
-        // the close-on-drop trap of OwnedFd::from_raw_fd for the parent's fd 1.
-        process.stdout(Stdio::inherit());
-    } else if want_capture {
+    if want_capture {
+        // Pipe fd 1 back to the parent for capture. An explicit `>file` (or other
+        // fd-1 redirect) in `plan.ops` overrides this in the child replay, so the
+        // capture pipe correctly sees EOF when the command redirects its stdout.
         process.stdout(Stdio::piped());
-    }
-    if let Some(file) = files.stderr {
-        process.stderr(Stdio::from(file));
-    } else if stderr_dup_target.is_some() {
-        // Dup redirect on stderr: inherit parent's stderr; dup2 applied in child.
-        process.stderr(Stdio::inherit());
     }
 
     // Flush pending parent stdout before spawning so the child's output is
     // ordered after buffered parent bytes (M-118 sibling: ordering).
     flush_stdout();
-    match process.spawn() {
+    let spawn_result = process.spawn();
+    // The child has now forked and inherited the parent-opened redirect fds in
+    // `plan.held` (FD_CLOEXEC). Drop the parent's copies so they don't leak and
+    // so heredoc/here-string read-ends fully close once the child exits.
+    drop(plan.held);
+    let heredoc_writers = plan.heredoc_writers;
+    match spawn_result {
         Ok(mut child) => {
             // The heredoc/herestring body (if any) is written by the forked
             // writer process whose read end is the child's stdin; nothing to
-            // write here. The writer pid is reaped after the child's status.
+            // write here. The writer pids are reaped after the child's status.
 
             let pid = child.id() as i32;
 
@@ -4303,19 +4496,28 @@ fn run_subprocess(
                     }
                 }
             };
-            // Reap the forked heredoc/herestring writer now the consumer has
-            // exited (M-120). It is an internal helper — not a job, not $!.
-            if let Some(wpid) = heredoc_writer_pid {
+            // Reap the forked heredoc/herestring writers now the consumer has
+            // exited (M-120). They are internal helpers — not jobs, not $!.
+            for wpid in heredoc_writers {
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
             outcome
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Spawn failed: reap any heredoc writers so they don't linger.
+            for wpid in heredoc_writers {
+                let mut st = 0;
+                unsafe { libc::waitpid(wpid, &mut st, 0); }
+            }
             eprintln!("huck: command not found: {}", cmd.program);
             ExecOutcome::Continue(127)
         }
         Err(e) => {
+            for wpid in heredoc_writers {
+                let mut st = 0;
+                unsafe { libc::waitpid(wpid, &mut st, 0); }
+            }
             eprintln!("huck: {}: {e}", cmd.program);
             ExecOutcome::Continue(1)
         }
@@ -5766,6 +5968,13 @@ fn spawn_external_with_fds(
         _ => None,
     };
 
+    // v156 task 4 (additive): lower the redirects the 0/1/2 bridge does NOT
+    // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
+    // applied in the child AFTER the bridge stdio/dup. `extra_held` keeps the
+    // parent-opened files alive (FD_CLOEXEC) until after spawn.
+    let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell)
+        .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
+
     let mut process = ProcessCommand::new(&resolved.program);
     process.args(&resolved.args);
     process.env_clear();
@@ -5786,6 +5995,43 @@ fn spawn_external_with_fds(
                 }
                 if let Some(fd) = stderr_dup_target && libc::dup2(fd, 2) < 0 {
                     return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // Replay the extra (fd>2 / dup-in / close / ReadWrite) ops in source order,
+    // AFTER the bridge stdio + dup-target pre_execs above. Pure dup2/close, so
+    // async-signal-safe. Runs even when the bridge dup pre_exec is absent.
+    if !extra_ops.is_empty() {
+        let ops = extra_ops.clone();
+        unsafe {
+            process.pre_exec(move || {
+                for op in &ops {
+                    match *op {
+                        ChildRedirOp::Dup { target, source } => {
+                            if source == target {
+                                // See run_subprocess: clear FD_CLOEXEC instead of
+                                // a no-op dup2 when a CLOEXEC'd file landed on the
+                                // target fd.
+                                let flags = libc::fcntl(target, libc::F_GETFD);
+                                if flags < 0 || libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                            } else if libc::dup2(source, target) < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        ChildRedirOp::Close { target } => {
+                            if libc::close(target) < 0 {
+                                let e = io::Error::last_os_error();
+                                if e.raw_os_error() != Some(libc::EBADF) {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(())
             });
@@ -5849,7 +6095,11 @@ fn spawn_external_with_fds(
         });
     }
 
-    let child = process.spawn()?;
+    let spawn_result = process.spawn();
+    // The child inherited the parent-opened extra-redirect fds (FD_CLOEXEC).
+    // Drop the parent's copies now so they don't leak.
+    drop(extra_held);
+    let child = spawn_result?;
     let pid = child.id() as i32;
 
     // Defensive setpgid in parent to close the race with the child's setpgid
