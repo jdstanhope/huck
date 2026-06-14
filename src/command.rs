@@ -624,7 +624,6 @@ pub enum Command {
     /// `coproc [NAME] command` (v157). `name` is "COPROC" when anonymous. The
     /// body runs asynchronously with its stdin/stdout wired to two pipes the
     /// shell holds as NAME[0] (read) / NAME[1] (write).
-    #[allow(dead_code)] // constructed by the parser in task 2
     Coproc { name: String, body: Box<Command> },
 }
 
@@ -749,7 +748,7 @@ pub enum ParseError {
 /// `peek`/`next`/`len`, plus `current_line()` (the line of the NEXT
 /// token to be returned). Lines are `0` ("unknown") unless built with real lines.
 pub struct TokenCursor {
-    iter: std::iter::Peekable<std::vec::IntoIter<Token>>,
+    tokens: Vec<Token>,
     lines: Vec<u32>,
     pos: usize,
 }
@@ -757,26 +756,35 @@ impl TokenCursor {
     pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
         debug_assert!(lines.is_empty() || lines.len() == tokens.len(),
             "lines must parallel tokens");
-        Self { iter: tokens.into_iter().peekable(), lines, pos: 0 }
+        Self { tokens, lines, pos: 0 }
     }
     /// Line of the next token to be returned (0 if unknown / past end).
     pub fn current_line(&self) -> u32 {
         self.lines.get(self.pos).copied().unwrap_or(0)
     }
-    pub fn peek(&mut self) -> Option<&Token> {
-        self.iter.peek()
+    /// Peek at the next token without consuming it.
+    pub fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+    /// Peek at the token after next without consuming anything.
+    pub fn peek2(&self) -> Option<&Token> {
+        self.tokens.get(self.pos + 1)
     }
 }
 impl Iterator for TokenCursor {
     type Item = Token;
     fn next(&mut self) -> Option<Token> {
-        let t = self.iter.next();
-        if t.is_some() { self.pos += 1; }
-        t
+        if self.pos < self.tokens.len() {
+            let t = self.tokens[self.pos].clone();
+            self.pos += 1;
+            Some(t)
+        } else {
+            None
+        }
     }
 }
 impl ExactSizeIterator for TokenCursor {
-    fn len(&self) -> usize { self.iter.len() }
+    fn len(&self) -> usize { self.tokens.len() - self.pos }
 }
 
 fn parse_cursor(cur: &mut TokenCursor) -> Result<Option<Sequence>, ParseError> {
@@ -1059,6 +1067,11 @@ fn parse_command_inner(
             maybe_wrap_redirects(cmd, iter)
         }
         Some(Keyword::Function) => parse_function_keyword_def(iter),
+        Some(Keyword::Coproc) => {
+            iter.next(); // consume `coproc`
+            let cmd = parse_coproc_command(iter)?;
+            maybe_wrap_redirects(cmd, iter)
+        }
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Check for bare `(` at command-start → subshell `(list)`.
@@ -1561,6 +1574,57 @@ fn parse_select_command(
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
     expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
     Ok(Command::Select(Box::new(SelectClause { var, words, body })))
+}
+
+/// Parses a `coproc` body after the `coproc` keyword has been consumed.
+///
+/// Named form (`coproc NAME compound`): consumed only when the token after
+/// the plain-word NAME starts a compound command.  Otherwise anonymous:
+/// name = "COPROC" and the body is the next ordinary command (simple or
+/// compound).
+fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
+    // Named form: a plain Word followed by a compound-command opener.
+    let is_named = matches!(iter.peek(), Some(Token::Word(w))
+        if word_literal_text(w).is_some())
+        && is_compound_opener(iter.peek2());
+
+    if is_named {
+        // Consume the NAME word (we already verified it's a plain literal).
+        let name = match iter.next() {
+            Some(Token::Word(w)) => word_literal_text(&w)
+                .expect("verified above")
+                .to_string(),
+            _ => unreachable!("peek matched Token::Word"),
+        };
+        let body = parse_command_inner(iter)?;
+        return Ok(Command::Coproc { name, body: Box::new(body) });
+    }
+
+    // Anonymous: parse the body as an ordinary command.
+    let body = parse_command_inner(iter)?;
+    Ok(Command::Coproc { name: "COPROC".to_string(), body: Box::new(body) })
+}
+
+/// True if `tok` is the first token of a compound command
+/// (`{`, `(`, if/while/until/for/case/select/function, `[[`, `((`).
+fn is_compound_opener(tok: Option<&Token>) -> bool {
+    match tok {
+        Some(Token::Op(Operator::LParen)) => true,
+        Some(Token::ArithBlock(_)) => true,
+        Some(t) => matches!(
+            keyword_of(t),
+            Some(Keyword::LBrace)
+                | Some(Keyword::If)
+                | Some(Keyword::While)
+                | Some(Keyword::Until)
+                | Some(Keyword::For)
+                | Some(Keyword::Case)
+                | Some(Keyword::Select)
+                | Some(Keyword::DoubleBracketOpen)
+                | Some(Keyword::Function)
+        ),
+        None => false,
+    }
 }
 
 /// Parses `case WORD in [clause]... esac`. The caller has peeked `case`.
@@ -2206,6 +2270,8 @@ fn parse_next_stage(
             Ok((Command::BraceGroup(Box::new(parse_brace_group(iter)?)), false))
         }
         Some(Keyword::DoubleBracketOpen) => Ok((parse_double_bracket(iter)?, false)),
+        // `coproc` is invalid as a pipeline stage (it's a top-level command).
+        Some(Keyword::Coproc) => Err(ParseError::UnexpectedKeyword("coproc".to_string())),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Bare `(` at pipeline-stage position → subshell.
@@ -5804,5 +5870,52 @@ mod tests {
         assert!(sin.is_some(), "Read on fd0 should fill stdin");
         assert!(sout.is_some(), "Truncate on fd1 should fill stdout");
         assert!(serr.is_some(), "Truncate on fd2 should fill stderr");
+    }
+
+    // ── coproc parser tests (v157 task 2) ─────────────────────────────────
+
+    /// Tokenize + parse `src`, find the top-level `Command::Coproc`, and
+    /// return `(name, *body)`.  Panics if parsing fails or the top command
+    /// isn't a `Coproc`.
+    fn coproc_of(src: &str) -> (String, Command) {
+        let tokens = crate::lexer::tokenize(src).expect("tokenize");
+        let seq = parse(tokens).expect("parse").expect("non-empty");
+        match seq.first {
+            Command::Coproc { name, body } => (name, *body),
+            other => panic!("expected Command::Coproc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_coproc_anonymous_simple() {
+        let (name, body) = coproc_of("coproc awk prog");
+        assert_eq!(name, "COPROC");
+        assert!(matches!(body, Command::Pipeline(_) | Command::Simple(_)));
+    }
+
+    #[test]
+    fn parse_coproc_named_compound() {
+        let (name, body) = coproc_of("coproc MYP { read l; }");
+        assert_eq!(name, "MYP");
+        assert!(matches!(body, Command::BraceGroup(_)));
+    }
+
+    #[test]
+    fn parse_coproc_word_then_simple_is_anonymous() {
+        let (name, _body) = coproc_of("coproc foo bar");
+        assert_eq!(name, "COPROC");
+    }
+
+    #[test]
+    fn parse_coproc_anonymous_compound() {
+        let (name, body) = coproc_of("coproc { read l; }");
+        assert_eq!(name, "COPROC");
+        assert!(matches!(body, Command::BraceGroup(_)));
+    }
+
+    #[test]
+    fn parse_coproc_in_pipeline_is_error() {
+        let toks = crate::lexer::tokenize("echo x | coproc cat").unwrap();
+        assert!(parse(toks).is_err());
     }
 }
