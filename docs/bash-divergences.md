@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 36 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -70,6 +70,7 @@ group.
 
 - **M-41: Limited signal name set** — `[deferred]` medium. huck: 15 names (no SEGV/ABRT/FPE/BUS/ILL/TRAP/…). bash: full platform signal set.
 - **M-42: `kill` with negative PID** — `[deferred]` low. huck: rejects. bash: passes to `kill(2)` as a pgrp / wildcard target.
+- **M-126: multiple simultaneous coprocs** — `[deferred]` low. v157 reliably supports ONE active coproc and emits the standard `coproc: NAME: still exists` warning when a second `coproc` is started while one is still running. bash 5 supports fully independent concurrent coprocs, each with its own `NAME[0]`/`NAME[1]`/`NAME_PID` triple tracked separately. The `Shell.coprocs` field is already a `Vec`, so supporting multiple active coprocs is a policy relaxation (remove the single-active-coproc guard and allow concurrent entries) rather than a structural change; deferred as a low-priority follow-on. Note: coproc fd numbers and the exact warning wording are NOT byte-compared in the coproc_diff_check.sh harness.
 - **M-96: first-class nested and-or AST (`list → and_or → pipeline → command`)** — `[deferred]` low. M-95 follow-on. v98 keeps the flat `Sequence` model with executor-side grouping (`partition_into_groups` + `run_andor_group`), which is correct and low-risk. A future first-class `list → and_or → pipeline → command` AST may eventually be wanted to express `time` on a whole group, per-group traps, and cleaner pipeline-status propagation — none of which the flat model represents natively. Not user-visible today; logged so the structural debt is tracked.
 
 ### Builtins (other)
