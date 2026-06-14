@@ -1026,18 +1026,22 @@ where
     // (the consumer has drained and closed its read end, so the writers have
     // finished). ECHILD or any error is fine — they are transient helpers.
     scope.reap_heredoc_writers();
-    // Drain any redirect-target process substitutions (e.g. `cmd < <(inner)`).
-    // Argument procsubs were already drained by run_exec_single inside run_inner;
-    // this covers the redirect-word slice [procsub_base .. run_exec_base).
-    // Drain BEFORE restoring the redirect scope: cleanup closes the parent pipe fd
-    // (signaling EOF to the inner process-sub children) and waitpid-reaps them, which
-    // must happen before the saved fd 0/1/2 are restored.
+    // Restore the real fds BEFORE draining redirect-target process substitutions.
+    // For an OUTPUT procsub (`cmd > >(consumer)`), the redirect dup'd the procsub's
+    // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
+    // (e.g. `cat`), which only sees EOF once that write end is closed — i.e. when the
+    // scope's Drop restores fd 1. Draining first causes a deadlock: the consumer
+    // never sees EOF while the scope still holds fd 1 open.
+    // (This mirrors the ordering in `run_builtin_with_redirects`, which was fixed
+    // for the same reason. Drop-then-drain is also safe for INPUT procsubs: their
+    // inner producer already wrote and the body has finished reading, so closing
+    // the pipe-read copy just lets cleanup reap normally.)
+    drop(scope);
     drain_procsubs(shell, procsub_base);
     debug_assert_eq!(
         shell.procsub_pending.len(), procsub_base,
         "process-substitution leak: a return path in with_redirect_scope skipped drain_procsubs"
     );
-    drop(scope);
     outcome
 }
 
@@ -2664,8 +2668,8 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
     // v156 task 7: redirections are NOT resolved here anymore. The builtin path
     // (run_builtin_with_redirects) and the single-external path (run_subprocess)
     // apply `cmd.redirects` in source order at execution time; the pipeline-stage
-    // path reads `exec.legacy_*` directly off the AST. So resolve() only expands
-    // the program + arguments.
+    // path reads `exec.slot_stdin/stdout/stderr()` directly off the AST. So
+    // resolve() only expands the program + arguments.
     Ok(ResolvedCommand { program, args, decl_args })
 }
 

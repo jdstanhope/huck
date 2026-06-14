@@ -5736,7 +5736,7 @@ mod tests {
     /// must be dropped by slots_for_simple_path rather than placed into the wrong slot
     /// (which would cause resolve()'s unreachable!() assertions to fire).
     #[test]
-    fn legacy_slots_drops_cross_type_low_fd() {
+    fn slots_for_simple_path_drops_cross_type_low_fd() {
         // Read-op on fd 1 (stdout): must not fill any slot.
         let r_read_on_fd1 = Redirection {
             fd: RedirFd::Number(1),
