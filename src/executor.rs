@@ -7,7 +7,7 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use crate::builtins::{self, ExecOutcome};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
-    IfClause, Pipeline, Redirect, RedirOp, Redirection, Sequence, SimpleCommand, TestBinaryOp,
+    IfClause, Pipeline, Redirect, RedirFd, RedirOp, Redirection, Sequence, SimpleCommand, TestBinaryOp,
     TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
@@ -576,11 +576,13 @@ impl RedirectScope {
 
     /// Apply one redirection to the real fds, saving the prior target for
     /// restore. Returns `Err(outcome)` on failure (diagnostic already printed).
-    /// `RedirFd::Var` is not handled here yet (a later task) — returns an error.
     fn apply(&mut self, redir: &Redirection, shell: &mut Shell) -> Result<(), ExecOutcome> {
         use std::os::unix::io::IntoRawFd;
+        if let RedirFd::Var(name) = &redir.fd {
+            return self.apply_var(name, redir, shell);
+        }
         let Some(target) = redir.target_fd() else {
-            // RedirFd::Var: allocate-a-free-fd is a later task.
+            // RedirFd::Var is handled above; any other None is unexpected.
             eprintln!("huck: ambiguous redirect");
             return Err(ExecOutcome::Continue(1));
         };
@@ -717,6 +719,145 @@ impl RedirectScope {
                 }
             }
         }
+    }
+
+    /// Apply a `{var}` named-fd redirection in-process. Allocates a free fd >= 10
+    /// (non-CLOEXEC, so an exec'd child would inherit it), wires the redirect onto
+    /// it, and assigns the number to `$name` (the var PERSISTS after the command).
+    /// The allocated fd itself is registered in `saved` as `(high, -1)` so Drop
+    /// closes it when the scope ends (a normal command keeps the fd open only for
+    /// its duration; the var keeps the now-closed number, bash-style). `exec`'s
+    /// permanence is the caller's decision (it skips the scope), not handled here.
+    fn apply_var(&mut self, name: &str, redir: &Redirection, shell: &mut Shell) -> Result<(), ExecOutcome> {
+        use std::os::unix::io::IntoRawFd;
+        // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
+        if matches!(&redir.op, RedirOp::Close) {
+            let cur = shell.lookup_var(name).unwrap_or_default();
+            let fd: RawFd = match cur.trim().parse::<i32>() {
+                Ok(n) if n >= 0 => n,
+                _ => {
+                    eprintln!("huck: {name}: ambiguous redirect");
+                    return Err(ExecOutcome::Continue(1));
+                }
+            };
+            // Save prior state so Drop restores (saved == -1 if it was unopened),
+            // then close. EBADF (already closed) is lenient per bash.
+            self.close_target(fd);
+            return Ok(());
+        }
+        // Compute the source fd to dup from. `owns_src` is true when WE opened it
+        // (File / heredoc / here-string read end) and must close it after duping;
+        // a Dup source belongs to the shell and is left alone.
+        let (src, owns_src): (RawFd, bool) = match &redir.op {
+            RedirOp::File { mode, target: word } => {
+                let path = match expand_single(word, shell) {
+                    Ok(p) => p,
+                    Err(()) => return Err(ExecOutcome::Continue(1)),
+                };
+                let fd: RawFd = match mode {
+                    FileMode::ReadOnly => match File::open(&path) {
+                        Ok(f) => f.into_raw_fd(),
+                        Err(e) => {
+                            eprintln!("huck: {path}: {e}");
+                            return Err(ExecOutcome::Continue(1));
+                        }
+                    },
+                    FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
+                        let resolved = match mode {
+                            FileMode::Append => ResolvedRedirect::Append(path),
+                            FileMode::Clobber => ResolvedRedirect::Truncate(path),
+                            _ if shell.shell_options.noclobber => {
+                                ResolvedRedirect::NoclobberTruncate(path)
+                            }
+                            _ => ResolvedRedirect::Truncate(path),
+                        };
+                        match open_resolved(&resolved) {
+                            Ok(f) => f.into_raw_fd(),
+                            Err(e) => {
+                                eprintln!("huck: {}: {e}", resolved_path(&resolved));
+                                return Err(ExecOutcome::Continue(1));
+                            }
+                        }
+                    }
+                    FileMode::ReadWrite => {
+                        match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                            Ok(f) => f.into_raw_fd(),
+                            Err(e) => {
+                                eprintln!("huck: {path}: {e}");
+                                return Err(ExecOutcome::Continue(1));
+                            }
+                        }
+                    }
+                };
+                (fd, true)
+            }
+            RedirOp::Dup { source, .. } => {
+                let src = match resolve_fd_target(source, shell) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        eprintln!("huck: {e}");
+                        return Err(ExecOutcome::Continue(1));
+                    }
+                };
+                if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
+                    eprintln!("huck: {src}: Bad file descriptor");
+                    return Err(ExecOutcome::Continue(1));
+                }
+                (src, false)
+            }
+            RedirOp::Heredoc { body, .. } => {
+                let bytes = expand_assignment(body, shell).into_bytes();
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => {
+                        self.heredoc_writers.push(pid);
+                        (rfd, true)
+                    }
+                    Err(e) => {
+                        eprintln!("huck: heredoc: {e}");
+                        return Err(ExecOutcome::Continue(1));
+                    }
+                }
+            }
+            RedirOp::HereString(w) => {
+                let mut bytes = expand_assignment(w, shell).into_bytes();
+                bytes.push(b'\n');
+                match spawn_heredoc_writer(&bytes) {
+                    Ok((rfd, pid)) => {
+                        self.heredoc_writers.push(pid);
+                        (rfd, true)
+                    }
+                    Err(e) => {
+                        eprintln!("huck: heredoc: {e}");
+                        return Err(ExecOutcome::Continue(1));
+                    }
+                }
+            }
+            RedirOp::Close => unreachable!("Close handled above"),
+        };
+        // Allocate a free high fd duped from `src` (non-CLOEXEC). The high fd
+        // ITSELF is the live descriptor the command sees — do NOT dup2 onto a
+        // lower fd.
+        let high = match alloc_high_fd(src) {
+            Ok(h) => h,
+            Err(e) => {
+                if owns_src {
+                    unsafe { libc::close(src) };
+                }
+                eprintln!("huck: {name}: {e}");
+                return Err(ExecOutcome::Continue(1));
+            }
+        };
+        if owns_src {
+            // The opened file / heredoc read-end was only a temp to dup from.
+            unsafe { libc::close(src) };
+        }
+        // Assign $var (persists after the command) and register `high` so Drop
+        // closes it when the scope ends. `(high, -1)` reuses the "was-closed →
+        // Drop closes target" path: `high` was free before alloc, so closing it
+        // on Drop returns it to that free state.
+        shell.set(name, high.to_string());
+        self.saved.push((high, -1));
+        Ok(())
     }
 
     /// Reap any forked heredoc/here-string writers spawned during `apply`.
@@ -4169,12 +4310,23 @@ fn relocate_high_cloexec(fd: RawFd) -> RawFd {
     }
 }
 
+/// Allocate a free fd >= 10 duped from `src_fd`. CLOEXEC is OFF so the fd is
+/// inherited by an exec'd child (bash leaves {var}/exec fds open across exec).
+fn alloc_high_fd(src_fd: RawFd) -> io::Result<RawFd> {
+    let fd = unsafe { libc::fcntl(src_fd, libc::F_DUPFD, 10) }; // F_DUPFD (not _CLOEXEC)
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
 /// Lower `redirects` (in source order) into a `ChildRedirPlan` for an external
 /// command: open files / spawn heredoc writers in the PARENT, resolve dup
 /// sources, and emit an ordered `dup2`/`close` op list the child replays. On
 /// any error a diagnostic is printed and `Err(1)` is returned (the held fds and
 /// heredoc writers built so far are dropped/leaked-cleanly via `held`).
-/// `RedirFd::Var` is rejected here (task 5).
+/// `RedirFd::Var` (`{var}>file`) allocates a free fd >= 10 (non-CLOEXEC), assigns
+/// it to `$var`, and emits a source==target replay op so the child inherits it.
 fn build_child_redir_plan(
     redirects: &[Redirection],
     shell: &mut Shell,
@@ -4182,8 +4334,113 @@ fn build_child_redir_plan(
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     let mut plan = ChildRedirPlan { ops: Vec::new(), held: Vec::new(), heredoc_writers: Vec::new() };
     for redir in redirects {
+        // `{var}` named-fd: allocate a free fd >= 10 in the PARENT (non-CLOEXEC so
+        // the child inherits it), assign $var (persists), and emit a source==target
+        // replay op so the child clears CLOEXEC on it (survives exec). The parent
+        // keeps it in `held` and closes it after spawn (normal-command semantics;
+        // exec's permanence is Task 6's caller decision).
+        if let RedirFd::Var(name) = &redir.fd {
+            // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
+            if matches!(&redir.op, RedirOp::Close) {
+                let cur = shell.lookup_var(name).unwrap_or_default();
+                let fd: i32 = match cur.trim().parse::<i32>() {
+                    Ok(n) if n >= 0 => n,
+                    _ => {
+                        eprintln!("huck: {name}: ambiguous redirect");
+                        return Err(1);
+                    }
+                };
+                plan.ops.push(ChildRedirOp::Close { target: fd });
+                continue;
+            }
+            // Resolve the source fd in the parent: an opened file, a dup source, or
+            // a forked heredoc/here-string read end. `owns_src` => we close it after
+            // duping to `high`; a Dup source belongs to the shell.
+            let (src, owns_src): (RawFd, bool) = match &redir.op {
+                RedirOp::File { mode, target: word } => {
+                    let path = match expand_single(word, shell) {
+                        Ok(p) => p,
+                        Err(()) => return Err(1),
+                    };
+                    let file: File = match mode {
+                        FileMode::ReadOnly => match File::open(&path) {
+                            Ok(f) => f,
+                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                        },
+                        FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
+                            let resolved = match mode {
+                                FileMode::Append => ResolvedRedirect::Append(path),
+                                FileMode::Clobber => ResolvedRedirect::Truncate(path),
+                                _ if shell.shell_options.noclobber => {
+                                    ResolvedRedirect::NoclobberTruncate(path)
+                                }
+                                _ => ResolvedRedirect::Truncate(path),
+                            };
+                            match open_resolved(&resolved) {
+                                Ok(f) => f,
+                                Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                            }
+                        }
+                        FileMode::ReadWrite => {
+                            match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+                                Ok(f) => f,
+                                Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                            }
+                        }
+                    };
+                    (file.into_raw_fd(), true)
+                }
+                RedirOp::Dup { source, .. } => {
+                    let src = match resolve_fd_target(source, shell) {
+                        Ok(fd) => fd,
+                        Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                    };
+                    (src, false)
+                }
+                RedirOp::Heredoc { body, .. } => {
+                    let bytes = expand_assignment(body, shell).into_bytes();
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
+                        Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                    }
+                }
+                RedirOp::HereString(w) => {
+                    let mut bytes = expand_assignment(w, shell).into_bytes();
+                    bytes.push(b'\n');
+                    match spawn_heredoc_writer(&bytes) {
+                        Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
+                        Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                    }
+                }
+                RedirOp::Close => unreachable!("Close handled above"),
+            };
+            let high = match alloc_high_fd(src) {
+                Ok(h) => h,
+                Err(e) => {
+                    if owns_src { unsafe { libc::close(src) }; }
+                    eprintln!("huck: {name}: {e}");
+                    return Err(1);
+                }
+            };
+            if owns_src {
+                unsafe { libc::close(src) };
+            }
+            // NOTE: bash does NOT assign $var in the PARENT for an external
+            // command — the redirect + var-assignment happen in the forked child,
+            // so the parent's `$var` is untouched (verified: `fd=99; /bin/echo hi
+            // {fd}>f` leaves $fd == 99). The child still inherits `high` OPEN
+            // (non-CLOEXEC) so the exec'd program sees the descriptor; we do not
+            // export $var to it (bash doesn't either). Hence: no `shell.set` here.
+            let _ = name;
+            // source == target makes the child's replay clear CLOEXEC on `high`
+            // (it is non-CLOEXEC already, but the branch must NOT dup2 onto a
+            // lower fd — `high` itself is the inherited descriptor).
+            plan.ops.push(ChildRedirOp::Dup { target: high, source: high });
+            plan.held.push(unsafe { OwnedFd::from_raw_fd(high) });
+            continue;
+        }
         let Some(target) = redir.target_fd() else {
-            // RedirFd::Var: allocate-a-free-fd is task 5.
+            // RedirFd::Var is handled above; any other None is unexpected.
             eprintln!("huck: ambiguous redirect");
             return Err(1);
         };
