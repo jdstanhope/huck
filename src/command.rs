@@ -323,7 +323,8 @@ impl RedirOp {
 
 impl Redirection {
     /// The concrete numeric target fd for non-`Var` redirections (`Var` is
-    /// resolved at apply time). Used by the legacy bridge + applier.
+    /// resolved at apply time). Used by the ordered applier and the
+    /// pipeline-stage slot fast-path.
     pub fn target_fd(&self) -> Option<u16> {
         match &self.fd {
             RedirFd::Default => Some(self.op.default_fd()),
@@ -333,12 +334,22 @@ impl Redirection {
     }
 }
 
-/// TEMPORARY bridge (removed in a later task): collapse the ordered list back to
-/// the old fixed 0/1/2 slots so the not-yet-migrated executor keeps working with
-/// IDENTICAL behavior. fd>2 targets, `RedirFd::Var`, `RedirOp::Close`, `<&`
-/// (Dup output:false), and ReadWrite are DROPPED here (made real in later tasks).
-/// Last-wins per slot, matching pre-v156 semantics.
-pub fn legacy_slots(redirs: &[Redirection]) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
+/// PERMANENT internal helper (v156): collapse the ordered redirect list to the
+/// fixed 0/1/2 slots for the paths that still consume 0/1/2 separately rather
+/// than via the unified ordered applier — the PIPELINE-STAGE executor
+/// (`run_multi_stage` / `run_background_sequence` / `spawn_external_with_fds`)
+/// and AST→source regeneration (`generate.rs`). fd>2 targets, `RedirFd::Var`,
+/// `RedirOp::Close`, `<&` (Dup output:false), and ReadWrite are DROPPED here
+/// (the pipeline path picks the fd>2/dup-in/close/ReadWrite set up additively via
+/// `slots_for_simple_path` + `build_child_extra_ops`). LAST-WINS per slot.
+///
+/// RESIDUAL LIMITATION (v156 task 7 fallback): because this is last-wins and the
+/// extra set is applied additively, SOURCE ORDERING between a 0/1/2 redirect and
+/// another redirect (`2>&1 >file` / `>file 3>&1`) is NOT preserved for pipeline
+/// stages, and an fd>2 heredoc on a pipeline-stage external is dropped. The
+/// single-command builtin and external paths do NOT use this helper anymore —
+/// they apply `cmd.redirects` in source order (so L-08 is fixed there).
+pub fn slots_for_simple_path(redirs: &[Redirection]) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
     let (mut sin, mut sout, mut serr) = (None, None, None);
     for r in redirs {
         let Some(fd) = r.target_fd() else { continue };
@@ -443,9 +454,10 @@ pub struct ExecCommand {
     pub program: Word,
     pub args: Vec<Word>,
     /// Redirections in source order (`>a 2>&1` differs from `2>&1 >a`).
-    /// Replaces the old fixed stdin/stdout/stderr slots (v156). The executor
-    /// currently bridges this back to 0/1/2 via `legacy_slots` until the
-    /// applier is migrated in a later task.
+    /// Replaces the old fixed stdin/stdout/stderr slots (v156). Single-command
+    /// builtin/external/exec paths apply this list in source order; the
+    /// pipeline-stage path still collapses it to 0/1/2 via `slots_for_simple_path`
+    /// (last-wins — source order not preserved there).
     pub redirects: Vec<Redirection>,
     /// 1-based source line of the command's first token (0 = unknown).
     /// Set at parse time; the executor uses it for $LINENO.
@@ -470,17 +482,18 @@ impl ExecCommand {
         None
     }
 
-    /// TEMPORARY (v156 task 2): the bridged legacy stdin/stdout/stderr slots
-    /// derived from `redirects`. Removed once the executor applies the ordered
-    /// list directly.
-    pub fn legacy_stdin(&self) -> Option<Redirect> {
-        legacy_slots(&self.redirects).0
+    /// The 0/1/2 redirect slots derived from `redirects` for the PIPELINE-STAGE
+    /// fast-path (v156). The single-command builtin/external paths no longer use
+    /// these — they apply `redirects` in source order. Last-wins, source-order
+    /// NOT preserved (see `slots_for_simple_path`).
+    pub fn slot_stdin(&self) -> Option<Redirect> {
+        slots_for_simple_path(&self.redirects).0
     }
-    pub fn legacy_stdout(&self) -> Option<Redirect> {
-        legacy_slots(&self.redirects).1
+    pub fn slot_stdout(&self) -> Option<Redirect> {
+        slots_for_simple_path(&self.redirects).1
     }
-    pub fn legacy_stderr(&self) -> Option<Redirect> {
-        legacy_slots(&self.redirects).2
+    pub fn slot_stderr(&self) -> Option<Redirect> {
+        slots_for_simple_path(&self.redirects).2
     }
 }
 
@@ -601,8 +614,8 @@ pub enum Command {
     /// execution: `{ …; } >f`, `while … done <<EOF`, etc. (v97)
     Redirected {
         inner: Box<Command>,
-        /// Trailing redirects in source order (v156). Bridged to 0/1/2 by the
-        /// executor via `legacy_slots` until the applier is migrated.
+        /// Trailing redirects in source order (v156), applied by the executor's
+        /// ordered `with_redirect_scope` applier (source order preserved).
         redirects: Vec<Redirection>,
     },
 }
@@ -2731,21 +2744,21 @@ mod tests {
     // working unchanged during the v156 migration.
     fn exec_stdout(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stdout(),
+            Command::Simple(SimpleCommand::Exec(e)) => e.slot_stdout(),
             _ => panic!("expected Simple(Exec)"),
         }
     }
 
     fn exec_stdin(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stdin(),
+            Command::Simple(SimpleCommand::Exec(e)) => e.slot_stdin(),
             _ => panic!("expected Simple(Exec)"),
         }
     }
 
     fn exec_stderr(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stderr(),
+            Command::Simple(SimpleCommand::Exec(e)) => e.slot_stderr(),
             _ => panic!("expected Simple(Exec)"),
         }
     }
@@ -2925,8 +2938,8 @@ mod tests {
                 assert!(ec.program.0.is_empty(), "program word should be empty");
                 assert!(ec.args.is_empty());
                 assert!(ec.inline_assignments.is_empty());
-                assert_eq!(ec.legacy_stdout(), Some(Redirect::Truncate(ww("f"))));
-                assert!(ec.legacy_stdin().is_none() && ec.legacy_stderr().is_none());
+                assert_eq!(ec.slot_stdout(), Some(Redirect::Truncate(ww("f"))));
+                assert!(ec.slot_stdin().is_none() && ec.slot_stderr().is_none());
             }
             other => panic!("expected empty-program Exec, got {other:?}"),
         }
@@ -3099,7 +3112,7 @@ mod tests {
                 assert_eq!(e.inline_assignments.len(), 1);
                 assert_eq!(e.inline_assignments[0].target.name(), "FOO");
                 assert_eq!(e.program, Word(Vec::new()));
-                assert_eq!(e.legacy_stdout(), Some(Redirect::Truncate(ww("f"))));
+                assert_eq!(e.slot_stdout(), Some(Redirect::Truncate(ww("f"))));
             }
             _ => panic!("expected Simple(Exec)"),
         }
@@ -3696,7 +3709,7 @@ mod tests {
         let cmd = parse_one("{ echo a; } > f");
         match cmd {
             Command::Redirected { inner, redirects } => {
-                let (stdin, stdout, stderr) = legacy_slots(&redirects);
+                let (stdin, stdout, stderr) = slots_for_simple_path(&redirects);
                 assert!(matches!(*inner, Command::BraceGroup(_)), "inner should be BraceGroup");
                 assert!(stdin.is_none());
                 assert!(matches!(stdout, Some(Redirect::Truncate(_))), "stdout should be Truncate");
@@ -3711,7 +3724,7 @@ mod tests {
         let cmd = parse_one("while read x; do echo $x; done <<EOF\na\nb\nEOF\n");
         match cmd {
             Command::Redirected { inner, redirects } => {
-                let (stdin, stdout, stderr) = legacy_slots(&redirects);
+                let (stdin, stdout, stderr) = slots_for_simple_path(&redirects);
                 assert!(matches!(*inner, Command::While(_)), "inner should be While");
                 assert!(matches!(stdin, Some(Redirect::Heredoc { .. })), "stdin should be Heredoc");
                 assert!(stdout.is_none());
@@ -4481,7 +4494,7 @@ mod tests {
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("expected Simple(Exec)") };
         // The last heredoc (B's body) should be in stdin.
-        let stdin = e.legacy_stdin();
+        let stdin = e.slot_stdin();
         if let Some(Redirect::Heredoc { body, .. }) = &stdin {
             // body_b → Literal{"body_b", quoted:false} + Literal{"\n", quoted:true}
             assert_eq!(body.0.len(), 2, "expected body_b parts, got: {:?}", body.0);
@@ -4498,13 +4511,13 @@ mod tests {
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
         assert_eq!(p.commands.len(), 2, "expected 2 pipeline stages");
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
-        let s0 = stage0.legacy_stdin();
+        let s0 = stage0.slot_stdin();
         assert!(
             matches!(s0, Some(Redirect::Heredoc { .. })),
             "stage 0 should have Heredoc stdin, got: {s0:?}"
         );
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
-        let s1 = stage1.legacy_stdin();
+        let s1 = stage1.slot_stdin();
         assert!(
             s1.is_none(),
             "stage 1 should have no stdin, got: {s1:?}"
@@ -4643,7 +4656,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
+        assert!(matches!(&e.slot_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4652,7 +4665,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
+        assert!(matches!(&e.slot_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4661,7 +4674,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
+        assert!(matches!(&e.slot_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4678,9 +4691,9 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 2);
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&stage0.legacy_stdin(), Some(Redirect::HereString(_))));
+        assert!(matches!(&stage0.slot_stdin(), Some(Redirect::HereString(_))));
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
-        assert!(stage1.legacy_stdin().is_none());
+        assert!(stage1.slot_stdin().is_none());
     }
 
     // ── v28 subshell parser tests ────────────────────────────────────────────
@@ -4806,7 +4819,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let stdout = e.legacy_stdout();
+        let stdout = e.slot_stdout();
         let Some(Redirect::Dup { fd, source }) = &stdout else { panic!("got {stdout:?}") };
         assert_eq!(*fd, 1);
         // source Word's first part should be Literal "2".
@@ -4819,7 +4832,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let stderr = e.legacy_stderr();
+        let stderr = e.slot_stderr();
         let Some(Redirect::Dup { fd, source }) = &stderr else { panic!("got {stderr:?}") };
         assert_eq!(*fd, 2);
         assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
@@ -4832,11 +4845,11 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
         // stdout = Truncate(file)
-        let stdout = e.legacy_stdout();
+        let stdout = e.slot_stdout();
         let Some(Redirect::Truncate(file)) = &stdout else { panic!("got {stdout:?}") };
         assert!(matches!(&file.0[0], WordPart::Literal { text, .. } if text == "file"));
         // stderr = Dup{fd:2, source:"1"}
-        let stderr = e.legacy_stderr();
+        let stderr = e.slot_stderr();
         let Some(Redirect::Dup { fd, source }) = &stderr else { panic!("got {stderr:?}") };
         assert_eq!(*fd, 2);
         assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
@@ -4848,9 +4861,9 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let stdout = e.legacy_stdout();
+        let stdout = e.slot_stdout();
         let Some(Redirect::Append(_)) = &stdout else { panic!("got {stdout:?}") };
-        let stderr = e.legacy_stderr();
+        let stderr = e.slot_stderr();
         let Some(Redirect::Dup { fd, .. }) = &stderr else { panic!() };
         assert_eq!(*fd, 2);
     }
@@ -4862,7 +4875,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let stderr = e.legacy_stderr();
+        let stderr = e.slot_stderr();
         let Some(Redirect::Dup { source, .. }) = &stderr else { panic!() };
         assert!(source.0.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "FD")));
     }
@@ -4874,9 +4887,9 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 2);
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&stage0.legacy_stderr(), Some(Redirect::Dup { .. })));
+        assert!(matches!(&stage0.slot_stderr(), Some(Redirect::Dup { .. })));
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
-        assert!(stage1.legacy_stderr().is_none());
+        assert!(stage1.slot_stderr().is_none());
     }
 
     #[test]
@@ -4885,8 +4898,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.legacy_stdout(), Some(Redirect::Truncate(_))));
-        assert!(matches!(&e.legacy_stderr(), Some(Redirect::Dup { fd: 2, .. })));
+        assert!(matches!(&e.slot_stdout(), Some(Redirect::Truncate(_))));
+        assert!(matches!(&e.slot_stderr(), Some(Redirect::Dup { fd: 2, .. })));
     }
 
     // ── v156: ordered redirect-list parser tests ─────────────────────────────
@@ -5720,7 +5733,7 @@ mod tests {
     }
 
     /// Regression: cross-type low-fd redirects (e.g. `1<file`, `0>file`, `0>&1`)
-    /// must be dropped by legacy_slots rather than placed into the wrong slot
+    /// must be dropped by slots_for_simple_path rather than placed into the wrong slot
     /// (which would cause resolve()'s unreachable!() assertions to fire).
     #[test]
     fn legacy_slots_drops_cross_type_low_fd() {
@@ -5729,7 +5742,7 @@ mod tests {
             fd: RedirFd::Number(1),
             op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
         };
-        let (sin, sout, serr) = legacy_slots(&[r_read_on_fd1]);
+        let (sin, sout, serr) = slots_for_simple_path(&[r_read_on_fd1]);
         assert!(sin.is_none(), "Read on fd1 must not fill stdin");
         assert!(sout.is_none(), "Read on fd1 must not fill stdout");
         assert!(serr.is_none(), "Read on fd1 must not fill stderr");
@@ -5739,7 +5752,7 @@ mod tests {
             fd: RedirFd::Number(0),
             op: RedirOp::File { mode: FileMode::Truncate, target: ww("f") },
         };
-        let (sin, sout, serr) = legacy_slots(&[r_trunc_on_fd0]);
+        let (sin, sout, serr) = slots_for_simple_path(&[r_trunc_on_fd0]);
         assert!(sin.is_none(), "Truncate on fd0 must not fill stdin");
         assert!(sout.is_none(), "Truncate on fd0 must not fill stdout");
         assert!(serr.is_none(), "Truncate on fd0 must not fill stderr");
@@ -5749,7 +5762,7 @@ mod tests {
             fd: RedirFd::Number(0),
             op: RedirOp::Dup { source: ww("1"), output: true },
         };
-        let (sin, sout, serr) = legacy_slots(&[r_dup_out_on_fd0]);
+        let (sin, sout, serr) = slots_for_simple_path(&[r_dup_out_on_fd0]);
         assert!(sin.is_none(), "Dup(output) on fd0 must not fill stdin");
         assert!(sout.is_none(), "Dup(output) on fd0 must not fill stdout");
         assert!(serr.is_none(), "Dup(output) on fd0 must not fill stderr");
@@ -5759,7 +5772,7 @@ mod tests {
             fd: RedirFd::Number(2),
             op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
         };
-        let (sin, sout, serr) = legacy_slots(&[r_read_on_fd2]);
+        let (sin, sout, serr) = slots_for_simple_path(&[r_read_on_fd2]);
         assert!(sin.is_none(), "Read on fd2 must not fill stdin");
         assert!(sout.is_none(), "Read on fd2 must not fill stdout");
         assert!(serr.is_none(), "Read on fd2 must not fill stderr");
@@ -5777,7 +5790,7 @@ mod tests {
             fd: RedirFd::Number(2),
             op: RedirOp::File { mode: FileMode::Truncate, target: ww("h") },
         };
-        let (sin, sout, serr) = legacy_slots(&[r_read_fd0, r_trunc_fd1, r_trunc_fd2]);
+        let (sin, sout, serr) = slots_for_simple_path(&[r_read_fd0, r_trunc_fd1, r_trunc_fd2]);
         assert!(sin.is_some(), "Read on fd0 should fill stdin");
         assert!(sout.is_some(), "Truncate on fd1 should fill stdout");
         assert!(serr.is_some(), "Truncate on fd2 should fill stderr");

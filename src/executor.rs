@@ -896,11 +896,14 @@ fn has_any_redirect(cmd: &ExecCommand) -> bool {
     !cmd.redirects.is_empty()
 }
 
-/// True if any redirection in `redirs` would write to fd 1 (stdout) via an
-/// output File or a Dup — the gate for forcing a `Terminal` inner sink so the
-/// redirect wins over an outer capture. A bare `>&-` (Close) or a stdin-only
-/// redirect does not force Terminal. `RedirFd::Var` (target_fd None) is ignored
-/// here (handled in a later task).
+/// True if any redirection in `redirs` re-targets fd 1 (stdout) — the gate for
+/// forcing a `Terminal` inner sink so the redirect wins over an outer capture.
+/// Any output File, a Dup (`>&N`), OR a Close (`>&-`) on fd 1 qualifies: in all
+/// three cases the command's real fd 1 is redirected (to a file, another fd, or
+/// closed), so an in-process builtin must write through `io::stdout()` (= fd 1 =
+/// the redirect target) rather than into the capture buffer — otherwise `>&-`'s
+/// discard / `>&N`'s dup would be silently ignored by the buffer. A stdin-only
+/// redirect does not force Terminal. `RedirFd::Var` (target_fd None) is ignored.
 fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
     redirs.iter().any(|r| {
         r.target_fd() == Some(1)
@@ -910,33 +913,34 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
                     mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite,
                     ..
                 } | RedirOp::Dup { .. }
+                  | RedirOp::Close
             )
     })
 }
 
-/// Returns the redirections NOT consumed by the legacy 0/1/2 bridge (fd>2,
-/// `<&` dup-in, `N>&-` close, `<>` ReadWrite, and the cross-direction combos
-/// the bridge drops). The bridge consumes:
+/// Returns the redirections NOT consumed by the pipeline-stage 0/1/2 slot
+/// fast-path (`slots_for_simple_path`): fd>2, `<&` dup-in, `N>&-` close, `<>`
+/// ReadWrite, and the cross-direction combos the fast-path drops. The fast-path
+/// consumes:
 ///   fd 0: File{ReadOnly}, Heredoc, HereString
 ///   fd 1/2: File{Truncate|Append|Clobber}, Dup{output:true}
-/// A redirection is "extra" iff it is NOT one the bridge consumes. ALL
-/// bridge-consumed entries are excluded — including earlier same-fd entries that
-/// the bridge itself shadowed (they would be a no-op or, worse, double-applied
-/// by the extra scope, so we drop every bridge-eligible entry regardless of
-/// position).
-/// Used by both the builtin in-process path (via `RedirectScope`) and the
-/// pipeline-external additive path (`build_child_extra_ops`).
-fn builtin_extra_redirects(redirs: &[Redirection]) -> Vec<Redirection> {
+/// A redirection is "extra" iff it is NOT one the fast-path consumes. ALL
+/// fast-path-consumed entries are excluded — including earlier same-fd entries
+/// the fast-path shadowed (they would be a no-op or, worse, double-applied, so we
+/// drop every fast-path-eligible entry regardless of position).
+/// Used ONLY by the pipeline-external additive path (`build_child_extra_ops`);
+/// the single-command builtin/external paths now apply the full ordered list.
+fn stage_extra_redirects(redirs: &[Redirection]) -> Vec<Redirection> {
     redirs
         .iter()
-        .filter(|r| !bridge_consumes(r))
+        .filter(|r| !slot_consumes(r))
         .cloned()
         .collect()
 }
 
-/// True if the legacy 0/1/2 bridge consumes this redirection into a slot (so the
-/// builtin path already applies it and the extra RedirectScope must skip it).
-fn bridge_consumes(r: &Redirection) -> bool {
+/// True if the pipeline-stage 0/1/2 slot fast-path consumes this redirection into
+/// a slot (so the additive extra-op list must skip it to avoid double-applying).
+fn slot_consumes(r: &Redirection) -> bool {
     match r.target_fd() {
         Some(0) => matches!(
             &r.op,
@@ -1034,6 +1038,85 @@ where
         "process-substitution leak: a return path in with_redirect_scope skipped drain_procsubs"
     );
     drop(scope);
+    outcome
+}
+
+/// Runs an in-process builtin (regular or declaration) with ALL of `redirs`
+/// applied in SOURCE ORDER to the real fds via one `RedirectScope`, then
+/// restored on return. Replaces the old additive bridge path (legacy 0/1/2
+/// slots + a disjoint extra scope), so `echo x 2>&1 >file` is now source-ordered
+/// for bare builtins exactly like compounds/functions/externals (L-08 fully
+/// fixed). A redirect-open failure prints its own diagnostic and returns
+/// `Continue(1)` WITHOUT running the builtin (the scope's Drop rolls back any
+/// partially-applied redirects).
+///
+/// Sink handling mirrors `with_redirect_scope`: when any redirect writes to
+/// stdout (fd 1), force a `Terminal` sink so the builtin writes through
+/// `io::stdout()` (= fd 1 = the redirect target) and an outer capture correctly
+/// receives nothing for the diverted stream. Otherwise the enclosing `sink` is
+/// kept, so `r=$(builtin)` still captures the builtin's stdout into the buffer.
+/// (The L-25 residual — capture-mode `$(builtin 2>&1)` cannot fold in-memory
+/// stdout into the captured stream — is preserved: `2>&1` alone does not force
+/// Terminal, so the builtin still writes to the capture buf while fd 2 is duped
+/// to fd 1 at the real-fd level, which the buf does not observe.)
+///
+/// `read`'s stdin (`<`, `<<`, `<<<`) lands on fd 0 via the scope, so the builtin
+/// reads from the redirected descriptor. Heredoc/here-string writer pids spawned
+/// during apply are reaped after the call.
+fn run_builtin_with_redirects(
+    resolved: &ResolvedCommand,
+    redirs: &[Redirection],
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+) -> ExecOutcome {
+    let procsub_base = shell.procsub_pending.len();
+    let _ = io::stdout().flush();
+
+    let mut scope = RedirectScope::new();
+    for r in redirs {
+        if let Err(outcome) = scope.apply(r, shell) {
+            scope.reap_heredoc_writers();
+            drop(scope);
+            drain_procsubs(shell, procsub_base);
+            return outcome;
+        }
+    }
+
+    // When a stdout redirect is present, fd 1 now points at the target; force a
+    // Terminal sink so the builtin writes there (= fd 1 = the target) instead of
+    // into an outer capture buf. A capture sink with NO stdout redirect keeps
+    // writing to the buf so `r=$(builtin)` still captures.
+    let write_to_fd1 = redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal);
+    let run = |out: &mut dyn std::io::Write, shell: &mut Shell| {
+        if let Some(da) = resolved.decl_args.as_deref() {
+            builtins::run_declaration_builtin(&resolved.program, da, out, shell)
+        } else {
+            builtins::run_builtin(&resolved.program, &resolved.args, out, shell)
+        }
+    };
+    let outcome = if write_to_fd1 {
+        let mut out = io::stdout();
+        run(&mut out, shell)
+    } else {
+        match sink {
+            // Unreachable Terminal arm folded into `write_to_fd1` above.
+            StdoutSink::Terminal => unreachable!("Terminal handled by write_to_fd1"),
+            StdoutSink::Capture(buf) => run(*buf, shell),
+        }
+    };
+    let _ = io::stdout().flush();
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    scope.reap_heredoc_writers();
+    // Restore the real fds BEFORE draining redirect-target process substitutions.
+    // For an OUTPUT procsub (`builtin > >(cat)`), the redirect dup'd the procsub's
+    // write end onto fd 1; `drain_procsubs` blocks waiting for the inner consumer
+    // (`cat`), which only sees EOF once that write end is closed — i.e. when the
+    // scope's Drop restores fd 1. (The old bridge path closed the builtin's
+    // stdout `File` before draining for the same reason.) Dropping first is safe
+    // for INPUT procsubs too: their inner producer already wrote and the builtin
+    // has finished reading, so closing fd 0 just lets cleanup reap.
+    drop(scope);
+    drain_procsubs(shell, procsub_base);
     outcome
 }
 
@@ -2011,7 +2094,7 @@ fn run_background_sequence(
         // the read end becomes this stage's stdin and the parent holds no write
         // end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-            match &exec.legacy_stdin() {
+            match &exec.slot_stdin() {
                 Some(Redirect::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
@@ -2096,7 +2179,7 @@ fn run_background_sequence(
         // ---- Stdout redirect (ExecCommand only) ------------------------------
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.legacy_stdout() {
+                match &exec.slot_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -2160,7 +2243,7 @@ fn run_background_sequence(
         // ---- Stderr redirect (ExecCommand only) ------------------------------
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.legacy_stderr() {
+                match &exec.slot_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -2267,7 +2350,7 @@ fn run_background_sequence(
         // spawn_external_with_fds itself.
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.legacy_stdout() {
+                let sdt = match &exec.slot_stdout() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -2284,7 +2367,7 @@ fn run_background_sequence(
                     }
                     _ => None,
                 };
-                let sedt = match &exec.legacy_stderr() {
+                let sedt = match &exec.slot_stderr() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -2456,22 +2539,11 @@ fn group_display_label(first: &Command) -> String {
 
 // ----- resolved command (post-expansion) ------------------------------------
 
-/// Resolved stdin source for a command — either a file path or a heredoc body
-/// Word that will be expanded just before the child is spawned (so that inline
-/// assignments applied between resolve-time and spawn-time are visible).
-enum ResolvedStdin {
-    /// `< file` — path to open for reading.
-    File(String),
-    /// `<< EOF` — body Word to be expanded after inline assignments are applied.
-    /// Storing the Word (rather than pre-expanded bytes) ensures that
-    /// `FOO=hi cat <<EOF\n$FOO\nEOF` sees FOO=hi in the body expansion.
-    Heredoc(crate::lexer::Word),
-    /// `<<< word` — here-string body Word to be expanded just before spawning.
-    /// Expansion uses expand_assignment (no split/glob); a trailing `\n` is
-    /// appended per bash semantics.
-    HereString(crate::lexer::Word),
-}
-
+/// A command after program/argument expansion. v156 task 7: redirections are no
+/// longer pre-resolved into 0/1/2 slots here — every execution path now applies
+/// the ordered `cmd.redirects` list directly (builtins via `RedirectScope`,
+/// externals via `build_child_redir_plan`/`run_subprocess`). So `ResolvedCommand`
+/// carries only the expanded program/args (+ declaration-arg shapes).
 struct ResolvedCommand {
     program: String,
     args: Vec<String>,
@@ -2481,9 +2553,6 @@ struct ResolvedCommand {
     /// assignments through `apply_one_assignment` while still handling
     /// flags and scalar names. `args` is left empty in that case.
     decl_args: Option<Vec<crate::command::DeclArg>>,
-    stdin: Option<ResolvedStdin>,
-    stdout: Option<ResolvedRedirect>,
-    stderr: Option<ResolvedRedirect>,
 }
 
 enum ResolvedRedirect {
@@ -2592,351 +2661,15 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             args.extend(fields);
         }
     }
-    // TEMPORARY bridge: collapse the ordered redirect list to 0/1/2 slots
-    // (v156 task 2) so the existing resolver logic is byte-identical.
-    let (cmd_stdin, cmd_stdout, cmd_stderr) = crate::command::legacy_slots(&cmd.redirects);
-    let stdin = match &cmd_stdin {
-        Some(Redirect::Read(word)) => {
-            let path = expand_single(word, shell).map_err(|()| 1)?;
-            if let Some(status) = shell.pending_fatal_pe_error {
-                return Err(status);
-            }
-            Some(ResolvedStdin::File(path))
-        }
-        Some(Redirect::Heredoc { body, .. }) => {
-            // Store the body Word to be expanded later (after inline
-            // assignments have been applied). This ensures `FOO=hi cat <<EOF`
-            // body expansion sees FOO=hi.
-            Some(ResolvedStdin::Heredoc(body.clone()))
-        }
-        Some(Redirect::HereString(w)) => Some(ResolvedStdin::HereString(w.clone())),
-        Some(Redirect::Truncate(_) | Redirect::Append(_) | Redirect::Clobber(_)) => {
-            unreachable!("parser never produces Truncate/Append/Clobber for stdin")
-        }
-        Some(Redirect::Dup { .. }) => unreachable!(
-            "Redirect::Dup on stdin (<&n) is out of scope for v29"
-        ),
-        None => None,
-    };
-    let stdout = match &cmd_stdout {
-        Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-            let path = expand_single(w, shell).map_err(|()| 1)?;
-            if let Some(status) = shell.pending_fatal_pe_error {
-                return Err(status);
-            }
-            let resolved = if matches!(r, Redirect::Clobber(_)) {
-                ResolvedRedirect::Truncate(path)
-            } else if shell.shell_options.noclobber {
-                ResolvedRedirect::NoclobberTruncate(path)
-            } else {
-                ResolvedRedirect::Truncate(path)
-            };
-            Some(resolved)
-        }
-        Some(Redirect::Append(w)) => {
-            let path = expand_single(w, shell).map_err(|()| 1)?;
-            if let Some(status) = shell.pending_fatal_pe_error {
-                return Err(status);
-            }
-            Some(ResolvedRedirect::Append(path))
-        }
-        Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
-            unreachable!("parser never produces Read/Heredoc/HereString for stdout")
-        }
-        Some(Redirect::Dup { .. }) => {
-            // Dup is handled via dup2 (pre_exec or direct), not by opening a file.
-            // Return None here; callers check exec.stdout for Dup and apply dup2.
-            None
-        }
-        None => None,
-    };
-    let stderr = match &cmd_stderr {
-        Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-            let path = expand_single(w, shell).map_err(|()| 1)?;
-            if let Some(status) = shell.pending_fatal_pe_error {
-                return Err(status);
-            }
-            let resolved = if matches!(r, Redirect::Clobber(_)) {
-                ResolvedRedirect::Truncate(path)
-            } else if shell.shell_options.noclobber {
-                ResolvedRedirect::NoclobberTruncate(path)
-            } else {
-                ResolvedRedirect::Truncate(path)
-            };
-            Some(resolved)
-        }
-        Some(Redirect::Append(w)) => {
-            let path = expand_single(w, shell).map_err(|()| 1)?;
-            if let Some(status) = shell.pending_fatal_pe_error {
-                return Err(status);
-            }
-            Some(ResolvedRedirect::Append(path))
-        }
-        Some(Redirect::Read(_) | Redirect::Heredoc { .. } | Redirect::HereString(_)) => {
-            unreachable!("parser never produces Read/Heredoc/HereString for stderr")
-        }
-        Some(Redirect::Dup { .. }) => {
-            // Dup is handled via dup2 (pre_exec or direct), not by opening a file.
-            // Return None here; callers check exec.stderr for Dup and apply dup2.
-            None
-        }
-        None => None,
-    };
-    Ok(ResolvedCommand { program, args, decl_args, stdin, stdout, stderr })
+    // v156 task 7: redirections are NOT resolved here anymore. The builtin path
+    // (run_builtin_with_redirects) and the single-external path (run_subprocess)
+    // apply `cmd.redirects` in source order at execution time; the pipeline-stage
+    // path reads `exec.legacy_*` directly off the AST. So resolve() only expands
+    // the program + arguments.
+    Ok(ResolvedCommand { program, args, decl_args })
 }
 
 // ----- redirect file handling -----------------------------------------------
-
-/// Resolved stdin for a spawned subprocess — either an open file or a
-/// heredoc body Word whose expansion is deferred until after per-stage inline
-/// assignments are applied, so that `$var` references in the body see the
-/// stage's own inline assignments.
-enum StdinInput {
-    File(File),
-    /// Heredoc body to be expanded just before spawning the child, after
-    /// `apply_inline_assignments` has been called for this stage.
-    DeferredHeredoc(crate::lexer::Word),
-    /// Here-string body to be expanded just before spawning the child.
-    /// Expansion via expand_assignment (no split/glob) + trailing `\n`.
-    DeferredHereString(crate::lexer::Word),
-}
-
-struct StageFiles {
-    stdin: Option<StdinInput>,
-    stdout: Option<File>,
-    stderr: Option<File>,
-}
-
-/// RAII guard that restores STDIN_FILENO from a saved dup'd fd on drop.
-/// Used to apply stdin redirection around an in-process builtin call.
-struct BuiltinStdinGuard {
-    saved_fd: RawFd,
-}
-
-impl Drop for BuiltinStdinGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::dup2(self.saved_fd, libc::STDIN_FILENO);
-            libc::close(self.saved_fd);
-        }
-    }
-}
-
-/// Apply `stdin` to STDIN_FILENO for the duration of an in-process builtin
-/// call. Returns an RAII guard whose Drop restores the original stdin.
-/// Returns Ok(None) when there is no stdin redirection (no save needed).
-///
-/// For `File`: dup2 the file's fd to 0.
-/// For `DeferredHeredoc` / `DeferredHereString`: build a pipe, write the
-/// expanded body to the write end (close it), dup2 the read end to 0. Bodies
-/// are bounded by the pipe buffer (~64K on Linux); larger bodies would block.
-fn prepare_builtin_stdin(
-    stdin: Option<StdinInput>,
-    shell: &mut Shell,
-) -> Result<Option<BuiltinStdinGuard>, ()> {
-    use std::os::unix::io::IntoRawFd;
-    let new_fd: RawFd = match stdin {
-        None => return Ok(None),
-        Some(StdinInput::File(file)) => file.into_raw_fd(),
-        Some(StdinInput::DeferredHeredoc(body)) => {
-            let bytes = expand_assignment(&body, shell).into_bytes();
-            write_pipe_for_stdin(&bytes)?
-        }
-        Some(StdinInput::DeferredHereString(body)) => {
-            let mut bytes = expand_assignment(&body, shell).into_bytes();
-            bytes.push(b'\n');
-            write_pipe_for_stdin(&bytes)?
-        }
-    };
-    unsafe {
-        let saved = libc::dup(libc::STDIN_FILENO);
-        if saved < 0 {
-            let e = io::Error::last_os_error();
-            eprintln!("huck: dup: {e}");
-            libc::close(new_fd);
-            return Err(());
-        }
-        if libc::dup2(new_fd, libc::STDIN_FILENO) < 0 {
-            let e = io::Error::last_os_error();
-            eprintln!("huck: dup2: {e}");
-            libc::close(saved);
-            libc::close(new_fd);
-            return Err(());
-        }
-        libc::close(new_fd);
-        Ok(Some(BuiltinStdinGuard { saved_fd: saved }))
-    }
-}
-
-/// RAII guard that restores STDERR_FILENO from a saved dup'd fd on drop.
-/// Used to apply a `2>`/`2>>`/`2>&1` redirection around an in-process builtin
-/// call so the builtin's `eprintln!` diagnostics honor the redirect. Drop
-/// flushes Rust's stderr buffer first so any buffered text lands on the
-/// redirect target before fd 2 is restored.
-struct BuiltinStderrGuard {
-    saved_fd: RawFd,
-}
-
-impl Drop for BuiltinStderrGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            libc::dup2(self.saved_fd, libc::STDERR_FILENO);
-            libc::close(self.saved_fd);
-        }
-    }
-}
-
-/// Apply a stderr redirection to STDERR_FILENO for the duration of an
-/// in-process builtin call. Returns an RAII guard whose Drop restores the
-/// original stderr. Returns None when there is no stderr redirection.
-///
-/// `stderr` is the opened `2>file`/`2>>file` target (mirrors
-/// `prepare_builtin_stdin`'s `File` handling via `into_raw_fd` + close-after).
-/// `dup_target` is `Some(fd)` for `2>&1` (a `Redirect::Dup{fd:2,source:1}`
-/// resolves to no File): the fd that `2>&1` should follow — the real fd 1 for a
-/// Terminal sink, or a redirected stdout file's fd for `>file 2>&1`. fd 2 is
-/// dup2'd onto a copy of that target, applied AFTER any stdout setup so
-/// `>out 2>&1` / pipeline ordering holds. `None` means no in-process dup.
-fn prepare_builtin_stderr(stderr: Option<File>, dup_target: Option<RawFd>) -> Option<BuiltinStderrGuard> {
-    use std::os::unix::io::IntoRawFd;
-    let new_fd: RawFd = match stderr {
-        Some(file) => file.into_raw_fd(),
-        None => match dup_target {
-            // `2>&1`: duplicate the target fd (the real fd 1, or a redirected
-            // stdout file's fd) so we dup2 a copy onto fd 2 and can close it.
-            Some(target) => {
-                let d = unsafe { libc::dup(target) };
-                if d < 0 {
-                    return None;
-                }
-                d
-            }
-            None => return None,
-        },
-    };
-    unsafe {
-        let saved = libc::dup(libc::STDERR_FILENO);
-        if saved < 0 {
-            let e = io::Error::last_os_error();
-            eprintln!("huck: dup: {e}");
-            libc::close(new_fd);
-            return None;
-        }
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        if libc::dup2(new_fd, libc::STDERR_FILENO) < 0 {
-            let e = io::Error::last_os_error();
-            eprintln!("huck: dup2: {e}");
-            libc::close(saved);
-            libc::close(new_fd);
-            return None;
-        }
-        libc::close(new_fd);
-        Some(BuiltinStderrGuard { saved_fd: saved })
-    }
-}
-
-/// For an in-process builtin whose stdout has a `>&N` (`Redirect::Dup`)
-/// redirect, returns the `File` the builtin should write to:
-///
-///   - not a Dup, or `>&1` (source == 1)  -> `Ok(None)` (use the normal sink)
-///   - `>&-` (source expands to "-")        -> `Ok(Some(/dev/null))` (discard)
-///   - `>&N`, N != 1                         -> `Ok(Some(File))` dup'd from fd N
-///
-/// On a bad fd target, prints `huck: <err>` and returns `Err(())` (status 1),
-/// mirroring the external path's `resolve_fd_target` error handling.
-fn builtin_stdout_dup_file(cmd: &ExecCommand, shell: &mut Shell) -> Result<Option<File>, ()> {
-    let source = match &cmd.legacy_stdout() {
-        Some(Redirect::Dup { source, .. }) => source.clone(),
-        _ => return Ok(None),
-    };
-    let source = &source;
-    let expanded = expand_assignment(source, shell);
-    if expanded == "-" {
-        return match OpenOptions::new().write(true).open("/dev/null") {
-            Ok(f) => Ok(Some(f)),
-            Err(e) => { eprintln!("huck: /dev/null: {e}"); Err(()) }
-        };
-    }
-    let target = match resolve_fd_target(source, shell) {
-        Ok(fd) => fd,
-        Err(e) => { eprintln!("huck: {e}"); return Err(()); }
-    };
-    if target == 1 {
-        return Ok(None);
-    }
-    let dup_fd = unsafe { libc::dup(target) };
-    if dup_fd < 0 {
-        let e = io::Error::last_os_error();
-        eprintln!("huck: {target}: {e}");
-        return Err(());
-    }
-    use std::os::unix::io::FromRawFd;
-    Ok(Some(unsafe { File::from_raw_fd(dup_fd) }))
-}
-
-/// True when `cmd.stderr` is a `2>&1`-style dup whose source resolves to fd 1,
-/// so an in-process builtin's stderr should follow fd 1 for the call's
-/// duration. `2>&N` for other N is left to the subprocess path (rare on
-/// builtins) and treated as no in-process dup.
-fn stderr_dups_to_stdout(cmd: &ExecCommand, shell: &mut Shell) -> bool {
-    match &cmd.legacy_stderr() {
-        Some(Redirect::Dup { source, .. }) => matches!(resolve_fd_target(source, shell), Ok(1)),
-        _ => false,
-    }
-}
-
-/// Create a pipe, write `bytes` to the write end, close it, return the
-/// read end's raw fd. Used to feed a heredoc/here-string body to an
-/// in-process builtin's stdin.
-/// Blocking-write variant: writes the body into a pipe before returning the read
-/// end. Safe ONLY where the consumer drains synchronously without backpressure
-/// (the in-process builtin stdin path). For compound/pipeline/captured consumers
-/// that can backpressure, use `spawn_heredoc_writer` (a body > the pipe buffer
-/// would otherwise deadlock — M-120). Task-2 sites still call this; v134 converts
-/// the deadlock-prone ones.
-fn write_pipe_for_stdin(bytes: &[u8]) -> Result<RawFd, ()> {
-    let mut fds: [libc::c_int; 2] = [-1, -1];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if rc != 0 {
-        let e = io::Error::last_os_error();
-        eprintln!("huck: pipe: {e}");
-        return Err(());
-    }
-    let r = fds[0];
-    let w = fds[1];
-    // Write may not complete if bytes exceed pipe buffer; for heredoc/
-    // here-string bodies in v55 read tests this is well under 64K. A
-    // future enhancement could fork a writer if needed.
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let n = unsafe {
-            libc::write(
-                w,
-                bytes[written..].as_ptr() as *const libc::c_void,
-                bytes.len() - written,
-            )
-        };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            // Retry on EINTR — a signal (e.g., SIGCHLD from a
-            // background job completing) during the write must not
-            // surface as "Interrupted system call".
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            eprintln!("huck: write: {e}");
-            unsafe {
-                libc::close(r);
-                libc::close(w);
-            }
-            return Err(());
-        }
-        written += n as usize;
-    }
-    unsafe { libc::close(w) };
-    Ok(r)
-}
 
 /// Feed `bytes` (an expanded heredoc/herestring body) to a child's stdin WITHOUT
 /// the parent ever blocking on a full pipe. Forks a writer process that owns the
@@ -2988,51 +2721,6 @@ fn spawn_heredoc_writer(bytes: &[u8]) -> Result<(RawFd, libc::pid_t), io::Error>
     }
     unsafe { libc::close(w); }
     Ok((r, pid))
-}
-
-fn open_stage_files(cmd: &ResolvedCommand, _shell: &mut Shell) -> Result<StageFiles, ()> {
-    let stdin = match &cmd.stdin {
-        Some(ResolvedStdin::File(path)) => match File::open(path) {
-            Ok(file) => Some(StdinInput::File(file)),
-            Err(e) => {
-                eprintln!("huck: {path}: {e}");
-                return Err(());
-            }
-        },
-        Some(ResolvedStdin::Heredoc(body)) => {
-            // Defer body expansion: store the Word so the caller can expand it
-            // after applying per-stage inline assignments. Callers that have
-            // already applied inline assignments before calling open_stage_files
-            // (run_exec_single, run_background_sequence) will see a
-            // DeferredHeredoc and must expand it before spawning the child.
-            Some(StdinInput::DeferredHeredoc(body.clone()))
-        }
-        Some(ResolvedStdin::HereString(body)) => {
-            Some(StdinInput::DeferredHereString(body.clone()))
-        }
-        None => None,
-    };
-    let stdout = match &cmd.stdout {
-        Some(redirect) => match open_resolved(redirect) {
-            Ok(file) => Some(file),
-            Err(e) => {
-                eprintln!("huck: {}: {e}", resolved_path(redirect));
-                return Err(());
-            }
-        },
-        None => None,
-    };
-    let stderr = match &cmd.stderr {
-        Some(redirect) => match open_resolved(redirect) {
-            Ok(file) => Some(file),
-            Err(e) => {
-                eprintln!("huck: {}: {e}", resolved_path(redirect));
-                return Err(());
-            }
-        },
-        None => None,
-    };
-    Ok(StageFiles { stdin, stdout, stderr })
 }
 
 fn open_resolved(redirect: &ResolvedRedirect) -> io::Result<File> {
@@ -3649,90 +3337,12 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // 3. Regular builtin.
     // 4. PATH-exec.
     let outcome = if is_control_builtin(&resolved.program) {
-        // v156: the 0/1/2 bridge (open_stage_files + the dup helpers below) keeps
-        // the historical builtin redirect semantics. Additionally apply the
-        // redirections the bridge does NOT cover — fd>2, `<&` dup-in, `N>&-`
-        // close, `<>` ReadWrite — via a RedirectScope around the call so
-        // `echo x >&3`, `3>&1`, etc. work in-process. No double-application: the
-        // extra set is disjoint from the bridge's (see builtin_extra_redirects).
-        // NOTE (interim, additive builtin path): the extra redirects (fd>2 / dup-in /
-        // close / <>) are applied to the real fds BEFORE the legacy bridge opens the
-        // fd-0/1/2 files (open_stage_files), so SOURCE ORDER between a bridge fd and an
-        // extra fd is not preserved — e.g. `>file 3>&1` makes fd 3 dup the PRE-redirect
-        // fd 1 rather than the file. Unobservable for typical builtins (they don't use
-        // fd>2); fully resolved when the bridge is deleted in Task 7 (everything then
-        // flows through one ordered RedirectScope).
-        let mut extra_scope = RedirectScope::new();
-        let extra = builtin_extra_redirects(&cmd.redirects);
-        for r in &extra {
-            if let Err(_e) = extra_scope.apply(r, shell) {
-                extra_scope.reap_heredoc_writers();
-                drop(extra_scope);
-                drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
-            }
-        }
-        let mut files = match open_stage_files(&resolved, shell) {
-            Ok(f) => f,
-            Err(()) => {
-                // Control builtins always persist their inline assignments (POSIX
-                // special-builtin semantics); no restore needed on the redirect-open
-                // failure path.
-                extra_scope.reap_heredoc_writers();
-                drop(extra_scope);
-                drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
-            }
-        };
-        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
-        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
-        // to the 2>&1-on-builtin handling below).
-        if files.stdout.is_none() {
-            match builtin_stdout_dup_file(cmd, shell) {
-                Ok(f) => files.stdout = f,
-                Err(()) => {
-                    extra_scope.reap_heredoc_writers();
-                    drop(extra_scope);
-                    drain_procsubs(shell, procsub_base);
-                    return ExecOutcome::Continue(1);
-                }
-            }
-        }
-        // `2>&1` on a builtin: follow wherever the builtin's stdout actually
-        // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
-        // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
-        // sink, dup the real fd 1; a Capture sink has no fd (L-25 residual).
-        let dup_target: Option<RawFd> = if files.stderr.is_none() && stderr_dups_to_stdout(cmd, shell) {
-            if let Some(file) = files.stdout.as_ref() {
-                use std::os::unix::io::AsRawFd;
-                Some(file.as_raw_fd())
-            } else if matches!(sink, StdoutSink::Terminal) {
-                Some(libc::STDOUT_FILENO)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_target);
-        let outcome = match files.stdout {
-            Some(mut file) => {
-                builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
-            }
-            None => match sink {
-                StdoutSink::Terminal => {
-                    let mut out = io::stdout();
-                    builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
-                }
-                StdoutSink::Capture(buf) => {
-                    builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
-                }
-            },
-        };
-        drop(stderr_guard);
-        extra_scope.reap_heredoc_writers();
-        drop(extra_scope);
-        outcome
+        // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
+        // run_builtin_with_redirects), so `break 2>&1 >file` etc. are source-ordered
+        // exactly like compounds/externals. Control builtins persist their inline
+        // assignments (POSIX special-builtin), so no restore on the redirect-open
+        // failure path inside the helper.
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink)
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
         let name = resolved.program.clone();
         let args = resolved.args;
@@ -3764,118 +3374,13 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             builtins::source_in_sink(&args, shell, sink)
         }
     } else if builtins::is_builtin(&resolved.program) {
-        // v156: keep the 0/1/2 bridge, additionally applying the redirections it
-        // does NOT cover (fd>2, `<&` dup-in, `N>&-` close, `<>`) via a
-        // RedirectScope so `echo x >&3` etc. work in-process. The extra set is
-        // disjoint from the bridge's slots, so no double-application.
-        // NOTE (interim, additive builtin path): the extra redirects (fd>2 / dup-in /
-        // close / <>) are applied to the real fds BEFORE the legacy bridge opens the
-        // fd-0/1/2 files (open_stage_files), so SOURCE ORDER between a bridge fd and an
-        // extra fd is not preserved — e.g. `>file 3>&1` makes fd 3 dup the PRE-redirect
-        // fd 1 rather than the file. Unobservable for typical builtins (they don't use
-        // fd>2); fully resolved when the bridge is deleted in Task 7 (everything then
-        // flows through one ordered RedirectScope).
-        let mut extra_scope = RedirectScope::new();
-        let extra = builtin_extra_redirects(&cmd.redirects);
-        for r in &extra {
-            if extra_scope.apply(r, shell).is_err() {
-                extra_scope.reap_heredoc_writers();
-                drop(extra_scope);
-                if !persistent { restore_inline_assignments(snap, shell); }
-                drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
-            }
-        }
-        let mut files = match open_stage_files(&resolved, shell) {
-            Ok(f) => f,
-            Err(()) => {
-                extra_scope.reap_heredoc_writers();
-                drop(extra_scope);
-                if !persistent {
-                    restore_inline_assignments(snap, shell);
-                }
-                drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
-            }
-        };
-        // `>&N` on a builtin's stdout: open_stage_files leaves files.stdout
-        // None for a Dup; resolve it so the builtin writes to fd N (symmetric
-        // to the 2>&1-on-builtin handling below).
-        if files.stdout.is_none() {
-            match builtin_stdout_dup_file(cmd, shell) {
-                Ok(f) => files.stdout = f,
-                Err(()) => {
-                    extra_scope.reap_heredoc_writers();
-                    drop(extra_scope);
-                    if !persistent { restore_inline_assignments(snap, shell); }
-                    drain_procsubs(shell, procsub_base);
-                    return ExecOutcome::Continue(1);
-                }
-            }
-        }
-        // Apply stdin redirection in-process for builtins: builtins that read
-        // from stdin (e.g. `read`) need `<<<`, `<<`, and `<file` to actually
-        // affect the fd they read from. Save+dup2 around the call.
-        let stdin_guard = match prepare_builtin_stdin(files.stdin, shell) {
-            Ok(g) => g,
-            Err(()) => {
-                extra_scope.reap_heredoc_writers();
-                drop(extra_scope);
-                if !persistent {
-                    restore_inline_assignments(snap, shell);
-                }
-                drain_procsubs(shell, procsub_base);
-                return ExecOutcome::Continue(1);
-            }
-        };
-        // `2>&1` on a builtin: follow wherever the builtin's stdout actually
-        // goes. With `>file` stdout the builtin writes to a Rust File (not fd 1),
-        // so dup the FILE's fd onto fd 2; with a bare `2>&1` under a Terminal
-        // sink, dup the real fd 1; a Capture sink has no fd (L-25 residual).
-        let dup_target: Option<RawFd> = if files.stderr.is_none() && stderr_dups_to_stdout(cmd, shell) {
-            if let Some(file) = files.stdout.as_ref() {
-                use std::os::unix::io::AsRawFd;
-                Some(file.as_raw_fd())
-            } else if matches!(sink, StdoutSink::Terminal) {
-                Some(libc::STDOUT_FILENO)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let stderr_guard = prepare_builtin_stderr(files.stderr.take(), dup_target);
-        let outcome = match files.stdout {
-            Some(mut file) => {
-                if let Some(da) = resolved.decl_args.as_deref() {
-                    builtins::run_declaration_builtin(&resolved.program, da, &mut file, shell)
-                } else {
-                    builtins::run_builtin(&resolved.program, &resolved.args, &mut file, shell)
-                }
-            }
-            None => match sink {
-                StdoutSink::Terminal => {
-                    let mut out = io::stdout();
-                    if let Some(da) = resolved.decl_args.as_deref() {
-                        builtins::run_declaration_builtin(&resolved.program, da, &mut out, shell)
-                    } else {
-                        builtins::run_builtin(&resolved.program, &resolved.args, &mut out, shell)
-                    }
-                }
-                StdoutSink::Capture(buf) => {
-                    if let Some(da) = resolved.decl_args.as_deref() {
-                        builtins::run_declaration_builtin(&resolved.program, da, *buf, shell)
-                    } else {
-                        builtins::run_builtin(&resolved.program, &resolved.args, *buf, shell)
-                    }
-                }
-            },
-        };
-        drop(stderr_guard);
-        drop(stdin_guard);
-        extra_scope.reap_heredoc_writers();
-        drop(extra_scope);
-        outcome
+        // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
+        // run_builtin_with_redirects) applied to the real fds in source order, so
+        // `echo x 2>&1 >file`, `>file 3>&1`, `read < file`, `cmd <<<here` etc. all
+        // honor source order and fd>2 uniformly — no more last-wins bridge. On a
+        // redirect-open failure the helper rolls back and returns Continue(1); we
+        // still owe the inline-assignment restore for temporary-scope targets.
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink)
     } else {
         // v156 task 4: lower the FULL ordered redirect list (on the original
         // ExecCommand, not the bridged ResolvedCommand) into a child replay plan.
@@ -4443,23 +3948,25 @@ fn build_child_redir_plan(
 }
 
 /// Additive (pipeline-stage) variant of `build_child_redir_plan`: lowers ONLY
-/// the redirects the legacy 0/1/2 bridge does NOT consume (fd>2 File/Dup/Close,
+/// the redirects the 0/1/2 slot fast-path does NOT consume (fd>2 File/Dup/Close,
 /// `<&` dup-in, `N>&-` close, `<>` ReadWrite) into a replay list, opening files
-/// in the PARENT. The bridge-consumed 0/1/2 file/dup ops are applied by the
+/// in the PARENT. The fast-path-consumed 0/1/2 file/dup ops are applied by the
 /// caller's existing pipe/stdio mechanism BEFORE this replay; the extra ops then
-/// add the higher / cross-direction fds on top. Source ordering between a
-/// bridge-consumed 0/1/2 op and an extra op is NOT preserved (same additive
-/// limitation as the in-process builtin path). Heredoc/here-string on an fd>2 of
-/// a *pipeline-stage* external is the one case not handled here (it would need a
-/// reaped writer threaded through the pipeline wait point) — the legacy bridge
-/// already dropped it, so this is not a regression; the common single-command
-/// path covers it via `build_child_redir_plan` / `run_subprocess`.
+/// add the higher / cross-direction fds on top.
+///
+/// RESIDUAL LIMITATION (v156 task 7): this is the ONLY path still on the slot
+/// fast-path. Source ordering between a 0/1/2 op and an extra op is NOT preserved
+/// for pipeline stages (`cmd 2>&1 >file | …` is last-wins, unlike a single
+/// command), and a heredoc/here-string on an fd>2 of a *pipeline-stage* external
+/// is dropped (it would need a reaped writer threaded through the pipeline wait
+/// point). The single-command builtin/external paths do NOT use this — they apply
+/// the full ordered `cmd.redirects` (so L-08 + fd>2 heredoc are fixed there).
 fn build_child_extra_ops(
     redirects: &[Redirection],
     shell: &mut Shell,
 ) -> Result<(Vec<ChildRedirOp>, Vec<std::os::fd::OwnedFd>), i32> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-    let extra = builtin_extra_redirects(redirects);
+    let extra = stage_extra_redirects(redirects);
     let mut ops: Vec<ChildRedirOp> = Vec::new();
     let mut held: Vec<OwnedFd> = Vec::new();
     for redir in &extra {
@@ -4895,7 +4402,7 @@ fn run_multi_stage(
         // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
         // becomes this stage's stdin. The parent never holds the pipe write end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-            match &exec.legacy_stdin() {
+            match &exec.slot_stdin() {
                 Some(Redirect::Read(word)) => {
                     // Discard the previous stage's pipe read-end: this stage
                     // overrides stdin, so that pipe would otherwise be leaked
@@ -4998,7 +4505,7 @@ fn run_multi_stage(
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.legacy_stdout() {
+                match &exec.slot_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -5058,7 +4565,7 @@ fn run_multi_stage(
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.legacy_stderr() {
+                match &exec.slot_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -5187,7 +4694,7 @@ fn run_multi_stage(
         // spawn_external_with_fds itself.
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.legacy_stdout() {
+                let sdt = match &exec.slot_stdout() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -5207,7 +4714,7 @@ fn run_multi_stage(
                     }
                     _ => None,
                 };
-                let sedt = match &exec.legacy_stderr() {
+                let sedt = match &exec.slot_stderr() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -6136,11 +5643,11 @@ fn spawn_external_with_fds(
 
     // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
     // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
-    let stdout_dup_target: Option<i32> = match &exec.legacy_stdout() {
+    let stdout_dup_target: Option<i32> = match &exec.slot_stdout() {
         Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };
-    let stderr_dup_target: Option<i32> = match &exec.legacy_stderr() {
+    let stderr_dup_target: Option<i32> = match &exec.slot_stderr() {
         Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };

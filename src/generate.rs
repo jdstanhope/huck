@@ -61,9 +61,10 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             format!("{name} ()\n{}", command_to_source(body, indent))
         }
         Command::Redirected { inner, redirects } => {
-            // TEMPORARY bridge to 0/1/2 slots (v156 task 2). Source regeneration
-            // of fd>2 / `<&` / `{var}` redirects is a later-task concern.
-            let (stdin, stdout, stderr) = crate::command::legacy_slots(redirects);
+            // Source regeneration uses the 0/1/2 slot fast-path (v156).
+            // Regeneration of fd>2 / `<&` / `{var}` redirects is best-effort
+            // (slot-collapsed).
+            let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
             let mut s = command_to_source(inner, indent);
             if let Some(r) = &stdin {
                 s.push(' ');
@@ -349,8 +350,8 @@ fn exec_to_source(e: &ExecCommand) -> String {
         parts.push(word_to_source(w));
     }
     let mut s = parts.join(" ");
-    // TEMPORARY bridge to 0/1/2 slots (v156 task 2).
-    let (stdin, stdout, stderr) = crate::command::legacy_slots(&e.redirects);
+    // 0/1/2 slot fast-path for source regeneration (v156, best-effort).
+    let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(&e.redirects);
     if let Some(r) = &stdin {
         s.push(' ');
         s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
