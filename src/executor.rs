@@ -358,6 +358,14 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
 
 /// Dispatches a single sequence element.
 fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    // `set -n` / `-n` (noexec): read and parse but do not execute. Per-command
+    // and non-interactive only (bash ignores -n interactively). Parsing already
+    // happened (the reader caught any syntax error) — we simply skip running.
+    // Once on, this also skips a later `set +n`, so noexec cannot be turned back
+    // off mid-script — matching bash.
+    if shell.shell_options.noexec && !shell.is_interactive {
+        return ExecOutcome::Continue(0);
+    }
     match cmd {
         Command::Pipeline(p) => run_pipeline(p, shell, sink),
         Command::Simple(s) => run_single(s, shell, sink),

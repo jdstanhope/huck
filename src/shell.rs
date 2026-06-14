@@ -49,6 +49,9 @@ enum RunMode {
 struct CliOptions {
     rcfile_path: Option<PathBuf>,
     norc: bool,
+    /// `-n`: read and parse commands without executing them (noexec / syntax
+    /// check). Applied to `shell_options.noexec`; honored only non-interactively.
+    noexec: bool,
     mode: RunMode,
 }
 
@@ -57,6 +60,7 @@ impl Default for CliOptions {
         CliOptions {
             rcfile_path: None,
             norc: false,
+            noexec: false,
             mode: RunMode::Interactive,
         }
     }
@@ -65,6 +69,7 @@ impl Default for CliOptions {
 fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut rcfile_path: Option<PathBuf> = None;
     let mut norc = false;
+    let mut noexec = false;
     let mut command: Option<String> = None;
     let mut i = 0;
 
@@ -73,6 +78,10 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         match args[i].as_str() {
             "--norc" => {
                 norc = true;
+                i += 1;
+            }
+            "-n" => {
+                noexec = true;
                 i += 1;
             }
             "--rcfile" => {
@@ -123,7 +132,7 @@ fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         RunMode::Interactive
     };
 
-    Ok(CliOptions { rcfile_path, norc, mode })
+    Ok(CliOptions { rcfile_path, norc, noexec, mode })
 }
 
 fn default_rc_path(shell: &Shell) -> Option<std::path::PathBuf> {
@@ -262,6 +271,11 @@ pub fn run(args: &[String]) -> i32 {
         install_sigint_handler(Arc::clone(&shell.sigint_flag));
         install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
     }
+
+    // `-n`: parse-only (noexec). Honored only in non-interactive modes; the
+    // run_command guard checks `is_interactive`, and `is_interactive` is set
+    // false for Command/File modes (an interactive REPL keeps executing).
+    shell_cell.borrow_mut().shell_options.noexec = opts.noexec;
 
     // Non-interactive program modes bypass the REPL entirely.
     match opts.mode {
@@ -884,6 +898,25 @@ mod rc_tests {
     }
 
     #[test]
+    fn parse_cli_noexec_flag() {
+        // `-n` alone (no script) → noexec set, Interactive mode.
+        let o = parse_cli(&["-n".to_string()]).unwrap();
+        assert!(o.noexec);
+        assert_eq!(o.mode, RunMode::Interactive);
+        // `-n script.sh args` → noexec + File mode.
+        let o = parse_cli(&["-n".to_string(), "s.sh".to_string(), "a".to_string()]).unwrap();
+        assert!(o.noexec);
+        assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec!["a".into()] });
+        // `-n -c 'echo'` → noexec + Command mode.
+        let o = parse_cli(&["-n".to_string(), "-c".to_string(), "echo hi".to_string()]).unwrap();
+        assert!(o.noexec);
+        assert_eq!(o.mode, RunMode::Command { command: "echo hi".into(), argv0: None, args: vec![] });
+        // default: no -n → noexec false.
+        let o = parse_cli(&["-c".to_string(), "echo".to_string()]).unwrap();
+        assert!(!o.noexec);
+    }
+
+    #[test]
     fn parse_cli_rcfile_separate() {
         let opts = parse_cli(&[
             "--rcfile".to_string(),
@@ -1004,6 +1037,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: true,
+            noexec: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -1019,6 +1053,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            noexec: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -1034,6 +1069,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            noexec: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -1053,6 +1089,7 @@ mod rc_tests {
                 "/no/such/file/huck_rc_does_not_exist",
             )),
             norc: false,
+            noexec: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
@@ -1066,6 +1103,7 @@ mod rc_tests {
         let opts = CliOptions {
             rcfile_path: Some(p.clone()),
             norc: false,
+            noexec: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
