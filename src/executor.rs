@@ -314,17 +314,6 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
     // backgrounded group reports the launch status 0.
     let mut last_status = ExecOutcome::Continue(0);
     for group in &groups {
-        // Between statements at the top level of a non-interactive shell
-        // (script / `-c`), drain any finished background children so coprocs
-        // (and other bg jobs) get auto-unset/cleaned up like bash does — the
-        // interactive REPL already does this via `reap_and_notify`, but
-        // non-interactive runs never reach that loop. Use `reap_completed`
-        // (NOT `reap_and_notify`) so no job notices are printed. Gated to the
-        // non-interactive top level only (`!is_interactive && !in_subshell`)
-        // to keep the blast radius off nested/subshell execution.
-        if !shell.is_interactive && !shell.in_subshell {
-            crate::jobs::reap_completed(shell);
-        }
         if group.backgrounded {
             // Background the group: wrap its commands into a synthetic
             // foreground `Sequence`, then a `Subshell`, and reuse the existing
