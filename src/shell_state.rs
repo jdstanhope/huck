@@ -246,7 +246,6 @@ impl ShoptOptions {
     }
 }
 
-/// Per-session shell state: variables (each either exported or not) and the
 /// A live coprocess started by `coproc`. The shell holds the two pipe ends
 /// (relocated to high fds, close-on-exec): `read_fd` = NAME[0] (read the
 /// coproc's stdout), `write_fd` = NAME[1] (write the coproc's stdin).
@@ -259,6 +258,7 @@ pub struct Coproc {
     pub write_fd: std::os::unix::io::RawFd,
 }
 
+/// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
 /// the process environment huck inherited at startup, every one marked
 /// exported.

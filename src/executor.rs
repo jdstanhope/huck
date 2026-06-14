@@ -4220,7 +4220,6 @@ enum PipelineStage {
     Forked(i32),
 }
 
-/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds.
 /// Start a coprocess: fork the body with stdin/stdout wired to two pipes, hold
 /// the shell-side ends (relocated high + close-on-exec) as NAME[0] (read) /
 /// NAME[1] (write), publish NAME_PID, $!, and a job. Returns 0 on a successful
@@ -4337,6 +4336,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     ExecOutcome::Continue(0)
 }
 
+/// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds.
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
