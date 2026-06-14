@@ -21,6 +21,7 @@ enum Keyword {
     DoubleBracketClose,  // ]]
     Function,
     Select,
+    Coproc,
 }
 
 impl Keyword {
@@ -45,6 +46,7 @@ impl Keyword {
             Keyword::DoubleBracketClose => "]]",
             Keyword::Function => "function",
             Keyword::Select => "select",
+            Keyword::Coproc => "coproc",
         }
     }
 }
@@ -80,6 +82,7 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
         "]]" => Some(Keyword::DoubleBracketClose),
         "function" => Some(Keyword::Function),
         "select" => Some(Keyword::Select),
+        "coproc" => Some(Keyword::Coproc),
         _ => None,
     }
 }
@@ -618,6 +621,11 @@ pub enum Command {
         /// ordered `with_redirect_scope` applier (source order preserved).
         redirects: Vec<Redirection>,
     },
+    /// `coproc [NAME] command` (v157). `name` is "COPROC" when anonymous. The
+    /// body runs asynchronously with its stdin/stdout wired to two pipes the
+    /// shell holds as NAME[0] (read) / NAME[1] (write).
+    #[allow(dead_code)] // constructed by the parser in task 2
+    Coproc { name: String, body: Box<Command> },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -2737,6 +2745,7 @@ mod tests {
             Command::ArithFor(_) => panic!("expected a pipeline, got an arith for"),
             Command::Select(_) => panic!("expected a pipeline, got a select"),
             Command::Redirected { .. } => panic!("expected a pipeline, got a redirected compound"),
+            Command::Coproc { .. } => panic!("expected a pipeline, got a coproc"),
         }
     }
 
@@ -3362,6 +3371,7 @@ mod tests {
             Command::ArithFor(_) => panic!("expected an if, got an arith for"),
             Command::Select(_) => panic!("expected an if, got a select"),
             Command::Redirected { .. } => panic!("expected an if, got a redirected compound"),
+            Command::Coproc { .. } => panic!("expected an if, got a coproc"),
         }
     }
 

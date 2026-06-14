@@ -516,6 +516,10 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Redirected { inner, redirects } => {
             run_redirected(inner, redirects, shell, sink)
         }
+        Command::Coproc { .. } => {
+            eprintln!("huck: coproc: not yet implemented");
+            ExecOutcome::Continue(1)
+        }
     }
 }
 
