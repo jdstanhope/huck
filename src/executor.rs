@@ -3407,7 +3407,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     if !persistent {
         restore_inline_assignments(snap, shell);
     }
-    drain_procsubs(shell, procsub_base);
+    // A STOPPED command (Ctrl-Z) leaves its process substitutions alive — drain
+    // them non-blocking (a blocking waitpid on a live procsub child whose
+    // consumer is also stopped would deadlock the shell). Both variants pop the
+    // pending entries, so the leak debug_assert below holds either way.
+    if std::mem::take(&mut shell.fg_stopped) {
+        drain_procsubs_nonblocking(shell, procsub_base);
+    } else {
+        drain_procsubs(shell, procsub_base);
+    }
     debug_assert_eq!(
         shell.procsub_pending.len(), procsub_base,
         "process-substitution leak: a return path in run_exec_single skipped drain_procsubs"
@@ -4132,6 +4140,10 @@ fn run_subprocess(
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
                         eprintln!("\n{line}");
+                        // The command was STOPPED: its process substitutions are
+                        // still alive (tied to the stopped job), so the drain in
+                        // run_exec_single's epilogue must be non-blocking.
+                        shell.fg_stopped = true;
                         std::mem::forget(child);
                         give_terminal_to(shell.shell_pgid);
                         ExecOutcome::Continue(128 + sig)
@@ -5018,7 +5030,11 @@ fn run_multi_stage(
             // for a stopped (Ctrl-Z) pipeline. (The capture fd, if any, was
             // already drained and taken above — capture sink => non-interactive,
             // so this stopped path never carries a live capture fd.)
-            drain_procsubs(shell, procsub_base);
+            // NON-blocking drain: the pipeline's process substitutions (e.g.
+            // `find | tee >(awk)`) are still alive, tied to the now-stopped job.
+            // A blocking `waitpid` on a procsub child whose consumer (`tee`) is
+            // also stopped would deadlock the shell (no prompt back after Ctrl-Z).
+            drain_procsubs_nonblocking(shell, procsub_base);
             return ExecOutcome::Continue(128 + sig);
         }
     }
