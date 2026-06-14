@@ -1846,18 +1846,38 @@ fn build_redirections(
             fd: plain_fd(),
             op: RedirOp::HereString(target),
         }],
-        Operator::DupOut => vec![Redirection {
-            fd: plain_fd(),
-            op: dup_op(target, true),
-        }],
-        Operator::DupErr => vec![Redirection {
-            fd: err_fd(),
-            op: dup_op(target, true),
-        }],
-        Operator::DupIn => vec![Redirection {
-            fd: plain_fd(),
-            op: dup_op(target, false),
-        }],
+        Operator::DupOut => {
+            let op = dup_op(target, true);
+            // When the source is `-` (Close), use fd 1 as the directional
+            // default (output dup targets stdout). `plain_fd()` would fall
+            // back to `Default` which resolves to 0 — the wrong fd.
+            let fd = if matches!(op, RedirOp::Close) {
+                fd_prefix.clone().unwrap_or(RedirFd::Number(1))
+            } else {
+                plain_fd()
+            };
+            vec![Redirection { fd, op }]
+        }
+        Operator::DupErr => {
+            let op = dup_op(target, true);
+            // DupErr already uses err_fd() which defaults to Number(2) —
+            // correct for both Dup and Close.
+            vec![Redirection { fd: err_fd(), op }]
+        }
+        Operator::DupIn => {
+            let op = dup_op(target, false);
+            // When the source is `-` (Close), use fd 0 as the directional
+            // default (input dup targets stdin). `plain_fd()` would fall
+            // back to `Default` which also resolves to 0, so this is
+            // technically a no-op for DupIn — but we make it explicit for
+            // symmetry and to avoid relying on the Default->0 fallback.
+            let fd = if matches!(op, RedirOp::Close) {
+                fd_prefix.clone().unwrap_or(RedirFd::Number(0))
+            } else {
+                plain_fd()
+            };
+            vec![Redirection { fd, op }]
+        }
         Operator::AndRedirOut => vec![
             Redirection {
                 fd: plain_fd(),
@@ -4950,13 +4970,30 @@ mod tests {
             Redirection { fd: RedirFd::Default, op: RedirOp::Dup { output: false, .. } }
         ), "got {:?}", redirs[0]);
 
-        // `cmd <&-` → Default fd, Close.
+        // `cmd <&-` → Number(0) + Close (input direction, default stdin fd).
         let redirs = redirs_of("cmd <&-");
         assert_eq!(redirs.len(), 1);
         assert!(matches!(
             &redirs[0],
-            Redirection { fd: RedirFd::Default, op: RedirOp::Close }
+            Redirection { fd: RedirFd::Number(0), op: RedirOp::Close }
         ), "got {:?}", redirs[0]);
+    }
+
+    #[test]
+    fn parser_close_default_fd_follows_direction() {
+        use crate::command::{RedirFd, RedirOp};
+        // `>&-` → output direction, no prefix → close fd 1
+        assert!(matches!(&redirs_of("cmd >&-")[0],  Redirection { fd: RedirFd::Number(1), op: RedirOp::Close }));
+        // `1>&-` → explicit prefix 1 → close fd 1
+        assert!(matches!(&redirs_of("cmd 1>&-")[0], Redirection { fd: RedirFd::Number(1), op: RedirOp::Close }));
+        // `<&-` → input direction, no prefix → close fd 0
+        assert!(matches!(&redirs_of("cmd <&-")[0],  Redirection { fd: RedirFd::Number(0), op: RedirOp::Close }));
+        // `0<&-` → explicit prefix 0 → close fd 0
+        assert!(matches!(&redirs_of("cmd 0<&-")[0], Redirection { fd: RedirFd::Number(0), op: RedirOp::Close }));
+        // `2>&-` → error direction, no prefix → close fd 2
+        assert!(matches!(&redirs_of("cmd 2>&-")[0], Redirection { fd: RedirFd::Number(2), op: RedirOp::Close }));
+        // `3>&-` → explicit prefix 3 → close fd 3
+        assert!(matches!(&redirs_of("cmd 3>&-")[0], Redirection { fd: RedirFd::Number(3), op: RedirOp::Close }));
     }
 
     // ──────────────────────────────────────────────────────────────
