@@ -89,10 +89,14 @@ last-wins (each `dup2` overwrites); interleaved dups now order correctly (L-08).
   `std::process::Command` 0/1/2 stdio setters give way to the uniform ordered application.
 
 ### `{varname}` allocation
-`{fd}>file`: open → if the resulting fd is <10, `fcntl(F_DUPFD_CLOEXEC, 10)` to a high fd, close
-the low one; assign `$fd` = the high number in the shell (persists after the command, bash-style).
-For a normal command the fd is open only during it (closed after — `$fd` keeps the now-closed
-number); under `exec` it is permanent. `{fd}>&-` reads `$fd` and closes that fd.
+`{fd}>file`: open → `fcntl(F_DUPFD, 10)` to a high fd (≥10, NON-cloexec so a child inherits it);
+assign `$fd` = the high number. **Lifetime (corrected vs an earlier draft):** for an IN-PROCESS
+command (compound / builtin / function) bash leaves the allocated fd OPEN in the shell after the
+command — it is only closed by an explicit `{fd}>&-` (or `exec {fd}>&-`) or at shell exit (a
+deliberate bash fd-"leak"); `$fd` holds the live number. For an EXTERNAL command bash does NOT
+set the parent's `$fd` at all (the redirect + assignment happen in the forked child); the parent
+allocates+inherits the fd into the child and closes its own copy after. `{fd}>&-` reads `$fd` and
+closes that fd.
 
 ### `exec` integration
 Rewrite v155's `apply_redirects_permanently` to consume the ordered list — arbitrary fds,

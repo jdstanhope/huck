@@ -60,22 +60,21 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
         Command::FunctionDef { name, body } => {
             format!("{name} ()\n{}", command_to_source(body, indent))
         }
-        Command::Redirected {
-            inner,
-            stdin,
-            stdout,
-            stderr,
-        } => {
+        Command::Redirected { inner, redirects } => {
+            // Source regeneration uses the 0/1/2 slot fast-path (v156).
+            // Regeneration of fd>2 / `<&` / `{var}` redirects is best-effort
+            // (slot-collapsed).
+            let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
             let mut s = command_to_source(inner, indent);
-            if let Some(r) = stdin {
+            if let Some(r) = &stdin {
                 s.push(' ');
                 s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
             }
-            if let Some(r) = stdout {
+            if let Some(r) = &stdout {
                 s.push(' ');
                 s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
             }
-            if let Some(r) = stderr {
+            if let Some(r) = &stderr {
                 s.push(' ');
                 s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
             }
@@ -351,15 +350,17 @@ fn exec_to_source(e: &ExecCommand) -> String {
         parts.push(word_to_source(w));
     }
     let mut s = parts.join(" ");
-    if let Some(r) = &e.stdin {
+    // 0/1/2 slot fast-path for source regeneration (v156, best-effort).
+    let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(&e.redirects);
+    if let Some(r) = &stdin {
         s.push(' ');
         s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
     }
-    if let Some(r) = &e.stdout {
+    if let Some(r) = &stdout {
         s.push(' ');
         s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
     }
-    if let Some(r) = &e.stderr {
+    if let Some(r) = &stderr {
         s.push(' ');
         s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
     }

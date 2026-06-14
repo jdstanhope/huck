@@ -113,6 +113,8 @@ pub enum Operator {
     AndRedirAppend, // &>>
     RedirClobber,   // >|
     RedirErrClobber, // 2>|
+    DupIn,          // <&
+    RedirReadWrite, // <>
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -282,6 +284,12 @@ pub enum Token {
     /// already consumed). Parsed by `crate::arith::parse` downstream.
     /// Captured verbatim including embedded `;` separators.
     ArithBlock(String),
+    /// An explicit fd-prefix glued to a following redirect operator:
+    /// `3>` → `RedirFd(Number(3))` then `RedirOut`; `{fd}>` →
+    /// `RedirFd(Var("fd"))` then `RedirOut`. Emitted by the lexer only
+    /// when a digit-run or `{ident}` Word immediately precedes (no
+    /// whitespace) a redirect operator (or heredoc).
+    RedirFd(crate::command::RedirFd),
 }
 
 /// State for a heredoc whose body hasn't been collected yet.
@@ -348,6 +356,30 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 /// literal text in a single Word (`false` for array-literal elements, which are
 /// brace-expanded later). See the `tokenize_partial` / `tokenize_no_brace`
 /// wrappers.
+/// If `token` is a single plain-literal Word holding a pure digit-run or a
+/// `{ident}` form, return the corresponding `RedirFd`. Used to detect an
+/// fd-prefix glued to a following redirect operator. Returns `None` for any
+/// other shape (e.g. `file2`, `{}`, `{1bad}`), leaving the Word intact as a
+/// normal argument.
+fn fd_prefix_of(token: Option<&Token>) -> Option<crate::command::RedirFd> {
+    let Some(Token::Word(w)) = token else { return None };
+    let text = crate::command::word_literal_text(w)?;
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
+        text.parse::<u16>().ok().map(crate::command::RedirFd::Number)
+    } else if let Some(inner) = text.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        if !inner.is_empty()
+            && inner.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+            && inner.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            Some(crate::command::RedirFd::Var(inner.to_string()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 fn tokenize_partial_inner(
     input: &str,
     opts: LexerOptions,
@@ -359,6 +391,25 @@ fn tokenize_partial_inner(
     // Lockstep push: always push offset and line together so they can never diverge.
     macro_rules! push_pos {
         ($off:expr, $ln:expr) => {{ offsets.push($off); lines.push($ln); }};
+    }
+    // When `$glued` (no whitespace between the just-flushed Word and the
+    // redirect operator about to be pushed), and that trailing Word is a pure
+    // digit-run or `{ident}`, replace it with a `Token::RedirFd` occupying the
+    // same offset/line. Keeps `offsets`/`lines` parallel to `tokens`. Must be
+    // invoked AFTER the preceding word has been flushed and BEFORE the operator
+    // token is pushed.
+    macro_rules! take_fd_prefix {
+        ($glued:expr) => {{
+            if $glued {
+                if let Some(fd) = fd_prefix_of(tokens.last()) {
+                    tokens.pop();
+                    let off = offsets.pop().expect("offset parallel to token");
+                    let ln = lines.pop().expect("line parallel to token");
+                    tokens.push(Token::RedirFd(fd));
+                    push_pos!(off, ln);
+                }
+            }
+        }};
     }
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
@@ -678,6 +729,9 @@ fn tokenize_partial_inner(
                 in_assignment_value = false;
             }
             '<' => {
+                // `glued` = a Word was being accumulated with no intervening
+                // whitespace before this operator. Captured before the flush.
+                let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
@@ -688,6 +742,7 @@ fn tokenize_partial_inner(
                     chars.next(); // consume second '<'
                     if chars.peek() == Some(&'<') {
                         chars.next(); // consume third '<' — here-string
+                        take_fd_prefix!(glued);
                         tokens.push(Token::Op(Operator::HereString));
                     } else {
                         let strip_tabs = if chars.peek() == Some(&'-') {
@@ -698,6 +753,9 @@ fn tokenize_partial_inner(
                         };
                         // Parse the delimiter word and detect literal vs expanding mode.
                         let (delim, expand) = parse_heredoc_delim(&mut chars)?;
+                        // A glued fd-prefix (`3<<EOF`) becomes a RedirFd token
+                        // before the heredoc placeholder.
+                        take_fd_prefix!(glued);
                         // Push a placeholder Token::Heredoc with empty body.
                         // The body is back-patched after the line's \n.
                         let placeholder_idx = tokens.len();
@@ -728,13 +786,27 @@ fn tokenize_partial_inner(
                     has_token = true;
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
                     in_assignment_value = false;
+                } else if chars.peek() == Some(&'&') {
+                    chars.next();
+                    take_fd_prefix!(glued);
+                    tokens.push(Token::Op(Operator::DupIn));
+                    push_pos!(c_off, c_line);
+                    in_assignment_value = false;
+                } else if chars.peek() == Some(&'>') {
+                    chars.next();
+                    take_fd_prefix!(glued);
+                    tokens.push(Token::Op(Operator::RedirReadWrite));
+                    push_pos!(c_off, c_line);
+                    in_assignment_value = false;
                 } else {
+                    take_fd_prefix!(glued);
                     tokens.push(Token::Op(Operator::RedirIn));
                     push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 }
             }
             '>' => {
+                let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
                     let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
@@ -743,16 +815,19 @@ fn tokenize_partial_inner(
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();
+                    take_fd_prefix!(glued);
                     tokens.push(Token::Op(Operator::RedirAppend));
                     push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
+                    take_fd_prefix!(glued);
                     tokens.push(Token::Op(Operator::DupOut));
                     push_pos!(c_off, c_line);
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
+                    take_fd_prefix!(glued);
                     tokens.push(Token::Op(Operator::RedirClobber));
                     push_pos!(c_off, c_line);
                     in_assignment_value = false;
@@ -770,6 +845,7 @@ fn tokenize_partial_inner(
                     parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
                     in_assignment_value = false;
                 } else {
+                    take_fd_prefix!(glued);
                     tokens.push(Token::Op(Operator::RedirOut));
                     push_pos!(c_off, c_line);
                     in_assignment_value = false;
@@ -3280,6 +3356,74 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::RedirFd;
+
+    /// True iff `tokens` contains at least one `Token::RedirFd`.
+    fn has_redir_fd(tokens: &[Token]) -> bool {
+        tokens.iter().any(|t| matches!(t, Token::RedirFd(_)))
+    }
+
+    #[test]
+    fn lexer_fd_prefix_numeric() {
+        // `echo 2>&1`: the `2` is whitespace-separated from `echo`, glued to the
+        // operator — but the dedicated `2>` scanner fires (DupErr) and encodes
+        // fd 2 in the operator itself, so NO RedirFd token is emitted here.
+        // Use an fd with no dedicated scanner (`3>`) to exercise take_fd_prefix.
+        let toks = tokenize("echo 3>file").unwrap();
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(3)))),
+            "expected RedirFd(Number(3)) in {toks:?}"
+        );
+        // And `echo 12>file` → fd 12.
+        let toks = tokenize("echo 12>file").unwrap();
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(12)))),
+            "expected RedirFd(Number(12)) in {toks:?}"
+        );
+    }
+
+    #[test]
+    fn lexer_fd_prefix_space_is_not_prefix() {
+        // `echo 3 >file`: a space separates `3` from `>` — the `3` stays a Word
+        // argument and NO RedirFd is emitted.
+        let toks = tokenize("echo 3 >file").unwrap();
+        assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
+        // The `3` survives as a Word arg.
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::Word(w) if crate::command::word_literal_text(w) == Some("3"))),
+            "expected Word(\"3\") arg in {toks:?}"
+        );
+    }
+
+    #[test]
+    fn lexer_fd_prefix_glued_word_is_not_prefix() {
+        // `file2>x`: `file2` is not all-digits, so no RedirFd; `file2` stays a Word.
+        let toks = tokenize("file2>x").unwrap();
+        assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::Word(w) if crate::command::word_literal_text(w) == Some("file2"))),
+            "expected Word(\"file2\") in {toks:?}"
+        );
+    }
+
+    #[test]
+    fn lexer_named_fd_prefix() {
+        // `exec {fd}>log`: `{fd}` glued to `>` → RedirFd::Var("fd").
+        let toks = tokenize("exec {fd}>log").unwrap();
+        assert!(
+            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Var(name)) if name == "fd")),
+            "expected RedirFd(Var(\"fd\")) in {toks:?}"
+        );
+    }
+
+    #[test]
+    fn lexer_readwrite_and_dupin_operators() {
+        let toks = tokenize("cmd <>f").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirReadWrite))));
+        let toks = tokenize("cmd 3<&0").unwrap();
+        assert!(toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(3)))));
+        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::DupIn))));
+    }
 
     #[test]
     fn line_at_offset_counts_newlines() {
@@ -4283,9 +4427,7 @@ mod tests {
                         .iter()
                         .map(|a| Word(vec![WordPart::Literal { text: a.to_string(), quoted: false }]))
                         .collect(),
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -4353,9 +4495,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -4388,9 +4528,7 @@ mod tests {
                         inline_assignments: Vec::new(),
                         program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                         args: vec![inner_word],
-                        stdin: None,
-                        stdout: None,
-                        stderr: None,
+                        redirects: Vec::new(),
                         line: 0,
                     }))],
                 }),

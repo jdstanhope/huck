@@ -89,7 +89,6 @@ fn realize_via_devfd(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Res
 /// O_WRONLY|O_NONBLOCK open produces when no reader exists yet.
 fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Result<(String, ProcSub)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use crate::command::Redirect;
     use crate::lexer::{Word, WordPart};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -113,16 +112,21 @@ fn realize_via_fifo(seq: &Sequence, dir: ProcDir, shell: &mut Shell) -> io::Resu
     // Wrap the inner sequence in a redirect so the CHILD opens its FIFO end:
     //   <(cmd) → cmd > FIFO  (child opens O_WRONLY, blocks until outer opens O_RDONLY)
     //   >(cmd) → cmd < FIFO  (child opens O_RDONLY, blocks until outer opens O_WRONLY)
-    let (redirect_stdin, redirect_stdout) = match dir {
-        ProcDir::In  => (None,                                Some(Redirect::Truncate(path_word))),
-        ProcDir::Out => (Some(Redirect::Read(path_word)),     None),
+    use crate::command::{Redirection, RedirFd, RedirOp, FileMode};
+    let redirects: Vec<Redirection> = match dir {
+        ProcDir::In => vec![Redirection {
+            fd: RedirFd::Number(1),
+            op: RedirOp::File { mode: FileMode::Truncate, target: path_word },
+        }],
+        ProcDir::Out => vec![Redirection {
+            fd: RedirFd::Number(0),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target: path_word },
+        }],
     };
     let inner_body = Command::Subshell { body: Box::new(seq.clone()) };
     let inner = Command::Redirected {
         inner: Box::new(inner_body),
-        stdin: redirect_stdin,
-        stdout: redirect_stdout,
-        stderr: None,
+        redirects,
     };
 
     // Fork: child inherits stdio (the wrapped redirect overrides the relevant one
