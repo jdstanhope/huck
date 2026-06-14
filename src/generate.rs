@@ -60,6 +60,14 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
         Command::FunctionDef { name, body } => {
             format!("{name} ()\n{}", command_to_source(body, indent))
         }
+        Command::Coproc { name, body } => {
+            let body_src = command_to_source(body, indent);
+            if name == "COPROC" {
+                format!("coproc {body_src}")
+            } else {
+                format!("coproc {name} {body_src}")
+            }
+        }
         Command::Redirected { inner, redirects } => {
             // Source regeneration uses the 0/1/2 slot fast-path (v156).
             // Regeneration of fd>2 / `<&` / `{var}` redirects is best-effort

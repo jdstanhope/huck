@@ -246,6 +246,18 @@ impl ShoptOptions {
     }
 }
 
+/// A live coprocess started by `coproc`. The shell holds the two pipe ends
+/// (relocated to high fds, close-on-exec): `read_fd` = NAME[0] (read the
+/// coproc's stdout), `write_fd` = NAME[1] (write the coproc's stdin).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Coproc {
+    pub name: String,
+    pub pid: libc::pid_t,
+    pub read_fd: std::os::unix::io::RawFd,
+    pub write_fd: std::os::unix::io::RawFd,
+}
+
 /// Per-session shell state: variables (each either exported or not) and the
 /// last command's exit status. The initial set of variables is seeded from
 /// the process environment huck inherited at startup, every one marked
@@ -427,6 +439,17 @@ pub struct Shell {
     /// instant gives the current `$SECONDS` value. Resettable via
     /// `SECONDS=n` (sets base to `now - n`).
     pub seconds_base: std::time::Instant,
+
+    /// Live coprocesses started by `coproc NAME { ... }`. At most one active
+    /// in bash 5.x (a second `coproc` kills the first), but stored as a Vec
+    /// to make the structure multi-coproc-ready.
+    ///
+    /// COW-clone note: a `$(...)`/subshell Shell clone copies these Coproc
+    /// records but does NOT own the fds; only the owning shell's reap path
+    /// calls `reap_coproc`, and a forked subshell exits without running it,
+    /// so there is no double-close.
+    #[allow(dead_code)]
+    pub coprocs: Vec<Coproc>,
 }
 
 // ---- Static builtin variable helpers (platform strings, libc wrappers) ----
@@ -597,6 +620,7 @@ impl Shell {
                 pid.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(nanos) | 1
             }),
             seconds_base: std::time::Instant::now(),
+            coprocs: Vec::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -1007,6 +1031,20 @@ impl Shell {
 
     pub fn unset(&mut self, name: &str) {
         self.vars.remove(name);
+    }
+
+    /// Called from the reap path when child `pid` has exited: if it is a live
+    /// coproc, close its held fds, unset NAME + NAME_PID, and drop the record.
+    /// bash unsets the coproc variables once the coprocess is reaped.
+    pub fn reap_coproc(&mut self, pid: libc::pid_t) {
+        let Some(idx) = self.coprocs.iter().position(|c| c.pid == pid) else { return; };
+        let c = self.coprocs.remove(idx);
+        unsafe {
+            libc::close(c.read_fd);
+            libc::close(c.write_fd);
+        }
+        self.unset(&c.name);                       // the NAME array
+        self.unset(&format!("{}_PID", c.name));    // NAME_PID
     }
 
     /// Scope-aware variable unset for the `unset` builtin's `-v`/default path
