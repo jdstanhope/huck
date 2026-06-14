@@ -353,7 +353,40 @@ pub fn legacy_slots(redirs: &[Redirection]) -> (Option<Redirect>, Option<Redirec
             RedirOp::Heredoc { body, expand, strip_tabs } => Some(Redirect::Heredoc { body: body.clone(), expand: *expand, strip_tabs: *strip_tabs }),
             RedirOp::HereString(w) => Some(Redirect::HereString(w.clone())),
         };
-        match fd { 0 => sin = legacy, 1 => sout = legacy, 2 => serr = legacy, _ => {} }
+        // Only fill a slot when the op direction matches the fd:
+        //   stdin  (0): input ops only (ReadOnly, Heredoc, HereString)
+        //   stdout (1) / stderr (2): output ops only (Truncate/Append/Clobber, Dup{output:true})
+        // Cross-type combos (e.g. Read→fd1, Truncate→fd0) are dropped — they
+        // would cause resolve()'s unreachable!() assertions to fire. They
+        // become fully functional when the applier tasks are migrated.
+        match fd {
+            0 => {
+                if matches!(&r.op,
+                    RedirOp::File { mode: FileMode::ReadOnly, .. }
+                    | RedirOp::Heredoc { .. }
+                    | RedirOp::HereString(_))
+                {
+                    sin = legacy;
+                }
+            }
+            1 => {
+                if matches!(&r.op,
+                    RedirOp::File { mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber, .. }
+                    | RedirOp::Dup { output: true, .. })
+                {
+                    sout = legacy;
+                }
+            }
+            2 => {
+                if matches!(&r.op,
+                    RedirOp::File { mode: FileMode::Truncate | FileMode::Append | FileMode::Clobber, .. }
+                    | RedirOp::Dup { output: true, .. })
+                {
+                    serr = legacy;
+                }
+            }
+            _ => {}
+        }
     }
     (sin, sout, serr)
 }
@@ -5647,5 +5680,69 @@ mod tests {
         assert_eq!(r.target_fd(), Some(3));
         let v = Redirection { fd: RedirFd::Var("x".into()), op: RedirOp::Close };
         assert_eq!(v.target_fd(), None);
+    }
+
+    /// Regression: cross-type low-fd redirects (e.g. `1<file`, `0>file`, `0>&1`)
+    /// must be dropped by legacy_slots rather than placed into the wrong slot
+    /// (which would cause resolve()'s unreachable!() assertions to fire).
+    #[test]
+    fn legacy_slots_drops_cross_type_low_fd() {
+        // Read-op on fd 1 (stdout): must not fill any slot.
+        let r_read_on_fd1 = Redirection {
+            fd: RedirFd::Number(1),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+        };
+        let (sin, sout, serr) = legacy_slots(&[r_read_on_fd1]);
+        assert!(sin.is_none(), "Read on fd1 must not fill stdin");
+        assert!(sout.is_none(), "Read on fd1 must not fill stdout");
+        assert!(serr.is_none(), "Read on fd1 must not fill stderr");
+
+        // Truncate-op on fd 0 (stdin): must not fill any slot.
+        let r_trunc_on_fd0 = Redirection {
+            fd: RedirFd::Number(0),
+            op: RedirOp::File { mode: FileMode::Truncate, target: ww("f") },
+        };
+        let (sin, sout, serr) = legacy_slots(&[r_trunc_on_fd0]);
+        assert!(sin.is_none(), "Truncate on fd0 must not fill stdin");
+        assert!(sout.is_none(), "Truncate on fd0 must not fill stdout");
+        assert!(serr.is_none(), "Truncate on fd0 must not fill stderr");
+
+        // Dup{output:true} on fd 0: must not fill any slot.
+        let r_dup_out_on_fd0 = Redirection {
+            fd: RedirFd::Number(0),
+            op: RedirOp::Dup { source: ww("1"), output: true },
+        };
+        let (sin, sout, serr) = legacy_slots(&[r_dup_out_on_fd0]);
+        assert!(sin.is_none(), "Dup(output) on fd0 must not fill stdin");
+        assert!(sout.is_none(), "Dup(output) on fd0 must not fill stdout");
+        assert!(serr.is_none(), "Dup(output) on fd0 must not fill stderr");
+
+        // Read-op on fd 2 (stderr): must not fill any slot.
+        let r_read_on_fd2 = Redirection {
+            fd: RedirFd::Number(2),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+        };
+        let (sin, sout, serr) = legacy_slots(&[r_read_on_fd2]);
+        assert!(sin.is_none(), "Read on fd2 must not fill stdin");
+        assert!(sout.is_none(), "Read on fd2 must not fill stdout");
+        assert!(serr.is_none(), "Read on fd2 must not fill stderr");
+
+        // Sanity: direction-matched ops still fill slots correctly.
+        let r_read_fd0 = Redirection {
+            fd: RedirFd::Number(0),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target: ww("f") },
+        };
+        let r_trunc_fd1 = Redirection {
+            fd: RedirFd::Number(1),
+            op: RedirOp::File { mode: FileMode::Truncate, target: ww("g") },
+        };
+        let r_trunc_fd2 = Redirection {
+            fd: RedirFd::Number(2),
+            op: RedirOp::File { mode: FileMode::Truncate, target: ww("h") },
+        };
+        let (sin, sout, serr) = legacy_slots(&[r_read_fd0, r_trunc_fd1, r_trunc_fd2]);
+        assert!(sin.is_some(), "Read on fd0 should fill stdin");
+        assert!(sout.is_some(), "Truncate on fd1 should fill stdout");
+        assert!(serr.is_some(), "Truncate on fd2 should fill stderr");
     }
 }
