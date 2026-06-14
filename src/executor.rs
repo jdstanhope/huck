@@ -4014,6 +4014,10 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
     // atomically (temporary semantics) and we return Err(()) to the caller.
     for redir in &cmd.redirects {
         if scope.apply(redir, shell).is_err() {
+            // Reap any heredoc writers spawned by already-applied redirs before
+            // the scope drops (Drop is writer-agnostic) — else a zombie until
+            // shell exit. Mirrors with_redirect_scope's error path.
+            scope.reap_heredoc_writers();
             return Err(()); // scope Drop restores partial → atomic rollback
         }
     }
