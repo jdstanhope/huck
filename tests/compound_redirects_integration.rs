@@ -140,3 +140,20 @@ fn capture_stdout_not_redirected_still_captures() {
     let (out, _rc) = run("x=$({ echo o; sh -c 'echo e 1>&2'; } 2>/dev/null); echo \"[$x]\"\n");
     assert_eq!(out, "[o]\n");
 }
+
+#[test]
+fn compound_high_fd_file_redirect() {
+    // v156 task3 fix: `{ echo hi >&3; } 3>/tmp/hk_b` — the kernel places the
+    // opened file directly at fd 3 (lowest free fd == target fd). The body
+    // must be able to write to fd 3 and the file must contain "hi".
+    // After the scope, fd 3 must be closed again (write to it fails, rc=1).
+    let f = "/tmp/huck_t_hfd";
+    // Part 1: file must contain "hi".
+    let script1 = format!("{{ echo hi >&3; }} 3>{f}; cat {f}; rm -f {f}\n");
+    let (out1, _rc1) = run(&script1);
+    assert_eq!(out1, "hi\n", "file should contain 'hi'");
+    // Part 2: fd 3 is closed after the scope — writing to it returns rc=1.
+    let script2 = format!("{{ echo hi >&3; }} 3>{f}; echo x >&3; echo \"rc=$?\"; rm -f {f}\n");
+    let (out2, _rc2) = run(&script2);
+    assert!(out2.contains("rc=1"), "fd 3 should be closed after scope (rc=1), got: {out2:?}");
+}

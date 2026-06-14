@@ -629,11 +629,25 @@ impl RedirectScope {
                         }
                     }
                 };
-                if self.redirect(new_fd, target).is_err() {
+                if new_fd == target {
+                    // The kernel placed the opened file directly at the target fd,
+                    // which means target was previously free/closed (lowest-free
+                    // fd == target). Leave the file in place and record a
+                    // "was-closed" restore (-1) so Drop closes target back when
+                    // the scope ends. Do NOT dup2 and do NOT close new_fd (it IS
+                    // the target now).
+                    self.saved.push((target, -1));
+                } else {
+                    // Normal case: save the prior target state (or -1 if it was
+                    // closed), dup2 the opened file onto the target, then close
+                    // the temp fd. `redirect()` already records saved=-1 when
+                    // dup(target) returns EBADF (target was free but not lowest).
+                    if self.redirect(new_fd, target).is_err() {
+                        unsafe { libc::close(new_fd) };
+                        return Err(ExecOutcome::Continue(1));
+                    }
                     unsafe { libc::close(new_fd) };
-                    return Err(ExecOutcome::Continue(1));
                 }
-                unsafe { libc::close(new_fd) };
                 Ok(())
             }
             RedirOp::Dup { source, .. } => {
