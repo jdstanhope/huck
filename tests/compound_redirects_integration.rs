@@ -80,6 +80,54 @@ fn capture_with_compound_stdout_redirect() {
     assert_eq!(out, "[]\na\nb\n");
 }
 
+// ── v156 task 3: in-process ordered redirect applier (RedirectScope) ──
+
+#[test]
+fn l08_source_order_2gt1_then_redirect() {
+    // L-08 ordering. `2>&1 >file`: stderr is dup'd onto the ORIGINAL stdout
+    // FIRST, then stdout goes to the file. So ONLY `out` lands in the file
+    // (`err` follows the original stdout). Asserting on the FILE content
+    // isolates the ordering from where the un-redirected stderr ends up.
+    let f = "/tmp/huck_t_l08a";
+    run(&format!(
+        "{{ echo out; echo err >&2; }} 2>&1 >{f}\n"
+    ));
+    let contents = std::fs::read_to_string(f).unwrap();
+    assert_eq!(contents, "out\n", "2>&1 >file: only stdout in the file");
+}
+
+#[test]
+fn l08_source_order_redirect_then_2gt1() {
+    // `>file 2>&1`: stdout to file FIRST, then stderr follows the (already
+    // redirected) stdout — BOTH land in the file. Different from the above,
+    // proving source-order is honored.
+    let f = "/tmp/huck_t_l08b";
+    run(&format!(
+        "{{ echo out; echo err >&2; }} >{f} 2>&1\n"
+    ));
+    let contents = std::fs::read_to_string(f).unwrap();
+    assert_eq!(contents, "out\nerr\n", ">file 2>&1: both streams in the file");
+}
+
+#[test]
+fn compound_stderr_to_file_via_dup() {
+    // `{ echo x >&2; } 2>file`: the inner `>&2` writes to fd 2, which the
+    // compound redirects to the file. The file gets `x`.
+    let f = "/tmp/huck_t_cdup";
+    let (out, _rc) = run(&format!("{{ echo x >&2; }} 2>{f}\ncat {f}\n"));
+    assert_eq!(out, "x\n");
+}
+
+#[test]
+fn builtin_dup_stdout_to_stderr_then_file() {
+    // `echo y 1>&2 2>file`: 1>&2 dups fd1 onto the ORIGINAL fd2 (terminal), then
+    // 2>file redirects fd2. `echo` writes to fd1 (terminal stderr), so the file
+    // stays empty — the create-truncates-it side effect is the only file change.
+    let f = "/tmp/huck_t_bdup";
+    let (out, _rc) = run(&format!("echo first > {f}\necho y 1>&2 2>{f}\ncat {f}\n"));
+    assert_eq!(out, "", "file should be truncated and not receive y");
+}
+
 #[test]
 fn capture_stdout_not_redirected_still_captures() {
     // Only stderr redirected on the compound -> stdout is still captured.
