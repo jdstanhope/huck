@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 19 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 17 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 36 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -59,9 +59,7 @@ group.
 
 ### Redirects
 
-- **M-20: `n<>file` read-write open** — `[deferred]` low. huck: not implemented. bash: opens fd for read+write.
 - **M-51: `|&` pipe stdout+stderr** — `[deferred]` low. huck: parse error. bash: shorthand for `2>&1 |`.
-- **M-124: arbitrary-fd (fd>2) redirections** — `[deferred]` medium. huck's `ExecCommand` AST models only stdin/stdout/stderr (fds 0/1/2), so `n>file` / `n<file` / `n>&m` for `n>2` (e.g. `cmd 3>log`, `exec 3<input`, `2>&3`) are not representable. Most visible now that v155 added `exec`: the common `exec 3<file` / `exec {fd}>file` private-fd idioms do not work (the bare `exec` redirect modes for fds 0/1/2 — `exec >log 2>&1`, `exec <in` — do work). Would require generalizing the redirect slots to an fd-indexed map across the lexer/parser/executor.
 
 ### Quoting
 
@@ -203,13 +201,15 @@ Things huck deliberately does differently from bash. Document and keep.
 - **L-39: process-substitution edge cases** — `[deferred]`, low (v150). The v150 process substitution `<(…)`/`>(…)` covers command-argument and redirect-target usage (foreground + pipelines + compound commands + background). Three residual edge gaps: (a) **assignment-RHS context** — `x=<(cmd)` is NOT realized (the `expand_assignment` path is a no-op for `ProcessSub`); bash assigns `/dev/fd/N`. Realizing there would fork a child with no command to consume the fd. (b) **setup-failure path** — if `pipe()`/`fork()` fails while realizing a process sub, huck prints an error and emits an EMPTY field, so the outer command still runs (with an empty arg / failing-open redirect); bash aborts the command on process-sub setup failure. Only reachable under fd/process exhaustion. (c) **background long-running inner producer** — `cmd < <(slow_producer) &` reaps the inner via `waitpid(WNOHANG)` after spawning the bg job (to avoid blocking `&`), so a still-running inner producer leaves a bounded zombie until SIGCHLD/shell-exit (its fd IS closed — no fd leak). Also: the FIFO fallback (`/dev/fd` absent) is verified by inspection only — unreachable on Linux/macOS, which both provide `/dev/fd`.
 - **L-41: computed builtin-variable edge cases** — `[deferred]`, low (v154). v154 added the shell-maintained builtin variables. The STATIC ones (`UID`/`EUID`/`PPID`/`GROUPS`/`HOSTNAME`/`HOSTTYPE`/`OSTYPE`/`MACHTYPE`/`BASH`/`BASH_VERSION`/`BASH_VERSINFO`/`HUCK_VERSION`/`SHLVL`) are stored in the vars table and match bash; the DYNAMIC ones (`RANDOM`/`SECONDS`/`EPOCHSECONDS`/`BASHPID`) are computed in `lookup_var` and therefore NOT in the vars table, which yields several edge divergences: (a) **`set`/`declare -p` omit them** — bare `set` and `declare -p RANDOM` don't list/print the computed dynamics (bash does); they DO complete via `compgen -v`/`$<TAB>` (the v154 completion registry). (b) **`[[ -v RANDOM ]]` is false** — `is_set` checks the vars table, so `-v` on a computed dynamic reports unset (bash: set). (c) **`BASHPID`/`EPOCHSECONDS` assignment** silently stores a shadowed ghost (the computed value still wins on read) rather than erroring as bash's readonly does. (d) **inline-assignment scoping** — `RANDOM=n cmd` / `SECONDS=n cmd` reseed/reset GLOBALLY (the reseed bypasses the vars snapshot/restore), whereas bash SCOPES the reseed to that command; standalone `RANDOM=n; …` (the common case) matches bash. (e) **`GROUPS` order** — huck returns the raw `getgroups(2)` order; bash orders egid-first (the SET matches; only order differs). (f) `RANDOM`'s LCG is huck's own — only range (0–32767) and reseed-determinism are guaranteed, not bash's exact sequence; `BASH_VERSION`/`BASH_VERSINFO` are a deliberate bash masquerade (`HUCK_VERSION` is the true identity). All low-impact; the common read/assign/completion paths match bash.
 
-### L-08: Redirect source-order not preserved (`2>&1 >file` anti-pattern)
-- **Status**: intentional (v29)
+### L-08: Redirect source-order not preserved on PIPELINE STAGES
+- **Status**: `[deferred]` low
 - **Severity**: low
-- **huck**: `cmd 2>&1 >file` is treated identically to `cmd >file 2>&1` — both fds end up at the file. The field-based `ExecCommand` AST (`stdin`/`stdout`/`stderr`) stores at most one redirect per fd and cannot preserve source order.
-- **bash**: `cmd 2>&1 >file` puts stderr to the terminal and stdout to the file (because `2>&1` dups stderr to the CURRENT stdout, which is the terminal at that point, then `>file` redirects stdout). The canonical form is `cmd >file 2>&1`.
-- **Why intentional**: source-order preservation requires refactoring `ExecCommand` to `redirects: Vec<(SourceFd, Redirect)>` — a substantial change. The canonical form covers >99% of real usage.
-- **Workaround**: write `cmd >file 2>&1` (or `cmd &>file`).
+- **huck**: v156 RESOLVED the source-order bug for SINGLE commands — bare builtins, external commands, compound commands (brace groups, subshells, if/for/while/case), functions, and `exec` all now process redirects in strict left-to-right order via an ordered `Vec<Redirect>` list, so `cmd 2>&1 >file` (puts stderr to terminal, stdout to file) and `cmd >file 2>&1` (both to file) are correctly distinguished on a single command. The gap REMAINS for PIPELINE STAGES: the fast-path `slots_for_simple_path` used to set up 0/1/2 for pipeline stages applies redirects in a last-wins fashion rather than preserving source order, so `cmd1 2>&1 >file | cmd2` may not produce the same result as bash. Additionally, a heredoc or here-string targeting fd>2 on a pipeline stage is dropped (the pipeline stage setup path does not plumb fd>2 heredocs). Two residual edges in this narrow scope:
+  - **Pipeline-stage ordering**: `cmd 2>&1 >file | …` — stage-level redirect setup is last-wins for fds 0/1/2.
+  - **fd>2 heredoc on a pipeline stage**: `cmd 3<<EOF … | …` — the heredoc for fd>2 is silently discarded on a pipeline stage.
+- **bash**: processes all redirects in strict left-to-right order on every command, including pipeline stages.
+- **Why deferred**: the pipeline-stage fast-path (`slots_for_simple_path`) would need to be replaced with the same ordered-redirect walk used for single commands; the heredoc-on-fd>2-in-pipeline gap would require extending the pipeline setup to pass through fd>2 heredoc fds. Single-command usage (the overwhelmingly common case) now matches bash.
+- **Workaround**: write `cmd >file 2>&1` (canonical form, correct on both single commands and pipeline stages); avoid fd>2 heredocs on pipeline stages.
 
 ### L-09: Regex `=~` is RE2-style, not POSIX ERE
 - **Status**: intentional (v30)
