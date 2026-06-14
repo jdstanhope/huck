@@ -309,6 +309,13 @@ pub struct Shell {
     pub shell_pid: i32,
     /// PID of the most-recently-backgrounded pipeline's last stage. Used for `$!`.
     pub last_bg_pid: Option<i32>,
+    /// Set when the just-finished foreground command/pipeline was STOPPED
+    /// (Ctrl-Z / SIGTSTP) rather than exiting. Its process substitutions are
+    /// still alive (tied to the stopped job), so the post-command procsub drain
+    /// must be NON-blocking — a blocking `waitpid` on a live procsub child whose
+    /// consumer is also stopped deadlocks the shell. Consumed (reset) by the
+    /// single-command drain epilogue.
+    pub fg_stopped: bool,
     /// The shell's argv[0], cached at startup. Used for `$0` at the top level.
     pub shell_argv0: String,
     /// Unified call stack. Each `call_function` pushes a `Frame` with
@@ -587,6 +594,7 @@ impl Shell {
             history: Rc::new(crate::history::History::new()),
             shell_pid,
             last_bg_pid: None,
+            fg_stopped: false,
             shell_argv0,
             call_stack: Vec::new(),
             function_source: std::collections::HashMap::new(),
