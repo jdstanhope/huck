@@ -748,7 +748,7 @@ pub enum ParseError {
 /// `peek`/`next`/`len`, plus `current_line()` (the line of the NEXT
 /// token to be returned). Lines are `0` ("unknown") unless built with real lines.
 pub struct TokenCursor {
-    tokens: Vec<Token>,
+    tokens: Vec<Option<Token>>,
     lines: Vec<u32>,
     pos: usize,
 }
@@ -756,6 +756,7 @@ impl TokenCursor {
     pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
         debug_assert!(lines.is_empty() || lines.len() == tokens.len(),
             "lines must parallel tokens");
+        let tokens = tokens.into_iter().map(Some).collect();
         Self { tokens, lines, pos: 0 }
     }
     /// Line of the next token to be returned (0 if unknown / past end).
@@ -764,23 +765,20 @@ impl TokenCursor {
     }
     /// Peek at the next token without consuming it.
     pub fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+        self.tokens.get(self.pos)?.as_ref()
     }
     /// Peek at the token after next without consuming anything.
     pub fn peek2(&self) -> Option<&Token> {
-        self.tokens.get(self.pos + 1)
+        self.tokens.get(self.pos + 1)?.as_ref()
     }
 }
 impl Iterator for TokenCursor {
     type Item = Token;
     fn next(&mut self) -> Option<Token> {
-        if self.pos < self.tokens.len() {
-            let t = self.tokens[self.pos].clone();
-            self.pos += 1;
-            Some(t)
-        } else {
-            None
-        }
+        let slot = self.tokens.get_mut(self.pos)?;
+        let t = slot.take()?;   // move out, leaving None in the slot
+        self.pos += 1;
+        Some(t)
     }
 }
 impl ExactSizeIterator for TokenCursor {
@@ -1583,17 +1581,16 @@ fn parse_select_command(
 /// name = "COPROC" and the body is the next ordinary command (simple or
 /// compound).
 fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
-    // Named form: a plain Word followed by a compound-command opener.
+    // Named form: a valid-identifier Word followed by a compound-command opener.
     let is_named = matches!(iter.peek(), Some(Token::Word(w))
-        if word_literal_text(w).is_some())
+        if valid_identifier_text(w).is_some())
         && is_compound_opener(iter.peek2());
 
     if is_named {
-        // Consume the NAME word (we already verified it's a plain literal).
+        // Consume the NAME word (we already verified it's a valid identifier).
         let name = match iter.next() {
-            Some(Token::Word(w)) => word_literal_text(&w)
-                .expect("verified above")
-                .to_string(),
+            Some(Token::Word(w)) => valid_identifier_text(&w)
+                .expect("verified above"),
             _ => unreachable!("peek matched Token::Word"),
         };
         let body = parse_command_inner(iter)?;
@@ -1606,7 +1603,7 @@ fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
 }
 
 /// True if `tok` is the first token of a compound command
-/// (`{`, `(`, if/while/until/for/case/select/function, `[[`, `((`).
+/// (`{`, `(`, if/while/until/for/case/select, `[[`, `((`).
 fn is_compound_opener(tok: Option<&Token>) -> bool {
     match tok {
         Some(Token::Op(Operator::LParen)) => true,
@@ -1621,7 +1618,6 @@ fn is_compound_opener(tok: Option<&Token>) -> bool {
                 | Some(Keyword::Case)
                 | Some(Keyword::Select)
                 | Some(Keyword::DoubleBracketOpen)
-                | Some(Keyword::Function)
         ),
         None => false,
     }
@@ -5917,5 +5913,23 @@ mod tests {
     fn parse_coproc_in_pipeline_is_error() {
         let toks = crate::lexer::tokenize("echo x | coproc cat").unwrap();
         assert!(parse(toks).is_err());
+    }
+
+    #[test]
+    fn parse_coproc_numeric_name_not_named() {
+        // "123" is not a valid identifier; the parser must NOT produce a named
+        // coproc with name "123".  It may fall back to anonymous parsing (which
+        // then hits a syntax error for "{ :; }" after a simple command "123")
+        // or produce a parse error — either is acceptable; "123" as NAME is not.
+        let toks = crate::lexer::tokenize("coproc 123 { :; }").unwrap();
+        let result = parse(toks);
+        if let Ok(Some(seq)) = result {
+            // If it parsed successfully (e.g. as anonymous + "123" consumed), make
+            // sure the coproc name is not "123".
+            if let Command::Coproc { ref name, .. } = seq.first {
+                assert_ne!(name, "123", "numeric word must not be accepted as coproc NAME");
+            }
+        }
+        // A parse error (UnexpectedToken / UnexpectedKeyword) is also acceptable.
     }
 }
