@@ -1371,36 +1371,48 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
     }
     let mut want_array = false;
     let mut want_associative = false;
+    let mut want_integer = false;
+    let mut want_readonly = false;
     let mut idx = 0;
-    // Parse leading flags from Plain args.
+    // Parse leading flags from Plain args. Letters cluster (`-ri`, `-ir`)
+    // exactly as in `declare`; a cluster containing an unsupported letter
+    // (`-l`/`-u`/`-n`) yields declare's not-yet-implemented message.
     while idx < args.len() {
-        match &args[idx] {
-            DeclArg::Plain(s) => {
-                if s == "-a" {
-                    want_array = true;
-                    idx += 1;
-                    continue;
-                }
-                if s == "-A" {
-                    want_associative = true;
-                    idx += 1;
-                    continue;
-                }
-                if s == "--" {
-                    idx += 1;
-                    break;
-                }
-                if s.starts_with('-') && s.len() > 1 {
-                    eprintln!("huck: local: {s}: invalid option");
+        let DeclArg::Plain(s) = &args[idx] else { break };
+        if s == "--" {
+            idx += 1;
+            break;
+        }
+        if !(s.starts_with('-') && s.len() > 1) {
+            break;
+        }
+        for &c in &s.as_bytes()[1..] {
+            match c {
+                b'a' => want_array = true,
+                b'A' => want_associative = true,
+                b'i' => want_integer = true,
+                b'r' => want_readonly = true,
+                b'l' | b'u' | b'n' => {
+                    eprintln!(
+                        "huck: local: -{}: not yet implemented in this version",
+                        c as char
+                    );
                     return ExecOutcome::Continue(1);
                 }
-                break;
+                other => {
+                    eprintln!("huck: local: -{}: invalid option", other as char);
+                    return ExecOutcome::Continue(1);
+                }
             }
-            DeclArg::Assign(_) => break,
         }
+        idx += 1;
     }
     if want_array && want_associative {
         eprintln!("huck: local: cannot specify both -a and -A");
+        return ExecOutcome::Continue(1);
+    }
+    if (want_array || want_associative) && want_integer {
+        eprintln!("huck: local: integer arrays not yet supported");
         return ExecOutcome::Continue(1);
     }
     let mut exit: i32 = 0;
@@ -1459,6 +1471,13 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                         );
                         exit = 1;
                     }
+                } else if want_integer {
+                    // Bare `local -i NAME`: create the local as a set-but-empty
+                    // integer scalar (matches bash + `declare -i NAME`) so a
+                    // later `NAME=2+3` arithmetic-coerces. mark_integer creates
+                    // the empty scalar when absent; the snapshot above records
+                    // the outer value for restore on return.
+                    shell.mark_integer(name);
                 } else if !already_local {
                     // Bare `local NAME` with no value (fresh local): declare it
                     // function-local but UNSET (matches bash + `declare NAME`).
@@ -1468,6 +1487,14 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     // re-`local` of an already-local name preserves its value
                     // (bash), so only unset when NOT already_local. (M-111)
                     shell.unset(name);
+                }
+                // Apply the readonly attribute last so `local -r NAME` (no
+                // value) marks the freshly-declared local readonly. (For an
+                // -i bare local, mark_integer above created the scalar; for a
+                // plain bare local it was unset — mark_readonly then creates an
+                // empty readonly scalar, matching `declare -r NAME`.)
+                if want_readonly {
+                    shell.mark_readonly(name);
                 }
             }
             DeclArg::Assign(a) => {
@@ -1501,8 +1528,20 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     exit = 1;
                     continue;
                 }
+                // `local -i NAME=expr`: flip the integer flag BEFORE the
+                // assignment so apply_one_assignment routes the RHS through
+                // the arithmetic coerce (mirrors declare's ordering).
+                if want_integer {
+                    shell.mark_integer(&name);
+                }
                 if crate::executor::apply_one_assignment(a, shell).is_err() {
                     exit = 1;
+                    continue;
+                }
+                // `local -r NAME=val`: mark readonly AFTER the value is set
+                // (mirrors declare's `-r NAME=VALUE` ordering).
+                if want_readonly {
+                    shell.mark_readonly(&name);
                 }
             }
         }
@@ -9543,6 +9582,96 @@ mod local_tests {
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn local_dash_i_marks_integer_and_coerces_rhs() {
+        // `local -i x=3+4` evaluates the RHS arithmetically (→ 7) and flags
+        // the local integer, like `declare -i`.
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &["-i".to_string(), "XYZ_LI=3+4".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("XYZ_LI").as_deref(), Some("7"));
+        assert!(shell.is_integer("XYZ_LI"));
+    }
+
+    #[test]
+    fn local_dash_i_bare_then_assign_coerces() {
+        // `local -i x` followed by `x=2+3` coerces on assignment (→ 5).
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = run_declaration_builtin_strs(
+            "local",
+            &["-i".to_string(), "XYZ_LIB".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(shell.is_integer("XYZ_LIB"));
+        let _ = shell.try_set("XYZ_LIB", "2+3".to_string());
+        assert_eq!(shell.lookup_var("XYZ_LIB").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn local_dash_r_marks_readonly() {
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &["-r".to_string(), "XYZ_LR=fixed".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("XYZ_LR").as_deref(), Some("fixed"));
+        assert!(shell.is_readonly("XYZ_LR"));
+    }
+
+    #[test]
+    fn local_clustered_ri_applies_both_attrs() {
+        // `local -ri n=5+5`: integer (→ 10) AND readonly.
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &["-ri".to_string(), "XYZ_LRI=5+5".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("XYZ_LRI").as_deref(), Some("10"));
+        assert!(shell.is_integer("XYZ_LRI"));
+        assert!(shell.is_readonly("XYZ_LRI"));
+    }
+
+    #[test]
+    fn local_unsupported_attr_is_not_yet_implemented() {
+        // `-l`/`-u`/`-n` match declare's "not yet implemented" message (rc 1),
+        // NOT "invalid option" — even when clustered with a supported letter.
+        for flag in ["-l", "-u", "-n", "-li"] {
+            let mut shell = Shell::new();
+            shell.local_scopes.push(std::collections::HashMap::new());
+            let mut buf: Vec<u8> = Vec::new();
+            let outcome = run_declaration_builtin_strs(
+                "local",
+                &[flag.to_string(), "XYZ_LU=1".to_string()],
+                &mut buf,
+                &mut shell,
+            );
+            assert!(
+                matches!(outcome, ExecOutcome::Continue(1)),
+                "flag {flag} should yield rc 1"
+            );
+        }
     }
 }
 
