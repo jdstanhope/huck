@@ -22,6 +22,12 @@ pub(crate) enum ArithToken {
     AmpEq, CaretEq, PipeEq,
     // v38 — inc/dec:
     PlusPlus, MinusMinus,
+    // array subscripts: `name[subscript]`. LBracket carries the RAW inner
+    // source text between the brackets (used as a literal key for
+    // associative arrays); the bracketed tokens are still emitted between
+    // LBracket/RBracket so the subscript can be parsed as an arith
+    // expression for indexed arrays.
+    LBracket(String), RBracket,
 }
 
 /// Parses hex digits 0-9, a-f, A-F after the `0x` / `0X` prefix has
@@ -170,6 +176,30 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
             }
             '(' => { chars.next(); out.push(ArithToken::LParen); }
             ')' => { chars.next(); out.push(ArithToken::RParen); }
+            '[' => {
+                // Capture the RAW inner text up to the matching ']' (for the
+                // associative-key case), tracking bracket nesting so that
+                // e.g. `a[b[0]]` captures `b[0]`. The inner tokens are still
+                // produced by the main loop after this LBracket.
+                chars.next();
+                let mut raw = String::new();
+                let mut depth = 1i32;
+                let mut lookahead = chars.clone();
+                while let Some(&d) = lookahead.peek() {
+                    match d {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => {}
+                    }
+                    raw.push(d);
+                    lookahead.next();
+                }
+                out.push(ArithToken::LBracket(raw));
+            }
+            ']' => { chars.next(); out.push(ArithToken::RBracket); }
             ',' => { chars.next(); out.push(ArithToken::Comma); }
             '+' => {
                 chars.next();
@@ -317,10 +347,24 @@ pub enum AssignOp {
     BitOr,  // |=
 }
 
+/// An assignable / incrementable target: either a scalar variable or an
+/// array element. For array elements, `subscript` is the parsed arithmetic
+/// expression (used for INDEXED arrays — arith-evaluated to an index) and
+/// `subscript_raw` is the raw inner source text (used for ASSOCIATIVE
+/// arrays — a literal key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LValue {
+    Scalar(String),
+    Element { name: String, subscript: Box<ArithExpr>, subscript_raw: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArithExpr {
     Num(i64),
     Var(String),
+    /// `name[subscript]` array-element READ. See `LValue::Element` for the
+    /// indexed-vs-associative interpretation of `subscript`/`subscript_raw`.
+    Index { name: String, subscript: Box<ArithExpr>, subscript_raw: String },
     Neg(Box<ArithExpr>),
     Not(Box<ArithExpr>),
     Add(Box<ArithExpr>, Box<ArithExpr>),
@@ -349,13 +393,13 @@ pub enum ArithExpr {
     Shr(Box<ArithExpr>, Box<ArithExpr>),
     // v38 — power (right-associative):
     Pow(Box<ArithExpr>, Box<ArithExpr>),
-    // v38 — assignment (LHS must be a Var; enforced at parse time):
-    Assign { name: String, op: AssignOp, rhs: Box<ArithExpr> },
-    // v38 — pre/post inc/dec (LHS must be a Var):
-    PreInc(String),
-    PreDec(String),
-    PostInc(String),
-    PostDec(String),
+    // v38 — assignment (LHS must be an lvalue; enforced at parse time):
+    Assign { target: LValue, op: AssignOp, rhs: Box<ArithExpr> },
+    // v38 — pre/post inc/dec (LHS must be an lvalue):
+    PreInc(LValue),
+    PreDec(LValue),
+    PostInc(LValue),
+    PostDec(LValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +452,17 @@ type BinOpEntry = (u8, u8, fn(Box<ArithExpr>, Box<ArithExpr>) -> ArithExpr);
 
 /// Maps an assignment token to its corresponding AssignOp variant.
 /// Returns None for non-assignment tokens.
+/// Converts a parsed primary expression into an assignable lvalue, or
+/// `None` if it isn't a scalar var or array element.
+fn expr_to_lvalue(e: ArithExpr) -> Option<LValue> {
+    match e {
+        ArithExpr::Var(name) => Some(LValue::Scalar(name)),
+        ArithExpr::Index { name, subscript, subscript_raw } =>
+            Some(LValue::Element { name, subscript, subscript_raw }),
+        _ => None,
+    }
+}
+
 fn assign_op_from_token(t: &ArithToken) -> Option<AssignOp> {
     match t {
         ArithToken::Assign     => Some(AssignOp::Set),
@@ -459,15 +514,15 @@ impl Parser {
             //    handling so a++ + 1 parses as (a++) + 1.
             if matches!(op, ArithToken::PlusPlus | ArithToken::MinusMinus) && 27 >= min_bp {
                 self.bump();
-                let name = match lhs {
-                    ArithExpr::Var(name) => name,
-                    _ => return Err(ArithError::Parse(
+                let target = match expr_to_lvalue(lhs) {
+                    Some(t) => t,
+                    None => return Err(ArithError::Parse(
                         "postfix ++/-- requires variable on LHS".to_string()
                     )),
                 };
                 lhs = match op {
-                    ArithToken::PlusPlus => ArithExpr::PostInc(name),
-                    _ => ArithExpr::PostDec(name),
+                    ArithToken::PlusPlus => ArithExpr::PostInc(target),
+                    _ => ArithExpr::PostDec(target),
                 };
                 continue;
             }
@@ -477,14 +532,14 @@ impl Parser {
             if let Some(assign_op) = assign_op_from_token(&op) {
                 if 2 < min_bp { break; }
                 self.bump();
-                let name = match lhs {
-                    ArithExpr::Var(name) => name,
-                    _ => return Err(ArithError::Parse(
+                let target = match expr_to_lvalue(lhs) {
+                    Some(t) => t,
+                    None => return Err(ArithError::Parse(
                         "assignment requires variable on LHS".to_string()
                     )),
                 };
                 let rhs = self.parse_expr(1)?;  // rbp = 1 allows cascading assigns
-                lhs = ArithExpr::Assign { name, op: assign_op, rhs: Box::new(rhs) };
+                lhs = ArithExpr::Assign { target, op: assign_op, rhs: Box::new(rhs) };
                 continue;
             }
 
@@ -543,10 +598,38 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// Parses `[subscript]` given the current token is `LBracket`. Returns
+    /// the parsed subscript expression (for indexed arrays) and the raw
+    /// inner source text (for associative-array keys).
+    fn parse_subscript(&mut self) -> Result<(ArithExpr, String), ArithError> {
+        let raw = match self.bump() {
+            Some(ArithToken::LBracket(raw)) => raw,
+            other => return Err(ArithError::Parse(format!(
+                "expected '[', got {other:?}"
+            ))),
+        };
+        let subscript = self.parse_comma_expr()?;
+        match self.bump() {
+            Some(ArithToken::RBracket) => {}
+            other => return Err(ArithError::Parse(format!(
+                "expected ']' after array subscript, got {other:?}"
+            ))),
+        }
+        Ok((subscript, raw))
+    }
+
     fn parse_prefix(&mut self) -> Result<ArithExpr, ArithError> {
         match self.bump() {
             Some(ArithToken::Number(n)) => Ok(ArithExpr::Num(n)),
-            Some(ArithToken::Ident(s)) => Ok(ArithExpr::Var(s)),
+            Some(ArithToken::Ident(s)) => {
+                // `name[subscript]` → array-element reference.
+                if matches!(self.peek(), Some(ArithToken::LBracket(_))) {
+                    let (subscript, subscript_raw) = self.parse_subscript()?;
+                    Ok(ArithExpr::Index { name: s, subscript: Box::new(subscript), subscript_raw })
+                } else {
+                    Ok(ArithExpr::Var(s))
+                }
+            }
             Some(ArithToken::Minus) => {
                 let inner = self.parse_expr(26)?;
                 Ok(ArithExpr::Neg(Box::new(inner)))
@@ -563,19 +646,21 @@ impl Parser {
                 Ok(ArithExpr::BitNot(Box::new(inner)))
             }
             Some(ArithToken::PlusPlus) => {
-                // ++name: prefix increment requires identifier next.
-                match self.bump() {
-                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreInc(name)),
-                    _ => Err(ArithError::Parse(
+                // ++name / ++name[sub]: prefix increment requires an lvalue.
+                let inner = self.parse_prefix()?;
+                match expr_to_lvalue(inner) {
+                    Some(target) => Ok(ArithExpr::PreInc(target)),
+                    None => Err(ArithError::Parse(
                         "prefix ++ requires variable".to_string()
                     )),
                 }
             }
             Some(ArithToken::MinusMinus) => {
-                // --name: prefix decrement requires identifier next.
-                match self.bump() {
-                    Some(ArithToken::Ident(name)) => Ok(ArithExpr::PreDec(name)),
-                    _ => Err(ArithError::Parse(
+                // --name / --name[sub]: prefix decrement requires an lvalue.
+                let inner = self.parse_prefix()?;
+                match expr_to_lvalue(inner) {
+                    Some(target) => Ok(ArithExpr::PreDec(target)),
+                    None => Err(ArithError::Parse(
                         "prefix -- requires variable".to_string()
                     )),
                 }
@@ -618,6 +703,66 @@ fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithE
         .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
 }
 
+/// Arith-evaluates an element's raw string value to an i64, exactly like a
+/// scalar variable: empty/unset → 0, an integer literal → its value, and an
+/// arbitrary arith expression (e.g. "1+1") → recursively evaluated.
+fn element_string_to_i64(
+    shell: &mut Shell,
+    name: &str,
+    raw: Option<String>,
+) -> Result<i64, ArithError> {
+    let raw = raw.unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    if let Ok(n) = raw.parse::<i64>() {
+        return Ok(n);
+    }
+    // Non-numeric: arith-evaluate recursively (an element may hold "1+1").
+    let parsed = parse(&raw).map_err(|_| ArithError::NotAnInteger {
+        var: name.to_string(),
+        value: raw.clone(),
+    })?;
+    eval(&parsed, shell)
+}
+
+/// Reads the current i64 value of an lvalue (scalar var or array element).
+fn read_lvalue_i64(shell: &mut Shell, target: &LValue) -> Result<i64, ArithError> {
+    match target {
+        LValue::Scalar(name) => read_var_i64(shell, name),
+        LValue::Element { name, subscript, subscript_raw } => {
+            if shell.get_associative(name).is_some() {
+                let key = subscript_raw.clone();
+                let raw = shell.lookup_associative_element(name, &key);
+                element_string_to_i64(shell, name, raw)
+            } else {
+                let idx = eval(subscript, shell)?;
+                let raw = shell.lookup_array_element(name, idx as usize);
+                element_string_to_i64(shell, name, raw)
+            }
+        }
+    }
+}
+
+/// Writes an i64 to an lvalue (scalar var or array element).
+fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<(), ArithError> {
+    match target {
+        LValue::Scalar(name) => write_var_i64(shell, name, value),
+        LValue::Element { name, subscript, subscript_raw } => {
+            if shell.get_associative(name).is_some() {
+                shell
+                    .set_associative_element(name, subscript_raw.clone(), value.to_string())
+                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+            } else {
+                let idx = eval(subscript, shell)?;
+                shell
+                    .set_array_element(name, idx as usize, value.to_string())
+                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+            }
+        }
+    }
+}
+
 pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
     match expr {
         ArithExpr::Num(n) => Ok(*n),
@@ -631,6 +776,13 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                     value: raw.to_string(),
                 })
             }
+        }
+        ArithExpr::Index { name, subscript, subscript_raw } => {
+            read_lvalue_i64(shell, &LValue::Element {
+                name: name.clone(),
+                subscript: subscript.clone(),
+                subscript_raw: subscript_raw.clone(),
+            })
         }
         ArithExpr::Neg(e) => Ok(eval(e, shell)?.wrapping_neg()),
         ArithExpr::Not(e) => Ok(if eval(e, shell)? == 0 { 1 } else { 0 }),
@@ -708,62 +860,62 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             }
             Ok(base.wrapping_pow(exp as u32))
         }
-        ArithExpr::Assign { name, op, rhs } => {
+        ArithExpr::Assign { target, op, rhs } => {
             let rhs_val = eval(rhs, shell)?;
             let new_val = match op {
                 AssignOp::Set    => rhs_val,
-                AssignOp::Add    => read_var_i64(shell, name)?.wrapping_add(rhs_val),
-                AssignOp::Sub    => read_var_i64(shell, name)?.wrapping_sub(rhs_val),
-                AssignOp::Mul    => read_var_i64(shell, name)?.wrapping_mul(rhs_val),
+                AssignOp::Add    => read_lvalue_i64(shell, target)?.wrapping_add(rhs_val),
+                AssignOp::Sub    => read_lvalue_i64(shell, target)?.wrapping_sub(rhs_val),
+                AssignOp::Mul    => read_lvalue_i64(shell, target)?.wrapping_mul(rhs_val),
                 AssignOp::Div => {
-                    let lhs = read_var_i64(shell, name)?;
+                    let lhs = read_lvalue_i64(shell, target)?;
                     if rhs_val == 0 { return Err(ArithError::DivisionByZero); }
                     lhs.wrapping_div(rhs_val)
                 }
                 AssignOp::Mod => {
-                    let lhs = read_var_i64(shell, name)?;
+                    let lhs = read_lvalue_i64(shell, target)?;
                     if rhs_val == 0 { return Err(ArithError::ModuloByZero); }
                     lhs.wrapping_rem(rhs_val)
                 }
                 AssignOp::Shl => {
-                    let lhs = read_var_i64(shell, name)?;
+                    let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
                         return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
                     }
                     lhs.wrapping_shl(rhs_val as u32)
                 }
                 AssignOp::Shr => {
-                    let lhs = read_var_i64(shell, name)?;
+                    let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
                         return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
                     }
                     lhs.wrapping_shr(rhs_val as u32)
                 }
-                AssignOp::BitAnd => read_var_i64(shell, name)? & rhs_val,
-                AssignOp::BitXor => read_var_i64(shell, name)? ^ rhs_val,
-                AssignOp::BitOr  => read_var_i64(shell, name)? | rhs_val,
+                AssignOp::BitAnd => read_lvalue_i64(shell, target)? & rhs_val,
+                AssignOp::BitXor => read_lvalue_i64(shell, target)? ^ rhs_val,
+                AssignOp::BitOr  => read_lvalue_i64(shell, target)? | rhs_val,
             };
-            write_var_i64(shell, name, new_val)?;
+            write_lvalue_i64(shell, target, new_val)?;
             Ok(new_val)
         }
-        ArithExpr::PreInc(name) => {
-            let new_val = read_var_i64(shell, name)?.wrapping_add(1);
-            write_var_i64(shell, name, new_val)?;
+        ArithExpr::PreInc(target) => {
+            let new_val = read_lvalue_i64(shell, target)?.wrapping_add(1);
+            write_lvalue_i64(shell, target, new_val)?;
             Ok(new_val)
         }
-        ArithExpr::PreDec(name) => {
-            let new_val = read_var_i64(shell, name)?.wrapping_sub(1);
-            write_var_i64(shell, name, new_val)?;
+        ArithExpr::PreDec(target) => {
+            let new_val = read_lvalue_i64(shell, target)?.wrapping_sub(1);
+            write_lvalue_i64(shell, target, new_val)?;
             Ok(new_val)
         }
-        ArithExpr::PostInc(name) => {
-            let old_val = read_var_i64(shell, name)?;
-            write_var_i64(shell, name, old_val.wrapping_add(1))?;
+        ArithExpr::PostInc(target) => {
+            let old_val = read_lvalue_i64(shell, target)?;
+            write_lvalue_i64(shell, target, old_val.wrapping_add(1))?;
             Ok(old_val)
         }
-        ArithExpr::PostDec(name) => {
-            let old_val = read_var_i64(shell, name)?;
-            write_var_i64(shell, name, old_val.wrapping_sub(1))?;
+        ArithExpr::PostDec(target) => {
+            let old_val = read_lvalue_i64(shell, target)?;
+            write_lvalue_i64(shell, target, old_val.wrapping_sub(1))?;
             Ok(old_val)
         }
     }
@@ -1150,10 +1302,10 @@ mod tests {
         // a = b = 5 parses as Assign(a, Set, Assign(b, Set, 5)).
         let expr = parse("a = b = 5").unwrap();
         assert_eq!(expr, ArithExpr::Assign {
-            name: "a".to_string(),
+            target: LValue::Scalar("a".to_string()),
             op: AssignOp::Set,
             rhs: Box::new(ArithExpr::Assign {
-                name: "b".to_string(),
+                target: LValue::Scalar("b".to_string()),
                 op: AssignOp::Set,
                 rhs: n(5),
             }),
@@ -1191,8 +1343,8 @@ mod tests {
         for (input, expected_op) in cases {
             let expr = parse(input).unwrap();
             match expr {
-                ArithExpr::Assign { name, op, rhs } => {
-                    assert_eq!(name, "a", "for input {input}");
+                ArithExpr::Assign { target, op, rhs } => {
+                    assert_eq!(target, LValue::Scalar("a".to_string()), "for input {input}");
                     assert_eq!(op, expected_op, "for input {input}");
                     assert_eq!(*rhs, ArithExpr::Num(1), "for input {input}");
                 }
@@ -1203,10 +1355,10 @@ mod tests {
 
     #[test]
     fn parse_pre_post_inc_dec() {
-        assert_eq!(parse("++a").unwrap(), ArithExpr::PreInc("a".to_string()));
-        assert_eq!(parse("--a").unwrap(), ArithExpr::PreDec("a".to_string()));
-        assert_eq!(parse("a++").unwrap(), ArithExpr::PostInc("a".to_string()));
-        assert_eq!(parse("a--").unwrap(), ArithExpr::PostDec("a".to_string()));
+        assert_eq!(parse("++a").unwrap(), ArithExpr::PreInc(LValue::Scalar("a".to_string())));
+        assert_eq!(parse("--a").unwrap(), ArithExpr::PreDec(LValue::Scalar("a".to_string())));
+        assert_eq!(parse("a++").unwrap(), ArithExpr::PostInc(LValue::Scalar("a".to_string())));
+        assert_eq!(parse("a--").unwrap(), ArithExpr::PostDec(LValue::Scalar("a".to_string())));
     }
 
     use crate::shell_state::Shell;
@@ -1537,6 +1689,78 @@ mod tests {
         s.set("a", "5".to_string());
         assert_eq!(eval_str("++a", &mut s).unwrap(), 6);
         assert_eq!(s.lookup_var("a"), Some("6".to_string()));
+    }
+
+    #[test]
+    fn parse_index_read() {
+        assert_eq!(parse("arr[0]").unwrap(), ArithExpr::Index {
+            name: "arr".to_string(),
+            subscript: n(0),
+            subscript_raw: "0".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_index_arith_subscript_keeps_raw() {
+        // The parsed subscript is an arith expr; the raw text is preserved
+        // verbatim (used as an associative key).
+        let expr = parse("m[1+1]").unwrap();
+        match expr {
+            ArithExpr::Index { name, subscript, subscript_raw } => {
+                assert_eq!(name, "m");
+                assert_eq!(*subscript, ArithExpr::Add(n(1), n(1)));
+                assert_eq!(subscript_raw, "1+1");
+            }
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_index_assign_lvalue() {
+        let expr = parse("a[2] = 9").unwrap();
+        match expr {
+            ArithExpr::Assign { target, op, rhs } => {
+                assert_eq!(target, LValue::Element {
+                    name: "a".to_string(),
+                    subscript: n(2),
+                    subscript_raw: "2".to_string(),
+                });
+                assert_eq!(op, AssignOp::Set);
+                assert_eq!(*rhs, ArithExpr::Num(9));
+            }
+            other => panic!("expected Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_index_read_indexed_array() {
+        let mut s = Shell::new();
+        s.set_array_element("arr", 0, "10".to_string()).unwrap();
+        s.set_array_element("arr", 1, "20".to_string()).unwrap();
+        assert_eq!(eval_str("arr[0] + arr[1]", &mut s).unwrap(), 30);
+    }
+
+    #[test]
+    fn eval_index_unset_element_is_zero() {
+        let mut s = Shell::new();
+        assert_eq!(eval_str("nope[3] + 5", &mut s).unwrap(), 5);
+    }
+
+    #[test]
+    fn eval_index_compound_assign_indexed() {
+        let mut s = Shell::new();
+        s.set_array_element("a", 0, "10".to_string()).unwrap();
+        s.set_array_element("a", 1, "20".to_string()).unwrap();
+        assert_eq!(eval_str("a[0] += a[1]", &mut s).unwrap(), 30);
+        assert_eq!(s.lookup_array_element("a", 0), Some("30".to_string()));
+    }
+
+    #[test]
+    fn eval_index_post_inc_element() {
+        let mut s = Shell::new();
+        s.set_array_element("a", 1, "2".to_string()).unwrap();
+        assert_eq!(eval_str("a[1]++", &mut s).unwrap(), 2);
+        assert_eq!(s.lookup_array_element("a", 1), Some("3".to_string()));
     }
 
     #[test]

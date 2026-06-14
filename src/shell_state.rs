@@ -926,6 +926,19 @@ impl Shell {
                         raw.parse::<i64>().ok()?
                     }
                 }
+                E::Index { name, subscript, subscript_raw } => {
+                    // Array-element read: associative uses the raw key, indexed
+                    // arith-evaluates the subscript. An unset element reads as 0.
+                    let raw = if sh.get_associative(name).is_some() {
+                        sh.lookup_associative_element(name, subscript_raw)
+                    } else {
+                        let idx = ev(subscript, sh)?;
+                        if idx < 0 { return None; }
+                        sh.lookup_array_element(name, idx as usize)
+                    };
+                    let raw = raw.unwrap_or_default();
+                    if raw.is_empty() { 0 } else { raw.parse::<i64>().ok()? }
+                }
                 E::Neg(a) => ev(a, sh)?.wrapping_neg(),
                 E::Not(a) => i64::from(ev(a, sh)? == 0),
                 E::BitNot(a) => !ev(a, sh)?,
