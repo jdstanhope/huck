@@ -4694,6 +4694,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "xtrace" => Some(shell.shell_options.xtrace),
         "noglob" => Some(shell.shell_options.noglob),
         "noclobber" => Some(shell.shell_options.noclobber),
+        "noexec" => Some(shell.shell_options.noexec),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -4709,6 +4710,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "xtrace" => { shell.shell_options.xtrace = value; Ok(()) }
         "noglob" => { shell.shell_options.noglob = value; Ok(()) }
         "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
+        "noexec" => { shell.shell_options.noexec = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -4811,6 +4813,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                     b'u' => shell.shell_options.nounset = true,
                     b'v' => shell.shell_options.verbose = true,
                     b'x' => shell.shell_options.xtrace = true,
+                    b'n' => shell.shell_options.noexec = true,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {
@@ -4855,6 +4858,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                     b'u' => shell.shell_options.nounset = false,
                     b'v' => shell.shell_options.verbose = false,
                     b'x' => shell.shell_options.xtrace = false,
+                    b'n' => shell.shell_options.noexec = false,
                     b'o' => {
                         i += 1;
                         if i >= args.len() {

@@ -133,6 +133,11 @@ pub struct ShellOptions {
     pub xtrace: bool,
     pub noglob: bool,
     pub noclobber: bool,
+    /// `set -n` / `-o noexec` / the `-n` CLI flag: read and parse commands but
+    /// do not execute them (syntax check). Honored only in a non-interactive
+    /// shell (bash ignores `-n` interactively). Once on, it cannot be turned
+    /// back off mid-script (`set +n` is itself skipped) — matching bash.
+    pub noexec: bool,
 }
 
 /// One row of the bash `shopt` option table.
