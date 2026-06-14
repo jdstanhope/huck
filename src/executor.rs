@@ -516,10 +516,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Redirected { inner, redirects } => {
             run_redirected(inner, redirects, shell, sink)
         }
-        Command::Coproc { .. } => {
-            eprintln!("huck: coproc: not yet implemented");
-            ExecOutcome::Continue(1)
-        }
+        Command::Coproc { name, body } => run_coproc(name, body, shell),
     }
 }
 
@@ -4224,6 +4221,122 @@ enum PipelineStage {
 }
 
 /// Opens a `libc::pipe()` and returns `(read_end, write_end)` as raw fds.
+/// Start a coprocess: fork the body with stdin/stdout wired to two pipes, hold
+/// the shell-side ends (relocated high + close-on-exec) as NAME[0] (read) /
+/// NAME[1] (write), publish NAME_PID, $!, and a job. Returns 0 on a successful
+/// spawn (the coproc runs asynchronously), 1 on pipe/fork failure. coproc
+/// ALWAYS forks (no builtin/function fast-path).
+fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
+    // v157 single-active: warn (but proceed) if a coproc is already live.
+    if let Some(existing) = shell.coprocs.first() {
+        eprintln!(
+            "huck: warning: execute_coproc: coproc [{}:{}] still exists",
+            existing.pid, existing.name
+        );
+    }
+    // make_pipe() returns (read_end, write_end).
+    // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
+    // pipe_out: coproc writes out_w (its stdout) -> shell reads out_r.
+    let (in_r, in_w) = match make_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("huck: coproc: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let (out_r, out_w) = match make_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe {
+                libc::close(in_r);
+                libc::close(in_w);
+            }
+            eprintln!("huck: coproc: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    flush_stdout();
+    // Fork the body: child stdin = in_r, stdout = out_w, stderr inherited; its
+    // own process group (pgid_target 0); the child must NOT keep the shell ends.
+    let pid = match fork_and_run_in_subshell(
+        body,
+        shell,
+        in_r,
+        out_w,
+        libc::STDERR_FILENO,
+        0,
+        &[in_w, out_r],
+        None,
+        None,
+    ) {
+        Ok(pid) => pid,
+        Err(e) => {
+            unsafe {
+                libc::close(in_r);
+                libc::close(in_w);
+                libc::close(out_r);
+                libc::close(out_w);
+            }
+            eprintln!("huck: coproc: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    // Parent: close the child ends; relocate the shell ends high + cloexec.
+    unsafe {
+        libc::close(in_r);
+        libc::close(out_w);
+    }
+    let read_fd = match alloc_high_fd(out_r) {
+        Ok(hi) => {
+            unsafe {
+                libc::close(out_r);
+            }
+            set_cloexec(hi);
+            hi
+        }
+        Err(e) => {
+            unsafe {
+                libc::close(out_r);
+                libc::close(in_w);
+            }
+            eprintln!("huck: coproc: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    let write_fd = match alloc_high_fd(in_w) {
+        Ok(hi) => {
+            unsafe {
+                libc::close(in_w);
+            }
+            set_cloexec(hi);
+            hi
+        }
+        Err(e) => {
+            unsafe {
+                libc::close(read_fd);
+                libc::close(in_w);
+            }
+            eprintln!("huck: coproc: {e}");
+            return ExecOutcome::Continue(1);
+        }
+    };
+    // Publish: NAME=(read write), NAME_PID, $!, a job, and the record.
+    let mut elems: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    elems.insert(0, read_fd.to_string());
+    elems.insert(1, write_fd.to_string());
+    let _ = shell.replace_array(name, elems);
+    shell.set(format!("{name}_PID").as_str(), pid.to_string());
+    shell.last_bg_pid = Some(pid);
+    shell.jobs.add(pid, vec![pid], format!("coproc {name}"));
+    shell.coprocs.push(crate::shell_state::Coproc {
+        name: name.to_string(),
+        pid,
+        read_fd,
+        write_fd,
+    });
+    ExecOutcome::Continue(0)
+}
+
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
