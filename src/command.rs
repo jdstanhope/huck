@@ -193,12 +193,9 @@ fn lit_word(s: &str) -> Word {
 fn finalize_stage(
     program: crate::lexer::Word,
     args: Vec<crate::lexer::Word>,
-    stdin: Option<Redirect>,
-    stdout: Option<Redirect>,
-    stderr: Option<Redirect>,
+    redirects: Vec<Redirection>,
     line: u32,
 ) -> SimpleCommand {
-    let no_redirs = stdin.is_none() && stdout.is_none() && stderr.is_none();
 
     // Walk [program, args…] peeling leading assignments. Stops at the first
     // word that isn't a valid `NAME=value` (per try_split_assignment).
@@ -219,7 +216,7 @@ fn finalize_stage(
     }
     let remaining: Vec<Word> = iter.collect();
 
-    if remaining.is_empty() && no_redirs && !inline.is_empty() {
+    if remaining.is_empty() && redirects.is_empty() && !inline.is_empty() {
         return SimpleCommand::Assign(inline, line);
     }
     // No trailing program word, but redirects (or zero words at all). Produce
@@ -231,9 +228,7 @@ fn finalize_stage(
             inline_assignments: inline,
             program: Word(Vec::new()),
             args: Vec::new(),
-            stdin,
-            stdout,
-            stderr,
+            redirects,
             line,
         });
     }
@@ -244,9 +239,7 @@ fn finalize_stage(
         inline_assignments: inline,
         program,
         args,
-        stdin,
-        stdout,
-        stderr,
+        redirects,
         line,
     })
 }
@@ -277,7 +270,6 @@ pub enum Redirect {
 /// One redirection, applied in source order. Replaces the old fixed
 /// stdin/stdout/stderr slots so fd>2 and source-ordering (`2>&1 >file`) work.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[allow(dead_code)] // wired in task 2
 pub struct Redirection {
     pub fd: RedirFd,
     pub op: RedirOp,
@@ -285,7 +277,6 @@ pub struct Redirection {
 
 /// The target file descriptor of a redirection.
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[allow(dead_code)] // wired in task 2
 pub enum RedirFd {
     /// No explicit prefix: resolves to 0 for input ops, 1 for output ops.
     Default,
@@ -296,7 +287,6 @@ pub enum RedirFd {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[allow(dead_code)] // wired in task 2
 pub enum FileMode {
     ReadOnly,   // <     default fd 0
     Truncate,   // >     default fd 1
@@ -306,7 +296,6 @@ pub enum FileMode {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[allow(dead_code)] // wired in task 2
 pub enum RedirOp {
     File { mode: FileMode, target: Word },
     /// `>&w` (output=true) / `<&w` (output=false). `source` is an fd-number
@@ -320,7 +309,6 @@ pub enum RedirOp {
 
 impl RedirOp {
     /// The fd this op targets when `RedirFd::Default` (no explicit prefix).
-    #[allow(dead_code)] // wired in task 2
     pub fn default_fd(&self) -> u16 {
         match self {
             RedirOp::File { mode: FileMode::ReadOnly | FileMode::ReadWrite, .. } => 0,
@@ -336,7 +324,6 @@ impl RedirOp {
 impl Redirection {
     /// The concrete numeric target fd for non-`Var` redirections (`Var` is
     /// resolved at apply time). Used by the legacy bridge + applier.
-    #[allow(dead_code)] // wired in task 2
     pub fn target_fd(&self) -> Option<u16> {
         match &self.fd {
             RedirFd::Default => Some(self.op.default_fd()),
@@ -344,6 +331,31 @@ impl Redirection {
             RedirFd::Var(_) => None,
         }
     }
+}
+
+/// TEMPORARY bridge (removed in a later task): collapse the ordered list back to
+/// the old fixed 0/1/2 slots so the not-yet-migrated executor keeps working with
+/// IDENTICAL behavior. fd>2 targets, `RedirFd::Var`, `RedirOp::Close`, `<&`
+/// (Dup output:false), and ReadWrite are DROPPED here (made real in later tasks).
+/// Last-wins per slot, matching pre-v156 semantics.
+pub fn legacy_slots(redirs: &[Redirection]) -> (Option<Redirect>, Option<Redirect>, Option<Redirect>) {
+    let (mut sin, mut sout, mut serr) = (None, None, None);
+    for r in redirs {
+        let Some(fd) = r.target_fd() else { continue };
+        let legacy = match &r.op {
+            RedirOp::File { mode: FileMode::ReadOnly, target } => Some(Redirect::Read(target.clone())),
+            RedirOp::File { mode: FileMode::Truncate, target } => Some(Redirect::Truncate(target.clone())),
+            RedirOp::File { mode: FileMode::Append, target } => Some(Redirect::Append(target.clone())),
+            RedirOp::File { mode: FileMode::Clobber, target } => Some(Redirect::Clobber(target.clone())),
+            RedirOp::File { mode: FileMode::ReadWrite, .. } => None,
+            RedirOp::Dup { source, output: true } => Some(Redirect::Dup { fd: fd as i32, source: source.clone() }),
+            RedirOp::Dup { output: false, .. } | RedirOp::Close => None,
+            RedirOp::Heredoc { body, expand, strip_tabs } => Some(Redirect::Heredoc { body: body.clone(), expand: *expand, strip_tabs: *strip_tabs }),
+            RedirOp::HereString(w) => Some(Redirect::HereString(w.clone())),
+        };
+        match fd { 0 => sin = legacy, 1 => sout = legacy, 2 => serr = legacy, _ => {} }
+    }
+    (sin, sout, serr)
 }
 
 /// Left-hand side of an assignment. Bare `name=v` is `Bare`;
@@ -397,13 +409,11 @@ pub struct ExecCommand {
     pub inline_assignments: Vec<Assignment>,
     pub program: Word,
     pub args: Vec<Word>,
-    // BREAKING CHANGE (v24): was Option<Word>; now Option<Redirect> so
-    // `<file` (Read), `<<EOF` (Heredoc), and (future) `<<<` share a
-    // uniform shape. Last-wins: a later redirect to stdin overwrites
-    // an earlier one.
-    pub stdin: Option<Redirect>,
-    pub stdout: Option<Redirect>,
-    pub stderr: Option<Redirect>,
+    /// Redirections in source order (`>a 2>&1` differs from `2>&1 >a`).
+    /// Replaces the old fixed stdin/stdout/stderr slots (v156). The executor
+    /// currently bridges this back to 0/1/2 via `legacy_slots` until the
+    /// applier is migrated in a later task.
+    pub redirects: Vec<Redirection>,
     /// 1-based source line of the command's first token (0 = unknown).
     /// Set at parse time; the executor uses it for $LINENO.
     pub line: u32,
@@ -425,6 +435,19 @@ impl ExecCommand {
             return Some(text.clone());
         }
         None
+    }
+
+    /// TEMPORARY (v156 task 2): the bridged legacy stdin/stdout/stderr slots
+    /// derived from `redirects`. Removed once the executor applies the ordered
+    /// list directly.
+    pub fn legacy_stdin(&self) -> Option<Redirect> {
+        legacy_slots(&self.redirects).0
+    }
+    pub fn legacy_stdout(&self) -> Option<Redirect> {
+        legacy_slots(&self.redirects).1
+    }
+    pub fn legacy_stderr(&self) -> Option<Redirect> {
+        legacy_slots(&self.redirects).2
     }
 }
 
@@ -545,9 +568,9 @@ pub enum Command {
     /// execution: `{ …; } >f`, `while … done <<EOF`, etc. (v97)
     Redirected {
         inner: Box<Command>,
-        stdin: Option<Redirect>,
-        stdout: Option<Redirect>,
-        stderr: Option<Redirect>,
+        /// Trailing redirects in source order (v156). Bridged to 0/1/2 by the
+        /// executor via `legacy_slots` until the applier is migrated.
+        redirects: Vec<Redirection>,
     },
 }
 
@@ -1715,10 +1738,6 @@ fn parse_while(
     Ok(WhileClause { condition, body, until })
 }
 
-/// stdin/stdout/stderr redirect slots plus a flag (true iff at least one
-/// redirect token was consumed).
-type RedirSlots = (Option<Redirect>, Option<Redirect>, Option<Redirect>, bool);
-
 /// True for the operators that introduce a redirection (and thus a trailing
 /// target word). Excludes pipeline/grouping operators (`|`, `(`, `)`, etc.).
 fn is_redirect_op(op: &Operator) -> bool {
@@ -1732,6 +1751,8 @@ fn is_redirect_op(op: &Operator) -> bool {
             | Operator::HereString
             | Operator::DupOut
             | Operator::DupErr
+            | Operator::DupIn
+            | Operator::RedirReadWrite
             | Operator::AndRedirOut
             | Operator::AndRedirAppend
             | Operator::RedirClobber
@@ -1739,27 +1760,144 @@ fn is_redirect_op(op: &Operator) -> bool {
     )
 }
 
-/// Consumes a run of trailing redirect tokens (`<`, `>`, `>>`, `2>`, `2>>`,
-/// `<<<`, `>&`, `2>&`, `&>`, `&>>`, and `Token::Heredoc`) from `iter`,
-/// filling the stdin/stdout/stderr slots (last-wins). Stops at the first
-/// non-redirect token. The `bool` is true iff at least one redirect was
-/// consumed. The op→slot mapping is identical to `parse_simple_stage`'s.
+/// Builds the ordered `Redirection`(s) for a redirect operator + target word.
+///
+/// `fd_prefix` is `Some` when an explicit `Token::RedirFd` preceded the
+/// operator (`3>`, `{fd}>`), else `None`. Most operators map to a single
+/// `Redirection` with `fd = fd_prefix.unwrap_or(Default)`. The stderr-default
+/// operators (`2>`/`2>>`/`2>&`/`2>|`) default their fd to `Number(2)` when no
+/// explicit prefix is given. `&>`/`&>>` desugar to TWO redirections
+/// (file-to-stdout + `2>&1`).
+fn build_redirections(
+    op: Operator,
+    target: Word,
+    fd_prefix: Option<RedirFd>,
+) -> Vec<Redirection> {
+    // Default fd for the stderr-family operators when unprefixed.
+    let err_fd = || fd_prefix.clone().unwrap_or(RedirFd::Number(2));
+    let plain_fd = || fd_prefix.clone().unwrap_or(RedirFd::Default);
+    match op {
+        Operator::RedirIn => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target },
+        }],
+        Operator::RedirOut => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Truncate, target },
+        }],
+        Operator::RedirAppend => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Append, target },
+        }],
+        Operator::RedirClobber => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Clobber, target },
+        }],
+        Operator::RedirReadWrite => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::ReadWrite, target },
+        }],
+        Operator::RedirErr => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Truncate, target },
+        }],
+        Operator::RedirErrAppend => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Append, target },
+        }],
+        Operator::RedirErrClobber => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Clobber, target },
+        }],
+        Operator::HereString => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::HereString(target),
+        }],
+        Operator::DupOut => vec![Redirection {
+            fd: plain_fd(),
+            op: dup_op(target, true),
+        }],
+        Operator::DupErr => vec![Redirection {
+            fd: err_fd(),
+            op: dup_op(target, true),
+        }],
+        Operator::DupIn => vec![Redirection {
+            fd: plain_fd(),
+            op: dup_op(target, false),
+        }],
+        Operator::AndRedirOut => vec![
+            Redirection {
+                fd: plain_fd(),
+                op: RedirOp::File { mode: FileMode::Truncate, target },
+            },
+            Redirection {
+                fd: RedirFd::Number(2),
+                op: RedirOp::Dup { source: lit_word("1"), output: true },
+            },
+        ],
+        Operator::AndRedirAppend => vec![
+            Redirection {
+                fd: plain_fd(),
+                op: RedirOp::File { mode: FileMode::Append, target },
+            },
+            Redirection {
+                fd: RedirFd::Number(2),
+                op: RedirOp::Dup { source: lit_word("1"), output: true },
+            },
+        ],
+        // is_redirect_op gates the callers; no other operator reaches here.
+        _ => unreachable!("build_redirections called with a non-redirect operator"),
+    }
+}
+
+/// `>&w`/`<&w`: a `-` source word closes the fd; otherwise a Dup.
+fn dup_op(source: Word, output: bool) -> RedirOp {
+    if word_literal_text(&source) == Some("-") {
+        RedirOp::Close
+    } else {
+        RedirOp::Dup { source, output }
+    }
+}
+
+/// True iff the next token begins a redirection: a `Token::RedirFd` prefix,
+/// a `Token::Heredoc`, or a redirect operator.
+fn next_is_redirect(iter: &mut TokenCursor) -> bool {
+    match iter.peek() {
+        Some(Token::RedirFd(_)) => true,
+        Some(Token::Heredoc { .. }) => true,
+        Some(Token::Op(op)) => is_redirect_op(op),
+        _ => false,
+    }
+}
+
+/// Consumes a run of trailing redirect tokens (an optional `Token::RedirFd`
+/// prefix, then a redirect operator + target word, or a `Token::Heredoc`)
+/// from `iter`, building an ORDERED list of `Redirection`s in source order
+/// (no last-wins merge — ordering matters for `2>&1 >f` vs `>f 2>&1`).
+/// Stops at the first non-redirect token.
 fn parse_trailing_redirects(
     iter: &mut TokenCursor,
-) -> Result<RedirSlots, ParseError> {
-    let mut stdin: Option<Redirect> = None;
-    let mut stdout: Option<Redirect> = None;
-    let mut stderr: Option<Redirect> = None;
-    let mut saw = false;
+) -> Result<Vec<Redirection>, ParseError> {
+    let mut redirs: Vec<Redirection> = Vec::new();
     loop {
+        // Optional explicit fd-prefix (`3>`, `{fd}>`, `3<<EOF`).
+        let fd_prefix = if let Some(Token::RedirFd(_)) = iter.peek() {
+            let Some(Token::RedirFd(fd)) = iter.next() else {
+                unreachable!("peek confirmed RedirFd")
+            };
+            Some(fd)
+        } else {
+            None
+        };
         match iter.peek() {
             Some(Token::Heredoc { .. }) => {
                 let Some(Token::Heredoc { body, expand, strip_tabs }) = iter.next() else {
                     unreachable!("peek confirmed Heredoc")
                 };
-                // Last-wins: a later heredoc or <file overwrites this.
-                stdin = Some(Redirect::Heredoc { body, expand, strip_tabs });
-                saw = true;
+                redirs.push(Redirection {
+                    fd: fd_prefix.unwrap_or(RedirFd::Number(0)),
+                    op: RedirOp::Heredoc { body, expand, strip_tabs },
+                });
             }
             Some(Token::Op(op)) if is_redirect_op(op) => {
                 let op = *op;
@@ -1769,40 +1907,23 @@ fn parse_trailing_redirects(
                     Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                     Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(Token::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(Token::ArithBlock(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 };
-                match op {
-                    Operator::RedirIn => stdin = Some(Redirect::Read(target)),
-                    Operator::RedirOut => stdout = Some(Redirect::Truncate(target)),
-                    Operator::RedirAppend => stdout = Some(Redirect::Append(target)),
-                    Operator::RedirErr => stderr = Some(Redirect::Truncate(target)),
-                    Operator::RedirErrAppend => stderr = Some(Redirect::Append(target)),
-                    Operator::HereString => stdin = Some(Redirect::HereString(target)),
-                    Operator::DupOut => {
-                        stdout = Some(Redirect::Dup { fd: 1, source: target });
-                    }
-                    Operator::DupErr => {
-                        stderr = Some(Redirect::Dup { fd: 2, source: target });
-                    }
-                    Operator::AndRedirOut => {
-                        stdout = Some(Redirect::Truncate(target));
-                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
-                    }
-                    Operator::AndRedirAppend => {
-                        stdout = Some(Redirect::Append(target));
-                        stderr = Some(Redirect::Dup { fd: 2, source: lit_word("1") });
-                    }
-                    Operator::RedirClobber => stdout = Some(Redirect::Clobber(target)),
-                    Operator::RedirErrClobber => stderr = Some(Redirect::Clobber(target)),
-                    // is_redirect_op excludes all other operators.
-                    _ => unreachable!("is_redirect_op gates the match arms above"),
-                }
-                saw = true;
+                redirs.extend(build_redirections(op, target, fd_prefix));
             }
-            _ => break,
+            _ => {
+                // A bare fd-prefix with no following redirect operator should
+                // not happen (the lexer only emits RedirFd glued to an op), but
+                // guard defensively: a dangling prefix means a missing target.
+                if fd_prefix.is_some() {
+                    return Err(ParseError::MissingRedirectTarget);
+                }
+                break;
+            }
         }
     }
-    Ok((stdin, stdout, stderr, saw))
+    Ok(redirs)
 }
 
 /// Wraps a freshly-parsed compound command in `Command::Redirected` when one
@@ -1813,9 +1934,9 @@ fn maybe_wrap_redirects(
     cmd: Command,
     iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
-    let (stdin, stdout, stderr, saw) = parse_trailing_redirects(iter)?;
-    if saw {
-        Ok(Command::Redirected { inner: Box::new(cmd), stdin, stdout, stderr })
+    let redirects = parse_trailing_redirects(iter)?;
+    if !redirects.is_empty() {
+        Ok(Command::Redirected { inner: Box::new(cmd), redirects })
     } else {
         Ok(cmd)
     }
@@ -1839,9 +1960,7 @@ fn parse_simple_stage(
 ) -> Result<(Command, bool), ParseError> {
     let mut program: Option<Word> = first;
     let mut args: Vec<Word> = Vec::new();
-    let mut stdin: Option<Redirect> = None;
-    let mut stdout: Option<Redirect> = None;
-    let mut stderr: Option<Redirect> = None;
+    let mut redirects: Vec<Redirection> = Vec::new();
     let mut pipe_follows = false;
 
     // Drain prefix_tokens first (extra assignment words re-injected by the
@@ -1881,26 +2000,12 @@ fn parse_simple_stage(
         ) {
             break;
         }
-        // Redirect tokens (a heredoc, or a redirect operator) — delegate to the
-        // shared `parse_trailing_redirects` helper, then merge its slots
-        // last-wins into this stage's. This keeps the simple-command redirect
-        // semantics byte-identical with compound-command redirects.
-        let is_redirect_token = match iter.peek() {
-            Some(Token::Heredoc { .. }) => true,
-            Some(Token::Op(op)) => is_redirect_op(op),
-            _ => false,
-        };
-        if is_redirect_token {
-            let (rin, rout, rerr, _saw) = parse_trailing_redirects(iter)?;
-            if rin.is_some() {
-                stdin = rin;
-            }
-            if rout.is_some() {
-                stdout = rout;
-            }
-            if rerr.is_some() {
-                stderr = rerr;
-            }
+        // Redirect tokens (an fd-prefix, a heredoc, or a redirect operator) —
+        // delegate to the shared `parse_trailing_redirects` helper, appending
+        // its ordered Redirections to this stage's. This keeps the simple- and
+        // compound-command redirect semantics identical.
+        if next_is_redirect(iter) {
+            redirects.extend(parse_trailing_redirects(iter)?);
             continue;
         }
         let token = iter.next().unwrap();
@@ -1949,6 +2054,11 @@ fn parse_simple_stage(
                 // branch; terminators break via the peek-break above).
                 return Err(ParseError::UnexpectedToken);
             }
+            Token::RedirFd(_) => {
+                // Unreachable: next_is_redirect consumes RedirFd prefixes via
+                // the delegation branch above before this match.
+                unreachable!("RedirFd consumed by parse_trailing_redirects branch");
+            }
         }
     }
 
@@ -1964,22 +2074,20 @@ fn parse_simple_stage(
             // no redirections either, the command is genuinely empty: keep
             // MissingCommand so the caller can treat an exhausted iterator as a
             // line continuation and a pending one as a real "expected a command".
-            if stdin.is_none() && stdout.is_none() && stderr.is_none() {
+            if redirects.is_empty() {
                 return Err(ParseError::MissingCommand);
             }
             let cmd = Command::Simple(SimpleCommand::Exec(ExecCommand {
                 inline_assignments: Vec::new(),
                 program: Word(Vec::new()),
                 args: Vec::new(),
-                stdin,
-                stdout,
-                stderr,
+                redirects,
                 line: first_line,
             }));
             return Ok((cmd, pipe_follows));
         }
     };
-    let cmd = Command::Simple(finalize_stage(prog, args, stdin, stdout, stderr, first_line));
+    let cmd = Command::Simple(finalize_stage(prog, args, redirects, first_line));
     Ok((cmd, pipe_follows))
 }
 
@@ -2529,9 +2637,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: ww(program),
             args: args.iter().map(|a| ww(a)).collect(),
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         })
     }
@@ -2568,24 +2674,41 @@ mod tests {
         }
     }
 
-    fn exec_stdout(seq: &Sequence) -> &Option<Redirect> {
+    // These bridge through `legacy_*` so existing slot-based assertions keep
+    // working unchanged during the v156 migration.
+    fn exec_stdout(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => &e.stdout,
+            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stdout(),
             _ => panic!("expected Simple(Exec)"),
         }
     }
 
-    fn exec_stdin(seq: &Sequence) -> &Option<Redirect> {
+    fn exec_stdin(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => &e.stdin,
+            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stdin(),
             _ => panic!("expected Simple(Exec)"),
         }
     }
 
-    fn exec_stderr(seq: &Sequence) -> &Option<Redirect> {
+    fn exec_stderr(seq: &Sequence) -> Option<Redirect> {
         match &first_pipeline(seq).commands[0] {
-            Command::Simple(SimpleCommand::Exec(e)) => &e.stderr,
+            Command::Simple(SimpleCommand::Exec(e)) => e.legacy_stderr(),
             _ => panic!("expected Simple(Exec)"),
+        }
+    }
+
+    /// Tokenize + parse `src`, returning the first ExecCommand's ordered
+    /// redirect list. Panics if the first stage isn't a simple Exec.
+    fn redirs_of(src: &str) -> Vec<Redirection> {
+        let tokens = crate::lexer::tokenize(src).expect("tokenize");
+        let seq = parse(tokens).expect("parse").expect("non-empty");
+        match &seq.first {
+            Command::Pipeline(p) => match &p.commands[0] {
+                Command::Simple(SimpleCommand::Exec(e)) => e.redirects.clone(),
+                other => panic!("expected Simple(Exec), got {other:?}"),
+            },
+            Command::Simple(SimpleCommand::Exec(e)) => e.redirects.clone(),
+            other => panic!("expected a pipeline/simple exec, got {other:?}"),
         }
     }
 
@@ -2615,7 +2738,7 @@ mod tests {
         let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirOut), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(exec_stdout(&seq), &Some(Redirect::Truncate(ww("f"))));
+        assert_eq!(exec_stdout(&seq), Some(Redirect::Truncate(ww("f"))));
     }
 
     #[test]
@@ -2623,7 +2746,7 @@ mod tests {
         let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirAppend), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(exec_stdout(&seq), &Some(Redirect::Append(ww("f"))));
+        assert_eq!(exec_stdout(&seq), Some(Redirect::Append(ww("f"))));
     }
 
     #[test]
@@ -2631,7 +2754,7 @@ mod tests {
         let seq = parse(vec![w_tok("cat"), Token::Op(Operator::RedirIn), w_tok("f")])
             .unwrap()
             .unwrap();
-        assert_eq!(exec_stdin(&seq), &Some(Redirect::Read(ww("f"))));
+        assert_eq!(exec_stdin(&seq), Some(Redirect::Read(ww("f"))));
     }
 
     #[test]
@@ -2639,7 +2762,7 @@ mod tests {
         let seq = parse(vec![w_tok("cmd"), Token::Op(Operator::RedirErr), w_tok("e")])
             .unwrap()
             .unwrap();
-        assert_eq!(exec_stderr(&seq), &Some(Redirect::Truncate(ww("e"))));
+        assert_eq!(exec_stderr(&seq), Some(Redirect::Truncate(ww("e"))));
     }
 
     #[test]
@@ -2651,7 +2774,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(exec_stderr(&seq), &Some(Redirect::Append(ww("e"))));
+        assert_eq!(exec_stderr(&seq), Some(Redirect::Append(ww("e"))));
     }
 
     // ── >| clobber redirect parser tests (v123) ──────────────────────────
@@ -2664,7 +2787,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(exec_stdout(&seq), &Some(Redirect::Clobber(ww("f"))));
+        assert_eq!(exec_stdout(&seq), Some(Redirect::Clobber(ww("f"))));
     }
 
     #[test]
@@ -2676,7 +2799,7 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert_eq!(exec_stderr(&seq), &Some(Redirect::Clobber(ww("e"))));
+        assert_eq!(exec_stderr(&seq), Some(Redirect::Clobber(ww("e"))));
     }
 
     #[test]
@@ -2749,8 +2872,8 @@ mod tests {
                 assert!(ec.program.0.is_empty(), "program word should be empty");
                 assert!(ec.args.is_empty());
                 assert!(ec.inline_assignments.is_empty());
-                assert_eq!(ec.stdout, Some(Redirect::Truncate(ww("f"))));
-                assert!(ec.stdin.is_none() && ec.stderr.is_none());
+                assert_eq!(ec.legacy_stdout(), Some(Redirect::Truncate(ww("f"))));
+                assert!(ec.legacy_stdin().is_none() && ec.legacy_stderr().is_none());
             }
             other => panic!("expected empty-program Exec, got {other:?}"),
         }
@@ -2923,7 +3046,7 @@ mod tests {
                 assert_eq!(e.inline_assignments.len(), 1);
                 assert_eq!(e.inline_assignments[0].target.name(), "FOO");
                 assert_eq!(e.program, Word(Vec::new()));
-                assert_eq!(e.stdout, Some(Redirect::Truncate(ww("f"))));
+                assert_eq!(e.legacy_stdout(), Some(Redirect::Truncate(ww("f"))));
             }
             _ => panic!("expected Simple(Exec)"),
         }
@@ -2958,10 +3081,8 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww("bar")],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
-            line: 0,
+                    redirects: Vec::new(),
+                    line: 0,
                 }))],
             }),
             rest: vec![],
@@ -3521,7 +3642,8 @@ mod tests {
     fn brace_group_with_trailing_redirect_wraps() {
         let cmd = parse_one("{ echo a; } > f");
         match cmd {
-            Command::Redirected { inner, stdin, stdout, stderr } => {
+            Command::Redirected { inner, redirects } => {
+                let (stdin, stdout, stderr) = legacy_slots(&redirects);
                 assert!(matches!(*inner, Command::BraceGroup(_)), "inner should be BraceGroup");
                 assert!(stdin.is_none());
                 assert!(matches!(stdout, Some(Redirect::Truncate(_))), "stdout should be Truncate");
@@ -3535,7 +3657,8 @@ mod tests {
     fn while_with_trailing_heredoc_wraps() {
         let cmd = parse_one("while read x; do echo $x; done <<EOF\na\nb\nEOF\n");
         match cmd {
-            Command::Redirected { inner, stdin, stdout, stderr } => {
+            Command::Redirected { inner, redirects } => {
+                let (stdin, stdout, stderr) = legacy_slots(&redirects);
                 assert!(matches!(*inner, Command::While(_)), "inner should be While");
                 assert!(matches!(stdin, Some(Redirect::Heredoc { .. })), "stdin should be Heredoc");
                 assert!(stdout.is_none());
@@ -4305,11 +4428,12 @@ mod tests {
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("expected Simple(Exec)") };
         // The last heredoc (B's body) should be in stdin.
-        if let Some(Redirect::Heredoc { body, .. }) = &e.stdin {
+        let stdin = e.legacy_stdin();
+        if let Some(Redirect::Heredoc { body, .. }) = &stdin {
             // body_b → Literal{"body_b", quoted:false} + Literal{"\n", quoted:true}
             assert_eq!(body.0.len(), 2, "expected body_b parts, got: {:?}", body.0);
         } else {
-            panic!("expected Heredoc stdin, got: {:?}", e.stdin);
+            panic!("expected Heredoc stdin, got: {stdin:?}");
         }
     }
 
@@ -4321,14 +4445,16 @@ mod tests {
         let Command::Pipeline(p) = &seq.first else { panic!("expected Pipeline") };
         assert_eq!(p.commands.len(), 2, "expected 2 pipeline stages");
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
+        let s0 = stage0.legacy_stdin();
         assert!(
-            matches!(stage0.stdin, Some(Redirect::Heredoc { .. })),
-            "stage 0 should have Heredoc stdin, got: {:?}", stage0.stdin
+            matches!(s0, Some(Redirect::Heredoc { .. })),
+            "stage 0 should have Heredoc stdin, got: {s0:?}"
         );
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
+        let s1 = stage1.legacy_stdin();
         assert!(
-            stage1.stdin.is_none(),
-            "stage 1 should have no stdin, got: {:?}", stage1.stdin
+            s1.is_none(),
+            "stage 1 should have no stdin, got: {s1:?}"
         );
     }
 
@@ -4464,7 +4590,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4473,7 +4599,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4482,7 +4608,7 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.stdin, Some(Redirect::HereString(_))));
+        assert!(matches!(&e.legacy_stdin(), Some(Redirect::HereString(_))));
     }
 
     #[test]
@@ -4499,9 +4625,9 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 2);
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&stage0.stdin, Some(Redirect::HereString(_))));
+        assert!(matches!(&stage0.legacy_stdin(), Some(Redirect::HereString(_))));
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
-        assert!(stage1.stdin.is_none());
+        assert!(stage1.legacy_stdin().is_none());
     }
 
     // ── v28 subshell parser tests ────────────────────────────────────────────
@@ -4627,7 +4753,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let Some(Redirect::Dup { fd, source }) = &e.stdout else { panic!("got {:?}", e.stdout) };
+        let stdout = e.legacy_stdout();
+        let Some(Redirect::Dup { fd, source }) = &stdout else { panic!("got {stdout:?}") };
         assert_eq!(*fd, 1);
         // source Word's first part should be Literal "2".
         assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "2"));
@@ -4639,7 +4766,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let Some(Redirect::Dup { fd, source }) = &e.stderr else { panic!("got {:?}", e.stderr) };
+        let stderr = e.legacy_stderr();
+        let Some(Redirect::Dup { fd, source }) = &stderr else { panic!("got {stderr:?}") };
         assert_eq!(*fd, 2);
         assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
     }
@@ -4651,10 +4779,12 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
         // stdout = Truncate(file)
-        let Some(Redirect::Truncate(file)) = &e.stdout else { panic!("got {:?}", e.stdout) };
+        let stdout = e.legacy_stdout();
+        let Some(Redirect::Truncate(file)) = &stdout else { panic!("got {stdout:?}") };
         assert!(matches!(&file.0[0], WordPart::Literal { text, .. } if text == "file"));
         // stderr = Dup{fd:2, source:"1"}
-        let Some(Redirect::Dup { fd, source }) = &e.stderr else { panic!("got {:?}", e.stderr) };
+        let stderr = e.legacy_stderr();
+        let Some(Redirect::Dup { fd, source }) = &stderr else { panic!("got {stderr:?}") };
         assert_eq!(*fd, 2);
         assert!(matches!(&source.0[0], WordPart::Literal { text, .. } if text == "1"));
     }
@@ -4665,8 +4795,10 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let Some(Redirect::Append(_)) = &e.stdout else { panic!("got {:?}", e.stdout) };
-        let Some(Redirect::Dup { fd, .. }) = &e.stderr else { panic!() };
+        let stdout = e.legacy_stdout();
+        let Some(Redirect::Append(_)) = &stdout else { panic!("got {stdout:?}") };
+        let stderr = e.legacy_stderr();
+        let Some(Redirect::Dup { fd, .. }) = &stderr else { panic!() };
         assert_eq!(*fd, 2);
     }
 
@@ -4677,7 +4809,8 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        let Some(Redirect::Dup { source, .. }) = &e.stderr else { panic!() };
+        let stderr = e.legacy_stderr();
+        let Some(Redirect::Dup { source, .. }) = &stderr else { panic!() };
         assert!(source.0.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "FD")));
     }
 
@@ -4688,9 +4821,9 @@ mod tests {
         let Command::Pipeline(p) = parsed.first else { panic!() };
         assert_eq!(p.commands.len(), 2);
         let Command::Simple(SimpleCommand::Exec(stage0)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&stage0.stderr, Some(Redirect::Dup { .. })));
+        assert!(matches!(&stage0.legacy_stderr(), Some(Redirect::Dup { .. })));
         let Command::Simple(SimpleCommand::Exec(stage1)) = &p.commands[1] else { panic!() };
-        assert!(stage1.stderr.is_none());
+        assert!(stage1.legacy_stderr().is_none());
     }
 
     #[test]
@@ -4699,8 +4832,98 @@ mod tests {
         let parsed = parse(tokens).unwrap().expect("non-empty parse");
         let Command::Pipeline(p) = parsed.first else { panic!() };
         let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!() };
-        assert!(matches!(&e.stdout, Some(Redirect::Truncate(_))));
-        assert!(matches!(&e.stderr, Some(Redirect::Dup { fd: 2, .. })));
+        assert!(matches!(&e.legacy_stdout(), Some(Redirect::Truncate(_))));
+        assert!(matches!(&e.legacy_stderr(), Some(Redirect::Dup { fd: 2, .. })));
+    }
+
+    // ── v156: ordered redirect-list parser tests ─────────────────────────────
+
+    #[test]
+    fn parser_redirects_preserve_source_order() {
+        // `cmd >a 2>&1` → [File(Truncate) @ Default, Dup @ Number(2)]
+        let redirs = redirs_of("cmd >a 2>&1");
+        assert_eq!(redirs.len(), 2);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Default, op: RedirOp::File { mode: FileMode::Truncate, .. } }
+        ), "got {:?}", redirs[0]);
+        assert!(matches!(
+            &redirs[1],
+            Redirection { fd: RedirFd::Number(2), op: RedirOp::Dup { output: true, .. } }
+        ), "got {:?}", redirs[1]);
+
+        // `cmd 2>&1 >a` → reversed order.
+        let redirs = redirs_of("cmd 2>&1 >a");
+        assert_eq!(redirs.len(), 2);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Number(2), op: RedirOp::Dup { output: true, .. } }
+        ), "got {:?}", redirs[0]);
+        assert!(matches!(
+            &redirs[1],
+            Redirection { fd: RedirFd::Default, op: RedirOp::File { mode: FileMode::Truncate, .. } }
+        ), "got {:?}", redirs[1]);
+    }
+
+    #[test]
+    fn parser_readwrite_and_named_fd() {
+        // `cmd 3<>f` → Number(3) + File(ReadWrite)
+        let redirs = redirs_of("cmd 3<>f");
+        assert_eq!(redirs.len(), 1);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Number(3), op: RedirOp::File { mode: FileMode::ReadWrite, .. } }
+        ), "got {:?}", redirs[0]);
+
+        // `cmd {fd}>f` → Var("fd") + File(Truncate)
+        let redirs = redirs_of("cmd {fd}>f");
+        assert_eq!(redirs.len(), 1);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Var(n), op: RedirOp::File { mode: FileMode::Truncate, .. } } if n == "fd"
+        ), "got {:?}", redirs[0]);
+
+        // `cmd 3>&-` → Number(3) + Close
+        let redirs = redirs_of("cmd 3>&-");
+        assert_eq!(redirs.len(), 1);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Number(3), op: RedirOp::Close }
+        ), "got {:?}", redirs[0]);
+    }
+
+    #[test]
+    fn parser_and_redir_emits_two_ordered_redirections() {
+        // `cmd &>file` desugars to [File(Truncate) @ Default, Dup @ Number(2)].
+        let redirs = redirs_of("cmd &>file");
+        assert_eq!(redirs.len(), 2);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Default, op: RedirOp::File { mode: FileMode::Truncate, .. } }
+        ), "got {:?}", redirs[0]);
+        assert!(matches!(
+            &redirs[1],
+            Redirection { fd: RedirFd::Number(2), op: RedirOp::Dup { output: true, .. } }
+        ), "got {:?}", redirs[1]);
+    }
+
+    #[test]
+    fn parser_dup_in_and_close() {
+        // `cmd <&3` → Default fd, Dup{output:false}.
+        let redirs = redirs_of("cmd <&3");
+        assert_eq!(redirs.len(), 1);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Default, op: RedirOp::Dup { output: false, .. } }
+        ), "got {:?}", redirs[0]);
+
+        // `cmd <&-` → Default fd, Close.
+        let redirs = redirs_of("cmd <&-");
+        assert_eq!(redirs.len(), 1);
+        assert!(matches!(
+            &redirs[0],
+            Redirection { fd: RedirFd::Default, op: RedirOp::Close }
+        ), "got {:?}", redirs[0]);
     }
 
     // ──────────────────────────────────────────────────────────────

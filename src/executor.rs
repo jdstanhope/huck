@@ -512,8 +512,8 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
         Command::Arith(expr) => run_arith(expr, shell),
         Command::Select(clause) => run_select(clause, shell, sink),
-        Command::Redirected { inner, stdin, stdout, stderr } => {
-            run_redirected(inner, stdin, stdout, stderr, shell, sink)
+        Command::Redirected { inner, redirects } => {
+            run_redirected(inner, redirects, shell, sink)
         }
     }
 }
@@ -576,7 +576,7 @@ impl Drop for CompoundRedirectScope {
 /// for wrapping a body-running command (function / eval / source) in
 /// `with_redirect_scope`.
 fn has_any_redirect(cmd: &ExecCommand) -> bool {
-    cmd.stdin.is_some() || cmd.stdout.is_some() || cmd.stderr.is_some()
+    !cmd.redirects.is_empty()
 }
 
 fn with_redirect_scope<F>(
@@ -720,13 +720,13 @@ where
 /// and returns `Continue(1)` WITHOUT running `inner`.
 fn run_redirected(
     inner: &Command,
-    stdin: &Option<Redirect>,
-    stdout: &Option<Redirect>,
-    stderr: &Option<Redirect>,
+    redirects: &[crate::command::Redirection],
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
-    with_redirect_scope(stdin, stdout, stderr, shell, sink, |shell, inner_sink| {
+    // TEMPORARY bridge: collapse the ordered list to 0/1/2 slots (v156 task 2).
+    let (stdin, stdout, stderr) = crate::command::legacy_slots(redirects);
+    with_redirect_scope(&stdin, &stdout, &stderr, shell, sink, |shell, inner_sink| {
         run_command(inner, shell, inner_sink)
     })
 }
@@ -1755,7 +1755,7 @@ fn run_background_sequence(
         // the read end becomes this stage's stdin and the parent holds no write
         // end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-            match &exec.stdin {
+            match &exec.legacy_stdin() {
                 Some(Redirect::Read(word)) => {
                     if let Some(r) = prev_pipe_read.take() {
                         parent_held.retain(|&fd| fd != r);
@@ -1840,7 +1840,7 @@ fn run_background_sequence(
         // ---- Stdout redirect (ExecCommand only) ------------------------------
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.stdout {
+                match &exec.legacy_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -1904,7 +1904,7 @@ fn run_background_sequence(
         // ---- Stderr redirect (ExecCommand only) ------------------------------
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.stderr {
+                match &exec.legacy_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -2011,7 +2011,7 @@ fn run_background_sequence(
         // spawn_external_with_fds itself.
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.stdout {
+                let sdt = match &exec.legacy_stdout() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -2028,7 +2028,7 @@ fn run_background_sequence(
                     }
                     _ => None,
                 };
-                let sedt = match &exec.stderr {
+                let sedt = match &exec.legacy_stderr() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -2336,7 +2336,10 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             args.extend(fields);
         }
     }
-    let stdin = match &cmd.stdin {
+    // TEMPORARY bridge: collapse the ordered redirect list to 0/1/2 slots
+    // (v156 task 2) so the existing resolver logic is byte-identical.
+    let (cmd_stdin, cmd_stdout, cmd_stderr) = crate::command::legacy_slots(&cmd.redirects);
+    let stdin = match &cmd_stdin {
         Some(Redirect::Read(word)) => {
             let path = expand_single(word, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
@@ -2359,7 +2362,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         ),
         None => None,
     };
-    let stdout = match &cmd.stdout {
+    let stdout = match &cmd_stdout {
         Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
@@ -2391,7 +2394,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         }
         None => None,
     };
-    let stderr = match &cmd.stderr {
+    let stderr = match &cmd_stderr {
         Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
             let path = expand_single(w, shell).map_err(|()| 1)?;
             if let Some(status) = shell.pending_fatal_pe_error {
@@ -2587,10 +2590,11 @@ fn prepare_builtin_stderr(stderr: Option<File>, dup_target: Option<RawFd>) -> Op
 /// On a bad fd target, prints `huck: <err>` and returns `Err(())` (status 1),
 /// mirroring the external path's `resolve_fd_target` error handling.
 fn builtin_stdout_dup_file(cmd: &ExecCommand, shell: &mut Shell) -> Result<Option<File>, ()> {
-    let source = match &cmd.stdout {
-        Some(Redirect::Dup { source, .. }) => source,
+    let source = match &cmd.legacy_stdout() {
+        Some(Redirect::Dup { source, .. }) => source.clone(),
         _ => return Ok(None),
     };
+    let source = &source;
     let expanded = expand_assignment(source, shell);
     if expanded == "-" {
         return match OpenOptions::new().write(true).open("/dev/null") {
@@ -2620,7 +2624,7 @@ fn builtin_stdout_dup_file(cmd: &ExecCommand, shell: &mut Shell) -> Result<Optio
 /// duration. `2>&N` for other N is left to the subprocess path (rare on
 /// builtins) and treated as no in-process dup.
 fn stderr_dups_to_stdout(cmd: &ExecCommand, shell: &mut Shell) -> bool {
-    match &cmd.stderr {
+    match &cmd.legacy_stderr() {
         Some(Redirect::Dup { source, .. }) => matches!(resolve_fd_target(source, shell), Ok(1)),
         _ => false,
     }
@@ -3129,9 +3133,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             inline_assignments: cmd.inline_assignments.clone(),
             program: cmd.args[k].clone(),
             args: cmd.args[k + 1..].to_vec(),
-            stdin: cmd.stdin.clone(),
-            stdout: cmd.stdout.clone(),
-            stderr: cmd.stderr.clone(),
+            redirects: cmd.redirects.clone(),
             line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
@@ -3158,9 +3160,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             inline_assignments: cmd.inline_assignments.clone(),
             program: cmd.args[0].clone(),
             args: cmd.args[1..].to_vec(),
-            stdin: cmd.stdin.clone(),
-            stdout: cmd.stdout.clone(),
-            stderr: cmd.stderr.clone(),
+            redirects: cmd.redirects.clone(),
             line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
@@ -3187,10 +3187,11 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // `x=1 </missing` → `x` is set, rc 1) — with_redirect_scope returns the
         // open failure before running the body, so its status wins.
         let st = run_assignment_list(&cmd.inline_assignments, shell);
+        let (sb_stdin, sb_stdout, sb_stderr) = crate::command::legacy_slots(&cmd.redirects);
         let outcome = with_redirect_scope(
-            &cmd.stdin,
-            &cmd.stdout,
-            &cmd.stderr,
+            &sb_stdin,
+            &sb_stdout,
+            &sb_stderr,
             shell,
             sink,
             move |_shell, _sink| ExecOutcome::Continue(st),
@@ -3451,7 +3452,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         let name = resolved.program.clone();
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+            let (rin, rout, rerr) = crate::command::legacy_slots(&cmd.redirects);
+            with_redirect_scope(&rin, &rout, &rerr, shell, sink,
                 move |shell, inner_sink| call_function(&name, body, args, shell, inner_sink))
         } else {
             call_function(&name, body, args, shell, sink)
@@ -3464,7 +3466,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if resolved.program == "eval" {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+            let (rin, rout, rerr) = crate::command::legacy_slots(&cmd.redirects);
+            with_redirect_scope(&rin, &rout, &rerr, shell, sink,
                 move |shell, inner_sink| builtins::eval_in_sink(&args, shell, inner_sink))
         } else {
             builtins::eval_in_sink(&args, shell, sink)
@@ -3472,7 +3475,8 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.stdin, &cmd.stdout, &cmd.stderr, shell, sink,
+            let (rin, rout, rerr) = crate::command::legacy_slots(&cmd.redirects);
+            with_redirect_scope(&rin, &rout, &rerr, shell, sink,
                 move |shell, inner_sink| builtins::source_in_sink(&args, shell, inner_sink))
         } else {
             builtins::source_in_sink(&args, shell, sink)
@@ -3572,7 +3576,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             }
         };
         // Resolve Dup targets pre-fork (expansion may allocate; not async-signal-safe).
-        let stdout_dup_target = match &cmd.stdout {
+        // TEMPORARY bridge to 0/1/2 slots (v156 task 2).
+        let (_cmd_bin, cmd_bout, cmd_berr) = crate::command::legacy_slots(&cmd.redirects);
+        let stdout_dup_target = match &cmd_bout {
             Some(Redirect::Dup { source, .. }) => {
                 match resolve_fd_target(source, shell) {
                     Ok(fd) => Some(fd),
@@ -3586,7 +3592,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             }
             _ => None,
         };
-        let stderr_dup_target = match &cmd.stderr {
+        let stderr_dup_target = match &cmd_berr {
             Some(Redirect::Dup { source, .. }) => {
                 match resolve_fd_target(source, shell) {
                     Ok(fd) => Some(fd),
@@ -3717,7 +3723,9 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
     use std::os::unix::io::IntoRawFd;
     let mut scope = CompoundRedirectScope::new();
 
-    if let Some(r) = &cmd.stdin {
+    // TEMPORARY bridge to 0/1/2 slots (v156 task 2).
+    let (cmd_stdin, cmd_stdout, cmd_stderr) = crate::command::legacy_slots(&cmd.redirects);
+    if let Some(r) = &cmd_stdin {
         let new_fd: RawFd = match r {
             Redirect::Read(word) => {
                 let path = match expand_single(word, shell) {
@@ -3758,12 +3766,12 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
         }
         unsafe { libc::close(new_fd); }
     }
-    if let Some(r) = &cmd.stdout
+    if let Some(r) = &cmd_stdout
         && apply_out_redirect(r, libc::STDOUT_FILENO, &mut scope, shell).is_err()
     {
         return Err(());
     }
-    if let Some(r) = &cmd.stderr
+    if let Some(r) = &cmd_stderr
         && apply_out_redirect(r, libc::STDERR_FILENO, &mut scope, shell).is_err()
     {
         return Err(());
@@ -4270,7 +4278,7 @@ fn run_multi_stage(
         // heredoc contract), handed to `spawn_heredoc_writer`, and the read end
         // becomes this stage's stdin. The parent never holds the pipe write end.
         let stdin_fd: RawFd = if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-            match &exec.stdin {
+            match &exec.legacy_stdin() {
                 Some(Redirect::Read(word)) => {
                     // Discard the previous stage's pipe read-end: this stage
                     // overrides stdin, so that pipe would otherwise be leaked
@@ -4373,7 +4381,7 @@ fn run_multi_stage(
         // ---- Determine stdout redirect (from ExecCommand if Simple) ----------
         let explicit_stdout_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.stdout {
+                match &exec.legacy_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -4433,7 +4441,7 @@ fn run_multi_stage(
         // ---- Determine stderr redirect (from ExecCommand if Simple) ----------
         let explicit_stderr_fd: Option<RawFd> =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                match &exec.stderr {
+                match &exec.legacy_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
                         let path = match expand_single(w, shell) {
                             Ok(p) => p,
@@ -4562,7 +4570,7 @@ fn run_multi_stage(
         // spawn_external_with_fds itself.
         let (stdout_dup_target, stderr_dup_target) =
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
-                let sdt = match &exec.stdout {
+                let sdt = match &exec.legacy_stdout() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -4582,7 +4590,7 @@ fn run_multi_stage(
                     }
                     _ => None,
                 };
-                let sedt = match &exec.stderr {
+                let sedt = match &exec.legacy_stderr() {
                     Some(Redirect::Dup { source, .. }) => {
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
@@ -5511,11 +5519,11 @@ fn spawn_external_with_fds(
 
     // Resolve Dup targets pre-fork (Word expansion may allocate; not async-signal-safe).
     // stdout-dup BEFORE stderr-dup matches canonical `>file 2>&1` semantics.
-    let stdout_dup_target: Option<i32> = match &exec.stdout {
+    let stdout_dup_target: Option<i32> = match &exec.legacy_stdout() {
         Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };
-    let stderr_dup_target: Option<i32> = match &exec.stderr {
+    let stderr_dup_target: Option<i32> = match &exec.legacy_stderr() {
         Some(Redirect::Dup { source, .. }) => Some(resolve_fd_target(source, shell)?),
         _ => None,
     };
@@ -5758,9 +5766,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: ww("echo"),
                     args: vec![ww(word)],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -5783,9 +5789,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: ww("test"),
                     args: vec![ww(lhs), ww("-eq"), ww("0")],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -5811,9 +5815,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: lit_word(program),
             args: args.iter().map(|a| lit_word(a)).collect(),
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         })
     }
@@ -6018,9 +6020,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -6103,9 +6103,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Var { name: var.to_string(), quoted: false }])],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -6123,9 +6121,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "continue".to_string(), quoted: false }]),
                     args: vec![],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -6225,9 +6221,7 @@ mod tests {
                 inline_assignments: Vec::new(),
                 program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
                 args: vec![Word(vec![WordPart::Literal { text: "NOPE".to_string(), quoted: false }])],
-                stdin: None,
-                stdout: None,
-                stderr: None,
+                redirects: Vec::new(),
                 line: 0,
             }))],
         });
@@ -6258,9 +6252,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: ww("break"),
                     args: vec![],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -6436,9 +6428,7 @@ mod tests {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
                     args: vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])],
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
+                    redirects: Vec::new(),
                     line: 0,
                 }))],
             }),
@@ -6556,9 +6546,7 @@ mod tests {
             inline_assignments: vec![bare_assign("FOO", lit_word("inner"))],
             program: lit_word("true"),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
@@ -6581,9 +6569,7 @@ mod tests {
             inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("myfunc"),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
@@ -6599,9 +6585,7 @@ mod tests {
             inline_assignments: vec![bare_assign("FOO", lit_word("val"))],
             program: lit_word("export"),
             args: vec![lit_word("FOO")],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         });
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
@@ -6685,9 +6669,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: lit_word(program),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         }))
     }
@@ -6700,9 +6682,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         }))
     }
@@ -6802,9 +6782,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: lit_word("cat"),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         };
         assert_eq!(exec.program_static_text(), Some("cat".to_string()));
@@ -6818,9 +6796,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: Word(vec![WordPart::Literal { text: "cat".to_string(), quoted: true }]),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         };
         // Quoted literal → None (could be a function or builtin masked by quoting).
@@ -6835,9 +6811,7 @@ mod tests {
             inline_assignments: Vec::new(),
             program: Word(vec![WordPart::Var { name: "cmd".to_string(), quoted: false }]),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
@@ -6855,9 +6829,7 @@ mod tests {
                 WordPart::Literal { text: "t".to_string(), quoted: false },
             ]),
             args: vec![],
-            stdin: None,
-            stdout: None,
-            stderr: None,
+            redirects: Vec::new(),
             line: 0,
         };
         assert_eq!(exec.program_static_text(), None);
