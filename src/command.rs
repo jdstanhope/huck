@@ -274,6 +274,78 @@ pub enum Redirect {
     Dup { fd: i32, source: Word },
 }
 
+/// One redirection, applied in source order. Replaces the old fixed
+/// stdin/stdout/stderr slots so fd>2 and source-ordering (`2>&1 >file`) work.
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[allow(dead_code)] // wired in task 2
+pub struct Redirection {
+    pub fd: RedirFd,
+    pub op: RedirOp,
+}
+
+/// The target file descriptor of a redirection.
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[allow(dead_code)] // wired in task 2
+pub enum RedirFd {
+    /// No explicit prefix: resolves to 0 for input ops, 1 for output ops.
+    Default,
+    /// `3>` / `2<&` — an explicit numeric fd.
+    Number(u16),
+    /// `{name}>` — allocate a free fd (>=10) at apply time and assign $name.
+    Var(String),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[allow(dead_code)] // wired in task 2
+pub enum FileMode {
+    ReadOnly,   // <     default fd 0
+    Truncate,   // >     default fd 1
+    Append,     // >>    default fd 1
+    Clobber,    // >|    default fd 1
+    ReadWrite,  // <>    default fd 0
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[allow(dead_code)] // wired in task 2
+pub enum RedirOp {
+    File { mode: FileMode, target: Word },
+    /// `>&w` (output=true) / `<&w` (output=false). `source` is an fd-number
+    /// word; a `-` source is normalized to `Close` by the parser.
+    Dup { source: Word, output: bool },
+    /// `N>&-` / `N<&-`.
+    Close,
+    Heredoc { body: Word, expand: bool, strip_tabs: bool },
+    HereString(Word),
+}
+
+impl RedirOp {
+    /// The fd this op targets when `RedirFd::Default` (no explicit prefix).
+    #[allow(dead_code)] // wired in task 2
+    pub fn default_fd(&self) -> u16 {
+        match self {
+            RedirOp::File { mode: FileMode::ReadOnly | FileMode::ReadWrite, .. } => 0,
+            RedirOp::File { .. } => 1,
+            RedirOp::Dup { output: true, .. } => 1,
+            RedirOp::Dup { output: false, .. } => 0,
+            RedirOp::Close => 0,
+            RedirOp::Heredoc { .. } | RedirOp::HereString(_) => 0,
+        }
+    }
+}
+
+impl Redirection {
+    /// The concrete numeric target fd for non-`Var` redirections (`Var` is
+    /// resolved at apply time). Used by the legacy bridge + applier.
+    #[allow(dead_code)] // wired in task 2
+    pub fn target_fd(&self) -> Option<u16> {
+        match &self.fd {
+            RedirFd::Default => Some(self.op.default_fd()),
+            RedirFd::Number(n) => Some(*n),
+            RedirFd::Var(_) => None,
+        }
+    }
+}
+
 /// Left-hand side of an assignment. Bare `name=v` is `Bare`;
 /// subscripted `name[expr]=v` is `Indexed`.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -5339,5 +5411,18 @@ mod tests {
         let lines: Vec<u32> = lex_lines[..toks.len()].to_vec();
         let seq = parse_with_lines(toks, lines).unwrap().unwrap();
         assert_eq!(collect_exec_lines(&seq), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn redirop_default_fds() {
+        let w = ww("f");
+        assert_eq!(RedirOp::File { mode: FileMode::ReadOnly, target: w.clone() }.default_fd(), 0);
+        assert_eq!(RedirOp::File { mode: FileMode::Truncate, target: w.clone() }.default_fd(), 1);
+        assert_eq!(RedirOp::File { mode: FileMode::ReadWrite, target: w.clone() }.default_fd(), 0);
+        assert_eq!(RedirOp::Dup { source: ww("1"), output: true }.default_fd(), 1);
+        let r = Redirection { fd: RedirFd::Number(3), op: RedirOp::Close };
+        assert_eq!(r.target_fd(), Some(3));
+        let v = Redirection { fd: RedirFd::Var("x".into()), op: RedirOp::Close };
+        assert_eq!(v.target_fd(), None);
     }
 }
