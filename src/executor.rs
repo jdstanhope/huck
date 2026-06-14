@@ -1832,6 +1832,19 @@ fn eval_unary(op: TestUnaryOp, s: &str) -> bool {
     }
 }
 
+/// Arithmetic-evaluate a `[[ ]]` integer-comparison operand string. An empty
+/// operand is 0 (bash). Errors render the same as the arith evaluator does
+/// elsewhere (the caller wraps the `Err(String)` into a `[[`-prefixed message).
+fn arith_eval_operand(s: &str, shell: &mut Shell) -> Result<i64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(0);
+    }
+    crate::arith::parse(t)
+        .and_then(|e| crate::arith::eval(&e, shell))
+        .map_err(|e| format!("{e}"))
+}
+
 fn eval_binary(
     op: TestBinaryOp,
     lhs: &str,
@@ -1874,15 +1887,11 @@ fn eval_binary(
         | TestBinaryOp::IntLe
         | TestBinaryOp::IntGe => {
             let rhs = expand_assignment(rhs_word, shell);
-            let parse_int = |s: &str| -> Result<i64, String> {
-                let t = s.trim();
-                if t.is_empty() {
-                    return Ok(0);
-                }
-                t.parse().map_err(|_| format!("bad integer: {s}"))
-            };
-            let l: i64 = parse_int(lhs)?;
-            let r: i64 = parse_int(&rhs)?;
+            // In `[[ ]]`, the arithmetic comparison ops evaluate BOTH operands
+            // as arithmetic expressions: a bare variable name resolves to its
+            // value, `2+3` -> 5, and an unset/empty operand -> 0.
+            let l: i64 = arith_eval_operand(lhs, shell)?;
+            let r: i64 = arith_eval_operand(&rhs, shell)?;
             Ok(match op {
                 TestBinaryOp::IntEq => l == r,
                 TestBinaryOp::IntNe => l != r,
