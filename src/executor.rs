@@ -724,10 +724,10 @@ impl RedirectScope {
     /// Apply a `{var}` named-fd redirection in-process. Allocates a free fd >= 10
     /// (non-CLOEXEC, so an exec'd child would inherit it), wires the redirect onto
     /// it, and assigns the number to `$name` (the var PERSISTS after the command).
-    /// The allocated fd itself is registered in `saved` as `(high, -1)` so Drop
-    /// closes it when the scope ends (a normal command keeps the fd open only for
-    /// its duration; the var keeps the now-closed number, bash-style). `exec`'s
-    /// permanence is the caller's decision (it skips the scope), not handled here.
+    /// The allocated fd is NOT registered in `saved` — bash keeps it open in the
+    /// shell process until an explicit `{var}>&-` (Close) or shell exit, so Drop
+    /// must NOT close it. Explicit close via `{var}>&-` is handled in the
+    /// `RedirOp::Close` arm above.
     fn apply_var(&mut self, name: &str, redir: &Redirection, shell: &mut Shell) -> Result<(), ExecOutcome> {
         use std::os::unix::io::IntoRawFd;
         // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
@@ -851,12 +851,10 @@ impl RedirectScope {
             // The opened file / heredoc read-end was only a temp to dup from.
             unsafe { libc::close(src) };
         }
-        // Assign $var (persists after the command) and register `high` so Drop
-        // closes it when the scope ends. `(high, -1)` reuses the "was-closed →
-        // Drop closes target" path: `high` was free before alloc, so closing it
-        // on Drop returns it to that free state.
+        // Assign $var and leave `high` OPEN — bash keeps the allocated fd alive
+        // in the shell process until an explicit `{var}>&-` or shell exit.
+        // Do NOT register `high` in `self.saved`; Drop must NOT close it.
         shell.set(name, high.to_string());
-        self.saved.push((high, -1));
         Ok(())
     }
 

@@ -85,6 +85,55 @@ fn named_fd_close_makes_subsequent_write_fail() {
 }
 
 #[test]
+fn inprocess_named_fd_stays_open_until_explicit_close() {
+    // Regression test for v156 task5 fix: the allocated `high` fd must NOT be
+    // closed when the in-process command's RedirectScope drops — it must stay
+    // open in the shell until an explicit `{var}>&-` (or `{var}<&-`) close.
+    //
+    // Part 1: write to `$fd` AFTER the compound command ends — the fd is still
+    // live so the write succeeds and the file contains "b".
+    let f1 = format!("/tmp/huck_named_life1_{}", std::process::id());
+    let script1 = format!(
+        "{{ :; }} {{fd}}>{f1}; echo b >&$fd; echo \"rc=$?\"; cat {f1}; rm -f {f1}"
+    );
+    // Verify vs bash: same output (rc=0, file has "b").
+    let (bash_out, _) = run_c("bash", &script1);
+    let (huck_out, _) = run_c(&huck_binary(), &script1);
+    assert_eq!(
+        huck_out, bash_out,
+        "Part 1 (fd stays open) stdout differs\n bash: {bash_out:?}\n huck: {huck_out:?}"
+    );
+    assert!(
+        huck_out.contains("rc=0"),
+        "Part 1: expected rc=0, got: {huck_out:?}"
+    );
+    assert!(
+        huck_out.contains('b'),
+        "Part 1: expected 'b' in file contents, got: {huck_out:?}"
+    );
+
+    // Part 2: `{fd}<&-` as a redirect on a command closes the fd for the
+    // duration of that command (write inside the scope fails, rc=1); both bash
+    // and huck restore the fd when the scope drops, matching each other.
+    let f2 = format!("/tmp/huck_named_life2_{}", std::process::id());
+    let script2 = format!(
+        "{{ :; }} {{fd}}>{f2}; \
+         {{ echo c >&$fd; }} 2>/dev/null {{fd}}<&-; \
+         echo \"close-rc=$?\"; rm -f {f2}"
+    );
+    let (bash_out2, _) = run_c("bash", &script2);
+    let (huck_out2, _) = run_c(&huck_binary(), &script2);
+    assert_eq!(
+        huck_out2, bash_out2,
+        "Part 2 (close scope) stdout differs\n bash: {bash_out2:?}\n huck: {huck_out2:?}"
+    );
+    assert!(
+        huck_out2.contains("close-rc=1"),
+        "Part 2: expected close-rc=1 (write inside close scope failed), got: {huck_out2:?}"
+    );
+}
+
+#[test]
 fn external_parent_var_not_modified() {
     // bash semantics: for an EXTERNAL command the redirect + var-assignment happen
     // in the forked child, so the PARENT's $fd is untouched (a pre-set value is
