@@ -1209,7 +1209,7 @@ impl Shell {
         } else {
             value
         };
-        let folded = apply_case_fold(self.case_fold_of(name), &coerced);
+        let folded = apply_case_fold(self.case_fold_of(name), coerced);
 
         if do_integer_coerce {
             if let Some(existing) = self.vars.get_mut(name) {
@@ -1588,7 +1588,7 @@ impl Shell {
         };
         let elements = elements
             .into_iter()
-            .map(|(k, v)| (k, apply_case_fold(case_fold, &v)))
+            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
             .collect();
         self.vars.insert(
             name.to_string(),
@@ -1618,7 +1618,7 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        let value = apply_case_fold(self.case_fold_of(name), &value);
+        let value = apply_case_fold(self.case_fold_of(name), value);
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
                 VarValue::Indexed(m) => {
@@ -1704,7 +1704,7 @@ impl Shell {
             && let VarValue::Indexed(m) = &mut v.value
         {
             for (idx, val) in entries {
-                m.insert(idx, apply_case_fold(fold, &val));
+                m.insert(idx, apply_case_fold(fold, val));
             }
             Ok(())
         } else {
@@ -1782,7 +1782,7 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        let value = apply_case_fold(self.case_fold_of(name), &value);
+        let value = apply_case_fold(self.case_fold_of(name), value);
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
                 VarValue::Associative(pairs) => {
@@ -1855,7 +1855,14 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        let exported = self.vars.get(name).map(|v| v.exported).unwrap_or(false);
+        let (exported, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.case_fold),
+            None => (false, None),
+        };
+        let pairs = pairs
+            .into_iter()
+            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
+            .collect();
         self.vars.insert(
             name.to_string(),
             Variable {
@@ -1864,7 +1871,7 @@ impl Shell {
                 readonly: false,
                 // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
-                case_fold: None,
+                case_fold,
             },
         );
         Ok(())
@@ -2019,9 +2026,9 @@ impl Default for Shell {
 /// `to_lowercase`/`to_uppercase`, which is byte-identical to the
 /// `${v,,}`/`${v^^}` `case_modify` helper for the no-pattern case (and
 /// therefore inherits the same documented L-04 Unicode behavior).
-fn apply_case_fold(fold: Option<CaseFold>, value: &str) -> String {
+fn apply_case_fold(fold: Option<CaseFold>, value: String) -> String {
     match fold {
-        None => value.to_string(),
+        None => value,
         Some(CaseFold::Lower) => value.to_lowercase(),
         Some(CaseFold::Upper) => value.to_uppercase(),
     }
@@ -2961,11 +2968,11 @@ mod shopt_tests {
 
     #[test]
     fn apply_case_fold_lower_upper_and_none() {
-        assert_eq!(apply_case_fold(None, "AbC"), "AbC");
-        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "AbC"), "abc");
-        assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC"), "ABC");
+        assert_eq!(apply_case_fold(None, "AbC".to_string()), "AbC");
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "AbC".to_string()), "abc");
+        assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC".to_string()), "ABC");
         // idempotent
-        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc"), "abc");
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc".to_string()), "abc");
     }
 
     #[test]
@@ -3010,6 +3017,17 @@ mod shopt_tests {
         em.insert(0usize, "abc".to_string());
         shell.extend_indexed("app", em).unwrap();
         assert_eq!(shell.lookup_array_element("app", 0).as_deref(), Some("ABC"));
+
+        // whole associative-array literal via replace_associative, attribute preserved
+        shell.declare_associative("am").unwrap();
+        shell.set_case_fold("am", Some(CaseFold::Upper));
+        shell.replace_associative("am", vec![("k".to_string(), "abc".to_string())]).unwrap();
+        assert_eq!(
+            shell.get_associative("am").unwrap().iter()
+                .find(|(k, _)| k == "k").map(|(_, v)| v.as_str()),
+            Some("ABC")
+        );
+        assert_eq!(shell.case_fold_of("am"), Some(CaseFold::Upper)); // preserved
     }
 
     #[test]
