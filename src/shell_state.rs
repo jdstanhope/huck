@@ -55,12 +55,21 @@ impl VarValue {
     }
 }
 
+/// The case-fold attribute set by `declare -l` / `declare -u`. Mutually
+/// exclusive by construction — a variable is Lower, Upper, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseFold {
+    Lower,
+    Upper,
+}
+
 #[derive(Debug, Clone)]
 pub struct Variable {
     pub value: VarValue,
     pub exported: bool,
     pub readonly: bool,
     pub integer: bool,
+    pub case_fold: Option<CaseFold>,
 }
 
 impl Variable {
@@ -72,6 +81,7 @@ impl Variable {
             exported: false,
             readonly: false,
             integer: false,
+            case_fold: None,
         }
     }
 }
@@ -584,6 +594,7 @@ impl Shell {
                 exported: true,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             });
         }
         let shell_pid = unsafe { libc::getpid() };
@@ -1021,6 +1032,7 @@ impl Shell {
                 exported: true,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             });
     }
 
@@ -1043,6 +1055,7 @@ impl Shell {
                         exported: true,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
             }
@@ -1183,28 +1196,31 @@ impl Shell {
         // an existing integer-flagged Scalar. Indexed variables (even
         // if integer-flagged) take the array-element-0 overwrite path
         // instead.
+        // Compute the final stored string: integer-coerce first (only on an
+        // existing integer-flagged Scalar), then apply the case-fold attribute.
         let do_integer_coerce = self.is_integer(name)
             && self
                 .vars
                 .get(name)
                 .is_some_and(|v| matches!(v.value, VarValue::Scalar(_)));
+        let coerced = if do_integer_coerce {
+            eval_integer_coerce(self, &value)
+        } else {
+            value
+        };
+        let folded = apply_case_fold(self.case_fold_of(name), coerced);
+
         if do_integer_coerce {
-            // Compute the coerced value BEFORE taking the &mut borrow.
-            let coerced = eval_integer_coerce(self, &value);
             if let Some(existing) = self.vars.get_mut(name) {
-                existing.value = VarValue::Scalar(coerced);
+                existing.value = VarValue::Scalar(folded);
             }
             return Ok(());
         }
-        // Non-integer (or no existing entry) path: route through `set`,
-        // except that an existing Indexed variable has element 0
-        // overwritten rather than the whole array being replaced
-        // (matches bash: `a=v` on an indexed array overwrites a[0]).
         if let Some(existing) = self.vars.get_mut(name) {
-            install_scalar_value(existing, value);
+            install_scalar_value(existing, folded);
             Ok(())
         } else {
-            self.vars.insert(name.to_string(), Variable::scalar(value));
+            self.vars.insert(name.to_string(), Variable::scalar(folded));
             Ok(())
         }
     }
@@ -1235,6 +1251,7 @@ impl Shell {
                     exported: false,
                     readonly: true,
                     integer: false,
+                    case_fold: None,
                 },
             );
         }
@@ -1259,6 +1276,7 @@ impl Shell {
                     exported: false,
                     readonly: false,
                     integer: true,
+                    case_fold: None,
                 },
             );
         }
@@ -1269,6 +1287,31 @@ impl Shell {
     pub fn unmark_integer(&mut self, name: &str) {
         if let Some(v) = self.vars.get_mut(name) {
             v.integer = false;
+        }
+    }
+
+    /// The case-fold attribute on `name`, or `None` if unset / no attribute.
+    pub fn case_fold_of(&self, name: &str) -> Option<CaseFold> {
+        self.vars.get(name).and_then(|v| v.case_fold)
+    }
+
+    /// Sets (or clears, with `None`) the case-fold attribute on `name`.
+    /// Creates an empty scalar if the variable is unset, mirroring
+    /// `mark_integer` (so `declare -l NAME` with no value declares it).
+    pub fn set_case_fold(&mut self, name: &str, fold: Option<CaseFold>) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.case_fold = fold;
+        } else {
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: VarValue::Scalar(String::new()),
+                    exported: false,
+                    readonly: false,
+                    integer: false,
+                    case_fold: fold,
+                },
+            );
         }
     }
 
@@ -1293,6 +1336,7 @@ impl Shell {
             exported: false,
             readonly,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1304,6 +1348,7 @@ impl Shell {
             exported: false,
             readonly,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1355,6 +1400,7 @@ impl Shell {
             exported: true,
             readonly: false,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1411,6 +1457,7 @@ impl Shell {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
     }
@@ -1422,6 +1469,7 @@ impl Shell {
             exported: false,
             readonly: false,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1533,10 +1581,14 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        let (exported, integer) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.integer),
-            None => (false, false),
+        let (exported, integer, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.integer, v.case_fold),
+            None => (false, false, None),
         };
+        let elements = elements
+            .into_iter()
+            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
+            .collect();
         self.vars.insert(
             name.to_string(),
             Variable {
@@ -1544,6 +1596,7 @@ impl Shell {
                 exported,
                 readonly: false,
                 integer,
+                case_fold,
             },
         );
         Ok(())
@@ -1564,6 +1617,7 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
+        let value = apply_case_fold(self.case_fold_of(name), value);
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
                 VarValue::Indexed(m) => {
@@ -1596,6 +1650,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
             }
@@ -1639,14 +1694,16 @@ impl Shell {
                     exported: false,
                     readonly: false,
                     integer: false,
+                    case_fold: None,
                 },
             );
         }
+        let fold = self.case_fold_of(name);
         if let Some(v) = self.vars.get_mut(name)
             && let VarValue::Indexed(m) = &mut v.value
         {
             for (idx, val) in entries {
-                m.insert(idx, val);
+                m.insert(idx, apply_case_fold(fold, val));
             }
             Ok(())
         } else {
@@ -1724,6 +1781,7 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
+        let value = apply_case_fold(self.case_fold_of(name), value);
         match self.vars.get_mut(name) {
             Some(v) => match &mut v.value {
                 VarValue::Associative(pairs) => {
@@ -1796,7 +1854,14 @@ impl Shell {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
-        let exported = self.vars.get(name).map(|v| v.exported).unwrap_or(false);
+        let (exported, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.case_fold),
+            None => (false, None),
+        };
+        let pairs = pairs
+            .into_iter()
+            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
+            .collect();
         self.vars.insert(
             name.to_string(),
             Variable {
@@ -1805,6 +1870,7 @@ impl Shell {
                 readonly: false,
                 // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
+                case_fold,
             },
         );
         Ok(())
@@ -1829,6 +1895,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
                 Ok(())
@@ -1953,6 +2020,19 @@ impl Default for Shell {
     }
 }
 
+/// Applies a variable's case-fold attribute to a value string. `None`
+/// returns the value unchanged. Lower/Upper use Rust's whole-string
+/// `to_lowercase`/`to_uppercase`, which is byte-identical to the
+/// `${v,,}`/`${v^^}` `case_modify` helper for the no-pattern case (and
+/// therefore inherits the same documented L-04 Unicode behavior).
+fn apply_case_fold(fold: Option<CaseFold>, value: String) -> String {
+    match fold {
+        None => value,
+        Some(CaseFold::Lower) => value.to_lowercase(),
+        Some(CaseFold::Upper) => value.to_uppercase(),
+    }
+}
+
 #[cfg(test)]
 impl Shell {
     /// Test-only helper: install an indexed-array variable directly.
@@ -1970,6 +2050,7 @@ impl Shell {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
     }
@@ -2495,6 +2576,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         let result = shell.try_set("a", "new".to_string());
@@ -2521,6 +2603,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         shell.set("a", "new".to_string());
@@ -2546,6 +2629,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         shell.export_set("a", "new".to_string());
@@ -2597,7 +2681,7 @@ mod assoc_value_tests {
         m.insert(0, "x".into());
         shell.vars.insert("a".into(), Variable {
             value: VarValue::Indexed(m),
-            exported: false, readonly: false, integer: false,
+            exported: false, readonly: false, integer: false, case_fold: None,
         });
         assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
     }
@@ -2879,5 +2963,85 @@ mod shopt_tests {
         assert_eq!(s.resolve_histfilesize(), None); // negative -> inhibit
         s.set("HISTFILESIZE", "abc".to_string());
         assert_eq!(s.resolve_histfilesize(), None); // non-numeric -> inhibit
+    }
+
+    #[test]
+    fn apply_case_fold_lower_upper_and_none() {
+        assert_eq!(apply_case_fold(None, "AbC".to_string()), "AbC");
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "AbC".to_string()), "abc");
+        assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC".to_string()), "ABC");
+        // idempotent
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc".to_string()), "abc");
+    }
+
+    #[test]
+    fn storage_mutators_apply_case_fold() {
+        let mut shell = Shell::new();
+
+        // scalar via try_set
+        shell.set_case_fold("s", Some(CaseFold::Lower));
+        shell.try_set("s", "ABCdef".to_string()).unwrap();
+        assert_eq!(shell.get("s"), Some("abcdef"));
+
+        // scalar += (try_set with concatenated value) folds the whole result
+        shell.try_set("s", "abcdef".to_string() + "GHI").unwrap();
+        assert_eq!(shell.get("s"), Some("abcdefghi"));
+
+        // indexed element
+        shell.set_case_fold("arr", Some(CaseFold::Lower));
+        shell.set_array_element("arr", 1, "XYZ".to_string()).unwrap();
+        assert_eq!(shell.lookup_array_element("arr", 1).as_deref(), Some("xyz"));
+
+        // associative value folded, key NOT folded
+        // must declare as associative first (set_case_fold creates a Scalar)
+        shell.declare_associative("m").unwrap();
+        shell.set_case_fold("m", Some(CaseFold::Lower));
+        shell.set_associative_element("m", "Key".to_string(), "VALUE".to_string()).unwrap();
+        assert_eq!(shell.get_associative("m").unwrap().iter()
+            .find(|(k, _)| k == "Key").map(|(_, v)| v.as_str()), Some("value"));
+
+        // whole-array literal via replace_array, attribute preserved
+        shell.set_case_fold("lit", Some(CaseFold::Lower));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(0usize, "ABC".to_string());
+        map.insert(1usize, "DeF".to_string());
+        shell.replace_array("lit", map).unwrap();
+        assert_eq!(shell.lookup_array_element("lit", 0).as_deref(), Some("abc"));
+        assert_eq!(shell.lookup_array_element("lit", 1).as_deref(), Some("def"));
+        assert_eq!(shell.case_fold_of("lit"), Some(CaseFold::Lower)); // preserved
+
+        // upper attribute through array append (extend_indexed)
+        shell.set_case_fold("app", Some(CaseFold::Upper));
+        let mut em = std::collections::BTreeMap::new();
+        em.insert(0usize, "abc".to_string());
+        shell.extend_indexed("app", em).unwrap();
+        assert_eq!(shell.lookup_array_element("app", 0).as_deref(), Some("ABC"));
+
+        // whole associative-array literal via replace_associative, attribute preserved
+        shell.declare_associative("am").unwrap();
+        shell.set_case_fold("am", Some(CaseFold::Upper));
+        shell.replace_associative("am", vec![("k".to_string(), "abc".to_string())]).unwrap();
+        assert_eq!(
+            shell.get_associative("am").unwrap().iter()
+                .find(|(k, _)| k == "k").map(|(_, v)| v.as_str()),
+            Some("ABC")
+        );
+        assert_eq!(shell.case_fold_of("am"), Some(CaseFold::Upper)); // preserved
+    }
+
+    #[test]
+    fn set_case_fold_creates_and_clears() {
+        let mut shell = Shell::new();
+        // create-if-absent, like mark_integer
+        shell.set_case_fold("x", Some(CaseFold::Lower));
+        assert_eq!(shell.case_fold_of("x"), Some(CaseFold::Lower));
+        // overwrite (later-wins mutual exclusivity is handled by the caller)
+        shell.set_case_fold("x", Some(CaseFold::Upper));
+        assert_eq!(shell.case_fold_of("x"), Some(CaseFold::Upper));
+        // clear
+        shell.set_case_fold("x", None);
+        assert_eq!(shell.case_fold_of("x"), None);
+        // unknown var reads None
+        assert_eq!(shell.case_fold_of("nope"), None);
     }
 }

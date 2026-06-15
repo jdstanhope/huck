@@ -779,7 +779,7 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
-    // Order matches bash's `declare -p` output: a/A, i, r, x.
+    // Order matches bash's `declare -p` output: a/A, i, r, x, l/u.
     if matches!(var.value, VarValue::Indexed(_)) {
         attrs.push('a');
     }
@@ -794,6 +794,11 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     }
     if var.exported {
         attrs.push('x');
+    }
+    match var.case_fold {
+        Some(crate::shell_state::CaseFold::Lower) => attrs.push('l'),
+        Some(crate::shell_state::CaseFold::Upper) => attrs.push('u'),
+        None => {}
     }
     let flag_str = if attrs.is_empty() {
         "--".to_string()
@@ -965,6 +970,10 @@ fn builtin_declare(
     let mut function_names_only = false;
     let mut print_mode = false;
     let mut global = false;
+    let mut saw_minus_l = false;
+    let mut saw_minus_u = false;
+    let mut saw_plus_l = false;
+    let mut saw_plus_u = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -991,6 +1000,10 @@ fn builtin_declare(
                 b'x' if plus => want_remove_export = true,
                 b'i' if minus => want_integer = true,
                 b'i' if plus => want_remove_integer = true,
+                b'l' if minus => saw_minus_l = true,
+                b'l' if plus => saw_plus_l = true,
+                b'u' if minus => saw_minus_u = true,
+                b'u' if plus => saw_plus_u = true,
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
@@ -998,7 +1011,7 @@ fn builtin_declare(
                 }
                 b'p' if minus => print_mode = true,
                 b'g' if minus => global = true,
-                b'l' | b'u' | b'a' | b'A' | b'n' if minus => {
+                b'a' | b'A' | b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1018,6 +1031,18 @@ fn builtin_declare(
         i += 1;
     }
     let names = &args[i..];
+
+    // Net case-fold attribute from this command's flags.
+    let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
+        if saw_minus_l && saw_minus_u {
+            Some(None) // both cancel → clear
+        } else if saw_minus_l {
+            Some(Some(crate::shell_state::CaseFold::Lower))
+        } else if saw_minus_u {
+            Some(Some(crate::shell_state::CaseFold::Upper))
+        } else {
+            None // no minus case-fold flag this command
+        };
 
     // Function export: `declare -fx [NAME...]`. With no names, list exported
     // functions; with names, mark each existing function exported. A missing
@@ -1110,6 +1135,22 @@ fn builtin_declare(
         }
         if want_remove_integer {
             shell.unmark_integer(name);
+        }
+
+        // Apply case-fold attribute BEFORE any value-set path so the
+        // subsequent assignment folds through the new attribute.
+        if let Some(fold) = minus_case_fold {
+            shell.set_case_fold(name, fold);
+        }
+        if saw_plus_l
+            && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Lower)
+        {
+            shell.set_case_fold(name, None);
+        }
+        if saw_plus_u
+            && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Upper)
+        {
+            shell.set_case_fold(name, None);
         }
 
         if want_readonly {
@@ -1375,10 +1416,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
     let mut want_associative = false;
     let mut want_integer = false;
     let mut want_readonly = false;
+    let mut saw_minus_l = false;
+    let mut saw_minus_u = false;
     let mut idx = 0;
     // Parse leading flags from Plain args. Letters cluster (`-ri`, `-ir`)
     // exactly as in `declare`; a cluster containing an unsupported letter
-    // (`-l`/`-u`/`-n`) yields declare's not-yet-implemented message.
+    // (`-n`) yields declare's not-yet-implemented message.
     while idx < args.len() {
         let DeclArg::Plain(s) = &args[idx] else { break };
         if s == "--" {
@@ -1394,7 +1437,9 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 b'A' => want_associative = true,
                 b'i' => want_integer = true,
                 b'r' => want_readonly = true,
-                b'l' | b'u' | b'n' => {
+                b'l' => saw_minus_l = true,
+                b'u' => saw_minus_u = true,
+                b'n' => {
                     eprintln!(
                         "huck: local: -{}: not yet implemented in this version",
                         c as char
@@ -1417,6 +1462,18 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
         eprintln!("huck: local: integer arrays not yet supported");
         return ExecOutcome::Continue(1);
     }
+
+    // Net case-fold attribute from this command's flags.
+    let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
+        if saw_minus_l && saw_minus_u {
+            Some(None) // both cancel → clear
+        } else if saw_minus_l {
+            Some(Some(crate::shell_state::CaseFold::Lower))
+        } else if saw_minus_u {
+            Some(Some(crate::shell_state::CaseFold::Upper))
+        } else {
+            None // no minus case-fold flag this command
+        };
     let mut exit: i32 = 0;
     for arg in &args[idx..] {
         match arg {
@@ -1490,6 +1547,13 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     // (bash), so only unset when NOT already_local. (M-111)
                     shell.unset(name);
                 }
+                // Apply case-fold attribute AFTER shape setup (so that -lA
+                // finds the associative var and only updates case_fold) but
+                // BEFORE value is set — for bare names there is no value,
+                // so ordering is a no-op here beyond attribute stamping.
+                if let Some(fold) = minus_case_fold {
+                    shell.set_case_fold(name, fold);
+                }
                 // Apply the readonly attribute last so `local -r NAME` (no
                 // value) marks the freshly-declared local readonly. (For an
                 // -i bare local, mark_integer above created the scalar; for a
@@ -1535,6 +1599,11 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 // the arithmetic coerce (mirrors declare's ordering).
                 if want_integer {
                     shell.mark_integer(&name);
+                }
+                // `local -l/-u NAME=val`: set case-fold attribute BEFORE the
+                // assignment so the value is folded on write.
+                if let Some(fold) = minus_case_fold {
+                    shell.set_case_fold(&name, fold);
                 }
                 if crate::executor::apply_one_assignment(a, shell).is_err() {
                     exit = 1;
@@ -1693,6 +1762,10 @@ fn builtin_declare_decl(
     let mut function_names_only = false;
     let mut print_mode = false;
     let mut global = false;
+    let mut saw_minus_l = false;
+    let mut saw_minus_u = false;
+    let mut saw_plus_l = false;
+    let mut saw_plus_u = false;
 
     // Parse leading flags from Plain args. As soon as we hit a non-flag
     // Plain or any Assign, switch into the per-name phase.
@@ -1740,6 +1813,10 @@ fn builtin_declare_decl(
                     );
                     return ExecOutcome::Continue(1);
                 }
+                b'l' if minus => saw_minus_l = true,
+                b'l' if plus => saw_plus_l = true,
+                b'u' if minus => saw_minus_u = true,
+                b'u' if plus => saw_plus_u = true,
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
@@ -1747,7 +1824,7 @@ fn builtin_declare_decl(
                 }
                 b'p' if minus => print_mode = true,
                 b'g' if minus => global = true,
-                b'l' | b'u' | b'n' if minus => {
+                b'n' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1767,6 +1844,18 @@ fn builtin_declare_decl(
         idx += 1;
     }
     let names = &args[idx..];
+
+    // Net case-fold attribute from this command's flags.
+    let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
+        if saw_minus_l && saw_minus_u {
+            Some(None) // both cancel → clear
+        } else if saw_minus_l {
+            Some(Some(crate::shell_state::CaseFold::Lower))
+        } else if saw_minus_u {
+            Some(Some(crate::shell_state::CaseFold::Upper))
+        } else {
+            None // no minus case-fold flag this command
+        };
 
     // Reject the combinations we haven't implemented yet.
     if want_array && want_integer {
@@ -1937,6 +2026,23 @@ fn builtin_declare_decl(
             );
             exit = 1;
             continue;
+        }
+
+        // Apply case-fold attribute AFTER shape setup (so -lA finds the
+        // associative var and only flips case_fold) but BEFORE any value
+        // assignment (so the fold is in effect when the value is written).
+        if let Some(fold) = minus_case_fold {
+            shell.set_case_fold(name, fold);
+        }
+        if saw_plus_l
+            && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Lower)
+        {
+            shell.set_case_fold(name, None);
+        }
+        if saw_plus_u
+            && shell.case_fold_of(name) == Some(crate::shell_state::CaseFold::Upper)
+        {
+            shell.set_case_fold(name, None);
         }
 
         // Compound assignment path: a parsed Assignment (scalar or array).
@@ -4786,10 +4892,10 @@ fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
     shell.getopts_optind_cache = step.optind;
     shell.getopts_sp = step.sp;
     // Assign the matched letter (or '?' / ':').
-    shell.set(&name, step.name.clone());
+    let _ = shell.try_set(&name, step.name.clone());
     // OPTARG: set or unset.
     match step.optarg {
-        Some(v) => shell.set("OPTARG", v),
+        Some(v) => { let _ = shell.try_set("OPTARG", v); }
         None => shell.unset("OPTARG"),
     }
     // Verbose error message (suppressed by OPTERR=0).
@@ -9845,23 +9951,50 @@ mod local_tests {
 
     #[test]
     fn local_unsupported_attr_is_not_yet_implemented() {
-        // `-l`/`-u`/`-n` match declare's "not yet implemented" message (rc 1),
-        // NOT "invalid option" — even when clustered with a supported letter.
-        for flag in ["-l", "-u", "-n", "-li"] {
-            let mut shell = Shell::new();
-            shell.local_scopes.push(std::collections::HashMap::new());
-            let mut buf: Vec<u8> = Vec::new();
-            let outcome = run_declaration_builtin_strs(
-                "local",
-                &[flag.to_string(), "XYZ_LU=1".to_string()],
-                &mut buf,
-                &mut shell,
-            );
-            assert!(
-                matches!(outcome, ExecOutcome::Continue(1)),
-                "flag {flag} should yield rc 1"
-            );
-        }
+        // `-n` is not yet implemented and should yield rc 1.
+        let flag = "-n";
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &[flag.to_string(), "XYZ_LU=1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(1)),
+            "flag {flag} should yield rc 1"
+        );
+    }
+
+    #[test]
+    fn local_case_fold_lower_upper() {
+        // `local -l v=HELLO` folds to lowercase.
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &["-l".to_string(), "V=HELLO".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("V").as_deref(), Some("hello"));
+
+        // `local -u v=hello` folds to uppercase.
+        let mut shell2 = Shell::new();
+        shell2.local_scopes.push(std::collections::HashMap::new());
+        let mut buf2: Vec<u8> = Vec::new();
+        let outcome2 = run_declaration_builtin_strs(
+            "local",
+            &["-u".to_string(), "W=hello".to_string()],
+            &mut buf2,
+            &mut shell2,
+        );
+        assert!(matches!(outcome2, ExecOutcome::Continue(0)));
+        assert_eq!(shell2.lookup_var("W").as_deref(), Some("HELLO"));
     }
 }
 
@@ -11265,11 +11398,69 @@ mod declare_tests {
     #[test]
     fn declare_deferred_flag_errors() {
         let mut shell = Shell::new();
-        // -i was deferred in v64; v65 ships it. Pick another still-
-        // deferred flag (-l = lowercase) to keep the deferred-list arm
-        // under coverage.
-        let (oc, _) = run(&["-l", "X=5"], &mut shell);
+        // -n (nameref) is still deferred (v159). Keep the deferred-list
+        // arm under coverage by testing a flag that still errors out.
+        let (oc, _) = run(&["-n", "X=5"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_lu_cancel_no_fold() {
+        // `declare -lu x=AbC` — both -l and -u cancel to no attribute;
+        // the stored value must be unchanged (AbC).
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-lu", "X_LU_CANCEL=AbC"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_LU_CANCEL").as_deref(), Some("AbC"));
+        assert_eq!(shell.case_fold_of("X_LU_CANCEL"), None);
+    }
+
+    #[test]
+    fn declare_plus_l_removes_lower_attr() {
+        // `declare -l x` then `declare +l x` then assign x=ABC → stored ABC
+        // (the lowercase attribute was removed, so no fold occurs).
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-l", "X_PL=hello"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PL").as_deref(), Some("hello"));
+        let (oc2, _) = run(&["+l", "X_PL"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        assert_eq!(shell.case_fold_of("X_PL"), None);
+        let _ = run(&["X_PL=ABC"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PL").as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn declare_plus_u_removes_upper_attr() {
+        // `declare -u x` then `declare +u x` then assign x=abc → stored abc.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-u", "X_PU=HELLO"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PU").as_deref(), Some("HELLO"));
+        let (oc2, _) = run(&["+u", "X_PU"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        assert_eq!(shell.case_fold_of("X_PU"), None);
+        let _ = run(&["X_PU=abc"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PU").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn declare_plus_l_noop_on_upper_attr() {
+        // `declare -u x` then `declare +l x` → +l is a no-op (x has Upper,
+        // not Lower), so assigning abc still yields ABC.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-u", "X_PL_NOP=hello"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PL_NOP").as_deref(), Some("HELLO"));
+        let (oc2, _) = run(&["+l", "X_PL_NOP"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        // Upper attribute must still be present.
+        assert_eq!(
+            shell.case_fold_of("X_PL_NOP"),
+            Some(crate::shell_state::CaseFold::Upper)
+        );
+        let _ = run(&["X_PL_NOP=abc"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PL_NOP").as_deref(), Some("ABC"));
     }
 }
 
