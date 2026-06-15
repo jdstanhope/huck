@@ -208,6 +208,10 @@ pub struct ShellOptions {
     /// shell (bash ignores `-n` interactively). Once on, it cannot be turned
     /// back off mid-script (`set +n` is itself skipped) — matching bash.
     pub noexec: bool,
+    /// `set -o physical`: when enabled, `cd` and `pwd` resolve symlinks
+    /// (use the physical directory structure). When off (default), the logical
+    /// PWD is maintained (symlinks preserved in `$PWD`). Mirrors bash `-P`.
+    pub physical: bool,
 }
 
 /// One row of the bash `shopt` option table.

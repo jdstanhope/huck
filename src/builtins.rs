@@ -85,7 +85,7 @@ pub fn run_builtin(
     );
     match name {
         "cd" => builtin_cd(args, out, shell),
-        "pwd" => builtin_pwd(out),
+        "pwd" => builtin_pwd(args, out, shell),
         "echo" => builtin_echo(args, out),
         "exit" => builtin_exit(args, shell),
         "export" => builtin_export(args, out, shell),
@@ -291,74 +291,180 @@ pub fn run_declaration_builtin(
     }
 }
 
+/// Lexically normalizes an ABSOLUTE path for logical `cd`: collapses `.`,
+/// empty components (from `//`), and `..` (removing the preceding component
+/// WITHOUT resolving symlinks). A `..` at the root is dropped (bash behavior).
+/// Always returns an absolute path; `/` for an empty result.
+fn normalize_logical(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                // cd always passes an absolute path here, so `..` is never on
+                // the stack — a non-empty stack means a real parent to pop.
+                if !components.is_empty() {
+                    components.pop();
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if args.len() > 1 {
+    // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
+    //    is the OLDPWD shortcut / target).
+    let mut physical_flag: Option<bool> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-L" => { physical_flag = Some(false); idx += 1; }
+            "-P" => { physical_flag = Some(true); idx += 1; }
+            "--" => { idx += 1; break; }
+            "-" => break, // OLDPWD shortcut, handled as the target below
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: cd: {s}: invalid option");
+                eprintln!("huck: cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break, // a target
+        }
+    }
+    let rest = &args[idx..];
+    if rest.len() > 1 {
         eprintln!("huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
+
+    // 2. Effective mode: explicit flag, else the `physical` set-option.
+    let physical = physical_flag.unwrap_or_else(|| option_get(shell, "physical").unwrap_or(false));
+
+    // 3. Compute the target directory.
     let mut print_new_pwd = false;
-    let target = match args.first() {
+    let target = match rest.first() {
         Some(dir) if dir == "-" => match shell.get("OLDPWD") {
-            Some(oldpwd) if !oldpwd.is_empty() => {
-                print_new_pwd = true;
-                oldpwd.to_string()
-            }
-            _ => {
-                eprintln!("huck: cd: OLDPWD not set");
-                return ExecOutcome::Continue(1);
-            }
+            Some(oldpwd) if !oldpwd.is_empty() => { print_new_pwd = true; oldpwd.to_string() }
+            _ => { eprintln!("huck: cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
         },
         Some(dir) => dir.clone(),
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
-            None => {
-                eprintln!("huck: cd: HOME not set");
-                return ExecOutcome::Continue(1);
-            }
+            None => { eprintln!("huck: cd: HOME not set"); return ExecOutcome::Continue(1); }
         },
     };
-    if let Err(e) = env::set_current_dir(Path::new(&target)) {
-        eprintln!("huck: cd: {target}: {e}");
-        return ExecOutcome::Continue(1);
-    }
-    // chdir succeeded — maintain PWD/OLDPWD.
+
     let prev_pwd = shell.get("PWD").map(str::to_string);
-    match env::current_dir() {
-        Ok(new_pwd) => {
-            if let Some(prev) = prev_pwd {
-                shell.export_set("OLDPWD", prev);
-            }
-            shell.export_set("PWD", new_pwd.to_string_lossy().to_string());
-            if print_new_pwd
-                && let Err(e) = writeln!(out, "{}", new_pwd.display())
-            {
-                eprintln!("huck: cd: {e}");
-                return ExecOutcome::Continue(1);
+
+    let new_pwd: String = if physical {
+        // Physical: chdir to the target, store the canonical cwd.
+        if let Err(e) = env::set_current_dir(Path::new(&target)) {
+            eprintln!("huck: cd: {target}: {e}");
+            return ExecOutcome::Continue(1);
+        }
+        match env::current_dir() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!("huck: cd: warning: could not read current dir: {e}");
+                prev_pwd.clone().unwrap_or_default()
             }
         }
-        Err(e) => {
-            // chdir succeeded but we can't read it back — warn but
-            // don't fail the command.
-            eprintln!("huck: cd: warning: could not read current dir: {e}");
+    } else {
+        // Logical: build curpath from $PWD (for relative targets), lexically
+        // normalize, chdir to the normalized path, store it.
+        let curpath = if target.starts_with('/') {
+            target.clone()
+        } else {
+            let base = prev_pwd.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| {
+                env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            format!("{base}/{target}")
+        };
+        let normalized = normalize_logical(&curpath);
+        if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
+            eprintln!("huck: cd: {target}: {e}");
+            return ExecOutcome::Continue(1);
         }
+        normalized
+    };
+
+    // 4. Maintain OLDPWD / PWD.
+    if let Some(prev) = prev_pwd {
+        shell.export_set("OLDPWD", prev);
+    }
+    shell.export_set("PWD", new_pwd.clone());
+
+    // 5. `cd -` prints the new directory.
+    if print_new_pwd
+        && let Err(e) = writeln!(out, "{new_pwd}")
+    {
+        eprintln!("huck: cd: {e}");
+        return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
 
-fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
-    match env::current_dir() {
-        Ok(path) => {
-            if let Err(e) = writeln!(out, "{}", path.display()) {
-                eprintln!("huck: pwd: {e}");
-                return ExecOutcome::Continue(1);
+fn builtin_pwd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    // Parse -L/-P (last wins); `--` ends flags; non-flag args are ignored
+    // (bash prints pwd anyway). Unknown flag → invalid option, rc 2.
+    let mut physical_flag: Option<bool> = None;
+    for a in args {
+        match a.as_str() {
+            "-L" => physical_flag = Some(false),
+            "-P" => physical_flag = Some(true),
+            "--" => break,
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: pwd: {s}: invalid option");
+                eprintln!("huck: pwd: usage: pwd [-LP]");
+                return ExecOutcome::Continue(2);
             }
-            ExecOutcome::Continue(0)
-        }
-        Err(e) => {
-            eprintln!("huck: pwd: {e}");
-            ExecOutcome::Continue(1)
+            _ => {} // ignore non-flag args
         }
     }
+    let physical = physical_flag.unwrap_or_else(|| option_get(shell, "physical").unwrap_or(false));
+
+    let path: String = if physical {
+        // Resolved physical path.
+        match env::current_dir() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => shell
+                .get("PWD")
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    } else {
+        // Logical: use $PWD only if it is valid (canonicalises to the real
+        // cwd) — mirrors bash's pwd -L validation.  An inherited $PWD that
+        // doesn't match the process cwd (e.g. because the shell was spawned
+        // with current_dir() but without updating $PWD) is silently
+        // discarded and we fall back to getcwd().
+        let real_cwd = env::current_dir().ok();
+        let logical = shell.get("PWD").filter(|p| !p.is_empty()).and_then(|p| {
+            let canon = std::fs::canonicalize(p).ok()?;
+            if real_cwd.as_deref() == Some(canon.as_path()) {
+                Some(p.to_string())
+            } else {
+                None
+            }
+        });
+        logical.unwrap_or_else(|| {
+            real_cwd
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+    };
+
+    if let Err(e) = writeln!(out, "{path}") {
+        eprintln!("huck: pwd: {e}");
+        return ExecOutcome::Continue(1);
+    }
+    ExecOutcome::Continue(0)
 }
 
 fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
@@ -5210,6 +5316,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "noglob" => Some(shell.shell_options.noglob),
         "noclobber" => Some(shell.shell_options.noclobber),
         "noexec" => Some(shell.shell_options.noexec),
+        "physical" => Some(shell.shell_options.physical),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -5226,6 +5333,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "noglob" => { shell.shell_options.noglob = value; Ok(()) }
         "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
         "noexec" => { shell.shell_options.noexec = value; Ok(()) }
+        "physical" => { shell.shell_options.physical = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -7779,9 +7887,11 @@ mod tests {
     #[test]
     fn pwd_writes_the_current_directory() {
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_pwd(&mut out);
+        let mut shell = Shell::new();
+        let outcome = builtin_pwd(&[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let written = String::from_utf8(out).unwrap();
+        // With no $PWD set, logical mode falls back to getcwd.
         let expected = env::current_dir().unwrap();
         assert_eq!(written.trim_end(), expected.to_str().unwrap());
     }
@@ -9208,13 +9318,6 @@ mod cd_pwd_tests {
     /// on macOS `/tmp` is a symlink to `/private/tmp` and the kernel
     /// returns the resolved path. Computing it at test time keeps the
     /// assertions portable.
-    fn canonical_tmp() -> String {
-        std::fs::canonicalize("/tmp")
-            .expect("canonicalize /tmp")
-            .to_string_lossy()
-            .into_owned()
-    }
-
     #[test]
     fn cd_sets_pwd_to_target_directory() {
         let _g = CWD_LOCK.lock().unwrap();
@@ -9225,8 +9328,9 @@ mod cd_pwd_tests {
         // Restore for any other tests.
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
         assert!(shell.exported_env().any(|(k, _)| k == "PWD"));
         assert!(out.is_empty());
     }
@@ -9257,8 +9361,9 @@ mod cd_pwd_tests {
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), None);
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
     }
 
     #[test]
@@ -9272,8 +9377,9 @@ mod cd_pwd_tests {
         let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
         assert_eq!(shell.get("OLDPWD"), Some("/var"));
     }
 
@@ -9288,8 +9394,8 @@ mod cd_pwd_tests {
         let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        // `cd -` echoes the post-chdir cwd (per builtin_cd, the canonical form).
-        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", canonical_tmp()));
+        // `cd -` echoes the logical PWD (v162): the OLDPWD value as-typed.
+        assert_eq!(String::from_utf8(out).unwrap(), "/tmp\n");
     }
 
     #[test]
@@ -12848,5 +12954,22 @@ mod getopts_step_tests {
         assert_eq!(s.name, ":");
         assert_eq!(s.optarg.as_deref(), Some("b"));
         assert!(s.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod normalize_logical_tests {
+    use super::normalize_logical;
+
+    #[test]
+    fn normalize_logical_collapses_lexically() {
+        assert_eq!(normalize_logical("/a/b/../c"), "/a/c");
+        assert_eq!(normalize_logical("/a/./b"), "/a/b");
+        assert_eq!(normalize_logical("/a//b"), "/a/b");
+        assert_eq!(normalize_logical("/a/b/.."), "/a");
+        assert_eq!(normalize_logical("/.."), "/");
+        assert_eq!(normalize_logical("/a/../.."), "/");
+        assert_eq!(normalize_logical("/"), "/");
+        assert_eq!(normalize_logical("/tmp/m/link/.."), "/tmp/m");
     }
 }
