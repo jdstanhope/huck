@@ -58,7 +58,6 @@ impl VarValue {
 /// The case-fold attribute set by `declare -l` / `declare -u`. Mutually
 /// exclusive by construction — a variable is Lower, Upper, or neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum CaseFold {
     Lower,
     Upper,

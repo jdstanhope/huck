@@ -32,6 +32,8 @@ chk "declare -p lower"    'declare -l x; x=ab; declare -p x'
 chk "declare -p flags"    'declare -irxl a=1; declare -p a'
 chk "typeset -u"          'typeset -u x=abc; echo "$x"'
 chk "plus on cancelled"   'declare -lu x; declare +u x; x=AbC; echo "$x"'
+chk "getopts var fold"    'declare -u o; set -- -a -b val; while getopts "ab:" o; do echo "$o"; done'
+chk "getopts optarg fold" 'declare -u OPTARG; set -- -b xyz; getopts "b:" o; echo "$OPTARG"'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

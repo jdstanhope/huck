@@ -4892,10 +4892,10 @@ fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
     shell.getopts_optind_cache = step.optind;
     shell.getopts_sp = step.sp;
     // Assign the matched letter (or '?' / ':').
-    shell.set(&name, step.name.clone());
+    let _ = shell.try_set(&name, step.name.clone());
     // OPTARG: set or unset.
     match step.optarg {
-        Some(v) => shell.set("OPTARG", v),
+        Some(v) => { let _ = shell.try_set("OPTARG", v); }
         None => shell.unset("OPTARG"),
     }
     // Verbose error message (suppressed by OPTERR=0).
