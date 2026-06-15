@@ -820,7 +820,6 @@ impl Shell {
         self.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string())
     }
 
-    /// Sets a variable's value, preserving its existing `exported` flag (or
     /// If `name` is a reseed/reset-on-assignment dynamic special (`RANDOM`/`SECONDS`),
     /// apply the side effect and return `true` (caller must NOT store it as a var —
     /// these are computed in `lookup_var`). Returns `false` for ordinary names.
@@ -846,10 +845,12 @@ impl Shell {
         }
     }
 
-    /// creating it as unexported if it didn't exist). When the existing
-    /// value is an `Indexed` array, only element 0 is overwritten — the
-    /// rest of the map is preserved (matches bash: `a=v` on an indexed
-    /// array overwrites a[0]).
+    /// Raw scalar store: NO readonly check and NO attribute application
+    /// (integer-coerce / case-fold) — for shell-internal writes only (env
+    /// import, special/numeric vars). `reseed_special_on_assign` still fires.
+    /// When the existing value is an `Indexed` array, only element 0 is
+    /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
+    /// User-facing assignments must use `assign()` / `try_set` instead.
     pub fn set(&mut self, name: &str, value: String) {
         self.store_scalar(name, value);
     }
@@ -1382,7 +1383,11 @@ impl Shell {
         }
 
         match (&dest, op, source) {
-            // ── Scalar value into a whole variable: `x=v` / `x+=v` (NEW path) ──
+            // ── Scalar value into a whole variable: `x=v` / `x+=v` ──
+            // The Append sub-case has no caller today (the executor pre-
+            // concatenates scalar `+=` and calls Set); it is intentionally
+            // live, not `unreachable!()`, because v160 nameref `r+=v` resolves
+            // to `assign(Whole(r), Append, Scalar(v))`.
             (AssignDest::Whole(_), _, AssignSource::Scalar(v)) => {
                 let v = if op == AssignKind::Append {
                     let existing = self.get(&name).map(str::to_string).unwrap_or_default();
@@ -2079,10 +2084,10 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
 
 /// Installs `value` as the scalar value of `existing`, preserving the
 /// rest of an `Indexed` map (writing only element 0). Shared by
-/// `Shell::set`, `Shell::export_set`, and `Shell::try_set`'s non-
-/// integer path so the three callers stay in lockstep on the
-/// "scalar assignment to an array overwrites a[0]" rule (matches
-/// bash: `a=v` on an indexed array overwrites a[0]).
+/// `Shell::store_scalar` (the single scalar-store primitive behind both
+/// `assign()` and the raw `set()`) and `Shell::export_set`, so every
+/// scalar-store path applies the "scalar assignment to an array
+/// overwrites a[0]" rule identically (matches bash).
 fn install_scalar_value(existing: &mut Variable, value: String) {
     match &mut existing.value {
         VarValue::Indexed(m) => {
