@@ -301,7 +301,9 @@ fn normalize_logical(path: &str) -> String {
         match comp {
             "" | "." => {}
             ".." => {
-                if matches!(components.last(), Some(&c) if c != "..") {
+                // cd always passes an absolute path here, so `..` is never on
+                // the stack — a non-empty stack means a real parent to pop.
+                if !components.is_empty() {
                     components.pop();
                 }
             }
@@ -9316,13 +9318,6 @@ mod cd_pwd_tests {
     /// on macOS `/tmp` is a symlink to `/private/tmp` and the kernel
     /// returns the resolved path. Computing it at test time keeps the
     /// assertions portable.
-    fn canonical_tmp() -> String {
-        std::fs::canonicalize("/tmp")
-            .expect("canonicalize /tmp")
-            .to_string_lossy()
-            .into_owned()
-    }
-
     #[test]
     fn cd_sets_pwd_to_target_directory() {
         let _g = CWD_LOCK.lock().unwrap();
@@ -9333,8 +9328,9 @@ mod cd_pwd_tests {
         // Restore for any other tests.
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
         assert!(shell.exported_env().any(|(k, _)| k == "PWD"));
         assert!(out.is_empty());
     }
@@ -9365,8 +9361,9 @@ mod cd_pwd_tests {
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), None);
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
     }
 
     #[test]
@@ -9380,8 +9377,9 @@ mod cd_pwd_tests {
         let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        let expected = canonical_tmp();
-        assert_eq!(shell.get("PWD"), Some(expected.as_str()));
+        // Logical PWD (v162): `cd /tmp` stores the logical path, not the
+        // symlink-resolved one (matters on macOS where /tmp -> /private/tmp).
+        assert_eq!(shell.get("PWD"), Some("/tmp"));
         assert_eq!(shell.get("OLDPWD"), Some("/var"));
     }
 
@@ -9396,8 +9394,8 @@ mod cd_pwd_tests {
         let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
-        // `cd -` echoes the post-chdir cwd (per builtin_cd, the canonical form).
-        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", canonical_tmp()));
+        // `cd -` echoes the logical PWD (v162): the OLDPWD value as-typed.
+        assert_eq!(String::from_utf8(out).unwrap(), "/tmp\n");
     }
 
     #[test]
