@@ -565,13 +565,20 @@ fn expand_array_param(
     }
 
     // Nameref resolution: if `name` is a nameref, resolve to the effective
-    // array name before any array expansion. No-op for ordinary variables.
-    let name: &str = &match shell.resolve_nameref(name) {
-        ResolvedName::Name(n) => n,
-        // Element namerefs (e.g. r=arr[1]) on whole-array expansions:
-        // resolve to the base array name so ${r[@]} expands the whole array.
-        ResolvedName::Element { name: base, .. } => base,
-        ResolvedName::Unbound(_) | ResolvedName::Cycle => return ExpansionResult::Empty,
+    // array name before any array expansion. Gate behind a cheap attribute
+    // check so non-namerefs skip allocation entirely.
+    let resolved_name: String;
+    let name: &str = if shell.is_nameref(name) {
+        resolved_name = match shell.resolve_nameref(name) {
+            ResolvedName::Name(n) => n,
+            // Element namerefs (e.g. r=arr[1]) on whole-array expansions:
+            // resolve to the base array name so ${r[@]} expands the whole array.
+            ResolvedName::Element { name: base, .. } => base,
+            ResolvedName::Unbound(_) | ResolvedName::Cycle => return ExpansionResult::Empty,
+        };
+        &resolved_name
+    } else {
+        name
     };
 
     // Type-aware dispatch: associative arrays get string-key semantics.

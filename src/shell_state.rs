@@ -821,15 +821,17 @@ impl Shell {
             }
             return self.positional_args.get(n - 1).cloned();
         }
-        // Nameref resolution: a nameref reads its target. No-op for ordinary
-        // variables (resolve_nameref returns Name(name)).
-        match self.resolve_nameref(name) {
-            ResolvedName::Name(n) if n != name => return self.lookup_var(&n),
-            ResolvedName::Element { name: arr, subscript } => {
-                return self.lookup_nameref_element(&arr, &subscript);
+        // Nameref resolution: a nameref reads its target. Gate behind a cheap
+        // attribute check so non-namerefs skip allocation entirely.
+        if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) if n != name => return self.lookup_var(&n),
+                ResolvedName::Element { name: arr, subscript } => {
+                    return self.lookup_nameref_element(&arr, &subscript);
+                }
+                ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
+                ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
             }
-            ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
-            ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
         }
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
@@ -943,14 +945,17 @@ impl Shell {
                 .map(|n| n >= 1 && n <= self.positional_args.len())
                 .unwrap_or(false);
         }
-        // Nameref resolution: a nameref's -v tests the TARGET.
-        match self.resolve_nameref(name) {
-            ResolvedName::Name(n) if n != name => return self.is_set(&n),
-            ResolvedName::Element { name: arr, subscript } => {
-                return self.lookup_nameref_element(&arr, &subscript).is_some();
+        // Nameref resolution: a nameref's -v tests the TARGET. Gate behind a
+        // cheap attribute check so non-namerefs skip allocation entirely.
+        if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) if n != name => return self.is_set(&n),
+                ResolvedName::Element { name: arr, subscript } => {
+                    return self.lookup_nameref_element(&arr, &subscript).is_some();
+                }
+                ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
+                ResolvedName::Name(_) => {}
             }
-            ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
-            ResolvedName::Name(_) => {}
         }
         self.vars.contains_key(name)
     }
@@ -1636,7 +1641,7 @@ impl Shell {
         let mut visited = std::collections::HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
-                eprintln!("huck: warning: {name}: circular name reference");
+                eprintln!("huck: warning: {current}: circular name reference");
                 return ResolvedName::Cycle;
             }
             match self.vars.get(&current) {
