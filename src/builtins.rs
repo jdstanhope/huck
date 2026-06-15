@@ -9947,21 +9947,20 @@ mod local_tests {
     #[test]
     fn local_unsupported_attr_is_not_yet_implemented() {
         // `-n` is not yet implemented and should yield rc 1.
-        for flag in ["-n"] {
-            let mut shell = Shell::new();
-            shell.local_scopes.push(std::collections::HashMap::new());
-            let mut buf: Vec<u8> = Vec::new();
-            let outcome = run_declaration_builtin_strs(
-                "local",
-                &[flag.to_string(), "XYZ_LU=1".to_string()],
-                &mut buf,
-                &mut shell,
-            );
-            assert!(
-                matches!(outcome, ExecOutcome::Continue(1)),
-                "flag {flag} should yield rc 1"
-            );
-        }
+        let flag = "-n";
+        let mut shell = Shell::new();
+        shell.local_scopes.push(std::collections::HashMap::new());
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_declaration_builtin_strs(
+            "local",
+            &[flag.to_string(), "XYZ_LU=1".to_string()],
+            &mut buf,
+            &mut shell,
+        );
+        assert!(
+            matches!(outcome, ExecOutcome::Continue(1)),
+            "flag {flag} should yield rc 1"
+        );
     }
 
     #[test]
@@ -11398,6 +11397,65 @@ mod declare_tests {
         // arm under coverage by testing a flag that still errors out.
         let (oc, _) = run(&["-n", "X=5"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_lu_cancel_no_fold() {
+        // `declare -lu x=AbC` — both -l and -u cancel to no attribute;
+        // the stored value must be unchanged (AbC).
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-lu", "X_LU_CANCEL=AbC"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_LU_CANCEL").as_deref(), Some("AbC"));
+        assert_eq!(shell.case_fold_of("X_LU_CANCEL"), None);
+    }
+
+    #[test]
+    fn declare_plus_l_removes_lower_attr() {
+        // `declare -l x` then `declare +l x` then assign x=ABC → stored ABC
+        // (the lowercase attribute was removed, so no fold occurs).
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-l", "X_PL=hello"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PL").as_deref(), Some("hello"));
+        let (oc2, _) = run(&["+l", "X_PL"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        assert_eq!(shell.case_fold_of("X_PL"), None);
+        let _ = run(&["X_PL=ABC"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PL").as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn declare_plus_u_removes_upper_attr() {
+        // `declare -u x` then `declare +u x` then assign x=abc → stored abc.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-u", "X_PU=HELLO"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PU").as_deref(), Some("HELLO"));
+        let (oc2, _) = run(&["+u", "X_PU"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        assert_eq!(shell.case_fold_of("X_PU"), None);
+        let _ = run(&["X_PU=abc"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PU").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn declare_plus_l_noop_on_upper_attr() {
+        // `declare -u x` then `declare +l x` → +l is a no-op (x has Upper,
+        // not Lower), so assigning abc still yields ABC.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-u", "X_PL_NOP=hello"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(shell.lookup_var("X_PL_NOP").as_deref(), Some("HELLO"));
+        let (oc2, _) = run(&["+l", "X_PL_NOP"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        // Upper attribute must still be present.
+        assert_eq!(
+            shell.case_fold_of("X_PL_NOP"),
+            Some(crate::shell_state::CaseFold::Upper)
+        );
+        let _ = run(&["X_PL_NOP=abc"], &mut shell);
+        assert_eq!(shell.lookup_var("X_PL_NOP").as_deref(), Some("ABC"));
     }
 }
 
