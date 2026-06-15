@@ -5519,7 +5519,25 @@ pub(crate) fn apply_one_assignment(
                         // nameref prepends with the TARGET's current value, not the
                         // raw nameref binding string.
                         let existing = shell.lookup_var(name).unwrap_or_default();
-                        shell.try_set(name, existing + &s).map_err(|_| ())
+                        // For an integer-flagged target, `+=` is ARITHMETIC addition
+                        // (bash: `declare -i s=5; s+=3` -> 8), not string concatenation.
+                        // Check the effective target's integer attribute (resolving a
+                        // nameref only when needed, to avoid the hot-path allocation).
+                        let target_is_integer = if shell.is_nameref(name) {
+                            matches!(
+                                shell.resolve_nameref(name),
+                                crate::shell_state::ResolvedName::Name(ref n) if shell.is_integer(n)
+                            )
+                        } else {
+                            shell.is_integer(name)
+                        };
+                        if target_is_integer {
+                            let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
+                            let add = arith_eval_operand(&s, shell).unwrap_or(0);
+                            shell.try_set(name, (cur + add).to_string()).map_err(|_| ())
+                        } else {
+                            shell.try_set(name, existing + &s).map_err(|_| ())
+                        }
                     }
                 }
             } else {
@@ -5537,7 +5555,16 @@ pub(crate) fn apply_one_assignment(
             };
             let v = expand_assignment(&a.value, shell);
             if a.append {
-                shell.append_array_element(name, idx, &v).map_err(|_| ())
+                // Integer array element `a[i]+=v` is ARITHMETIC addition, like
+                // the scalar case (bash: `declare -ai a=(5); a[0]+=3` -> 8).
+                if shell.is_integer(name) {
+                    let existing = shell.lookup_array_element(name, idx).unwrap_or_default();
+                    let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
+                    let add = arith_eval_operand(&v, shell).unwrap_or(0);
+                    shell.set_array_element(name, idx, (cur + add).to_string()).map_err(|_| ())
+                } else {
+                    shell.append_array_element(name, idx, &v).map_err(|_| ())
+                }
             } else {
                 shell.set_array_element(name, idx, v).map_err(|_| ())
             }
