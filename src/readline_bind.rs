@@ -56,7 +56,11 @@ pub fn parse_keyseq(seq: &str) -> Option<Event> {
         "\\n" => '\n',
         "\\b" => '\x08',
         _ if rest.starts_with("\\x") => {
-            char::from_u32(u32::from_str_radix(&rest[2..], 16).ok()?)?
+            let h = &rest[2..];
+            if h.len() != 2 {
+                return None;
+            }
+            char::from_u32(u32::from_str_radix(h, 16).ok()?)?
         }
         _ if rest.starts_with('\\') && rest.len() > 1 => {
             let body = &rest[1..];
@@ -84,8 +88,20 @@ pub fn parse_keyseq(seq: &str) -> Option<Event> {
     // the key is pressed: e.g. `\C-a` -> Char('A')+CTRL (rustyline upper-cases
     // control letters and folds control chars into named keys). Without this,
     // bind_sequence would register an event the terminal never produces.
-    let ev = KeyEvent::normalize(KeyEvent::new(ch, mods));
-    Some(ev.into())
+    // Readline treats \C-i / \C-m / \C-h (and \t / \r / \b / DEL) as the named
+    // Tab / Enter / Backspace keys; the terminal delivers them that way, so a
+    // binding must register the named KeyCode (not Char+CTRL) or it never fires.
+    let is_ctrl = mods.contains(Modifiers::CTRL);
+    if matches!(ch, '\t') || (is_ctrl && matches!(ch, 'i' | 'I')) {
+        return Some(KeyEvent(KeyCode::Tab, Modifiers::NONE).into());
+    }
+    if matches!(ch, '\r' | '\n') || (is_ctrl && matches!(ch, 'm' | 'M')) {
+        return Some(KeyEvent(KeyCode::Enter, Modifiers::NONE).into());
+    }
+    if matches!(ch, '\x08' | '\x7f') || (is_ctrl && matches!(ch, 'h' | 'H')) {
+        return Some(KeyEvent(KeyCode::Backspace, Modifiers::NONE).into());
+    }
+    Some(KeyEvent::normalize(KeyEvent::new(ch, mods)).into())
 }
 
 /// Maps a readline function name to the rustyline `Cmd` that implements it.
@@ -191,6 +207,17 @@ mod tests {
         assert!(parse_keyseq("a").is_some());
         assert!(parse_keyseq("\\C-").is_none());
         assert!(parse_keyseq("").is_none());
+    }
+
+    #[test]
+    fn parse_keyseq_produces_correct_events() {
+        use rustyline::{KeyCode, KeyEvent, Modifiers};
+        assert_eq!(parse_keyseq("\\C-w"), Some(KeyEvent(KeyCode::Char('W'), Modifiers::CTRL).into()));
+        assert_eq!(parse_keyseq("\\C-i"), Some(KeyEvent(KeyCode::Tab, Modifiers::NONE).into()));
+        assert_eq!(parse_keyseq("\\C-m"), Some(KeyEvent(KeyCode::Enter, Modifiers::NONE).into()));
+        assert_eq!(parse_keyseq("\\C-h"), Some(KeyEvent(KeyCode::Backspace, Modifiers::NONE).into()));
+        assert_eq!(parse_keyseq("\\e[A"), Some(KeyEvent(KeyCode::Up, Modifiers::NONE).into()));
+        assert_eq!(parse_keyseq("\\M-f"), Some(KeyEvent(KeyCode::Char('f'), Modifiers::ALT).into()));
     }
 
     #[test]
