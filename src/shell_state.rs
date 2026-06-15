@@ -2393,46 +2393,39 @@ fn install_scalar_value(existing: &mut Variable, value: String) {
 impl Shell {
     /// Records a `set VAR value` (sets `dirty`). The run loop applies the
     /// editor-mapped ones; others are recorded for `bind -v` round-trip.
-    #[allow(dead_code)]
     pub fn set_readline_var(&mut self, name: &str, value: &str) {
         self.readline_settings.vars.insert(name.to_string(), value.to_string());
         self.readline_settings.dirty = true;
     }
 
     /// Queues a key binding (keyseq -> function) for the loop to apply.
-    #[allow(dead_code)]
     pub fn add_bind(&mut self, keyseq: &str, function: &str) {
         self.readline_settings.pending_binds.push((keyseq.to_string(), function.to_string()));
         self.readline_settings.dirty = true;
     }
 
     /// Queues an unbind (keyseq) for the loop to apply.
-    #[allow(dead_code)]
     pub fn add_unbind(&mut self, keyseq: &str) {
         self.readline_settings.pending_unbinds.push(keyseq.to_string());
         self.readline_settings.dirty = true;
     }
 
     /// `bind -v` lines: `set NAME VALUE`, sorted by name (BTreeMap iterates sorted).
-    #[allow(dead_code)]
     pub fn readline_var_lines(&self) -> Vec<String> {
         self.readline_settings.vars.iter().map(|(k, v)| format!("set {k} {v}")).collect()
     }
 
     /// `bind -V` lines: `` NAME is set to `VALUE' ``.
-    #[allow(dead_code)]
     pub fn readline_var_lines_verbose(&self) -> Vec<String> {
         self.readline_settings.vars.iter().map(|(k, v)| format!("{k} is set to `{v}'")).collect()
     }
 
     /// `bind -p` lines: `"KEYSEQ": FUNCTION`.
-    #[allow(dead_code)]
     pub fn active_bind_lines(&self) -> Vec<String> {
         self.readline_settings.active_binds.iter().map(|(k, f)| format!("{k}: {f}")).collect()
     }
 
     /// `bind -P` lines: `FUNCTION can be found on "KEYSEQ".`
-    #[allow(dead_code)]
     pub fn active_bind_lines_verbose(&self) -> Vec<String> {
         self.readline_settings.active_binds.iter().map(|(k, f)| format!("{f} can be found on {k}.")).collect()
     }

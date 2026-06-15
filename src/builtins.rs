@@ -34,6 +34,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "let",
     "help",
     "complete", "compgen", "compopt",
+    "bind",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -140,6 +141,7 @@ pub fn run_builtin(
         "break" => builtin_break(args, shell),
         "continue" => builtin_continue(args, shell),
         "return" => builtin_return(args, shell),
+        "bind" => builtin_bind(args, out, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -7454,6 +7456,96 @@ fn builtin_dirs(
         return ExecOutcome::Continue(0);
     }
     print_stack(out, shell, collapse, per_line, numbered)
+}
+
+fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    use crate::readline_bind::{is_known_function, keyseq_is_valid, readline_function_names};
+    const USAGE: &str = "bind: usage: bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]";
+
+    let mut i = 0;
+    let mut rc = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-v" => { for l in shell.readline_var_lines() { let _ = writeln!(out, "{l}"); } }
+            "-V" => { for l in shell.readline_var_lines_verbose() { let _ = writeln!(out, "{l}"); } }
+            "-l" => { for f in readline_function_names() { let _ = writeln!(out, "{f}"); } }
+            "-p" => { for l in shell.active_bind_lines() { let _ = writeln!(out, "{l}"); } }
+            "-P" => { for l in shell.active_bind_lines_verbose() { let _ = writeln!(out, "{l}"); } }
+            "-s" | "-S" | "-X" => { /* no macros / shell-command bindings: empty */ }
+            "-m" | "-q" | "-u" | "-f" => { i += 1; /* takes an arg; accept + no-op */ }
+            "-r" => {
+                i += 1;
+                if let Some(seq) = args.get(i) {
+                    shell.add_unbind(seq);
+                } else {
+                    eprintln!("huck: bind: -r: option requires an argument");
+                    rc = 2;
+                }
+            }
+            "-x" => { i += 1; /* keyseq:shell-command — deferred no-op */ }
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: bind: {s}: invalid option");
+                eprintln!("huck: {USAGE}");
+                return ExecOutcome::Continue(2);
+            }
+            // Non-flag argument: `set VAR VALUE` (3-arg or inline), or `keyseq:function`.
+            _ => {
+                if a == "set" {
+                    // 3-arg form: bind set VAR VALUE
+                    let var = args.get(i + 1).cloned();
+                    let val = args.get(i + 2).cloned();
+                    if let (Some(var), Some(val)) = (var, val) {
+                        if !validate_readline_var(&var, &val) {
+                            eprintln!("huck: bind: {val}: invalid value for {var}");
+                            rc = 1;
+                        } else {
+                            shell.set_readline_var(&var, &val);
+                        }
+                        i += 2;
+                    }
+                } else if let Some(rest) = a.strip_prefix("set ") {
+                    // one-arg form: "set VAR VALUE"
+                    let mut it = rest.split_whitespace();
+                    if let (Some(var), Some(val)) = (it.next(), it.next()) {
+                        if !validate_readline_var(var, val) {
+                            eprintln!("huck: bind: {val}: invalid value for {var}");
+                            rc = 1;
+                        } else {
+                            shell.set_readline_var(var, val);
+                        }
+                    }
+                } else if let Some((seq, func)) = a.split_once(':') {
+                    if !keyseq_is_valid(seq) {
+                        eprintln!("huck: bind: {seq}: cannot parse key sequence");
+                        rc = 1;
+                    } else if !is_known_function(func) {
+                        eprintln!("huck: bind: {func}: unknown function name");
+                        rc = 1;
+                    } else {
+                        shell.add_bind(seq, func);
+                    }
+                } else {
+                    eprintln!("huck: bind: {a}: unknown command");
+                    rc = 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    ExecOutcome::Continue(rc)
+}
+
+/// Validates a readline variable value for the 5 editor-mapped variables.
+/// Unmapped variables accept any value (recorded for `bind -v` round-trip).
+fn validate_readline_var(var: &str, val: &str) -> bool {
+    match var {
+        "editing-mode" => matches!(val, "emacs" | "vi"),
+        "bell-style" => matches!(val, "none" | "audible" | "visible"),
+        "show-all-if-ambiguous" => matches!(val, "on" | "off"),
+        "completion-query-items" | "keyseq-timeout" => val.parse::<i64>().is_ok(),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
