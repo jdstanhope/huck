@@ -5276,7 +5276,27 @@ fn apply_inline_assignments(
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
     for a in assignments {
         let name = a.target.name();
-        let prior = shell.snapshot_var(name);
+
+        // Determine which variable's state must be saved/restored.  For a
+        // nameref `r`, the write goes to the RESOLVED TARGET (e.g. `x`), so
+        // we must snapshot/restore that target — not the nameref binding itself.
+        // Non-nameref: snap_name == name (byte-identical to the old path).
+        let snap_name: String = if shell.is_nameref(name) {
+            match shell.resolve_nameref(name) {
+                // Resolved to a plain variable — snapshot that variable.
+                crate::shell_state::ResolvedName::Name(n) => n,
+                // Resolved to arr[subscript] — snapshot the whole array (covers the element).
+                crate::shell_state::ResolvedName::Element { name: arr, .. } => arr,
+                // Unbound nameref: the assignment will BIND the nameref itself → snapshot name.
+                // Cycle: write is dropped; snapshot name as a safe fallback.
+                crate::shell_state::ResolvedName::Unbound(_)
+                | crate::shell_state::ResolvedName::Cycle => name.to_string(),
+            }
+        } else {
+            name.to_string()
+        };
+
+        let prior = shell.snapshot_var(&snap_name);
         // For namerefs, skip the early readonly check; assign() checks the resolved target.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
@@ -5293,12 +5313,13 @@ fn apply_inline_assignments(
         // later `a=val cmd` (scalar reassignment of the same name) sees
         // the expected state. Match the pre-v71 behavior by toggling the
         // export bit only when the value is a bare scalar.
+        // For a nameref the export should mark the resolved target, so use snap_name.
         if matches!(&a.target, crate::command::AssignTarget::Bare(_))
             && !is_array_value_word(&a.value)
         {
-            shell.export(name);
+            shell.export(&snap_name);
         }
-        snap.push((name.to_string(), prior));
+        snap.push((snap_name, prior));
     }
     Ok(snap)
 }
@@ -5393,6 +5414,11 @@ pub(crate) fn apply_one_assignment(
     // subscripts are string-evaluated and writes route through the
     // associative mutators. Positional-list `m=(x y z)` and scalar
     // `m=v` are rejected (bash type-mismatch).
+    //
+    // Note: guarding with `!shell.is_nameref(target_name)` here would break
+    // `declare -n r=assoc_arr; r[k]=v` (associative write through a nameref).
+    // The minor double-warning for cyclic namerefs (get_associative resolves
+    // the chain once, then the funnel resolves again) is stderr-only and benign.
     let target_name = a.target.name();
     if shell.get_associative(target_name).is_some() {
         match (&a.target, trailing_array_literal) {
