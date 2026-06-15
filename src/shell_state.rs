@@ -1288,6 +1288,31 @@ impl Shell {
         }
     }
 
+    /// The case-fold attribute on `name`, or `None` if unset / no attribute.
+    pub fn case_fold_of(&self, name: &str) -> Option<CaseFold> {
+        self.vars.get(name).and_then(|v| v.case_fold)
+    }
+
+    /// Sets (or clears, with `None`) the case-fold attribute on `name`.
+    /// Creates an empty scalar if the variable is unset, mirroring
+    /// `mark_integer` (so `declare -l NAME` with no value declares it).
+    pub fn set_case_fold(&mut self, name: &str, fold: Option<CaseFold>) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.case_fold = fold;
+        } else {
+            self.vars.insert(
+                name.to_string(),
+                Variable {
+                    value: VarValue::Scalar(String::new()),
+                    exported: false,
+                    readonly: false,
+                    integer: false,
+                    case_fold: fold,
+                },
+            );
+        }
+    }
+
     /// Sorted list of all variable names currently marked readonly.
     pub fn readonly_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
@@ -2932,5 +2957,21 @@ mod shopt_tests {
         assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC"), "ABC");
         // idempotent
         assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc"), "abc");
+    }
+
+    #[test]
+    fn set_case_fold_creates_and_clears() {
+        let mut shell = Shell::new();
+        // create-if-absent, like mark_integer
+        shell.set_case_fold("x", Some(CaseFold::Lower));
+        assert_eq!(shell.case_fold_of("x"), Some(CaseFold::Lower));
+        // overwrite (later-wins mutual exclusivity is handled by the caller)
+        shell.set_case_fold("x", Some(CaseFold::Upper));
+        assert_eq!(shell.case_fold_of("x"), Some(CaseFold::Upper));
+        // clear
+        shell.set_case_fold("x", None);
+        assert_eq!(shell.case_fold_of("x"), None);
+        // unknown var reads None
+        assert_eq!(shell.case_fold_of("nope"), None);
     }
 }
