@@ -3127,4 +3127,58 @@ mod shopt_tests {
         // unknown var reads None
         assert_eq!(shell.case_fold_of("nope"), None);
     }
+
+    // ── v159 Task 4: funnel-uniformity unit tests ────────────────────────────
+
+    /// Proves that assign() applies case-fold on every storage path:
+    /// scalar whole-variable, indexed element, and whole indexed-array literal.
+    #[test]
+    fn assign_funnel_applies_case_fold_on_every_path() {
+        let mut shell = Shell::new();
+
+        // scalar whole-variable path
+        shell.set_case_fold("s", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Whole("s".into()),
+            AssignKind::Set,
+            AssignSource::Scalar("abc".into()),
+        ).unwrap();
+        assert_eq!(shell.get("s"), Some("ABC"));
+
+        // indexed element path
+        shell.set_case_fold("a", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Element { name: "a".into(), sub: Subscript::Index(2) },
+            AssignKind::Set,
+            AssignSource::Scalar("xy".into()),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("a", 2).as_deref(), Some("XY"));
+
+        // whole indexed-array literal path
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "lo".to_string());
+        shell.set_case_fold("b", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Whole("b".into()),
+            AssignKind::Set,
+            AssignSource::Indexed(m),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("b", 0).as_deref(), Some("LO"));
+    }
+
+    /// Proves that assign() enforces readonly on every write path (scalar).
+    #[test]
+    fn assign_funnel_readonly_blocks_all_paths() {
+        let mut shell = Shell::new();
+        shell.try_set("r", "init".into()).unwrap();
+        shell.mark_readonly("r");
+        assert!(
+            shell.assign(
+                AssignDest::Whole("r".into()),
+                AssignKind::Set,
+                AssignSource::Scalar("x".into()),
+            ).is_err()
+        );
+        assert_eq!(shell.get("r"), Some("init")); // value unchanged
+    }
 }
