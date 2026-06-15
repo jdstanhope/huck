@@ -466,11 +466,14 @@ fn apply_readline_settings(
     if let Some(v) = shell.readline_settings.vars.get("show-all-if-ambiguous") {
         editor.set_completion_show_all_if_ambiguous(v == "on");
     }
-    if let Some(n) = shell.readline_settings.vars.get("completion-query-items").and_then(|s| s.parse::<usize>().ok()) {
-        editor.set_completion_prompt_limit(n);
+    // Numeric vars: parse as i64 and CLAMP to the setter's range so an
+    // out-of-range value (the validator accepts any integer, like bash) still
+    // applies clamped rather than being silently dropped.
+    if let Some(n) = shell.readline_settings.vars.get("completion-query-items").and_then(|s| s.parse::<i64>().ok()) {
+        editor.set_completion_prompt_limit(n.max(0) as usize);
     }
-    if let Some(n) = shell.readline_settings.vars.get("keyseq-timeout").and_then(|s| s.parse::<u16>().ok()) {
-        editor.set_keyseq_timeout(Some(n));
+    if let Some(n) = shell.readline_settings.vars.get("keyseq-timeout").and_then(|s| s.parse::<i64>().ok()) {
+        editor.set_keyseq_timeout(Some(n.clamp(0, u16::MAX as i64) as u16));
     }
 
     // 2. Pending key binds.

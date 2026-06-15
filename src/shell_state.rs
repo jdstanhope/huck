@@ -2369,6 +2369,12 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
     live && !job.marked_for_nohup
 }
 
+/// Wraps a `bind` key sequence in double quotes for `bind -p`/`-P` output if
+/// the user didn't already supply them (bash always double-quotes the keyseq).
+fn quote_keyseq(k: &str) -> String {
+    if k.starts_with('"') { k.to_string() } else { format!("\"{k}\"") }
+}
+
 /// Installs `value` as the scalar value of `existing`, preserving the
 /// rest of an `Indexed` map (writing only element 0). Shared by
 /// `Shell::store_scalar` (the single scalar-store primitive behind both
@@ -2419,14 +2425,16 @@ impl Shell {
         self.readline_settings.vars.iter().map(|(k, v)| format!("{k} is set to `{v}'")).collect()
     }
 
-    /// `bind -p` lines: `"KEYSEQ": FUNCTION`.
+    // (quote_keyseq helper is a module-level free fn below.)
+
+    /// `bind -p` lines: `"KEYSEQ": FUNCTION` (keyseq double-quoted, bash form).
     pub fn active_bind_lines(&self) -> Vec<String> {
-        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{k}: {f}")).collect()
+        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{}: {f}", quote_keyseq(k))).collect()
     }
 
     /// `bind -P` lines: `FUNCTION can be found on "KEYSEQ".`
     pub fn active_bind_lines_verbose(&self) -> Vec<String> {
-        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{f} can be found on {k}.")).collect()
+        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{f} can be found on {}.", quote_keyseq(k))).collect()
     }
 }
 
