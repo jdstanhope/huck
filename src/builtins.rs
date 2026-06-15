@@ -85,7 +85,7 @@ pub fn run_builtin(
     );
     match name {
         "cd" => builtin_cd(args, out, shell),
-        "pwd" => builtin_pwd(out),
+        "pwd" => builtin_pwd(args, out, shell),
         "echo" => builtin_echo(args, out),
         "exit" => builtin_exit(args, shell),
         "export" => builtin_export(args, out, shell),
@@ -407,20 +407,62 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
     ExecOutcome::Continue(0)
 }
 
-fn builtin_pwd(out: &mut dyn Write) -> ExecOutcome {
-    match env::current_dir() {
-        Ok(path) => {
-            if let Err(e) = writeln!(out, "{}", path.display()) {
-                eprintln!("huck: pwd: {e}");
-                return ExecOutcome::Continue(1);
+fn builtin_pwd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    // Parse -L/-P (last wins); `--` ends flags; non-flag args are ignored
+    // (bash prints pwd anyway). Unknown flag → invalid option, rc 2.
+    let mut physical_flag: Option<bool> = None;
+    for a in args {
+        match a.as_str() {
+            "-L" => physical_flag = Some(false),
+            "-P" => physical_flag = Some(true),
+            "--" => break,
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: pwd: {s}: invalid option");
+                eprintln!("huck: pwd: usage: pwd [-LP]");
+                return ExecOutcome::Continue(2);
             }
-            ExecOutcome::Continue(0)
-        }
-        Err(e) => {
-            eprintln!("huck: pwd: {e}");
-            ExecOutcome::Continue(1)
+            _ => {} // ignore non-flag args
         }
     }
+    let physical = physical_flag.unwrap_or_else(|| option_get(shell, "physical").unwrap_or(false));
+
+    let path: String = if physical {
+        // Resolved physical path.
+        match env::current_dir() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => shell
+                .get("PWD")
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    } else {
+        // Logical: use $PWD only if it is valid (canonicalises to the real
+        // cwd) — mirrors bash's pwd -L validation.  An inherited $PWD that
+        // doesn't match the process cwd (e.g. because the shell was spawned
+        // with current_dir() but without updating $PWD) is silently
+        // discarded and we fall back to getcwd().
+        let real_cwd = env::current_dir().ok();
+        let logical = shell.get("PWD").filter(|p| !p.is_empty()).and_then(|p| {
+            let canon = std::fs::canonicalize(p).ok()?;
+            if real_cwd.as_deref() == Some(canon.as_path()) {
+                Some(p.to_string())
+            } else {
+                None
+            }
+        });
+        logical.unwrap_or_else(|| {
+            real_cwd
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+    };
+
+    if let Err(e) = writeln!(out, "{path}") {
+        eprintln!("huck: pwd: {e}");
+        return ExecOutcome::Continue(1);
+    }
+    ExecOutcome::Continue(0)
 }
 
 fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
@@ -7843,9 +7885,11 @@ mod tests {
     #[test]
     fn pwd_writes_the_current_directory() {
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_pwd(&mut out);
+        let mut shell = Shell::new();
+        let outcome = builtin_pwd(&[], &mut out, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let written = String::from_utf8(out).unwrap();
+        // With no $PWD set, logical mode falls back to getcwd.
         let expected = env::current_dir().unwrap();
         assert_eq!(written.trim_end(), expected.to_str().unwrap());
     }
