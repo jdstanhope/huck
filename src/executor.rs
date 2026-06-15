@@ -3043,7 +3043,9 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
     let mut st = 0;
     for a in items {
         let name = a.target.name();
-        if shell.is_readonly(name) {
+        // For namerefs, skip the early readonly check and let assign() check the
+        // RESOLVED target's readonly — a readonly nameref lets you write through.
+        if !shell.is_nameref(name) && shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             st = 1;
             break;
@@ -5274,8 +5276,29 @@ fn apply_inline_assignments(
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
     for a in assignments {
         let name = a.target.name();
-        let prior = shell.snapshot_var(name);
-        if shell.is_readonly(name) {
+
+        // Determine which variable's state must be saved/restored.  For a
+        // nameref `r`, the write goes to the RESOLVED TARGET (e.g. `x`), so
+        // we must snapshot/restore that target — not the nameref binding itself.
+        // Non-nameref: snap_name == name (byte-identical to the old path).
+        let snap_name: String = if shell.is_nameref(name) {
+            match shell.resolve_nameref(name) {
+                // Resolved to a plain variable — snapshot that variable.
+                crate::shell_state::ResolvedName::Name(n) => n,
+                // Resolved to arr[subscript] — snapshot the whole array (covers the element).
+                crate::shell_state::ResolvedName::Element { name: arr, .. } => arr,
+                // Unbound nameref: the assignment will BIND the nameref itself → snapshot name.
+                // Cycle: write is dropped; snapshot name as a safe fallback.
+                crate::shell_state::ResolvedName::Unbound(_)
+                | crate::shell_state::ResolvedName::Cycle => name.to_string(),
+            }
+        } else {
+            name.to_string()
+        };
+
+        let prior = shell.snapshot_var(&snap_name);
+        // For namerefs, skip the early readonly check; assign() checks the resolved target.
+        if !shell.is_nameref(name) && shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(snap);
         }
@@ -5290,12 +5313,13 @@ fn apply_inline_assignments(
         // later `a=val cmd` (scalar reassignment of the same name) sees
         // the expected state. Match the pre-v71 behavior by toggling the
         // export bit only when the value is a bare scalar.
+        // For a nameref the export should mark the resolved target, so use snap_name.
         if matches!(&a.target, crate::command::AssignTarget::Bare(_))
             && !is_array_value_word(&a.value)
         {
-            shell.export(name);
+            shell.export(&snap_name);
         }
-        snap.push((name.to_string(), prior));
+        snap.push((snap_name, prior));
     }
     Ok(snap)
 }
@@ -5390,13 +5414,20 @@ pub(crate) fn apply_one_assignment(
     // subscripts are string-evaluated and writes route through the
     // associative mutators. Positional-list `m=(x y z)` and scalar
     // `m=v` are rejected (bash type-mismatch).
+    //
+    // Note: guarding with `!shell.is_nameref(target_name)` here would break
+    // `declare -n r=assoc_arr; r[k]=v` (associative write through a nameref).
+    // The minor double-warning for cyclic namerefs (get_associative resolves
+    // the chain once, then the funnel resolves again) is stderr-only and benign.
     let target_name = a.target.name();
     if shell.get_associative(target_name).is_some() {
         match (&a.target, trailing_array_literal) {
             (AssignTarget::Bare(name), Some(elements)) => {
                 if a.append {
                     // Pre-validate readonly so the loop below cannot partial-write.
-                    if shell.is_readonly(target_name) {
+                    // Skip for namerefs — the individual element writes go through
+                    // assign() which checks the resolved target.
+                    if !shell.is_nameref(target_name) && shell.is_readonly(target_name) {
                         eprintln!("huck: {target_name}: readonly variable");
                         return Err(());
                     }
@@ -5448,16 +5479,19 @@ pub(crate) fn apply_one_assignment(
                 // a+=(elements): field-expand each bare element (split/glob/[@])
                 // and append after the current max index, honoring explicit
                 // [i]=v elements. Readonly pre-check avoids a partial write.
-                if shell.is_readonly(name) {
+                // Skip for namerefs — assign() checks the resolved target.
+                if !shell.is_nameref(name) && shell.is_readonly(name) {
                     eprintln!("huck: {name}: readonly variable");
                     return Err(());
                 }
                 // Starting auto-index: max+1 for an existing array; 1 for a
                 // scalar (which promotes to element 0); 0 when unset — matching
                 // extend_indexed's promotion.
+                // get_array is nameref-aware, so it sees the target's array for namerefs.
                 let start = if shell.get_array(name).is_some() {
                     shell.array_max_index(name).map_or(0, |m| m + 1)
-                } else if shell.get(name).is_some() {
+                } else if shell.lookup_var(name).is_some() {
+                    // Use lookup_var (nameref-aware) so a nameref to a scalar gives start=1.
                     1
                 } else {
                     0
@@ -5481,7 +5515,10 @@ pub(crate) fn apply_one_assignment(
                         .append_array_element(name, 0, &s)
                         .map_err(|_| ()),
                     None => {
-                        let existing = shell.get(name).map(str::to_string).unwrap_or_default();
+                        // Use lookup_var (nameref-aware) so that `r+=v` where r is a
+                        // nameref prepends with the TARGET's current value, not the
+                        // raw nameref binding string.
+                        let existing = shell.lookup_var(name).unwrap_or_default();
                         shell.try_set(name, existing + &s).map_err(|_| ())
                     }
                 }

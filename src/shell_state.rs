@@ -70,6 +70,7 @@ pub struct Variable {
     pub readonly: bool,
     pub integer: bool,
     pub case_fold: Option<CaseFold>,
+    pub nameref: bool,
 }
 
 impl Variable {
@@ -82,6 +83,7 @@ impl Variable {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         }
     }
 }
@@ -113,6 +115,21 @@ pub enum AssignDest {
     Whole(String),
     /// A single element with an already-resolved subscript.
     Element { name: String, sub: Subscript },
+}
+
+/// Result of following a nameref chain to its effective destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedName {
+    /// A plain variable target (the original name if `name` is not a nameref).
+    Name(String),
+    /// An element target `base[subscript-text]` — the subscript is evaluated
+    /// at the use site in the base's current shape.
+    Element { name: String, subscript: String },
+    /// A nameref whose target value is empty (attribute set, not yet bound).
+    /// Carries the nameref's own name (assignment BINDS it; reads are unset).
+    Unbound(String),
+    /// A cycle was detected; the `circular name reference` warning was emitted.
+    Cycle,
 }
 
 /// A subscript resolved by the caller. Index → indexed array (arith-evaluated);
@@ -638,6 +655,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             });
         }
         let shell_pid = unsafe { libc::getpid() };
@@ -803,6 +821,18 @@ impl Shell {
             }
             return self.positional_args.get(n - 1).cloned();
         }
+        // Nameref resolution: a nameref reads its target. Gate behind a cheap
+        // attribute check so non-namerefs skip allocation entirely.
+        if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) if n != name => return self.lookup_var(&n),
+                ResolvedName::Element { name: arr, subscript } => {
+                    return self.lookup_nameref_element(&arr, &subscript);
+                }
+                ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
+                ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
+            }
+        }
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
@@ -915,6 +945,18 @@ impl Shell {
                 .map(|n| n >= 1 && n <= self.positional_args.len())
                 .unwrap_or(false);
         }
+        // Nameref resolution: a nameref's -v tests the TARGET. Gate behind a
+        // cheap attribute check so non-namerefs skip allocation entirely.
+        if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) if n != name => return self.is_set(&n),
+                ResolvedName::Element { name: arr, subscript } => {
+                    return self.lookup_nameref_element(&arr, &subscript).is_some();
+                }
+                ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
+                ResolvedName::Name(_) => {}
+            }
+        }
         self.vars.contains_key(name)
     }
 
@@ -934,6 +976,17 @@ impl Shell {
     /// yield false — a rare edge.
     pub fn element_or_var_is_set(&self, target: &str) -> bool {
         if let Some((name, sub)) = crate::expand::split_name_subscript(target) {
+            // Resolve a nameref base so `[[ -v r[i] ]]` (r→arr) tests arr[i],
+            // not the nameref's own scalar value (its target name) at index i.
+            let name = if self.is_nameref(&name) {
+                match self.resolve_nameref(&name) {
+                    ResolvedName::Name(n) => n,
+                    ResolvedName::Element { name: base, .. } => base,
+                    ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
+                }
+            } else {
+                name
+            };
             if self.get_associative(&name).is_some() {
                 return self.lookup_associative_element(&name, &sub).is_some();
             }
@@ -1071,6 +1124,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             });
     }
 
@@ -1094,6 +1148,7 @@ impl Shell {
                         readonly: false,
                         integer: false,
                         case_fold: None,
+                        nameref: false,
                     },
                 );
             }
@@ -1215,14 +1270,51 @@ impl Shell {
         self.vars.get(name).map(|v| v.readonly).unwrap_or(false)
     }
 
-    /// Resolves an assignment target through any nameref indirection. Identity
-    /// today — huck has no namerefs yet (v160). This is the ONE place a future
-    /// `declare -n r=target` will rewrite the destination (name, and for
-    /// `declare -n r=arr[i]` a `Whole(r)` into an `Element{arr, Index(i)}`),
-    /// with circular-reference detection. Do NOT add nameref behavior here in
-    /// v159 — only the seam.
-    fn resolve_assign_target(&self, dest: AssignDest) -> AssignDest {
-        dest
+    /// Resolves an assignment target through any nameref indirection.
+    /// Returns `None` on a cycle (warning already emitted; caller drops the
+    /// write and returns `Ok(())`). For an unbound nameref, returns
+    /// `Some(Whole(refname))` so that `assign()` stores the RHS into the
+    /// nameref's own scalar, binding the target name.
+    fn resolve_assign_target(&mut self, dest: AssignDest) -> Option<AssignDest> {
+        let name = dest.name().to_string();
+        // Fast path: only namerefs are resolved.
+        if !self.is_nameref(&name) {
+            return Some(dest);
+        }
+        match self.resolve_nameref(&name) {
+            ResolvedName::Name(n) => Some(match dest {
+                AssignDest::Whole(_) => AssignDest::Whole(n),
+                AssignDest::Element { sub, .. } => AssignDest::Element { name: n, sub },
+            }),
+            ResolvedName::Element { name: arr, subscript } => {
+                let sub = self.eval_nameref_subscript(&arr, &subscript);
+                Some(AssignDest::Element { name: arr, sub })
+            }
+            ResolvedName::Unbound(refname) => {
+                // Assigning to an UNBOUND nameref BINDS it: store the value as
+                // the nameref's own scalar (which becomes the target name).
+                Some(AssignDest::Whole(refname))
+            }
+            ResolvedName::Cycle => None, // warning already emitted; drop the write
+        }
+    }
+
+    /// Evaluates a nameref element-target subscript into a `Subscript` value,
+    /// choosing between associative (string key) and indexed (arith) based on
+    /// the target array's current shape — mirroring `apply_one_assignment`.
+    fn eval_nameref_subscript(&mut self, arr: &str, subscript: &str) -> Subscript {
+        let sub_word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+            text: subscript.to_string(),
+            quoted: false,
+        }]);
+        if self.get_associative(arr).is_some() {
+            Subscript::Key(crate::expand::eval_subscript_key(&sub_word, self))
+        } else {
+            match crate::expand::eval_subscript(&sub_word, self, arr) {
+                Ok(i) => Subscript::Index(i),
+                Err(_) => Subscript::Index(0),
+            }
+        }
     }
 
     /// Raw scalar store: RANDOM/SECONDS interception, else overwrite an existing
@@ -1266,7 +1358,7 @@ impl Shell {
                 m.insert(idx, value);
                 self.vars.insert(name.to_string(), Variable {
                     value: VarValue::Indexed(m),
-                    exported: false, readonly: false, integer: false, case_fold: None,
+                    exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
                 });
             }
         }
@@ -1282,7 +1374,7 @@ impl Shell {
         };
         self.vars.insert(name.to_string(), Variable {
             value: VarValue::Indexed(elements),
-            exported, readonly: false, integer, case_fold,
+            exported, readonly: false, integer, case_fold, nameref: false,
         });
         Ok(())
     }
@@ -1301,7 +1393,7 @@ impl Shell {
         if !self.vars.contains_key(name) {
             self.vars.insert(name.to_string(), Variable {
                 value: VarValue::Indexed(BTreeMap::new()),
-                exported: false, readonly: false, integer: false, case_fold: None,
+                exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
             });
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -1356,6 +1448,7 @@ impl Shell {
                 // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
                 case_fold,
+                nameref: false,
             },
         );
         Ok(())
@@ -1372,7 +1465,10 @@ impl Shell {
         op: AssignKind,
         source: AssignSource,
     ) -> Result<(), AssignErr> {
-        let dest = self.resolve_assign_target(dest);
+        let dest = match self.resolve_assign_target(dest) {
+            Some(d) => d,
+            None => return Ok(()), // cycle: warning emitted, write dropped (rc 0)
+        };
         let name = dest.name().to_string();
 
         // The single readonly check, before any store (no partial array
@@ -1501,6 +1597,7 @@ impl Shell {
                     readonly: true,
                     integer: false,
                     case_fold: None,
+                    nameref: false,
                 },
             );
         }
@@ -1526,6 +1623,7 @@ impl Shell {
                     readonly: false,
                     integer: true,
                     case_fold: None,
+                    nameref: false,
                 },
             );
         }
@@ -1559,8 +1657,100 @@ impl Shell {
                     readonly: false,
                     integer: false,
                     case_fold: fold,
+                    nameref: false,
                 },
             );
+        }
+    }
+
+    /// Reader for the nameref attribute.
+    pub fn is_nameref(&self, name: &str) -> bool {
+        self.vars.get(name).map(|v| v.nameref).unwrap_or(false)
+    }
+
+    /// Sets/clears the nameref attribute, creating the variable if absent
+    /// (mirrors `set_case_fold`). The target name (if any) is stored as the
+    /// scalar value separately, via the normal store path.
+    pub fn set_nameref(&mut self, name: &str, on: bool) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.nameref = on;
+        } else {
+            self.vars.insert(name.to_string(), Variable {
+                value: VarValue::Scalar(String::new()),
+                exported: false, readonly: false, integer: false,
+                case_fold: None, nameref: on,
+            });
+        }
+    }
+
+    /// Follows the nameref chain starting at `name` to its effective storage
+    /// destination. A no-op for ordinary variables (returns `Name(name)`), so
+    /// callers may resolve unconditionally. Detects cycles via a visited set
+    /// and emits bash's `circular name reference` warning.
+    pub fn resolve_nameref(&self, name: &str) -> ResolvedName {
+        let mut current = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                eprintln!("huck: warning: {current}: circular name reference");
+                return ResolvedName::Cycle;
+            }
+            match self.vars.get(&current) {
+                Some(v) if v.nameref => {
+                    let target = v.value.scalar_view().to_string();
+                    if target.is_empty() {
+                        return ResolvedName::Unbound(current);
+                    }
+                    // Element target `base[sub]`?
+                    match crate::builtins::parse_subscripted_arg(&target) {
+                        Ok(Some((base, sub))) => {
+                            return ResolvedName::Element {
+                                name: base.to_string(),
+                                subscript: sub.to_string(),
+                            };
+                        }
+                        _ => { current = target; } // plain name → follow the chain
+                    }
+                }
+                _ => return ResolvedName::Name(current),
+            }
+        }
+    }
+
+    /// The raw target-name value of a nameref (its stored scalar), WITHOUT
+    /// dereferencing. `None` if `name` is not a nameref.
+    pub fn nameref_raw_target(&self, name: &str) -> Option<String> {
+        self.vars.get(name).filter(|v| v.nameref).map(|v| v.value.scalar_view().to_string())
+    }
+
+    /// Reads `arr[subscript-text]` as a scalar, evaluating the subscript in
+    /// arr's current shape (associative → literal string key; else → read-only
+    /// arith index). Read-only (&self): used by nameref element-target resolution.
+    fn lookup_nameref_element(&self, arr: &str, subscript: &str) -> Option<String> {
+        if self.get_associative(arr).is_some() {
+            // Associative: treat the raw subscript text as the string key
+            // (no expansion needed for the common literal-key case).
+            self.lookup_associative_element(arr, subscript)
+        } else {
+            // Resolve the subscript to a usize index.
+            let idx: Option<usize> = if let Ok(i) = subscript.parse::<usize>() {
+                // Fast path: literal non-negative integer (the common arr[0] case).
+                Some(i)
+            } else if let Some(n) = self.read_only_arith(subscript) {
+                // Read-only arith evaluation for computed subscripts.
+                if n >= 0 {
+                    Some(n as usize)
+                } else {
+                    // Negative index: wrap from end.
+                    self.array_max_index(arr).and_then(|max| {
+                        let wrapped = max as i64 + 1 + n;
+                        if wrapped >= 0 { Some(wrapped as usize) } else { None }
+                    })
+                }
+            } else {
+                None
+            };
+            idx.and_then(|i| self.lookup_array_element(arr, i))
         }
     }
 
@@ -1586,6 +1776,7 @@ impl Shell {
             readonly,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1598,6 +1789,7 @@ impl Shell {
             readonly,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1650,6 +1842,7 @@ impl Shell {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1658,7 +1851,17 @@ impl Shell {
     /// Returns a reference to the indexed array stored under `name`,
     /// or `None` if the variable is unset or a scalar.
     pub fn get_array(&self, name: &str) -> Option<&BTreeMap<usize, String>> {
-        match self.vars.get(name) {
+        // Resolve through namerefs so that array operations on a nameref
+        // target the actual array (e.g. `local -n a=arr; a+=(z)` sees arr).
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return None,
+            }
+        } else {
+            name.to_string()
+        };
+        match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => Some(m),
                 VarValue::Scalar(_) | VarValue::Associative(_) => None,
@@ -1707,6 +1910,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
     }
@@ -1719,6 +1923,7 @@ impl Shell {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1885,8 +2090,19 @@ impl Shell {
 
     /// Returns a reference to the associative array stored under `name`,
     /// or `None` if the variable is unset, scalar, or indexed.
+    /// Resolves through namerefs so that `local -n m=mymap; m[k]=v` dispatches
+    /// correctly to the associative path.
     pub fn get_associative(&self, name: &str) -> Option<&Vec<(String, String)>> {
-        match self.vars.get(name) {
+        // Resolve through namerefs.
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return None,
+            }
+        } else {
+            name.to_string()
+        };
+        match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Associative(pairs) => Some(pairs),
                 _ => None,
@@ -1984,6 +2200,7 @@ impl Shell {
                         readonly: false,
                         integer: false,
                         case_fold: None,
+                        nameref: false,
                     },
                 );
                 Ok(())
@@ -2139,6 +2356,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
     }
@@ -2665,6 +2883,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         let result = shell.try_set("a", "new".to_string());
@@ -2692,6 +2911,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         shell.set("a", "new".to_string());
@@ -2718,6 +2938,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         shell.export_set("a", "new".to_string());
@@ -2769,7 +2990,7 @@ mod assoc_value_tests {
         m.insert(0, "x".into());
         shell.vars.insert("a".into(), Variable {
             value: VarValue::Indexed(m),
-            exported: false, readonly: false, integer: false, case_fold: None,
+            exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
         });
         assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
     }
@@ -3185,5 +3406,30 @@ mod shopt_tests {
             ).is_err()
         );
         assert_eq!(shell.get("r"), Some("init")); // value unchanged
+    }
+
+    #[test]
+    fn resolve_nameref_covers_plain_chain_cycle_element_unbound() {
+        let mut shell = Shell::new();
+        // plain (not a nameref) → itself
+        assert_eq!(shell.resolve_nameref("x"), ResolvedName::Name("x".into()));
+        // single hop r -> x
+        shell.set_nameref("r", true);
+        shell.set("r", "x".into()); // store target name
+        assert_eq!(shell.resolve_nameref("r"), ResolvedName::Name("x".into()));
+        // chain a -> b -> c
+        shell.set_nameref("a", true); shell.set("a", "b".into());
+        shell.set_nameref("b", true); shell.set("b", "c".into());
+        assert_eq!(shell.resolve_nameref("a"), ResolvedName::Name("c".into()));
+        // element target e -> arr[2]
+        shell.set_nameref("e", true); shell.set("e", "arr[2]".into());
+        assert_eq!(shell.resolve_nameref("e"), ResolvedName::Element { name: "arr".into(), subscript: "2".into() });
+        // unbound u (attribute set, empty value)
+        shell.set_nameref("u", true);
+        assert_eq!(shell.resolve_nameref("u"), ResolvedName::Unbound("u".into()));
+        // cycle p -> q -> p
+        shell.set_nameref("p", true); shell.set("p", "q".into());
+        shell.set_nameref("q", true); shell.set("q", "p".into());
+        assert_eq!(shell.resolve_nameref("p"), ResolvedName::Cycle);
     }
 }
