@@ -291,6 +291,31 @@ pub fn run_declaration_builtin(
     }
 }
 
+/// Lexically normalizes an ABSOLUTE path for logical `cd`: collapses `.`,
+/// empty components (from `//`), and `..` (removing the preceding component
+/// WITHOUT resolving symlinks). A `..` at the root is dropped (bash behavior).
+/// Always returns an absolute path; `/` for an empty result.
+#[allow(dead_code)]
+fn normalize_logical(path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if matches!(components.last(), Some(&c) if c != "..") {
+                    components.pop();
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.len() > 1 {
         eprintln!("huck: cd: too many arguments");
@@ -5210,6 +5235,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "noglob" => Some(shell.shell_options.noglob),
         "noclobber" => Some(shell.shell_options.noclobber),
         "noexec" => Some(shell.shell_options.noexec),
+        "physical" => Some(shell.shell_options.physical),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -5226,6 +5252,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "noglob" => { shell.shell_options.noglob = value; Ok(()) }
         "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
         "noexec" => { shell.shell_options.noexec = value; Ok(()) }
+        "physical" => { shell.shell_options.physical = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -12848,5 +12875,22 @@ mod getopts_step_tests {
         assert_eq!(s.name, ":");
         assert_eq!(s.optarg.as_deref(), Some("b"));
         assert!(s.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod normalize_logical_tests {
+    use super::normalize_logical;
+
+    #[test]
+    fn normalize_logical_collapses_lexically() {
+        assert_eq!(normalize_logical("/a/b/../c"), "/a/c");
+        assert_eq!(normalize_logical("/a/./b"), "/a/b");
+        assert_eq!(normalize_logical("/a//b"), "/a/b");
+        assert_eq!(normalize_logical("/a/b/.."), "/a");
+        assert_eq!(normalize_logical("/.."), "/");
+        assert_eq!(normalize_logical("/a/../.."), "/");
+        assert_eq!(normalize_logical("/"), "/");
+        assert_eq!(normalize_logical("/tmp/m/link/.."), "/tmp/m");
     }
 }
