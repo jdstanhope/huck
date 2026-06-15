@@ -191,14 +191,40 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Completes a command name: builtins plus executables found in the
-/// `:`-separated `path`.
-pub fn complete_command(prefix: &str, path: &str) -> Vec<Candidate> {
+/// Shell keywords completed at command position (bash completes these too).
+const COMPLETION_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
+    "while", "until", "do", "done", "in", "function", "time", "coproc",
+];
+
+/// Completes a command name: builtins, keywords, user-defined functions and
+/// aliases (`function_names`/`alias_names`), plus executables found in the
+/// `:`-separated `path` — the full bash command-position candidate set.
+pub fn complete_command(
+    prefix: &str,
+    path: &str,
+    function_names: &[String],
+    alias_names: &[String],
+) -> Vec<Candidate> {
     let mut names: BTreeSet<String> = BTreeSet::new();
 
     for &builtin in crate::builtins::BUILTIN_NAMES {
         if builtin.starts_with(prefix) {
             names.insert(builtin.to_string());
+        }
+    }
+
+    for &kw in COMPLETION_KEYWORDS {
+        if kw.starts_with(prefix) {
+            names.insert(kw.to_string());
+        }
+    }
+
+    // User-defined commands: functions + aliases (bash completes these at the
+    // command position alongside builtins/keywords/PATH executables).
+    for name in function_names.iter().chain(alias_names.iter()) {
+        if name.starts_with(prefix) {
+            names.insert(name.clone());
         }
     }
 
@@ -416,7 +442,9 @@ pub(crate) mod dispatch {
                 return (start, cands);
             }
             let path = shell.get("PATH").unwrap_or("").to_string();
-            return (start, complete_command(prefix, &path));
+            let funcs: Vec<String> = shell.functions.keys().cloned().collect();
+            let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
+            return (start, complete_command(prefix, &path, &funcs, &aliases));
         }
 
         // Path 3: file/argument position.
@@ -583,7 +611,9 @@ pub(crate) mod dispatch {
             }
             CompletionContext::Command { prefix } => {
                 let path = shell.get("PATH").unwrap_or("").to_string();
-                complete_command(&prefix, &path)
+                let funcs: Vec<String> = shell.functions.keys().cloned().collect();
+                let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
+                complete_command(&prefix, &path, &funcs, &aliases)
                     .into_iter()
                     .map(|c| c.replacement)
                     .collect()
@@ -1033,13 +1063,13 @@ mod tests {
 
     #[test]
     fn complete_command_matches_builtin_prefix() {
-        let cands = complete_command("ec", "");
+        let cands = complete_command("ec", "", &[], &[]);
         assert!(cands.iter().any(|c| c.replacement == "echo"));
     }
 
     #[test]
     fn complete_command_empty_prefix_includes_builtins() {
-        let cands = complete_command("", "");
+        let cands = complete_command("", "", &[], &[]);
         assert!(cands.iter().any(|c| c.replacement == "cd"));
         assert!(cands.iter().any(|c| c.replacement == "history"));
     }
@@ -1057,7 +1087,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("huckcmd_subdir")).unwrap();
 
         let path = dir.path().to_str().unwrap();
-        let cands = complete_command("huckcmd_", path);
+        let cands = complete_command("huckcmd_", path, &[], &[]);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(names.contains(&"huckcmd_exe"), "exe should match: {names:?}");
         assert!(!names.contains(&"huckcmd_plain"), "non-exe should not match");
@@ -1066,7 +1096,7 @@ mod tests {
 
     #[test]
     fn complete_command_results_are_sorted_and_unique() {
-        let cands = complete_command("", "");
+        let cands = complete_command("", "", &[], &[]);
         let mut sorted = cands.clone();
         sorted.sort_by(|a, b| a.replacement.cmp(&b.replacement));
         assert_eq!(cands, sorted);
@@ -1176,7 +1206,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let path = dir.path().to_str().unwrap();
-        let cands = complete_command("huckcmd_", path);
+        let cands = complete_command("huckcmd_", path, &[], &[]);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(names.contains(&"huckcmd_real"), "{names:?}");
         assert!(names.contains(&"huckcmd_link"), "symlinked exe should complete: {names:?}");
@@ -1251,6 +1281,36 @@ mod tests {
         let (_, cands) = dispatch::resolve("ec", 2, &mut shell);
         let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
         assert!(names.contains(&"echo"), "{names:?}");
+    }
+
+    #[test]
+    fn complete_command_includes_functions_aliases_and_keywords() {
+        let funcs = vec!["hello".to_string(), "helper".to_string()];
+        let aliases = vec!["heya".to_string()];
+        let cands = complete_command("he", "", &funcs, &aliases);
+        let names: Vec<&str> = cands.iter().map(|c| c.display.as_str()).collect();
+        assert!(names.contains(&"hello"), "function missing: {names:?}");
+        assert!(names.contains(&"helper"), "function missing: {names:?}");
+        assert!(names.contains(&"heya"), "alias missing: {names:?}");
+        // a keyword starting with the prefix is also completed
+        let kw = complete_command("whi", "", &[], &[]);
+        assert!(kw.iter().any(|c| c.display == "while"), "keyword missing");
+        // a function NOT matching the prefix is excluded
+        let only = complete_command("hell", "", &funcs, &aliases);
+        let only_names: Vec<&str> = only.iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(only_names, vec!["hello"]);
+    }
+
+    #[test]
+    fn dispatch_command_position_completes_a_user_alias() {
+        // Regression: command-position TAB must include user-defined command
+        // names (functions + aliases), not just builtins + PATH. (Functions go
+        // through the identical wiring; an alias is trivial to set up here.)
+        let mut shell = Shell::new();
+        shell.aliases.insert("myuniquealias".to_string(), "ls".to_string());
+        let (_, cands) = dispatch::resolve("myuniquea", 9, &mut shell);
+        let names: Vec<&str> = cands.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(names.contains(&"myuniquealias"), "alias not completed: {names:?}");
     }
 
     #[test]
