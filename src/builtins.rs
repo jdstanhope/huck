@@ -602,7 +602,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
 /// whole-variable unset path. Otherwise returns `Err(diagnostic)` —
 /// e.g. `a[`, `a[]`, or `1foo[i]` — matching bash's "bad array subscript"
 /// / "not a valid identifier" diagnostics for `unset`.
-fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, String> {
+pub(crate) fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, String> {
     let Some(bracket) = s.find('[') else {
         return Ok(None);
     };

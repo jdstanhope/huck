@@ -70,6 +70,7 @@ pub struct Variable {
     pub readonly: bool,
     pub integer: bool,
     pub case_fold: Option<CaseFold>,
+    pub nameref: bool,
 }
 
 impl Variable {
@@ -82,6 +83,7 @@ impl Variable {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         }
     }
 }
@@ -113,6 +115,21 @@ pub enum AssignDest {
     Whole(String),
     /// A single element with an already-resolved subscript.
     Element { name: String, sub: Subscript },
+}
+
+/// Result of following a nameref chain to its effective destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedName {
+    /// A plain variable target (the original name if `name` is not a nameref).
+    Name(String),
+    /// An element target `base[subscript-text]` — the subscript is evaluated
+    /// at the use site in the base's current shape.
+    Element { name: String, subscript: String },
+    /// A nameref whose target value is empty (attribute set, not yet bound).
+    /// Carries the nameref's own name (assignment BINDS it; reads are unset).
+    Unbound(String),
+    /// A cycle was detected; the `circular name reference` warning was emitted.
+    Cycle,
 }
 
 /// A subscript resolved by the caller. Index → indexed array (arith-evaluated);
@@ -638,6 +655,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             });
         }
         let shell_pid = unsafe { libc::getpid() };
@@ -1071,6 +1089,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             });
     }
 
@@ -1094,6 +1113,7 @@ impl Shell {
                         readonly: false,
                         integer: false,
                         case_fold: None,
+                        nameref: false,
                     },
                 );
             }
@@ -1266,7 +1286,7 @@ impl Shell {
                 m.insert(idx, value);
                 self.vars.insert(name.to_string(), Variable {
                     value: VarValue::Indexed(m),
-                    exported: false, readonly: false, integer: false, case_fold: None,
+                    exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
                 });
             }
         }
@@ -1282,7 +1302,7 @@ impl Shell {
         };
         self.vars.insert(name.to_string(), Variable {
             value: VarValue::Indexed(elements),
-            exported, readonly: false, integer, case_fold,
+            exported, readonly: false, integer, case_fold, nameref: false,
         });
         Ok(())
     }
@@ -1301,7 +1321,7 @@ impl Shell {
         if !self.vars.contains_key(name) {
             self.vars.insert(name.to_string(), Variable {
                 value: VarValue::Indexed(BTreeMap::new()),
-                exported: false, readonly: false, integer: false, case_fold: None,
+                exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
             });
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -1356,6 +1376,7 @@ impl Shell {
                 // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
                 case_fold,
+                nameref: false,
             },
         );
         Ok(())
@@ -1501,6 +1522,7 @@ impl Shell {
                     readonly: true,
                     integer: false,
                     case_fold: None,
+                    nameref: false,
                 },
             );
         }
@@ -1526,6 +1548,7 @@ impl Shell {
                     readonly: false,
                     integer: true,
                     case_fold: None,
+                    nameref: false,
                 },
             );
         }
@@ -1559,8 +1582,63 @@ impl Shell {
                     readonly: false,
                     integer: false,
                     case_fold: fold,
+                    nameref: false,
                 },
             );
+        }
+    }
+
+    /// Reader for the nameref attribute.
+    pub fn is_nameref(&self, name: &str) -> bool {
+        self.vars.get(name).map(|v| v.nameref).unwrap_or(false)
+    }
+
+    /// Sets/clears the nameref attribute, creating the variable if absent
+    /// (mirrors `set_case_fold`). The target name (if any) is stored as the
+    /// scalar value separately, via the normal store path.
+    pub fn set_nameref(&mut self, name: &str, on: bool) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.nameref = on;
+        } else {
+            self.vars.insert(name.to_string(), Variable {
+                value: VarValue::Scalar(String::new()),
+                exported: false, readonly: false, integer: false,
+                case_fold: None, nameref: on,
+            });
+        }
+    }
+
+    /// Follows the nameref chain starting at `name` to its effective storage
+    /// destination. A no-op for ordinary variables (returns `Name(name)`), so
+    /// callers may resolve unconditionally. Detects cycles via a visited set
+    /// and emits bash's `circular name reference` warning.
+    pub fn resolve_nameref(&self, name: &str) -> ResolvedName {
+        let mut current = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                eprintln!("huck: warning: {name}: circular name reference");
+                return ResolvedName::Cycle;
+            }
+            match self.vars.get(&current) {
+                Some(v) if v.nameref => {
+                    let target = v.value.scalar_view().to_string();
+                    if target.is_empty() {
+                        return ResolvedName::Unbound(current);
+                    }
+                    // Element target `base[sub]`?
+                    match crate::builtins::parse_subscripted_arg(&target) {
+                        Ok(Some((base, sub))) => {
+                            return ResolvedName::Element {
+                                name: base.to_string(),
+                                subscript: sub.to_string(),
+                            };
+                        }
+                        _ => { current = target; } // plain name → follow the chain
+                    }
+                }
+                _ => return ResolvedName::Name(current),
+            }
         }
     }
 
@@ -1586,6 +1664,7 @@ impl Shell {
             readonly,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1598,6 +1677,7 @@ impl Shell {
             readonly,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1650,6 +1730,7 @@ impl Shell {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1707,6 +1788,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
     }
@@ -1719,6 +1801,7 @@ impl Shell {
             readonly: false,
             integer: false,
             case_fold: None,
+            nameref: false,
         });
     }
 
@@ -1984,6 +2067,7 @@ impl Shell {
                         readonly: false,
                         integer: false,
                         case_fold: None,
+                        nameref: false,
                     },
                 );
                 Ok(())
@@ -2139,6 +2223,7 @@ impl Shell {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
     }
@@ -2665,6 +2750,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         let result = shell.try_set("a", "new".to_string());
@@ -2692,6 +2778,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         shell.set("a", "new".to_string());
@@ -2718,6 +2805,7 @@ mod array_value_tests {
                 readonly: false,
                 integer: false,
                 case_fold: None,
+                nameref: false,
             },
         );
         shell.export_set("a", "new".to_string());
@@ -2769,7 +2857,7 @@ mod assoc_value_tests {
         m.insert(0, "x".into());
         shell.vars.insert("a".into(), Variable {
             value: VarValue::Indexed(m),
-            exported: false, readonly: false, integer: false, case_fold: None,
+            exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
         });
         assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
     }
@@ -3185,5 +3273,30 @@ mod shopt_tests {
             ).is_err()
         );
         assert_eq!(shell.get("r"), Some("init")); // value unchanged
+    }
+
+    #[test]
+    fn resolve_nameref_covers_plain_chain_cycle_element_unbound() {
+        let mut shell = Shell::new();
+        // plain (not a nameref) → itself
+        assert_eq!(shell.resolve_nameref("x"), ResolvedName::Name("x".into()));
+        // single hop r -> x
+        shell.set_nameref("r", true);
+        shell.set("r", "x".into()); // store target name
+        assert_eq!(shell.resolve_nameref("r"), ResolvedName::Name("x".into()));
+        // chain a -> b -> c
+        shell.set_nameref("a", true); shell.set("a", "b".into());
+        shell.set_nameref("b", true); shell.set("b", "c".into());
+        assert_eq!(shell.resolve_nameref("a"), ResolvedName::Name("c".into()));
+        // element target e -> arr[2]
+        shell.set_nameref("e", true); shell.set("e", "arr[2]".into());
+        assert_eq!(shell.resolve_nameref("e"), ResolvedName::Element { name: "arr".into(), subscript: "2".into() });
+        // unbound u (attribute set, empty value)
+        shell.set_nameref("u", true);
+        assert_eq!(shell.resolve_nameref("u"), ResolvedName::Unbound("u".into()));
+        // cycle p -> q -> p
+        shell.set_nameref("p", true); shell.set("p", "q".into());
+        shell.set_nameref("q", true); shell.set("q", "p".into());
+        assert_eq!(shell.resolve_nameref("p"), ResolvedName::Cycle);
     }
 }
