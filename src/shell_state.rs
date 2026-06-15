@@ -105,6 +105,49 @@ pub enum AssignErr {
     TypeMismatch,
 }
 
+/// Where an assigned value lands. Subscripts are ALREADY resolved by the
+/// caller (which holds expansion context); the funnel takes only primitives.
+#[derive(Debug, Clone)]
+pub enum AssignDest {
+    /// Whole variable: `name=…`, `name=(…)`, `read -a name`, `mapfile name`.
+    Whole(String),
+    /// A single element with an already-resolved subscript.
+    Element { name: String, sub: Subscript },
+}
+
+/// A subscript resolved by the caller. Index → indexed array (arith-evaluated);
+/// Key → associative array (string-evaluated). The caller picks the variant
+/// from the target's current shape, as `apply_one_assignment` does today.
+#[derive(Debug, Clone)]
+pub enum Subscript {
+    Index(usize),
+    Key(String),
+}
+
+/// `=` vs `+=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignKind {
+    Set,
+    Append,
+}
+
+/// The value(s) to store, already fully expanded by the caller.
+#[derive(Debug, Clone)]
+pub enum AssignSource {
+    Scalar(String),
+    Indexed(BTreeMap<usize, String>),
+    Associative(Vec<(String, String)>),
+}
+
+impl AssignDest {
+    fn name(&self) -> &str {
+        match self {
+            AssignDest::Whole(n) => n,
+            AssignDest::Element { name, .. } => name,
+        }
+    }
+}
+
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
 /// Callers translate these into a "huck: {cmd}: ..." diagnostic via
@@ -777,7 +820,6 @@ impl Shell {
         self.lookup_var("IFS").unwrap_or_else(|| " \t\n".to_string())
     }
 
-    /// Sets a variable's value, preserving its existing `exported` flag (or
     /// If `name` is a reseed/reset-on-assignment dynamic special (`RANDOM`/`SECONDS`),
     /// apply the side effect and return `true` (caller must NOT store it as a var —
     /// these are computed in `lookup_var`). Returns `false` for ordinary names.
@@ -803,18 +845,14 @@ impl Shell {
         }
     }
 
-    /// creating it as unexported if it didn't exist). When the existing
-    /// value is an `Indexed` array, only element 0 is overwritten — the
-    /// rest of the map is preserved (matches bash: `a=v` on an indexed
-    /// array overwrites a[0]).
+    /// Raw scalar store: NO readonly check and NO attribute application
+    /// (integer-coerce / case-fold) — for shell-internal writes only (env
+    /// import, special/numeric vars). `reseed_special_on_assign` still fires.
+    /// When the existing value is an `Indexed` array, only element 0 is
+    /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
+    /// User-facing assignments must use `assign()` / `try_set` instead.
     pub fn set(&mut self, name: &str, value: String) {
-        if self.reseed_special_on_assign(name, &value) { return; }
-        match self.vars.get_mut(name) {
-            Some(existing) => install_scalar_value(existing, value),
-            None => {
-                self.vars.insert(name.to_string(), Variable::scalar(value));
-            }
-        }
+        self.store_scalar(name, value);
     }
 
     /// Resolves `$HISTSIZE` to the in-memory history cap. `None` = unlimited.
@@ -1177,27 +1215,238 @@ impl Shell {
         self.vars.get(name).map(|v| v.readonly).unwrap_or(false)
     }
 
-    /// Checked write: refuses to overwrite a readonly variable. Returns
-    /// `Err(())` if `name` is readonly (caller prints the diagnostic);
-    /// otherwise sets the value and returns `Ok(())`. Consumed by
-    /// executor/expansion write paths in v54 task 2.
-    ///
-    /// When `name` is integer-flagged (v65), the RHS is routed through
-    /// `arith::parse` + `arith::eval` and stored as the decimal string.
-    /// Parse/eval failures silently coerce to `"0"` (matches bash for
-    /// non-`declare` integer write paths).
-    pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
-        if self.is_readonly(name) {
-            return Err(());
+    /// Resolves an assignment target through any nameref indirection. Identity
+    /// today — huck has no namerefs yet (v160). This is the ONE place a future
+    /// `declare -n r=target` will rewrite the destination (name, and for
+    /// `declare -n r=arr[i]` a `Whole(r)` into an `Element{arr, Index(i)}`),
+    /// with circular-reference detection. Do NOT add nameref behavior here in
+    /// v159 — only the seam.
+    fn resolve_assign_target(&self, dest: AssignDest) -> AssignDest {
+        dest
+    }
+
+    /// Raw scalar store: RANDOM/SECONDS interception, else overwrite an existing
+    /// Indexed array's element 0 (bash's `a=v` rule) or set/create a Scalar.
+    /// No readonly check, no attributes — those belong to `assign()`.
+    fn store_scalar(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) {
+            return;
         }
-        // Intercept dynamic builtin variables: reseed RANDOM or reset SECONDS.
-        if self.reseed_special_on_assign(name, &value) { return Ok(()); }
-        // Determine whether the integer-coerce path applies: only on
-        // an existing integer-flagged Scalar. Indexed variables (even
-        // if integer-flagged) take the array-element-0 overwrite path
-        // instead.
-        // Compute the final stored string: integer-coerce first (only on an
-        // existing integer-flagged Scalar), then apply the case-fold attribute.
+        match self.vars.get_mut(name) {
+            Some(existing) => install_scalar_value(existing, value),
+            None => {
+                self.vars.insert(name.to_string(), Variable::scalar(value));
+            }
+        }
+    }
+
+    /// Storage only: insert `value` at `idx`, promoting a scalar to indexed
+    /// (element-0 rule). Caller has done readonly + fold.
+    fn store_indexed_element(&mut self, name: &str, idx: usize, value: String) -> Result<(), AssignErr> {
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Indexed(m) => { m.insert(idx, value); }
+                VarValue::Scalar(s) => {
+                    let mut m = BTreeMap::new();
+                    if idx == 0 {
+                        m.insert(0, value);
+                    } else {
+                        m.insert(0, std::mem::take(s));
+                        m.insert(idx, value);
+                    }
+                    v.value = VarValue::Indexed(m);
+                }
+                VarValue::Associative(_) => {
+                    eprintln!("huck: {name}: set_array_element on associative variable");
+                    return Err(AssignErr::TypeMismatch);
+                }
+            },
+            None => {
+                let mut m = BTreeMap::new();
+                m.insert(idx, value);
+                self.vars.insert(name.to_string(), Variable {
+                    value: VarValue::Indexed(m),
+                    exported: false, readonly: false, integer: false, case_fold: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Storage only: replace the whole variable with an indexed array of the
+    /// given (already-folded) elements, preserving exported/integer/case_fold.
+    fn store_indexed_replace(&mut self, name: &str, elements: BTreeMap<usize, String>) -> Result<(), AssignErr> {
+        let (exported, integer, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.integer, v.case_fold),
+            None => (false, false, None),
+        };
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Indexed(elements),
+            exported, readonly: false, integer, case_fold,
+        });
+        Ok(())
+    }
+
+    /// Storage only: merge (already-folded) entries into the indexed array,
+    /// promoting a scalar to element 0 and creating if absent.
+    fn store_indexed_extend(&mut self, name: &str, entries: BTreeMap<usize, String>) -> Result<(), AssignErr> {
+        if matches!(self.vars.get(name).map(|v| &v.value), Some(VarValue::Scalar(_)))
+            && let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Scalar(s) = &mut v.value
+        {
+            let mut m = BTreeMap::new();
+            m.insert(0, std::mem::take(s));
+            v.value = VarValue::Indexed(m);
+        }
+        if !self.vars.contains_key(name) {
+            self.vars.insert(name.to_string(), Variable {
+                value: VarValue::Indexed(BTreeMap::new()),
+                exported: false, readonly: false, integer: false, case_fold: None,
+            });
+        }
+        if let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Indexed(m) = &mut v.value
+        {
+            for (idx, val) in entries { m.insert(idx, val); }
+            Ok(())
+        } else {
+            eprintln!("huck: {name}: cannot append array literal to associative array");
+            Err(AssignErr::TypeMismatch)
+        }
+    }
+
+    /// Storage only: set `key`=`value` (already folded) in the associative
+    /// array, preserving insertion order; type-error if non-associative/unset.
+    fn store_assoc_element(&mut self, name: &str, key: String, value: String) -> Result<(), AssignErr> {
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Associative(pairs) => {
+                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
+                        slot.1 = value;
+                    } else {
+                        pairs.push((key, value));
+                    }
+                }
+                _ => {
+                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
+                    return Err(AssignErr::TypeMismatch);
+                }
+            },
+            None => {
+                eprintln!("huck: {name}: set_associative_element on unset variable");
+                return Err(AssignErr::TypeMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Storage only: replace the whole variable with an associative array of the
+    /// given (already-folded) pairs, preserving exported/case_fold.
+    fn store_assoc_replace(&mut self, name: &str, pairs: Vec<(String, String)>) -> Result<(), AssignErr> {
+        let (exported, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.case_fold),
+            None => (false, None),
+        };
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Associative(pairs),
+                exported,
+                readonly: false,
+                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
+                integer: false,
+                case_fold,
+            },
+        );
+        Ok(())
+    }
+
+    /// The single chokepoint for variable assignment. Applies cross-cutting
+    /// concerns in a fixed order — resolve target (nameref seam) → readonly →
+    /// integer-coerce → case-fold → store — then dispatches to a storage
+    /// primitive. All value-producing paths route through here (directly or via
+    /// the thin leaf-mutator wrappers).
+    pub fn assign(
+        &mut self,
+        dest: AssignDest,
+        op: AssignKind,
+        source: AssignSource,
+    ) -> Result<(), AssignErr> {
+        let dest = self.resolve_assign_target(dest);
+        let name = dest.name().to_string();
+
+        // The single readonly check, before any store (no partial array
+        // writes); the storage primitives do not re-check.
+        if self.is_readonly(&name) {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+
+        match (&dest, op, source) {
+            // ── Scalar value into a whole variable: `x=v` / `x+=v` ──
+            // The Append sub-case has no caller today (the executor pre-
+            // concatenates scalar `+=` and calls Set); it is intentionally
+            // live, not `unreachable!()`, because v160 nameref `r+=v` resolves
+            // to `assign(Whole(r), Append, Scalar(v))`.
+            (AssignDest::Whole(_), _, AssignSource::Scalar(v)) => {
+                let v = if op == AssignKind::Append {
+                    let existing = self.get(&name).map(str::to_string).unwrap_or_default();
+                    existing + &v
+                } else {
+                    v
+                };
+                let stored = self.value_with_scalar_attrs(&name, v);
+                self.store_scalar(&name, stored);
+                Ok(())
+            }
+            // ── Element + Scalar (indexed): apply fold then call primitive ──
+            (AssignDest::Element { name: n, sub: Subscript::Index(idx) }, _, AssignSource::Scalar(v)) => {
+                let n = n.clone();
+                let idx = *idx;
+                let v = if op == AssignKind::Append {
+                    self.lookup_array_element(&n, idx).unwrap_or_default() + &v
+                } else { v };
+                let v = apply_case_fold(self.case_fold_of(&n), v); // NB: NO integer-coerce on elements (preserve asymmetry)
+                self.store_indexed_element(&n, idx, v)
+            }
+            (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
+                let n = n.clone();
+                let key = key.clone();
+                let v = if op == AssignKind::Append {
+                    self.lookup_associative_element(&n, &key).unwrap_or_default() + &v
+                } else { v };
+                let v = apply_case_fold(self.case_fold_of(&n), v);
+                self.store_assoc_element(&n, key, v)
+            }
+            // ── Whole + Indexed source: fold then call primitive ──
+            (AssignDest::Whole(n), _, AssignSource::Indexed(m)) => {
+                let n = n.clone();
+                let fold = self.case_fold_of(&n);
+                let m: BTreeMap<usize, String> = m.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
+                match op {
+                    AssignKind::Set => self.store_indexed_replace(&n, m),
+                    AssignKind::Append => self.store_indexed_extend(&n, m),
+                }
+            }
+            (AssignDest::Whole(n), AssignKind::Set, AssignSource::Associative(p)) => {
+                let n = n.clone();
+                let fold = self.case_fold_of(&n);
+                let p: Vec<(String, String)> = p.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
+                self.store_assoc_replace(&n, p)
+            }
+            (AssignDest::Whole(_), AssignKind::Append, AssignSource::Associative(_)) => {
+                unreachable!("associative whole-append is not produced by any caller")
+            }
+            (AssignDest::Element { .. }, _, AssignSource::Indexed(_))
+            | (AssignDest::Element { .. }, _, AssignSource::Associative(_)) => {
+                unreachable!("Element dest with array/assoc source is not produced by any caller")
+            }
+        }
+    }
+
+    /// Applies the SCALAR attribute chain (integer-coerce only on an existing
+    /// integer-flagged Scalar, then case-fold) to a whole-variable value.
+    fn value_with_scalar_attrs(&mut self, name: &str, value: String) -> String {
         let do_integer_coerce = self.is_integer(name)
             && self
                 .vars
@@ -1208,21 +1457,21 @@ impl Shell {
         } else {
             value
         };
-        let folded = apply_case_fold(self.case_fold_of(name), coerced);
+        apply_case_fold(self.case_fold_of(name), coerced)
+    }
 
-        if do_integer_coerce {
-            if let Some(existing) = self.vars.get_mut(name) {
-                existing.value = VarValue::Scalar(folded);
-            }
-            return Ok(());
-        }
-        if let Some(existing) = self.vars.get_mut(name) {
-            install_scalar_value(existing, folded);
-            Ok(())
-        } else {
-            self.vars.insert(name.to_string(), Variable::scalar(folded));
-            Ok(())
-        }
+    /// Checked write: refuses to overwrite a readonly variable. Returns
+    /// `Err(())` if `name` is readonly (caller prints the diagnostic);
+    /// otherwise sets the value and returns `Ok(())`. Consumed by
+    /// executor/expansion write paths in v54 task 2.
+    ///
+    /// When `name` is integer-flagged (v65), the RHS is routed through
+    /// `arith::parse` + `arith::eval` and stored as the decimal string.
+    /// Parse/eval failures silently coerce to `"0"` (matches bash for
+    /// non-`declare` integer write paths).
+    pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Scalar(value))
+            .map_err(|_| ())
     }
 
     /// Checked unset: refuses to remove a readonly variable. Returns
@@ -1575,31 +1824,7 @@ impl Shell {
         name: &str,
         elements: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let (exported, integer, case_fold) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.integer, v.case_fold),
-            None => (false, false, None),
-        };
-        let elements = elements
-            .into_iter()
-            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
-            .collect();
-        self.vars.insert(
-            name.to_string(),
-            Variable {
-                value: VarValue::Indexed(elements),
-                exported,
-                readonly: false,
-                integer,
-                case_fold,
-            },
-        );
-        Ok(())
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Indexed(elements))
     }
 
     /// Sets a single element. Promotes a scalar variable to indexed
@@ -1611,105 +1836,21 @@ impl Shell {
         idx: usize,
         value: String,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let value = apply_case_fold(self.case_fold_of(name), value);
-        match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Indexed(m) => {
-                    m.insert(idx, value);
-                }
-                VarValue::Scalar(s) => {
-                    let mut m = BTreeMap::new();
-                    if idx == 0 {
-                        m.insert(0, value);
-                    } else {
-                        m.insert(0, std::mem::take(s));
-                        m.insert(idx, value);
-                    }
-                    v.value = VarValue::Indexed(m);
-                }
-                VarValue::Associative(_) => {
-                    eprintln!(
-                        "huck: {name}: set_array_element on associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
-            None => {
-                let mut m = BTreeMap::new();
-                m.insert(idx, value);
-                self.vars.insert(
-                    name.to_string(),
-                    Variable {
-                        value: VarValue::Indexed(m),
-                        exported: false,
-                        readonly: false,
-                        integer: false,
-                        case_fold: None,
-                    },
-                );
-            }
-        }
-        Ok(())
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Set, AssignSource::Scalar(value))
     }
 
     /// Merges explicit `(index → value)` entries into the named indexed
     /// array, creating it if missing and promoting a scalar to element 0
-    /// first. Honors readonly (callers should pre-check to avoid a partial
-    /// write; this re-checks defensively). Used by `a+=(elements)` after the
-    /// elements are field-expanded with continuation indices already
-    /// computed. Appending to an associative array is a type error.
+    /// first. Thin wrapper over `assign()`, which performs the readonly check
+    /// (callers may still pre-check to avoid a partial write). Used by
+    /// `a+=(elements)` after the elements are field-expanded with continuation
+    /// indices already computed. Appending to an associative array is a type error.
     pub fn extend_indexed(
         &mut self,
         name: &str,
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        // Promote scalar to indexed (scalar becomes element 0).
-        if matches!(
-            self.vars.get(name).map(|v| &v.value),
-            Some(VarValue::Scalar(_))
-        ) && let Some(v) = self.vars.get_mut(name)
-            && let VarValue::Scalar(s) = &mut v.value
-        {
-            let mut m = BTreeMap::new();
-            m.insert(0, std::mem::take(s));
-            v.value = VarValue::Indexed(m);
-        }
-        if !self.vars.contains_key(name) {
-            self.vars.insert(
-                name.to_string(),
-                Variable {
-                    value: VarValue::Indexed(BTreeMap::new()),
-                    exported: false,
-                    readonly: false,
-                    integer: false,
-                    case_fold: None,
-                },
-            );
-        }
-        let fold = self.case_fold_of(name);
-        if let Some(v) = self.vars.get_mut(name)
-            && let VarValue::Indexed(m) = &mut v.value
-        {
-            for (idx, val) in entries {
-                m.insert(idx, apply_case_fold(fold, val));
-            }
-            Ok(())
-        } else {
-            eprintln!("huck: {name}: cannot append array literal to associative array");
-            Err(AssignErr::TypeMismatch)
-        }
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Append, AssignSource::Indexed(entries))
     }
 
     /// Appends `value` to the existing element at `idx` (concatenation).
@@ -1721,8 +1862,7 @@ impl Shell {
         idx: usize,
         value: &str,
     ) -> Result<(), AssignErr> {
-        let existing = self.lookup_array_element(name, idx).unwrap_or_default();
-        self.set_array_element(name, idx, existing + value)
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
     }
 
     /// Removes a single element from an indexed array. No-op if the
@@ -1775,33 +1915,7 @@ impl Shell {
         key: String,
         value: String,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let value = apply_case_fold(self.case_fold_of(name), value);
-        match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Associative(pairs) => {
-                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
-                        slot.1 = value;
-                    } else {
-                        pairs.push((key, value));
-                    }
-                }
-                _ => {
-                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
-            None => {
-                eprintln!("huck: {name}: set_associative_element on unset variable");
-                return Err(AssignErr::TypeMismatch);
-            }
-        }
-        Ok(())
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key) }, AssignKind::Set, AssignSource::Scalar(value))
     }
 
     /// `m[k]+=v` — concatenate `value` to the existing element at `key`,
@@ -1812,8 +1926,7 @@ impl Shell {
         key: &str,
         value: &str,
     ) -> Result<(), AssignErr> {
-        let existing = self.lookup_associative_element(name, key).unwrap_or_default();
-        self.set_associative_element(name, key.to_string(), existing + value)
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key.to_string()) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
     }
 
     /// Removes the entry at `key` from the associative array `name`.
@@ -1848,32 +1961,7 @@ impl Shell {
         name: &str,
         pairs: Vec<(String, String)>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let (exported, case_fold) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.case_fold),
-            None => (false, None),
-        };
-        let pairs = pairs
-            .into_iter()
-            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
-            .collect();
-        self.vars.insert(
-            name.to_string(),
-            Variable {
-                value: VarValue::Associative(pairs),
-                exported,
-                readonly: false,
-                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
-                integer: false,
-                case_fold,
-            },
-        );
-        Ok(())
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Associative(pairs))
     }
 
     /// Creates an empty associative array under `name`. Enforces bash rules:
@@ -1996,10 +2084,10 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
 
 /// Installs `value` as the scalar value of `existing`, preserving the
 /// rest of an `Indexed` map (writing only element 0). Shared by
-/// `Shell::set`, `Shell::export_set`, and `Shell::try_set`'s non-
-/// integer path so the three callers stay in lockstep on the
-/// "scalar assignment to an array overwrites a[0]" rule (matches
-/// bash: `a=v` on an indexed array overwrites a[0]).
+/// `Shell::store_scalar` (the single scalar-store primitive behind both
+/// `assign()` and the raw `set()`) and `Shell::export_set`, so every
+/// scalar-store path applies the "scalar assignment to an array
+/// overwrites a[0]" rule identically (matches bash).
 fn install_scalar_value(existing: &mut Variable, value: String) {
     match &mut existing.value {
         VarValue::Indexed(m) => {
@@ -3043,5 +3131,59 @@ mod shopt_tests {
         assert_eq!(shell.case_fold_of("x"), None);
         // unknown var reads None
         assert_eq!(shell.case_fold_of("nope"), None);
+    }
+
+    // ── v159 Task 4: funnel-uniformity unit tests ────────────────────────────
+
+    /// Proves that assign() applies case-fold on every storage path:
+    /// scalar whole-variable, indexed element, and whole indexed-array literal.
+    #[test]
+    fn assign_funnel_applies_case_fold_on_every_path() {
+        let mut shell = Shell::new();
+
+        // scalar whole-variable path
+        shell.set_case_fold("s", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Whole("s".into()),
+            AssignKind::Set,
+            AssignSource::Scalar("abc".into()),
+        ).unwrap();
+        assert_eq!(shell.get("s"), Some("ABC"));
+
+        // indexed element path
+        shell.set_case_fold("a", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Element { name: "a".into(), sub: Subscript::Index(2) },
+            AssignKind::Set,
+            AssignSource::Scalar("xy".into()),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("a", 2).as_deref(), Some("XY"));
+
+        // whole indexed-array literal path
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "lo".to_string());
+        shell.set_case_fold("b", Some(CaseFold::Upper));
+        shell.assign(
+            AssignDest::Whole("b".into()),
+            AssignKind::Set,
+            AssignSource::Indexed(m),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("b", 0).as_deref(), Some("LO"));
+    }
+
+    /// Proves that assign() enforces readonly on every write path (scalar).
+    #[test]
+    fn assign_funnel_readonly_blocks_all_paths() {
+        let mut shell = Shell::new();
+        shell.try_set("r", "init".into()).unwrap();
+        shell.mark_readonly("r");
+        assert!(
+            shell.assign(
+                AssignDest::Whole("r".into()),
+                AssignKind::Set,
+                AssignSource::Scalar("x".into()),
+            ).is_err()
+        );
+        assert_eq!(shell.get("r"), Some("init")); // value unchanged
     }
 }
