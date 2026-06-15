@@ -1239,6 +1239,81 @@ impl Shell {
         }
     }
 
+    /// Storage only: insert `value` at `idx`, promoting a scalar to indexed
+    /// (element-0 rule). Caller has done readonly + fold.
+    fn store_indexed_element(&mut self, name: &str, idx: usize, value: String) -> Result<(), AssignErr> {
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Indexed(m) => { m.insert(idx, value); }
+                VarValue::Scalar(s) => {
+                    let mut m = BTreeMap::new();
+                    if idx == 0 {
+                        m.insert(0, value);
+                    } else {
+                        m.insert(0, std::mem::take(s));
+                        m.insert(idx, value);
+                    }
+                    v.value = VarValue::Indexed(m);
+                }
+                VarValue::Associative(_) => {
+                    eprintln!("huck: {name}: set_array_element on associative variable");
+                    return Err(AssignErr::TypeMismatch);
+                }
+            },
+            None => {
+                let mut m = BTreeMap::new();
+                m.insert(idx, value);
+                self.vars.insert(name.to_string(), Variable {
+                    value: VarValue::Indexed(m),
+                    exported: false, readonly: false, integer: false, case_fold: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Storage only: replace the whole variable with an indexed array of the
+    /// given (already-folded) elements, preserving exported/integer/case_fold.
+    fn store_indexed_replace(&mut self, name: &str, elements: BTreeMap<usize, String>) -> Result<(), AssignErr> {
+        let (exported, integer, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.integer, v.case_fold),
+            None => (false, false, None),
+        };
+        self.vars.insert(name.to_string(), Variable {
+            value: VarValue::Indexed(elements),
+            exported, readonly: false, integer, case_fold,
+        });
+        Ok(())
+    }
+
+    /// Storage only: merge (already-folded) entries into the indexed array,
+    /// promoting a scalar to element 0 and creating if absent.
+    fn store_indexed_extend(&mut self, name: &str, entries: BTreeMap<usize, String>) -> Result<(), AssignErr> {
+        if matches!(self.vars.get(name).map(|v| &v.value), Some(VarValue::Scalar(_)))
+            && let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Scalar(s) = &mut v.value
+        {
+            let mut m = BTreeMap::new();
+            m.insert(0, std::mem::take(s));
+            v.value = VarValue::Indexed(m);
+        }
+        if !self.vars.contains_key(name) {
+            self.vars.insert(name.to_string(), Variable {
+                value: VarValue::Indexed(BTreeMap::new()),
+                exported: false, readonly: false, integer: false, case_fold: None,
+            });
+        }
+        if let Some(v) = self.vars.get_mut(name)
+            && let VarValue::Indexed(m) = &mut v.value
+        {
+            for (idx, val) in entries { m.insert(idx, val); }
+            Ok(())
+        } else {
+            eprintln!("huck: {name}: cannot append array literal to associative array");
+            Err(AssignErr::TypeMismatch)
+        }
+    }
+
     /// The single chokepoint for variable assignment. Applies cross-cutting
     /// concerns in a fixed order — resolve target (nameref seam) → readonly →
     /// integer-coerce → case-fold → store — then dispatches to a storage
@@ -1275,14 +1350,15 @@ impl Shell {
                 self.store_scalar(&name, stored);
                 Ok(())
             }
-            // ── Element + Scalar: delegate to existing public methods (Task 2/3 replaces) ──
+            // ── Element + Scalar (indexed): apply fold then call primitive ──
             (AssignDest::Element { name: n, sub: Subscript::Index(idx) }, _, AssignSource::Scalar(v)) => {
                 let n = n.clone();
                 let idx = *idx;
-                match op {
-                    AssignKind::Set => self.set_array_element(&n, idx, v),
-                    AssignKind::Append => self.append_array_element(&n, idx, &v),
-                }
+                let v = if op == AssignKind::Append {
+                    self.lookup_array_element(&n, idx).unwrap_or_default() + &v
+                } else { v };
+                let v = apply_case_fold(self.case_fold_of(&n), v); // NB: NO integer-coerce on elements (preserve asymmetry)
+                self.store_indexed_element(&n, idx, v)
             }
             (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
                 let n = n.clone();
@@ -1292,12 +1368,14 @@ impl Shell {
                     AssignKind::Append => self.append_associative_element(&n, &key, &v),
                 }
             }
-            // ── Whole + array/assoc source: delegate (Task 2/3 replaces) ──
+            // ── Whole + Indexed source: fold then call primitive ──
             (AssignDest::Whole(n), _, AssignSource::Indexed(m)) => {
                 let n = n.clone();
+                let fold = self.case_fold_of(&n);
+                let m: BTreeMap<usize, String> = m.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
                 match op {
-                    AssignKind::Set => self.replace_array(&n, m),
-                    AssignKind::Append => self.extend_indexed(&n, m),
+                    AssignKind::Set => self.store_indexed_replace(&n, m),
+                    AssignKind::Append => self.store_indexed_extend(&n, m),
                 }
             }
             (AssignDest::Whole(n), AssignKind::Set, AssignSource::Associative(p)) => {
@@ -1694,31 +1772,7 @@ impl Shell {
         name: &str,
         elements: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let (exported, integer, case_fold) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.integer, v.case_fold),
-            None => (false, false, None),
-        };
-        let elements = elements
-            .into_iter()
-            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
-            .collect();
-        self.vars.insert(
-            name.to_string(),
-            Variable {
-                value: VarValue::Indexed(elements),
-                exported,
-                readonly: false,
-                integer,
-                case_fold,
-            },
-        );
-        Ok(())
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Indexed(elements))
     }
 
     /// Sets a single element. Promotes a scalar variable to indexed
@@ -1730,51 +1784,7 @@ impl Shell {
         idx: usize,
         value: String,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let value = apply_case_fold(self.case_fold_of(name), value);
-        match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Indexed(m) => {
-                    m.insert(idx, value);
-                }
-                VarValue::Scalar(s) => {
-                    let mut m = BTreeMap::new();
-                    if idx == 0 {
-                        m.insert(0, value);
-                    } else {
-                        m.insert(0, std::mem::take(s));
-                        m.insert(idx, value);
-                    }
-                    v.value = VarValue::Indexed(m);
-                }
-                VarValue::Associative(_) => {
-                    eprintln!(
-                        "huck: {name}: set_array_element on associative variable"
-                    );
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
-            None => {
-                let mut m = BTreeMap::new();
-                m.insert(idx, value);
-                self.vars.insert(
-                    name.to_string(),
-                    Variable {
-                        value: VarValue::Indexed(m),
-                        exported: false,
-                        readonly: false,
-                        integer: false,
-                        case_fold: None,
-                    },
-                );
-            }
-        }
-        Ok(())
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Set, AssignSource::Scalar(value))
     }
 
     /// Merges explicit `(index → value)` entries into the named indexed
@@ -1788,47 +1798,7 @@ impl Shell {
         name: &str,
         entries: BTreeMap<usize, String>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        // Promote scalar to indexed (scalar becomes element 0).
-        if matches!(
-            self.vars.get(name).map(|v| &v.value),
-            Some(VarValue::Scalar(_))
-        ) && let Some(v) = self.vars.get_mut(name)
-            && let VarValue::Scalar(s) = &mut v.value
-        {
-            let mut m = BTreeMap::new();
-            m.insert(0, std::mem::take(s));
-            v.value = VarValue::Indexed(m);
-        }
-        if !self.vars.contains_key(name) {
-            self.vars.insert(
-                name.to_string(),
-                Variable {
-                    value: VarValue::Indexed(BTreeMap::new()),
-                    exported: false,
-                    readonly: false,
-                    integer: false,
-                    case_fold: None,
-                },
-            );
-        }
-        let fold = self.case_fold_of(name);
-        if let Some(v) = self.vars.get_mut(name)
-            && let VarValue::Indexed(m) = &mut v.value
-        {
-            for (idx, val) in entries {
-                m.insert(idx, apply_case_fold(fold, val));
-            }
-            Ok(())
-        } else {
-            eprintln!("huck: {name}: cannot append array literal to associative array");
-            Err(AssignErr::TypeMismatch)
-        }
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Append, AssignSource::Indexed(entries))
     }
 
     /// Appends `value` to the existing element at `idx` (concatenation).
@@ -1840,8 +1810,7 @@ impl Shell {
         idx: usize,
         value: &str,
     ) -> Result<(), AssignErr> {
-        let existing = self.lookup_array_element(name, idx).unwrap_or_default();
-        self.set_array_element(name, idx, existing + value)
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Index(idx) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
     }
 
     /// Removes a single element from an indexed array. No-op if the
