@@ -11536,7 +11536,10 @@ mod declare_tests {
         let (oc, _) = run(&["-n", "r=x"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.is_nameref("r"));
-        assert_eq!(shell.lookup_var("r").as_deref(), Some("x"));
+        // After Task 3: lookup_var dereferences the nameref; x is unset → None.
+        assert_eq!(shell.lookup_var("r"), None);
+        // The raw target name is still "x".
+        assert_eq!(shell.nameref_raw_target("r").as_deref(), Some("x"));
     }
 
     #[test]
@@ -11560,7 +11563,10 @@ mod declare_tests {
         let (oc, _) = run(&["-n", "e=arr[0]"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.is_nameref("e"));
-        assert_eq!(shell.lookup_var("e").as_deref(), Some("arr[0]"));
+        // After Task 3: lookup_var dereferences the nameref; arr is unset → None.
+        assert_eq!(shell.lookup_var("e"), None);
+        // The raw target name is still "arr[0]".
+        assert_eq!(shell.nameref_raw_target("e").as_deref(), Some("arr[0]"));
     }
 
     #[test]

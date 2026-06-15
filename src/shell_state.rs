@@ -821,6 +821,16 @@ impl Shell {
             }
             return self.positional_args.get(n - 1).cloned();
         }
+        // Nameref resolution: a nameref reads its target. No-op for ordinary
+        // variables (resolve_nameref returns Name(name)).
+        match self.resolve_nameref(name) {
+            ResolvedName::Name(n) if n != name => return self.lookup_var(&n),
+            ResolvedName::Element { name: arr, subscript } => {
+                return self.lookup_nameref_element(&arr, &subscript);
+            }
+            ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
+            ResolvedName::Name(_) => {} // not a nameref → fall through to normal read
+        }
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
@@ -932,6 +942,15 @@ impl Shell {
                 .parse::<usize>()
                 .map(|n| n >= 1 && n <= self.positional_args.len())
                 .unwrap_or(false);
+        }
+        // Nameref resolution: a nameref's -v tests the TARGET.
+        match self.resolve_nameref(name) {
+            ResolvedName::Name(n) if n != name => return self.is_set(&n),
+            ResolvedName::Element { name: arr, subscript } => {
+                return self.lookup_nameref_element(&arr, &subscript).is_some();
+            }
+            ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
+            ResolvedName::Name(_) => {}
         }
         self.vars.contains_key(name)
     }
@@ -1639,6 +1658,43 @@ impl Shell {
                 }
                 _ => return ResolvedName::Name(current),
             }
+        }
+    }
+
+    /// The raw target-name value of a nameref (its stored scalar), WITHOUT
+    /// dereferencing. `None` if `name` is not a nameref.
+    pub fn nameref_raw_target(&self, name: &str) -> Option<String> {
+        self.vars.get(name).filter(|v| v.nameref).map(|v| v.value.scalar_view().to_string())
+    }
+
+    /// Reads `arr[subscript-text]` as a scalar, evaluating the subscript in
+    /// arr's current shape (associative → literal string key; else → read-only
+    /// arith index). Read-only (&self): used by nameref element-target resolution.
+    fn lookup_nameref_element(&self, arr: &str, subscript: &str) -> Option<String> {
+        if self.get_associative(arr).is_some() {
+            // Associative: treat the raw subscript text as the string key
+            // (no expansion needed for the common literal-key case).
+            self.lookup_associative_element(arr, subscript)
+        } else {
+            // Resolve the subscript to a usize index.
+            let idx: Option<usize> = if let Ok(i) = subscript.parse::<usize>() {
+                // Fast path: literal non-negative integer (the common arr[0] case).
+                Some(i)
+            } else if let Some(n) = self.read_only_arith(subscript) {
+                // Read-only arith evaluation for computed subscripts.
+                if n >= 0 {
+                    Some(n as usize)
+                } else {
+                    // Negative index: wrap from end.
+                    self.array_max_index(arr).and_then(|max| {
+                        let wrapped = max as i64 + 1 + n;
+                        if wrapped >= 0 { Some(wrapped as usize) } else { None }
+                    })
+                }
+            } else {
+                None
+            };
+            idx.and_then(|i| self.lookup_array_element(arr, i))
         }
     }
 

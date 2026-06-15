@@ -471,6 +471,13 @@ fn expand_indirect(
     shell: &mut Shell,
 ) -> crate::param_expansion::ExpansionResult {
     use crate::param_expansion::ExpansionResult;
+    // Nameref special case: ${!r} where r is a nameref yields the TARGET NAME
+    // (the raw stored value), not value-as-name indirection (bash behavior).
+    if subscript.is_none() && shell.is_nameref(name) {
+        return ExpansionResult::Value(
+            shell.nameref_raw_target(name).unwrap_or_default(),
+        );
+    }
     // Step 1: through-value = scalar value of (name, subscript).
     let through = match subscript {
         None => shell.lookup_var(name).unwrap_or_default(),
@@ -551,10 +558,21 @@ fn expand_array_param(
 ) -> crate::param_expansion::ExpansionResult {
     use crate::lexer::{ParamModifier as PM, SubscriptKind as SK};
     use crate::param_expansion::ExpansionResult;
+    use crate::shell_state::ResolvedName;
 
     if shell.pending_fatal_pe_error.is_some() {
         return ExpansionResult::Empty;
     }
+
+    // Nameref resolution: if `name` is a nameref, resolve to the effective
+    // array name before any array expansion. No-op for ordinary variables.
+    let name: &str = &match shell.resolve_nameref(name) {
+        ResolvedName::Name(n) => n,
+        // Element namerefs (e.g. r=arr[1]) on whole-array expansions:
+        // resolve to the base array name so ${r[@]} expands the whole array.
+        ResolvedName::Element { name: base, .. } => base,
+        ResolvedName::Unbound(_) | ResolvedName::Cycle => return ExpansionResult::Empty,
+    };
 
     // Type-aware dispatch: associative arrays get string-key semantics.
     // Must come before the indexed/scalar/unset path below, so a
