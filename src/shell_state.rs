@@ -1259,14 +1259,51 @@ impl Shell {
         self.vars.get(name).map(|v| v.readonly).unwrap_or(false)
     }
 
-    /// Resolves an assignment target through any nameref indirection. Identity
-    /// today — huck has no namerefs yet (v160). This is the ONE place a future
-    /// `declare -n r=target` will rewrite the destination (name, and for
-    /// `declare -n r=arr[i]` a `Whole(r)` into an `Element{arr, Index(i)}`),
-    /// with circular-reference detection. Do NOT add nameref behavior here in
-    /// v159 — only the seam.
-    fn resolve_assign_target(&self, dest: AssignDest) -> AssignDest {
-        dest
+    /// Resolves an assignment target through any nameref indirection.
+    /// Returns `None` on a cycle (warning already emitted; caller drops the
+    /// write and returns `Ok(())`). For an unbound nameref, returns
+    /// `Some(Whole(refname))` so that `assign()` stores the RHS into the
+    /// nameref's own scalar, binding the target name.
+    fn resolve_assign_target(&mut self, dest: AssignDest) -> Option<AssignDest> {
+        let name = dest.name().to_string();
+        // Fast path: only namerefs are resolved.
+        if !self.is_nameref(&name) {
+            return Some(dest);
+        }
+        match self.resolve_nameref(&name) {
+            ResolvedName::Name(n) => Some(match dest {
+                AssignDest::Whole(_) => AssignDest::Whole(n),
+                AssignDest::Element { sub, .. } => AssignDest::Element { name: n, sub },
+            }),
+            ResolvedName::Element { name: arr, subscript } => {
+                let sub = self.eval_nameref_subscript(&arr, &subscript);
+                Some(AssignDest::Element { name: arr, sub })
+            }
+            ResolvedName::Unbound(refname) => {
+                // Assigning to an UNBOUND nameref BINDS it: store the value as
+                // the nameref's own scalar (which becomes the target name).
+                Some(AssignDest::Whole(refname))
+            }
+            ResolvedName::Cycle => None, // warning already emitted; drop the write
+        }
+    }
+
+    /// Evaluates a nameref element-target subscript into a `Subscript` value,
+    /// choosing between associative (string key) and indexed (arith) based on
+    /// the target array's current shape — mirroring `apply_one_assignment`.
+    fn eval_nameref_subscript(&mut self, arr: &str, subscript: &str) -> Subscript {
+        let sub_word = crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
+            text: subscript.to_string(),
+            quoted: false,
+        }]);
+        if self.get_associative(arr).is_some() {
+            Subscript::Key(crate::expand::eval_subscript_key(&sub_word, self))
+        } else {
+            match crate::expand::eval_subscript(&sub_word, self, arr) {
+                Ok(i) => Subscript::Index(i),
+                Err(_) => Subscript::Index(0),
+            }
+        }
     }
 
     /// Raw scalar store: RANDOM/SECONDS interception, else overwrite an existing
@@ -1417,7 +1454,10 @@ impl Shell {
         op: AssignKind,
         source: AssignSource,
     ) -> Result<(), AssignErr> {
-        let dest = self.resolve_assign_target(dest);
+        let dest = match self.resolve_assign_target(dest) {
+            Some(d) => d,
+            None => return Ok(()), // cycle: warning emitted, write dropped (rc 0)
+        };
         let name = dest.name().to_string();
 
         // The single readonly check, before any store (no partial array
@@ -1800,7 +1840,17 @@ impl Shell {
     /// Returns a reference to the indexed array stored under `name`,
     /// or `None` if the variable is unset or a scalar.
     pub fn get_array(&self, name: &str) -> Option<&BTreeMap<usize, String>> {
-        match self.vars.get(name) {
+        // Resolve through namerefs so that array operations on a nameref
+        // target the actual array (e.g. `local -n a=arr; a+=(z)` sees arr).
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return None,
+            }
+        } else {
+            name.to_string()
+        };
+        match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => Some(m),
                 VarValue::Scalar(_) | VarValue::Associative(_) => None,
@@ -2029,8 +2079,19 @@ impl Shell {
 
     /// Returns a reference to the associative array stored under `name`,
     /// or `None` if the variable is unset, scalar, or indexed.
+    /// Resolves through namerefs so that `local -n m=mymap; m[k]=v` dispatches
+    /// correctly to the associative path.
     pub fn get_associative(&self, name: &str) -> Option<&Vec<(String, String)>> {
-        match self.vars.get(name) {
+        // Resolve through namerefs.
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                _ => return None,
+            }
+        } else {
+            name.to_string()
+        };
+        match self.vars.get(&resolved) {
             Some(v) => match &v.value {
                 VarValue::Associative(pairs) => Some(pairs),
                 _ => None,

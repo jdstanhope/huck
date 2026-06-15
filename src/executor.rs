@@ -3043,7 +3043,9 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
     let mut st = 0;
     for a in items {
         let name = a.target.name();
-        if shell.is_readonly(name) {
+        // For namerefs, skip the early readonly check and let assign() check the
+        // RESOLVED target's readonly — a readonly nameref lets you write through.
+        if !shell.is_nameref(name) && shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             st = 1;
             break;
@@ -5275,7 +5277,8 @@ fn apply_inline_assignments(
     for a in assignments {
         let name = a.target.name();
         let prior = shell.snapshot_var(name);
-        if shell.is_readonly(name) {
+        // For namerefs, skip the early readonly check; assign() checks the resolved target.
+        if !shell.is_nameref(name) && shell.is_readonly(name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(snap);
         }
@@ -5396,7 +5399,9 @@ pub(crate) fn apply_one_assignment(
             (AssignTarget::Bare(name), Some(elements)) => {
                 if a.append {
                     // Pre-validate readonly so the loop below cannot partial-write.
-                    if shell.is_readonly(target_name) {
+                    // Skip for namerefs — the individual element writes go through
+                    // assign() which checks the resolved target.
+                    if !shell.is_nameref(target_name) && shell.is_readonly(target_name) {
                         eprintln!("huck: {target_name}: readonly variable");
                         return Err(());
                     }
@@ -5448,16 +5453,19 @@ pub(crate) fn apply_one_assignment(
                 // a+=(elements): field-expand each bare element (split/glob/[@])
                 // and append after the current max index, honoring explicit
                 // [i]=v elements. Readonly pre-check avoids a partial write.
-                if shell.is_readonly(name) {
+                // Skip for namerefs — assign() checks the resolved target.
+                if !shell.is_nameref(name) && shell.is_readonly(name) {
                     eprintln!("huck: {name}: readonly variable");
                     return Err(());
                 }
                 // Starting auto-index: max+1 for an existing array; 1 for a
                 // scalar (which promotes to element 0); 0 when unset — matching
                 // extend_indexed's promotion.
+                // get_array is nameref-aware, so it sees the target's array for namerefs.
                 let start = if shell.get_array(name).is_some() {
                     shell.array_max_index(name).map_or(0, |m| m + 1)
-                } else if shell.get(name).is_some() {
+                } else if shell.lookup_var(name).is_some() {
+                    // Use lookup_var (nameref-aware) so a nameref to a scalar gives start=1.
                     1
                 } else {
                     0
@@ -5481,7 +5489,10 @@ pub(crate) fn apply_one_assignment(
                         .append_array_element(name, 0, &s)
                         .map_err(|_| ()),
                     None => {
-                        let existing = shell.get(name).map(str::to_string).unwrap_or_default();
+                        // Use lookup_var (nameref-aware) so that `r+=v` where r is a
+                        // nameref prepends with the TARGET's current value, not the
+                        // raw nameref binding string.
+                        let existing = shell.lookup_var(name).unwrap_or_default();
                         shell.try_set(name, existing + &s).map_err(|_| ())
                     }
                 }
