@@ -295,7 +295,6 @@ pub fn run_declaration_builtin(
 /// empty components (from `//`), and `..` (removing the preceding component
 /// WITHOUT resolving symlinks). A `..` at the root is dropped (bash behavior).
 /// Always returns an absolute path; `/` for an empty result.
-#[allow(dead_code)]
 fn normalize_logical(path: &str) -> String {
     let mut components: Vec<&str> = Vec::new();
     for comp in path.split('/') {
@@ -317,55 +316,93 @@ fn normalize_logical(path: &str) -> String {
 }
 
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    if args.len() > 1 {
+    // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
+    //    is the OLDPWD shortcut / target).
+    let mut physical_flag: Option<bool> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "-L" => { physical_flag = Some(false); idx += 1; }
+            "-P" => { physical_flag = Some(true); idx += 1; }
+            "--" => { idx += 1; break; }
+            "-" => break, // OLDPWD shortcut, handled as the target below
+            s if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("huck: cd: {s}: invalid option");
+                eprintln!("huck: cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                return ExecOutcome::Continue(2);
+            }
+            _ => break, // a target
+        }
+    }
+    let rest = &args[idx..];
+    if rest.len() > 1 {
         eprintln!("huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
+
+    // 2. Effective mode: explicit flag, else the `physical` set-option.
+    let physical = physical_flag.unwrap_or_else(|| option_get(shell, "physical").unwrap_or(false));
+
+    // 3. Compute the target directory.
     let mut print_new_pwd = false;
-    let target = match args.first() {
+    let target = match rest.first() {
         Some(dir) if dir == "-" => match shell.get("OLDPWD") {
-            Some(oldpwd) if !oldpwd.is_empty() => {
-                print_new_pwd = true;
-                oldpwd.to_string()
-            }
-            _ => {
-                eprintln!("huck: cd: OLDPWD not set");
-                return ExecOutcome::Continue(1);
-            }
+            Some(oldpwd) if !oldpwd.is_empty() => { print_new_pwd = true; oldpwd.to_string() }
+            _ => { eprintln!("huck: cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
         },
         Some(dir) => dir.clone(),
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
-            None => {
-                eprintln!("huck: cd: HOME not set");
-                return ExecOutcome::Continue(1);
-            }
+            None => { eprintln!("huck: cd: HOME not set"); return ExecOutcome::Continue(1); }
         },
     };
-    if let Err(e) = env::set_current_dir(Path::new(&target)) {
-        eprintln!("huck: cd: {target}: {e}");
-        return ExecOutcome::Continue(1);
-    }
-    // chdir succeeded — maintain PWD/OLDPWD.
+
     let prev_pwd = shell.get("PWD").map(str::to_string);
-    match env::current_dir() {
-        Ok(new_pwd) => {
-            if let Some(prev) = prev_pwd {
-                shell.export_set("OLDPWD", prev);
-            }
-            shell.export_set("PWD", new_pwd.to_string_lossy().to_string());
-            if print_new_pwd
-                && let Err(e) = writeln!(out, "{}", new_pwd.display())
-            {
-                eprintln!("huck: cd: {e}");
-                return ExecOutcome::Continue(1);
+
+    let new_pwd: String = if physical {
+        // Physical: chdir to the target, store the canonical cwd.
+        if let Err(e) = env::set_current_dir(Path::new(&target)) {
+            eprintln!("huck: cd: {target}: {e}");
+            return ExecOutcome::Continue(1);
+        }
+        match env::current_dir() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!("huck: cd: warning: could not read current dir: {e}");
+                prev_pwd.clone().unwrap_or_default()
             }
         }
-        Err(e) => {
-            // chdir succeeded but we can't read it back — warn but
-            // don't fail the command.
-            eprintln!("huck: cd: warning: could not read current dir: {e}");
+    } else {
+        // Logical: build curpath from $PWD (for relative targets), lexically
+        // normalize, chdir to the normalized path, store it.
+        let curpath = if target.starts_with('/') {
+            target.clone()
+        } else {
+            let base = prev_pwd.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| {
+                env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            format!("{base}/{target}")
+        };
+        let normalized = normalize_logical(&curpath);
+        if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
+            eprintln!("huck: cd: {target}: {e}");
+            return ExecOutcome::Continue(1);
         }
+        normalized
+    };
+
+    // 4. Maintain OLDPWD / PWD.
+    if let Some(prev) = prev_pwd {
+        shell.export_set("OLDPWD", prev);
+    }
+    shell.export_set("PWD", new_pwd.clone());
+
+    // 5. `cd -` prints the new directory.
+    if print_new_pwd
+        && let Err(e) = writeln!(out, "{new_pwd}")
+    {
+        eprintln!("huck: cd: {e}");
+        return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
