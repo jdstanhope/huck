@@ -417,7 +417,9 @@ fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> 
             // `replacement` field is escape_filename()'d for rustyline
             // and is not what compgen / -A command consumers expect.
             let path = shell.get("PATH").unwrap_or("").to_string();
-            crate::completion::complete_command(prefix, &path)
+            let funcs: Vec<String> = shell.functions.keys().cloned().collect();
+            let aliases: Vec<String> = shell.aliases.keys().cloned().collect();
+            crate::completion::complete_command(prefix, &path, &funcs, &aliases)
                 .into_iter()
                 .map(|c| c.display)
                 .collect()
