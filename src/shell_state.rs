@@ -1374,10 +1374,8 @@ impl Shell {
         let dest = self.resolve_assign_target(dest);
         let name = dest.name().to_string();
 
-        // Readonly check, once, before any store (no partial array writes).
-        // NOTE: in Task 1 the Element/whole-array arms below ALSO re-check
-        // readonly inside the public methods they call — harmless (this top
-        // check returns first). Tasks 2-3 remove the inner checks.
+        // The single readonly check, before any store (no partial array
+        // writes); the storage primitives do not re-check.
         if self.is_readonly(&name) {
             eprintln!("huck: {name}: readonly variable");
             return Err(AssignErr::Readonly);
