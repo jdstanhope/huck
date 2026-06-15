@@ -329,7 +329,6 @@ pub struct ReadlineSettings {
     /// rustyline defaults so `bind -v` lists bash-matching defaults).
     pub vars: std::collections::BTreeMap<String, String>,
     /// Pending key bindings (keyseq, function) for the loop to apply.
-    #[allow(dead_code)]
     pub pending_binds: Vec<(String, String)>,
     /// Pending unbinds (keyseq) from `bind -r`.
     pub pending_unbinds: Vec<String>,

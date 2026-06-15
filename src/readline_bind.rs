@@ -6,7 +6,6 @@
 //! rustyline [`Cmd`]s. Everything here is pure and unit-tested; the `bind`
 //! builtin (Task 3) consumes only the `bool` validators so it stays
 //! rustyline-free.
-#![allow(dead_code)]
 
 use rustyline::{Anchor, At, Cmd, KeyCode, KeyEvent, Modifiers, Movement, Word};
 use rustyline::Event;
