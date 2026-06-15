@@ -779,7 +779,10 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
-    // Order matches bash's `declare -p` output: a/A, i, r, x, l/u.
+    // Order matches bash's `declare -p` output: n, a/A, i, r, x, l/u.
+    if var.nameref {
+        attrs.push('n');
+    }
     if matches!(var.value, VarValue::Indexed(_)) {
         attrs.push('a');
     }
@@ -810,8 +813,13 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     };
     let value_part = match &var.value {
         VarValue::Scalar(s) => {
-            let escaped = escape_double_quote_value(s);
-            format!("=\"{escaped}\"")
+            // Unbound namerefs (empty value) omit the `=""` part — matches bash.
+            if var.nameref && s.is_empty() {
+                String::new()
+            } else {
+                let escaped = escape_double_quote_value(s);
+                format!("=\"{escaped}\"")
+            }
         }
         VarValue::Indexed(m) => {
             let mut parts: Vec<String> = Vec::new();
@@ -974,6 +982,8 @@ fn builtin_declare(
     let mut saw_minus_u = false;
     let mut saw_plus_l = false;
     let mut saw_plus_u = false;
+    let mut saw_minus_n = false;
+    let mut saw_plus_n = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1004,6 +1014,8 @@ fn builtin_declare(
                 b'l' if plus => saw_plus_l = true,
                 b'u' if minus => saw_minus_u = true,
                 b'u' if plus => saw_plus_u = true,
+                b'n' if minus => saw_minus_n = true,
+                b'n' if plus => saw_plus_n = true,
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
@@ -1011,7 +1023,7 @@ fn builtin_declare(
                 }
                 b'p' if minus => print_mode = true,
                 b'g' if minus => global = true,
-                b'a' | b'A' | b'n' if minus => {
+                b'a' | b'A' if minus => {
                     eprintln!(
                         "huck: declare: -{}: not yet implemented in this version",
                         c as char
@@ -1207,6 +1219,43 @@ fn builtin_declare(
 
         if want_remove_export {
             shell.unexport(name);
+            continue;
+        }
+
+        // Nameref (-n / +n) handling.
+        if saw_minus_n {
+            if let Some(target) = value.as_deref() {
+                // Direct self-reference is a hard error.
+                if target == name {
+                    eprintln!(
+                        "huck: declare: {name}: nameref variable self references not allowed"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                // Target must be a valid variable name OR name[subscript].
+                let valid = is_valid_name(target)
+                    || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
+                if !valid {
+                    eprintln!(
+                        "huck: declare: `{target}': invalid variable name for name reference"
+                    );
+                    exit = 1;
+                    continue;
+                }
+            }
+            shell.set_nameref(name, true);
+            // BIND: store the target name as the RAW value (not through try_set
+            // which post-Task-4 will deref namerefs).
+            if let Some(target) = value.as_deref() {
+                shell.set(name, target.to_string());
+            }
+            continue;
+        }
+        if saw_plus_n {
+            if shell.is_nameref(name) {
+                shell.set_nameref(name, false);
+            }
             continue;
         }
 
@@ -1418,10 +1467,10 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
     let mut want_readonly = false;
     let mut saw_minus_l = false;
     let mut saw_minus_u = false;
+    let mut saw_minus_n = false;
     let mut idx = 0;
     // Parse leading flags from Plain args. Letters cluster (`-ri`, `-ir`)
-    // exactly as in `declare`; a cluster containing an unsupported letter
-    // (`-n`) yields declare's not-yet-implemented message.
+    // exactly as in `declare`.
     while idx < args.len() {
         let DeclArg::Plain(s) = &args[idx] else { break };
         if s == "--" {
@@ -1439,13 +1488,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 b'r' => want_readonly = true,
                 b'l' => saw_minus_l = true,
                 b'u' => saw_minus_u = true,
-                b'n' => {
-                    eprintln!(
-                        "huck: local: -{}: not yet implemented in this version",
-                        c as char
-                    );
-                    return ExecOutcome::Continue(1);
-                }
+                b'n' => saw_minus_n = true,
                 other => {
                     eprintln!("huck: local: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(1);
@@ -1504,7 +1547,11 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     .map(|f| f.contains_key(name))
                     .unwrap_or(false);
                 snapshot_for_local_scope(shell, name);
-                if want_array {
+                if saw_minus_n {
+                    // `local -n NAME` (bare, no value): declare as nameref,
+                    // leave value empty (unbound nameref).
+                    shell.set_nameref(name, true);
+                } else if want_array {
                     // Promote existing scalar to element 0 (bash semantics)
                     // or create an empty indexed array.
                     if shell.get_array(name).is_none() {
@@ -1578,6 +1625,32 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     continue;
                 }
                 snapshot_for_local_scope(shell, &name);
+
+                // `local -n NAME=target`: nameref bind — validate and store raw.
+                if saw_minus_n {
+                    // Expand the RHS word to obtain the target name string.
+                    let target = crate::expand::expand_assignment(&a.value, shell);
+                    if target == name {
+                        eprintln!(
+                            "huck: local: {name}: nameref variable self references not allowed"
+                        );
+                        exit = 1;
+                        continue;
+                    }
+                    let valid = is_valid_name(&target)
+                        || matches!(parse_subscripted_arg(&target), Ok(Some((b, _))) if is_valid_name(b));
+                    if !valid {
+                        eprintln!(
+                            "huck: local: `{target}': invalid variable name for name reference"
+                        );
+                        exit = 1;
+                        continue;
+                    }
+                    shell.set_nameref(&name, true);
+                    shell.set(&name, target);
+                    continue;
+                }
+
                 // For `local -A NAME=([k]=v)`: ensure NAME is associative
                 // BEFORE apply_one_assignment so the executor routes the
                 // compound RHS through the associative path. Without this,
@@ -1766,6 +1839,8 @@ fn builtin_declare_decl(
     let mut saw_minus_u = false;
     let mut saw_plus_l = false;
     let mut saw_plus_u = false;
+    let mut saw_minus_n = false;
+    let mut saw_plus_n = false;
 
     // Parse leading flags from Plain args. As soon as we hit a non-flag
     // Plain or any Assign, switch into the per-name phase.
@@ -1817,6 +1892,8 @@ fn builtin_declare_decl(
                 b'l' if plus => saw_plus_l = true,
                 b'u' if minus => saw_minus_u = true,
                 b'u' if plus => saw_plus_u = true,
+                b'n' if minus => saw_minus_n = true,
+                b'n' if plus => saw_plus_n = true,
                 b'f' if minus => function_mode = true,
                 b'F' if minus => {
                     function_mode = true;
@@ -1824,13 +1901,6 @@ fn builtin_declare_decl(
                 }
                 b'p' if minus => print_mode = true,
                 b'g' if minus => global = true,
-                b'n' if minus => {
-                    eprintln!(
-                        "huck: declare: -{}: not yet implemented in this version",
-                        c as char
-                    );
-                    return ExecOutcome::Continue(1);
-                }
                 other => {
                     let sign = if plus { '+' } else { '-' };
                     eprintln!(
@@ -2045,8 +2115,60 @@ fn builtin_declare_decl(
             shell.set_case_fold(name, None);
         }
 
+        // Nameref (-n / +n) handling. Must come BEFORE the compound-assignment
+        // path so that the target is stored raw (not through apply_one_assignment).
+        if saw_minus_n {
+            let target_opt: Option<String> = assign_opt.map(|a| {
+                crate::expand::expand_assignment(&a.value, shell)
+            });
+            if let Some(ref target) = target_opt {
+                // Direct self-reference is a hard error.
+                if target == name {
+                    eprintln!(
+                        "huck: declare: {name}: nameref variable self references not allowed"
+                    );
+                    exit = 1;
+                    continue;
+                }
+                // Target must be a valid variable name OR name[subscript].
+                let valid = is_valid_name(target)
+                    || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
+                if !valid {
+                    eprintln!(
+                        "huck: declare: `{target}': invalid variable name for name reference"
+                    );
+                    exit = 1;
+                    continue;
+                }
+            }
+            shell.set_nameref(name, true);
+            // BIND: store the target name as the RAW value (not through
+            // apply_one_assignment which post-Task-4 will deref namerefs).
+            if let Some(target) = target_opt {
+                shell.set(name, target);
+            }
+            continue;
+        }
+        if saw_plus_n && shell.is_nameref(name) {
+            shell.set_nameref(name, false);
+            // Other attribute changes (export etc.) can still apply.
+            // Fall through to the no-value path below.
+        }
+
         // Compound assignment path: a parsed Assignment (scalar or array).
         if let Some(a) = assign_opt {
+            // Skip if +n was requested (nameref removal only, no value).
+            if saw_plus_n {
+                if want_readonly {
+                    shell.mark_readonly(name);
+                }
+                if want_export {
+                    shell.export(name);
+                } else if want_remove_export {
+                    shell.unexport(name);
+                }
+                continue;
+            }
             // -r combined with =VALUE: must not clobber an existing
             // readonly. Other =VALUE assignments rely on
             // apply_one_assignment's internal readonly check.
@@ -9950,22 +10072,18 @@ mod local_tests {
     }
 
     #[test]
-    fn local_unsupported_attr_is_not_yet_implemented() {
-        // `-n` is not yet implemented and should yield rc 1.
-        let flag = "-n";
+    fn local_nameref_invalid_target_errors() {
+        // `local -n XYZ_LU=1` — target "1" is not a valid identifier → rc 1.
         let mut shell = Shell::new();
         shell.local_scopes.push(std::collections::HashMap::new());
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_declaration_builtin_strs(
             "local",
-            &[flag.to_string(), "XYZ_LU=1".to_string()],
+            &["-n".to_string(), "XYZ_LU=1".to_string()],
             &mut buf,
             &mut shell,
         );
-        assert!(
-            matches!(outcome, ExecOutcome::Continue(1)),
-            "flag {flag} should yield rc 1"
-        );
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
@@ -11396,12 +11514,60 @@ mod declare_tests {
     }
 
     #[test]
-    fn declare_deferred_flag_errors() {
+    fn declare_nameref_basic() {
+        // `declare -n r=x` binds r as a nameref pointing at x.
         let mut shell = Shell::new();
-        // -n (nameref) is still deferred (v159). Keep the deferred-list
-        // arm under coverage by testing a flag that still errors out.
-        let (oc, _) = run(&["-n", "X=5"], &mut shell);
+        let (oc, _) = run(&["-n", "r=x"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_nameref("r"));
+        assert_eq!(shell.lookup_var("r").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn declare_nameref_self_ref_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-n", "r=r"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_nameref_invalid_target_errors() {
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-n", "r=a b"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(1)));
+    }
+
+    #[test]
+    fn declare_nameref_subscript_target() {
+        // `declare -n e=arr[0]` should succeed.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-n", "e=arr[0]"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_nameref("e"));
+        assert_eq!(shell.lookup_var("e").as_deref(), Some("arr[0]"));
+    }
+
+    #[test]
+    fn declare_plus_n_removes_nameref() {
+        // `declare +n r` removes the nameref attribute.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-n", "r=x"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_nameref("r"));
+        let (oc2, _) = run(&["+n", "r"], &mut shell);
+        assert!(matches!(oc2, ExecOutcome::Continue(0)));
+        assert!(!shell.is_nameref("r"));
+        // Value remains "x" after nameref removal.
+        assert_eq!(shell.lookup_var("r").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn declare_nameref_bare_unbound() {
+        // `declare -n r` (no value) creates an unbound nameref with empty value.
+        let mut shell = Shell::new();
+        let (oc, _) = run(&["-n", "r"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert!(shell.is_nameref("r"));
     }
 
     #[test]
