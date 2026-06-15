@@ -1648,6 +1648,11 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     }
                     shell.set_nameref(&name, true);
                     shell.set(&name, target);
+                    // Apply co-requested -r (local does not support -x,
+                    // but mirror the same pattern for safety).
+                    if want_readonly {
+                        shell.mark_readonly(&name);
+                    }
                     continue;
                 }
 
@@ -2146,6 +2151,17 @@ fn builtin_declare_decl(
             // apply_one_assignment which post-Task-4 will deref namerefs).
             if let Some(target) = target_opt {
                 shell.set(name, target);
+            }
+            // Apply co-requested attributes (-r, -x) that the normal
+            // path would handle below — must not skip them on the
+            // nameref fast-path.
+            if want_readonly {
+                shell.mark_readonly(name);
+            }
+            if want_export {
+                shell.export(name);
+            } else if want_remove_export {
+                shell.unexport(name);
             }
             continue;
         }
