@@ -1314,6 +1314,52 @@ impl Shell {
         }
     }
 
+    /// Storage only: set `key`=`value` (already folded) in the associative
+    /// array, preserving insertion order; type-error if non-associative/unset.
+    fn store_assoc_element(&mut self, name: &str, key: String, value: String) -> Result<(), AssignErr> {
+        match self.vars.get_mut(name) {
+            Some(v) => match &mut v.value {
+                VarValue::Associative(pairs) => {
+                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
+                        slot.1 = value;
+                    } else {
+                        pairs.push((key, value));
+                    }
+                }
+                _ => {
+                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
+                    return Err(AssignErr::TypeMismatch);
+                }
+            },
+            None => {
+                eprintln!("huck: {name}: set_associative_element on unset variable");
+                return Err(AssignErr::TypeMismatch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Storage only: replace the whole variable with an associative array of the
+    /// given (already-folded) pairs, preserving exported/case_fold.
+    fn store_assoc_replace(&mut self, name: &str, pairs: Vec<(String, String)>) -> Result<(), AssignErr> {
+        let (exported, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.case_fold),
+            None => (false, None),
+        };
+        self.vars.insert(
+            name.to_string(),
+            Variable {
+                value: VarValue::Associative(pairs),
+                exported,
+                readonly: false,
+                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
+                integer: false,
+                case_fold,
+            },
+        );
+        Ok(())
+    }
+
     /// The single chokepoint for variable assignment. Applies cross-cutting
     /// concerns in a fixed order — resolve target (nameref seam) → readonly →
     /// integer-coerce → case-fold → store — then dispatches to a storage
@@ -1363,10 +1409,11 @@ impl Shell {
             (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
                 let n = n.clone();
                 let key = key.clone();
-                match op {
-                    AssignKind::Set => self.set_associative_element(&n, key, v),
-                    AssignKind::Append => self.append_associative_element(&n, &key, &v),
-                }
+                let v = if op == AssignKind::Append {
+                    self.lookup_associative_element(&n, &key).unwrap_or_default() + &v
+                } else { v };
+                let v = apply_case_fold(self.case_fold_of(&n), v);
+                self.store_assoc_element(&n, key, v)
             }
             // ── Whole + Indexed source: fold then call primitive ──
             (AssignDest::Whole(n), _, AssignSource::Indexed(m)) => {
@@ -1380,7 +1427,9 @@ impl Shell {
             }
             (AssignDest::Whole(n), AssignKind::Set, AssignSource::Associative(p)) => {
                 let n = n.clone();
-                self.replace_associative(&n, p)
+                let fold = self.case_fold_of(&n);
+                let p: Vec<(String, String)> = p.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
+                self.store_assoc_replace(&n, p)
             }
             (AssignDest::Whole(_), AssignKind::Append, AssignSource::Associative(_)) => {
                 unreachable!("associative whole-append is not produced by any caller")
@@ -1863,33 +1912,7 @@ impl Shell {
         key: String,
         value: String,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let value = apply_case_fold(self.case_fold_of(name), value);
-        match self.vars.get_mut(name) {
-            Some(v) => match &mut v.value {
-                VarValue::Associative(pairs) => {
-                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == &key) {
-                        slot.1 = value;
-                    } else {
-                        pairs.push((key, value));
-                    }
-                }
-                _ => {
-                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
-                    return Err(AssignErr::TypeMismatch);
-                }
-            },
-            None => {
-                eprintln!("huck: {name}: set_associative_element on unset variable");
-                return Err(AssignErr::TypeMismatch);
-            }
-        }
-        Ok(())
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key) }, AssignKind::Set, AssignSource::Scalar(value))
     }
 
     /// `m[k]+=v` — concatenate `value` to the existing element at `key`,
@@ -1900,8 +1923,7 @@ impl Shell {
         key: &str,
         value: &str,
     ) -> Result<(), AssignErr> {
-        let existing = self.lookup_associative_element(name, key).unwrap_or_default();
-        self.set_associative_element(name, key.to_string(), existing + value)
+        self.assign(AssignDest::Element { name: name.to_string(), sub: Subscript::Key(key.to_string()) }, AssignKind::Append, AssignSource::Scalar(value.to_string()))
     }
 
     /// Removes the entry at `key` from the associative array `name`.
@@ -1936,32 +1958,7 @@ impl Shell {
         name: &str,
         pairs: Vec<(String, String)>,
     ) -> Result<(), AssignErr> {
-        if let Some(existing) = self.vars.get(name)
-            && existing.readonly
-        {
-            eprintln!("huck: {name}: readonly variable");
-            return Err(AssignErr::Readonly);
-        }
-        let (exported, case_fold) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.case_fold),
-            None => (false, None),
-        };
-        let pairs = pairs
-            .into_iter()
-            .map(|(k, v)| (k, apply_case_fold(case_fold, v)))
-            .collect();
-        self.vars.insert(
-            name.to_string(),
-            Variable {
-                value: VarValue::Associative(pairs),
-                exported,
-                readonly: false,
-                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
-                integer: false,
-                case_fold,
-            },
-        );
-        Ok(())
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Associative(pairs))
     }
 
     /// Creates an empty associative array under `name`. Enforces bash rules:
