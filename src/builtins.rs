@@ -500,7 +500,9 @@ fn builtin_export(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Ex
 fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
     // Leading flags select the namespace and apply to all following names:
     // `-f` => function namespace, `-v` (or no flag) => variable namespace.
+    // `-n` => variable namespace but unset the nameref variable ITSELF (no deref).
     let mut mode_fn = false;
+    let mut unset_nameref = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -510,6 +512,10 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
             "-v" => {
                 mode_fn = false;
+                idx += 1;
+            }
+            "-n" => {
+                unset_nameref = true;
                 idx += 1;
             }
             "--" => {
@@ -539,7 +545,47 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             shell.remove_function(arg);
             continue;
         }
-        match parse_subscripted_arg(arg) {
+        // `unset -n NAME`: remove the nameref variable ITSELF, without dereffing.
+        // On a non-nameref, bash silently does nothing (the var survives). Matches bash.
+        if unset_nameref {
+            if !shell.is_nameref(arg) {
+                // Not a nameref: bash no-ops silently. Skip.
+                continue;
+            }
+            if !is_valid_name(arg) {
+                eprintln!("huck: unset: '{arg}': not a valid identifier");
+                any_error = true;
+                continue;
+            }
+            if shell.is_readonly(arg) {
+                eprintln!("huck: unset: {arg}: readonly variable");
+                any_error = true;
+                continue;
+            }
+            shell.unset_var(arg);
+            continue;
+        }
+        // `unset NAME` where NAME is a nameref: resolve to the target and unset that.
+        // For a chain (a→b→c), resolve_nameref follows to the end, so we unset c.
+        let resolved_owned: String;
+        let effective_arg: &str = if shell.is_nameref(arg) {
+            match shell.resolve_nameref(arg) {
+                crate::shell_state::ResolvedName::Name(n) => {
+                    resolved_owned = n;
+                    &resolved_owned
+                }
+                crate::shell_state::ResolvedName::Element { name: base, subscript } => {
+                    resolved_owned = format!("{base}[{subscript}]");
+                    &resolved_owned
+                }
+                // Unbound or cycle: nothing to unset, skip silently (matches bash).
+                crate::shell_state::ResolvedName::Unbound(_)
+                | crate::shell_state::ResolvedName::Cycle => continue,
+            }
+        } else {
+            arg
+        };
+        match parse_subscripted_arg(effective_arg) {
             Ok(Some((name, sub_text))) => {
                 // `unset a[i]`: remove a single element. The subscript is
                 // parsed as a synthetic literal `Word` so subscript
@@ -577,17 +623,17 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 continue;
             }
         }
-        if !is_valid_name(arg) {
-            eprintln!("huck: unset: '{arg}': not a valid identifier");
+        if !is_valid_name(effective_arg) {
+            eprintln!("huck: unset: '{effective_arg}': not a valid identifier");
             any_error = true;
             continue;
         }
-        if shell.is_readonly(arg) {
-            eprintln!("huck: unset: {arg}: readonly variable");
+        if shell.is_readonly(effective_arg) {
+            eprintln!("huck: unset: {effective_arg}: readonly variable");
             any_error = true;
             continue;
         }
-        shell.unset_var(arg);
+        shell.unset_var(effective_arg);
     }
     if any_error {
         ExecOutcome::Continue(1)
