@@ -1570,11 +1570,14 @@ impl Shell {
     /// Applies the SCALAR attribute chain (integer-coerce only on an existing
     /// integer-flagged Scalar, then case-fold) to a whole-variable value.
     fn value_with_scalar_attrs(&mut self, name: &str, value: String) -> String {
-        let do_integer_coerce = self.is_integer(name)
-            && self
-                .vars
-                .get(name)
-                .is_some_and(|v| matches!(v.value, VarValue::Scalar(_)));
+        // Coerce whenever the target is integer-flagged, regardless of its
+        // current shape. For an integer SCALAR this is unchanged. For an
+        // integer INDEXED array, `a=v` funnels here (Whole + Scalar arm →
+        // store_scalar overwrites element 0) and bash coerces that element 0
+        // value (e.g. `declare -ai a=(1 2); a=2+3` → element 0 becomes 5). An
+        // integer associative `m=v` is a separate type-error path, so coercing
+        // the value first is harmless.
+        let do_integer_coerce = self.is_integer(name);
         let coerced = if do_integer_coerce {
             eval_integer_coerce(self, &value)
         } else {

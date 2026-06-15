@@ -29,6 +29,8 @@ chk "non-int array literal" 'a=(2+3); echo "${a[0]}"'
 chk "local -ai in func"     'f(){ local -ai a=(1+1 2+2); echo "${a[@]}"; }; f'
 chk "local -Ai in func"     'f(){ local -Ai m=([a]=3*3); echo "${m[a]}"; }; f'
 chk "ai negative + ref"     'declare -ai a=(10); a[0]+=-3; echo "${a[0]}"'
+chk "ai scalar-assign elem0" 'declare -ai a=(1 2); a=2+3; echo "${a[@]}"'
+chk "declare -i then array"  'declare -i a; a=(1 2); a=4*5; echo "${a[0]}"'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

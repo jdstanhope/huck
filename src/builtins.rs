@@ -1603,6 +1603,10 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                         }
                         if shell.replace_array(name, empty).is_err() {
                             exit = 1;
+                            // Shape creation FAILED — skip the post-chain
+                            // mark_integer (consistent with the associative
+                            // branch / builtin_declare_decl).
+                            continue;
                         }
                     }
                 } else if want_associative {
@@ -1618,6 +1622,11 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                             crate::shell_state::declare_err_message("local", name, &e)
                         );
                         exit = 1;
+                        // Shape creation FAILED — skip the post-chain
+                        // mark_integer so the integer attribute is not
+                        // applied to a var whose associative shape never
+                        // materialized (matches builtin_declare_decl).
+                        continue;
                     }
                 } else if want_integer && !(want_array || want_associative) {
                     // Bare `local -i NAME`: create the local as a set-but-empty
