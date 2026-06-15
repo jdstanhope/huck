@@ -28,8 +28,8 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 20 | Deferred bash-compat backlog, ranked by severity within each group. |
-| Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
+| Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 41 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
@@ -76,8 +76,6 @@ group.
 
 ### Builtins (other)
 
-- **M-32: `cd -P` / `-L`** — `[deferred]` medium. huck: flags rejected. bash: physical/logical mode.
-- **M-33: `pwd -P` / `-L`** — `[deferred]` low. huck: flags silently passed through. bash: physical/logical.
 - **M-36b: system-data completion actions** — `[deferred]` low. `compgen -A
   hostname`/`user`/`group`/`service` are recognized but return nothing; bash reads
   `/etc/hosts`(`$HOSTFILE`)/`/etc/passwd`/`/etc/group`/`/etc/services`. Rarely the
@@ -100,13 +98,6 @@ group.
 ## Tier 3: Intentional divergences
 
 Things huck deliberately does differently from bash. Document and keep.
-
-### I-01: `cd` always sets the physical PWD
-- **Status**: intentional
-- **Severity**: medium
-- **huck**: after `cd symlink`, `PWD` is the canonical path (`std::env::current_dir()`).
-- **bash**: defaults to logical PWD (the path you typed, through symlinks).
-- **Why**: simpler implementation; canonical paths are less surprising for cross-language tooling.
 
 ### I-02: `case` requires a separator before `esac`
 - **Status**: intentional
