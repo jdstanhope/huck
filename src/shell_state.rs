@@ -323,6 +323,12 @@ pub struct Shell {
     pub fg_stopped: bool,
     /// The shell's argv[0], cached at startup. Used for `$0` at the top level.
     pub shell_argv0: String,
+    /// `$_`: the last argument (post-expansion) of the previously run simple
+    /// command, or that command's program name when it had no arguments. At
+    /// startup it holds the shell's invocation path (`shell_argv0`), matching
+    /// bash. Updated for every simple command (builtins and externals) just
+    /// after the program+args are resolved in `run_exec_single`.
+    pub last_arg: String,
     /// Unified call stack. Each `call_function` pushes a `Frame` with
     /// `kind == FrameKind::Function`. Replaces the old `function_arg0: Vec<String>`.
     /// `$0` returns the innermost Function frame name, or `shell_argv0` at top level.
@@ -600,6 +606,7 @@ impl Shell {
             shell_pid,
             last_bg_pid: None,
             fg_stopped: false,
+            last_arg: shell_argv0.clone(),
             shell_argv0,
             call_stack: Vec::new(),
             function_source: std::collections::HashMap::new(),
@@ -709,6 +716,7 @@ impl Shell {
             "0" => return Some(
                 self.current_function_name().unwrap_or_else(|| self.shell_argv0.clone())
             ),
+            "_" => return Some(self.last_arg.clone()),
             "$" => return Some(self.shell_pid.to_string()),
             "!" => return Some(
                 // Returns "" not None when unset: bash expands $! to empty before
@@ -847,7 +855,7 @@ impl Shell {
     pub fn is_set(&self, name: &str) -> bool {
         // Always-defined special parameters.
         match name {
-            "0" | "$" | "#" | "-" | "?" => return true,
+            "0" | "$" | "#" | "-" | "?" | "_" => return true,
             "!" => return self.last_bg_pid.is_some(),
             _ => {}
         }
@@ -2362,6 +2370,18 @@ mod tests {
         let mut shell = Shell::new();
         shell.last_bg_pid = Some(54321);
         assert_eq!(shell.lookup_var("!"), Some("54321".to_string()));
+    }
+
+    #[test]
+    fn lookup_var_underscore_returns_last_arg() {
+        let mut shell = Shell::new();
+        // At startup `$_` mirrors the invocation path (shell_argv0).
+        assert_eq!(shell.lookup_var("_"), Some(shell.shell_argv0.clone()));
+        // After a command updates it, `$_` reflects the last argument.
+        shell.last_arg = "world".to_string();
+        assert_eq!(shell.lookup_var("_"), Some("world".to_string()));
+        // `_` is always considered set (backs `${_-x}` / `[[ -v _ ]]`).
+        assert!(shell.is_set("_"));
     }
 
     #[test]
