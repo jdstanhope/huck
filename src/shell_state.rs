@@ -321,6 +321,41 @@ impl ShoptOptions {
     }
 }
 
+/// readline-style settings driven by the `bind` builtin and applied to the
+/// rustyline editor by the run loop. Pure data — no rustyline types here.
+#[derive(Debug, Clone)]
+pub struct ReadlineSettings {
+    /// Every `set VAR value` (seeded with the 5 editor-mapped vars at their
+    /// rustyline defaults so `bind -v` lists bash-matching defaults).
+    pub vars: std::collections::BTreeMap<String, String>,
+    /// Pending key bindings (keyseq, function) for the loop to apply.
+    pub pending_binds: Vec<(String, String)>,
+    /// Pending unbinds (keyseq) from `bind -r`.
+    pub pending_unbinds: Vec<String>,
+    /// Bindings the loop has applied — for `bind -p`/`-P` (keyseq -> function).
+    pub active_binds: std::collections::BTreeMap<String, String>,
+    /// Set when the loop must re-sync vars/binds to the editor.
+    pub dirty: bool,
+}
+
+impl Default for ReadlineSettings {
+    fn default() -> Self {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("editing-mode".to_string(), "emacs".to_string());
+        vars.insert("bell-style".to_string(), "audible".to_string());
+        vars.insert("show-all-if-ambiguous".to_string(), "off".to_string());
+        vars.insert("completion-query-items".to_string(), "100".to_string());
+        vars.insert("keyseq-timeout".to_string(), "500".to_string());
+        ReadlineSettings {
+            vars,
+            pending_binds: Vec::new(),
+            pending_unbinds: Vec::new(),
+            active_binds: std::collections::BTreeMap::new(),
+            dirty: false,
+        }
+    }
+}
+
 /// A live coprocess started by `coproc`. The shell holds the two pipe ends
 /// (relocated to high fds, close-on-exec): `read_fd` = NAME[0] (read the
 /// coproc's stdout), `write_fd` = NAME[1] (write the coproc's stdin).
@@ -538,6 +573,10 @@ pub struct Shell {
     /// so there is no double-close.
     #[allow(dead_code)]
     pub coprocs: Vec<Coproc>,
+
+    /// readline-style settings populated by the `bind` builtin; applied to
+    /// the rustyline editor by the run loop. See `ReadlineSettings`.
+    pub readline_settings: ReadlineSettings,
 }
 
 // ---- Static builtin variable helpers (platform strings, libc wrappers) ----
@@ -713,6 +752,7 @@ impl Shell {
             }),
             seconds_base: std::time::Instant::now(),
             coprocs: Vec::new(),
+            readline_settings: ReadlineSettings::default(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.
@@ -2329,6 +2369,12 @@ fn should_hangup(job: &crate::jobs::Job) -> bool {
     live && !job.marked_for_nohup
 }
 
+/// Wraps a `bind` key sequence in double quotes for `bind -p`/`-P` output if
+/// the user didn't already supply them (bash always double-quotes the keyseq).
+fn quote_keyseq(k: &str) -> String {
+    if k.starts_with('"') { k.to_string() } else { format!("\"{k}\"") }
+}
+
 /// Installs `value` as the scalar value of `existing`, preserving the
 /// rest of an `Indexed` map (writing only element 0). Shared by
 /// `Shell::store_scalar` (the single scalar-store primitive behind both
@@ -2346,6 +2392,49 @@ fn install_scalar_value(existing: &mut Variable, value: String) {
         VarValue::Associative(_) => {
             eprintln!("huck: internal: install_scalar_value on associative array");
         }
+    }
+}
+
+impl Shell {
+    /// Records a `set VAR value` (sets `dirty`). The run loop applies the
+    /// editor-mapped ones; others are recorded for `bind -v` round-trip.
+    pub fn set_readline_var(&mut self, name: &str, value: &str) {
+        self.readline_settings.vars.insert(name.to_string(), value.to_string());
+        self.readline_settings.dirty = true;
+    }
+
+    /// Queues a key binding (keyseq -> function) for the loop to apply.
+    pub fn add_bind(&mut self, keyseq: &str, function: &str) {
+        self.readline_settings.pending_binds.push((keyseq.to_string(), function.to_string()));
+        self.readline_settings.dirty = true;
+    }
+
+    /// Queues an unbind (keyseq) for the loop to apply.
+    pub fn add_unbind(&mut self, keyseq: &str) {
+        self.readline_settings.pending_unbinds.push(keyseq.to_string());
+        self.readline_settings.dirty = true;
+    }
+
+    /// `bind -v` lines: `set NAME VALUE`, sorted by name (BTreeMap iterates sorted).
+    pub fn readline_var_lines(&self) -> Vec<String> {
+        self.readline_settings.vars.iter().map(|(k, v)| format!("set {k} {v}")).collect()
+    }
+
+    /// `bind -V` lines: `` NAME is set to `VALUE' ``.
+    pub fn readline_var_lines_verbose(&self) -> Vec<String> {
+        self.readline_settings.vars.iter().map(|(k, v)| format!("{k} is set to `{v}'")).collect()
+    }
+
+    // (quote_keyseq helper is a module-level free fn below.)
+
+    /// `bind -p` lines: `"KEYSEQ": FUNCTION` (keyseq double-quoted, bash form).
+    pub fn active_bind_lines(&self) -> Vec<String> {
+        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{}: {f}", quote_keyseq(k))).collect()
+    }
+
+    /// `bind -P` lines: `FUNCTION can be found on "KEYSEQ".`
+    pub fn active_bind_lines_verbose(&self) -> Vec<String> {
+        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{f} can be found on {}.", quote_keyseq(k))).collect()
     }
 }
 
@@ -3528,5 +3617,23 @@ mod shopt_tests {
         shell.set_nameref("p", true); shell.set("p", "q".into());
         shell.set_nameref("q", true); shell.set("q", "p".into());
         assert_eq!(shell.resolve_nameref("p"), ResolvedName::Cycle);
+    }
+
+    #[test]
+    fn readline_settings_set_and_list() {
+        let mut shell = Shell::new();
+        // default seeded vars present
+        assert_eq!(shell.readline_settings.vars.get("editing-mode").map(String::as_str), Some("emacs"));
+        // set a mapped var
+        shell.set_readline_var("editing-mode", "vi");
+        assert_eq!(shell.readline_settings.vars.get("editing-mode").map(String::as_str), Some("vi"));
+        assert!(shell.readline_settings.dirty);
+        // -v listing form
+        let lines = shell.readline_var_lines();
+        assert!(lines.iter().any(|l| l == "set editing-mode vi"));
+        assert!(lines.iter().any(|l| l == "set bell-style audible"));
+        // record a binding + list it
+        shell.add_bind("\"\\C-x\"", "kill-line");
+        assert_eq!(shell.readline_settings.pending_binds, vec![("\"\\C-x\"".to_string(), "kill-line".to_string())]);
     }
 }

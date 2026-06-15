@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{CompletionType, Config, Editor};
@@ -341,6 +342,7 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     loop {
+        apply_readline_settings(&mut editor, &shell_cell);
         {
             let mut shell = shell_cell.borrow_mut();
             crate::jobs::reap_and_notify(&mut shell);
@@ -434,6 +436,66 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     }
+}
+
+/// Applies any pending `bind` settings (editor-mapped vars + key (un)binds)
+/// from the shell to the live rustyline editor, then clears the dirty flag.
+/// No-op when nothing is dirty.
+fn apply_readline_settings(
+    editor: &mut Editor<HuckHelper, FileHistory>,
+    shell_cell: &Rc<RefCell<Shell>>,
+) {
+    let mut shell = shell_cell.borrow_mut();
+    if !shell.readline_settings.dirty {
+        return;
+    }
+
+    // 1. Editor-mapped variables.
+    if let Some(v) = shell.readline_settings.vars.get("editing-mode") {
+        let mode = if v == "vi" { rustyline::EditMode::Vi } else { rustyline::EditMode::Emacs };
+        editor.set_edit_mode(mode);
+    }
+    if let Some(v) = shell.readline_settings.vars.get("bell-style") {
+        let style = match v.as_str() {
+            "none" => rustyline::config::BellStyle::None,
+            "visible" => rustyline::config::BellStyle::Visible,
+            _ => rustyline::config::BellStyle::Audible,
+        };
+        editor.set_bell_style(style);
+    }
+    if let Some(v) = shell.readline_settings.vars.get("show-all-if-ambiguous") {
+        editor.set_completion_show_all_if_ambiguous(v == "on");
+    }
+    // Numeric vars: parse as i64 and CLAMP to the setter's range so an
+    // out-of-range value (the validator accepts any integer, like bash) still
+    // applies clamped rather than being silently dropped.
+    if let Some(n) = shell.readline_settings.vars.get("completion-query-items").and_then(|s| s.parse::<i64>().ok()) {
+        editor.set_completion_prompt_limit(n.max(0) as usize);
+    }
+    if let Some(n) = shell.readline_settings.vars.get("keyseq-timeout").and_then(|s| s.parse::<i64>().ok()) {
+        editor.set_keyseq_timeout(Some(n.clamp(0, u16::MAX as i64) as u16));
+    }
+
+    // 2. Pending key binds.
+    let binds = std::mem::take(&mut shell.readline_settings.pending_binds);
+    for (seq, func) in binds {
+        if let (Some(event), Some(cmd)) = (
+            crate::readline_bind::parse_keyseq(&seq),
+            crate::readline_bind::function_to_cmd(&func),
+        ) {
+            editor.bind_sequence(event, cmd);
+            shell.readline_settings.active_binds.insert(seq, func);
+        }
+    }
+    // 3. Pending unbinds.
+    let unbinds = std::mem::take(&mut shell.readline_settings.pending_unbinds);
+    for seq in unbinds {
+        if let Some(event) = crate::readline_bind::parse_keyseq(&seq) {
+            editor.unbind_sequence(event);
+            shell.readline_settings.active_binds.remove(&seq);
+        }
+    }
+    shell.readline_settings.dirty = false;
 }
 
 /// Reads one logical command, gathering continuation lines until the

@@ -18,6 +18,7 @@ mod lexer;
 mod param_expansion;
 mod prompt;
 mod procsub;
+mod readline_bind;
 mod shell;
 mod shell_state;
 mod test_builtin;
