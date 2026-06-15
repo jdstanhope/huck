@@ -1789,10 +1789,10 @@ impl Shell {
 
     /// Merges explicit `(index → value)` entries into the named indexed
     /// array, creating it if missing and promoting a scalar to element 0
-    /// first. Honors readonly (callers should pre-check to avoid a partial
-    /// write; this re-checks defensively). Used by `a+=(elements)` after the
-    /// elements are field-expanded with continuation indices already
-    /// computed. Appending to an associative array is a type error.
+    /// first. Thin wrapper over `assign()`, which performs the readonly check
+    /// (callers may still pre-check to avoid a partial write). Used by
+    /// `a+=(elements)` after the elements are field-expanded with continuation
+    /// indices already computed. Appending to an associative array is a type error.
     pub fn extend_indexed(
         &mut self,
         name: &str,
