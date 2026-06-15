@@ -105,6 +105,49 @@ pub enum AssignErr {
     TypeMismatch,
 }
 
+/// Where an assigned value lands. Subscripts are ALREADY resolved by the
+/// caller (which holds expansion context); the funnel takes only primitives.
+#[derive(Debug, Clone)]
+pub enum AssignDest {
+    /// Whole variable: `name=…`, `name=(…)`, `read -a name`, `mapfile name`.
+    Whole(String),
+    /// A single element with an already-resolved subscript.
+    Element { name: String, sub: Subscript },
+}
+
+/// A subscript resolved by the caller. Index → indexed array (arith-evaluated);
+/// Key → associative array (string-evaluated). The caller picks the variant
+/// from the target's current shape, as `apply_one_assignment` does today.
+#[derive(Debug, Clone)]
+pub enum Subscript {
+    Index(usize),
+    Key(String),
+}
+
+/// `=` vs `+=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignKind {
+    Set,
+    Append,
+}
+
+/// The value(s) to store, already fully expanded by the caller.
+#[derive(Debug, Clone)]
+pub enum AssignSource {
+    Scalar(String),
+    Indexed(BTreeMap<usize, String>),
+    Associative(Vec<(String, String)>),
+}
+
+impl AssignDest {
+    fn name(&self) -> &str {
+        match self {
+            AssignDest::Whole(n) => n,
+            AssignDest::Element { name, .. } => name,
+        }
+    }
+}
+
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
 /// Callers translate these into a "huck: {cmd}: ..." diagnostic via
@@ -808,13 +851,7 @@ impl Shell {
     /// rest of the map is preserved (matches bash: `a=v` on an indexed
     /// array overwrites a[0]).
     pub fn set(&mut self, name: &str, value: String) {
-        if self.reseed_special_on_assign(name, &value) { return; }
-        match self.vars.get_mut(name) {
-            Some(existing) => install_scalar_value(existing, value),
-            None => {
-                self.vars.insert(name.to_string(), Variable::scalar(value));
-            }
-        }
+        self.store_scalar(name, value);
     }
 
     /// Resolves `$HISTSIZE` to the in-memory history cap. `None` = unlimited.
@@ -1177,27 +1214,109 @@ impl Shell {
         self.vars.get(name).map(|v| v.readonly).unwrap_or(false)
     }
 
-    /// Checked write: refuses to overwrite a readonly variable. Returns
-    /// `Err(())` if `name` is readonly (caller prints the diagnostic);
-    /// otherwise sets the value and returns `Ok(())`. Consumed by
-    /// executor/expansion write paths in v54 task 2.
-    ///
-    /// When `name` is integer-flagged (v65), the RHS is routed through
-    /// `arith::parse` + `arith::eval` and stored as the decimal string.
-    /// Parse/eval failures silently coerce to `"0"` (matches bash for
-    /// non-`declare` integer write paths).
-    pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
-        if self.is_readonly(name) {
-            return Err(());
+    /// Resolves an assignment target through any nameref indirection. Identity
+    /// today — huck has no namerefs yet (v160). This is the ONE place a future
+    /// `declare -n r=target` will rewrite the destination (name, and for
+    /// `declare -n r=arr[i]` a `Whole(r)` into an `Element{arr, Index(i)}`),
+    /// with circular-reference detection. Do NOT add nameref behavior here in
+    /// v159 — only the seam.
+    fn resolve_assign_target(&self, dest: AssignDest) -> AssignDest {
+        dest
+    }
+
+    /// Raw scalar store: RANDOM/SECONDS interception, else overwrite an existing
+    /// Indexed array's element 0 (bash's `a=v` rule) or set/create a Scalar.
+    /// No readonly check, no attributes — those belong to `assign()`.
+    fn store_scalar(&mut self, name: &str, value: String) {
+        if self.reseed_special_on_assign(name, &value) {
+            return;
         }
-        // Intercept dynamic builtin variables: reseed RANDOM or reset SECONDS.
-        if self.reseed_special_on_assign(name, &value) { return Ok(()); }
-        // Determine whether the integer-coerce path applies: only on
-        // an existing integer-flagged Scalar. Indexed variables (even
-        // if integer-flagged) take the array-element-0 overwrite path
-        // instead.
-        // Compute the final stored string: integer-coerce first (only on an
-        // existing integer-flagged Scalar), then apply the case-fold attribute.
+        match self.vars.get_mut(name) {
+            Some(existing) => install_scalar_value(existing, value),
+            None => {
+                self.vars.insert(name.to_string(), Variable::scalar(value));
+            }
+        }
+    }
+
+    /// The single chokepoint for variable assignment. Applies cross-cutting
+    /// concerns in a fixed order — resolve target (nameref seam) → readonly →
+    /// integer-coerce → case-fold → store — then dispatches to a storage
+    /// primitive. All value-producing paths route through here (directly or via
+    /// the thin leaf-mutator wrappers).
+    pub fn assign(
+        &mut self,
+        dest: AssignDest,
+        op: AssignKind,
+        source: AssignSource,
+    ) -> Result<(), AssignErr> {
+        let dest = self.resolve_assign_target(dest);
+        let name = dest.name().to_string();
+
+        // Readonly check, once, before any store (no partial array writes).
+        // NOTE: in Task 1 the Element/whole-array arms below ALSO re-check
+        // readonly inside the public methods they call — harmless (this top
+        // check returns first). Tasks 2-3 remove the inner checks.
+        if self.is_readonly(&name) {
+            eprintln!("huck: {name}: readonly variable");
+            return Err(AssignErr::Readonly);
+        }
+
+        match (&dest, op, source) {
+            // ── Scalar value into a whole variable: `x=v` / `x+=v` (NEW path) ──
+            (AssignDest::Whole(_), _, AssignSource::Scalar(v)) => {
+                let v = if op == AssignKind::Append {
+                    let existing = self.get(&name).map(str::to_string).unwrap_or_default();
+                    existing + &v
+                } else {
+                    v
+                };
+                let stored = self.value_with_scalar_attrs(&name, v);
+                self.store_scalar(&name, stored);
+                Ok(())
+            }
+            // ── Element + Scalar: delegate to existing public methods (Task 2/3 replaces) ──
+            (AssignDest::Element { name: n, sub: Subscript::Index(idx) }, _, AssignSource::Scalar(v)) => {
+                let n = n.clone();
+                let idx = *idx;
+                match op {
+                    AssignKind::Set => self.set_array_element(&n, idx, v),
+                    AssignKind::Append => self.append_array_element(&n, idx, &v),
+                }
+            }
+            (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
+                let n = n.clone();
+                let key = key.clone();
+                match op {
+                    AssignKind::Set => self.set_associative_element(&n, key, v),
+                    AssignKind::Append => self.append_associative_element(&n, &key, &v),
+                }
+            }
+            // ── Whole + array/assoc source: delegate (Task 2/3 replaces) ──
+            (AssignDest::Whole(n), _, AssignSource::Indexed(m)) => {
+                let n = n.clone();
+                match op {
+                    AssignKind::Set => self.replace_array(&n, m),
+                    AssignKind::Append => self.extend_indexed(&n, m),
+                }
+            }
+            (AssignDest::Whole(n), AssignKind::Set, AssignSource::Associative(p)) => {
+                let n = n.clone();
+                self.replace_associative(&n, p)
+            }
+            (AssignDest::Whole(_), AssignKind::Append, AssignSource::Associative(_)) => {
+                unreachable!("associative whole-append is not produced by any caller")
+            }
+            (AssignDest::Element { .. }, _, AssignSource::Indexed(_))
+            | (AssignDest::Element { .. }, _, AssignSource::Associative(_)) => {
+                unreachable!("Element dest with array/assoc source is not produced by any caller")
+            }
+        }
+    }
+
+    /// Applies the SCALAR attribute chain (integer-coerce only on an existing
+    /// integer-flagged Scalar, then case-fold) to a whole-variable value.
+    fn value_with_scalar_attrs(&mut self, name: &str, value: String) -> String {
         let do_integer_coerce = self.is_integer(name)
             && self
                 .vars
@@ -1208,21 +1327,21 @@ impl Shell {
         } else {
             value
         };
-        let folded = apply_case_fold(self.case_fold_of(name), coerced);
+        apply_case_fold(self.case_fold_of(name), coerced)
+    }
 
-        if do_integer_coerce {
-            if let Some(existing) = self.vars.get_mut(name) {
-                existing.value = VarValue::Scalar(folded);
-            }
-            return Ok(());
-        }
-        if let Some(existing) = self.vars.get_mut(name) {
-            install_scalar_value(existing, folded);
-            Ok(())
-        } else {
-            self.vars.insert(name.to_string(), Variable::scalar(folded));
-            Ok(())
-        }
+    /// Checked write: refuses to overwrite a readonly variable. Returns
+    /// `Err(())` if `name` is readonly (caller prints the diagnostic);
+    /// otherwise sets the value and returns `Ok(())`. Consumed by
+    /// executor/expansion write paths in v54 task 2.
+    ///
+    /// When `name` is integer-flagged (v65), the RHS is routed through
+    /// `arith::parse` + `arith::eval` and stored as the decimal string.
+    /// Parse/eval failures silently coerce to `"0"` (matches bash for
+    /// non-`declare` integer write paths).
+    pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
+        self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Scalar(value))
+            .map_err(|_| ())
     }
 
     /// Checked unset: refuses to remove a readonly variable. Returns
