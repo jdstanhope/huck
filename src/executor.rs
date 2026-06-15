@@ -3293,6 +3293,20 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         return ExecOutcome::Continue(1);
     }
 
+    // `$_` value for THIS simple command: the last argument (post-expansion),
+    // or the program name when there are no arguments. Computed here — after
+    // the `command`/`builtin` prefixes are stripped and arguments are fully
+    // expanded — so it covers builtins, functions, and externals alike (bash:
+    // `echo a b c; echo "$_"` → `c`; `: foo` → `foo`; `ls` → `ls`). It is
+    // applied to `shell.last_arg` AFTER dispatch (below), so that a function /
+    // eval / source body's own nested commands don't leave a stale `$_`
+    // (bash: `f(){ :; }; f a b; echo "$_"` → `b`, the outer call's last arg).
+    let next_last_arg = resolved
+        .args
+        .last()
+        .cloned()
+        .unwrap_or_else(|| resolved.program.clone());
+
     // Apply inline assignments (e.g. FOO=bar in `FOO=bar cmd args`) before
     // dispatch. The snapshot is used to restore state for temporary-scope
     // targets (regular builtins and externals). Persistent-scope targets
@@ -3459,6 +3473,9 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     if !persistent {
         restore_inline_assignments(snap, shell);
     }
+    // Apply `$_` AFTER dispatch so a function/eval/source body's nested
+    // commands don't leave a stale value (see `next_last_arg` above).
+    shell.last_arg = next_last_arg;
     // A STOPPED command (Ctrl-Z) leaves its process substitutions alive — drain
     // them non-blocking (a blocking waitpid on a live procsub child whose
     // consumer is also stopped would deadlock the shell). Both variants pop the
