@@ -2655,6 +2655,10 @@ struct ConvSpec {
     flags: ConvFlags,
     width: Option<usize>,
     precision: Option<usize>,
+    /// Width came from a `*` (dynamic): take it from the next arg.
+    width_star: bool,
+    /// Precision came from a `.*` (dynamic): take it from the next arg.
+    prec_star: bool,
     conv: ConvChar,
 }
 
@@ -2671,6 +2675,8 @@ enum ConvChar {
     B,
     Q,
     Percent,
+    /// Floating-point: `f F e E g G` (rendered via libc::snprintf).
+    Float(u8),
 }
 
 /// Decodes a backslash-escape starting at the byte AFTER the `\`.
@@ -2800,30 +2806,42 @@ fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
             }
             i += 1;
         }
-        // Width (decimal digits — no runtime `*` in v56).
+        // Width: `*` (dynamic, from next arg) or decimal digits.
         let mut width: Option<usize> = None;
-        let mut wstr = String::new();
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            wstr.push(bytes[i] as char);
+        let mut width_star = false;
+        if i < bytes.len() && bytes[i] == b'*' {
+            width_star = true;
             i += 1;
-        }
-        if !wstr.is_empty() {
-            width = Some(wstr.parse().unwrap_or(0));
-        }
-        // Precision.
-        let mut precision: Option<usize> = None;
-        if i < bytes.len() && bytes[i] == b'.' {
-            i += 1;
-            let mut pstr = String::new();
+        } else {
+            let mut wstr = String::new();
             while i < bytes.len() && bytes[i].is_ascii_digit() {
-                pstr.push(bytes[i] as char);
+                wstr.push(bytes[i] as char);
                 i += 1;
             }
-            precision = Some(if pstr.is_empty() {
-                0
+            if !wstr.is_empty() {
+                width = Some(wstr.parse().unwrap_or(0));
+            }
+        }
+        // Precision: `.` then `*` (dynamic) or decimal digits.
+        let mut precision: Option<usize> = None;
+        let mut prec_star = false;
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'*' {
+                prec_star = true;
+                i += 1;
             } else {
-                pstr.parse().unwrap_or(0)
-            });
+                let mut pstr = String::new();
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    pstr.push(bytes[i] as char);
+                    i += 1;
+                }
+                precision = Some(if pstr.is_empty() {
+                    0
+                } else {
+                    pstr.parse().unwrap_or(0)
+                });
+            }
         }
         // Conversion char.
         if i >= bytes.len() {
@@ -2841,6 +2859,7 @@ fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
             b'b' => ConvChar::B,
             b'q' => ConvChar::Q,
             b'%' => ConvChar::Percent,
+            c @ (b'f' | b'F' | b'e' | b'E' | b'g' | b'G') => ConvChar::Float(c),
             c => return Err(format!("`%{}': invalid directive", c as char)),
         };
         i += 1;
@@ -2848,6 +2867,8 @@ fn parse_format(fmt: &str) -> Result<Vec<FormatPart>, String> {
             flags,
             width,
             precision,
+            width_star,
+            prec_star,
             conv,
         }));
     }
@@ -2919,6 +2940,116 @@ fn parse_printf_int(s: &str) -> (i64, Option<String>) {
         None
     };
     (sign.saturating_mul(parsed), err)
+}
+
+/// Parses a printf float argument. Returns (value, optional error).
+/// Mirrors `parse_printf_int`'s contract: empty → 0 (no error);
+/// a leading `'`/`"` char-literal yields that char's code; otherwise
+/// a leading numeric prefix is parsed as f64 and trailing garbage is
+/// reported (value = parsed prefix, or 0 if none).
+fn parse_printf_float(s: &str) -> (f64, Option<String>) {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return (0.0, None);
+    }
+    let bytes = trimmed.as_bytes();
+    // Char-literal form: leading ' or " (same as the integer path).
+    if bytes[0] == b'\'' || bytes[0] == b'"' {
+        if bytes.len() == 1 {
+            return (0.0, None);
+        }
+        let v = bytes[1] as f64;
+        let extra = if bytes.len() > 2 {
+            Some(format!(
+                "warning: `{s}': character(s) following character constant have been ignored"
+            ))
+        } else {
+            None
+        };
+        return (v, extra);
+    }
+    // Whole string parses cleanly (covers integers, decimals, exponents,
+    // nan/inf): no error.
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return (v, None);
+    }
+    // Otherwise find the longest leading prefix that parses as f64; the
+    // remaining bytes are trailing garbage (matches bash's `invalid number`
+    // warning while still using the parsed prefix).
+    let mut best: Option<f64> = None;
+    for (idx, _) in trimmed.char_indices().skip(1) {
+        if let Ok(v) = trimmed[..idx].parse::<f64>() {
+            best = Some(v);
+        }
+    }
+    match best {
+        Some(v) => (v, Some(format!("`{s}': invalid number"))),
+        None => (0.0, Some(format!("`{s}': invalid number"))),
+    }
+}
+
+/// Renders one resolved float directive via `libc::snprintf`, matching
+/// C/bash float formatting byte-for-byte. `width`/`precision` are already
+/// resolved to concrete values (dynamic `*` handled by the caller).
+fn snprintf_float(spec: &ConvSpec, conv: u8, value: f64) -> Vec<u8> {
+    // Reconstruct the C conversion spec: %[flags][width][.precision]<conv>.
+    let mut cfmt = String::from("%");
+    if spec.flags.left_align {
+        cfmt.push('-');
+    }
+    if spec.flags.sign {
+        cfmt.push('+');
+    }
+    if spec.flags.space_sign {
+        cfmt.push(' ');
+    }
+    if spec.flags.alt {
+        cfmt.push('#');
+    }
+    if spec.flags.zero_pad {
+        cfmt.push('0');
+    }
+    if let Some(w) = spec.width {
+        cfmt.push_str(&w.to_string());
+    }
+    if let Some(p) = spec.precision {
+        cfmt.push('.');
+        cfmt.push_str(&p.to_string());
+    }
+    cfmt.push(conv as char);
+
+    let cfmt_c = match std::ffi::CString::new(cfmt) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    // 512 is plenty for normal use; grow once if truncated.
+    let mut cap = 512usize;
+    loop {
+        let mut buf = vec![0u8; cap];
+        // SAFETY: `cfmt_c` is a single, well-formed float conversion spec
+        // (one directive, no `%n`, no `*` — those were resolved away). The
+        // matching variadic argument is the `f64` `value`, which is the
+        // correct type for `f`/`e`/`g` conversions on all targets. The
+        // buffer is `cap` bytes and `snprintf` never writes past it.
+        let n = unsafe {
+            libc::snprintf(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                cap,
+                cfmt_c.as_ptr(),
+                value,
+            )
+        };
+        if n < 0 {
+            return Vec::new();
+        }
+        let n = n as usize;
+        if n < cap {
+            buf.truncate(n);
+            return buf;
+        }
+        // Truncated: grow to fit and retry.
+        cap = n + 1;
+    }
 }
 
 /// bash `printf %q`: quote `arg` so it re-reads as the same word. Empty → `''`;
@@ -3098,6 +3229,11 @@ fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, Str
             out.extend_from_slice(&pad_string(&decoded, spec));
             Ok(!halted)
         }
+        ConvChar::Float(conv) => {
+            let (val, err) = parse_printf_float(arg);
+            out.extend_from_slice(&snprintf_float(spec, conv, val));
+            err.map_or(Ok(true), Err)
+        }
         ConvChar::Percent => {
             // Caller treats `%%` specially (no arg consumed); shouldn't
             // reach here, but emit a `%` defensively.
@@ -3188,14 +3324,43 @@ fn builtin_printf(
                     buf.push(b'%');
                 }
                 FormatPart::Conv(c) => {
-                    let arg = if arg_idx < rest_args.len() {
-                        rest_args[arg_idx].as_str()
-                    } else {
-                        // Missing arg: %s → "", %d → 0.
-                        ""
+                    // Resolve dynamic `*` width/precision: each `*` consumes
+                    // the next arg as an integer before the conversion's own
+                    // arg. A negative width means left-justify (C semantics);
+                    // a negative precision is treated as if omitted.
+                    let mut spec = c.clone();
+                    let next_arg = |arg_idx: &mut usize| -> &str {
+                        let a = if *arg_idx < rest_args.len() {
+                            rest_args[*arg_idx].as_str()
+                        } else {
+                            ""
+                        };
+                        *arg_idx += 1;
+                        a
                     };
-                    arg_idx += 1;
-                    match format_one(c, arg, &mut buf) {
+                    if spec.width_star {
+                        let (n, err) = parse_printf_int(next_arg(&mut arg_idx));
+                        if let Some(msg) = err {
+                            eprintln!("huck: printf: {msg}");
+                            exit = 1;
+                        }
+                        if n < 0 {
+                            spec.flags.left_align = true;
+                            spec.width = Some(n.unsigned_abs() as usize);
+                        } else {
+                            spec.width = Some(n as usize);
+                        }
+                    }
+                    if spec.prec_star {
+                        let (n, err) = parse_printf_int(next_arg(&mut arg_idx));
+                        if let Some(msg) = err {
+                            eprintln!("huck: printf: {msg}");
+                            exit = 1;
+                        }
+                        spec.precision = if n < 0 { None } else { Some(n as usize) };
+                    }
+                    let arg = next_arg(&mut arg_idx);
+                    match format_one(&spec, arg, &mut buf) {
                         Ok(true) => {}
                         Ok(false) => halted = true,
                         Err(msg) => {
@@ -10309,6 +10474,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: None,
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::S,
         };
         format_one(&spec, "hi", &mut out).unwrap();
@@ -10322,6 +10489,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: Some(5),
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::S,
         };
         format_one(&spec, "hi", &mut out).unwrap();
@@ -10338,6 +10507,8 @@ mod printf_tests {
             },
             width: Some(5),
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::S,
         };
         format_one(&spec, "hi", &mut out).unwrap();
@@ -10351,6 +10522,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: None,
             precision: Some(3),
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::S,
         };
         format_one(&spec, "hello", &mut out).unwrap();
@@ -10364,6 +10537,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: None,
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::D,
         };
         format_one(&spec, "42", &mut out).unwrap();
@@ -10380,6 +10555,8 @@ mod printf_tests {
             },
             width: Some(5),
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::D,
         };
         format_one(&spec, "42", &mut out).unwrap();
@@ -10396,6 +10573,8 @@ mod printf_tests {
             },
             width: None,
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::X,
         };
         format_one(&spec_x, "255", &mut out).unwrap();
@@ -10409,6 +10588,8 @@ mod printf_tests {
             },
             width: None,
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::BigX,
         };
         format_one(&spec_bigx, "255", &mut out2).unwrap();
@@ -10422,6 +10603,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: None,
             precision: None,
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::B,
         };
         format_one(&spec, "a\\tb", &mut out).unwrap();
@@ -10437,6 +10620,8 @@ mod printf_tests {
             flags: ConvFlags::default(),
             width: None,
             precision: Some(0),
+            width_star: false,
+            prec_star: false,
             conv: ConvChar::D,
         };
         format_one(&spec, "0", &mut out).unwrap();
@@ -10446,6 +10631,52 @@ mod printf_tests {
         let mut out2 = Vec::new();
         format_one(&spec, "5", &mut out2).unwrap();
         assert_eq!(out2, b"5");
+    }
+
+    #[test]
+    fn format_float_via_snprintf() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: Some(5),
+            precision: Some(2),
+            width_star: false,
+            prec_star: false,
+            conv: ConvChar::Float(b'f'),
+        };
+        format_one(&spec, "3.14159", &mut out).unwrap();
+        assert_eq!(out, b" 3.14");
+    }
+
+    #[test]
+    fn format_float_invalid_arg_reports_err() {
+        let mut out = Vec::new();
+        let spec = ConvSpec {
+            flags: ConvFlags::default(),
+            width: None,
+            precision: None,
+            width_star: false,
+            prec_star: false,
+            conv: ConvChar::Float(b'f'),
+        };
+        // Non-numeric arg → 0.000000 plus an error (caller sets rc 1).
+        let err = format_one(&spec, "abc", &mut out).unwrap_err();
+        assert!(err.contains("invalid number"));
+        assert_eq!(out, b"0.000000");
+    }
+
+    #[test]
+    fn parse_format_accepts_star_and_floats() {
+        // `*` width/precision flagged; float convs parsed.
+        let parts = parse_format("%*.*f").unwrap();
+        match &parts[0] {
+            FormatPart::Conv(c) => {
+                assert!(c.width_star);
+                assert!(c.prec_star);
+                assert_eq!(c.conv, ConvChar::Float(b'f'));
+            }
+            _ => panic!("expected a conv part"),
+        }
     }
 }
 
