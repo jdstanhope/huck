@@ -779,7 +779,7 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
-    // Order matches bash's `declare -p` output: a/A, i, r, x.
+    // Order matches bash's `declare -p` output: a/A, i, r, x, l/u.
     if matches!(var.value, VarValue::Indexed(_)) {
         attrs.push('a');
     }
@@ -794,6 +794,11 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     }
     if var.exported {
         attrs.push('x');
+    }
+    match var.case_fold {
+        Some(crate::shell_state::CaseFold::Lower) => attrs.push('l'),
+        Some(crate::shell_state::CaseFold::Upper) => attrs.push('u'),
+        None => {}
     }
     let flag_str = if attrs.is_empty() {
         "--".to_string()
