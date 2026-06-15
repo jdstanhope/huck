@@ -55,12 +55,22 @@ impl VarValue {
     }
 }
 
+/// The case-fold attribute set by `declare -l` / `declare -u`. Mutually
+/// exclusive by construction — a variable is Lower, Upper, or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CaseFold {
+    Lower,
+    Upper,
+}
+
 #[derive(Debug, Clone)]
 pub struct Variable {
     pub value: VarValue,
     pub exported: bool,
     pub readonly: bool,
     pub integer: bool,
+    pub case_fold: Option<CaseFold>,
 }
 
 impl Variable {
@@ -72,6 +82,7 @@ impl Variable {
             exported: false,
             readonly: false,
             integer: false,
+            case_fold: None,
         }
     }
 }
@@ -584,6 +595,7 @@ impl Shell {
                 exported: true,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             });
         }
         let shell_pid = unsafe { libc::getpid() };
@@ -1021,6 +1033,7 @@ impl Shell {
                 exported: true,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             });
     }
 
@@ -1043,6 +1056,7 @@ impl Shell {
                         exported: true,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
             }
@@ -1235,6 +1249,7 @@ impl Shell {
                     exported: false,
                     readonly: true,
                     integer: false,
+                    case_fold: None,
                 },
             );
         }
@@ -1259,6 +1274,7 @@ impl Shell {
                     exported: false,
                     readonly: false,
                     integer: true,
+                    case_fold: None,
                 },
             );
         }
@@ -1293,6 +1309,7 @@ impl Shell {
             exported: false,
             readonly,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1304,6 +1321,7 @@ impl Shell {
             exported: false,
             readonly,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1355,6 +1373,7 @@ impl Shell {
             exported: true,
             readonly: false,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1411,6 +1430,7 @@ impl Shell {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
     }
@@ -1422,6 +1442,7 @@ impl Shell {
             exported: false,
             readonly: false,
             integer: false,
+            case_fold: None,
         });
     }
 
@@ -1544,6 +1565,7 @@ impl Shell {
                 exported,
                 readonly: false,
                 integer,
+                case_fold: None,
             },
         );
         Ok(())
@@ -1596,6 +1618,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
             }
@@ -1639,6 +1662,7 @@ impl Shell {
                     exported: false,
                     readonly: false,
                     integer: false,
+                    case_fold: None,
                 },
             );
         }
@@ -1805,6 +1829,7 @@ impl Shell {
                 readonly: false,
                 // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
                 integer: false,
+                case_fold: None,
             },
         );
         Ok(())
@@ -1829,6 +1854,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         integer: false,
+                        case_fold: None,
                     },
                 );
                 Ok(())
@@ -1953,6 +1979,20 @@ impl Default for Shell {
     }
 }
 
+/// Applies a variable's case-fold attribute to a value string. `None`
+/// returns the value unchanged. Lower/Upper use Rust's whole-string
+/// `to_lowercase`/`to_uppercase`, which is byte-identical to the
+/// `${v,,}`/`${v^^}` `case_modify` helper for the no-pattern case (and
+/// therefore inherits the same documented L-04 Unicode behavior).
+#[allow(dead_code)]
+fn apply_case_fold(fold: Option<CaseFold>, value: &str) -> String {
+    match fold {
+        None => value.to_string(),
+        Some(CaseFold::Lower) => value.to_lowercase(),
+        Some(CaseFold::Upper) => value.to_uppercase(),
+    }
+}
+
 #[cfg(test)]
 impl Shell {
     /// Test-only helper: install an indexed-array variable directly.
@@ -1970,6 +2010,7 @@ impl Shell {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
     }
@@ -2495,6 +2536,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         let result = shell.try_set("a", "new".to_string());
@@ -2521,6 +2563,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         shell.set("a", "new".to_string());
@@ -2546,6 +2589,7 @@ mod array_value_tests {
                 exported: false,
                 readonly: false,
                 integer: false,
+                case_fold: None,
             },
         );
         shell.export_set("a", "new".to_string());
@@ -2597,7 +2641,7 @@ mod assoc_value_tests {
         m.insert(0, "x".into());
         shell.vars.insert("a".into(), Variable {
             value: VarValue::Indexed(m),
-            exported: false, readonly: false, integer: false,
+            exported: false, readonly: false, integer: false, case_fold: None,
         });
         assert!(matches!(shell.declare_associative("a"), Err(DeclareErr::IndexedExists)));
     }
@@ -2879,5 +2923,14 @@ mod shopt_tests {
         assert_eq!(s.resolve_histfilesize(), None); // negative -> inhibit
         s.set("HISTFILESIZE", "abc".to_string());
         assert_eq!(s.resolve_histfilesize(), None); // non-numeric -> inhibit
+    }
+
+    #[test]
+    fn apply_case_fold_lower_upper_and_none() {
+        assert_eq!(apply_case_fold(None, "AbC"), "AbC");
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "AbC"), "abc");
+        assert_eq!(apply_case_fold(Some(CaseFold::Upper), "AbC"), "ABC");
+        // idempotent
+        assert_eq!(apply_case_fold(Some(CaseFold::Lower), "abc"), "abc");
     }
 }
