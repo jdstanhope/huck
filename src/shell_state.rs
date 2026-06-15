@@ -976,6 +976,17 @@ impl Shell {
     /// yield false — a rare edge.
     pub fn element_or_var_is_set(&self, target: &str) -> bool {
         if let Some((name, sub)) = crate::expand::split_name_subscript(target) {
+            // Resolve a nameref base so `[[ -v r[i] ]]` (r→arr) tests arr[i],
+            // not the nameref's own scalar value (its target name) at index i.
+            let name = if self.is_nameref(&name) {
+                match self.resolve_nameref(&name) {
+                    ResolvedName::Name(n) => n,
+                    ResolvedName::Element { name: base, .. } => base,
+                    ResolvedName::Unbound(_) | ResolvedName::Cycle => return false,
+                }
+            } else {
+                name
+            };
             if self.get_associative(&name).is_some() {
                 return self.lookup_associative_element(&name, &sub).is_some();
             }
