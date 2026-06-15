@@ -1547,10 +1547,6 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
         eprintln!("huck: local: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
     }
-    if (want_array || want_associative) && want_integer {
-        eprintln!("huck: local: integer arrays not yet supported");
-        return ExecOutcome::Continue(1);
-    }
 
     // Net case-fold attribute from this command's flags.
     let minus_case_fold: Option<Option<crate::shell_state::CaseFold>> =
@@ -1623,7 +1619,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                         );
                         exit = 1;
                     }
-                } else if want_integer {
+                } else if want_integer && !(want_array || want_associative) {
                     // Bare `local -i NAME`: create the local as a set-but-empty
                     // integer scalar (matches bash + `declare -i NAME`) so a
                     // later `NAME=2+3` arithmetic-coerces. mark_integer creates
@@ -1639,6 +1635,13 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     // re-`local` of an already-local name preserves its value
                     // (bash), so only unset when NOT already_local. (M-111)
                     shell.unset(name);
+                }
+                // `local -ai`/`-Ai` NAME (bare): apply the integer flag AFTER
+                // the array shape was created above (mark_integer sets the flag
+                // on the existing var without clobbering shape). A later
+                // `NAME[i]=expr` then arith-coerces (L-49).
+                if want_integer && (want_array || want_associative) {
+                    shell.mark_integer(name);
                 }
                 // Apply case-fold attribute AFTER shape setup (so that -lA
                 // finds the associative var and only updates case_fold) but
@@ -1979,16 +1982,8 @@ fn builtin_declare_decl(
         };
 
     // Reject the combinations we haven't implemented yet.
-    if want_array && want_integer {
-        eprintln!("huck: declare: integer arrays not yet supported");
-        return ExecOutcome::Continue(1);
-    }
     if want_array && want_associative {
         eprintln!("huck: declare: cannot specify both -a and -A");
-        return ExecOutcome::Continue(1);
-    }
-    if want_associative && want_integer {
-        eprintln!("huck: declare: integer associative arrays not yet supported");
         return ExecOutcome::Continue(1);
     }
 
@@ -2109,8 +2104,13 @@ fn builtin_declare_decl(
             continue;
         }
 
-        // Apply integer-flag flips before any value-set path.
-        if want_integer {
+        // Apply integer-flag flips before any value-set path. For ARRAY/assoc
+        // declarations the integer flag is applied AFTER shape creation
+        // (mark_integer creates an empty Scalar when the name is unset, which
+        // would otherwise make declare_associative/replace_array see a scalar);
+        // see the deferred `mark_integer` below. For a plain (scalar) integer
+        // declaration it must run BEFORE the `=value` path so the value coerces.
+        if want_integer && !(want_array || want_associative) {
             shell.mark_integer(name);
         }
         if want_remove_integer {
@@ -2147,6 +2147,14 @@ fn builtin_declare_decl(
             );
             exit = 1;
             continue;
+        }
+
+        // Integer flag for array/associative declarations (`declare -ai`/`-Ai`):
+        // applied AFTER the array shape exists (set on the existing var without
+        // clobbering shape) and BEFORE any `=value` assignment below, so the
+        // funnel arith-coerces the literal's element values on store (L-49).
+        if want_integer && (want_array || want_associative) {
+            shell.mark_integer(name);
         }
 
         // Apply case-fold attribute AFTER shape setup (so -lA finds the
@@ -12264,10 +12272,16 @@ mod array_declare_tests {
     }
 
     #[test]
-    fn declare_dash_ai_errors() {
+    fn declare_dash_ai_creates_integer_array() {
+        // L-49: `declare -ai` now creates an integer-flagged indexed array
+        // whose element values arith-coerce on assignment.
         let mut s = Shell::new();
-        let outcome = run(&mut s, "declare -ai a");
-        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        let outcome = run(&mut s, "declare -ai a=(2+3 4*5)");
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(s.is_integer("a"));
+        let m = s.get_array("a").unwrap();
+        assert_eq!(m.get(&0).map(String::as_str), Some("5"));
+        assert_eq!(m.get(&1).map(String::as_str), Some("20"));
     }
 
     #[test]
@@ -12360,11 +12374,22 @@ mod assoc_declare_tests {
     }
 
     #[test]
-    fn declare_dash_cap_a_i_errors() {
+    fn declare_dash_cap_a_i_creates_integer_assoc() {
+        // L-49: `declare -Ai` creates an integer-flagged associative array
+        // whose VALUES arith-coerce on assignment (keys are not coerced).
         let mut s = Shell::new();
-        let outcome = run(&mut s, "declare -Ai m");
-        assert!(matches!(outcome, ExecOutcome::Continue(1)));
-        assert!(s.get_associative("m").is_none());
+        let outcome = run(&mut s, "declare -Ai m=([x]=2+3 [y]=10)");
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(s.is_integer("m"));
+        let pairs = s.get_associative("m").unwrap();
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "x").map(|(_, v)| v.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "y").map(|(_, v)| v.as_str()),
+            Some("10")
+        );
     }
 
     #[test]

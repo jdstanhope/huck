@@ -1435,9 +1435,9 @@ impl Shell {
     /// Storage only: replace the whole variable with an associative array of the
     /// given (already-folded) pairs, preserving exported/case_fold.
     fn store_assoc_replace(&mut self, name: &str, pairs: Vec<(String, String)>) -> Result<(), AssignErr> {
-        let (exported, case_fold) = match self.vars.get(name) {
-            Some(v) => (v.exported, v.case_fold),
-            None => (false, None),
+        let (exported, integer, case_fold) = match self.vars.get(name) {
+            Some(v) => (v.exported, v.integer, v.case_fold),
+            None => (false, false, None),
         };
         self.vars.insert(
             name.to_string(),
@@ -1445,8 +1445,10 @@ impl Shell {
                 value: VarValue::Associative(pairs),
                 exported,
                 readonly: false,
-                // bash does not support `declare -Ai` (integer associative arrays); drop the flag.
-                integer: false,
+                // Integer associative arrays (`declare -Ai`) coerce VALUES on
+                // assignment (the funnel does this before storing); preserve the
+                // flag so later `m[k]=expr` writes keep coercing (L-49).
+                integer,
                 case_fold,
                 nameref: false,
             },
@@ -1502,7 +1504,11 @@ impl Shell {
                 let v = if op == AssignKind::Append {
                     self.lookup_array_element(&n, idx).unwrap_or_default() + &v
                 } else { v };
-                let v = apply_case_fold(self.case_fold_of(&n), v); // NB: NO integer-coerce on elements (preserve asymmetry)
+                // Integer arrays (v-L49) coerce each element value via arith
+                // before case-fold, mirroring the scalar attribute order in
+                // `value_with_scalar_attrs`. Non-integer arrays are untouched.
+                let v = if self.is_integer(&n) { eval_integer_coerce(self, &v) } else { v };
+                let v = apply_case_fold(self.case_fold_of(&n), v);
                 self.store_indexed_element(&n, idx, v)
             }
             (AssignDest::Element { name: n, sub: Subscript::Key(key) }, _, AssignSource::Scalar(v)) => {
@@ -1511,6 +1517,8 @@ impl Shell {
                 let v = if op == AssignKind::Append {
                     self.lookup_associative_element(&n, &key).unwrap_or_default() + &v
                 } else { v };
+                // Integer associative arrays coerce the VALUE (never the key).
+                let v = if self.is_integer(&n) { eval_integer_coerce(self, &v) } else { v };
                 let v = apply_case_fold(self.case_fold_of(&n), v);
                 self.store_assoc_element(&n, key, v)
             }
@@ -1518,7 +1526,17 @@ impl Shell {
             (AssignDest::Whole(n), _, AssignSource::Indexed(m)) => {
                 let n = n.clone();
                 let fold = self.case_fold_of(&n);
-                let m: BTreeMap<usize, String> = m.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
+                let is_int = self.is_integer(&n);
+                let m: BTreeMap<usize, String> = if is_int {
+                    // eval_integer_coerce needs &mut self: build sequentially.
+                    let mut out = BTreeMap::new();
+                    for (k, v) in m {
+                        out.insert(k, apply_case_fold(fold, eval_integer_coerce(self, &v)));
+                    }
+                    out
+                } else {
+                    m.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect()
+                };
                 match op {
                     AssignKind::Set => self.store_indexed_replace(&n, m),
                     AssignKind::Append => self.store_indexed_extend(&n, m),
@@ -1527,7 +1545,16 @@ impl Shell {
             (AssignDest::Whole(n), AssignKind::Set, AssignSource::Associative(p)) => {
                 let n = n.clone();
                 let fold = self.case_fold_of(&n);
-                let p: Vec<(String, String)> = p.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect();
+                let is_int = self.is_integer(&n);
+                let p: Vec<(String, String)> = if is_int {
+                    let mut out = Vec::with_capacity(p.len());
+                    for (k, v) in p {
+                        out.push((k, apply_case_fold(fold, eval_integer_coerce(self, &v))));
+                    }
+                    out
+                } else {
+                    p.into_iter().map(|(k, v)| (k, apply_case_fold(fold, v))).collect()
+                };
                 self.store_assoc_replace(&n, p)
             }
             (AssignDest::Whole(_), AssignKind::Append, AssignSource::Associative(_)) => {
@@ -3390,6 +3417,73 @@ mod shopt_tests {
             AssignSource::Indexed(m),
         ).unwrap();
         assert_eq!(shell.lookup_array_element("b", 0).as_deref(), Some("LO"));
+    }
+
+    /// L-49: an integer-flagged array arith-coerces element VALUES on every
+    /// storage path (whole indexed literal, indexed element, whole associative
+    /// literal, associative element); a non-integer array stays literal.
+    #[test]
+    fn assign_funnel_integer_coerces_array_values() {
+        let mut shell = Shell::new();
+
+        // whole indexed-array literal coerces each value
+        shell.mark_integer("a");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "2+3".to_string());
+        m.insert(1usize, "4*5".to_string());
+        shell.assign(
+            AssignDest::Whole("a".into()),
+            AssignKind::Set,
+            AssignSource::Indexed(m),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("a", 0).as_deref(), Some("5"));
+        assert_eq!(shell.lookup_array_element("a", 1).as_deref(), Some("20"));
+        assert!(shell.is_integer("a")); // flag survives the replace
+
+        // indexed element coerces
+        shell.assign(
+            AssignDest::Element { name: "a".into(), sub: Subscript::Index(2) },
+            AssignKind::Set,
+            AssignSource::Scalar("6/2".into()),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("a", 2).as_deref(), Some("3"));
+
+        // whole associative literal coerces VALUES (not keys)
+        shell.declare_associative("m").unwrap();
+        shell.mark_integer("m");
+        shell.assign(
+            AssignDest::Whole("m".into()),
+            AssignKind::Set,
+            AssignSource::Associative(vec![("x".into(), "2+3".into())]),
+        ).unwrap();
+        assert_eq!(
+            shell.get_associative("m").unwrap().iter()
+                .find(|(k, _)| k == "x").map(|(_, v)| v.as_str()),
+            Some("5")
+        );
+        assert!(shell.is_integer("m")); // flag survives the assoc replace
+
+        // associative element coerces
+        shell.assign(
+            AssignDest::Element { name: "m".into(), sub: Subscript::Key("k".into()) },
+            AssignKind::Set,
+            AssignSource::Scalar("10-1".into()),
+        ).unwrap();
+        assert_eq!(
+            shell.get_associative("m").unwrap().iter()
+                .find(|(k, _)| k == "k").map(|(_, v)| v.as_str()),
+            Some("9")
+        );
+
+        // non-integer array stays literal
+        let mut m2 = std::collections::BTreeMap::new();
+        m2.insert(0usize, "2+3".to_string());
+        shell.assign(
+            AssignDest::Whole("plain".into()),
+            AssignKind::Set,
+            AssignSource::Indexed(m2),
+        ).unwrap();
+        assert_eq!(shell.lookup_array_element("plain", 0).as_deref(), Some("2+3"));
     }
 
     /// Proves that assign() enforces readonly on every write path (scalar).
