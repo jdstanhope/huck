@@ -380,9 +380,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
         Command::Subshell { .. } => {
-            let interactive = matches!(sink, StdoutSink::Terminal)
-                && !shell.in_subshell
-                && !shell.in_completion;
+            let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
             // Determine stdout fd for the child.  For Terminal (the common
             // case) we pass STDOUT_FILENO directly.  For Capture we create a
             // pipe so the parent can read the child's output back into the
@@ -404,7 +402,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 libc::STDIN_FILENO,
                 stdout_fd,
                 libc::STDERR_FILENO,
-                0,
+                if interactive { 0 } else { NO_PGROUP },
                 &[],
                 None, // no Dup redirect at this call site
                 None,
@@ -4129,8 +4127,7 @@ fn run_subprocess(
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
-    let interactive =
-        matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
+    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
