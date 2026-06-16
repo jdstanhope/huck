@@ -1033,11 +1033,11 @@ fn parse_command_inner(
     skip_newlines(iter);
 
     // Standalone arith block: `((expr))` at command position.
-    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
-        let Some(Token::ArithBlock(text)) = iter.next() else {
+    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
+        let Some(Token::ArithBlock(text, opts)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
-        let body = crate::lexer::arith_string_to_word(&text)
+        let body = crate::lexer::arith_string_to_word(&text, opts)
             .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
         return maybe_wrap_redirects(Command::Arith(body), iter);
     }
@@ -1391,7 +1391,10 @@ type ArithForHeaderTriple = (
 /// Splits an arith-for header into three optional arith expressions.
 /// Empty sections (e.g., the cond in `((;;))`) yield `None`. Returns
 /// `ArithForHeader` if the header doesn't split into exactly 3 sections.
-fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError> {
+fn parse_arith_for_header(
+    text: &str,
+    opts: crate::lexer::LexerOptions,
+) -> Result<ArithForHeaderTriple, ParseError> {
     let sections = split_top_level_semi(text);
     if sections.len() != 3 {
         return Err(ParseError::ArithForHeader(format!(
@@ -1404,7 +1407,7 @@ fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError
         if trimmed.is_empty() {
             Ok(None)
         } else {
-            crate::lexer::arith_string_to_word(trimmed)
+            crate::lexer::arith_string_to_word(trimmed, opts)
                 .map(Some)
                 .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))
         }
@@ -1424,11 +1427,11 @@ fn parse_arith_for_header(text: &str) -> Result<ArithForHeaderTriple, ParseError
 fn parse_arith_for_clause(
     iter: &mut TokenCursor,
 ) -> Result<ArithForClause, ParseError> {
-    let header_text = match iter.next() {
-        Some(Token::ArithBlock(text)) => text,
+    let (header_text, arith_opts) = match iter.next() {
+        Some(Token::ArithBlock(text, opts)) => (text, opts),
         _ => unreachable!("caller verified peek"),
     };
-    let (init, cond, step) = parse_arith_for_header(&header_text)?;
+    let (init, cond, step) = parse_arith_for_header(&header_text, arith_opts)?;
 
     // Skip `;` and newline separators between the header and `do`.
     while matches!(
@@ -1459,7 +1462,7 @@ fn parse_for_command(
         iter.next();
     }
 
-    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
+    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
         return Ok(Command::ArithFor(Box::new(parse_arith_for_clause(iter)?)));
     }
 
@@ -1607,7 +1610,7 @@ fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
 fn is_compound_opener(tok: Option<&Token>) -> bool {
     match tok {
         Some(Token::Op(Operator::LParen)) => true,
-        Some(Token::ArithBlock(_)) => true,
+        Some(Token::ArithBlock(..)) => true,
         Some(t) => matches!(
             keyword_of(t),
             Some(Keyword::LBrace)
@@ -2042,7 +2045,7 @@ fn parse_trailing_redirects(
                     Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                     Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(Token::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::ArithBlock(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(Token::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
                 };
                 redirs.extend(build_redirections(op, target, fd_prefix));
             }
@@ -2167,7 +2170,7 @@ fn parse_simple_stage(
                 // before parse_simple_stage is called.
                 return Err(ParseError::UnexpectedToken);
             }
-            Token::ArithBlock(_) => {
+            Token::ArithBlock(..) => {
                 // `((...))` mid-argument (e.g. `cmd ((1+2))`) is a syntax
                 // error. The standalone arith block at command-start is
                 // dispatched by parse_command before parse_simple_stage runs.
@@ -2242,11 +2245,11 @@ fn parse_next_stage(
 ) -> Result<(Command, bool), ParseError> {
     // Standalone arith block: `((expr))` at pipeline-stage position
     // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
-    if matches!(iter.peek(), Some(Token::ArithBlock(_))) {
-        let Some(Token::ArithBlock(text)) = iter.next() else {
+    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
+        let Some(Token::ArithBlock(text, opts)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
-        let body = crate::lexer::arith_string_to_word(&text)
+        let body = crate::lexer::arith_string_to_word(&text, opts)
             .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
         return Ok((Command::Arith(body), false));
     }

@@ -283,7 +283,7 @@ pub enum Token {
     /// Raw text inside a `(( ... ))` block (the outer `((` and `))`
     /// already consumed). Parsed by `crate::arith::parse` downstream.
     /// Captured verbatim including embedded `;` separators.
-    ArithBlock(String),
+    ArithBlock(String, LexerOptions),
     /// An explicit fd-prefix glued to a following redirect operator:
     /// `3>` → `RedirFd(Number(3))` then `RedirOut`; `{fd}>` →
     /// `RedirFd(Var("fd"))` then `RedirOut`. Emitted by the lexer only
@@ -302,7 +302,7 @@ struct PendingHeredoc {
 }
 
 /// Lexer feature toggles resolved from shell state at tokenize time.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LexerOptions {
     pub extglob: bool,
 }
@@ -710,7 +710,7 @@ fn tokenize_partial_inner(
                 if chars.peek() == Some(&'(') {
                     chars.next(); // consume the second `(`
                     let body = scan_arith_block(&mut chars)?;
-                    tokens.push(Token::ArithBlock(body));
+                    tokens.push(Token::ArithBlock(body, opts));
                 } else {
                     tokens.push(Token::Op(Operator::LParen));
                 }
@@ -1649,7 +1649,7 @@ fn flush_body_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: b
 /// `$`-forms become ParamExpansion/Var/CommandSub/Arith parts; backticks
 /// become CommandSub; everything else is literal text. Used by `$(( ))`
 /// (lexer) and, via `command.rs`, by `(( ))` and arith-`for` headers.
-pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
+pub(crate) fn arith_string_to_word(s: &str, opts: LexerOptions) -> Result<Word, LexError> {
     let mut chars = CharCursor::new(s);
     let mut parts: Vec<WordPart> = Vec::new();
     let mut lit = String::new();
@@ -1665,12 +1665,12 @@ pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
             '$' => {
                 flush_lit!();
                 chars.next();
-                read_dollar_expansion(&mut chars, &mut parts, true, LexerOptions::default())?;
+                read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
             }
             '`' => {
                 flush_lit!();
                 chars.next();
-                let sequence = scan_backtick_substitution(&mut chars, LexerOptions::default())?;
+                let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: true });
             }
             // bash performs quote removal within arithmetic: the quote
@@ -1707,12 +1707,12 @@ pub(crate) fn arith_string_to_word(s: &str) -> Result<Word, LexError> {
                         '$' => {
                             flush_lit!();
                             chars.next();
-                            read_dollar_expansion(&mut chars, &mut parts, true, LexerOptions::default())?;
+                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         '`' => {
                             flush_lit!();
                             chars.next();
-                            let sequence = scan_backtick_substitution(&mut chars, LexerOptions::default())?;
+                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         _ => { lit.push(ch); chars.next(); }
@@ -1738,7 +1738,7 @@ fn read_dollar_expansion(
             if chars.peek() == Some(&'(') {
                 chars.next(); // consume second '(' — this is `$((`
                 let inner = scan_arith_body(chars)?;
-                let body = arith_string_to_word(&inner)?;
+                let body = arith_string_to_word(&inner, opts)?;
                 parts.push(WordPart::Arith { body, quoted });
             } else {
                 let sequence = scan_paren_substitution(chars, opts)?;
@@ -3643,7 +3643,7 @@ mod tests {
         let toks = tokenize("[[ x =~ (a) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "x", "=~", "(a)", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen) | Token::ArithBlock(_))));
+        assert!(!toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen) | Token::ArithBlock(..))));
     }
 
     #[test]
@@ -3651,7 +3651,7 @@ mod tests {
         let toks = tokenize("[[ ab =~ ((a)) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "ab", "=~", "((a))", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
     }
 
     #[test]
@@ -3660,7 +3660,7 @@ mod tests {
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert!(texts.iter().any(|t| t.starts_with("(\\[")));
         assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
     }
 
     #[test]
@@ -3679,7 +3679,7 @@ mod tests {
         // the regex operand is the single word `(a|b)c`, then `]]`.
         assert!(texts.contains(&"(a|b)c".to_string()), "texts: {texts:?}");
         assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(_) | Token::Op(Operator::LParen))));
+        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..) | Token::Op(Operator::LParen))));
     }
 
     #[test]
@@ -3703,7 +3703,7 @@ mod tests {
     #[test]
     fn arith_block_outside_dbracket_unchanged() {
         let toks = tokenize("(( 1 + 1 ))").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::ArithBlock(_))));
+        assert!(toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
     }
 
     #[test]
@@ -5107,6 +5107,15 @@ mod tests {
         };
         assert!(!(*quoted));
         assert_eq!(arith_body_lit(&parts[0]), "1+2");
+    }
+
+    #[test]
+    fn arith_string_to_word_inherits_extglob() {
+        // A command substitution inside arithmetic whose body uses an extglob
+        // pattern lexes only when extglob is enabled (L-24).
+        let body = "$( [[ foo == @(foo|bar) ]] && echo 1 )";
+        assert!(arith_string_to_word(body, LexerOptions { extglob: true }).is_ok());
+        assert!(arith_string_to_word(body, LexerOptions { extglob: false }).is_err());
     }
 
     #[test]
@@ -7004,7 +7013,7 @@ mod tests {
         let tokens = tokenize("((1+2))").unwrap();
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::ArithBlock(s) => assert_eq!(s, "1+2"),
+            Token::ArithBlock(s, _) => assert_eq!(s, "1+2"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -7014,7 +7023,7 @@ mod tests {
         let tokens = tokenize("((a;b;c))").unwrap();
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::ArithBlock(s) => assert_eq!(s, "a;b;c"),
+            Token::ArithBlock(s, _) => assert_eq!(s, "a;b;c"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -7027,7 +7036,7 @@ mod tests {
         let tokens = tokenize("((((a+b)*c)))").unwrap();
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::ArithBlock(s) => assert_eq!(s, "((a+b)*c)"),
+            Token::ArithBlock(s, _) => assert_eq!(s, "((a+b)*c)"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -7037,7 +7046,7 @@ mod tests {
         let tokens = tokenize("((  1 + 2  ))").unwrap();
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::ArithBlock(s) => assert_eq!(s, "  1 + 2  "),
+            Token::ArithBlock(s, _) => assert_eq!(s, "  1 + 2  "),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -7047,7 +7056,7 @@ mod tests {
         let tokens = tokenize("(())").unwrap();
         assert_eq!(tokens.len(), 1);
         match &tokens[0] {
-            Token::ArithBlock(s) => assert_eq!(s, ""),
+            Token::ArithBlock(s, _) => assert_eq!(s, ""),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -7078,7 +7087,7 @@ mod tests {
             .count();
         let arith_count = tokens
             .iter()
-            .filter(|t| matches!(t, Token::ArithBlock(_)))
+            .filter(|t| matches!(t, Token::ArithBlock(..)))
             .count();
         assert_eq!(lparen_count, 2, "expected two LParen tokens: {tokens:?}");
         assert_eq!(arith_count, 0, "did not expect ArithBlock: {tokens:?}");
