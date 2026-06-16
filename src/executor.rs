@@ -13,6 +13,11 @@ use crate::command::{
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
 use crate::shell_state::Shell;
 
+/// `pgid_target` sentinel for the fork primitives meaning "do not `setpgid` —
+/// inherit the shell's process group" (job control off). `0` = become a new
+/// group leader; `N > 0` = join group `N`.
+const NO_PGROUP: i32 = -1;
+
 /// Where the terminal stage of a top-level pipeline sends its stdout when
 /// there's no explicit `> file` redirect.
 pub enum StdoutSink<'a> {
@@ -375,9 +380,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         Command::Case(clause) => run_case(clause, shell, sink),
         Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
         Command::Subshell { .. } => {
-            let interactive = matches!(sink, StdoutSink::Terminal)
-                && !shell.in_subshell
-                && !shell.in_completion;
+            let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
             // Determine stdout fd for the child.  For Terminal (the common
             // case) we pass STDOUT_FILENO directly.  For Capture we create a
             // pipe so the parent can read the child's output back into the
@@ -399,7 +402,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 libc::STDIN_FILENO,
                 stdout_fd,
                 libc::STDERR_FILENO,
-                0,
+                if interactive { 0 } else { NO_PGROUP },
                 &[],
                 None, // no Dup redirect at this call site
                 None,
@@ -4124,8 +4127,7 @@ fn run_subprocess(
     shell: &mut Shell,
     sink: &mut StdoutSink,
 ) -> ExecOutcome {
-    let interactive =
-        matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
+    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
 
     let mut process = ProcessCommand::new(&cmd.program);
     process.args(&cmd.args);
@@ -4462,7 +4464,7 @@ fn run_multi_stage(
     // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
     // controlling terminal (M-104). A subshell's inner pipeline uses the
     // non-job-control path (stages stay in the subshell's pgrp), matching bash.
-    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
+    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
     let n = commands.len();
 
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
@@ -4512,7 +4514,7 @@ fn run_multi_stage(
             }
             // Run the assignments via fork so they're isolated.
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
             let stdin_fd = libc::STDIN_FILENO;
             let stdout_fd = if !is_last {
                 // Create a pipe; next stage reads from it (will be empty).
@@ -4881,7 +4883,7 @@ fn run_multi_stage(
         let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
 
         // parent_fds_to_close: all fds the parent currently holds that the
         // child must close (so it doesn't hold downstream pipe write-ends open,
@@ -5748,8 +5750,11 @@ pub fn fork_and_run_in_subshell(
             // signal to default inside a subshell, so a forked stage must not
             // inherit a top-level PIPE handler.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            // 2. Join the pgrp (or become pgrp leader if pgid_target == 0).
-            libc::setpgid(0, pgid_target);
+            // 2. Join the pgrp (leader if pgid_target == 0); NO_PGROUP (< 0)
+            //    means "stay in the shell's group" (job control off).
+            if pgid_target >= 0 {
+                libc::setpgid(0, pgid_target);
+            }
             // 3. dup2 the stdio fds to 0/1/2.
             if stdin_fd != 0 {
                 libc::dup2(stdin_fd, 0);
@@ -5826,8 +5831,11 @@ pub fn fork_and_run_in_subshell(
         unsafe { libc::_exit(status) };
     }
     // PARENT: defensive setpgid to close the race with the child's setpgid.
-    unsafe {
-        libc::setpgid(pid, pgid_target);
+    // Skipped when pgid_target == NO_PGROUP (job control off — stay in shell group).
+    if pgid_target >= 0 {
+        unsafe {
+            libc::setpgid(pid, pgid_target);
+        }
     }
     Ok(pid)
 }
@@ -5972,8 +5980,12 @@ fn spawn_external_with_fds(
         }
     }
 
-    // Join the pgrp (or become pgrp leader if pgid_target == 0).
-    process.process_group(pgid_target);
+    // Join the pgrp (leader if pgid_target == 0); NO_PGROUP (< 0) means "stay in
+    // the shell's group" (job control off) — skip the pre-exec setpgid entirely
+    // (process_group(-1) would setpgid(0, -1) → EINVAL).
+    if pgid_target >= 0 {
+        process.process_group(pgid_target);
+    }
 
     // Convert raw fds to Stdio. For fds that are already at their "natural"
     // slot (stdin=0, stdout=1, stderr=2), use Stdio::inherit() so we don't
@@ -6043,8 +6055,11 @@ fn spawn_external_with_fds(
 
     // Defensive setpgid in parent to close the race with the child's setpgid
     // (set via process_group above, which runs pre-exec in the child).
-    unsafe {
-        let _ = libc::setpgid(pid, pgid_target);
+    // Skipped when pgid_target == NO_PGROUP (job control off — stay in shell group).
+    if pgid_target >= 0 {
+        unsafe {
+            let _ = libc::setpgid(pid, pgid_target);
+        }
     }
 
     // mem::forget the Child handle — the caller waitpids manually (B-09 pattern).
