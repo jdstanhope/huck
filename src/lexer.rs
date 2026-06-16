@@ -2025,41 +2025,50 @@ fn scan_arith_body(
 /// yields `Err(LexError::UnterminatedBrace)` (the same error `scan_braced_operand`
 /// raises for an unterminated operand). Mirrors `scan_paren_substitution`'s loop
 /// but appends text instead of parsing it.
-fn consume_paren_cmdsub_verbatim(
+/// Scans a `$(…)` command-substitution body, the opening `$(` having already
+/// been consumed by the caller. Consumes through the matching `)` (which is
+/// consumed but NOT appended); any unquoted `(` raises the paren depth and any
+/// unquoted `)` lowers it, so nested `$(…)`, `$((…))`, and `$( (…) )` balance;
+/// `'…'`/`"…"` spans are skipped (double-quote honors `\`) and `\` escapes the
+/// next char — none affect depth. The body (excluding the closing `)`) is
+/// appended to `out`. Running out of input unterminated returns `Err(unterminated)`.
+/// The single source of truth for `$()` scanning (see `scan_paren_substitution`,
+/// `consume_paren_cmdsub_verbatim`, `split_modifier_operand`).
+fn scan_cmdsub_body(
     chars: &mut CharCursor<'_>,
     out: &mut String,
+    unterminated: LexError,
 ) -> Result<(), LexError> {
-    let mut depth: u32 = 1;
+    let mut depth: usize = 0;
     loop {
         match chars.next() {
-            None => return Err(LexError::UnterminatedBrace),
+            None => return Err(unterminated),
+            Some(')') if depth == 0 => return Ok(()),
+            Some(')') => {
+                depth -= 1;
+                out.push(')');
+            }
             Some('(') => {
                 depth += 1;
                 out.push('(');
             }
-            Some(')') => {
-                depth -= 1;
-                out.push(')');
-                if depth == 0 {
-                    return Ok(());
-                }
-            }
             Some('\\') => {
                 out.push('\\');
-                if let Some(c) = chars.next() {
-                    out.push(c);
+                match chars.next() {
+                    Some(c) => out.push(c),
+                    None => return Err(unterminated),
                 }
             }
             Some('\'') => {
                 out.push('\'');
                 loop {
                     match chars.next() {
-                        None => return Err(LexError::UnterminatedBrace),
                         Some('\'') => {
                             out.push('\'');
                             break;
                         }
                         Some(c) => out.push(c),
+                        None => return Err(unterminated),
                     }
                 }
             }
@@ -2067,24 +2076,36 @@ fn consume_paren_cmdsub_verbatim(
                 out.push('"');
                 loop {
                     match chars.next() {
-                        None => return Err(LexError::UnterminatedBrace),
                         Some('"') => {
                             out.push('"');
                             break;
                         }
                         Some('\\') => {
                             out.push('\\');
-                            if let Some(c) = chars.next() {
-                                out.push(c);
+                            match chars.next() {
+                                Some(c) => out.push(c),
+                                None => return Err(unterminated),
                             }
                         }
                         Some(c) => out.push(c),
+                        None => return Err(unterminated),
                     }
                 }
             }
             Some(c) => out.push(c),
         }
     }
+}
+
+fn consume_paren_cmdsub_verbatim(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+) -> Result<(), LexError> {
+    // The kernel consumes (but does not append) the closing `)`; re-add it so
+    // the command substitution is reconstructed verbatim in `out`.
+    scan_cmdsub_body(chars, out, LexError::UnterminatedBrace)?;
+    out.push(')');
+    Ok(())
 }
 
 fn scan_braced_operand(
@@ -2286,79 +2307,8 @@ fn scan_paren_substitution(
     opts: LexerOptions,
 ) -> Result<crate::command::Sequence, LexError> {
     let mut body = String::new();
-    let mut depth: usize = 0;
-    while let Some(c) = chars.next() {
-        match c {
-            ')' if depth == 0 => {
-                return parse_substitution_body(&body, opts);
-            }
-            ')' => {
-                depth -= 1;
-                body.push(c);
-            }
-            '(' => {
-                // A subshell `(cmd)` or the inner `(` of `$((…))` raises depth
-                // so its matching `)` doesn't close the command substitution
-                // early. (huck has had subshell syntax since v28.)
-                depth += 1;
-                body.push(c);
-            }
-            '\\' => {
-                body.push(c);
-                if let Some(next) = chars.next() {
-                    body.push(next);
-                } else {
-                    return Err(LexError::UnterminatedSubstitution);
-                }
-            }
-            '\'' => {
-                body.push(c);
-                loop {
-                    match chars.next() {
-                        Some('\'') => {
-                            body.push('\'');
-                            break;
-                        }
-                        Some(ch) => body.push(ch),
-                        None => return Err(LexError::UnterminatedSubstitution),
-                    }
-                }
-            }
-            '"' => {
-                body.push(c);
-                loop {
-                    match chars.next() {
-                        Some('"') => {
-                            body.push('"');
-                            break;
-                        }
-                        Some('\\') => {
-                            body.push('\\');
-                            if let Some(next) = chars.next() {
-                                body.push(next);
-                            } else {
-                                return Err(LexError::UnterminatedSubstitution);
-                            }
-                        }
-                        Some(ch) => body.push(ch),
-                        None => return Err(LexError::UnterminatedSubstitution),
-                    }
-                }
-            }
-            '$' => {
-                body.push(c);
-                if let Some(&next) = chars.peek()
-                    && next == '('
-                {
-                    chars.next();
-                    body.push('(');
-                    depth += 1;
-                }
-            }
-            _ => body.push(c),
-        }
-    }
-    Err(LexError::UnterminatedSubstitution)
+    scan_cmdsub_body(chars, &mut body, LexError::UnterminatedSubstitution)?;
+    parse_substitution_body(&body, opts)
 }
 
 /// Tokenizes and parses a substitution body, wrapping any errors with the
@@ -3204,30 +3154,22 @@ fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
     let mut first = String::new();
     let mut second = String::new();
     let mut delim_seen = false;
-    let mut paren_depth: u32 = 0; // > 0 while inside a $( … ) command substitution
-    let mut brace_depth: u32 = 0; // { } nesting, tracked only at paren_depth 0
+    let mut brace_depth: u32 = 0; // { } nesting
     let mut chars = CharCursor::new(body);
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
                 let dst = if delim_seen { &mut second } else { &mut first };
-                if paren_depth == 0 {
-                    match chars.peek().copied() {
-                        Some(d) if d == delim => {
-                            chars.next();
-                            dst.push(delim);
-                        }
-                        Some('\\') => {
-                            chars.next();
-                            dst.push('\\');
-                        }
-                        _ => dst.push('\\'),
+                match chars.peek().copied() {
+                    Some(d) if d == delim => {
+                        chars.next();
+                        dst.push(delim);
                     }
-                } else {
-                    dst.push('\\');
-                    if let Some(nc) = chars.next() {
-                        dst.push(nc);
+                    Some('\\') => {
+                        chars.next();
+                        dst.push('\\');
                     }
+                    _ => dst.push('\\'),
                 }
             }
             '\'' => {
@@ -3274,26 +3216,23 @@ fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
                 if chars.peek() == Some(&'(') {
                     chars.next();
                     dst.push('(');
-                    paren_depth += 1;
+                    // Skip the whole command substitution verbatim so a delimiter
+                    // inside it is ignored (L-10). The `Result` is unreachable: the
+                    // operand body was already $()-balanced by scan_braced_operand;
+                    // on the impossible error the partial is appended and the cursor
+                    // is exhausted, so the outer loop ends with identical segments.
+                    let _ = consume_paren_cmdsub_verbatim(&mut chars, dst);
                 }
             }
-            '(' if paren_depth > 0 => {
-                paren_depth += 1;
-                if delim_seen { second.push('('); } else { first.push('('); }
-            }
-            ')' if paren_depth > 0 => {
-                paren_depth -= 1;
-                if delim_seen { second.push(')'); } else { first.push(')'); }
-            }
-            '{' if paren_depth == 0 => {
+            '{' => {
                 brace_depth += 1;
                 if delim_seen { second.push('{'); } else { first.push('{'); }
             }
-            '}' if paren_depth == 0 => {
+            '}' => {
                 brace_depth = brace_depth.saturating_sub(1);
                 if delim_seen { second.push('}'); } else { first.push('}'); }
             }
-            c if c == delim && paren_depth == 0 && brace_depth == 0 && !delim_seen => {
+            c if c == delim && brace_depth == 0 && !delim_seen => {
                 delim_seen = true;
             }
             _ => {
@@ -5278,6 +5217,53 @@ mod tests {
         // A `)` inside a quoted span within $(…) must not end the substitution.
         let mut chars = CharCursor::new("$(echo \")\")}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo \")\")");
+    }
+
+    #[test]
+    fn scan_cmdsub_body_basic_consumes_through_close_paren() {
+        let mut chars = CharCursor::new("echo hi)rest");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
+        assert_eq!(out, "echo hi"); // closing ) consumed, not appended
+        assert_eq!(chars.next(), Some('r')); // cursor left just past the )
+    }
+
+    #[test]
+    fn scan_cmdsub_body_balances_nested_and_arith() {
+        let mut chars = CharCursor::new("echo $(echo x))");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "echo $(echo x)");
+
+        // $((1+2)) — caller consumed the outer `$(`, body starts at the inner `(`
+        let mut chars = CharCursor::new("(1+2))");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "(1+2)");
+    }
+
+    #[test]
+    fn scan_cmdsub_body_skips_quoted_paren() {
+        let mut chars = CharCursor::new("echo \")\")");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "echo \")\"");
+    }
+
+    #[test]
+    fn scan_cmdsub_body_unterminated_uses_passed_error() {
+        let mut chars = CharCursor::new("echo hi");
+        let mut out = String::new();
+        assert_eq!(
+            scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap_err(),
+            LexError::UnterminatedSubstitution
+        );
+        let mut chars = CharCursor::new("echo hi");
+        let mut out = String::new();
+        assert_eq!(
+            scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
+            LexError::UnterminatedBrace
+        );
     }
 
     #[test]
