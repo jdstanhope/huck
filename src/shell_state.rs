@@ -780,6 +780,16 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.scalar_view())
     }
 
+    /// True when this shell should use job control (own process groups +
+    /// terminal handoff) for the commands it forks: an interactive shell not
+    /// inside a subshell environment or a completion function. The single source
+    /// of truth — replaces the inline `matches!(sink, Terminal) && !in_subshell
+    /// && !in_completion` copies that had drifted (they omitted `is_interactive`).
+    /// Foreground callers additionally require a `StdoutSink::Terminal` sink.
+    pub fn job_control_active(&self) -> bool {
+        self.is_interactive && !self.in_subshell && !self.in_completion
+    }
+
     /// Returns the value of `$-` — alphabetical concatenation of
     /// short-flag letters reflecting current shell-options state
     /// and the interactive flag. Order: `e` (errexit), `f` (noglob),

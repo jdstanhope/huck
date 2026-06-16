@@ -13,6 +13,11 @@ use crate::command::{
 use crate::expand::{expand, expand_assignment, expand_pattern, glob_expand_fields_opts};
 use crate::shell_state::Shell;
 
+/// `pgid_target` sentinel for the fork primitives meaning "do not `setpgid` —
+/// inherit the shell's process group" (job control off). `0` = become a new
+/// group leader; `N > 0` = join group `N`.
+const NO_PGROUP: i32 = -1;
+
 /// Where the terminal stage of a top-level pipeline sends its stdout when
 /// there's no explicit `> file` redirect.
 pub enum StdoutSink<'a> {
@@ -5748,8 +5753,11 @@ pub fn fork_and_run_in_subshell(
             // signal to default inside a subshell, so a forked stage must not
             // inherit a top-level PIPE handler.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            // 2. Join the pgrp (or become pgrp leader if pgid_target == 0).
-            libc::setpgid(0, pgid_target);
+            // 2. Join the pgrp (leader if pgid_target == 0); NO_PGROUP (< 0)
+            //    means "stay in the shell's group" (job control off).
+            if pgid_target >= 0 {
+                libc::setpgid(0, pgid_target);
+            }
             // 3. dup2 the stdio fds to 0/1/2.
             if stdin_fd != 0 {
                 libc::dup2(stdin_fd, 0);
@@ -5826,8 +5834,11 @@ pub fn fork_and_run_in_subshell(
         unsafe { libc::_exit(status) };
     }
     // PARENT: defensive setpgid to close the race with the child's setpgid.
-    unsafe {
-        libc::setpgid(pid, pgid_target);
+    // Skipped when pgid_target == NO_PGROUP (job control off — stay in shell group).
+    if pgid_target >= 0 {
+        unsafe {
+            libc::setpgid(pid, pgid_target);
+        }
     }
     Ok(pid)
 }
@@ -6043,8 +6054,11 @@ fn spawn_external_with_fds(
 
     // Defensive setpgid in parent to close the race with the child's setpgid
     // (set via process_group above, which runs pre-exec in the child).
-    unsafe {
-        let _ = libc::setpgid(pid, pgid_target);
+    // Skipped when pgid_target == NO_PGROUP (job control off — stay in shell group).
+    if pgid_target >= 0 {
+        unsafe {
+            let _ = libc::setpgid(pid, pgid_target);
+        }
     }
 
     // mem::forget the Child handle — the caller waitpids manually (B-09 pattern).
