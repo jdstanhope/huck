@@ -3090,11 +3090,6 @@ fn scan_substitution_operand(
     Ok((pattern, replacement))
 }
 
-/// Splits a substitution-operand body (as returned by `scan_braced_operand`)
-/// on the first unescaped `/` that sits at brace-depth zero outside any
-/// quoted span. Returns `(pattern_src, replacement_src)`. If no delimiter
-/// is found, the whole body is the pattern and the replacement is empty
-/// (the bash `${var/pat}` form).
 /// Splits a `${…}` modifier operand body on the FIRST top-level `delim`,
 /// returning `(before, Some(after))` if a top-level delimiter was found, or
 /// `(before, None)` otherwise. "Top level" excludes single quotes, double
