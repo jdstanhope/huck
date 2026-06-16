@@ -1896,6 +1896,11 @@ impl Shell {
             false,
         );
         self.install_var("BASH_VERSION", "5.2.0(1)-release".to_string(), false);
+        // readline's default word-break set. bash initializes this (interactive
+        // AND -c); programmable-completion scripts APPEND to it (e.g. git does
+        // `COMP_WORDBREAKS="$COMP_WORDBREAKS:"`), so it must start non-empty and
+        // whitespace-inclusive or COMP_WORDS tokenization breaks after they load.
+        self.install_var("COMP_WORDBREAKS", " \t\n\"'@><=;|&(:".to_string(), false);
         self.install_indexed(
             "BASH_VERSINFO",
             vec![

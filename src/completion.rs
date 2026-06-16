@@ -1302,6 +1302,40 @@ mod tests {
     }
 
     #[test]
+    fn comp_wordbreaks_initialized_to_bash_default() {
+        // Root cause of the "git <tab> breaks all completion" bug: huck left
+        // COMP_WORDBREAKS unset, so a completion script's
+        // `COMP_WORDBREAKS="$COMP_WORDBREAKS:"` (git does this) turned it into
+        // just ":" — dropping whitespace, so COMP_WORDS tokenization no longer
+        // split on spaces and every subsequent spec completion returned nothing.
+        let shell = Shell::new();
+        assert_eq!(shell.get("COMP_WORDBREAKS"), Some(" \t\n\"'@><=;|&(:"));
+    }
+
+    #[test]
+    fn spec_completion_survives_colon_appended_wordbreaks() {
+        // Simulates git's `COMP_WORDBREAKS="$COMP_WORDBREAKS:"`: with the
+        // whitespace-inclusive default, appending ':' must keep `cd ~/`
+        // tokenizing on the space (cur word "~/"), so the spec still completes.
+        let _g = CWD_LOCK.lock().unwrap();
+        let mut shell = Shell::new();
+        shell.export_set("HOME", std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+        // Append ':' the way a completion script does.
+        let wb = format!("{}:", shell.get("COMP_WORDBREAKS").unwrap());
+        shell.export_set("COMP_WORDBREAKS", wb);
+        // A `-o default` spec for cd (so it routes through run_spec_with_empty_fallback).
+        Rc::make_mut(&mut shell.completion_specs).by_command.insert(
+            "cd".to_string(),
+            crate::completion_spec::CompletionSpec {
+                options: crate::completion_spec::CompOptions { default: true, ..Default::default() },
+                ..Default::default()
+            },
+        );
+        let (_, cands) = dispatch::resolve("cd ~/", 5, &mut shell);
+        assert!(!cands.is_empty(), "cd ~/ completion broke with ':'-appended COMP_WORDBREAKS");
+    }
+
+    #[test]
     fn dispatch_command_position_completes_a_user_alias() {
         // Regression: command-position TAB must include user-defined command
         // names (functions + aliases), not just builtins + PATH. (Functions go
