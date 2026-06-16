@@ -204,12 +204,12 @@ pub fn expand_modifier_with_value(
         }
         ParamModifier::Substring { offset, length } => {
             let value = lookup_v(shell);
-            let off_n = match eval_arith_word(offset, shell) {
+            let off_n = match eval_substring_index(offset, shell) {
                 Ok(n) => n,
                 Err(()) => return ExpansionResult::Empty,
             };
             let len_n = match length {
-                Some(w) => match eval_arith_word(w, shell) {
+                Some(w) => match eval_substring_index(w, shell) {
                     Ok(n) => Some(n),
                     Err(()) => return ExpansionResult::Empty,
                 },
@@ -342,7 +342,7 @@ pub(crate) fn ansi_c_quote(v: &str) -> String {
 /// Expands `word` to a string (no field-splitting), parses it as
 /// arithmetic, evaluates it. On any error, prints `huck: arithmetic: <msg>`
 /// and sets `$? = 1`, returning `Err(())`.
-fn eval_arith_word(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
+fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     let s = crate::expand::expand_assignment(word, shell);
     let expr = match crate::arith::parse(&s) {
         Ok(e) => e,
