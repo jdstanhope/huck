@@ -1639,6 +1639,9 @@ impl Shell {
     /// `arith::parse` + `arith::eval` and stored as the decimal string.
     /// Parse/eval failures silently coerce to `"0"` (matches bash for
     /// non-`declare` integer write paths).
+    // `Err(())` is an intentional single-failure-mode sentinel (readonly
+    // refused; the caller prints its own diagnostic) — not a discarded error.
+    #[allow(clippy::result_unit_err)]
     pub fn try_set(&mut self, name: &str, value: String) -> Result<(), ()> {
         self.assign(AssignDest::Whole(name.to_string()), AssignKind::Set, AssignSource::Scalar(value))
             .map_err(|_| ())
@@ -1647,7 +1650,8 @@ impl Shell {
     /// Checked unset: refuses to remove a readonly variable. Returns
     /// `Err(())` if `name` is readonly; otherwise removes and returns
     /// `Ok(())`. Reserved for future read-only-aware unset call sites.
-    #[allow(dead_code)]
+    // `Err(())` is an intentional single-failure-mode sentinel (see `try_set`).
+    #[allow(dead_code, clippy::result_unit_err)]
     pub fn try_unset(&mut self, name: &str) -> Result<(), ()> {
         if self.is_readonly(name) {
             return Err(());
