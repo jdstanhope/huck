@@ -4467,7 +4467,7 @@ fn run_multi_stage(
     // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
     // controlling terminal (M-104). A subshell's inner pipeline uses the
     // non-job-control path (stages stay in the subshell's pgrp), matching bash.
-    let interactive = matches!(sink, StdoutSink::Terminal) && !shell.in_subshell && !shell.in_completion;
+    let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
     let n = commands.len();
 
     // Fd for the capture-sink case: last stage's stdout is piped back to parent.
@@ -4517,7 +4517,7 @@ fn run_multi_stage(
             }
             // Run the assignments via fork so they're isolated.
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+            let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
             let stdin_fd = libc::STDIN_FILENO;
             let stdout_fd = if !is_last {
                 // Create a pipe; next stage reads from it (will be empty).
@@ -4886,7 +4886,7 @@ fn run_multi_stage(
         let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { 0 };
+        let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
 
         // parent_fds_to_close: all fds the parent currently holds that the
         // child must close (so it doesn't hold downstream pipe write-ends open,
@@ -5983,8 +5983,12 @@ fn spawn_external_with_fds(
         }
     }
 
-    // Join the pgrp (or become pgrp leader if pgid_target == 0).
-    process.process_group(pgid_target);
+    // Join the pgrp (leader if pgid_target == 0); NO_PGROUP (< 0) means "stay in
+    // the shell's group" (job control off) — skip the pre-exec setpgid entirely
+    // (process_group(-1) would setpgid(0, -1) → EINVAL).
+    if pgid_target >= 0 {
+        process.process_group(pgid_target);
+    }
 
     // Convert raw fds to Stdio. For fds that are already at their "natural"
     // slot (stdin=0, stdout=1, stderr=2), use Stdio::inherit() so we don't
