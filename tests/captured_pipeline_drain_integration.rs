@@ -10,6 +10,32 @@ use std::time::Duration;
 
 fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
 
+/// SIGKILL the entire descendant tree rooted at `root` (BFS via `pgrep -P`),
+/// then `root` itself. A hung huck spawns its pipeline stages in their OWN
+/// process group (pgid = first-stage pid, distinct from huck's pid/group), so
+/// killing huck alone orphans those stages — they linger blocked on pipes
+/// (reparented to PID 1). Killing the whole tree prevents the leak.
+fn kill_process_tree(root: u32) {
+    let mut pids = vec![root];
+    let mut i = 0;
+    while i < pids.len() {
+        let pid = pids[i];
+        i += 1;
+        if let Ok(o) = Command::new("pgrep").arg("-P").arg(pid.to_string()).output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Ok(child) = line.trim().parse::<u32>() {
+                    pids.push(child);
+                }
+            }
+        }
+    }
+    for pid in pids {
+        // SAFETY: `kill(pid, SIGKILL)` is an always-safe syscall; an already-dead
+        // or reparented pid just yields ESRCH, which we ignore.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+    }
+}
+
 /// Runs `script` through huck with a `secs` watchdog. Returns
 /// `Some((stdout, stderr, code))` on normal completion, `None` if it hung.
 fn run_guarded(script: &str, secs: u64) -> Option<(String, String, i32)> {
@@ -21,7 +47,7 @@ fn run_guarded(script: &str, secs: u64) -> Option<(String, String, i32)> {
     let (tx, rx) = mpsc::channel::<()>();
     let wd = thread::spawn(move || -> bool {
         if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            kill_process_tree(pid);
             true
         } else {
             false
