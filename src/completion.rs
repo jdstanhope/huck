@@ -412,7 +412,7 @@ pub(crate) mod dispatch {
     //! a registered -F spec, default-spec fallback, or file completion.
 
     use super::*;
-    use crate::completion_spec::{resolve_spec, CompletionCtx, CompletionSpec};
+    use crate::completion_spec::{run_spec, CompletionCtx, CompletionSpec};
     use crate::shell_state::Shell;
 
     /// Entry point. Returns (start_offset, candidates) for rustyline.
@@ -479,7 +479,7 @@ pub(crate) mod dispatch {
         }
     }
 
-    /// Runs `resolve_spec` on the spec, applies `-o filenames` rendering
+    /// Runs `run_spec` on the spec, applies `-o filenames` rendering
     /// and the empty-fallback (`-o default` / `-o bashdefault`).
     fn run_spec_with_empty_fallback(
         spec: &CompletionSpec,
@@ -509,7 +509,7 @@ pub(crate) mod dispatch {
             comp_point: pos,
         };
 
-        let raw_results = resolve_spec(spec, &ctx, shell);
+        let raw_results = run_spec(spec, &ctx, shell);
 
         // Take the (possibly mutated) options from current_completion_spec
         // back if Task 6's compopt has touched them. If -F never ran,

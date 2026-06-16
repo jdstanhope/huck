@@ -1,7 +1,7 @@
-//! Completion-spec data and the `resolve_spec()` candidate generator.
+//! Completion-spec data and the `run_spec()` candidate generator.
 //!
 //! A `CompletionSpec` is what the `complete` builtin builds and stores
-//! per command name. `resolve_spec()` is the pure-ish function that
+//! per command name. `run_spec()` is the pure-ish function that
 //! turns a spec plus a completion context into a list of candidate
 //! strings. It is reused by tab-time dispatch (`completion.rs`) AND by
 //! the `compgen` builtin.
@@ -148,7 +148,7 @@ const SHELL_KEYWORDS: &[&str] = &[
     "fi", "for", "function", "if", "in", "select", "then", "until", "while", "{", "}",
 ];
 
-/// Completion context for a single `resolve_spec` call.
+/// Completion context for a single `run_spec` call.
 #[derive(Debug, Clone)]
 pub struct CompletionCtx {
     /// The command name (word 0 of the simple command).
@@ -175,7 +175,7 @@ pub struct CompletionCtx {
 /// Note: this does NOT apply `-o filenames` rendering or `-o default`/
 /// `bashdefault` empty-fallback. Those are the caller's responsibility
 /// (Task 5) because they depend on rustyline / dispatch-ladder state.
-pub fn resolve_spec(
+pub fn run_spec(
     spec: &CompletionSpec,
     ctx: &CompletionCtx,
     shell: &mut Shell,
@@ -213,7 +213,7 @@ pub fn resolve_spec(
 
     // -A action: enumerate predefined sources, filtered by cur_word.
     for action in &spec.actions {
-        let mut from_action = enumerate_action(*action, &ctx.cur_word, shell);
+        let mut from_action = complete_action(*action, &ctx.cur_word, shell);
         out.append(&mut from_action);
     }
 
@@ -245,7 +245,7 @@ pub fn resolve_spec(
     // bash adds these AFTER the compspec's own matches and does NOT apply the
     // -P/-S/-X decorations to them, so this runs last.
     if spec.options.plusdirs {
-        let mut dirs = enumerate_action(Action::Directory, &ctx.cur_word, shell);
+        let mut dirs = complete_action(Action::Directory, &ctx.cur_word, shell);
         out.append(&mut dirs);
     }
 
@@ -406,7 +406,7 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
     }
 }
 
-fn enumerate_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
+fn complete_action(action: Action, prefix: &str, shell: &Shell) -> Vec<String> {
     let home = shell.get("HOME").unwrap_or("").to_string();
     match action {
         Action::File => list_dir_with_path_prefix(prefix, false, &home),
@@ -621,17 +621,17 @@ mod tests {
     #[test]
     fn enumerate_setopt_shopt_table_order_and_membership() {
         let sh = Shell::new();
-        let setopt = enumerate_action(Action::Setopt, "", &sh);
+        let setopt = complete_action(Action::Setopt, "", &sh);
         assert!(setopt.contains(&"errexit".to_string()));
         assert_eq!(setopt[0], "allexport"); // table order, NOT sorted
-        let shopt = enumerate_action(Action::Shopt, "", &sh);
+        let shopt = complete_action(Action::Shopt, "", &sh);
         assert!(shopt.contains(&"nullglob".to_string()));
         assert_eq!(
             &shopt[0..2],
             &["autocd".to_string(), "assoc_expand_once".to_string()]
         ); // table order
         assert_eq!(
-            enumerate_action(Action::Shopt, "null", &sh),
+            complete_action(Action::Shopt, "null", &sh),
             vec!["nullglob".to_string()]
         );
     }
@@ -639,9 +639,9 @@ mod tests {
     #[test]
     fn enumerate_signal_helptopic_enabled() {
         let sh = Shell::new();
-        assert!(enumerate_action(Action::Signal, "SIGIN", &sh) == vec!["SIGINT".to_string()]);
-        assert!(!enumerate_action(Action::Helptopic, "", &sh).is_empty());
-        assert!(enumerate_action(Action::Enabled, "ech", &sh).contains(&"echo".to_string()));
+        assert!(complete_action(Action::Signal, "SIGIN", &sh) == vec!["SIGINT".to_string()]);
+        assert!(!complete_action(Action::Helptopic, "", &sh).is_empty());
+        assert!(complete_action(Action::Enabled, "ech", &sh).contains(&"echo".to_string()));
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
             Action::Service,
         ] {
             assert!(
-                enumerate_action(a, "", &sh).is_empty(),
+                complete_action(a, "", &sh).is_empty(),
                 "expected empty for {a:?}"
             );
         }
@@ -681,7 +681,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx("al"), &mut sh);
+        let got = run_spec(&spec, &ctx("al"), &mut sh);
         assert_eq!(got, vec!["alpha", "alpine"]);
     }
 
@@ -692,7 +692,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx("z"), &mut sh);
+        let got = run_spec(&spec, &ctx("z"), &mut sh);
         assert!(got.is_empty());
     }
 
@@ -704,7 +704,7 @@ mod tests {
         };
         let mut sh = Shell::new();
         sh.set("IFS", ":".to_string());
-        let got = resolve_spec(&spec, &ctx("a"), &mut sh);
+        let got = run_spec(&spec, &ctx("a"), &mut sh);
         assert_eq!(got, vec!["alpha", "apple"]);
     }
 
@@ -723,7 +723,7 @@ mod tests {
             actions: vec![Action::Function],
             ..Default::default()
         };
-        let got = resolve_spec(&spec, &ctx("al"), &mut sh);
+        let got = run_spec(&spec, &ctx("al"), &mut sh);
         assert_eq!(got, vec!["alpha", "alpine"]);
     }
 
@@ -734,7 +734,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx("ec"), &mut sh);
+        let got = run_spec(&spec, &ctx("ec"), &mut sh);
         assert!(got.contains(&"echo".to_string()), "{got:?}");
     }
 
@@ -745,7 +745,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx("fo"), &mut sh);
+        let got = run_spec(&spec, &ctx("fo"), &mut sh);
         assert_eq!(got, vec!["for"]);
     }
 
@@ -757,7 +757,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        let got = run_spec(&spec, &ctx(""), &mut sh);
         // "a*" removes alpha and apple; banana and cherry remain.
         assert_eq!(got, vec!["banana", "cherry"]);
     }
@@ -770,7 +770,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        let got = run_spec(&spec, &ctx(""), &mut sh);
         assert_eq!(got, vec!["alpha", "apple"]);
     }
 
@@ -783,7 +783,7 @@ mod tests {
             ..Default::default()
         };
         let mut sh = Shell::new();
-        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        let got = run_spec(&spec, &ctx(""), &mut sh);
         assert_eq!(got, vec!["x:a:y", "x:b:y"]);
     }
 
@@ -804,7 +804,7 @@ mod tests {
             function: Some("_myf".to_string()),
             ..Default::default()
         };
-        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        let got = run_spec(&spec, &ctx(""), &mut sh);
         assert_eq!(got, vec!["alpha", "beta"]);
     }
 
@@ -825,7 +825,7 @@ mod tests {
         let mut c = ctx("");
         c.comp_words = vec!["cmd".to_string(), "expected_word".to_string()];
         c.comp_cword = 1;
-        let got = resolve_spec(&spec, &c, &mut sh);
+        let got = run_spec(&spec, &c, &mut sh);
         assert_eq!(got, vec!["expected_word"]);
     }
 
@@ -852,7 +852,7 @@ mod tests {
             comp_line: "git checkout che".to_string(),
             comp_point: 16,
         };
-        let got = resolve_spec(&spec, &c, &mut sh);
+        let got = run_spec(&spec, &c, &mut sh);
         assert_eq!(got, vec!["git", "che", "checkout"]);
     }
 
@@ -872,7 +872,7 @@ mod tests {
             function: Some("_myf".to_string()),
             ..Default::default()
         };
-        let _ = resolve_spec(&spec, &ctx(""), &mut sh);
+        let _ = run_spec(&spec, &ctx(""), &mut sh);
         // Completion functions must NOT pollute $?.
         assert_eq!(sh.last_status(), 42);
     }
@@ -885,7 +885,7 @@ mod tests {
             function: Some("_myf".to_string()),
             ..Default::default()
         };
-        let _ = resolve_spec(&spec, &ctx(""), &mut sh);
+        let _ = run_spec(&spec, &ctx(""), &mut sh);
         assert!(
             sh.current_completion_spec.is_some(),
             "Task 5/6 depend on current_completion_spec being left set",
@@ -899,7 +899,7 @@ mod tests {
             function: Some("_does_not_exist".to_string()),
             ..Default::default()
         };
-        let got = resolve_spec(&spec, &ctx(""), &mut sh);
+        let got = run_spec(&spec, &ctx(""), &mut sh);
         assert!(got.is_empty());
     }
 
@@ -948,7 +948,7 @@ mod tests {
             actions: vec![Action::Command],
             ..Default::default()
         };
-        let got = resolve_spec(&spec, &ctx("myraw"), &mut sh);
+        let got = run_spec(&spec, &ctx("myraw"), &mut sh);
         assert!(got.iter().any(|s| s == "myrawcmd"), "{got:?}");
         // No backslash anywhere in the results.
         assert!(got.iter().all(|s| !s.contains('\\')), "{got:?}");
@@ -972,7 +972,7 @@ mod tests {
             actions: vec![Action::File],
             ..Default::default()
         };
-        let got = resolve_spec(&spec, &ctx("subdir/al"), &mut sh);
+        let got = run_spec(&spec, &ctx("subdir/al"), &mut sh);
         std::env::set_current_dir(prior).unwrap();
 
         // Result must round-trip with the "subdir/" prefix included.
@@ -989,11 +989,11 @@ mod tests {
         let mut sh = Shell::new();
         sh.set("HOME", home.path().to_str().unwrap().to_string());
 
-        let res = enumerate_action(Action::Directory, "~/", &sh);
+        let res = complete_action(Action::Directory, "~/", &sh);
         assert!(res.contains(&"~/projects".to_string()), "{res:?}");
         assert!(res.contains(&"~/pub".to_string()), "{res:?}");
 
-        let res2 = enumerate_action(Action::Directory, "~/pro", &sh);
+        let res2 = complete_action(Action::Directory, "~/pro", &sh);
         assert_eq!(res2, vec!["~/projects".to_string()], "{res2:?}");
     }
 }
