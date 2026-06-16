@@ -2108,6 +2108,72 @@ fn consume_paren_cmdsub_verbatim(
     Ok(())
 }
 
+/// Scans a backtick (`` `…` ``) command-substitution body, the opening backtick
+/// having already been consumed by the caller. Consumes through the matching
+/// un-escaped backtick (consumed but NOT appended); a `\` escapes the next char
+/// (so `` \` `` does not close — the `\` and next char are appended raw). The
+/// raw body (escapes preserved, excluding the closing backtick) is appended to
+/// `out`. Backticks are quote-naive and do not nest. EOF → `Err(unterminated)`.
+/// The single source of truth for backtick boundary scanning (see
+/// `scan_backtick_substitution`, `consume_backtick_verbatim`).
+fn scan_backtick_body(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+    unterminated: LexError,
+) -> Result<(), LexError> {
+    loop {
+        match chars.next() {
+            None => return Err(unterminated),
+            Some('`') => return Ok(()),
+            Some('\\') => {
+                out.push('\\');
+                match chars.next() {
+                    Some(c) => out.push(c),
+                    None => return Err(unterminated),
+                }
+            }
+            Some(c) => out.push(c),
+        }
+    }
+}
+
+/// Appends a backtick command substitution to `out` verbatim, the opening
+/// backtick having already been pushed by the caller: the kernel collects the
+/// raw body (excluding the closing backtick); this re-adds the closing backtick.
+fn consume_backtick_verbatim(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+) -> Result<(), LexError> {
+    scan_backtick_body(chars, out, LexError::UnterminatedBrace)?;
+    out.push('`');
+    Ok(())
+}
+
+/// Applies bash's backtick un-escaping to a raw backtick body: `` \` `` → `` ` ``,
+/// `\\` → `\`, `\$` → `$`, and `\x` (any other char) → `\x` verbatim. A trailing
+/// lone `\` is kept. Only the parse path un-escapes, so it lives in one function.
+fn unescape_backtick(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('`') => out.push('`'),
+                Some('\\') => out.push('\\'),
+                Some('$') => out.push('$'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn scan_braced_operand(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
@@ -2154,22 +2220,7 @@ fn scan_braced_operand(
                 // matching unescaped backtick so a `}` inside it does not close
                 // the operand (L-52). `\` escapes the next char inside.
                 body.push('`');
-                loop {
-                    match chars.next() {
-                        None => return Err(LexError::UnterminatedBrace),
-                        Some('`') => {
-                            body.push('`');
-                            break;
-                        }
-                        Some('\\') => {
-                            body.push('\\');
-                            if let Some(c) = chars.next() {
-                                body.push(c);
-                            }
-                        }
-                        Some(c) => body.push(c),
-                    }
-                }
+                consume_backtick_verbatim(chars, &mut body)?;
             }
             Some('$') => {
                 // `${` (dollar-brace) nests the operand and needs a matching `}`.
@@ -2331,26 +2382,9 @@ fn scan_backtick_substitution(
     chars: &mut CharCursor<'_>,
     opts: LexerOptions,
 ) -> Result<crate::command::Sequence, LexError> {
-    let mut body = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '`' => {
-                return parse_substitution_body(&body, opts);
-            }
-            '\\' => match chars.next() {
-                Some('`') => body.push('`'),
-                Some('\\') => body.push('\\'),
-                Some('$') => body.push('$'),
-                Some(other) => {
-                    body.push('\\');
-                    body.push(other);
-                }
-                None => return Err(LexError::UnterminatedSubstitution),
-            },
-            _ => body.push(c),
-        }
-    }
-    Err(LexError::UnterminatedSubstitution)
+    let mut raw = String::new();
+    scan_backtick_body(chars, &mut raw, LexError::UnterminatedSubstitution)?;
+    parse_substitution_body(&unescape_backtick(&raw), opts)
 }
 
 fn empty_sequence() -> crate::command::Sequence {
@@ -3199,16 +3233,11 @@ fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
             '`' => {
                 let dst = if delim_seen { &mut second } else { &mut first };
                 dst.push('`');
-                while let Some(qc) = chars.next() {
-                    dst.push(qc);
-                    if qc == '\\' {
-                        if let Some(nc) = chars.next() {
-                            dst.push(nc);
-                        }
-                    } else if qc == '`' {
-                        break;
-                    }
-                }
+                // Skip the backtick command substitution verbatim. The Result is
+                // unreachable (operand body pre-balanced by scan_braced_operand);
+                // on the impossible EOF the closing backtick is not re-added and
+                // the cursor is exhausted, so the loop ends with identical segments.
+                let _ = consume_backtick_verbatim(&mut chars, dst);
             }
             '$' => {
                 let dst = if delim_seen { &mut second } else { &mut first };
@@ -5264,6 +5293,49 @@ mod tests {
             scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
             LexError::UnterminatedBrace
         );
+    }
+
+    #[test]
+    fn scan_backtick_body_basic_consumes_through_close() {
+        let mut chars = CharCursor::new("echo hi`rest");
+        let mut out = String::new();
+        scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
+        assert_eq!(out, "echo hi"); // closing backtick consumed, not appended
+        assert_eq!(chars.next(), Some('r'));
+    }
+
+    #[test]
+    fn scan_backtick_body_escaped_backtick_does_not_close() {
+        // Input: a \ ` b `  — the escaped backtick is raw-preserved and does not close.
+        let mut chars = CharCursor::new("a\\`b`");
+        let mut out = String::new();
+        scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "a\\`b"); // raw, escape preserved
+    }
+
+    #[test]
+    fn scan_backtick_body_unterminated_uses_passed_error() {
+        let mut chars = CharCursor::new("echo hi");
+        let mut out = String::new();
+        assert_eq!(
+            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap_err(),
+            LexError::UnterminatedSubstitution
+        );
+        let mut chars = CharCursor::new("echo hi");
+        let mut out = String::new();
+        assert_eq!(
+            scan_backtick_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
+            LexError::UnterminatedBrace
+        );
+    }
+
+    #[test]
+    fn unescape_backtick_applies_bash_rules() {
+        assert_eq!(unescape_backtick("a\\`b"), "a`b"); // \` -> `
+        assert_eq!(unescape_backtick("a\\\\b"), "a\\b"); // \\ -> \
+        assert_eq!(unescape_backtick("a\\$b"), "a$b"); // \$ -> $
+        assert_eq!(unescape_backtick("a\\xb"), "a\\xb"); // \x -> \x (verbatim)
+        assert_eq!(unescape_backtick("plain"), "plain");
     }
 
     #[test]
