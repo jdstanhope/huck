@@ -32,7 +32,8 @@ the bottom, expansion + execution above, builtins at the top.
 | `completion.rs` | Tab completion (commands, files, variables, arith-context). |
 | `continuation.rs` | Multi-line input handling (backslash-newline, unclosed quotes, partial control structures). |
 | `shell.rs` | Top-level CLI + REPL entry point. `process_line` (the canonical "execute string in current shell" path). |
-| `main.rs` | Argv parsing + `shell::run` invocation. |
+| `lib.rs` | Library crate root: declares every module (`pub mod`) so the frontend (`lexer`/`command`) and leaf utilities are reusable/library-testable. Also holds the `#[cfg(test)] test_support` (`CWD_LOCK`) module. |
+| `main.rs` | Thin binary shim: argv parsing + `huck::shell::run` invocation. All logic lives in the `huck` library crate. |
 
 ## Execution pipeline
 
