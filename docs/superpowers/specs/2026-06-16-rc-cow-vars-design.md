@@ -1,6 +1,35 @@
 # v164: Rc-COW the `vars` table — Design
 
-**Status:** approved 2026-06-16
+> ## ⛔ OUTCOME: ABANDONED (2026-06-16) — implemented, measured, reverted
+>
+> The change was implemented exactly as designed (field → `Rc<HashMap<…>>`,
+> `vars_mut()` → `Rc::make_mut`, ~41 sites converted, full suite + 91 harnesses
+> + clippy all green) and then **reverted**, because a before/after measurement
+> showed **no win — in fact a slight regression**.
+>
+> **Root cause the design missed:** the spec assumed `$()` does not write the
+> variable table. It does — on **every** command. `run_single`
+> (`executor.rs`) calls `set_pipestatus` after each simple command (including
+> `:`), and `set_pipestatus` does `self.vars_mut().insert("PIPESTATUS", …)`.
+> So inside every substitution: `clone()` shares the `Rc` (O(1)), then the
+> command's PIPESTATUS write triggers `Rc::make_mut` on the **shared** map →
+> it deep-copies the entire table **anyway** — the exact cost we meant to
+> eliminate, merely deferred by microseconds and with added `Rc` bookkeeping.
+> Proof: `huck -c 'y=$(:; echo "${PIPESTATUS[@]}")'` → `inner PS=[0]`.
+> Measured (min user-CPU of 3, 2000 vars × ~300-char values, 4000 `$()`):
+> before (eager) **8.18s** vs after (Rc-COW) **9.72s**.
+>
+> **To actually capture the win** the vars table must not be written per
+> command — i.e. PIPESTATUS would have to be extracted into a dedicated field
+> (like `$?`/`$_` already are via `last_status`/`last_arg`) and materialized
+> into the var namespace lazily on read. That is a larger, riskier change
+> (PIPESTATUS is an array; computed-dynamics have edge cases — cf. L-41) and
+> was judged not worth it: v127 already captured the big COW win (the
+> `functions` table), leaving only a modest, workload-dependent gain here.
+> Do **not** retry the naive "just wrap `vars` in `Rc`" change — it cannot
+> work while PIPESTATUS lives in the vars table and is written per command.
+
+**Status:** ABANDONED 2026-06-16 (was: approved 2026-06-16)
 **Iteration:** v164
 **Origin:** the 2026-06-16 architecture review identified `Shell::vars` as the
 one large per-`$()`-deep-cloned table not yet wrapped in `Rc` (the other four —
