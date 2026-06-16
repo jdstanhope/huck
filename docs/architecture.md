@@ -179,7 +179,7 @@ These appear in many call-site signatures; learn them once.
 Function-name verbs follow these conventions (codified v170; see the 2026-06-16
 naming review). New code should match them:
 
-- **Retrieval** — `get_*` borrows a stored container (`&T`, e.g. `get_array`);
+- **Retrieval** — `get_*` borrows a stored container (`&T`, e.g. `get_indexed`);
   `lookup_*` computes one resolved value (owned `Option<String>`, e.g.
   `lookup_var`); `resolve_*` follows indirection to a concrete target
   (namerefs, paths — e.g. `resolve_nameref`, `resolve_dir`).
@@ -196,6 +196,11 @@ naming review). New code should match them:
   registered compspec; `dispatch::resolve` is the top-level completion entry.
 - **Options** — option structs are `*Options` (`LexerOptions`, `ShellOptions`,
   `CompOptions`); their bindings/params are abbreviated `opts`.
+- **Array types** — the two array kinds use `indexed` / `associative` as the
+  type adjective (matching `VarValue::Indexed`/`Associative`), e.g.
+  `replace_indexed`/`replace_associative`, `set_indexed_element`/
+  `set_associative_element`, `get_indexed`/`get_associative`. Avoid the bare
+  noun `array` (ambiguous — both kinds are arrays).
 
 ## Iteration workflow
 
@@ -234,7 +239,7 @@ The "(1M context)" parenthetical is canonical — do not remove it.
 | New control-flow construct | `lexer.rs`: add token recognition + AST construction (in `command.rs`). `executor.rs`: add `run_*` walker for the new `Command` variant. |
 | New `set -o` option | `shell_state.rs::ShellOptions`: add the bool field. `builtins.rs::builtin_set`: add to the OptionInfo registry and the get/set/print helpers. Wire into the executor at the relevant action site. |
 | New trap signal / pseudo-signal | `traps.rs`: add to the signal name table. `executor.rs`: add a `fire_*_trap` call at the appropriate spot. |
-| Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_array_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
+| Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_indexed_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
 
 ## Pointers for new sessions
 

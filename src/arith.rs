@@ -737,7 +737,7 @@ fn read_lvalue_i64(shell: &mut Shell, target: &LValue) -> Result<i64, ArithError
                 element_string_to_i64(shell, name, raw)
             } else {
                 let idx = eval(subscript, shell)?;
-                let raw = shell.lookup_array_element(name, idx as usize);
+                let raw = shell.lookup_indexed_element(name, idx as usize);
                 element_string_to_i64(shell, name, raw)
             }
         }
@@ -756,7 +756,7 @@ fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<()
             } else {
                 let idx = eval(subscript, shell)?;
                 shell
-                    .set_array_element(name, idx as usize, value.to_string())
+                    .set_indexed_element(name, idx as usize, value.to_string())
                     .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
             }
         }
@@ -1735,8 +1735,8 @@ mod tests {
     #[test]
     fn eval_index_read_indexed_array() {
         let mut s = Shell::new();
-        s.set_array_element("arr", 0, "10".to_string()).unwrap();
-        s.set_array_element("arr", 1, "20".to_string()).unwrap();
+        s.set_indexed_element("arr", 0, "10".to_string()).unwrap();
+        s.set_indexed_element("arr", 1, "20".to_string()).unwrap();
         assert_eq!(eval_str("arr[0] + arr[1]", &mut s).unwrap(), 30);
     }
 
@@ -1749,18 +1749,18 @@ mod tests {
     #[test]
     fn eval_index_compound_assign_indexed() {
         let mut s = Shell::new();
-        s.set_array_element("a", 0, "10".to_string()).unwrap();
-        s.set_array_element("a", 1, "20".to_string()).unwrap();
+        s.set_indexed_element("a", 0, "10".to_string()).unwrap();
+        s.set_indexed_element("a", 1, "20".to_string()).unwrap();
         assert_eq!(eval_str("a[0] += a[1]", &mut s).unwrap(), 30);
-        assert_eq!(s.lookup_array_element("a", 0), Some("30".to_string()));
+        assert_eq!(s.lookup_indexed_element("a", 0), Some("30".to_string()));
     }
 
     #[test]
     fn eval_index_post_inc_element() {
         let mut s = Shell::new();
-        s.set_array_element("a", 1, "2".to_string()).unwrap();
+        s.set_indexed_element("a", 1, "2".to_string()).unwrap();
         assert_eq!(eval_str("a[1]++", &mut s).unwrap(), 2);
-        assert_eq!(s.lookup_array_element("a", 1), Some("3".to_string()));
+        assert_eq!(s.lookup_indexed_element("a", 1), Some("3".to_string()));
     }
 
     #[test]
