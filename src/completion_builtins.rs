@@ -429,8 +429,8 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
         comp_line: word.clone(),
         comp_point: word.len(),
     };
-    // Save+restore shell.current_completion_spec around resolve_spec.
-    // resolve_spec with a -F function calls call_completion_function,
+    // Save+restore shell.current_completion_spec around run_spec.
+    // run_spec with a -F function calls call_completion_function,
     // which INTENTIONALLY leaves the synthetic compgen spec stashed in
     // current_completion_spec (so Task-5 dispatch can read compopt-applied
     // mutations). For `compgen` from script context we have no consumer,
@@ -441,7 +441,7 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
     // (e.g., a -F dispatcher that internally calls `compgen -F _other`
     // must see ITS spec on return, not _other's).
     let saved = shell.current_completion_spec.take();
-    let results = crate::completion_spec::resolve_spec(&parsed.spec, &ctx, shell);
+    let results = crate::completion_spec::run_spec(&parsed.spec, &ctx, shell);
     shell.current_completion_spec = saved;
     let any = !results.is_empty();
     for r in results {
@@ -935,8 +935,8 @@ mod tests {
             comp_line: "myc ".to_string(),
             comp_point: 4,
         };
-        let _ = crate::completion_spec::resolve_spec(&spec, &ctx, &mut sh);
-        // After resolve_spec, dispatch reads current_completion_spec —
+        let _ = crate::completion_spec::run_spec(&spec, &ctx, &mut sh);
+        // After run_spec, dispatch reads current_completion_spec —
         // but for this unit test we read it directly to verify the
         // function's compopt call mutated it.
         let mutated = sh

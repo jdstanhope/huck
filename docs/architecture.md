@@ -174,6 +174,29 @@ These appear in many call-site signatures; learn them once.
   scripts in `tests/*.rs` using the `run_capture` helper pattern
   (spawn `huck_binary()`, write to stdin, capture stdout/stderr/exit).
 
+## Naming conventions
+
+Function-name verbs follow these conventions (codified v170; see the 2026-06-16
+naming review). New code should match them:
+
+- **Retrieval** — `get_*` borrows a stored container (`&T`, e.g. `get_array`);
+  `lookup_*` computes one resolved value (owned `Option<String>`, e.g.
+  `lookup_var`); `resolve_*` follows indirection to a concrete target
+  (namerefs, paths — e.g. `resolve_nameref`, `resolve_dir`).
+- **Lexing/scanning** — `scan_*` advances a `CharCursor` and collects a span
+  (e.g. `scan_cmdsub_body`, `scan_subscript`); `split_*` partitions an
+  already-collected `&str` (e.g. `split_modifier_operand`); `parse_*` produces
+  AST/structure from tokens; `tokenize` turns source into tokens. The thin
+  `consume_…_verbatim` wrappers re-emit a closing delimiter around a `scan_*`.
+- **Execution** — `run_*` executes an AST node/construct (`run_command`,
+  `run_pipeline`); `execute*` are the public crate entry points
+  (`execute`/`execute_with_sink`/`execute_capturing`); `eval_*` computes a value
+  from an expression; `fire_*_trap` runs a trap.
+- **Completion** — `complete_*` produces candidates; `run_spec` evaluates a
+  registered compspec; `dispatch::resolve` is the top-level completion entry.
+- **Options** — option structs are `*Options` (`LexerOptions`, `ShellOptions`,
+  `CompOptions`); their bindings/params are abbreviated `opts`.
+
 ## Iteration workflow
 
 The project is built one numbered iteration at a time
