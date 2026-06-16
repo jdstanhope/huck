@@ -3095,57 +3095,130 @@ fn scan_substitution_operand(
 /// quoted span. Returns `(pattern_src, replacement_src)`. If no delimiter
 /// is found, the whole body is the pattern and the replacement is empty
 /// (the bash `${var/pat}` form).
-fn split_substitution_body(body: &str) -> (String, String) {
-    let mut pattern = String::new();
-    let mut replacement = String::new();
+/// Splits a `${…}` modifier operand body on the FIRST top-level `delim`,
+/// returning `(before, Some(after))` if a top-level delimiter was found, or
+/// `(before, None)` otherwise. "Top level" excludes single quotes, double
+/// quotes, backticks, a `$(…)` command substitution (nested parens — also
+/// covers `$((…))` and `$( (…) )`), and `{…}` braces. Skipped spans are
+/// appended VERBATIM so the segments re-parse exactly as written. At the top
+/// level only, `\delim` un-escapes to `delim` and `\\` to `\`; any other `\x`
+/// keeps the backslash. Inside a command substitution escapes are verbatim
+/// (they belong to the command), mirroring `scan_paren_substitution`.
+fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
+    let mut first = String::new();
+    let mut second = String::new();
     let mut delim_seen = false;
-    let mut depth: u32 = 0;
+    let mut paren_depth: u32 = 0; // > 0 while inside a $( … ) command substitution
+    let mut brace_depth: u32 = 0; // { } nesting, tracked only at paren_depth 0
     let mut chars = CharCursor::new(body);
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                let lit = match chars.peek().copied() {
-                    Some('/') => { chars.next(); '/' }
-                    Some('\\') => { chars.next(); '\\' }
-                    _ => '\\',
-                };
-                if delim_seen { replacement.push(lit); } else { pattern.push(lit); }
+                let dst = if delim_seen { &mut second } else { &mut first };
+                if paren_depth == 0 {
+                    match chars.peek().copied() {
+                        Some(d) if d == delim => {
+                            chars.next();
+                            dst.push(delim);
+                        }
+                        Some('\\') => {
+                            chars.next();
+                            dst.push('\\');
+                        }
+                        _ => dst.push('\\'),
+                    }
+                } else {
+                    dst.push('\\');
+                    if let Some(nc) = chars.next() {
+                        dst.push(nc);
+                    }
+                }
+            }
+            '\'' => {
+                let dst = if delim_seen { &mut second } else { &mut first };
+                dst.push('\'');
+                for qc in chars.by_ref() {
+                    dst.push(qc);
+                    if qc == '\'' {
+                        break;
+                    }
+                }
             }
             '"' => {
-                let dst = if delim_seen { &mut replacement } else { &mut pattern };
+                let dst = if delim_seen { &mut second } else { &mut first };
                 dst.push('"');
                 while let Some(qc) = chars.next() {
                     dst.push(qc);
                     if qc == '\\' {
-                        if let Some(nc) = chars.next() { dst.push(nc); }
+                        if let Some(nc) = chars.next() {
+                            dst.push(nc);
+                        }
                     } else if qc == '"' {
                         break;
                     }
                 }
             }
-            '\'' => {
-                let dst = if delim_seen { &mut replacement } else { &mut pattern };
-                dst.push('\'');
-                for qc in chars.by_ref() {
+            '`' => {
+                let dst = if delim_seen { &mut second } else { &mut first };
+                dst.push('`');
+                while let Some(qc) = chars.next() {
                     dst.push(qc);
-                    if qc == '\'' { break; }
+                    if qc == '\\' {
+                        if let Some(nc) = chars.next() {
+                            dst.push(nc);
+                        }
+                    } else if qc == '`' {
+                        break;
+                    }
                 }
             }
-            '{' => {
-                depth += 1;
-                if delim_seen { replacement.push('{'); } else { pattern.push('{'); }
+            '$' => {
+                let dst = if delim_seen { &mut second } else { &mut first };
+                dst.push('$');
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    dst.push('(');
+                    paren_depth += 1;
+                }
             }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if delim_seen { replacement.push('}'); } else { pattern.push('}'); }
+            '(' if paren_depth > 0 => {
+                paren_depth += 1;
+                if delim_seen { second.push('('); } else { first.push('('); }
             }
-            '/' if depth == 0 && !delim_seen => { delim_seen = true; }
+            ')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                if delim_seen { second.push(')'); } else { first.push(')'); }
+            }
+            '{' if paren_depth == 0 => {
+                brace_depth += 1;
+                if delim_seen { second.push('{'); } else { first.push('{'); }
+            }
+            '}' if paren_depth == 0 => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if delim_seen { second.push('}'); } else { first.push('}'); }
+            }
+            c if c == delim && paren_depth == 0 && brace_depth == 0 && !delim_seen => {
+                delim_seen = true;
+            }
             _ => {
-                if delim_seen { replacement.push(c); } else { pattern.push(c); }
+                if delim_seen { second.push(c); } else { first.push(c); }
             }
         }
     }
-    (pattern, replacement)
+    if delim_seen {
+        (first, Some(second))
+    } else {
+        (first, None)
+    }
+}
+
+/// Splits a `${var/pat/repl}` operand body into `(pattern, replacement)` on the
+/// first top-level `/` (skipping command substitutions / quotes / braces — see
+/// `split_modifier_operand`). A missing replacement (`${var/pat}`) yields `""`,
+/// matching bash's treatment of `${var/pat}` as `${var/pat/}`.
+fn split_substitution_body(body: &str) -> (String, String) {
+    let (pattern, replacement) = split_modifier_operand(body, '/');
+    (pattern, replacement.unwrap_or_default())
 }
 
 /// Scans a `${var:offset}` / `${var:offset:length}` operand pair. Delegates
@@ -3170,60 +3243,7 @@ fn scan_substring_operands(
 /// quoted span. Returns `(offset_src, Some(length_src))` if a delimiter
 /// was found, or `(offset_src, None)` otherwise (the no-length form).
 fn split_substring_body(body: &str) -> (String, Option<String>) {
-    let mut offset = String::new();
-    let mut length = String::new();
-    let mut delim_seen = false;
-    let mut depth: u32 = 0;
-    let mut chars = CharCursor::new(body);
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let lit = match chars.peek().copied() {
-                    Some(':') => { chars.next(); ':' }
-                    Some('\\') => { chars.next(); '\\' }
-                    _ => '\\',
-                };
-                if delim_seen { length.push(lit); } else { offset.push(lit); }
-            }
-            '"' => {
-                let dst = if delim_seen { &mut length } else { &mut offset };
-                dst.push('"');
-                while let Some(qc) = chars.next() {
-                    dst.push(qc);
-                    if qc == '\\' {
-                        if let Some(nc) = chars.next() { dst.push(nc); }
-                    } else if qc == '"' {
-                        break;
-                    }
-                }
-            }
-            '\'' => {
-                let dst = if delim_seen { &mut length } else { &mut offset };
-                dst.push('\'');
-                for qc in chars.by_ref() {
-                    dst.push(qc);
-                    if qc == '\'' { break; }
-                }
-            }
-            '{' => {
-                depth += 1;
-                if delim_seen { length.push('{'); } else { offset.push('{'); }
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if delim_seen { length.push('}'); } else { offset.push('}'); }
-            }
-            ':' if depth == 0 && !delim_seen => { delim_seen = true; }
-            _ => {
-                if delim_seen { length.push(c); } else { offset.push(c); }
-            }
-        }
-    }
-    if delim_seen {
-        (offset, Some(length))
-    } else {
-        (offset, None)
-    }
+    split_modifier_operand(body, ':')
 }
 
 fn is_name_start(c: char) -> bool {
@@ -3357,6 +3377,64 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::command::RedirFd;
+
+    #[test]
+    fn split_modifier_operand_basic_split() {
+        assert_eq!(split_modifier_operand("a/b", '/'), ("a".into(), Some("b".into())));
+        assert_eq!(split_modifier_operand("a", '/'), ("a".into(), None));
+        assert_eq!(split_modifier_operand("2:3", ':'), ("2".into(), Some("3".into())));
+        assert_eq!(split_modifier_operand("2", ':'), ("2".into(), None));
+    }
+
+    #[test]
+    fn split_modifier_operand_skips_command_sub() {
+        // A delimiter inside $(...) is NOT the split point (L-10).
+        assert_eq!(
+            split_modifier_operand("$(echo a/x)/Z", '/'),
+            ("$(echo a/x)".into(), Some("Z".into()))
+        );
+        assert_eq!(
+            split_modifier_operand("$(echo 1:2)", ':'),
+            ("$(echo 1:2)".into(), None)
+        );
+        // Nested $( $() ).
+        assert_eq!(
+            split_modifier_operand("$(echo $(echo a/b))/Q", '/'),
+            ("$(echo $(echo a/b))".into(), Some("Q".into()))
+        );
+        // $(( ... )) arithmetic with a ternary colon inside.
+        assert_eq!(
+            split_modifier_operand("$((1>0?2:3))", ':'),
+            ("$((1>0?2:3))".into(), None)
+        );
+    }
+
+    #[test]
+    fn split_modifier_operand_skips_backtick() {
+        assert_eq!(
+            split_modifier_operand("`echo a/x`/Z", '/'),
+            ("`echo a/x`".into(), Some("Z".into()))
+        );
+    }
+
+    #[test]
+    fn split_modifier_operand_quotes_and_escapes() {
+        // A quoted delimiter is kept verbatim and does not split.
+        assert_eq!(
+            split_modifier_operand("\"a/b\"/x", '/'),
+            ("\"a/b\"".into(), Some("x".into()))
+        );
+        // An escaped delimiter un-escapes to the literal char and does not split.
+        assert_eq!(split_modifier_operand("a\\/b/x", '/'), ("a/b".into(), Some("x".into())));
+        // \\ un-escapes to a single backslash.
+        assert_eq!(split_modifier_operand("a\\\\b", '/'), ("a\\b".into(), None));
+    }
+
+    #[test]
+    fn split_modifier_operand_brace_nesting() {
+        // A delimiter inside ${...} plain nesting is not the split point.
+        assert_eq!(split_modifier_operand("${x:-y}", ':'), ("${x:-y}".into(), None));
+    }
 
     /// True iff `tokens` contains at least one `Token::RedirFd`.
     fn has_redir_fd(tokens: &[Token]) -> bool {
