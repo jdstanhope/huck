@@ -30,6 +30,11 @@ fragments=(
     # --- quoted / escaped delimiter in the operand ---
     's=axb; echo "${s/"a/b"/Z}"'
     's=a/b/c; echo "${s/a\/b/Z}"'
+    # --- L-52: literal } inside a command substitution in the operand ---
+    's=a}b; echo "${s/$(echo a}b)/Z}"'
+    's=xy; echo "${s/`echo a}b`/Z}"'
+    's=xyz; echo "${s/$(echo $(echo a}b))/Q}"'
+    's=ab; echo "${s/$(echo "}")/Z}"'
     # --- plain forms (must be unchanged by the refactor) ---
     's=abcdefgh; echo "${s:2:3}"'
     's=abcdefgh; echo "${s:2}"'
