@@ -89,8 +89,8 @@ impl Variable {
 }
 
 /// Error kind returned by the readonly-aware array mutator helpers
-/// (`replace_array`, `set_array_element`, `extend_indexed`,
-/// `append_array_element`, `unset_array_element`). The mutator prints
+/// (`replace_indexed`, `set_indexed_element`, `extend_indexed`,
+/// `append_indexed_element`, `unset_indexed_element`). The mutator prints
 /// the user-facing diagnostic itself; callers translate this into the
 /// appropriate exit status.
 #[derive(Debug)]
@@ -1054,7 +1054,7 @@ impl Shell {
                     None => return false,
                 }
             };
-            return self.lookup_array_element(&name, idx).is_some();
+            return self.lookup_indexed_element(&name, idx).is_some();
         }
         self.is_set(target)
     }
@@ -1088,7 +1088,7 @@ impl Shell {
                     } else {
                         let idx = ev(subscript, sh)?;
                         if idx < 0 { return None; }
-                        sh.lookup_array_element(name, idx as usize)
+                        sh.lookup_indexed_element(name, idx as usize)
                     };
                     let raw = raw.unwrap_or_default();
                     if raw.is_empty() { 0 } else { raw.parse::<i64>().ok()? }
@@ -1393,7 +1393,7 @@ impl Shell {
                     v.value = VarValue::Indexed(m);
                 }
                 VarValue::Associative(_) => {
-                    eprintln!("huck: {name}: set_array_element on associative variable");
+                    eprintln!("huck: {name}: set_indexed_element on associative variable");
                     return Err(AssignErr::TypeMismatch);
                 }
             },
@@ -1546,7 +1546,7 @@ impl Shell {
                 let n = n.clone();
                 let idx = *idx;
                 let v = if op == AssignKind::Append {
-                    self.lookup_array_element(&n, idx).unwrap_or_default() + &v
+                    self.lookup_indexed_element(&n, idx).unwrap_or_default() + &v
                 } else { v };
                 // Integer arrays (v-L49) coerce each element value via arith
                 // before case-fold, mirroring the scalar attribute order in
@@ -1828,7 +1828,7 @@ impl Shell {
             } else {
                 None
             };
-            idx.and_then(|i| self.lookup_array_element(arr, i))
+            idx.and_then(|i| self.lookup_indexed_element(arr, i))
         }
     }
 
@@ -1933,7 +1933,7 @@ impl Shell {
 
     /// Returns a reference to the indexed array stored under `name`,
     /// or `None` if the variable is unset or a scalar.
-    pub fn get_array(&self, name: &str) -> Option<&BTreeMap<usize, String>> {
+    pub fn get_indexed(&self, name: &str) -> Option<&BTreeMap<usize, String>> {
         // Resolve through namerefs so that array operations on a nameref
         // target the actual array (e.g. `local -n a=arr; a+=(z)` sees arr).
         let resolved = if self.is_nameref(name) {
@@ -1956,7 +1956,7 @@ impl Shell {
     /// Returns the value at subscript `idx` for the indexed array named
     /// `name`. For scalar variables, idx=0 returns the scalar string —
     /// matches bash's `$a ≡ ${a[0]}` rule.
-    pub fn lookup_array_element(&self, name: &str, idx: usize) -> Option<String> {
+    pub fn lookup_indexed_element(&self, name: &str, idx: usize) -> Option<String> {
         match self.vars.get(name) {
             Some(v) => match &v.value {
                 VarValue::Indexed(m) => m.get(&idx).cloned(),
@@ -1972,7 +1972,7 @@ impl Shell {
     /// `None` if no elements / not an array. Used for negative-subscript
     /// wrapping in `${a[-n]}`.
     pub fn array_max_index(&self, name: &str) -> Option<usize> {
-        self.get_array(name)
+        self.get_indexed(name)
             .and_then(|m| m.keys().next_back().copied())
     }
 
@@ -2107,7 +2107,7 @@ impl Shell {
     /// Replaces (or creates) `name` as an indexed array with the given
     /// elements. Honors readonly. Preserves the existing `exported` and
     /// `integer` flags if the variable already exists.
-    pub fn replace_array(
+    pub fn replace_indexed(
         &mut self,
         name: &str,
         elements: BTreeMap<usize, String>,
@@ -2118,7 +2118,7 @@ impl Shell {
     /// Sets a single element. Promotes a scalar variable to indexed
     /// (the existing scalar value becomes element 0, unless `idx == 0`
     /// in which case it is overwritten). Honors readonly.
-    pub fn set_array_element(
+    pub fn set_indexed_element(
         &mut self,
         name: &str,
         idx: usize,
@@ -2144,7 +2144,7 @@ impl Shell {
     /// Appends `value` to the existing element at `idx` (concatenation).
     /// Used by `a[i]+=v`. If the element doesn't exist, treats prior
     /// value as empty.
-    pub fn append_array_element(
+    pub fn append_indexed_element(
         &mut self,
         name: &str,
         idx: usize,
@@ -2156,7 +2156,7 @@ impl Shell {
     /// Removes a single element from an indexed array. No-op if the
     /// variable is missing, scalar, or doesn't contain that subscript.
     /// Honors readonly.
-    pub fn unset_array_element(&mut self, name: &str, idx: usize) -> Result<(), AssignErr> {
+    pub fn unset_indexed_element(&mut self, name: &str, idx: usize) -> Result<(), AssignErr> {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
@@ -2590,7 +2590,7 @@ mod tests {
         let mut elements = std::collections::BTreeMap::new();
         elements.insert(0usize, "a".to_string());
         elements.insert(1usize, "b".to_string());
-        sh.replace_array("arr", elements).unwrap(); // existing pub Shell method (indexed array)
+        sh.replace_indexed("arr", elements).unwrap(); // existing pub Shell method (indexed array)
         let names = sh.array_var_names();
         assert!(names.contains(&"arr".to_string()));
         assert!(!names.contains(&"scal".to_string()));
@@ -2621,7 +2621,7 @@ mod tests {
     fn set_pipestatus_writes_indexed_array() {
         let mut sh = Shell::new();
         sh.set_pipestatus(&[0, 1, 0]);
-        let arr = sh.get_array("PIPESTATUS").expect("PIPESTATUS array");
+        let arr = sh.get_indexed("PIPESTATUS").expect("PIPESTATUS array");
         assert_eq!(arr.get(&0).map(String::as_str), Some("0"));
         assert_eq!(arr.get(&1).map(String::as_str), Some("1"));
         assert_eq!(arr.get(&2).map(String::as_str), Some("0"));
@@ -2643,7 +2643,7 @@ mod tests {
         sh.call_stack.push(make_func_frame("outer"));
         sh.call_stack.push(make_func_frame("inner"));
         sh.sync_call_arrays();
-        let arr = sh.get_array("FUNCNAME").expect("FUNCNAME array");
+        let arr = sh.get_indexed("FUNCNAME").expect("FUNCNAME array");
         assert_eq!(arr.get(&0).map(String::as_str), Some("inner")); // [0] = current
         assert_eq!(arr.get(&1).map(String::as_str), Some("outer")); // [1] = caller
         assert_eq!(arr.len(), 2);
@@ -2655,10 +2655,10 @@ mod tests {
         let mut sh = Shell::new();
         sh.call_stack.push(make_func_frame("f"));
         sh.sync_call_arrays();
-        assert!(sh.get_array("FUNCNAME").is_some());
+        assert!(sh.get_indexed("FUNCNAME").is_some());
         sh.call_stack.pop();
         sh.sync_call_arrays();
-        assert!(sh.get_array("FUNCNAME").is_none(), "empty stack unsets FUNCNAME");
+        assert!(sh.get_indexed("FUNCNAME").is_none(), "empty stack unsets FUNCNAME");
         assert_eq!(sh.lookup_var("FUNCNAME"), None);
     }
 
@@ -2668,7 +2668,7 @@ mod tests {
         sh.call_stack.push(make_func_frame("solo"));
         sh.sync_call_arrays();
         assert_eq!(sh.lookup_var("FUNCNAME"), Some("solo".to_string()));
-        assert_eq!(sh.get_array("FUNCNAME").expect("array").len(), 1);
+        assert_eq!(sh.get_indexed("FUNCNAME").expect("array").len(), 1);
     }
 
     #[test]
@@ -3430,8 +3430,8 @@ mod shopt_tests {
 
         // indexed element
         shell.set_case_fold("arr", Some(CaseFold::Lower));
-        shell.set_array_element("arr", 1, "XYZ".to_string()).unwrap();
-        assert_eq!(shell.lookup_array_element("arr", 1).as_deref(), Some("xyz"));
+        shell.set_indexed_element("arr", 1, "XYZ".to_string()).unwrap();
+        assert_eq!(shell.lookup_indexed_element("arr", 1).as_deref(), Some("xyz"));
 
         // associative value folded, key NOT folded
         // must declare as associative first (set_case_fold creates a Scalar)
@@ -3441,14 +3441,14 @@ mod shopt_tests {
         assert_eq!(shell.get_associative("m").unwrap().iter()
             .find(|(k, _)| k == "Key").map(|(_, v)| v.as_str()), Some("value"));
 
-        // whole-array literal via replace_array, attribute preserved
+        // whole-array literal via replace_indexed, attribute preserved
         shell.set_case_fold("lit", Some(CaseFold::Lower));
         let mut map = std::collections::BTreeMap::new();
         map.insert(0usize, "ABC".to_string());
         map.insert(1usize, "DeF".to_string());
-        shell.replace_array("lit", map).unwrap();
-        assert_eq!(shell.lookup_array_element("lit", 0).as_deref(), Some("abc"));
-        assert_eq!(shell.lookup_array_element("lit", 1).as_deref(), Some("def"));
+        shell.replace_indexed("lit", map).unwrap();
+        assert_eq!(shell.lookup_indexed_element("lit", 0).as_deref(), Some("abc"));
+        assert_eq!(shell.lookup_indexed_element("lit", 1).as_deref(), Some("def"));
         assert_eq!(shell.case_fold_of("lit"), Some(CaseFold::Lower)); // preserved
 
         // upper attribute through array append (extend_indexed)
@@ -3456,7 +3456,7 @@ mod shopt_tests {
         let mut em = std::collections::BTreeMap::new();
         em.insert(0usize, "abc".to_string());
         shell.extend_indexed("app", em).unwrap();
-        assert_eq!(shell.lookup_array_element("app", 0).as_deref(), Some("ABC"));
+        assert_eq!(shell.lookup_indexed_element("app", 0).as_deref(), Some("ABC"));
 
         // whole associative-array literal via replace_associative, attribute preserved
         shell.declare_associative("am").unwrap();
@@ -3510,7 +3510,7 @@ mod shopt_tests {
             AssignKind::Set,
             AssignSource::Scalar("xy".into()),
         ).unwrap();
-        assert_eq!(shell.lookup_array_element("a", 2).as_deref(), Some("XY"));
+        assert_eq!(shell.lookup_indexed_element("a", 2).as_deref(), Some("XY"));
 
         // whole indexed-array literal path
         let mut m = std::collections::BTreeMap::new();
@@ -3521,7 +3521,7 @@ mod shopt_tests {
             AssignKind::Set,
             AssignSource::Indexed(m),
         ).unwrap();
-        assert_eq!(shell.lookup_array_element("b", 0).as_deref(), Some("LO"));
+        assert_eq!(shell.lookup_indexed_element("b", 0).as_deref(), Some("LO"));
     }
 
     /// L-49: an integer-flagged array arith-coerces element VALUES on every
@@ -3541,8 +3541,8 @@ mod shopt_tests {
             AssignKind::Set,
             AssignSource::Indexed(m),
         ).unwrap();
-        assert_eq!(shell.lookup_array_element("a", 0).as_deref(), Some("5"));
-        assert_eq!(shell.lookup_array_element("a", 1).as_deref(), Some("20"));
+        assert_eq!(shell.lookup_indexed_element("a", 0).as_deref(), Some("5"));
+        assert_eq!(shell.lookup_indexed_element("a", 1).as_deref(), Some("20"));
         assert!(shell.is_integer("a")); // flag survives the replace
 
         // indexed element coerces
@@ -3551,7 +3551,7 @@ mod shopt_tests {
             AssignKind::Set,
             AssignSource::Scalar("6/2".into()),
         ).unwrap();
-        assert_eq!(shell.lookup_array_element("a", 2).as_deref(), Some("3"));
+        assert_eq!(shell.lookup_indexed_element("a", 2).as_deref(), Some("3"));
 
         // whole associative literal coerces VALUES (not keys)
         shell.declare_associative("m").unwrap();
@@ -3588,7 +3588,7 @@ mod shopt_tests {
             AssignKind::Set,
             AssignSource::Indexed(m2),
         ).unwrap();
-        assert_eq!(shell.lookup_array_element("plain", 0).as_deref(), Some("2+3"));
+        assert_eq!(shell.lookup_indexed_element("plain", 0).as_deref(), Some("2+3"));
     }
 
     /// Proves that assign() enforces readonly on every write path (scalar).

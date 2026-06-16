@@ -712,7 +712,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 } else {
                     match crate::expand::eval_subscript(&sub_word, shell, name) {
                         Ok(idx) => {
-                            if shell.unset_array_element(name, idx).is_err() {
+                            if shell.unset_indexed_element(name, idx).is_err() {
                                 any_error = true;
                             }
                         }
@@ -1704,12 +1704,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 } else if want_array {
                     // Promote existing scalar to element 0 (bash semantics)
                     // or create an empty indexed array.
-                    if shell.get_array(name).is_none() {
+                    if shell.get_indexed(name).is_none() {
                         let mut empty = std::collections::BTreeMap::new();
                         if let Some(scalar) = shell.get(name) {
                             empty.insert(0, scalar.to_string());
                         }
-                        if shell.replace_array(name, empty).is_err() {
+                        if shell.replace_indexed(name, empty).is_err() {
                             exit = 1;
                             // Shape creation FAILED — skip the post-chain
                             // mark_integer (consistent with the associative
@@ -2224,7 +2224,7 @@ fn builtin_declare_decl(
         // Apply integer-flag flips before any value-set path. For ARRAY/assoc
         // declarations the integer flag is applied AFTER shape creation
         // (mark_integer creates an empty Scalar when the name is unset, which
-        // would otherwise make declare_associative/replace_array see a scalar);
+        // would otherwise make declare_associative/replace_indexed see a scalar);
         // see the deferred `mark_integer` below. For a plain (scalar) integer
         // declaration it must run BEFORE the `=value` path so the value coerces.
         if want_integer && !(want_array || want_associative) {
@@ -2238,12 +2238,12 @@ fn builtin_declare_decl(
         // scalar to element 0 (or create empty array). With a value,
         // fall through into the assignment path below — it always
         // routes compound RHS through apply_one_assignment.
-        if want_array && assign_opt.is_none() && shell.get_array(name).is_none() {
+        if want_array && assign_opt.is_none() && shell.get_indexed(name).is_none() {
             let mut empty = std::collections::BTreeMap::new();
             if let Some(scalar) = shell.get(name) {
                 empty.insert(0, scalar.to_string());
             }
-            if shell.replace_array(name, empty).is_err() {
+            if shell.replace_indexed(name, empty).is_err() {
                 eprintln!("huck: declare: {name}: readonly variable");
                 exit = 1;
                 continue;
@@ -2836,13 +2836,13 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
         None => {
             let map: std::collections::BTreeMap<usize, String> =
                 elements.into_iter().enumerate().collect();
-            if shell.replace_array(&array_name, map).is_err() {
+            if shell.replace_indexed(&array_name, map).is_err() {
                 return ExecOutcome::Continue(1);
             }
         }
         Some(o) => {
             for (k, val) in elements.into_iter().enumerate() {
-                if shell.set_array_element(&array_name, o + k, val).is_err() {
+                if shell.set_indexed_element(&array_name, o + k, val).is_err() {
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -3025,8 +3025,8 @@ fn builtin_read(
         let fields = split_read_fields(&line, &ifs);
         let map: std::collections::BTreeMap<usize, String> =
             fields.into_iter().enumerate().collect();
-        if shell.replace_array(&arr, map).is_err() {
-            return ExecOutcome::Continue(1); // replace_array printed the readonly message
+        if shell.replace_indexed(&arr, map).is_err() {
+            return ExecOutcome::Continue(1); // replace_indexed printed the readonly message
         }
         return ExecOutcome::Continue(0);
     }
@@ -12453,15 +12453,15 @@ mod array_declare_tests {
     fn declare_dash_a_creates_empty_array() {
         let mut s = Shell::new();
         let _ = run(&mut s, "declare -a a");
-        assert!(s.get_array("a").is_some());
-        assert_eq!(s.get_array("a").unwrap().len(), 0);
+        assert!(s.get_indexed("a").is_some());
+        assert_eq!(s.get_indexed("a").unwrap().len(), 0);
     }
 
     #[test]
     fn declare_dash_a_with_value() {
         let mut s = Shell::new();
         let _ = run(&mut s, "declare -a a=(x y)");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert_eq!(m.get(&0).map(String::as_str), Some("x"));
         assert_eq!(m.get(&1).map(String::as_str), Some("y"));
     }
@@ -12486,7 +12486,7 @@ mod array_declare_tests {
         let outcome = run(&mut s, "declare -ai a=(2+3 4*5)");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(s.is_integer("a"));
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert_eq!(m.get(&0).map(String::as_str), Some("5"));
         assert_eq!(m.get(&1).map(String::as_str), Some("20"));
     }
@@ -12496,7 +12496,7 @@ mod array_declare_tests {
         let mut s = Shell::new();
         let _ = run(&mut s, "readonly a=(x y)");
         let _ = run(&mut s, "a[2]=z");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert!(m.get(&2).is_none());
     }
 
@@ -12508,7 +12508,7 @@ mod array_declare_tests {
             outcome,
             ExecOutcome::Continue(1) | ExecOutcome::Exit(1)
         ));
-        assert!(s.get_array("a").is_none());
+        assert!(s.get_indexed("a").is_none());
     }
 
     #[test]
@@ -12612,7 +12612,7 @@ mod assoc_declare_tests {
         let _ = run(&mut s, "a=(x y z)");
         let outcome = run(&mut s, "declare -A a");
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
-        assert!(s.get_array("a").is_some());
+        assert!(s.get_indexed("a").is_some());
         assert!(s.get_associative("a").is_none());
     }
 

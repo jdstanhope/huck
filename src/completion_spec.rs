@@ -287,7 +287,7 @@ fn call_completion_function(
     for (i, w) in ctx.comp_words.iter().enumerate() {
         words_map.insert(i, w.clone());
     }
-    let _ = shell.replace_array("COMP_WORDS", words_map);
+    let _ = shell.replace_indexed("COMP_WORDS", words_map);
 
     // Clear COMPREPLY so the function can detect "not set yet" if it
     // wants — and so an empty result is unambiguous.
@@ -317,7 +317,7 @@ fn call_completion_function(
     shell.in_completion = saved_in_completion;
 
     // 6. Read COMPREPLY (values in index order).
-    let reply_values: Vec<String> = match shell.get_array("COMPREPLY") {
+    let reply_values: Vec<String> = match shell.get_indexed("COMPREPLY") {
         Some(map) => map.values().cloned().collect(),
         None => Vec::new(),
     };

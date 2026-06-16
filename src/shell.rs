@@ -671,7 +671,7 @@ pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
     }
     // Collect owned strings first so the immutable borrow ends before the
     // `&mut shell` process_line calls below.
-    let commands: Vec<String> = if let Some(map) = shell.get_array("PROMPT_COMMAND") {
+    let commands: Vec<String> = if let Some(map) = shell.get_indexed("PROMPT_COMMAND") {
         map.values().filter(|s| !s.is_empty()).cloned().collect()
     } else {
         match shell.lookup_var("PROMPT_COMMAND") {
@@ -904,7 +904,7 @@ mod prompt_command_tests {
         let mut shell = interactive_shell();
         // literal element strings — NOT pre-expanded; each runs as a command later.
         shell
-            .replace_array("PROMPT_COMMAND", arr(&["ORDER=${ORDER}a", "ORDER=${ORDER}b"]))
+            .replace_indexed("PROMPT_COMMAND", arr(&["ORDER=${ORDER}a", "ORDER=${ORDER}b"]))
             .unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
         assert_eq!(shell.get("ORDER"), Some("ab"), "both elements ran, in order");
@@ -913,7 +913,7 @@ mod prompt_command_tests {
     #[test]
     fn array_skips_empty_elements() {
         let mut shell = interactive_shell();
-        shell.replace_array("PROMPT_COMMAND", arr(&["MA=1", "", "MB=1"])).unwrap();
+        shell.replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "", "MB=1"])).unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
         assert_eq!(shell.get("MA"), Some("1"));
         assert_eq!(shell.get("MB"), Some("1"));
@@ -922,7 +922,7 @@ mod prompt_command_tests {
     #[test]
     fn array_propagates_exit_and_stops() {
         let mut shell = interactive_shell();
-        shell.replace_array("PROMPT_COMMAND", arr(&["MA=1", "exit 7", "MB=1"])).unwrap();
+        shell.replace_indexed("PROMPT_COMMAND", arr(&["MA=1", "exit 7", "MB=1"])).unwrap();
         assert_eq!(fire_prompt_command(&mut shell), Some(7));
         assert_eq!(shell.get("MA"), Some("1"), "element before exit ran");
         assert_eq!(shell.get("MB"), None, "element after exit did NOT run");
@@ -931,7 +931,7 @@ mod prompt_command_tests {
     #[test]
     fn array_last_status_reflects_last_element() {
         let mut shell = interactive_shell();
-        shell.replace_array("PROMPT_COMMAND", arr(&["true", "false"])).unwrap();
+        shell.replace_indexed("PROMPT_COMMAND", arr(&["true", "false"])).unwrap();
         assert_eq!(fire_prompt_command(&mut shell), None);
         assert_eq!(shell.last_status(), 1, "last element (false) sets $?");
     }

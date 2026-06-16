@@ -1774,12 +1774,12 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
                             )
                         })
                         .collect();
-                    let _ = shell.replace_array("BASH_REMATCH", map);
+                    let _ = shell.replace_indexed("BASH_REMATCH", map);
                     Ok(true)
                 }
                 None => {
                     // bash clears BASH_REMATCH to an empty array on no match.
-                    let _ = shell.replace_array("BASH_REMATCH", std::collections::BTreeMap::new());
+                    let _ = shell.replace_indexed("BASH_REMATCH", std::collections::BTreeMap::new());
                     Ok(false)
                 }
             }
@@ -4406,7 +4406,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     let mut elems: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     elems.insert(0, read_fd.to_string());
     elems.insert(1, write_fd.to_string());
-    let _ = shell.replace_array(name, elems);
+    let _ = shell.replace_indexed(name, elems);
     shell.set(format!("{name}_PID").as_str(), pid.to_string());
     shell.last_bg_pid = Some(pid);
     shell.jobs.add(pid, vec![pid], format!("coproc {name}"));
@@ -5387,9 +5387,9 @@ fn is_array_value_word(word: &crate::lexer::Word) -> bool {
 
 /// Applies one `Assignment` to `shell`. Dispatches on the four
 /// combinations of (target kind, value kind):
-///   1. Bare + compound array RHS  →  `replace_array` / `extend_indexed`
+///   1. Bare + compound array RHS  →  `replace_indexed` / `extend_indexed`
 ///   2. Bare + scalar RHS          →  `try_set` / scalar+=value
-///   3. Indexed + scalar RHS       →  `set_array_element` / `append_array_element`
+///   3. Indexed + scalar RHS       →  `set_indexed_element` / `append_indexed_element`
 ///   4. Indexed + compound array   →  rejected (matches bash)
 ///
 /// Returns `Err(())` on readonly violation or other write failure
@@ -5487,8 +5487,8 @@ pub(crate) fn apply_one_assignment(
                 // Starting auto-index: max+1 for an existing array; 1 for a
                 // scalar (which promotes to element 0); 0 when unset — matching
                 // extend_indexed's promotion.
-                // get_array is nameref-aware, so it sees the target's array for namerefs.
-                let start = if shell.get_array(name).is_some() {
+                // get_indexed is nameref-aware, so it sees the target's array for namerefs.
+                let start = if shell.get_indexed(name).is_some() {
                     shell.array_max_index(name).map_or(0, |m| m + 1)
                 } else if shell.lookup_var(name).is_some() {
                     // Use lookup_var (nameref-aware) so a nameref to a scalar gives start=1.
@@ -5501,7 +5501,7 @@ pub(crate) fn apply_one_assignment(
             } else {
                 // a=(elements): replace whole array.
                 let map = build_array_map(elements, name, shell)?;
-                shell.replace_array(name, map).map_err(|_| ())
+                shell.replace_indexed(name, map).map_err(|_| ())
             }
         }
         // Bare name + scalar RHS.
@@ -5510,9 +5510,9 @@ pub(crate) fn apply_one_assignment(
             if a.append {
                 // a+=v: on a scalar, concatenate; on an array, append to element 0
                 // (bash: `a=(x y); a+=z; echo "${a[0]}"` → "xz").
-                match shell.get_array(name) {
+                match shell.get_indexed(name) {
                     Some(_) => shell
-                        .append_array_element(name, 0, &s)
+                        .append_indexed_element(name, 0, &s)
                         .map_err(|_| ()),
                     None => {
                         // Use lookup_var (nameref-aware) so that `r+=v` where r is a
@@ -5558,15 +5558,15 @@ pub(crate) fn apply_one_assignment(
                 // Integer array element `a[i]+=v` is ARITHMETIC addition, like
                 // the scalar case (bash: `declare -ai a=(5); a[0]+=3` -> 8).
                 if shell.is_integer(name) {
-                    let existing = shell.lookup_array_element(name, idx).unwrap_or_default();
+                    let existing = shell.lookup_indexed_element(name, idx).unwrap_or_default();
                     let cur = arith_eval_operand(&existing, shell).unwrap_or(0);
                     let add = arith_eval_operand(&v, shell).unwrap_or(0);
-                    shell.set_array_element(name, idx, (cur + add).to_string()).map_err(|_| ())
+                    shell.set_indexed_element(name, idx, (cur + add).to_string()).map_err(|_| ())
                 } else {
-                    shell.append_array_element(name, idx, &v).map_err(|_| ())
+                    shell.append_indexed_element(name, idx, &v).map_err(|_| ())
                 }
             } else {
-                shell.set_array_element(name, idx, v).map_err(|_| ())
+                shell.set_indexed_element(name, idx, v).map_err(|_| ())
             }
         }
         // Subscripted lvalue + compound array RHS: bash rejects this.
@@ -7536,7 +7536,7 @@ mod array_assign_tests {
     fn compound_assign_creates_array() {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y z)");
-        let m = s.get_array("a").expect("a should be an array");
+        let m = s.get_indexed("a").expect("a should be an array");
         assert_eq!(m.get(&0).map(String::as_str), Some("x"));
         assert_eq!(m.get(&1).map(String::as_str), Some("y"));
         assert_eq!(m.get(&2).map(String::as_str), Some("z"));
@@ -7546,7 +7546,7 @@ mod array_assign_tests {
     fn sparse_compound_assign_respects_explicit_subscripts() {
         let mut s = Shell::new();
         run_line(&mut s, "a=([5]=x [2]=y)");
-        let m = s.get_array("a").expect("a should be an array");
+        let m = s.get_indexed("a").expect("a should be an array");
         assert_eq!(m.len(), 2);
         assert_eq!(m.get(&5).map(String::as_str), Some("x"));
         assert_eq!(m.get(&2).map(String::as_str), Some("y"));
@@ -7556,7 +7556,7 @@ mod array_assign_tests {
     fn element_assign_creates_array() {
         let mut s = Shell::new();
         run_line(&mut s, "a[3]=hello");
-        let m = s.get_array("a").expect("a should be an array");
+        let m = s.get_indexed("a").expect("a should be an array");
         assert_eq!(m.get(&3).map(String::as_str), Some("hello"));
     }
 
@@ -7565,7 +7565,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=old");
         run_line(&mut s, "a[2]=new");
-        let m = s.get_array("a").expect("scalar should promote to array");
+        let m = s.get_indexed("a").expect("scalar should promote to array");
         assert_eq!(m.get(&0).map(String::as_str), Some("old"));
         assert_eq!(m.get(&2).map(String::as_str), Some("new"));
     }
@@ -7575,7 +7575,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y)");
         run_line(&mut s, "a+=(z w)");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert_eq!(
             m.values().cloned().collect::<Vec<_>>(),
             vec![
@@ -7592,7 +7592,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a[0]=hello");
         run_line(&mut s, "a[0]+=_world");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert_eq!(m.get(&0).map(String::as_str), Some("hello_world"));
     }
 
@@ -7602,7 +7602,7 @@ mod array_assign_tests {
         run_line(&mut s, "a=(initial)");
         s.mark_readonly("a");
         run_line(&mut s, "a=(changed)");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert_eq!(m.get(&0).map(String::as_str), Some("initial"));
     }
 
@@ -7612,7 +7612,7 @@ mod array_assign_tests {
         run_line(&mut s, "a=(initial)");
         s.mark_readonly("a");
         run_line(&mut s, "a[5]=new");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert!(m.get(&5).is_none());
     }
 
@@ -7621,7 +7621,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y z)");
         run_line(&mut s, "unset a[1]");
-        let m = s.get_array("a").unwrap();
+        let m = s.get_indexed("a").unwrap();
         assert!(m.get(&1).is_none());
         assert_eq!(m.get(&0).map(String::as_str), Some("x"));
         assert_eq!(m.get(&2).map(String::as_str), Some("z"));
@@ -7632,7 +7632,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y z)");
         run_line(&mut s, "unset a");
-        assert!(s.get_array("a").is_none());
+        assert!(s.get_indexed("a").is_none());
         assert!(s.get("a").is_none());
     }
 
@@ -7643,7 +7643,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y)");
         run_line(&mut s, "a+=z");
-        let m = s.get_array("a").expect("still an array");
+        let m = s.get_indexed("a").expect("still an array");
         assert_eq!(m.get(&0).map(String::as_str), Some("xz"));
         assert_eq!(m.get(&1).map(String::as_str), Some("y"));
     }
@@ -7654,7 +7654,7 @@ mod array_assign_tests {
         // it with a diagnostic and leaves `a` empty.
         let mut s = Shell::new();
         run_line(&mut s, "a[0]=(x y)");
-        assert!(s.get_array("a").is_none());
+        assert!(s.get_indexed("a").is_none());
     }
 
     #[test]
@@ -7664,7 +7664,7 @@ mod array_assign_tests {
         let mut s = Shell::new();
         run_line(&mut s, "a=(x y z)");
         run_line(&mut s, "unset a[]");
-        let m = s.get_array("a").expect("a should still exist");
+        let m = s.get_indexed("a").expect("a should still exist");
         assert_eq!(m.len(), 3);
     }
 }
@@ -7690,9 +7690,9 @@ mod assoc_assign_tests {
         // Bash gotcha: `m[foo]=v` on unset `m` creates indexed (foo→0).
         let mut s = Shell::new();
         run(&mut s, "m[foo]=bar");
-        assert!(s.get_array("m").is_some());
+        assert!(s.get_indexed("m").is_some());
         assert!(s.get_associative("m").is_none());
-        assert_eq!(s.lookup_array_element("m", 0), Some("bar".into()));
+        assert_eq!(s.lookup_indexed_element("m", 0), Some("bar".into()));
     }
 
     #[test]
@@ -7799,7 +7799,7 @@ mod assoc_assign_tests {
         s.set_associative_element("foo", "k".into(), "v".into())
             .unwrap();
         run(&mut s, "bar[baz]=value");
-        assert!(s.get_array("bar").is_some(), "bar should be indexed");
+        assert!(s.get_indexed("bar").is_some(), "bar should be indexed");
         assert!(
             s.get_associative("bar").is_none(),
             "bar should NOT be associative"

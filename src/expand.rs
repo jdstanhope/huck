@@ -591,7 +591,7 @@ fn expand_array_param(
 
     // Snapshot the array's values / keys in subscript-ascending order.
     let collect_values = |sh: &Shell| -> Vec<String> {
-        match sh.get_array(name) {
+        match sh.get_indexed(name) {
             Some(m) => m.values().cloned().collect(),
             None => match sh.get(name) {
                 Some(s) => vec![s.to_string()],
@@ -600,7 +600,7 @@ fn expand_array_param(
         }
     };
     let collect_keys = |sh: &Shell| -> Vec<usize> {
-        match sh.get_array(name) {
+        match sh.get_indexed(name) {
             Some(m) => m.keys().copied().collect(),
             None => match sh.get(name) {
                 Some(_) => vec![0],
@@ -632,7 +632,7 @@ fn expand_array_param(
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
-            let val = shell.lookup_array_element(name, idx);
+            let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
                 eprintln!("huck: {name}[{idx}]: unbound variable");
                 shell.pending_fatal_pe_error = Some(1);
@@ -654,7 +654,7 @@ fn expand_array_param(
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
-            let val = shell.lookup_array_element(name, idx).unwrap_or_default();
+            let val = shell.lookup_indexed_element(name, idx).unwrap_or_default();
             ExpansionResult::Value(val.chars().count().to_string())
         }
         // ${!a[@]} / ${!a[*]} — list of subscripts.
@@ -702,7 +702,7 @@ fn expand_array_param(
                 Ok(i) => i,
                 Err(_) => return ExpansionResult::Value(String::new()),
             };
-            let val = shell.lookup_array_element(name, idx);
+            let val = shell.lookup_indexed_element(name, idx);
             crate::param_expansion::expand_modifier_with_value(
                 name,
                 modif,
