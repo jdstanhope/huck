@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 18 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 41 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -323,15 +323,6 @@ than silently producing invalid UTF-8.
 - **bash**: a quoted span inside an `=~` regex is treated as a literal string (regex metacharacters within it are escaped).
 - **Why intentional**: bash_completion's regexes (the M-100 driver) use `\`-escapes for literal characters, not quoting-for-literal-match, so this gap doesn't affect the real-world payload; matching it would require tracking quote spans through expansion and re-escaping them for the regex engine.
 - **Workaround**: use a `\`-escape (`\.`) rather than quoting (`"."`) to match a regex metacharacter literally inside `=~`.
-
-### L-24: a command substitution nested inside `$(( … ))` does not inherit extglob
-
-- **Status**: `[intentional]`, low (noted v106)
-- **Severity**: low
-- **huck**: M-101 threads the parent's `LexerOptions` through every nested-body re-tokenization EXCEPT one: `arith_string_to_word` (which lexes an arithmetic body for `$(( … ))` / `(( … ))`) keeps its existing `pub(crate)` signature and passes `LexerOptions::default()`, so a command substitution nested inside arithmetic re-lexes with extglob OFF even when `shopt -s extglob` is on. An extglob pattern inside `$(( $(…!(x)…) ))` would therefore fail to lex.
-- **bash**: extglob applies inside an arithmetic-nested command substitution too.
-- **Why intentional**: a negligible edge — an extglob pattern inside a command substitution inside arithmetic does not occur in any real-world payload (bash_completion / nvm / etc.). Threading `opts` here would mean changing `arith_string_to_word`'s `pub(crate)` signature and all its callers for no observed benefit; deferred until a real case appears.
-- **Workaround**: none needed in practice; lift the extglob command substitution out of the arithmetic context.
 
 ### L-25: a builtin's `2>&1` inside a capture context can't capture stderr
 
