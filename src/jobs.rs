@@ -34,6 +34,11 @@ pub struct Job {
     pub notified: bool,
     pub created_at: u64,
     pub marked_for_nohup: bool,
+    /// True when this job has its OWN process group (`setpgid`'d at spawn —
+    /// interactive job control, or any stopped/own-group job). False when the
+    /// job shares the shell's process group (a non-interactive background job,
+    /// since v173): signal it per-pid, never `killpg`. Bash's `J_JOBCONTROL`.
+    pub own_pgroup: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,9 +57,22 @@ impl JobTable {
         &self.jobs
     }
 
-    /// Inserts a new Running job. Allocates the lowest unused job id
-    /// (bash-style reuse). Returns the allocated id.
+    /// Inserts a new Running job that owns its process group (the common case:
+    /// interactive job control). Allocates the lowest unused job id. Returns it.
     pub fn add(&mut self, pgid: i32, pids: Vec<i32>, command: String) -> u32 {
+        self.add_with_pgroup(pgid, pids, command, true)
+    }
+
+    /// Like `add`, but records whether the job owns its process group. A
+    /// non-interactive background job shares the shell's group (`own_pgroup =
+    /// false`) and must be signalled per-pid.
+    pub fn add_with_pgroup(
+        &mut self,
+        pgid: i32,
+        pids: Vec<i32>,
+        command: String,
+        own_pgroup: bool,
+    ) -> u32 {
         let id = self.next_id();
         let n = pids.len();
         let job = Job {
@@ -68,6 +86,7 @@ impl JobTable {
             notified: false,
             created_at: self.next_created_at,
             marked_for_nohup: false,
+            own_pgroup,
         };
         self.next_created_at += 1;
         self.jobs.push(job);
@@ -92,6 +111,7 @@ impl JobTable {
             notified: false,
             created_at: self.next_created_at,
             marked_for_nohup: false,
+            own_pgroup: true,
         };
         self.next_created_at += 1;
         self.jobs.push(job);
