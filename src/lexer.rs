@@ -557,7 +557,7 @@ fn tokenize_partial_inner(
                         Some('$') => {
                             // Expansion inside double quotes (quoted: true).
                             flush_literal(&mut parts, &mut quoted_current, true);
-                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
+                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             // Backtick substitution inside double quotes (quoted: true).
@@ -601,7 +601,7 @@ fn tokenize_partial_inner(
                 // Expansion outside any quotes (quoted: false).
                 has_token = true;
                 flush_literal(&mut parts, &mut current, false);
-                read_dollar_expansion(&mut chars, &mut parts, false, opts)?;
+                scan_dollar_expansion(&mut chars, &mut parts, false, opts)?;
             }
             '#' if !has_token => {
                 // POSIX: an unquoted `#` that begins a word starts a comment
@@ -894,7 +894,7 @@ fn tokenize_partial_inner(
                 if chars.peek() == Some(&'(') {
                     chars.next(); // consume '('
                     flush_literal(&mut parts, &mut current, false);
-                    let elements = read_array_literal(&mut chars, opts)?;
+                    let elements = scan_array_literal(&mut chars, opts)?;
                     parts.push(WordPart::ArrayLiteral(elements));
                 }
             }
@@ -921,7 +921,7 @@ fn tokenize_partial_inner(
                 // Compound RHS: `name+=(...)`.
                 if chars.peek() == Some(&'(') {
                     chars.next();
-                    let elements = read_array_literal(&mut chars, opts)?;
+                    let elements = scan_array_literal(&mut chars, opts)?;
                     parts.push(WordPart::ArrayLiteral(elements));
                 }
             }
@@ -996,7 +996,7 @@ fn tokenize_partial_inner(
                         // Compound RHS: `name[i]=(...)`.
                         if chars.peek() == Some(&'(') {
                             chars.next();
-                            let elements = read_array_literal(&mut chars, opts)?;
+                            let elements = scan_array_literal(&mut chars, opts)?;
                             parts.push(WordPart::ArrayLiteral(elements));
                         }
                     }
@@ -1138,7 +1138,7 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<
         match c {
             '$' => {
                 flush(&mut lit, &mut parts);
-                read_dollar_expansion(chars, &mut parts, false, opts)?;
+                scan_dollar_expansion(chars, &mut parts, false, opts)?;
             }
             '`' => {
                 flush(&mut lit, &mut parts);
@@ -1174,7 +1174,7 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<
                         },
                         Some('$') => {
                             flush_literal(&mut parts, &mut q, true);
-                            read_dollar_expansion(chars, &mut parts, true, opts)?;
+                            scan_dollar_expansion(chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_literal(&mut parts, &mut q, true);
@@ -1231,7 +1231,7 @@ fn scan_extglob_group(
         match c {
             '$' => {
                 flush(&mut lit, &mut group_parts);
-                read_dollar_expansion(chars, &mut group_parts, false, opts)?;
+                scan_dollar_expansion(chars, &mut group_parts, false, opts)?;
             }
             '`' => {
                 flush(&mut lit, &mut group_parts);
@@ -1269,7 +1269,7 @@ fn scan_extglob_group(
                         },
                         Some('$') => {
                             flush_literal(&mut group_parts, &mut quoted_current, true);
-                            read_dollar_expansion(chars, &mut group_parts, true, opts)?;
+                            scan_dollar_expansion(chars, &mut group_parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_literal(&mut group_parts, &mut quoted_current, true);
@@ -1403,7 +1403,7 @@ fn emit_word_with_braces(
 /// unquoted brace, returns the single input list unchanged. Non-literal
 /// parts (expansions, quoted runs) are sentinel-protected so only literal
 /// source braces expand. Shared by `emit_word_with_braces` (command words)
-/// and `read_array_literal` (bare array elements).
+/// and `scan_array_literal` (bare array elements).
 fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
     if !word_contains_unquoted_brace(&parts) {
         return Ok(vec![parts]);
@@ -1618,7 +1618,7 @@ fn scan_expanding_body_line(
             '$' => {
                 flush_body_literal(parts, &mut current, false);
                 // Heredoc bodies are quoted-context (no word-splitting).
-                read_dollar_expansion(&mut chars, parts, true, opts)?;
+                scan_dollar_expansion(&mut chars, parts, true, opts)?;
             }
             '`' => {
                 flush_body_literal(parts, &mut current, false);
@@ -1665,7 +1665,7 @@ pub(crate) fn arith_string_to_word(s: &str, opts: LexerOptions) -> Result<Word, 
             '$' => {
                 flush_lit!();
                 chars.next();
-                read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
+                scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
             }
             '`' => {
                 flush_lit!();
@@ -1707,7 +1707,7 @@ pub(crate) fn arith_string_to_word(s: &str, opts: LexerOptions) -> Result<Word, 
                         '$' => {
                             flush_lit!();
                             chars.next();
-                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
+                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         '`' => {
                             flush_lit!();
@@ -1726,7 +1726,7 @@ pub(crate) fn arith_string_to_word(s: &str, opts: LexerOptions) -> Result<Word, 
     Ok(Word(parts))
 }
 
-fn read_dollar_expansion(
+fn scan_dollar_expansion(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
@@ -1747,11 +1747,11 @@ fn read_dollar_expansion(
         }
         Some('{') => {
             chars.next();
-            read_braced_param_expansion(chars, parts, quoted, opts)?;
+            scan_braced_param_expansion(chars, parts, quoted, opts)?;
         }
         Some('\'') => {
             chars.next();
-            let text = read_ansi_c_quoted(chars)?;
+            let text = scan_ansi_c_quoted(chars)?;
             parts.push(WordPart::Literal { text, quoted: true });
         }
         Some('?') => {
@@ -1787,7 +1787,7 @@ fn read_dollar_expansion(
             parts.push(WordPart::Var { name: d.to_string(), quoted });
         }
         Some(c) if is_name_start(c) => {
-            let name = read_var_name(chars);
+            let name = scan_var_name(chars);
             parts.push(WordPart::Var { name, quoted });
         }
         _ => {
@@ -1801,7 +1801,7 @@ fn read_dollar_expansion(
 /// already been consumed; this scans forward, processing C-style backslash
 /// escapes, until the matching unescaped `'` is consumed. Returns the
 /// decoded string.
-fn read_ansi_c_quoted(
+fn scan_ansi_c_quoted(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut out = String::new();
@@ -2284,7 +2284,7 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
             }
             '$' => {
                 flush_body_literal(&mut parts, &mut cur, false);
-                read_dollar_expansion(&mut chars, &mut parts, false, opts)?;
+                scan_dollar_expansion(&mut chars, &mut parts, false, opts)?;
             }
             '`' => {
                 flush_body_literal(&mut parts, &mut cur, false);
@@ -2321,7 +2321,7 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
                         },
                         Some('$') => {
                             flush_body_literal(&mut parts, &mut cur, true);
-                            read_dollar_expansion(&mut chars, &mut parts, true, opts)?;
+                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
                             flush_body_literal(&mut parts, &mut cur, true);
@@ -2398,7 +2398,7 @@ fn empty_sequence() -> crate::command::Sequence {
     }
 }
 
-fn read_var_name(chars: &mut CharCursor<'_>) -> String {
+fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
     let mut name = String::new();
     while let Some(&c) = chars.peek() {
         if is_name_cont(c) {
@@ -2414,7 +2414,7 @@ fn read_var_name(chars: &mut CharCursor<'_>) -> String {
 /// Reads a `${...}` parameter expansion. The opening `$` and `{` have
 /// already been consumed. Pushes either a `WordPart::Var` (plain `${name}`)
 /// or a `WordPart::ParamExpansion` (any modifier).
-fn read_braced_param_expansion(
+fn scan_braced_param_expansion(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
@@ -2489,7 +2489,7 @@ fn read_braced_param_expansion(
             }
             Some('@') => { chars.next(); "@".to_string() }
             Some('*') => { chars.next(); "*".to_string() }
-            _ => read_braced_name(chars)?,
+            _ => scan_braced_name(chars)?,
         };
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
@@ -2547,7 +2547,7 @@ fn read_braced_param_expansion(
         }
         // `${!N}` — indirect through a numeric positional source (e.g.
         // `${!2}`, `${!1-default}`). The source name is a positional
-        // parameter reference; `read_braced_name` rejects digit-leading
+        // parameter reference; `scan_braced_name` rejects digit-leading
         // names, so read the run of digits directly here. Positionals
         // cannot be subscripted, so the subscript is `None`.
         if matches!(chars.peek().copied(), Some(c) if c.is_ascii_digit()) {
@@ -2562,7 +2562,7 @@ fn read_braced_param_expansion(
             }
             return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts);
         }
-        let name = read_braced_name(chars)?;
+        let name = scan_braced_name(chars)?;
         if name.is_empty() {
             return Err(LexError::EmptyParamName);
         }
@@ -2591,7 +2591,7 @@ fn read_braced_param_expansion(
         }
     }
 
-    let name = read_braced_name(chars)?;
+    let name = scan_braced_name(chars)?;
     if name.is_empty() {
         return Err(LexError::EmptyParamName);
     }
@@ -2603,7 +2603,7 @@ fn read_braced_param_expansion(
 /// Scans an optional `[…]` subscript immediately after the parameter name
 /// inside a `${…}` form. Returns `None` if the next char isn't `[`.
 /// Special sigils `@` and `*` produce `SubscriptKind::All` / `Star`;
-/// any other expression is parsed via `read_subscript` into
+/// any other expression is parsed via `scan_subscript` into
 /// `SubscriptKind::Index`.
 fn scan_param_subscript(
     chars: &mut CharCursor<'_>,
@@ -2626,7 +2626,7 @@ fn scan_param_subscript(
             }))
         }
         _ => {
-            let inner = read_subscript(chars, opts)?;
+            let inner = scan_subscript(chars, opts)?;
             Ok(Some(SubscriptKind::Index(inner)))
         }
     }
@@ -2635,7 +2635,7 @@ fn scan_param_subscript(
 /// Scans `expr]` and returns the Word inside the brackets. Caller has
 /// already consumed the leading `[`. Balanced over nested `[…]` (for
 /// arith-style expressions like `a[$((i+1))]`).
-fn read_subscript(
+fn scan_subscript(
     chars: &mut CharCursor<'_>,
     opts: LexerOptions,
 ) -> Result<Word, LexError> {
@@ -2697,7 +2697,7 @@ fn parse_subscript_body(src: &str, opts: LexerOptions) -> Result<Word, LexError>
 /// are all preserved verbatim and re-tokenized into a single Word per
 /// element. Subscripted elements `[expr]=value` carry an explicit
 /// `subscript` Word.
-fn read_array_literal(
+fn scan_array_literal(
     chars: &mut CharCursor<'_>,
     opts: LexerOptions,
 ) -> Result<Vec<ArrayLiteralElement>, LexError> {
@@ -2716,7 +2716,7 @@ fn read_array_literal(
         // Optional explicit `[expr]=`.
         let subscript = if chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            let sub = read_subscript(chars, opts)?;
+            let sub = scan_subscript(chars, opts)?;
             if chars.next() != Some('=') {
                 return Err(LexError::ArrayLiteralMissingEquals);
             }
@@ -2724,7 +2724,7 @@ fn read_array_literal(
         } else {
             None
         };
-        let value = read_array_element_word(chars, opts)?;
+        let value = scan_array_element_word(chars, opts)?;
         match subscript {
             // Subscripted `[i]=value` keeps single-value semantics (brace stays
             // literal — matches bash for associative subscripts; the indexed
@@ -2761,7 +2761,7 @@ fn skip_array_literal_whitespace(
 /// nested `${…}` so closing `)` inside command substitutions doesn't
 /// end the array literal prematurely. The collected raw text is then
 /// re-tokenized via `tokenize` to produce a `Word`.
-fn read_array_element_word(
+fn scan_array_element_word(
     chars: &mut CharCursor<'_>,
     opts: LexerOptions,
 ) -> Result<Word, LexError> {
@@ -2874,7 +2874,7 @@ fn read_array_element_word(
     // Re-tokenize the collected text as a single Word. Brace expansion is
     // suppressed here so an element like `x{1,2}$v` stays ONE Word with the
     // brace as literal text and `$v` as a real expansion part; the brace is
-    // expanded later by `brace_expand_parts` in `read_array_literal`, which
+    // expanded later by `brace_expand_parts` in `scan_array_literal`, which
     // sentinel-protects the expansion.
     let toks = tokenize_no_brace(&buf, opts)?;
     let mut words: Vec<Word> = Vec::new();
@@ -2902,7 +2902,7 @@ fn read_array_element_word(
 
 /// Reads identifier chars (the parameter name) inside a `${...}` until it
 /// hits a non-identifier char. Does NOT consume the terminator.
-fn read_braced_name(
+fn scan_braced_name(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
     let mut name = String::new();
