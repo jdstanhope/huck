@@ -2016,6 +2016,77 @@ fn scan_arith_body(
 /// Tracks brace-depth, plus `'...'` and `"..."` so a stray `}` inside a
 /// quoted span doesn't close the expansion. Returns the inner text (without
 /// the closing `}`).
+/// Consumes a `$(…)` command substitution body VERBATIM from `chars`, starting
+/// just after the opening `(` (which the caller has already appended to `out`),
+/// through the matching `)` (also appended). Any unquoted `(` raises the paren
+/// depth and any unquoted `)` lowers it, so nested `$(…)`, `$((…))`, and
+/// `$( (…) )` all balance; `'…'`/`"…"` spans are skipped (double-quote honors
+/// `\`) so a `)` or `}` inside them does not affect depth. Running out of input
+/// yields `Err(LexError::UnterminatedBrace)` (the same error `scan_braced_operand`
+/// raises for an unterminated operand). Mirrors `scan_paren_substitution`'s loop
+/// but appends text instead of parsing it.
+fn consume_paren_cmdsub_verbatim(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+) -> Result<(), LexError> {
+    let mut depth: u32 = 1;
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedBrace),
+            Some('(') => {
+                depth += 1;
+                out.push('(');
+            }
+            Some(')') => {
+                depth -= 1;
+                out.push(')');
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
+            Some('\\') => {
+                out.push('\\');
+                if let Some(c) = chars.next() {
+                    out.push(c);
+                }
+            }
+            Some('\'') => {
+                out.push('\'');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('\'') => {
+                            out.push('\'');
+                            break;
+                        }
+                        Some(c) => out.push(c),
+                    }
+                }
+            }
+            Some('"') => {
+                out.push('"');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('"') => {
+                            out.push('"');
+                            break;
+                        }
+                        Some('\\') => {
+                            out.push('\\');
+                            if let Some(c) = chars.next() {
+                                out.push(c);
+                            }
+                        }
+                        Some(c) => out.push(c),
+                    }
+                }
+            }
+            Some(c) => out.push(c),
+        }
+    }
+}
+
 fn scan_braced_operand(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
@@ -2057,17 +2128,47 @@ fn scan_braced_operand(
                     }
                 }
             }
+            Some('`') => {
+                // Backtick command substitution: consume verbatim through the
+                // matching unescaped backtick so a `}` inside it does not close
+                // the operand (L-52). `\` escapes the next char inside.
+                body.push('`');
+                loop {
+                    match chars.next() {
+                        None => return Err(LexError::UnterminatedBrace),
+                        Some('`') => {
+                            body.push('`');
+                            break;
+                        }
+                        Some('\\') => {
+                            body.push('\\');
+                            if let Some(c) = chars.next() {
+                                body.push(c);
+                            }
+                        }
+                        Some(c) => body.push(c),
+                    }
+                }
+            }
             Some('$') => {
-                // Only a `${` (dollar-brace) nests the `${...}` and needs a
-                // matching `}`. A BARE `{` (e.g. in a `%%`/`##` glob pattern like
-                // `${x%%[<{(]*}`) is a literal character and must NOT raise depth,
-                // or the real `}` would close the inner brace and the operand would
-                // never terminate.
+                // `${` (dollar-brace) nests the operand and needs a matching `}`.
+                // A BARE `{` (e.g. in a `%%`/`##` glob pattern like `${x%%[<{(]*}`)
+                // is literal and must NOT raise depth. `$(` opens a command
+                // substitution whose body — including any `}` — is consumed
+                // verbatim so it cannot close the operand (L-52).
                 body.push('$');
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    body.push('{');
-                    depth += 1;
+                match chars.peek() {
+                    Some(&'{') => {
+                        chars.next();
+                        body.push('{');
+                        depth += 1;
+                    }
+                    Some(&'(') => {
+                        chars.next();
+                        body.push('(');
+                        consume_paren_cmdsub_verbatim(chars, &mut body)?;
+                    }
+                    _ => {}
                 }
             }
             Some('{') => { body.push('{'); } // bare brace: literal, does not nest
@@ -5137,6 +5238,46 @@ mod tests {
     fn scan_braced_operand_unterminated_is_error() {
         let mut chars = CharCursor::new("foo");
         assert_eq!(scan_braced_operand(&mut chars).unwrap_err(), LexError::UnterminatedBrace);
+    }
+
+    #[test]
+    fn scan_braced_operand_skips_paren_cmdsub_with_brace() {
+        let mut chars = CharCursor::new("$(echo a}b)/Z}");
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo a}b)/Z");
+    }
+
+    #[test]
+    fn scan_braced_operand_skips_backtick_cmdsub_with_brace() {
+        let mut chars = CharCursor::new("`echo a}b`/Z}");
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "`echo a}b`/Z");
+    }
+
+    #[test]
+    fn scan_braced_operand_skips_nested_cmdsub() {
+        let mut chars = CharCursor::new("$(echo $(echo a}b))/Q}");
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo $(echo a}b))/Q");
+    }
+
+    #[test]
+    fn scan_braced_operand_skips_arith_cmdsub() {
+        let mut chars = CharCursor::new("$((1+2))}");
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$((1+2))");
+    }
+
+    #[test]
+    fn scan_braced_operand_unterminated_paren_cmdsub_errors() {
+        let mut chars = CharCursor::new("$(echo a");
+        assert_eq!(
+            scan_braced_operand(&mut chars).unwrap_err(),
+            LexError::UnterminatedBrace
+        );
+    }
+
+    #[test]
+    fn scan_braced_operand_paren_cmdsub_skips_quoted_paren() {
+        // A `)` inside a quoted span within $(…) must not end the substitution.
+        let mut chars = CharCursor::new("$(echo \")\")}");
+        assert_eq!(scan_braced_operand(&mut chars).unwrap(), "$(echo \")\")");
     }
 
     #[test]
