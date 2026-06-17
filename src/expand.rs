@@ -906,9 +906,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                     Err(e) => {
                         eprintln!("huck: arithmetic: {}", e);
-                        shell.set_last_status(1);
-                        has_emitted = true;
-                        // Append nothing; the field stays empty if no other parts.
+                        shell.pending_fatal_pe_error = Some(1);
+                        return result;
                     }
                 }
             }
@@ -1118,8 +1117,8 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
                         eprintln!("huck: arithmetic: {}", e);
-                        shell.set_last_status(1);
-                        // Append nothing.
+                        shell.pending_fatal_pe_error = Some(1);
+                        return result;
                     }
                 }
             }
@@ -2352,13 +2351,14 @@ mod tests {
     }
 
     #[test]
-    fn expand_arith_part_division_by_zero_yields_empty_field_and_sets_status() {
+    fn expand_arith_part_division_by_zero_is_fatal() {
+        // v178: an arithmetic eval error (e.g. division by zero) in $((…)) is a
+        // FATAL expansion error — it sets pending_fatal_pe_error so the command
+        // aborts (matching bash), instead of yielding an empty field + status 0.
         let mut shell = Shell::new();
         let word = Word(vec![arith_part("1 / 0")]);
-        let fields = expand(&word, &mut shell);
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].chars, "");
-        assert_eq!(shell.last_status(), 1);
+        let _ = expand(&word, &mut shell);
+        assert_eq!(shell.pending_fatal_pe_error, Some(1));
     }
 
     #[test]

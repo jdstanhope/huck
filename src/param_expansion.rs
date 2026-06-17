@@ -206,12 +206,12 @@ pub fn expand_modifier_with_value(
             let value = lookup_v(shell);
             let off_n = match eval_substring_index(offset, shell) {
                 Ok(n) => n,
-                Err(()) => return ExpansionResult::Empty,
+                Err(()) => return ExpansionResult::Fatal { status: 1 },
             };
             let len_n = match length {
                 Some(w) => match eval_substring_index(w, shell) {
                     Ok(n) => Some(n),
-                    Err(()) => return ExpansionResult::Empty,
+                    Err(()) => return ExpansionResult::Fatal { status: 1 },
                 },
                 None => None,
             };
@@ -1261,7 +1261,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_modifier_substring_bad_arith_returns_empty_sets_status() {
+    fn expand_modifier_substring_bad_offset_arith_is_fatal() {
+        // v178: a bad arithmetic OFFSET in ${var:off:len} is a fatal expansion
+        // error (matches bash: `${v:1+:2}` exits 1), returning Fatal not Empty.
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_SS5", "abc".to_string());
         let m = ParamModifier::Substring {
@@ -1269,8 +1271,7 @@ mod tests {
             length: None,
         };
         let r = expand_modifier("HUCK_TEST_PE_SS5", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Empty);
-        assert_eq!(shell.last_status(), 1);
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
     }
 
     #[test]
@@ -1335,20 +1336,19 @@ mod tests {
     }
 
     #[test]
-    fn expand_modifier_substring_bad_arith_stays_empty_not_fatal() {
-        // Regression guard: bad arith in offset stays non-fatal (matches
-        // bash: arithmetic errors inside ${var:off:len} operands don't
-        // exit the script).
+    fn expand_modifier_substring_bad_length_arith_is_fatal() {
+        // v178: corrects a prior guard that wrongly claimed bash tolerates a bad
+        // arithmetic index in ${var:off:len}. Empirically bash makes BOTH operands
+        // fatal (`${v:1+:2}` and `${v:0:1+}` exit 1). Here the LENGTH operand is
+        // bad — it must return Fatal, not Empty.
         let mut shell = Shell::new();
         shell.export_set("HUCK_TEST_PE_FATAL5", "hello".to_string());
         let m = ParamModifier::Substring {
-            offset: lit("@@@"),
-            length: None,
+            offset: lit("0"),
+            length: Some(lit("@@@")),
         };
         let r = expand_modifier("HUCK_TEST_PE_FATAL5", &m, &mut shell);
-        assert_eq!(r, ExpansionResult::Empty);
-        assert_eq!(shell.last_status(), 1);
-        assert_eq!(shell.pending_fatal_pe_error, None);
+        assert_eq!(r, ExpansionResult::Fatal { status: 1 });
     }
 
     #[test]
