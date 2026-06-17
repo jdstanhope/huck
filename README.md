@@ -122,39 +122,13 @@ drives the system `bash-completion` framework.
 
 ## Known differences from bash
 
-huck targets byte-identical behavior; remaining differences are tracked in
-[`docs/bash-divergences.md`](docs/bash-divergences.md) (the authoritative,
-exhaustive list, tiered by severity). In summary:
-
-**Not yet implemented** (parity backlog — bash accepts these, huck doesn't yet):
-- Redirections: `n<>file` (read-write open), `|&`
-  (pipe stdout+stderr shorthand); process substitution `<(…)` / `>(…)`.
-- Array I/O: `mapfile`/`readarray`, `read -a`/`-A`; array/attribute transforms
-  `${v@A}` / `@K` / `@k` / `@a`; prefix-name `${!prefix@}` / `${!prefix*}`.
-- Some `set`/`declare` modes: `set -n` (noexec), `-b`, `-h`,
-  job-control `monitor`; `declare -l`/`-u`/`-n` (lowercase/uppercase/nameref);
-  integer/exported arrays.
-- Misc: `$"…"` locale quoting, `cd -P`/`-L`, `pwd -P`/`-L`,
-  `history -d`/`-w`/`-r`/`-a` and `history N`, `HISTSIZE`/`HISTFILESIZE`, the
-  full signal-name table and `kill -<negative-PID>`, and `test -v` (the `[[ ]]`
-  form works).
-
-**Intentional divergences** (kept on purpose):
-- `[[ =~ ]]` uses Rust's `regex` engine (RE2-style), not POSIX ERE — no
-  backreferences, and leftmost-longest/alternation semantics can differ.
-- Associative-array iteration order is insertion order, not bash 5.x's
-  hash-table order.
-- Arithmetic shift counts outside `[0, 64)` are an explicit error (bash leaves
-  them C-undefined); `[[ < ]]`/`>` compare by byte value (no `LC_COLLATE`).
-- `$'\xHH'`/`\nnn` above `0x7F` decode to a Unicode code point, not a raw byte.
-- `set -x` uses a flat `$PS4` prefix (no per-depth nesting / PS4 escapes).
-
-**Low-impact / cosmetic**
-- Diagnostics use a `huck:` prefix rather than bash's `script: line N:` form.
-- History expansion runs on piped non-interactive stdin (bash only does it
-  interactively); `huck script.sh` / `source` match bash.
-- A handful of pathological edge cases (e.g. `&` inside `$( ( … ) )`) are
-  documented in the divergences doc.
+huck targets byte-identical behavior with bash 5.x. The remaining differences —
+open bugs, missing features, and intentional divergences kept by design — are
+tracked exhaustively in
+[`docs/bash-divergences.md`](docs/bash-divergences.md), tiered by severity and
+kept current as each iteration lands. That document is the single source of
+truth; this README deliberately does not duplicate the list (it would only drift
+out of date).
 
 Note: a *fully* working `mise<TAB>` additionally requires `bash-completion`
 **2.12+** (mise's generated completion calls the 2.12 API); on systems with
@@ -214,4 +188,4 @@ gracefully where no PTY is available.
 
 ## License
 
-Personal project; no license declared.
+MIT — see [`LICENSE`](LICENSE).
