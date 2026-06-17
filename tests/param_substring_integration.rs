@@ -123,12 +123,12 @@ fn substring_positional_in_function() {
 }
 
 #[test]
-fn substring_bad_arith_returns_empty_sets_status() {
-    // Bad arith in substring offset/length stays NON-fatal in v34: prints
-    // the arithmetic error, sets $?=1, but does not abort the surrounding
-    // command (matches bash, which only treats `:?` and substring-<0 as
-    // exit-the-script errors). The echo still runs and prints `[]`.
+fn substring_bad_arith_is_fatal() {
+    // v178 (corrects a prior wrong claim that this "stays non-fatal"): a bad
+    // arithmetic index in ${var:off:len} is a FATAL expansion error in bash
+    // (`${s:@@@}` / `${v:1+:2}` exit 1), so the command aborts and the `[]`
+    // is never printed. huck now matches (routes through pending_fatal_pe_error).
     let (out, err) = run("s=hello\necho \"[${s:@@@}]\"\nexit\n");
-    assert!(out.lines().any(|l| l == "[]"), "stdout: {out}");
+    assert!(!out.lines().any(|l| l == "[]"), "command should abort, not print []; stdout: {out}");
     assert!(err.contains("arithmetic"), "stderr: {err}");
 }

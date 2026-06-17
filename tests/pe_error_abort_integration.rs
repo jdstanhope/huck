@@ -71,13 +71,15 @@ fn substring_negative_computed_length_aborts_and_exits() {
 }
 
 #[test]
-fn bad_arith_in_substring_stays_non_fatal() {
-    // Regression: arithmetic errors in offset/length do NOT abort the
-    // command — only `:?` and substring-<0 do.
-    let (out, err, _) = run("s=hello\necho \"[${s:@@@}]\"\necho after\nexit\n");
-    assert!(out.lines().any(|l| l == "[]"), "stdout: {out}");
-    assert!(out.lines().any(|l| l == "after"), "stdout: {out}");
+fn bad_arith_in_substring_aborts_and_exits() {
+    // v178 (corrects a prior "stays non-fatal" claim): an arithmetic error in a
+    // ${var:off:len} offset/length aborts the command with exit 1 — like the
+    // substring-<0 case above — matching bash (`${s:@@@}` exits 1).
+    let (out, err, status) = run("s=hello\necho \"[${s:@@@}]\"\necho after\n");
+    assert!(!out.lines().any(|l| l == "[]"), "stdout: {out}");
+    assert!(!out.lines().any(|l| l == "after"), "stdout: {out}");
     assert!(err.contains("arithmetic"), "stderr: {err}");
+    assert_eq!(status.code(), Some(1));
 }
 
 #[test]
