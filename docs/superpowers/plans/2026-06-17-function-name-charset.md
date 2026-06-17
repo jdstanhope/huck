@@ -145,10 +145,15 @@ check() {  # label ; fragment — assert byte-identical stdout+stderr+exit
     else printf 'FAIL: %s\n' "$label"; diff <(echo "$b") <(echo "$h") | sed 's/^/    /'; FAIL=$((FAIL+1)); fi
 }
 
-both_reject() {  # label ; fragment — assert BOTH shells reject (nonzero -n exit)
+both_reject() {  # label ; fragment — assert BOTH shells reject it (nonzero exit
+                 # when RUN). NOT `-n`: bash defers for-loop var validation to
+                 # runtime, so `bash -n` accepts `for a-b in …` while huck rejects
+                 # at parse time — a separate pre-existing divergence. Executing
+                 # the fragment makes both shells reject (codes may differ; only
+                 # both-nonzero matters). The fragments here are harmless to run.
     local label="$1" frag="$2" bn hn
-    printf '%s\n' "$frag" | bash --norc --noprofile -n /dev/stdin >/dev/null 2>&1; bn=$?
-    printf '%s\n' "$frag" | "$HUCK_BIN" -n /dev/stdin >/dev/null 2>&1; hn=$?
+    printf '%s\n' "$frag" | bash --norc --noprofile >/dev/null 2>&1; bn=$?
+    printf '%s\n' "$frag" | "$HUCK_BIN" >/dev/null 2>&1; hn=$?
     if [[ "$bn" != 0 && "$hn" != 0 ]]; then printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
     else printf 'FAIL: %s (bash rc=%s huck rc=%s; both should be nonzero)\n' "$label" "$bn" "$hn"; FAIL=$((FAIL+1)); fi
 }
