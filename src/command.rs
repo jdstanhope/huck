@@ -4404,10 +4404,16 @@ mod tests {
 
     #[test]
     fn parse_function_invalid_name() {
-        // 1foo() { echo; }
+        // "foo"() { echo; } — a quoted name is still not a valid function name.
+        // (Since v175, bash-legal special-char names like 1foo/foo-bar ARE valid;
+        // the remaining guards are single-unquoted-Literal + not-a-keyword.)
+        let quoted_name = Token::Word(Word(vec![WordPart::Literal {
+            text: "foo".to_string(),
+            quoted: true,
+        }]));
         assert_eq!(
             parse(vec![
-                w_tok("1foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                quoted_name, Token::Op(Operator::LParen), Token::Op(Operator::RParen),
                 kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
             ]),
             Err(ParseError::FunctionName)
