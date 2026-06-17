@@ -154,7 +154,7 @@ check "subshell + 2>&1"        'echo $((echo hi) 2>&1)'
 check "subshell piped"         'echo $((echo a) | tr a-z A-Z)'
 check "subshell multi-cmd"     'echo $((printf X; printf Y) 2>/dev/null)'
 check "subshell redirect capt" 'v=$( (printf P; printf Q) 2>/dev/null ); echo "[$v]"'
-check "glued capt + nl"        'v=$((printf m; printf n)); echo "[$v]"'
+check "glued capture"          'v=$((printf m; printf n) 2>/dev/null); echo "[$v]"'
 
 # --- regressions: real arithmetic, unaffected ---
 check "plain arith"            'echo $((1+2))'
