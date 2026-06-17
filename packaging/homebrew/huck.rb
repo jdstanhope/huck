@@ -2,7 +2,7 @@ class Huck < Formula
   desc "POSIX-ish shell written in Rust"
   homepage "https://github.com/jdstanhope/huck"
   url "https://github.com/jdstanhope/huck/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "3f0a7490b400a484852e657f837bd79b21aaa9a2ff1b4b467fa53cdd9493b348"
   license "MIT"
   depends_on "rust" => :build
 
