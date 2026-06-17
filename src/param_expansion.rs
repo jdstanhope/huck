@@ -206,12 +206,12 @@ pub fn expand_modifier_with_value(
             let value = lookup_v(shell);
             let off_n = match eval_substring_index(offset, shell) {
                 Ok(n) => n,
-                Err(()) => return ExpansionResult::Empty,
+                Err(()) => return ExpansionResult::Fatal { status: 1 },
             };
             let len_n = match length {
                 Some(w) => match eval_substring_index(w, shell) {
                     Ok(n) => Some(n),
-                    Err(()) => return ExpansionResult::Empty,
+                    Err(()) => return ExpansionResult::Fatal { status: 1 },
                 },
                 None => None,
             };
