@@ -1736,10 +1736,25 @@ fn scan_dollar_expansion(
         Some('(') => {
             chars.next(); // consume first '('
             if chars.peek() == Some(&'(') {
-                chars.next(); // consume second '(' — this is `$((`
-                let inner = scan_arith_body(chars)?;
-                let body = arith_string_to_word(&inner, opts)?;
-                parts.push(WordPart::Arith { body, quoted });
+                // `$((` is EITHER an arithmetic expansion `$(( … ))` OR a command
+                // substitution whose body starts with a subshell written glued:
+                // `$( (subshell) … )`. Try arithmetic; if the body does not close
+                // as `))` (scan_arith_body Err — bash's "not arithmetic" signal),
+                // rewind to just after the first `(` and reparse as a command
+                // substitution so the inner `(` parses as a subshell. Mirrors bash.
+                let saved = chars.clone();
+                chars.next(); // consume the second '('
+                match scan_arith_body(chars) {
+                    Ok(inner) => {
+                        let body = arith_string_to_word(&inner, opts)?;
+                        parts.push(WordPart::Arith { body, quoted });
+                    }
+                    Err(_) => {
+                        *chars = saved; // rewind to just after the first '('
+                        let sequence = scan_paren_substitution(chars, opts)?;
+                        parts.push(WordPart::CommandSub { sequence, quoted });
+                    }
+                }
             } else {
                 let sequence = scan_paren_substitution(chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted });
