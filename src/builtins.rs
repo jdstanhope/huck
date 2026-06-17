@@ -588,7 +588,7 @@ fn builtin_exit(args: &[String], shell: &Shell) -> ExecOutcome {
     }
 }
 
-fn is_valid_name(s: &str) -> bool {
+pub(crate) fn is_valid_name(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else { return false; };
     if !(first == '_' || first.is_ascii_alphabetic()) {
