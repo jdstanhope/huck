@@ -1782,11 +1782,22 @@ fn scan_dollar_expansion(
             chars.next();
             scan_braced_param_expansion(chars, parts, quoted, opts)?;
         }
-        Some('\'') => {
+        // `$'…'` is ANSI-C quoting ONLY outside double quotes. Inside `"…"`
+        // (`quoted`) bash treats the `$` as a literal char, so skip this arm and
+        // fall through to the `_` arm (literal `$`, the `'` left for the caller's
+        // double-quote loop to take as a literal) — matching bash `echo "$'"` → `$'`.
+        Some('\'') if !quoted => {
             chars.next();
             let text = scan_ansi_c_quoted(chars)?;
             parts.push(WordPart::Literal { text, quoted: true });
         }
+        // `$"…"` is bash's locale-translation quoting, special only outside double
+        // quotes. huck has no message catalog, so the translation is the identity:
+        // `$"…"` ≡ `"…"`. Drop the `$` and leave the `"` unconsumed so the caller's
+        // existing double-quote handler scans the body (with its normal
+        // expansions/escapes). Inside double quotes (`quoted`) `$"` is a literal `$`
+        // via the `_` arm, after which the `"` closes the surrounding string.
+        Some('"') if !quoted => {}
         Some('?') => {
             chars.next();
             parts.push(WordPart::LastStatus { quoted });
@@ -4428,6 +4439,34 @@ mod tests {
     #[test]
     fn tokenize_dollar_var_in_double_quotes_is_quoted() {
         assert_eq!(tokenize("\"$FOO\"").unwrap(), vec![vword_quoted("FOO")]);
+    }
+
+    #[test]
+    fn tokenize_dollar_squote_inside_double_quotes_is_literal() {
+        // v181: `$'` inside double quotes is a literal `$` + `'`, NOT ANSI-C
+        // quoting; it must tokenize (pre-fix this was Err(UnterminatedQuote)).
+        let toks = tokenize("\"$'\"").unwrap();
+        assert_eq!(toks.len(), 1);
+        let Token::Word(Word(parts)) = &toks[0] else { panic!("not a word: {toks:?}") };
+        let joined: String = parts.iter().map(|p| match p {
+            WordPart::Literal { text, .. } => text.clone(),
+            other => panic!("unexpected part {other:?}"),
+        }).collect();
+        assert_eq!(joined, "$'");
+    }
+
+    #[test]
+    fn tokenize_dollar_dquote_locale_drops_dollar() {
+        // v181: `$"x"` is locale-translation quoting = identity; the `$` is
+        // dropped and the body is a plain double-quoted literal `x`.
+        assert_eq!(tokenize("$\"x\"").unwrap(), vec![wq("x")]);
+    }
+
+    #[test]
+    fn tokenize_unquoted_ansi_c_still_decodes() {
+        // v181 regression: unquoted `$'…'` ANSI-C escapes still decode (the
+        // `!quoted` guard must not disturb the outside-double-quotes path).
+        assert_eq!(tokenize("$'a\\tb'").unwrap(), vec![wq("a\tb")]);
     }
 
     #[test]
