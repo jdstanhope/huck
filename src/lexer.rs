@@ -640,10 +640,28 @@ fn tokenize_partial_inner(
                 if chars.peek() == Some(&'|') {
                     chars.next();
                     tokens.push(Token::Op(Operator::Or));
+                    push_pos!(c_off, c_line);
+                } else if chars.peek() == Some(&'&') {
+                    // `|&` is bash shorthand for `2>&1 |`: merge the left command's
+                    // stderr into the pipe, then pipe. Desugar at the token level so
+                    // the existing pipeline/redirect machinery (incl. v176
+                    // compound-stage redirects) handles it unchanged.
+                    chars.next(); // consume the '&' of `|&`
+                    tokens.push(Token::RedirFd(crate::command::RedirFd::Number(2)));
+                    push_pos!(c_off, c_line);
+                    tokens.push(Token::Op(Operator::DupOut));
+                    push_pos!(c_off, c_line);
+                    tokens.push(Token::Word(Word(vec![WordPart::Literal {
+                        text: "1".to_string(),
+                        quoted: false,
+                    }])));
+                    push_pos!(c_off, c_line);
+                    tokens.push(Token::Op(Operator::Pipe));
+                    push_pos!(c_off, c_line);
                 } else {
                     tokens.push(Token::Op(Operator::Pipe));
+                    push_pos!(c_off, c_line);
                 }
-                push_pos!(c_off, c_line);
                 in_assignment_value = false;
             }
             '&' => {
@@ -4145,6 +4163,23 @@ mod tests {
         assert_eq!(
             tokenize("a|b").unwrap(),
             vec![w("a"), Token::Op(Operator::Pipe), w("b")]
+        );
+    }
+
+    #[test]
+    fn pipe_both_desugars_to_2_redir_1_then_pipe() {
+        // `a |& b` lexes as `a 2>&1 | b`.
+        let toks = tokenize("a |& b").unwrap();
+        assert_eq!(
+            toks,
+            vec![
+                w("a"),
+                Token::RedirFd(crate::command::RedirFd::Number(2)),
+                Token::Op(Operator::DupOut),
+                w("1"),
+                Token::Op(Operator::Pipe),
+                w("b"),
+            ]
         );
     }
 
