@@ -12,6 +12,22 @@ Real-world bar: huck sources a non-trivial `~/.bashrc` (bash-completion, git
 prompt, nvm, mise activation) and drives interactive tab completion against the
 system `bash-completion` package.
 
+## Installation
+
+**Homebrew (macOS/Linux):**
+
+    brew install jdstanhope/huck/huck
+
+**Debian/Ubuntu (.deb):**
+
+    curl -fsSL https://raw.githubusercontent.com/jdstanhope/huck/main/scripts/install.sh | sh
+    # or, manually:
+    sudo apt install ./huck_<version>_<arch>.deb
+
+**From source:**
+
+    cargo install --git https://github.com/jdstanhope/huck huck
+
 ## Status
 
 Actively developed, one coherent feature at a time. Current scope:
