@@ -5140,8 +5140,11 @@ mod tests {
 
     #[test]
     fn tokenize_arith_unterminated_returns_error() {
+        // `$((1+2` doesn't close as `))`, so since v177 it falls back to a
+        // command substitution (`$( (1+2 … )`) — which is itself unterminated at
+        // EOF. Still an error, now reported as an unterminated substitution.
         let err = tokenize("$((1+2").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedArith);
+        assert_eq!(err, LexError::UnterminatedSubstitution);
     }
 
     #[test]
@@ -5185,11 +5188,14 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_arith_close_paren_not_followed_by_close_paren_is_unterminated() {
-        // After the inner `)` at depth 1, the next char must be `)` to close `))`.
-        // If it's anything else, that's an unterminated arithmetic expansion.
-        let err = tokenize("$((1)x)").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedArith);
+    fn tokenize_dollar_paren_subshell_falls_back_to_command_sub() {
+        // v177: when the body after `$((` does not close as `))` (the inner `)`
+        // is not immediately followed by another `)`), it is a command
+        // substitution whose body starts with a subshell — `$( (echo hi) 2>&1 )`
+        // written glued — NOT arithmetic. (Pre-v177 this returned UnterminatedArith.)
+        let tokens = tokenize("$((echo hi) 2>&1)").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert!(matches!(parts[0], WordPart::CommandSub { .. }));
     }
 
     #[test]
