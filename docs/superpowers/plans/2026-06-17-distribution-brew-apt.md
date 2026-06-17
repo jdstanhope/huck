@@ -12,7 +12,7 @@
 
 **Branch:** `dist-brew-apt`
 
-**Conventions:** commit trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. Maintainer string is `John Stanhope <jdstanhope@gmail.com>`. Repo is `github.com/jdstanhope/shuck`; binary + package name is `huck`.
+**Conventions:** commit trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. Maintainer string is `John Stanhope <jdstanhope@gmail.com>`. Repo is `github.com/jdstanhope/huck`; binary + package name is `huck`.
 
 **Environment facts (verified):** `dpkg-deb`, `cargo`, `ruby`, `gh`, `curl`, `sha256sum`, `gzip` all present; `dpkg --print-architecture` = `amd64`; `uname -m` = `x86_64`. Build huck first so `target/debug/huck` exists: `cargo build`.
 
@@ -83,8 +83,8 @@ version = "0.1.0"
 edition = "2024"
 description = "A POSIX-ish shell written in Rust"
 license = "MIT"
-repository = "https://github.com/jdstanhope/shuck"
-homepage = "https://github.com/jdstanhope/shuck"
+repository = "https://github.com/jdstanhope/huck"
+homepage = "https://github.com/jdstanhope/huck"
 readme = "README.md"
 ```
 
@@ -154,7 +154,7 @@ Maintainer: $3
 Section: shells
 Priority: optional
 Depends: libc6
-Homepage: https://github.com/jdstanhope/shuck
+Homepage: https://github.com/jdstanhope/huck
 Description: A POSIX-ish shell written in Rust
  huck is a small POSIX-ish shell implemented in Rust, aiming for
  byte-level bash compatibility on a large command subset.
@@ -166,8 +166,8 @@ pack_render_formula() {
     cat <<EOF
 class Huck < Formula
   desc "POSIX-ish shell written in Rust"
-  homepage "https://github.com/jdstanhope/shuck"
-  url "https://github.com/jdstanhope/shuck/archive/refs/tags/v$1.tar.gz"
+  homepage "https://github.com/jdstanhope/huck"
+  url "https://github.com/jdstanhope/huck/archive/refs/tags/v$1.tar.gz"
   sha256 "$2"
   license "MIT"
   depends_on "rust" => :build
@@ -234,7 +234,7 @@ check "tag"              ". $L; pack_tag 1.2.3"
 check "version read"     ". $L; pack_version Cargo.toml"
 check "control render"   ". $L; pack_render_control 0.1.0 amd64 'John Stanhope <jdstanhope@gmail.com>'"
 check "formula render"   ". $L; pack_render_formula 0.1.0 0123abc"
-check "latest deb url"   ". $L; printf '%s\n' '  \"browser_download_url\": \"https://github.com/jdstanhope/shuck/releases/download/v0.1.0/huck_0.1.0_amd64.deb\"' | pack_latest_deb_url amd64"
+check "latest deb url"   ". $L; printf '%s\n' '  \"browser_download_url\": \"https://github.com/jdstanhope/huck/releases/download/v0.1.0/huck_0.1.0_amd64.deb\"' | pack_latest_deb_url amd64"
 check "latest deb miss"  ". $L; printf '%s\n' 'nothing here' | pack_latest_deb_url amd64; echo rc=\$?"
 
 # --- script dry-run parity cases are appended by later tasks ---
@@ -356,10 +356,10 @@ Create `scripts/install.sh` with exactly:
 ```sh
 #!/usr/bin/env sh
 # Install the latest huck .deb from GitHub Releases on a Debian/Ubuntu system.
-# Usage:  curl -fsSL https://raw.githubusercontent.com/jdstanhope/shuck/main/scripts/install.sh | sh
+# Usage:  curl -fsSL https://raw.githubusercontent.com/jdstanhope/huck/main/scripts/install.sh | sh
 set -eu
 
-REPO="jdstanhope/shuck"
+REPO="jdstanhope/huck"
 API="https://api.github.com/repos/$REPO/releases/latest"
 
 case "$(uname -m)" in
@@ -504,7 +504,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 VERSION=$(pack_version "$ROOT/Cargo.toml")
 TAG=$(pack_tag "$VERSION")
-TARBALL_URL="https://github.com/jdstanhope/shuck/archive/refs/tags/$TAG.tar.gz"
+TARBALL_URL="https://github.com/jdstanhope/huck/archive/refs/tags/$TAG.tar.gz"
 
 run() {
     if [ "$DRY_RUN" = 1 ]; then printf '+ %s\n' "$*"; else eval "$@"; fi
@@ -580,14 +580,14 @@ brew install jdstanhope/huck/huck
 
 **Debian/Ubuntu (.deb):**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jdstanhope/shuck/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jdstanhope/huck/main/scripts/install.sh | sh
 # or, manually:
 sudo apt install ./huck_<version>_<arch>.deb
 ```
 
 **From source:**
 ```sh
-cargo install --git https://github.com/jdstanhope/shuck huck
+cargo install --git https://github.com/jdstanhope/huck huck
 ```
 ```
 (Use a 4-backtick fence around the whole block when editing so the inner triple-backticks render — or add the three subsections as separate fenced blocks.)

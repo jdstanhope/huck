@@ -10,7 +10,7 @@ Let people install `huck` via Homebrew (`brew install jdstanhope/huck/huck`) and
 
 ## Decisions (locked during brainstorming)
 
-- **Distribution model:** self-hosted off GitHub Releases (`github.com/jdstanhope/shuck`). No homebrew-core, no Launchpad PPA, no external gatekeepers.
+- **Distribution model:** self-hosted off GitHub Releases (`github.com/jdstanhope/huck`). No homebrew-core, no Launchpad PPA, no external gatekeepers.
 - **Build approach:** build-from-source. The Homebrew formula compiles on the user's machine (`depends_on "rust" => :build`) — so NO macOS cross-compilation or CI macOS runner is needed. The `.deb` is built locally on Linux.
 - **apt depth:** a plain `.deb` attached to each GitHub Release + a `curl | sh` install script. No GPG-signed apt repo, no `apt update` auto-upgrades.
 - **License:** MIT (new `LICENSE` file; `license = "MIT"` in `Cargo.toml`).
@@ -21,7 +21,7 @@ Let people install `huck` via Homebrew (`brew install jdstanhope/huck/huck`) and
 ### A. Repo prerequisites
 
 - `LICENSE` — MIT, `Copyright (c) 2026 John Stanhope`.
-- `Cargo.toml [package]` gains: `license = "MIT"`, `description = "A POSIX-ish shell written in Rust"`, `repository = "https://github.com/jdstanhope/shuck"`, `homepage = "https://github.com/jdstanhope/shuck"`. (Binary name stays `huck`.)
+- `Cargo.toml [package]` gains: `license = "MIT"`, `description = "A POSIX-ish shell written in Rust"`, `repository = "https://github.com/jdstanhope/huck"`, `homepage = "https://github.com/jdstanhope/huck"`. (Binary name stays `huck`.)
 
 ### B. `.deb` build (apt side — fully buildable on Linux)
 
@@ -37,7 +37,7 @@ Arch is `dpkg --print-architecture` (amd64/arm64); a fallback maps `uname -m` (`
 
 `scripts/install.sh` — POSIX `sh` (run via `/bin/sh`, not huck, since end users won't have huck yet):
 1. Detect arch (`uname -m` → amd64/arm64).
-2. Resolve the latest release's `.deb` asset URL from the GitHub API (`https://api.github.com/repos/jdstanhope/shuck/releases/latest`), parsed without `jq` (grep/sed) so it has no deps.
+2. Resolve the latest release's `.deb` asset URL from the GitHub API (`https://api.github.com/repos/jdstanhope/huck/releases/latest`), parsed without `jq` (grep/sed) so it has no deps.
 3. Download to a temp file; install via `sudo apt-get install -y ./<file>` with a `sudo dpkg -i` fallback.
 4. `set -eu`, clear error if no asset for the arch, cleanup trap on exit.
 
@@ -47,8 +47,8 @@ Arch is `dpkg --print-architecture` (amd64/arm64); a fallback maps `uname -m` (`
   ```ruby
   class Huck < Formula
     desc "POSIX-ish shell written in Rust"
-    homepage "https://github.com/jdstanhope/shuck"
-    url "https://github.com/jdstanhope/shuck/archive/refs/tags/v0.1.0.tar.gz"
+    homepage "https://github.com/jdstanhope/huck"
+    url "https://github.com/jdstanhope/huck/archive/refs/tags/v0.1.0.tar.gz"
     sha256 "<sha256 of that tarball>"
     license "MIT"
     depends_on "rust" => :build
