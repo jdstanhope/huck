@@ -3214,10 +3214,12 @@ fn scan_substitution_operand(
 /// `(before, None)` otherwise. "Top level" excludes single quotes, double
 /// quotes, backticks, a `$(…)` command substitution (nested parens — also
 /// covers `$((…))` and `$( (…) )`), and `{…}` braces. Skipped spans are
-/// appended VERBATIM so the segments re-parse exactly as written. At the top
-/// level only, `\delim` un-escapes to `delim` and `\\` to `\`; any other `\x`
-/// keeps the backslash. Inside a command substitution escapes are verbatim
-/// (they belong to the command), mirroring `scan_paren_substitution`.
+/// appended VERBATIM so the segments re-parse exactly as written. A backslash
+/// escape `\x` is ALSO preserved verbatim (and the escaped char consumed, so an
+/// escaped delimiter `\delim` does not split and an escaped quote `\"` does not
+/// open a span); all un-escaping is done once, downstream, by
+/// `parse_braced_operand_opts`. Inside a command substitution escapes are
+/// verbatim too (they belong to the command), mirroring `scan_paren_substitution`.
 fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
     let mut first = String::new();
     let mut second = String::new();
@@ -3227,17 +3229,17 @@ fn split_modifier_operand(body: &str, delim: char) -> (String, Option<String>) {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
+                // Preserve an escaped char VERBATIM (backslash + the char) and
+                // CONSUME the char so it cannot act as a delimiter or open a
+                // quote/backtick span. The real un-escaping happens once,
+                // downstream, in parse_braced_operand_opts; pre-un-escaping here
+                // would double-process backslashes (corrupting runs like `\\\"`).
+                // An escaped delimiter (`\/`) is thus preserved AND not seen as a
+                // split point. A trailing `\` at end of body pushes just `\`.
                 let dst = if delim_seen { &mut second } else { &mut first };
-                match chars.peek().copied() {
-                    Some(d) if d == delim => {
-                        chars.next();
-                        dst.push(delim);
-                    }
-                    Some('\\') => {
-                        chars.next();
-                        dst.push('\\');
-                    }
-                    _ => dst.push('\\'),
+                dst.push('\\');
+                if let Some(nc) = chars.next() {
+                    dst.push(nc);
                 }
             }
             '\'' => {
@@ -3522,10 +3524,18 @@ mod tests {
             split_modifier_operand("\"a/b\"/x", '/'),
             ("\"a/b\"".into(), Some("x".into()))
         );
-        // An escaped delimiter un-escapes to the literal char and does not split.
-        assert_eq!(split_modifier_operand("a\\/b/x", '/'), ("a/b".into(), Some("x".into())));
-        // \\ un-escapes to a single backslash.
-        assert_eq!(split_modifier_operand("a\\\\b", '/'), ("a\\b".into(), None));
+        // An escaped delimiter is preserved VERBATIM and does not split
+        // (downstream parse_braced_operand_opts un-escapes `\/`→`/`).
+        assert_eq!(split_modifier_operand("a\\/b/x", '/'), ("a\\/b".into(), Some("x".into())));
+        // `\\` is preserved verbatim (un-escaped once, downstream).
+        assert_eq!(split_modifier_operand("a\\\\b", '/'), ("a\\\\b".into(), None));
+        // Regression: `\\\"` (escaped backslash + escaped quote) must not let the
+        // `"` open a span that swallows the delimiter. Body `\\\"/Z` (Rust
+        // literal `"\\\\\\\"/Z"`) splits to pattern `\\\"` and replacement `Z`.
+        assert_eq!(
+            split_modifier_operand("\\\\\\\"/Z", '/'),
+            ("\\\\\\\"".into(), Some("Z".into()))
+        );
     }
 
     #[test]
