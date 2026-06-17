@@ -2278,31 +2278,47 @@ fn parse_next_stage(
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
             .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
-        return Ok((Command::Arith(body), false));
+        return Ok((maybe_wrap_redirects(Command::Arith(body), iter)?, false));
     }
 
     match iter.peek().and_then(keyword_of) {
-        Some(Keyword::If) => Ok((Command::If(Box::new(parse_if(iter)?)), false)),
-        Some(Keyword::While) | Some(Keyword::Until) => {
-            Ok((Command::While(Box::new(parse_while(iter)?)), false))
+        Some(Keyword::If) => Ok((
+            maybe_wrap_redirects(Command::If(Box::new(parse_if(iter)?)), iter)?,
+            false,
+        )),
+        Some(Keyword::While) | Some(Keyword::Until) => Ok((
+            maybe_wrap_redirects(Command::While(Box::new(parse_while(iter)?)), iter)?,
+            false,
+        )),
+        Some(Keyword::For) => {
+            let cmd = parse_for_command(iter)?;
+            Ok((maybe_wrap_redirects(cmd, iter)?, false))
         }
-        Some(Keyword::For) => Ok((parse_for_command(iter)?, false)),
         Some(Keyword::Select) => {
             iter.next(); // consume `select`
-            Ok((parse_select_command(iter)?, false))
+            let cmd = parse_select_command(iter)?;
+            Ok((maybe_wrap_redirects(cmd, iter)?, false))
         }
-        Some(Keyword::Case) => Ok((Command::Case(Box::new(parse_case(iter)?)), false)),
-        Some(Keyword::LBrace) => {
-            Ok((Command::BraceGroup(Box::new(parse_brace_group(iter)?)), false))
+        Some(Keyword::Case) => Ok((
+            maybe_wrap_redirects(Command::Case(Box::new(parse_case(iter)?)), iter)?,
+            false,
+        )),
+        Some(Keyword::LBrace) => Ok((
+            maybe_wrap_redirects(Command::BraceGroup(Box::new(parse_brace_group(iter)?)), iter)?,
+            false,
+        )),
+        Some(Keyword::DoubleBracketOpen) => {
+            let cmd = parse_double_bracket(iter)?;
+            Ok((maybe_wrap_redirects(cmd, iter)?, false))
         }
-        Some(Keyword::DoubleBracketOpen) => Ok((parse_double_bracket(iter)?, false)),
         // `coproc` is invalid as a pipeline stage (it's a top-level command).
         Some(Keyword::Coproc) => Err(ParseError::UnexpectedKeyword("coproc".to_string())),
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Bare `(` at pipeline-stage position → subshell.
             if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
-                return Ok((parse_subshell(iter)?, false));
+                let cmd = parse_subshell(iter)?;
+                return Ok((maybe_wrap_redirects(cmd, iter)?, false));
             }
             // Non-keyword: may be a function definition `name() compound` or
             // a plain simple stage. Need two-token lookahead.
