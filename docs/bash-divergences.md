@@ -28,9 +28,9 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 17 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 16 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 39 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 38 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -61,10 +61,6 @@ group.
 ### Redirects
 
 - **M-125: a non-final pipeline stage with an explicit stdout redirect doesn't get an inter-stage pipe** — `[deferred]` low (found in v156 review; pre-existing, NOT introduced by v156). `cmd >file | next`: bash gives `next` an immediate-EOF stdin (the explicit `>file` overrides the pipe for `cmd`'s stdout, and `next` reads end-of-pipe → EOF); huck skips creating the inter-stage pipe when a stage has an explicit stdout fd, so `next` inherits the PARENT's stdin instead. With an already-EOF parent stdin the observable result matches bash; with a blocking parent stdin (terminal/FIFO) huck HANGS where bash returns. Edge: requires a non-final stage with `>file`/`>>file` AND a blocking parent stdin. Fix lives in the pipeline executor (`run_multi_stage`, ~the `explicit_stdout_fd`/`!is_last` pipe-creation branch): still create the inter-stage pipe for the downstream reader even when the upstream stage's stdout is explicitly redirected (the redirect overrides the upstream's pipe write-end, but the downstream still needs the read-end).
-
-### Quoting
-
-- **M-29: `$"…"` locale quoting** — `[deferred]` low. huck: parses as `$` + double-quoted word. bash: gettext lookup.
 
 ### Job control
 
