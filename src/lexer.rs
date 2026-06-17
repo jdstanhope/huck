@@ -2823,23 +2823,8 @@ fn scan_array_element_word(
                     Some('(') => {
                         buf.push('(');
                         chars.next();
-                        let mut depth: usize = 1;
-                        for ch in chars.by_ref() {
-                            buf.push(ch);
-                            match ch {
-                                '(' => depth += 1,
-                                ')' => {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if depth != 0 {
-                            return Err(LexError::UnterminatedSubstitution);
-                        }
+                        scan_cmdsub_body(chars, &mut buf, LexError::UnterminatedSubstitution)?;
+                        buf.push(')');
                     }
                     Some('{') => {
                         buf.push('{');
@@ -2864,6 +2849,11 @@ fn scan_array_element_word(
                     }
                     _ => {}
                 }
+            }
+            '`' => {
+                buf.push('`');
+                chars.next();
+                consume_backtick_verbatim(chars, &mut buf)?;
             }
             _ => {
                 buf.push(c);
