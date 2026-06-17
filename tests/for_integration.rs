@@ -132,8 +132,12 @@ fn for_variable_observable_after_loop() {
 }
 
 #[test]
-fn for_invalid_variable_is_nonfatal_syntax_error() {
+fn for_invalid_variable_name_is_nonfatal_runtime_error() {
+    // bash parses any word as the loop var and validates the identifier at
+    // runtime: a bad name (`2x`) is a NON-FATAL "not a valid identifier" error
+    // (body not run, the surrounding list continues — `still-alive` prints).
     let (out, err) = run("for 2x in a; do echo hi; done\necho still-alive\nexit\n");
-    assert!(err.to_lowercase().contains("syntax error"), "stderr: {err}");
+    assert!(err.contains("not a valid identifier"), "stderr: {err}");
+    assert!(!out.lines().any(|l| l == "hi"), "loop body must not run: {out}");
     assert!(out.lines().any(|l| l == "still-alive"), "stdout: {out}");
 }

@@ -3749,25 +3749,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_for_invalid_variable_name_errors() {
-        assert_eq!(
-            parse(vec![
-                kw("for"), w_tok("2x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
-                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
-            ]),
-            Err(ParseError::ForVariable)
-        );
+    fn parse_for_invalid_variable_name_parses_runtime_validated() {
+        // v180: any single word is accepted as the loop var at PARSE time; the
+        // identifier is validated (non-fatally) at RUNTIME, not parse time.
+        let seq = parse(vec![
+            kw("for"), w_tok("2x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+        ]).unwrap().unwrap();
+        let clause = first_for(&seq);
+        assert_eq!(clause.var, "2x");
+        assert!(clause.has_in);
     }
 
     #[test]
-    fn parse_for_keyword_as_variable_errors() {
-        assert_eq!(
-            parse(vec![
-                kw("for"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
-                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
-            ]),
-            Err(ParseError::ForVariable)
-        );
+    fn parse_for_keyword_as_variable_is_accepted() {
+        // v180: a reserved word (`in`) is a valid identifier and is accepted as
+        // the loop var; with no second `in` it is the no-in (positional) form.
+        let seq = parse(vec![
+            kw("for"), kw("in"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+        ]).unwrap().unwrap();
+        let clause = first_for(&seq);
+        assert_eq!(clause.var, "in");
+        assert!(!clause.has_in);
     }
 
     #[test]
