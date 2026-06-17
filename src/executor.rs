@@ -1954,6 +1954,7 @@ fn run_background_subshell(
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
+    let job_control = shell.job_control_active();
     // Inherit stdin from the terminal (unlike pipeline backgrounds that use
     // /dev/null) — match bash/dash behaviour for `(cmd) &`.
     match fork_and_run_in_subshell(
@@ -1962,14 +1963,14 @@ fn run_background_subshell(
         libc::STDIN_FILENO,
         libc::STDOUT_FILENO,
         libc::STDERR_FILENO,
-        /*pgid_target=*/ 0,
+        /*pgid_target=*/ if job_control { 0 } else { NO_PGROUP },
         /*parent_fds_to_close=*/ &[],
         None, // no Dup redirect at this call site
         None,
     ) {
         Ok(pid) => {
             shell.last_bg_pid = Some(pid);
-            let id = shell.jobs.add(pid, vec![pid], display);
+            let id = shell.jobs.add_with_pgroup(pid, vec![pid], display, job_control);
             // bash suppresses automatic job notices inside a subshell environment / completion funcs
             if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
                 eprintln!("[{id}] {pid}");
@@ -1990,6 +1991,7 @@ fn run_background_sequence(
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
+    let job_control = shell.job_control_active();
 
     // Spawn each stage using the same per-stage fork dispatch as run_multi_stage
     // (classify_stage → External via spawn_external_with_fds, or InProcess via
@@ -2040,7 +2042,7 @@ fn run_background_sequence(
             }
             // Run via fork so it's isolated (assignments don't affect parent).
             let assign_cmd = Command::Simple(SimpleCommand::Assign(items.clone(), *aline));
-            let pgid_target = first_pid.unwrap_or(0);
+            let pgid_target = if job_control { first_pid.unwrap_or(0) } else { NO_PGROUP };
             let stdin_fd = devnull_fd; // stage 0 default (overridden below if not first)
             // For a no-op assign stage, stdout is irrelevant but we still need
             // to either pipe or close it for downstream stages.
@@ -2074,11 +2076,13 @@ fn run_background_sequence(
                     }
                     if first_pid.is_none() {
                         first_pid = Some(pid);
-                        unsafe {
-                            if libc::setpgid(pid, pid) != 0 {
-                                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                                debug_assert!(errno == libc::ESRCH || errno == libc::EACCES,
-                                    "setpgid({pid},{pid}) failed errno {errno}");
+                        if job_control {
+                            unsafe {
+                                if libc::setpgid(pid, pid) != 0 {
+                                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                                    debug_assert!(errno == libc::ESRCH || errno == libc::EACCES,
+                                        "setpgid({pid},{pid}) failed errno {errno}");
+                                }
                             }
                         }
                     }
@@ -2362,7 +2366,7 @@ fn run_background_sequence(
         let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
 
         // ---- Classify and spawn ----------------------------------------------
-        let pgid_target = first_pid.unwrap_or(0);
+        let pgid_target = if job_control { first_pid.unwrap_or(0) } else { NO_PGROUP };
 
         let fds_to_close_in_child: Vec<RawFd> = parent_held.iter().copied()
             .filter(|&fd| fd != stdout_fd && fd != stdin_fd && fd != stderr_fd)
@@ -2465,13 +2469,15 @@ fn run_background_sequence(
         // Track pgrp + pid.
         if first_pid.is_none() {
             first_pid = Some(pid);
-            unsafe {
-                if libc::setpgid(pid, pid) != 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    debug_assert!(
-                        errno == libc::ESRCH || errno == libc::EACCES,
-                        "setpgid({pid},{pid}) failed errno {errno}"
-                    );
+            if job_control {
+                unsafe {
+                    if libc::setpgid(pid, pid) != 0 {
+                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        debug_assert!(
+                            errno == libc::ESRCH || errno == libc::EACCES,
+                            "setpgid({pid},{pid}) failed errno {errno}"
+                        );
+                    }
                 }
             }
         }
@@ -2502,7 +2508,7 @@ fn run_background_sequence(
 
     let last_pid = *spawned_pids.last().unwrap();
     shell.last_bg_pid = Some(last_pid);
-    let id = shell.jobs.add(pgid, spawned_pids, display);
+    let id = shell.jobs.add_with_pgroup(pgid, spawned_pids, display, job_control);
     // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
         eprintln!("[{id}] {last_pid}");
@@ -2522,6 +2528,16 @@ fn cleanup_partial_pipeline_raw(pgid: Option<i32>, pids: &[i32]) {
     if let Some(pg) = pgid {
         unsafe {
             libc::killpg(pg, libc::SIGKILL);
+        }
+    }
+    // Also SIGKILL each pid directly. When job control is off the stages share
+    // the shell's group (no dedicated group to killpg), so the killpg above is a
+    // no-op (ESRCH) and the blocking waitpid below would otherwise hang on a
+    // still-running stage. The pids are our direct children, so this is safe and
+    // (when a group DOES exist) merely redundant.
+    for &pid in pids {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
         }
     }
     for &pid in pids {

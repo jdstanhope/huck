@@ -4563,15 +4563,28 @@ fn send_signal_to_targets(
                     continue;
                 }
             };
-            let pgid = match shell.jobs.iter().find(|j| j.id == id) {
-                Some(j) => j.pgid,
+            let (own_pgroup, pgid, pids) = match shell.jobs.iter().find(|j| j.id == id) {
+                Some(j) => (j.own_pgroup, j.pgid, j.pids.clone()),
                 None => {
                     eprintln!("huck: kill: {target}: no such job");
                     any_failed = true;
                     continue;
                 }
             };
-            let rc = unsafe { libc::killpg(pgid, sig) };
+            // A job that owns its group is signalled via the group (catches
+            // grandchildren); a group-less job (non-interactive background, v173)
+            // is signalled per-pid, matching bash's J_JOBCONTROL-unset path.
+            let rc = if own_pgroup {
+                unsafe { libc::killpg(pgid, sig) }
+            } else {
+                let mut r = 0;
+                for pid in &pids {
+                    if unsafe { libc::kill(*pid, sig) } != 0 {
+                        r = -1;
+                    }
+                }
+                r
+            };
             if rc != 0 {
                 let errno = std::io::Error::last_os_error();
                 eprintln!("huck: kill: ({target}) - {errno}");

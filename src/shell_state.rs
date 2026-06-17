@@ -2358,9 +2358,18 @@ impl Shell {
             if !should_hangup(job) {
                 continue;
             }
-            unsafe {
-                libc::killpg(job.pgid, libc::SIGCONT);
-                libc::killpg(job.pgid, libc::SIGHUP);
+            if job.own_pgroup {
+                unsafe {
+                    libc::killpg(job.pgid, libc::SIGCONT);
+                    libc::killpg(job.pgid, libc::SIGHUP);
+                }
+            } else {
+                for &pid in &job.pids {
+                    unsafe {
+                        libc::kill(pid, libc::SIGCONT);
+                        libc::kill(pid, libc::SIGHUP);
+                    }
+                }
             }
         }
     }
