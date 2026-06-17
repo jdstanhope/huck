@@ -1180,7 +1180,7 @@ fn parse_function_def(
     name_word: Word,
     iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
-    let name = valid_identifier_text(&name_word).ok_or(ParseError::FunctionName)?;
+    let name = valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
     // Consume `(`.
     iter.next();
     // Expect `)`.
@@ -1215,7 +1215,7 @@ fn parse_function_keyword_def(
         Some(Token::Word(w)) => w,
         _ => return Err(ParseError::FunctionName),
     };
-    let name = valid_identifier_text(&name_word).ok_or(ParseError::FunctionName)?;
+    let name = valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
 
     // Optionally consume `()`.
     if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
@@ -1344,6 +1344,33 @@ fn valid_identifier_text(word: &Word) -> Option<String> {
         return None;
     }
     if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(text.clone())
+}
+
+/// Returns the function name if `word` is a single, unquoted, non-empty
+/// `Literal` that is not a reserved keyword. Unlike `valid_identifier_text`, this
+/// does NOT restrict the character set: bash accepts almost any single word as a
+/// function name (`foo-bar`, `a.b`, `2foo`, …), and the lexer already guarantees a
+/// single `Literal` has no metacharacters or whitespace, so the trailing `()`
+/// (or the `function` keyword) — not the name's spelling — is what makes it a
+/// definition. The keyword guard keeps `if() { :; }` a syntax error like bash.
+fn valid_function_name_text(word: &Word) -> Option<String> {
+    if word.0.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal { text, quoted: false } = &word.0[0] else {
+        return None;
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let tok = Token::Word(Word(vec![WordPart::Literal {
+        text: text.clone(),
+        quoted: false,
+    }]));
+    if keyword_of(&tok).is_some() {
         return None;
     }
     Some(text.clone())
@@ -4377,10 +4404,16 @@ mod tests {
 
     #[test]
     fn parse_function_invalid_name() {
-        // 1foo() { echo; }
+        // "foo"() { echo; } — a quoted name is still not a valid function name.
+        // (Since v175, bash-legal special-char names like 1foo/foo-bar ARE valid;
+        // the remaining guards are single-unquoted-Literal + not-a-keyword.)
+        let quoted_name = Token::Word(Word(vec![WordPart::Literal {
+            text: "foo".to_string(),
+            quoted: true,
+        }]));
         assert_eq!(
             parse(vec![
-                w_tok("1foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                quoted_name, Token::Op(Operator::LParen), Token::Op(Operator::RParen),
                 kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
             ]),
             Err(ParseError::FunctionName)
