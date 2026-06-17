@@ -1223,6 +1223,14 @@ fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> Exec
 }
 
 fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+    // bash accepts any word as the loop variable at parse time but requires a
+    // valid identifier at runtime; a bad name is a NON-FATAL error (status 1,
+    // body not run, the surrounding list continues). Reserved words like `if`
+    // are valid identifiers and fall through to run normally.
+    if !crate::builtins::is_valid_name(&clause.var) {
+        eprintln!("huck: `{}': not a valid identifier", clause.var);
+        return ExecOutcome::Continue(1);
+    }
 
     // Expand the word list once — the same path command arguments take.
     // The no-`in` form (`has_in == false`) iterates the positional

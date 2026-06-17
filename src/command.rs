@@ -644,7 +644,7 @@ pub struct WhileClause {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ForClause {
-    /// The loop variable name — a validated identifier.
+    /// The raw loop variable name; identifier-validated at runtime (`run_for`).
     pub var: String,
     /// The unexpanded `in` word list. Empty for the no-`in` form.
     pub words: Vec<Word>,
@@ -1376,12 +1376,23 @@ fn valid_function_name_text(word: &Word) -> Option<String> {
     Some(text.clone())
 }
 
-/// Returns the loop-variable name if `token` is a single, unquoted
-/// `Literal` `Word` whose text is a valid identifier and not a reserved
-/// keyword. Otherwise `None`.
+/// Returns the raw loop-variable name if `token` is a single, unquoted,
+/// non-empty `Literal` `Word`. bash accepts ANY word as the `for` variable at
+/// parse time (including reserved words like `if`, and non-identifiers like
+/// `a-b`); the identifier rule is enforced at RUNTIME (`run_for`). So this does
+/// NOT apply the keyword / charset checks of `valid_identifier_text`.
 fn for_variable_name(token: &Token) -> Option<String> {
     let Token::Word(w) = token else { return None };
-    valid_identifier_text(w)
+    if w.0.len() != 1 {
+        return None;
+    }
+    let WordPart::Literal { text, quoted: false } = &w.0[0] else {
+        return None;
+    };
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.clone())
 }
 
 /// Splits `text` on `;` at paren depth 0. Useful for arith-for headers
