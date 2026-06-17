@@ -38,7 +38,7 @@ check "formula render"   ". $L; pack_render_formula 0.1.0 0123abc"
 check "latest deb url"   ". $L; printf '%s\n' '  \"browser_download_url\": \"https://github.com/jdstanhope/huck/releases/download/v0.1.0/huck_0.1.0_amd64.deb\"' | pack_latest_deb_url amd64"
 check "latest deb miss"  ". $L; printf '%s\n' 'nothing here' | pack_latest_deb_url amd64; echo rc=\$?"
 
-# --- script dry-run parity cases are appended by later tasks ---
+check_script "build-deb --dry-run" packaging/deb/build-deb.sh --dry-run
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
