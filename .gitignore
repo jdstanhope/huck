@@ -1,3 +1,5 @@
 /target
 /dist
 .claude/
+# Generated parse/sweep artifacts (regenerate the corpus via find_shell_scripts.sh)
+/tools/*.tsv
