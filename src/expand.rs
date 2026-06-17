@@ -906,9 +906,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                     Err(e) => {
                         eprintln!("huck: arithmetic: {}", e);
-                        shell.set_last_status(1);
-                        has_emitted = true;
-                        // Append nothing; the field stays empty if no other parts.
+                        shell.pending_fatal_pe_error = Some(1);
+                        return result;
                     }
                 }
             }
@@ -1118,8 +1117,8 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
                         eprintln!("huck: arithmetic: {}", e);
-                        shell.set_last_status(1);
-                        // Append nothing.
+                        shell.pending_fatal_pe_error = Some(1);
+                        return result;
                     }
                 }
             }
