@@ -39,6 +39,7 @@ check "latest deb url"   ". $L; printf '%s\n' '  \"browser_download_url\": \"htt
 check "latest deb miss"  ". $L; printf '%s\n' 'nothing here' | pack_latest_deb_url amd64; echo rc=\$?"
 
 check_script "build-deb --dry-run" packaging/deb/build-deb.sh --dry-run
+check_script "release --dry-run" scripts/release.sh --dry-run
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
