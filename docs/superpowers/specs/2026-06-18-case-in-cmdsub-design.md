@@ -100,9 +100,10 @@ Per-character `cmd_pos` transitions (after finalizing any pending word):
 
 ### Known limitation (documented, not fixed)
 
-A pattern that is LITERALLY `case` or `esac` appearing after `;;` (where `cmd_pos`
-is true) — e.g. `case x in a) :;; case) :;; esac` — would be mis-counted. This is
-pathological (a bare `case`/`esac` as a case pattern is itself a bash gotcha,
+A `case`/`esac` literal in PATTERN position is mishandled — a pattern named
+`case`/`esac` (after `in` or after `;;`), AND the empty case `$(case x in esac)`
+(huck does not track the `in` keyword, so the first pattern position is not a
+command position so `esac` there isn't recognized). This is pathological (a bare `case`/`esac` as a case pattern is itself a bash gotcha,
 normally written `(case)`), matches bash's own LEX_INCASE imperfections, and does
 not occur in real code. Note it in the function doc comment.
 
