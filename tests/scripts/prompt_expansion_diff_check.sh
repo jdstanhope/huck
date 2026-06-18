@@ -20,5 +20,19 @@ check "cmdsub nested" 'v='\''$(echo $(echo nested))'\''; echo "${v@P}"'
 check "backtick"      'v='\''`echo bt`'\''; echo "${v@P}"'
 check "cmdsub+var"    'x=VAL; v='\''[$x]$(echo Y)'\''; echo "${v@P}"'
 check "trailing nl"   'v='\''$(printf "a\n\n")|'\''; echo "${v@P}"'
+
+# Prompt ESCAPE sequences via @P — exercises the prompt.rs escape expanders
+# (cwd_tilde \w, cwd_basename \W, next_history_number \!, user \u, host_short \h,
+# host_full \H), which the cmdsub/arith cases above never reach.
+check "esc cwd abs"    'cd /tmp; PS1='\''[\w]'\''; echo "${PS1@P}"'
+check "esc cwd tilde"  'cd "$HOME"; PS1='\''[\w]'\''; echo "${PS1@P}"'
+check "esc cwd base"   'cd /tmp; PS1='\''[\W]'\''; echo "${PS1@P}"'
+check "esc histnum"    'PS1='\''<\!>'\''; echo "${PS1@P}"'
+check "esc user"       'PS1='\''\u'\''; echo "${PS1@P}"'
+check "esc host short" 'PS1='\''\h'\''; echo "${PS1@P}"'
+check "esc host full"  'PS1='\''\H'\''; echo "${PS1@P}"'
+check "esc dollar"     'PS1='\''\$'\''; echo "${PS1@P}"'
+check "esc jobs"       'PS1='\''\j'\''; echo "${PS1@P}"'
+check "esc combined"   'cd /tmp; PS1='\''\u@\h:\w\$ '\''; echo "${PS1@P}"'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
