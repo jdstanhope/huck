@@ -2109,10 +2109,12 @@ fn scan_cmdsub_body(
     // at a COMMAND position (so a bare `case`/`esac` there is a keyword, but
     // `echo case` / `grep case` are not). `word` accumulates the current BARE
     // word (identifier chars); `word_bare` goes false once a quote/`$`/other char
-    // makes the word not a bare keyword. KNOWN LIMITATION: a pattern LITERALLY
-    // named `case`/`esac` after `;;` (where `cmd_pos` is true), or a `VAR=val case`
-    // prefix-assignment case, is mis-counted — pathological, matches bash's own
-    // LEX_INCASE edges, and absent from real code.
+    // makes the word not a bare keyword. KNOWN LIMITATION (pathological, absent
+    // from real code): a `case`/`esac` literal in PATTERN position is mishandled —
+    // a pattern named `case`/`esac` (after `in` or `;;`) is mis-counted, and the
+    // empty case `$(case x in esac)` errors (huck doesn't track `in`, so the first
+    // pattern position isn't a command position). Also a `VAR=val case` prefix-
+    // assignment case. These match bash's own LEX_INCASE edges' rarity.
     let mut case_depth: usize = 0;
     let mut cmd_pos = true;
     let mut word = String::new();
