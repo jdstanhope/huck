@@ -70,3 +70,13 @@ fn declare_f_missing_silent() {
     let out = huck_c("declare -f nosuchfn");
     assert_eq!(out, "", "should be silent: {out:?}");
 }
+
+#[test]
+fn declare_f_preserves_definition_redirect() {
+    // v187 (M-09b): a definition-attached redirect renders in declare -f and
+    // round-trips through eval.
+    let d = huck_c("f() { echo hi; } >&2; declare -f f");
+    assert!(d.contains("&2"), "declare -f dropped the redirect: {d:?}");
+    let out = huck_c("f() { echo hi; } >&2; eval \"$(declare -f f)\"; f 2>&1");
+    assert!(out.contains("hi"), "redirect not preserved through round-trip: {out:?}");
+}
