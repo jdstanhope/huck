@@ -1159,6 +1159,14 @@ fn parse_command_inner(
 /// allowed as a function body in both POSIX `name() body` form and
 /// the bash `function NAME body` form.
 fn is_function_body_shape(body: &Command) -> bool {
+    // A redirected compound (`{ … } >file`) is a valid function body — the
+    // redirect attaches to the definition and is applied (with call-time
+    // filename expansion) on every call. The Redirected body is stored and
+    // re-executed per call, giving bash's semantics with no executor change
+    // (M-09b). A Redirected wrapping a non-compound is still rejected.
+    if let Command::Redirected { inner, .. } = body {
+        return is_function_body_shape(inner);
+    }
     matches!(
         body,
         Command::If(_)
@@ -4445,6 +4453,31 @@ mod tests {
         let (name, body) = first_function(&seq);
         assert_eq!(name, "foo");
         assert!(matches!(body, Command::If(_)));
+    }
+
+    #[test]
+    fn function_def_accepts_trailing_redirect() {
+        // v187 (M-09b): a trailing redirect makes the body a Redirected wrapping
+        // the compound; accepted for BOTH definition forms.
+        for src in ["f() { :; } >&2", "function f { :; } >&2"] {
+            let toks = crate::lexer::tokenize(src).unwrap();
+            let seq = parse(toks).unwrap().unwrap();
+            let (name, body) = first_function(&seq);
+            assert_eq!(name, "f", "src={src:?}");
+            let Command::Redirected { inner, redirects } = body else {
+                panic!("expected Redirected body for {src:?}, got {body:?}");
+            };
+            assert!(matches!(**inner, Command::BraceGroup(_)), "src={src:?}");
+            assert_eq!(redirects.len(), 1, "src={src:?}");
+        }
+    }
+
+    #[test]
+    fn function_def_rejects_redirected_non_compound_body() {
+        // A redirected NON-compound (`f() echo hi >f`) is still not a valid
+        // function body (the recursion bottoms out at a Simple command).
+        let toks = crate::lexer::tokenize("f() echo hi >/tmp/zz").unwrap();
+        assert!(matches!(parse(toks), Err(ParseError::FunctionBody)));
     }
 
     #[test]

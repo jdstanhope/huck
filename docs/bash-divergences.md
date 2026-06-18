@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 16 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 15 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -50,7 +50,6 @@ group.
 ### Functions & scoping
 
 - **M-09a: Relaxed function-name characters** — `[deferred]` low. huck restricts function names to POSIX identifiers (`[A-Za-z_][A-Za-z0-9_]*`) in BOTH the `name() body` and `function name body` forms. Bash 5 accepts `.`, `-`, `+`, `:` and other non-POSIX-identifier characters when the function is defined via the keyword form (`function foo.bar { :; }`). Rarely used in practice.
-- **M-09b: Definition-attached redirections** — `[deferred]` low. Both function-definition forms (`name() body > file` and `function name body > file`) currently reject trailing redirections. Bash allows attaching redirections to the function definition itself, taking effect at every call. Affects both forms equally.
 
 ### Parameter expansion modifiers
 
