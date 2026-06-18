@@ -1504,6 +1504,20 @@ fn parse_for_command(
         return Ok(Command::ArithFor(Box::new(parse_arith_for_clause(iter)?)));
     }
 
+    // v184: an arith-for header `((init;cond;step))` lexes as `Token::ArithBlock`
+    // only when its `((` closes with a matching `))`. An *unterminated* `((`
+    // (e.g. the REPL line `for ((;;`) now falls back to two `LParen` tokens, so
+    // here we see `for` immediately followed by `(` `(`. In bash, `for` may only
+    // be followed by `(` as a C-style header — any other paren use is a syntax
+    // error — so two consecutive `(` here mean an arith-for header that hasn't
+    // closed yet. Report it as UnterminatedLoop (the v19 classifier maps that to
+    // "read more"), matching bash which prompts `>` for an unclosed `for ((`.
+    if matches!(iter.peek(), Some(Token::Op(Operator::LParen)))
+        && matches!(iter.peek2(), Some(Token::Op(Operator::LParen)))
+    {
+        return Err(ParseError::UnterminatedLoop);
+    }
+
     Ok(Command::For(Box::new(parse_for_after_keyword(iter)?)))
 }
 

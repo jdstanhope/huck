@@ -187,20 +187,27 @@ mod tests {
 
     #[test]
     fn unterminated_arith_block_requests_more_input() {
-        // `((1+2` — no closing `))`. Should classify as Incomplete,
-        // not Error, so the REPL prompts for continuation.
+        // `((1+2` — no closing `))`. As of v184, `((` with no matching `))`
+        // falls back to nested subshells `( (`, so this lexes cleanly and the
+        // parser reports an unterminated subshell. Still Incomplete (so the
+        // REPL prompts for continuation), matching bash which prompts `>` for
+        // unclosed parens — just via the Subshell reason now, not arith.
         assert_eq!(
             classify("((1+2", false),
-            Completeness::Incomplete(ContinuationReason::OpenQuote)
+            Completeness::Incomplete(ContinuationReason::Subshell)
         );
     }
 
     #[test]
     fn unterminated_arith_for_header_requests_more_input() {
-        // `for ((;;` — the arith block isn't closed yet.
+        // `for ((;;` — the arith-for header isn't closed yet. As of v184 an
+        // unterminated `((` no longer lex-errors; it falls back to two LParens,
+        // so the parser sees `for ( (` and reports an unclosed arith-for header
+        // as UnterminatedLoop → Incomplete(Compound). Still Incomplete (the REPL
+        // prompts for continuation), matching bash which prompts `>` here.
         assert_eq!(
             classify("for ((;;", false),
-            Completeness::Incomplete(ContinuationReason::OpenQuote)
+            Completeness::Incomplete(ContinuationReason::Compound)
         );
     }
 
