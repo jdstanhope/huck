@@ -5522,6 +5522,31 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_legacy_arith_braced_param() {
+        // A `}` inside `${…}` inside `$[…]` must not close early (exercises
+        // scan_braced_skip, which the other tests don't reach).
+        let tokens = tokenize("$[${x}+1]").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], WordPart::Arith { .. }), "got {:?}", parts[0]);
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_inside_dquote() {
+        // `"$[1+2]"` — the $[ arm must carry quoted: true through to WordPart::Arith.
+        let tokens = tokenize("\"$[1+2]\"").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Arith { quoted, .. } = &parts[0] else {
+            panic!("expected Arith part, got {:?}", parts[0])
+        };
+        assert!(*quoted);
+        assert_eq!(arith_body_lit(&parts[0]), "1+2");
+    }
+
+    #[test]
     fn arith_string_to_word_inherits_extglob() {
         // A command substitution inside arithmetic whose body uses an extglob
         // pattern lexes only when extglob is enabled (L-24).
