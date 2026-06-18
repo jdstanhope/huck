@@ -604,14 +604,9 @@ fn tokenize_partial_inner(
                 scan_dollar_expansion(&mut chars, &mut parts, false, opts)?;
             }
             '#' if !has_token => {
-                // POSIX: an unquoted `#` that begins a word starts a comment
-                // to end-of-line. `#` mid-word (has_token=true) falls through
-                // to the catch-all as a literal char.
-                while let Some(&ch) = chars.peek() {
-                    if ch == '\n' { break; }
-                    chars.next();
-                }
-                // The trailing newline (if any) is handled by the outer loop.
+                // POSIX: an unquoted `#` that begins a word starts a comment to
+                // end-of-line. `#` mid-word (has_token) falls through as literal.
+                skip_line_comment(&mut chars);
             }
             '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
                 if let Some(spec) = try_parse_tilde(&mut chars, in_assignment_value) {
@@ -2747,8 +2742,8 @@ fn scan_array_literal(
 ) -> Result<Vec<ArrayLiteralElement>, LexError> {
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
-        // Skip whitespace AND newlines (array literals span lines in bash).
-        skip_array_literal_whitespace(chars);
+        // Skip inter-element separators: whitespace, newlines, and comments.
+        skip_array_literal_separators(chars);
         match chars.peek() {
             Some(&')') => {
                 chars.next();
@@ -2787,13 +2782,35 @@ fn scan_array_literal(
     }
 }
 
-/// Skips whitespace AND newlines inside an array literal.
-fn skip_array_literal_whitespace(
+/// Consumes a `#` line comment's body up to (but NOT including) the terminating
+/// newline; the caller's loop handles the newline. The opening `#` must already
+/// be confirmed as a comment-start (word boundary) by the caller.
+fn skip_line_comment(chars: &mut CharCursor<'_>) {
+    while let Some(&c) = chars.peek() {
+        if c == '\n' {
+            break;
+        }
+        chars.next();
+    }
+}
+
+/// Skips inter-element separators inside an array literal: whitespace, newlines,
+/// and `#` comments. The post-skip position is always an element boundary (after
+/// `(` or inter-element whitespace), so a `#` here is unambiguously a comment —
+/// its body (incl. any `)`) must NOT be read as elements or close the literal.
+fn skip_array_literal_separators(
     chars: &mut CharCursor<'_>,
 ) {
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() {
-            chars.next();
+    loop {
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if chars.peek() == Some(&'#') {
+            skip_line_comment(chars);
         } else {
             break;
         }
@@ -5283,6 +5300,15 @@ mod tests {
     }
 
     #[test]
+    fn skip_line_comment_stops_before_newline() {
+        // The opening `#` is the caller's; this runs the body to (not incl.) \n.
+        let mut chars = CharCursor::new("a comment ) here\nNEXT");
+        skip_line_comment(&mut chars);
+        assert_eq!(chars.next(), Some('\n'));
+        assert_eq!(chars.next(), Some('N'));
+    }
+
+    #[test]
     fn scan_braced_operand_simple() {
         let mut chars = CharCursor::new("foo}");
         assert_eq!(scan_braced_operand(&mut chars).unwrap(), "foo");
@@ -7437,6 +7463,24 @@ mod array_parse_tests {
                 _ => None,
             })
             .expect("ArrayLiteral part present")
+    }
+
+    #[test]
+    fn array_literal_skips_comment_with_paren() {
+        // v183: a `#` comment between elements (incl. one whose text contains
+        // `)`) is skipped — the `)` must NOT close the array early.
+        let assigns = parse_assignments("a=(\n# c )\n1\n)");
+        let els = array_lit(&assigns[0].value);
+        assert_eq!(els.len(), 1);
+        assert!(els[0].subscript.is_none());
+    }
+
+    #[test]
+    fn array_literal_midword_hash_is_literal() {
+        // v183 regression: a `#` MID-word (`x#y`) is NOT a comment.
+        let assigns = parse_assignments("a=(x#y z)");
+        let els = array_lit(&assigns[0].value);
+        assert_eq!(els.len(), 2);
     }
 
     #[test]
