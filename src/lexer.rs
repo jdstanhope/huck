@@ -18,6 +18,9 @@ pub enum LexError {
     UnterminatedArrayLiteral,
     /// `a=([3] x)` — `[3]` not followed by `=`.
     ArrayLiteralMissingEquals,
+    /// `$[ 1+2` — EOF before the `]` closing a legacy `$[ … ]` arithmetic
+    /// expansion (bash's deprecated synonym for `$(( … ))`).
+    UnterminatedLegacyArith,
     /// `((1+2` — EOF before matching `))`.
     UnterminatedArithBlock,
     /// `+(a|b` — EOF before the closing `)` of an extglob group (only
@@ -1791,6 +1794,12 @@ fn scan_dollar_expansion(
             chars.next();
             scan_braced_param_expansion(chars, parts, quoted, opts)?;
         }
+        Some('[') => {
+            chars.next(); // consume '['
+            let inner = scan_legacy_arith_body(chars)?;
+            let body = arith_string_to_word(&inner, opts)?;
+            parts.push(WordPart::Arith { body, quoted });
+        }
         // `$'…'` is ANSI-C quoting ONLY outside double quotes. Inside `"…"`
         // (`quoted`) bash treats the `$` as a literal char, so skip this arm and
         // fall through to the `_` arm (literal `$`, the `'` left for the caller's
@@ -2066,6 +2075,127 @@ fn scan_arith_body(
                 } else {
                     depth -= 1;
                     body.push(')');
+                }
+            }
+            Some(c) => body.push(c),
+        }
+    }
+}
+
+/// Appends a quoted span — the opening quote already pushed by the caller —
+/// through its matching closing `quote`, verbatim. Single quotes take every
+/// char literally; double quotes honor `\` so `\"` does not close the span.
+/// Running out of input returns `Err(err)`.
+fn push_quoted_span(
+    chars: &mut CharCursor<'_>,
+    quote: char,
+    out: &mut String,
+    err: LexError,
+) -> Result<(), LexError> {
+    loop {
+        match chars.next() {
+            None => return Err(err),
+            Some(c) if c == quote => {
+                out.push(c);
+                return Ok(());
+            }
+            Some('\\') if quote == '"' => {
+                out.push('\\');
+                if let Some(c) = chars.next() {
+                    out.push(c);
+                }
+            }
+            Some(c) => out.push(c),
+        }
+    }
+}
+
+/// Skips a `${…}` parameter expansion VERBATIM — the opening `${` already
+/// consumed and pushed by the caller — appending through the matching `}` at
+/// brace-depth 0 (inclusive). Tracks `{`/`}` depth and `'…'`/`"…"` spans so a
+/// `}` inside a nested expansion or quote does not close early. Used by
+/// `scan_legacy_arith_body` so a `]` inside `${…}` cannot close the `$[…]`.
+fn scan_braced_skip(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+) -> Result<(), LexError> {
+    let mut depth: usize = 1; // inside the outer `${`
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedLegacyArith),
+            Some('{') => {
+                depth += 1;
+                out.push('{');
+            }
+            Some('}') => {
+                depth -= 1;
+                out.push('}');
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
+            Some(q @ ('\'' | '"')) => {
+                out.push(q);
+                push_quoted_span(chars, q, out, LexError::UnterminatedLegacyArith)?;
+            }
+            Some(c) => out.push(c),
+        }
+    }
+}
+
+/// Reads the inner text of a `$[ … ]` legacy arithmetic expansion. The opening
+/// `$[` has already been consumed; this scans forward to the matching `]` and
+/// returns the inner text (without the closing `]`). bash treats `$[ expr ]` as
+/// exactly `$(( expr ))`, so the caller feeds the result to
+/// `arith_string_to_word`. "Fully aware": tracks raw `[`/`]` nesting (so array
+/// subscripts `a[1]`, `${a[i]}`, and nested `$[…]` balance as raw brackets) and
+/// consumes `'…'`/`"…"` quoted spans and nested `$(…)`/`${…}` verbatim, so a `]`
+/// inside any of them does not close the expansion. EOF before the close yields
+/// `UnterminatedLegacyArith`.
+fn scan_legacy_arith_body(
+    chars: &mut CharCursor<'_>,
+) -> Result<String, LexError> {
+    let mut body = String::new();
+    let mut depth: usize = 0; // raw `[` nesting
+    loop {
+        match chars.next() {
+            None => return Err(LexError::UnterminatedLegacyArith),
+            Some('[') => {
+                depth += 1;
+                body.push('[');
+            }
+            Some(']') => {
+                if depth == 0 {
+                    return Ok(body);
+                }
+                depth -= 1;
+                body.push(']');
+            }
+            Some(q @ ('\'' | '"')) => {
+                body.push(q);
+                push_quoted_span(chars, q, &mut body, LexError::UnterminatedLegacyArith)?;
+            }
+            Some('\\') => {
+                body.push('\\');
+                if let Some(c) = chars.next() {
+                    body.push(c);
+                }
+            }
+            Some('$') => {
+                body.push('$');
+                match chars.peek().copied() {
+                    Some('(') => {
+                        chars.next(); // consume '('
+                        body.push('(');
+                        scan_cmdsub_body(chars, &mut body, LexError::UnterminatedLegacyArith)?;
+                        body.push(')');
+                    }
+                    Some('{') => {
+                        chars.next(); // consume '{'
+                        body.push('{');
+                        scan_braced_skip(chars, &mut body)?;
+                    }
+                    _ => {}
                 }
             }
             Some(c) => body.push(c),
@@ -5350,6 +5480,69 @@ mod tests {
             panic!("expected Arith part, got {:?}", parts[0])
         };
         assert!(!(*quoted));
+        assert_eq!(arith_body_lit(&parts[0]), "1+2");
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_basic() {
+        let tokens = tokenize("$[2**(3*2)]").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Arith { quoted, .. } = &parts[0] else {
+            panic!("expected Arith part, got {:?}", parts[0])
+        };
+        assert!(!(*quoted));
+        assert_eq!(arith_body_lit(&parts[0]), "2**(3*2)");
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_array_subscript() {
+        let tokens = tokenize("$[a[1]+1]").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(arith_body_lit(&parts[0]), "a[1]+1");
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_aware_close() {
+        for src in ["$[ $(echo ']')+1 ]", "$[ \"x]\" + 1 ]"] {
+            let tokens = tokenize(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+            assert_eq!(tokens.len(), 1, "{src} closed early: {tokens:?}");
+            let Token::Word(Word(parts)) = &tokens[0] else { panic!("{src}") };
+            assert_eq!(parts.len(), 1, "{src}: {parts:?}");
+            assert!(matches!(parts[0], WordPart::Arith { .. }), "{src}: {:?}", parts[0]);
+        }
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_unterminated() {
+        assert!(matches!(tokenize("$[ 1+2"), Err(LexError::UnterminatedLegacyArith)));
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_braced_param() {
+        // A `}` inside `${…}` inside `$[…]` must not close early (exercises
+        // scan_braced_skip, which the other tests don't reach).
+        let tokens = tokenize("$[${x}+1]").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], WordPart::Arith { .. }), "got {:?}", parts[0]);
+    }
+
+    #[test]
+    fn tokenize_legacy_arith_inside_dquote() {
+        // `"$[1+2]"` — the $[ arm must carry quoted: true through to WordPart::Arith.
+        let tokens = tokenize("\"$[1+2]\"").unwrap();
+        assert_eq!(tokens.len(), 1);
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        assert_eq!(parts.len(), 1);
+        let WordPart::Arith { quoted, .. } = &parts[0] else {
+            panic!("expected Arith part, got {:?}", parts[0])
+        };
+        assert!(*quoted);
         assert_eq!(arith_body_lit(&parts[0]), "1+2");
     }
 
