@@ -802,6 +802,9 @@ pub(crate) fn lex_error_message(error: LexError) -> String {
         LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
         LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
         LexError::UnterminatedArith => ": unterminated arithmetic expansion".to_string(),
+        LexError::UnterminatedLegacyArith => {
+            ": unterminated '$[' arithmetic expansion (expected ']')".to_string()
+        }
         LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
         LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
         LexError::Substitution(inner) => {
