@@ -2017,9 +2017,18 @@ fn scan_arith_block(
                 collected.push('(');
             }
             ')' => {
-                if depth == 0 && chars.peek() == Some(&')') {
-                    chars.next(); // consume the second `)`
-                    return Ok(collected);
+                if depth == 0 {
+                    if chars.peek() == Some(&')') {
+                        chars.next(); // consume the second `)`
+                        return Ok(collected);
+                    }
+                    // A `)` at depth 0 not forming `))` means the two opening
+                    // `(` of the `((` cannot close as an adjacent `))` — this is
+                    // not a balanced arithmetic block. Fail fast so the caller
+                    // (the `((` lexer site) rewinds and re-lexes as nested
+                    // subshells `( (`, instead of scanning on to an unrelated
+                    // distant `))` elsewhere in the input (L-51).
+                    return Err(LexError::UnterminatedArithBlock);
                 }
                 depth -= 1;
                 collected.push(')');
@@ -7197,6 +7206,38 @@ mod tests {
             Token::ArithBlock(s, _) => assert_eq!(s, "1+2"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scan_arith_block_bails_on_unbalanced_close() {
+        // v185 (L-51): a `)` at depth 0 not forming `))` means the `((` can't be
+        // a balanced arith block — bail (Err) immediately instead of scanning on
+        // for a distant `))`. The caller then falls back to nested subshells.
+        let mut chars = CharCursor::new("echo a) z))");
+        assert!(scan_arith_block(&mut chars).is_err());
+    }
+
+    #[test]
+    fn scan_arith_block_valid_inner_group() {
+        // Regression: a valid arith block whose content closes a paren group
+        // (`(a)`) before the final `))` still scans — the inner `)` is processed
+        // at depth 1 (decrement 1->0), never the depth-0 bail branch.
+        let mut chars = CharCursor::new("(a)+1))");
+        assert_eq!(scan_arith_block(&mut chars).unwrap(), "(a)+1");
+    }
+
+    #[test]
+    fn double_paren_no_wander_to_distant_close() {
+        // v185 (L-51): `((echo a)|cat)` has no matching `))`; the scanner must
+        // NOT wander to a later `$((1+1))`'s `))`. The head lexes as nested
+        // subshells (two LParens), not an ArithBlock.
+        let toks = tokenize("((echo a)|cat); x=$((1+1))").unwrap();
+        assert!(
+            !matches!(toks[0], Token::ArithBlock(..)),
+            "head must not be an ArithBlock: {toks:?}"
+        );
+        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
     }
 
     #[test]
