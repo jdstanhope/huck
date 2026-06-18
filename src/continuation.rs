@@ -35,6 +35,7 @@ fn is_unterminated_lex(e: &LexError) -> bool {
             | LexError::UnterminatedArith
             | LexError::UnterminatedArithBlock
             | LexError::UnterminatedExtglob
+            | LexError::UnterminatedArrayLiteral
     )
 }
 
