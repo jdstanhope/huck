@@ -65,23 +65,20 @@ fn interactive_pipeline_ctrl_z_then_fg_resumes() {
     );
 }
 
-/// L-51: a non-interactive huck running a pipeline blocked on a fifo must keep
-/// its stages in huck's OWN process group, not a sibling group.
+/// L-51: a non-interactive huck running a multi-stage pipeline must keep its
+/// stages in huck's OWN process group, not a sibling group.
 #[test]
 fn noninteractive_pipeline_stages_share_shell_pgroup() {
     let huck = env!("CARGO_BIN_EXE_huck");
-    let fifo = std::env::temp_dir().join(format!("v172_jc_{}", std::process::id()));
-    let _ = std::fs::remove_file(&fifo);
-    if Command::new("mkfifo").arg(&fifo).status().map(|s| !s.success()).unwrap_or(true) {
-        eprintln!("jobcontrol_pgroup_pty: skipping — mkfifo unavailable");
-        return;
-    }
 
-    // `cat <fifo>` blocks (no writer), so the pipeline stays alive while we
-    // inspect process groups. Non-interactive: stdin/stdout/stderr not a tty.
+    // `sleep 30 | wc -c`: a two-stage pipeline whose first stage stays alive
+    // (sleeping) so both stages are observable while we inspect process groups,
+    // and which self-terminates — a missed stage can never become a permanent
+    // orphan. (The old `cat <fifo>` form blocked forever, so any cleanup miss
+    // leaked a cat/wc pair indefinitely.) Non-interactive: stdio not a tty.
     let mut child = Command::new(huck)
         .arg("-c")
-        .arg(format!("cat {} | wc -c", fifo.display()))
+        .arg("sleep 30 | wc -c")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -94,11 +91,14 @@ fn noninteractive_pipeline_stages_share_shell_pgroup() {
     let stages = child_pids(huck_pid);
     let stage_pgids: Vec<(u32, i32)> = stages.iter().map(|&p| (p, pgid_of(p))).collect();
 
-    // Cleanup before asserting (so a failed assert never leaks processes).
-    let _ = std::fs::remove_file(&fifo);
+    // Cleanup before asserting (so a failed assert never leaks processes). Kill
+    // the whole descendant tree, not just direct children — a pipeline's stages
+    // can be grandchildren (under a pipeline subshell), which `pgrep -P` misses.
+    // Capture descendants BEFORE killing huck (they reparent to init after).
+    let descendants = descendant_pids(huck_pid);
     let _ = child.kill();
-    for &p in &stages {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).status();
+    for &p in &descendants {
+        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
     }
     let _ = child.wait();
 
@@ -121,15 +121,12 @@ fn noninteractive_pipeline_stages_share_shell_pgroup() {
 #[test]
 fn noninteractive_background_pipeline_shares_shell_pgroup() {
     let huck = env!("CARGO_BIN_EXE_huck");
-    let fifo = std::env::temp_dir().join(format!("v173_bgp_{}", std::process::id()));
-    let _ = std::fs::remove_file(&fifo);
-    if Command::new("mkfifo").arg(&fifo).status().map(|s| !s.success()).unwrap_or(true) {
-        eprintln!("jobcontrol_pgroup_pty: skipping — mkfifo unavailable");
-        return;
-    }
+    // `sleep 30 | wc -c &`: a BACKGROUND two-stage pipeline; the trailing `sleep`
+    // keeps huck alive while we inspect. Self-terminating stages (no fifo) so a
+    // cleanup miss can't leak indefinitely — see the L-51 test above.
     let mut child = Command::new(huck)
         .arg("-c")
-        .arg(format!("cat {} | wc -c & sleep 3", fifo.display()))
+        .arg("sleep 30 | wc -c & sleep 30")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -141,10 +138,13 @@ fn noninteractive_background_pipeline_shares_shell_pgroup() {
     let stages = child_pids(huck_pid);
     let stage_pgids: Vec<(u32, i32)> = stages.iter().map(|&p| (p, pgid_of(p))).collect();
 
-    let _ = std::fs::remove_file(&fifo);
+    // Kill the whole descendant tree — a background pipeline's stages can be
+    // grandchildren (under a pipeline subshell), which `pgrep -P` misses.
+    // Capture descendants BEFORE killing huck (they reparent to init after).
+    let descendants = descendant_pids(huck_pid);
     let _ = child.kill();
-    for &p in &stages {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).status();
+    for &p in &descendants {
+        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
     }
     let _ = child.wait();
 
@@ -182,7 +182,7 @@ fn noninteractive_background_subshell_shares_shell_pgroup() {
 
     let _ = child.kill();
     for &p in &kids {
-        let _ = Command::new("kill").args(["-9", &p.to_string()]).status();
+        let _ = Command::new("kill").args(["-9", &p.to_string()]).stderr(Stdio::null()).status();
     }
     let _ = child.wait();
 
@@ -221,4 +221,22 @@ fn child_pids(parent: u32) -> Vec<u32> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// All descendant pids of `parent` (breadth-first via `pgrep -P`), excluding
+/// `parent` itself. Cleanup needs this — a backgrounded pipeline's stages can be
+/// grandchildren under a pipeline subshell, which `child_pids` (direct only)
+/// would miss, orphaning them.
+fn descendant_pids(parent: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut frontier = vec![parent];
+    while let Some(p) = frontier.pop() {
+        for c in child_pids(p) {
+            if !out.contains(&c) {
+                out.push(c);
+                frontier.push(c);
+            }
+        }
+    }
+    out
 }
