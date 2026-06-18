@@ -2102,17 +2102,52 @@ fn scan_cmdsub_body(
     unterminated: LexError,
 ) -> Result<(), LexError> {
     let mut depth: usize = 0;
-    // bash recognises a `#` comment only at a word boundary: start-of-body,
-    // after whitespace, or after a metacharacter `( ) ; & | < >`. Track it so a
-    // `)` inside a word-start comment does not close the substitution.
+    // `#` comment recognition (v183): a `#` at a word boundary starts a comment.
     let mut at_boundary = true;
+    // v186: `case … esac` state so a BARE case-pattern `)` at paren-depth 0 is a
+    // pattern terminator, not the cmdsub close. `cmd_pos` = the next word begins
+    // at a COMMAND position (so a bare `case`/`esac` there is a keyword, but
+    // `echo case` / `grep case` are not). `word` accumulates the current BARE
+    // word (identifier chars); `word_bare` goes false once a quote/`$`/other char
+    // makes the word not a bare keyword. KNOWN LIMITATION: a pattern LITERALLY
+    // named `case`/`esac` after `;;` (where `cmd_pos` is true), or a `VAR=val case`
+    // prefix-assignment case, is mis-counted — pathological, matches bash's own
+    // LEX_INCASE edges, and absent from real code.
+    let mut case_depth: usize = 0;
+    let mut cmd_pos = true;
+    let mut word = String::new();
+    let mut word_bare = true;
+
+    // End the current word: recognise a bare `case`/`esac` keyword at command
+    // position; return whether it was a command-introducer keyword (for the
+    // space transition). Resets `word`/`word_bare`.
+    macro_rules! end_word {
+        () => {{
+            let introducer = word_bare
+                && matches!(
+                    word.as_str(),
+                    "if" | "then" | "elif" | "else" | "while" | "until" | "do"
+                );
+            if word_bare && cmd_pos {
+                if word == "case" {
+                    case_depth += 1;
+                } else if word == "esac" {
+                    case_depth = case_depth.saturating_sub(1);
+                }
+            }
+            word.clear();
+            word_bare = true;
+            introducer
+        }};
+    }
+
     loop {
         match chars.next() {
             None => return Err(unterminated),
             Some('#') if at_boundary => {
+                end_word!();
                 // Word-start comment to end-of-line: keep it VERBATIM in `out`
-                // (re-tokenized + stripped later) so its `)` is not counted. The
-                // next char (the newline) restores `at_boundary`.
+                // (re-tokenized + stripped later) so its `)` is not counted.
                 out.push('#');
                 while let Some(&c) = chars.peek() {
                     if c == '\n' {
@@ -2121,19 +2156,35 @@ fn scan_cmdsub_body(
                     out.push(c);
                     chars.next();
                 }
+                // the trailing newline (next char) restores at_boundary + cmd_pos
             }
-            Some(')') if depth == 0 => return Ok(()),
             Some(')') => {
-                depth -= 1;
-                out.push(')');
+                // Finalize the pending word FIRST so e.g. `esac)` updates
+                // case_depth before we decide whether this `)` is the close.
+                end_word!();
+                if depth == 0 {
+                    if case_depth == 0 {
+                        return Ok(()); // the cmdsub close
+                    }
+                    // depth-0 `)` inside a `case` is a pattern terminator — keep
+                    // scanning; a clause body (commands) follows.
+                    out.push(')');
+                } else {
+                    depth -= 1;
+                    out.push(')');
+                }
                 at_boundary = true;
+                cmd_pos = true;
             }
             Some('(') => {
+                end_word!();
                 depth += 1;
                 out.push('(');
                 at_boundary = true;
+                cmd_pos = true;
             }
             Some('\\') => {
+                word_bare = false;
                 out.push('\\');
                 match chars.next() {
                     Some(c) => out.push(c),
@@ -2142,6 +2193,7 @@ fn scan_cmdsub_body(
                 at_boundary = false;
             }
             Some('\'') => {
+                word_bare = false;
                 out.push('\'');
                 loop {
                     match chars.next() {
@@ -2156,6 +2208,7 @@ fn scan_cmdsub_body(
                 at_boundary = false;
             }
             Some('"') => {
+                word_bare = false;
                 out.push('"');
                 loop {
                     match chars.next() {
@@ -2178,8 +2231,42 @@ fn scan_cmdsub_body(
             }
             Some(c) => {
                 out.push(c);
-                at_boundary = c.is_whitespace()
-                    || matches!(c, ';' | '&' | '|' | '<' | '>');
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    // identifier char: extend the current bare word.
+                    if word_bare {
+                        word.push(c);
+                    }
+                    at_boundary = false;
+                } else if c.is_whitespace() {
+                    // A word was being built iff `word` is non-empty (bare) or
+                    // `word_bare` is false (a non-bare word). Whitespace after a
+                    // separator (no word) must PRESERVE cmd_pos (e.g. after `;;`).
+                    let had_word = !word.is_empty() || !word_bare;
+                    let introducer = end_word!();
+                    if had_word {
+                        // command position survives a space only after an
+                        // introducer keyword (`then case` → keyword; `echo case` → arg).
+                        cmd_pos = introducer;
+                    }
+                    at_boundary = true;
+                } else if matches!(c, ';' | '&' | '|') {
+                    end_word!();
+                    cmd_pos = true;
+                    at_boundary = true;
+                } else if matches!(c, '{' | '}') {
+                    end_word!();
+                    cmd_pos = c == '{';
+                    at_boundary = false;
+                } else if matches!(c, '<' | '>') {
+                    end_word!();
+                    cmd_pos = false; // redirect — same command
+                    at_boundary = true;
+                } else {
+                    // `$`, `-`, `.`, `*`, `?`, `=`, `~`, backtick, etc.: continues
+                    // / starts a word that is not a bare keyword.
+                    word_bare = false;
+                    at_boundary = false;
+                }
             }
         }
     }
@@ -5472,6 +5559,38 @@ mod tests {
             scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
             LexError::UnterminatedBrace
         );
+    }
+
+    #[test]
+    fn scan_cmdsub_body_case_pattern_paren_not_close() {
+        // v186: a bare case-pattern `)` (depth 0) is a pattern terminator, not the
+        // cmdsub close. Stops at the FINAL `)` after `esac`.
+        let mut chars = CharCursor::new("case $y in a) echo hit;; esac)rest");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
+        assert_eq!(out, "case $y in a) echo hit;; esac");
+        assert_eq!(chars.next(), Some('r'));
+    }
+
+    #[test]
+    fn scan_cmdsub_body_case_as_arg_is_not_keyword() {
+        // v186: `case` NOT in command position (an argument) is a plain word — the
+        // first `)` closes.
+        let mut chars = CharCursor::new("echo case)rest");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "echo case");
+        assert_eq!(chars.next(), Some('r'));
+    }
+
+    #[test]
+    fn scan_cmdsub_body_nested_case() {
+        // v186: nested `case … esac` — only the FINAL `)` closes.
+        let mut chars = CharCursor::new("case $y in a) case $y in a) :;; esac;; esac)X");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "case $y in a) case $y in a) :;; esac;; esac");
+        assert_eq!(chars.next(), Some('X'));
     }
 
     #[test]
