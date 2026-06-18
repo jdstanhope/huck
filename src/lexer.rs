@@ -721,9 +721,23 @@ fn tokenize_partial_inner(
                 // outer loop's whitespace handling — so by the time we get
                 // here, a second `(` means they were truly adjacent.
                 if chars.peek() == Some(&'(') {
+                    // `((` is an arithmetic command ONLY if a matching `))` is
+                    // found; otherwise bash treats it as nested subshells `( (`.
+                    // Save the cursor at the second `(`, try the arith block, and
+                    // on failure rewind + emit a single LParen (the first `(`); the
+                    // second `(` then re-lexes as another LParen. A `((` that DOES
+                    // close as `))` but isn't valid arithmetic stays an ArithBlock
+                    // → arith error at parse/eval, matching bash. Mirrors the v177
+                    // `$((` disambiguation.
+                    let saved = chars.clone();
                     chars.next(); // consume the second `(`
-                    let body = scan_arith_block(&mut chars)?;
-                    tokens.push(Token::ArithBlock(body, opts));
+                    match scan_arith_block(&mut chars) {
+                        Ok(body) => tokens.push(Token::ArithBlock(body, opts)),
+                        Err(_) => {
+                            chars = saved;
+                            tokens.push(Token::Op(Operator::LParen));
+                        }
+                    }
                 } else {
                     tokens.push(Token::Op(Operator::LParen));
                 }
@@ -7186,6 +7200,38 @@ mod tests {
     }
 
     #[test]
+    fn double_paren_nested_subshell_not_arith() {
+        // v184: `((echo a) | cat)` has no matching `))` → nested subshells `( (`,
+        // NOT an arithmetic block. Lexes to two LParens, no ArithBlock.
+        let toks = tokenize("((echo a) | cat)").unwrap();
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            "must not be an ArithBlock: {toks:?}"
+        );
+        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
+    }
+
+    #[test]
+    fn double_paren_real_arith_still_arithblock() {
+        // v184 regression: a `((` that DOES close as `))` stays an ArithBlock.
+        let toks = tokenize("((1+2))").unwrap();
+        assert_eq!(toks.len(), 1);
+        assert!(matches!(toks[0], Token::ArithBlock(..)));
+    }
+
+    #[test]
+    fn double_paren_deep_nesting_not_arith() {
+        // v184: `((( echo a ) ) )` — the closing parens are not adjacent, so no
+        // `))` for the outer `((` → LParens, not an ArithBlock.
+        let toks = tokenize("((( echo a ) ) )").unwrap();
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            "must not be an ArithBlock: {toks:?}"
+        );
+    }
+
+    #[test]
     fn arith_block_with_semicolons() {
         let tokens = tokenize("((a;b;c))").unwrap();
         assert_eq!(tokens.len(), 1);
@@ -7229,17 +7275,31 @@ mod tests {
     }
 
     #[test]
-    fn arith_block_unclosed_errors() {
-        let err = tokenize("((1+2").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedArithBlock);
+    fn arith_block_unclosed_falls_back_to_lparens() {
+        // `((1+2` — no closing `))`. As of v184, an unterminated `((` is no
+        // longer a lex error: it rewinds and emits a single LParen (the second
+        // `(` re-lexes as another), so this lexes as nested subshells `( (`.
+        // bash treats `((` as arithmetic only when a matching `))` is found.
+        let toks = tokenize("((1+2").unwrap();
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            "must not be an ArithBlock: {toks:?}"
+        );
+        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
     }
 
     #[test]
-    fn arith_block_single_paren_at_end_errors() {
-        // `((1+2)` — one closing paren, not two. Body consumed; depth goes
-        // to -1; then EOF → UnterminatedArithBlock.
-        let err = tokenize("((1+2)").unwrap_err();
-        assert_eq!(err, LexError::UnterminatedArithBlock);
+    fn arith_block_single_paren_at_end_falls_back_to_lparens() {
+        // `((1+2)` — one closing paren, not two, so no matching `))`. As of
+        // v184 this falls back to nested subshells `( (` rather than erroring.
+        let toks = tokenize("((1+2)").unwrap();
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            "must not be an ArithBlock: {toks:?}"
+        );
+        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
     }
 
     #[test]
