@@ -33,6 +33,7 @@ fn is_unterminated_lex(e: &LexError) -> bool {
             | LexError::UnterminatedBrace
             | LexError::UnterminatedSubstitution
             | LexError::UnterminatedArith
+            | LexError::UnterminatedLegacyArith
             | LexError::UnterminatedArithBlock
             | LexError::UnterminatedExtglob
             | LexError::UnterminatedArrayLiteral
@@ -195,6 +196,18 @@ mod tests {
         assert_eq!(
             classify("((1+2", false),
             Completeness::Incomplete(ContinuationReason::Subshell)
+        );
+    }
+
+    #[test]
+    fn unterminated_legacy_arith_requests_more_input() {
+        // `$[ 1 +` — no closing `]`. The lexer signals UnterminatedLegacyArith,
+        // which is_unterminated_lex treats as incomplete so the REPL prompts for
+        // continuation (via the generic OpenQuote reason, like other unterminated
+        // lex spans).
+        assert_eq!(
+            classify("echo $[ 1 +", false),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
 
