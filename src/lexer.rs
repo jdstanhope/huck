@@ -2079,17 +2079,36 @@ fn scan_cmdsub_body(
     unterminated: LexError,
 ) -> Result<(), LexError> {
     let mut depth: usize = 0;
+    // bash recognises a `#` comment only at a word boundary: start-of-body,
+    // after whitespace, or after a metacharacter `( ) ; & | < >`. Track it so a
+    // `)` inside a word-start comment does not close the substitution.
+    let mut at_boundary = true;
     loop {
         match chars.next() {
             None => return Err(unterminated),
+            Some('#') if at_boundary => {
+                // Word-start comment to end-of-line: keep it VERBATIM in `out`
+                // (re-tokenized + stripped later) so its `)` is not counted. The
+                // next char (the newline) restores `at_boundary`.
+                out.push('#');
+                while let Some(&c) = chars.peek() {
+                    if c == '\n' {
+                        break;
+                    }
+                    out.push(c);
+                    chars.next();
+                }
+            }
             Some(')') if depth == 0 => return Ok(()),
             Some(')') => {
                 depth -= 1;
                 out.push(')');
+                at_boundary = true;
             }
             Some('(') => {
                 depth += 1;
                 out.push('(');
+                at_boundary = true;
             }
             Some('\\') => {
                 out.push('\\');
@@ -2097,6 +2116,7 @@ fn scan_cmdsub_body(
                     Some(c) => out.push(c),
                     None => return Err(unterminated),
                 }
+                at_boundary = false;
             }
             Some('\'') => {
                 out.push('\'');
@@ -2110,6 +2130,7 @@ fn scan_cmdsub_body(
                         None => return Err(unterminated),
                     }
                 }
+                at_boundary = false;
             }
             Some('"') => {
                 out.push('"');
@@ -2130,8 +2151,13 @@ fn scan_cmdsub_body(
                         None => return Err(unterminated),
                     }
                 }
+                at_boundary = false;
             }
-            Some(c) => out.push(c),
+            Some(c) => {
+                out.push(c);
+                at_boundary = c.is_whitespace()
+                    || matches!(c, ';' | '&' | '|' | '<' | '>');
+            }
         }
     }
 }
@@ -5423,6 +5449,26 @@ mod tests {
             scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap_err(),
             LexError::UnterminatedBrace
         );
+    }
+
+    #[test]
+    fn scan_cmdsub_body_skips_word_start_comment() {
+        // v183: a word-start `#` comment is kept verbatim in the body; a `)`
+        // inside it does NOT close the substitution. Stops at the FINAL `)`.
+        let mut chars = CharCursor::new("echo hi # c with ) paren\n)rest");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedSubstitution).unwrap();
+        assert_eq!(out, "echo hi # c with ) paren\n");
+        assert_eq!(chars.next(), Some('r'));
+    }
+
+    #[test]
+    fn scan_cmdsub_body_midword_hash_not_comment() {
+        // v183 regression: `#` mid-word (`a#b`) is literal, not a comment.
+        let mut chars = CharCursor::new("echo a#b)");
+        let mut out = String::new();
+        scan_cmdsub_body(&mut chars, &mut out, LexError::UnterminatedBrace).unwrap();
+        assert_eq!(out, "echo a#b");
     }
 
     #[test]
