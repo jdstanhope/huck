@@ -35,6 +35,7 @@ fn is_unterminated_lex(e: &LexError) -> bool {
             | LexError::UnterminatedArith
             | LexError::UnterminatedArithBlock
             | LexError::UnterminatedExtglob
+            | LexError::UnterminatedArrayLiteral
     )
 }
 
@@ -152,6 +153,18 @@ mod tests {
     fn open_command_substitution_is_incomplete() {
         assert_eq!(
             classify("echo $(date", false),
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        );
+    }
+
+    #[test]
+    fn open_array_literal_is_incomplete() {
+        // v183: `a=(1 2` — the array literal `(` isn't closed yet. Classify as
+        // Incomplete (continuation), not Error, so the REPL / piped stdin keeps
+        // reading until `)`. Regression: is_unterminated_lex omitted
+        // UnterminatedArrayLiteral, so multi-line arrays mis-parsed.
+        assert_eq!(
+            classify("a=(1 2", false),
             Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
