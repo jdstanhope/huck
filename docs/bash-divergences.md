@@ -29,7 +29,7 @@ stays in sync.
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 13 | Deferred bash-compat backlog, ranked by severity within each group. |
-| Intentional (Tier 3) | 9 | Deliberate divergences we're keeping. |
+| Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
@@ -150,6 +150,13 @@ Things huck deliberately does differently from bash. Document and keep.
 - **huck**: the lexer accepts an array literal `name=(…)` as a command ARGUMENT and `expand()` reconstructs the argument to its `name=(…)` text — so `echo x=(a b)` prints `x=(a b)`.
 - **bash**: a parse-time syntax error (`echo x=(a b)` → `syntax error near unexpected token '('`).
 - **Why**: replicating bash's parse-time gating would need command-context-aware lexing; the reconstruction is harmless and is what makes `eval x=(a b)` / `declare`-style array-literal args work (v136 resolved the prior panic via this reconstruction).
+
+### I-17: malformed `${…}` rejected at parse, not runtime
+- **Status**: `[intentional]`
+- **Severity**: low (v192)
+- **huck**: rejects a malformed parameter expansion (`${}`, `${=1}`, `${ x}`, `${@x}`, `${1abc}`, `${-x}`, `${.}`) at PARSE time (`syntax error: parameter expansion with empty name` / `invalid parameter-expansion modifier`).
+- **bash**: parses these (`bash -n` rc 0) and emits the identical `bad substitution` error only at RUNTIME.
+- **Why**: the constructs are invalid in bash either way; huck's earlier error is by design (matching `bash -n`'s leniency would require a deferred-runtime-error path to accept syntax that is broken regardless). This is the parse sweep's remaining `${=1}` ×2 entries (`perf-completion.sh`, a zsh-only word-split form).
 
 ---
 
