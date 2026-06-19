@@ -924,11 +924,6 @@ pub(crate) fn escape_double_quote_value(s: &str) -> String {
     out
 }
 
-/// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
-/// `declare --`; otherwise the attribute order is `airx` to match
-/// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
-/// For indexed-array variables, the value is rendered as
-/// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
 /// bash's variable-listing quoting (the bare `declare` / `set` / `set -x`
 /// style): bare unless the value needs quoting; a value with a shell
 /// metacharacter is single-quoted (with `'` rewritten `'\''`); a value with a
@@ -948,6 +943,11 @@ fn declare_scalar_quote(v: &str) -> String {
     v.to_string()
 }
 
+/// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
+/// `declare --`; otherwise the attribute order is `airx` to match
+/// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
+/// For indexed-array variables, the value is rendered as
+/// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
 fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
     use crate::shell_state::VarValue;
 
@@ -7738,6 +7738,7 @@ mod tests {
         assert_eq!(declare_scalar_quote("bang!x"), "'bang!x'");
         assert_eq!(declare_scalar_quote("lt<gt>"), "'lt<gt>'");
         assert_eq!(declare_scalar_quote("br[ack]"), "'br[ack]'");
+        assert_eq!(declare_scalar_quote("back`tick"), "'back`tick'");
         assert_eq!(declare_scalar_quote("qu'ote"), "'qu'\\''ote'");
         // not metacharacters in this context -> stay bare
         assert_eq!(declare_scalar_quote("ti~lde"), "ti~lde");
