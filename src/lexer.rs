@@ -7800,6 +7800,24 @@ mod array_parse_tests {
     }
 
     #[test]
+    fn array_assignment_with_stacked_line_continuations() {
+        // `arr=\<NL>\<NL>(x)` — two stacked continuations, both deleted, so this
+        // is `arr=(x)` (exercises the loop in skip_line_continuations).
+        let assigns = parse_assignments("arr=\\\n\\\n(x)");
+        assert_eq!(assigns.len(), 1);
+        let els = assigns[0]
+            .value
+            .0
+            .iter()
+            .find_map(|p| match p {
+                WordPart::ArrayLiteral(els) => Some(els),
+                _ => None,
+            })
+            .expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 1);
+    }
+
+    #[test]
     fn backslash_escape_after_eq_is_not_continuation() {
         // `arr=\x` — `\x` is a literal escape, NOT a continuation; no array.
         let assigns = parse_assignments("arr=\\x");
