@@ -924,6 +924,25 @@ pub(crate) fn escape_double_quote_value(s: &str) -> String {
     out
 }
 
+/// bash's variable-listing quoting (the bare `declare` / `set` / `set -x`
+/// style): bare unless the value needs quoting; a value with a shell
+/// metacharacter is single-quoted (with `'` rewritten `'\''`); a value with a
+/// control char uses ANSI-C `$'…'`; the EMPTY value is bare (`name=`). This is
+/// NOT `${v@Q}` (which always quotes); it mirrors bash's `sh_contains_shell_metas`
+/// + `sh_single_quote`.
+fn declare_scalar_quote(v: &str) -> String {
+    if v.is_empty() {
+        return String::new();
+    }
+    if v.chars().any(|c| c.is_control()) {
+        return crate::param_expansion::ansi_c_quote(v);
+    }
+    if crate::param_expansion::contains_shell_metas(v) {
+        return format!("'{}'", escape_alias_value(v));
+    }
+    v.to_string()
+}
+
 /// Renders a `declare ATTR NAME="value"` line. Empty attrs print as
 /// `declare --`; otherwise the attribute order is `airx` to match
 /// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
@@ -965,35 +984,65 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
         s.push_str(&attrs);
         s
     };
-    let value_part = match &var.value {
+    let value_part = render_declare_value_part(var);
+    format!("declare {flag_str} {name}{value_part}")
+}
+
+/// Renders the `=<value>` suffix of a declare line: `="v"` for a scalar,
+/// `=([k]="v" …)` for arrays. Shared by `format_declare_line` (the `-p` form)
+/// and `format_declare_bare_line` (arrays only).
+fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
+    use crate::shell_state::VarValue;
+    match &var.value {
         VarValue::Scalar(s) => {
             // Unbound namerefs (empty value) omit the `=""` part — matches bash.
             if var.nameref && s.is_empty() {
                 String::new()
             } else {
-                let escaped = escape_double_quote_value(s);
-                format!("=\"{escaped}\"")
+                format!("=\"{}\"", escape_double_quote_value(s))
             }
         }
         VarValue::Indexed(m) => {
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in m {
-                let escaped = escape_double_quote_value(v);
-                parts.push(format!("[{k}]=\"{escaped}\""));
-            }
+            let parts: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("[{k}]=\"{}\"", escape_double_quote_value(v)))
+                .collect();
             format!("=({})", parts.join(" "))
         }
         VarValue::Associative(pairs) => {
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in pairs {
-                let key_escaped = escape_double_quote_value(k);
-                let val_escaped = escape_double_quote_value(v);
-                parts.push(format!("[\"{key_escaped}\"]=\"{val_escaped}\""));
-            }
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "[\"{}\"]=\"{}\"",
+                        escape_double_quote_value(k),
+                        escape_double_quote_value(v)
+                    )
+                })
+                .collect();
             format!("=({})", parts.join(" "))
         }
-    };
-    format!("declare {flag_str} {name}{value_part}")
+    }
+}
+
+/// Formats one variable in bash's bare-`declare` (no-args) form: `name=value`
+/// with NO `declare -X` prefix and NO attribute flags. Scalars use the minimal
+/// `declare_scalar_quote`; arrays reuse the `-p` value renderer (their element
+/// format is identical to `declare -p` minus the `declare -a/-A ` prefix).
+fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+    use crate::shell_state::VarValue;
+    match &var.value {
+        VarValue::Scalar(s) => {
+            if var.nameref && s.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}={}", declare_scalar_quote(s))
+            }
+        }
+        VarValue::Indexed(_) | VarValue::Associative(_) => {
+            format!("{name}{}", render_declare_value_part(var))
+        }
+    }
 }
 
 /// Lists every EXPORTED variable, sorted by name, as bash's
@@ -1057,12 +1106,26 @@ fn snapshot_for_local_scope(shell: &mut Shell, name: &str) {
 fn declare_list_all_vars(
     out: &mut dyn std::io::Write,
     shell: &Shell,
+    bare: bool,
 ) -> ExecOutcome {
     let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
         shell.iter_vars().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
-        let _ = writeln!(out, "{}", format_declare_line(name, var));
+        let line = if bare {
+            format_declare_bare_line(name, var)
+        } else {
+            format_declare_line(name, var)
+        };
+        let _ = writeln!(out, "{line}");
+    }
+    // bare `declare` also lists all functions (sorted), in the `f () {…}` form.
+    if bare {
+        let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
+        fnames.sort();
+        for n in &fnames {
+            emit_function(n, false, out, shell);
+        }
     }
     ExecOutcome::Continue(0)
 }
@@ -1239,7 +1302,7 @@ fn builtin_declare(
 
     // Bare or -p with no names: list everything.
     if names.is_empty() {
-        return declare_list_all_vars(out, shell);
+        return declare_list_all_vars(out, shell, !print_mode);
     }
 
     // Per-name processing.
@@ -2174,7 +2237,7 @@ fn builtin_declare_decl(
             }
             return ExecOutcome::Continue(0);
         }
-        return declare_list_all_vars(out, shell);
+        return declare_list_all_vars(out, shell, !print_mode);
     }
 
     let mut exit: i32 = 0;
@@ -7662,6 +7725,79 @@ fn validate_readline_var(var: &str, val: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declare_scalar_quote_matches_bash_listing() {
+        // bash bare-declare / set -x style minimal quoting (verified vs bash 5.x)
+        assert_eq!(declare_scalar_quote("hello"), "hello");
+        assert_eq!(declare_scalar_quote(""), "");            // empty -> bare (name=)
+        assert_eq!(declare_scalar_quote("a b"), "'a b'");
+        assert_eq!(declare_scalar_quote("x;y"), "'x;y'");
+        assert_eq!(declare_scalar_quote("gl*ob"), "'gl*ob'");
+        assert_eq!(declare_scalar_quote("d$ollar"), "'d$ollar'");
+        assert_eq!(declare_scalar_quote("bang!x"), "'bang!x'");
+        assert_eq!(declare_scalar_quote("lt<gt>"), "'lt<gt>'");
+        assert_eq!(declare_scalar_quote("br[ack]"), "'br[ack]'");
+        assert_eq!(declare_scalar_quote("back`tick"), "'back`tick'");
+        assert_eq!(declare_scalar_quote("qu'ote"), "'qu'\\''ote'");
+        // not metacharacters in this context -> stay bare
+        assert_eq!(declare_scalar_quote("ti~lde"), "ti~lde");
+        assert_eq!(declare_scalar_quote("eq=ual"), "eq=ual");
+        assert_eq!(declare_scalar_quote("hash#x"), "hash#x");
+        // control char -> ANSI-C
+        assert_eq!(declare_scalar_quote("ta\tb"), "$'ta\\tb'");
+    }
+
+    #[test]
+    fn format_declare_bare_line_scalar_and_array() {
+        use crate::shell_state::{VarValue, Variable};
+        // scalar needing quotes -> single-quoted
+        let zs = Variable::scalar("a b".to_string());
+        assert_eq!(format_declare_bare_line("zs", &zs), "zs='a b'");
+        // bare scalar -> unquoted
+        let zp = Variable::scalar("plain".to_string());
+        assert_eq!(format_declare_bare_line("zp", &zp), "zp=plain");
+        // indexed array -> name=([0]="p" [1]="q r") (matches declare -p minus prefix)
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "p".to_string());
+        m.insert(1usize, "q r".to_string());
+        let za = Variable {
+            value: VarValue::Indexed(m),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        };
+        assert_eq!(
+            format_declare_bare_line("za", &za),
+            r#"za=([0]="p" [1]="q r")"#
+        );
+    }
+
+    #[test]
+    fn bare_declare_lists_name_value_and_functions() {
+        let mut shell = crate::shell_state::Shell::new();
+        // Set a scalar and define a function via the normal command path.
+        shell.set("zsv", "hello".to_string());
+        let _ =
+            crate::shell::process_line("zf(){ echo hi; }", &mut shell, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = run_declaration_builtin("declare", &[], &mut buf, &mut shell);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("zsv=hello"),
+            "bare declare should list zsv=hello: {s}"
+        );
+        assert!(
+            !s.contains("declare -- zsv"),
+            "bare declare must not use the -p form: {s}"
+        );
+        assert!(
+            s.contains("zf ()"),
+            "bare declare should list function zf: {s}"
+        );
+    }
 
     #[test]
     fn printf_q_quoting() {
