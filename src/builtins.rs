@@ -984,35 +984,65 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
         s.push_str(&attrs);
         s
     };
-    let value_part = match &var.value {
+    let value_part = render_declare_value_part(var);
+    format!("declare {flag_str} {name}{value_part}")
+}
+
+/// Renders the `=<value>` suffix of a declare line: `="v"` for a scalar,
+/// `=([k]="v" …)` for arrays. Shared by `format_declare_line` (the `-p` form)
+/// and `format_declare_bare_line` (arrays only).
+fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
+    use crate::shell_state::VarValue;
+    match &var.value {
         VarValue::Scalar(s) => {
             // Unbound namerefs (empty value) omit the `=""` part — matches bash.
             if var.nameref && s.is_empty() {
                 String::new()
             } else {
-                let escaped = escape_double_quote_value(s);
-                format!("=\"{escaped}\"")
+                format!("=\"{}\"", escape_double_quote_value(s))
             }
         }
         VarValue::Indexed(m) => {
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in m {
-                let escaped = escape_double_quote_value(v);
-                parts.push(format!("[{k}]=\"{escaped}\""));
-            }
+            let parts: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("[{k}]=\"{}\"", escape_double_quote_value(v)))
+                .collect();
             format!("=({})", parts.join(" "))
         }
         VarValue::Associative(pairs) => {
-            let mut parts: Vec<String> = Vec::new();
-            for (k, v) in pairs {
-                let key_escaped = escape_double_quote_value(k);
-                let val_escaped = escape_double_quote_value(v);
-                parts.push(format!("[\"{key_escaped}\"]=\"{val_escaped}\""));
-            }
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "[\"{}\"]=\"{}\"",
+                        escape_double_quote_value(k),
+                        escape_double_quote_value(v)
+                    )
+                })
+                .collect();
             format!("=({})", parts.join(" "))
         }
-    };
-    format!("declare {flag_str} {name}{value_part}")
+    }
+}
+
+/// Formats one variable in bash's bare-`declare` (no-args) form: `name=value`
+/// with NO `declare -X` prefix and NO attribute flags. Scalars use the minimal
+/// `declare_scalar_quote`; arrays reuse the `-p` value renderer (their element
+/// format is identical to `declare -p` minus the `declare -a/-A ` prefix).
+fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+    use crate::shell_state::VarValue;
+    match &var.value {
+        VarValue::Scalar(s) => {
+            if var.nameref && s.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}={}", declare_scalar_quote(s))
+            }
+        }
+        VarValue::Indexed(_) | VarValue::Associative(_) => {
+            format!("{name}{}", render_declare_value_part(var))
+        }
+    }
 }
 
 /// Lists every EXPORTED variable, sorted by name, as bash's
@@ -7701,6 +7731,33 @@ mod tests {
         assert_eq!(declare_scalar_quote("hash#x"), "hash#x");
         // control char -> ANSI-C
         assert_eq!(declare_scalar_quote("ta\tb"), "$'ta\\tb'");
+    }
+
+    #[test]
+    fn format_declare_bare_line_scalar_and_array() {
+        use crate::shell_state::{VarValue, Variable};
+        // scalar needing quotes -> single-quoted
+        let zs = Variable::scalar("a b".to_string());
+        assert_eq!(format_declare_bare_line("zs", &zs), "zs='a b'");
+        // bare scalar -> unquoted
+        let zp = Variable::scalar("plain".to_string());
+        assert_eq!(format_declare_bare_line("zp", &zp), "zp=plain");
+        // indexed array -> name=([0]="p" [1]="q r") (matches declare -p minus prefix)
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "p".to_string());
+        m.insert(1usize, "q r".to_string());
+        let za = Variable {
+            value: VarValue::Indexed(m),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        };
+        assert_eq!(
+            format_declare_bare_line("za", &za),
+            r#"za=([0]="p" [1]="q r")"#
+        );
     }
 
     #[test]
