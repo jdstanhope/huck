@@ -145,6 +145,16 @@ check "complete +o nosort accepts" \
 # NOTE: complete -p re-input form is intentionally divergent (huck uses
 # a deterministic flag ordering; bash's varies). Not exercised here.
 
+# compgen file/dir/glob actions in a private temp dir — exercises the -G glob
+# action (completion_spec::expand_glob / filename_matches_prefix) and the -f/-d
+# filename/directory actions, none of which the wordlist cases above reach.
+check "compgen -G glob" \
+      'd=$(mktemp -d); touch "$d"/za.txt "$d"/zb.txt "$d"/zc.log; (cd "$d"; compgen -G "z*.txt" | sort); rm -rf "$d"'
+check "compgen -f prefix" \
+      'd=$(mktemp -d); touch "$d"/pfx_a "$d"/pfx_b "$d"/zzz; (cd "$d"; compgen -f pfx_ | sort); rm -rf "$d"'
+check "compgen -d prefix" \
+      'd=$(mktemp -d); mkdir "$d"/dd1 "$d"/dd2; touch "$d"/dfile; (cd "$d"; compgen -d dd | sort); rm -rf "$d"'
+
 echo ""
 echo "Total: $((PASS + FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $((FAIL > 0 ? 1 : 0))
