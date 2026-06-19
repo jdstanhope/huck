@@ -113,8 +113,8 @@ fn trap_p_output_format() {
 #[test]
 fn trap_l_lists_signals() {
     let (out, _err, _) = run("trap -l\nexit\n");
-    assert!(out.contains("2) INT"), "stdout: {out}");
-    assert!(out.contains("15) TERM"), "stdout: {out}");
+    assert!(out.contains("2) SIGINT"), "stdout: {out}");
+    assert!(out.contains("15) SIGTERM"), "stdout: {out}");
 }
 
 #[test]
