@@ -2464,14 +2464,74 @@ impl Shell {
 
     // (quote_keyseq helper is a module-level free fn below.)
 
-    /// `bind -p` lines: `"KEYSEQ": FUNCTION` (keyseq double-quoted, bash form).
-    pub fn active_bind_lines(&self) -> Vec<String> {
-        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{}: {f}", quote_keyseq(k))).collect()
+    /// The effective key bindings (keyseq → function): the default emacs keymap,
+    /// overlaid with the user's bindings (already-applied `active_binds` AND
+    /// not-yet-applied `pending_binds`, so `-c`-mode binds show too), minus any
+    /// keyseq the user unbound. Keyseqs are normalized to bash's quoted form.
+    fn effective_binds(&self) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        for (k, f) in crate::readline_bind::DEFAULT_EMACS_BINDS {
+            m.insert(quote_keyseq(k), (*f).to_string());
+        }
+        for (k, f) in &self.readline_settings.active_binds {
+            m.insert(quote_keyseq(k), f.clone());
+        }
+        for (k, f) in &self.readline_settings.pending_binds {
+            m.insert(quote_keyseq(k), f.clone());
+        }
+        for k in &self.readline_settings.unbound {
+            m.remove(&quote_keyseq(k));
+        }
+        m
     }
 
-    /// `bind -P` lines: `FUNCTION can be found on "KEYSEQ".`
+    /// `bind -p` lines: `"KEYSEQ": FUNCTION` for each effective binding, grouped
+    /// and sorted by function name (matching bash); `# FUNCTION (not bound)` for
+    /// honored functions with no binding.
+    pub fn active_bind_lines(&self) -> Vec<String> {
+        let eff = self.effective_binds();
+        let mut by_func: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (k, f) in &eff {
+            by_func.entry(f.as_str()).or_default().push(k.as_str());
+        }
+        let mut out = Vec::new();
+        for func in crate::readline_bind::readline_function_names() {
+            match by_func.get(func) {
+                Some(keys) => {
+                    let mut keys = keys.clone();
+                    keys.sort_unstable();
+                    for k in keys {
+                        out.push(format!("{k}: {func}"));
+                    }
+                }
+                None => out.push(format!("# {func} (not bound)")),
+            }
+        }
+        out
+    }
+
+    /// `bind -P` lines: `FUNCTION can be found on "K1", "K2".` (all keyseqs) or
+    /// `FUNCTION is not bound to any keys`, per honored function sorted by name.
     pub fn active_bind_lines_verbose(&self) -> Vec<String> {
-        self.readline_settings.active_binds.iter().map(|(k, f)| format!("{f} can be found on {}.", quote_keyseq(k))).collect()
+        let eff = self.effective_binds();
+        let mut by_func: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (k, f) in &eff {
+            by_func.entry(f.as_str()).or_default().push(k.as_str());
+        }
+        let mut out = Vec::new();
+        for func in crate::readline_bind::readline_function_names() {
+            match by_func.get(func) {
+                Some(keys) => {
+                    let mut keys = keys.clone();
+                    keys.sort_unstable();
+                    out.push(format!("{func} can be found on {}.", keys.join(", ")));
+                }
+                None => out.push(format!("{func} is not bound to any keys")),
+            }
+        }
+        out
     }
 }
 
@@ -2521,6 +2581,29 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_p_shows_defaults_user_override_and_unbind() {
+        let mut sh = Shell::new();
+        // default present
+        let p = sh.active_bind_lines();
+        assert!(p.iter().any(|l| l == "\"\\C-a\": beginning-of-line"), "missing default C-a: {p:?}");
+        assert!(p.iter().any(|l| l == "# backward-kill-line (not bound)"), "missing not-bound line: {p:?}");
+        // -P format
+        let pv = sh.active_bind_lines_verbose();
+        assert!(pv.iter().any(|l| l == "beginning-of-line can be found on \"\\C-a\"."), "{pv:?}");
+        assert!(pv.iter().any(|l| l == "backward-kill-line is not bound to any keys"), "{pv:?}");
+        // user override via pending_binds (the -c-mode path)
+        sh.add_bind("\"\\C-a\"", "kill-line");
+        let p2 = sh.active_bind_lines();
+        assert!(p2.iter().any(|l| l == "\"\\C-a\": kill-line"), "override not applied: {p2:?}");
+        assert!(!p2.iter().any(|l| l == "\"\\C-a\": beginning-of-line"), "default not overridden: {p2:?}");
+        // unbind a default
+        let mut sh2 = Shell::new();
+        sh2.add_unbind("\\C-e");
+        let p3 = sh2.active_bind_lines();
+        assert!(!p3.iter().any(|l| l.contains("\\C-e")), "C-e still shown after unbind: {p3:?}");
+    }
 
     #[cfg(test)]
     fn test_fn_body() -> Box<crate::command::Command> {
