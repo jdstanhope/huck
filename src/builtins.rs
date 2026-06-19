@@ -4351,17 +4351,20 @@ fn check_targets_terminal(targets: &[WaitTarget], shell: &Shell) -> Option<(i32,
 }
 
 fn print_killable_table(out: &mut dyn Write) {
-    let table = crate::traps::killable_signals();
-    let mut sorted: Vec<&(&str, i32)> = table.iter().collect();
-    sorted.sort_by_key(|(_, n)| *n);
-    let cols = 4;
-    for chunk in sorted.chunks(cols) {
-        let mut line = String::new();
-        for (i, (name, num)) in chunk.iter().enumerate() {
-            if i > 0 { line.push(' '); }
-            line.push_str(&format!("{num:>2}) {name:<5}"));
-        }
-        let _ = writeln!(out, "{line}");
+    print_sig_listing(out, crate::traps::killable_signals());
+}
+
+/// Prints a signal listing in bash's `kill -l` format: signals sorted by number,
+/// `SIG`-prefixed names, 5 columns per row, tab-separated, number right-aligned
+/// to width 2. (huck lists the standard signals 1–31; bash additionally appends
+/// the real-time tail 34–64, deferred.)
+fn print_sig_listing(out: &mut dyn Write, table: &[(&str, i32)]) {
+    let mut sigs: Vec<&(&str, i32)> = table.iter().collect();
+    sigs.sort_by_key(|(_, n)| *n);
+    let last = sigs.len().saturating_sub(1);
+    for (i, (name, num)) in sigs.iter().enumerate() {
+        let sep = if i % 5 == 4 || i == last { "\n" } else { "\t" };
+        let _ = write!(out, "{num:>2}) SIG{name}{sep}");
     }
 }
 
@@ -5015,20 +5018,7 @@ fn print_active_traps(
 /// Prints the trappable signal table in bash's 4-column format:
 ///   1) HUP   2) INT   3) QUIT  10) USR1
 fn print_signal_table(out: &mut dyn Write) {
-    use crate::traps::name_table;
-    let table = name_table();
-    // Sort by signal number for the listing.
-    let mut sorted: Vec<&(&str, i32)> = table.iter().collect();
-    sorted.sort_by_key(|(_, n)| *n);
-    let cols = 4;
-    for chunk in sorted.chunks(cols) {
-        let mut line = String::new();
-        for (i, (name, num)) in chunk.iter().enumerate() {
-            if i > 0 { line.push(' '); }
-            line.push_str(&format!("{num:>2}) {name:<5}"));
-        }
-        let _ = writeln!(out, "{line}");
-    }
+    print_sig_listing(out, crate::traps::name_table());
 }
 
 /// Returns the canonical name (no SIG prefix) for `signum`, or None
@@ -8600,8 +8590,8 @@ mod tests {
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("2) INT"), "stdout: {out}");
-        assert!(out.contains("15) TERM"), "stdout: {out}");
+        assert!(out.contains("2) SIGINT"), "stdout: {out}");
+        assert!(out.contains("15) SIGTERM"), "stdout: {out}");
     }
 
     #[test]
@@ -9047,16 +9037,34 @@ mod kill_tests {
     }
 
     #[test]
-    fn kill_l_no_args_lists_all_16_signals() {
+    fn kill_l_no_args_lists_all_standard_signals() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("kill", &["-l".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let s = String::from_utf8(buf).unwrap();
-        assert_eq!(s.matches(')').count(), 16, "output: {s}");
+        // Common signals that were already listed before v189.
         assert!(s.contains("KILL"), "output missing KILL: {s}");
         assert!(s.contains("TERM"), "output missing TERM: {s}");
         assert!(s.contains("WINCH"), "output missing WINCH: {s}");
+        // The point of v189: the listing must now include the newly-added
+        // standard signals by name (bare-name format at this stage).
+        for sig in ["ABRT", "SEGV", "BUS", "FPE", "ILL"] {
+            assert!(s.contains(sig), "kill -l listing missing {sig}: {s}");
+        }
+    }
+
+    #[test]
+    fn kill_l_listing_matches_bash_format() {
+        let mut buf = Vec::new();
+        print_killable_table(&mut buf);
+        let s = String::from_utf8(buf).unwrap();
+        // bash: ` 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP\n…`
+        let first = s.lines().next().unwrap();
+        assert_eq!(first, " 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP");
+        // SIG prefix everywhere, 5 columns per full row
+        assert!(s.contains("SIGABRT"), "missing SIGABRT: {s}");
+        assert!(s.contains("11) SIGSEGV"));
     }
 
     #[test]

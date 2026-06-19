@@ -176,6 +176,7 @@ dependencies = [
  "regex",
  "rustyline",
  "signal-hook",
+ "signal-hook-registry",
  "tempfile",
 ]
 
