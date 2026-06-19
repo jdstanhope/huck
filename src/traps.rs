@@ -27,7 +27,7 @@ static IGNORED_AT_STARTUP: OnceLock<HashSet<i32>> = OnceLock::new();
 fn ignored_at_startup_set() -> &'static HashSet<i32> {
     IGNORED_AT_STARTUP.get_or_init(|| {
         let mut set = HashSet::new();
-        for (_, signum) in TRAPPABLE {
+        for (_, signum) in name_table() {
             // SAFETY: sigaction with null new pointer just queries the
             // current disposition without changing it.
             unsafe {
@@ -223,59 +223,59 @@ pub enum TrapSignal {
     Real(i32),
 }
 
-/// Trappable real signals — huck's existing 15-name table from `kill`,
-/// minus KILL (9) and STOP (19) which POSIX says cannot be trapped.
-/// Each entry: (name without SIG prefix, libc signal number).
-const TRAPPABLE: &[(&str, i32)] = &[
-    ("HUP",   libc::SIGHUP),
-    ("INT",   libc::SIGINT),
-    ("QUIT",  libc::SIGQUIT),
-    ("USR1",  libc::SIGUSR1),
-    ("USR2",  libc::SIGUSR2),
-    ("PIPE",  libc::SIGPIPE),
-    ("ALRM",  libc::SIGALRM),
-    ("TERM",  libc::SIGTERM),
-    ("CHLD",  libc::SIGCHLD),
-    ("CONT",  libc::SIGCONT),
-    ("TSTP",  libc::SIGTSTP),
-    ("TTIN",  libc::SIGTTIN),
-    ("TTOU",  libc::SIGTTOU),
-    ("WINCH", libc::SIGWINCH),
-];
-
-/// All signals huck knows how to SEND via `kill`. This is the
-/// trappable list plus KILL and STOP, which can be sent but not
-/// trapped.
-const KILLABLE: &[(&str, i32)] = &[
-    ("HUP",   libc::SIGHUP),
-    ("INT",   libc::SIGINT),
-    ("QUIT",  libc::SIGQUIT),
-    ("KILL",  libc::SIGKILL),
-    ("USR1",  libc::SIGUSR1),
-    ("USR2",  libc::SIGUSR2),
-    ("PIPE",  libc::SIGPIPE),
-    ("ALRM",  libc::SIGALRM),
-    ("TERM",  libc::SIGTERM),
-    ("CHLD",  libc::SIGCHLD),
-    ("CONT",  libc::SIGCONT),
-    ("STOP",  libc::SIGSTOP),
-    ("TSTP",  libc::SIGTSTP),
-    ("TTIN",  libc::SIGTTIN),
-    ("TTOU",  libc::SIGTTOU),
-    ("WINCH", libc::SIGWINCH),
-];
-
-/// Returns the trappable signal table (name → signal-number pairs).
-pub fn name_table() -> &'static [(&'static str, i32)] {
-    TRAPPABLE
+/// Every standard (non-real-time) signal this platform names, as
+/// (name without SIG prefix, libc number). Built from libc constants so numbers
+/// are correct per platform; platform-specific signals are cfg-gated so the
+/// crate builds on macOS as well as Linux. Real-time signals (SIGRTMIN..) are
+/// intentionally excluded — the trap pending bitmask is an AtomicU32 (bits
+/// 1..=31 only).
+fn standard_signals() -> Vec<(&'static str, i32)> {
+    let mut v = vec![
+        ("HUP", libc::SIGHUP), ("INT", libc::SIGINT), ("QUIT", libc::SIGQUIT),
+        ("ILL", libc::SIGILL), ("TRAP", libc::SIGTRAP), ("ABRT", libc::SIGABRT),
+        ("BUS", libc::SIGBUS), ("FPE", libc::SIGFPE), ("KILL", libc::SIGKILL),
+        ("USR1", libc::SIGUSR1), ("SEGV", libc::SIGSEGV), ("USR2", libc::SIGUSR2),
+        ("PIPE", libc::SIGPIPE), ("ALRM", libc::SIGALRM), ("TERM", libc::SIGTERM),
+        ("CHLD", libc::SIGCHLD), ("CONT", libc::SIGCONT), ("STOP", libc::SIGSTOP),
+        ("TSTP", libc::SIGTSTP), ("TTIN", libc::SIGTTIN), ("TTOU", libc::SIGTTOU),
+        ("URG", libc::SIGURG), ("XCPU", libc::SIGXCPU), ("XFSZ", libc::SIGXFSZ),
+        ("VTALRM", libc::SIGVTALRM), ("PROF", libc::SIGPROF), ("WINCH", libc::SIGWINCH),
+        ("IO", libc::SIGIO), ("SYS", libc::SIGSYS),
+    ];
+    #[cfg(target_os = "linux")]
+    {
+        v.push(("STKFLT", libc::SIGSTKFLT));
+        v.push(("PWR", libc::SIGPWR));
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+    {
+        v.push(("EMT", libc::SIGEMT));
+        v.push(("INFO", libc::SIGINFO));
+    }
+    v
 }
 
-/// Returns the table of signal names huck knows how to SEND via
-/// `kill`. This is the 14-entry trappable table plus KILL and STOP,
-/// which are not trappable but ARE sendable. Used by `kill -l` and
-/// the `signal_by_name` helper in `builtins.rs`.
+static FULL_TABLE: OnceLock<Vec<(&'static str, i32)>> = OnceLock::new();
+static TRAPPABLE_VIEW: OnceLock<Vec<(&'static str, i32)>> = OnceLock::new();
+
+/// Returns the trappable signal table (name → number) — every standard signal
+/// except KILL and STOP (which POSIX says cannot be trapped).
+pub fn name_table() -> &'static [(&'static str, i32)] {
+    TRAPPABLE_VIEW
+        .get_or_init(|| {
+            killable_signals()
+                .iter()
+                .copied()
+                .filter(|(_, n)| *n != libc::SIGKILL && *n != libc::SIGSTOP)
+                .collect()
+        })
+        .as_slice()
+}
+
+/// Returns every signal huck can SEND via `kill` (the full standard set,
+/// including KILL and STOP). Used by `kill` send + `kill -l` number↔name.
 pub fn killable_signals() -> &'static [(&'static str, i32)] {
-    KILLABLE
+    FULL_TABLE.get_or_init(standard_signals).as_slice()
 }
 
 /// Parses `name` as a signal specification. Accepts:
@@ -312,7 +312,7 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
             return Err(format!("{name}: cannot trap"));
         }
         // Accept any signal in the trappable table.
-        if TRAPPABLE.iter().any(|(_, s)| *s == n) {
+        if name_table().iter().any(|(_, s)| *s == n) {
             return Ok(TrapSignal::Real(n));
         }
         return Err(format!("{name}: invalid signal specification"));
@@ -328,7 +328,7 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     }
 
     // Look up in the trappable table.
-    for (n, sig) in TRAPPABLE {
+    for (n, sig) in name_table() {
         if *n == stripped {
             return Ok(TrapSignal::Real(*sig));
         }
@@ -495,12 +495,29 @@ mod tests {
     }
 
     #[test]
-    fn name_table_has_14_trappable_entries() {
-        // 15 total minus KILL minus STOP = 13 trappable… wait, the
-        // table never included KILL/STOP since they're filtered at
-        // parse time, so the table has 14 entries. (HUP/INT/QUIT/USR1/
-        // USR2/PIPE/ALRM/TERM/CHLD/CONT/TSTP/TTIN/TTOU/WINCH.)
-        assert_eq!(name_table().len(), 14);
+    fn name_table_has_full_standard_set_minus_kill_stop() {
+        let t = name_table();
+        // newly-added standard signals are present (trappable)
+        for name in ["ABRT", "SEGV", "BUS", "FPE", "ILL", "TRAP", "SYS", "URG", "XCPU"] {
+            assert!(t.iter().any(|(n, _)| *n == name), "trappable missing {name}");
+        }
+        // KILL and STOP are NOT trappable
+        assert!(!t.iter().any(|(n, _)| *n == "KILL"), "KILL must not be trappable");
+        assert!(!t.iter().any(|(n, _)| *n == "STOP"), "STOP must not be trappable");
+        // all numbers fit the AtomicU32 pending mask (1..=31)
+        assert!(t.iter().all(|(_, num)| (1..=31).contains(num)), "signal out of 1..=31");
+    }
+
+    #[test]
+    fn killable_includes_kill_stop_and_new_signals() {
+        let k = killable_signals();
+        assert!(k.iter().any(|(n, _)| *n == "KILL"));
+        assert!(k.iter().any(|(n, _)| *n == "STOP"));
+        assert!(k.iter().any(|(n, _)| *n == "ABRT"));
+        assert!(k.iter().any(|(n, _)| *n == "SEGV"));
+        // number<->name agrees with libc
+        assert_eq!(k.iter().find(|(n, _)| *n == "ABRT").map(|(_, x)| *x), Some(libc::SIGABRT));
+        assert_eq!(k.iter().find(|(n, _)| *n == "SEGV").map(|(_, x)| *x), Some(libc::SIGSEGV));
     }
 
     #[test]

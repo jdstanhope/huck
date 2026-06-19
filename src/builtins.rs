@@ -9047,13 +9047,18 @@ mod kill_tests {
     }
 
     #[test]
-    fn kill_l_no_args_lists_all_16_signals() {
+    fn kill_l_no_args_lists_all_standard_signals() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("kill", &["-l".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let s = String::from_utf8(buf).unwrap();
-        assert_eq!(s.matches(')').count(), 16, "output: {s}");
+        // One `N)` entry per signal in the full standard set (1..=31).
+        assert_eq!(
+            s.matches(')').count(),
+            crate::traps::killable_signals().len(),
+            "output: {s}"
+        );
         assert!(s.contains("KILL"), "output missing KILL: {s}");
         assert!(s.contains("TERM"), "output missing TERM: {s}");
         assert!(s.contains("WINCH"), "output missing WINCH: {s}");
