@@ -1106,12 +1106,26 @@ fn snapshot_for_local_scope(shell: &mut Shell, name: &str) {
 fn declare_list_all_vars(
     out: &mut dyn std::io::Write,
     shell: &Shell,
+    bare: bool,
 ) -> ExecOutcome {
     let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
         shell.iter_vars().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
-        let _ = writeln!(out, "{}", format_declare_line(name, var));
+        let line = if bare {
+            format_declare_bare_line(name, var)
+        } else {
+            format_declare_line(name, var)
+        };
+        let _ = writeln!(out, "{line}");
+    }
+    // bare `declare` also lists all functions (sorted), in the `f () {…}` form.
+    if bare {
+        let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
+        fnames.sort();
+        for n in &fnames {
+            emit_function(n, false, out, shell);
+        }
     }
     ExecOutcome::Continue(0)
 }
@@ -1288,7 +1302,7 @@ fn builtin_declare(
 
     // Bare or -p with no names: list everything.
     if names.is_empty() {
-        return declare_list_all_vars(out, shell);
+        return declare_list_all_vars(out, shell, !print_mode);
     }
 
     // Per-name processing.
@@ -2223,7 +2237,7 @@ fn builtin_declare_decl(
             }
             return ExecOutcome::Continue(0);
         }
-        return declare_list_all_vars(out, shell);
+        return declare_list_all_vars(out, shell, !print_mode);
     }
 
     let mut exit: i32 = 0;
@@ -7757,6 +7771,30 @@ mod tests {
         assert_eq!(
             format_declare_bare_line("za", &za),
             r#"za=([0]="p" [1]="q r")"#
+        );
+    }
+
+    #[test]
+    fn bare_declare_lists_name_value_and_functions() {
+        let mut shell = crate::shell_state::Shell::new();
+        // Set a scalar and define a function via the normal command path.
+        shell.set("zsv", "hello".to_string());
+        let _ =
+            crate::shell::process_line("zf(){ echo hi; }", &mut shell, false);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = run_declaration_builtin("declare", &[], &mut buf, &mut shell);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("zsv=hello"),
+            "bare declare should list zsv=hello: {s}"
+        );
+        assert!(
+            !s.contains("declare -- zsv"),
+            "bare declare must not use the -p form: {s}"
+        );
+        assert!(
+            s.contains("zf ()"),
+            "bare declare should list function zf: {s}"
         );
     }
 
