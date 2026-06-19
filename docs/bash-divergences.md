@@ -83,7 +83,7 @@ group.
 
 ### Globbing
 
-- **M-53: `**` globstar** — `[deferred]` low. huck: `**` ≡ `*`. bash: `shopt -s globstar` makes `**` match across `/`.
+- **M-53: bare `**` globstar matches dirs-only (not files)** — `[deferred]` low (narrowed v193). `shopt globstar` now gates `**` correctly: OFF (default) `**` ≡ `*` (single level), ON `**` is recursive — both byte-identical to bash for the common `**/<glob>` form (v193, `collapse_globstar` in the glob path). RESIDUAL: a bare `**` with globstar ON matches directories at all depths but NOT the files bash also yields (huck's regular glob path uses the `glob` crate, whose bare `**` is dir-recursive only). Matching bash's bare-`**` set exactly needs huck's own recursive walker (the extglob `walk_components` path). Also: globstar inside an extglob pattern (`**/+(…)`) does not recurse. Rarely decisive; the dominant `**/<glob>` form is correct.
 
 ---
 
