@@ -338,6 +338,9 @@ pub struct ReadlineSettings {
     pub pending_unbinds: Vec<String>,
     /// Bindings the loop has applied — for `bind -p`/`-P` (keyseq -> function).
     pub active_binds: std::collections::BTreeMap<String, String>,
+    /// Keyseqs the user removed via `bind -r` — subtracted from the effective
+    /// keymap so unbinding a DEFAULT keyseq is reflected in `bind -p`/`-P`.
+    pub unbound: std::collections::BTreeSet<String>,
     /// Set when the loop must re-sync vars/binds to the editor.
     pub dirty: bool,
 }
@@ -355,6 +358,7 @@ impl Default for ReadlineSettings {
             pending_binds: Vec::new(),
             pending_unbinds: Vec::new(),
             active_binds: std::collections::BTreeMap::new(),
+            unbound: std::collections::BTreeSet::new(),
             dirty: false,
         }
     }
@@ -2444,6 +2448,7 @@ impl Shell {
     /// Queues an unbind (keyseq) for the loop to apply.
     pub fn add_unbind(&mut self, keyseq: &str) {
         self.readline_settings.pending_unbinds.push(keyseq.to_string());
+        self.readline_settings.unbound.insert(keyseq.to_string());
         self.readline_settings.dirty = true;
     }
 

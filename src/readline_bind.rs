@@ -103,6 +103,31 @@ pub fn parse_keyseq(seq: &str) -> Option<Event> {
     Some(KeyEvent::normalize(KeyEvent::new(ch, mods)).into())
 }
 
+/// huck's default emacs key bindings — the standard emacs keys rustyline honors
+/// for huck's supported functions, in bash's `bind -p` keyseq spelling. Each
+/// entry is verified to appear in bash's own default `bind -p` (the harness
+/// enforces this subset relation), so huck never reports a binding bash lacks.
+/// Functions in the honored set with no entry here render as `# … (not bound)`.
+pub const DEFAULT_EMACS_BINDS: &[(&str, &str)] = &[
+    ("\\C-a", "beginning-of-line"), ("\\C-e", "end-of-line"),
+    ("\\C-f", "forward-char"), ("\\C-b", "backward-char"),
+    ("\\ef", "forward-word"), ("\\eb", "backward-word"),
+    ("\\C-k", "kill-line"), ("\\C-u", "unix-line-discard"),
+    ("\\C-w", "unix-word-rubout"), ("\\ed", "kill-word"),
+    ("\\e\\C-?", "backward-kill-word"),
+    ("\\C-l", "clear-screen"), ("\\C-g", "abort"),
+    ("\\C-j", "accept-line"), ("\\C-m", "accept-line"),
+    ("\\C-p", "previous-history"), ("\\C-n", "next-history"),
+    ("\\e<", "beginning-of-history"), ("\\e>", "end-of-history"),
+    ("\\C-r", "reverse-search-history"), ("\\C-s", "forward-search-history"),
+    ("\\C-i", "complete"),
+    ("\\eu", "upcase-word"), ("\\el", "downcase-word"),
+    ("\\ec", "capitalize-word"), ("\\C-t", "transpose-chars"),
+    ("\\et", "transpose-words"), ("\\C-_", "undo"),
+    ("\\C-y", "yank"), ("\\C-d", "delete-char"),
+    ("\\C-?", "backward-delete-char"),
+];
+
 /// Maps a readline function name to the rustyline `Cmd` that implements it.
 /// Returns `None` for unknown or unsupported function names.
 pub fn function_to_cmd(name: &str) -> Option<Cmd> {
@@ -228,5 +253,14 @@ mod tests {
         assert!(is_known_function("clear-screen"));
         assert!(!is_known_function("totally-bogus"));
         assert!(readline_function_names().contains(&"accept-line"));
+    }
+
+    #[test]
+    fn default_emacs_binds_only_reference_honored_functions() {
+        assert!(!DEFAULT_EMACS_BINDS.is_empty());
+        for (seq, func) in DEFAULT_EMACS_BINDS {
+            assert!(is_known_function(func), "default binds a function huck can't honor: {func}");
+            assert!(!seq.is_empty());
+        }
     }
 }
