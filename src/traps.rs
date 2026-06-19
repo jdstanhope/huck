@@ -160,11 +160,18 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                     let pending = TRAP_PENDING.get()
                         .expect("TRAP_PENDING initialised by Shell::new")
                         .clone();
-                    // SAFETY: signal_hook::low_level::register requires
-                    // the closure to be async-signal-safe. fetch_or on
-                    // AtomicU32 is lock-free and signal-safe.
+                    // SAFETY: the registered closure must be async-signal-safe.
+                    // It performs a single lock-free `AtomicU32::fetch_or` — the
+                    // only async-signal-safe operation it does — so it is sound.
+                    // We use `register_unchecked` (not `register`) to bypass
+                    // signal-hook's FORBIDDEN-list assert ([SIGILL, SIGFPE,
+                    // SIGSEGV], plus KILL/STOP). That guard exists to stop
+                    // arbitrary handlers that might call unsafe libc routines;
+                    // ours doesn't, and bypassing it is required so huck can trap
+                    // SEGV/FPE/ILL like bash (firing on e.g. `kill -SEGV`).
+                    // `register_unchecked`'s action takes a `&siginfo_t` we ignore.
                     unsafe {
-                        signal_hook::low_level::register(signum, move || {
+                        signal_hook_registry::register_unchecked(signum, move |_: &_| {
                             pending.fetch_or(1u32 << signum, Ordering::SeqCst);
                         })
                     }.map_err(|e| format!("install signal handler: {e}"))?
@@ -178,8 +185,13 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
                     // "Out of scope" note in docs/bash-divergences.md. True SIG_IGN
                     // would require libc::sigaction with SIG_IGN action + tracking
                     // trap-installed-ignores separately from startup-ignored signals.
+                    // SAFETY: empty handler is trivially async-signal-safe;
+                    // `register_unchecked` bypasses the FORBIDDEN-list assert (see
+                    // the action-form comment above) so SEGV/FPE/ILL can be set to
+                    // the ignore form without panicking. The action takes a
+                    // `&siginfo_t` we ignore.
                     unsafe {
-                        signal_hook::low_level::register(signum, || {})
+                        signal_hook_registry::register_unchecked(signum, move |_: &_| {})
                     }.map_err(|e| format!("install signal handler: {e}"))?
                 }
             };
