@@ -316,6 +316,10 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
 
     // Numeric form.
     if let Ok(n) = name.parse::<i32>() {
+        // Numeric 0 is the EXIT pseudo-signal (bash: `trap … 0` ≡ `trap … EXIT`).
+        if n == 0 {
+            return Ok(TrapSignal::Exit);
+        }
         // Reject uncatchable signals up front.
         if n == libc::SIGKILL {
             return Err(format!("{name}: cannot trap"));
@@ -433,6 +437,13 @@ mod tests {
 
     #[test]
     fn parse_trap_signal_exit() {
+        assert_eq!(parse_trap_signal("EXIT"), Ok(TrapSignal::Exit));
+    }
+
+    #[test]
+    fn parse_trap_signal_zero_is_exit() {
+        assert_eq!(parse_trap_signal("0"), Ok(TrapSignal::Exit));
+        // regression: the EXIT name still maps to the same thing.
         assert_eq!(parse_trap_signal("EXIT"), Ok(TrapSignal::Exit));
     }
 
