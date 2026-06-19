@@ -2605,6 +2605,21 @@ mod tests {
         assert!(!p3.iter().any(|l| l.contains("\\C-e")), "C-e still shown after unbind: {p3:?}");
     }
 
+    #[test]
+    fn bind_p_groups_multiple_keyseqs_for_one_function() {
+        let sh = Shell::new();
+        // accept-line is bound to both C-j and C-m by default.
+        let p = sh.active_bind_lines();
+        assert!(p.iter().any(|l| l == "\"\\C-j\": accept-line"), "missing C-j: {p:?}");
+        assert!(p.iter().any(|l| l == "\"\\C-m\": accept-line"), "missing C-m: {p:?}");
+        // -P joins both keyseqs on one line (sorted): C-j before C-m.
+        let pv = sh.active_bind_lines_verbose();
+        assert!(
+            pv.iter().any(|l| l == "accept-line can be found on \"\\C-j\", \"\\C-m\"."),
+            "multi-keyseq -P join wrong: {pv:?}"
+        );
+    }
+
     #[cfg(test)]
     fn test_fn_body() -> Box<crate::command::Command> {
         let seq = crate::command::parse(crate::lexer::tokenize("f(){ echo hi; }").unwrap())
