@@ -921,6 +921,9 @@ fn tokenize_partial_inner(
                 current.push('=');
                 // Compound RHS: `name=(...)`. Scan the array literal as
                 // a single WordPart that becomes the value.
+                // A `\<NL>` line continuation may sit between `=` and the array
+                // `(` (`arr=\<NL>(…)`); bash deletes it pre-tokenization.
+                skip_line_continuations(&mut chars);
                 if chars.peek() == Some(&'(') {
                     chars.next(); // consume '('
                     flush_literal(&mut parts, &mut current, false);
@@ -949,6 +952,7 @@ fn tokenize_partial_inner(
                     append: true,
                 });
                 // Compound RHS: `name+=(...)`.
+                skip_line_continuations(&mut chars);
                 if chars.peek() == Some(&'(') {
                     chars.next();
                     let elements = scan_array_literal(&mut chars, opts)?;
@@ -2996,6 +3000,21 @@ fn parse_subscript_body(src: &str, opts: LexerOptions) -> Result<Word, LexError>
         text: src.to_string(),
         quoted: false,
     }]))
+}
+
+/// Consumes any run of `\`-newline line continuations at the cursor (POSIX
+/// 2.2.1: `\<NL>` is deleted before tokenizing). Uses a cloned-cursor 2-char
+/// lookahead so a `\` NOT followed by a newline (a real escape like `\x`) is
+/// left untouched. No-op when the cursor is not at a `\<NL>`.
+fn skip_line_continuations(chars: &mut CharCursor<'_>) {
+    loop {
+        let mut probe = chars.clone();
+        if probe.next() == Some('\\') && probe.next() == Some('\n') {
+            *chars = probe;
+        } else {
+            return;
+        }
+    }
 }
 
 /// Scans a compound array RHS `elem elem [idx]=elem … )`. The caller has
@@ -7741,6 +7760,58 @@ mod array_parse_tests {
         let els = array_part.expect("ArrayLiteral part present");
         assert_eq!(els.len(), 3);
         assert!(els.iter().all(|e| e.subscript.is_none()));
+    }
+
+    #[test]
+    fn array_assignment_with_line_continuation() {
+        // `arr=\<NL>(a b c)` — the \<NL> between `=` and `(` is a line
+        // continuation (deleted pre-tokenization), so this is `arr=(a b c)`.
+        let assigns = parse_assignments("arr=\\\n(a b c)");
+        assert_eq!(assigns.len(), 1);
+        assert_eq!(assigns[0].target.name(), "arr");
+        assert!(!assigns[0].append);
+        let els = assigns[0]
+            .value
+            .0
+            .iter()
+            .find_map(|p| match p {
+                WordPart::ArrayLiteral(els) => Some(els),
+                _ => None,
+            })
+            .expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 3);
+    }
+
+    #[test]
+    fn array_append_with_line_continuation() {
+        let assigns = parse_assignments("arr+=\\\n(d)");
+        assert_eq!(assigns.len(), 1);
+        assert!(assigns[0].append);
+        let els = assigns[0]
+            .value
+            .0
+            .iter()
+            .find_map(|p| match p {
+                WordPart::ArrayLiteral(els) => Some(els),
+                _ => None,
+            })
+            .expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 1);
+    }
+
+    #[test]
+    fn backslash_escape_after_eq_is_not_continuation() {
+        // `arr=\x` — `\x` is a literal escape, NOT a continuation; no array.
+        let assigns = parse_assignments("arr=\\x");
+        assert_eq!(assigns.len(), 1);
+        assert!(
+            !assigns[0]
+                .value
+                .0
+                .iter()
+                .any(|p| matches!(p, WordPart::ArrayLiteral(_))),
+            "a backslash-escape must not be treated as a line continuation"
+        );
     }
 
     #[test]
