@@ -820,6 +820,7 @@ impl Shell {
             failglob: self.shopt_options.get("failglob").unwrap_or(false),
             extglob: self.shopt_options.get("extglob").unwrap_or(false),
             noglob: self.shell_options.noglob,
+            globstar: self.shopt_options.get("globstar").unwrap_or(false),
         }
     }
 
@@ -2581,6 +2582,14 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_opts_reads_globstar_shopt() {
+        let mut sh = Shell::new();
+        assert!(!sh.glob_opts().globstar, "globstar off by default");
+        crate::shell::process_line("shopt -s globstar", &mut sh, false);
+        assert!(sh.glob_opts().globstar, "globstar on after shopt -s");
+    }
 
     #[test]
     fn bind_p_shows_defaults_user_override_and_unbind() {

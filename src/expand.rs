@@ -14,6 +14,7 @@ pub struct GlobOpts {
     pub failglob: bool,
     pub extglob: bool,
     pub noglob: bool,
+    pub globstar: bool,
 }
 
 fn resolve_tilde(spec: &TildeSpec, shell: &Shell) -> Option<String> {
@@ -1528,6 +1529,10 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
                 require_literal_leading_dot: !literal_leading_dot && !opts.dotglob,
             };
             let npat = crate::glob_match::translate_bracket_negation(&pattern);
+            // `**` is recursive only with `shopt -s globstar`; otherwise it is
+            // two ordinary `*` (≡ `*`). The `glob` crate always treats `**` as
+            // recursive, so collapse it to `*` when globstar is off.
+            let npat = if opts.globstar { npat } else { collapse_globstar(&npat).into() };
             match glob_with(&npat, match_opts) {
                 Ok(paths) => {
                     let mut m = Vec::new();
@@ -1598,6 +1603,42 @@ fn build_glob_pattern(field: &Field) -> String {
     p
 }
 
+/// Collapses a run of consecutive `*` to a single `*` (`**`→`*`, `***`→`*`),
+/// matching bash when `shopt globstar` is OFF (two `*` are just one). Skips `*`
+/// inside a `[…]` bracket class and honors `\`-escapes, so `[**]` and `\*\*`
+/// are untouched.
+fn collapse_globstar(pat: &str) -> String {
+    let mut out = String::with_capacity(pat.len());
+    let mut chars = pat.chars().peekable();
+    let mut in_bracket = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push('\\');
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '[' if !in_bracket => {
+                in_bracket = true;
+                out.push('[');
+            }
+            ']' if in_bracket => {
+                in_bracket = false;
+                out.push(']');
+            }
+            '*' if !in_bracket => {
+                out.push('*');
+                while chars.peek() == Some(&'*') {
+                    chars.next();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Checks whether a field contains any unquoted glob metacharacters: `*`, `?`, `[`.
 fn has_unquoted_metachar(field: &Field) -> bool {
     field
@@ -1627,6 +1668,17 @@ mod tests {
 
     fn lit(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    }
+
+    #[test]
+    fn collapse_globstar_reduces_double_star_to_single() {
+        assert_eq!(collapse_globstar("**"), "*");
+        assert_eq!(collapse_globstar("***"), "*");
+        assert_eq!(collapse_globstar("**/*.txt"), "*/*.txt");
+        assert_eq!(collapse_globstar("a/**/b"), "a/*/b");
+        assert_eq!(collapse_globstar("a*b"), "a*b");          // single star unchanged
+        assert_eq!(collapse_globstar("[**]"), "[**]");        // inside bracket class: untouched
+        assert_eq!(collapse_globstar("\\*\\*"), "\\*\\*");    // escaped stars: untouched
     }
 
     /// Test helper: project `Vec<Field>` back to `Vec<String>` so the existing
