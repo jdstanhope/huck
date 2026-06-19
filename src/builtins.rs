@@ -929,6 +929,25 @@ pub(crate) fn escape_double_quote_value(s: &str) -> String {
 /// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
 /// For indexed-array variables, the value is rendered as
 /// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
+/// bash's variable-listing quoting (the bare `declare` / `set` / `set -x`
+/// style): bare unless the value needs quoting; a value with a shell
+/// metacharacter is single-quoted (with `'` rewritten `'\''`); a value with a
+/// control char uses ANSI-C `$'…'`; the EMPTY value is bare (`name=`). This is
+/// NOT `${v@Q}` (which always quotes); it mirrors bash's `sh_contains_shell_metas`
+/// + `sh_single_quote`.
+fn declare_scalar_quote(v: &str) -> String {
+    if v.is_empty() {
+        return String::new();
+    }
+    if v.chars().any(|c| c.is_control()) {
+        return crate::param_expansion::ansi_c_quote(v);
+    }
+    if crate::param_expansion::contains_shell_metas(v) {
+        return format!("'{}'", escape_alias_value(v));
+    }
+    v.to_string()
+}
+
 fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
     use crate::shell_state::VarValue;
 
@@ -7662,6 +7681,27 @@ fn validate_readline_var(var: &str, val: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declare_scalar_quote_matches_bash_listing() {
+        // bash bare-declare / set -x style minimal quoting (verified vs bash 5.x)
+        assert_eq!(declare_scalar_quote("hello"), "hello");
+        assert_eq!(declare_scalar_quote(""), "");            // empty -> bare (name=)
+        assert_eq!(declare_scalar_quote("a b"), "'a b'");
+        assert_eq!(declare_scalar_quote("x;y"), "'x;y'");
+        assert_eq!(declare_scalar_quote("gl*ob"), "'gl*ob'");
+        assert_eq!(declare_scalar_quote("d$ollar"), "'d$ollar'");
+        assert_eq!(declare_scalar_quote("bang!x"), "'bang!x'");
+        assert_eq!(declare_scalar_quote("lt<gt>"), "'lt<gt>'");
+        assert_eq!(declare_scalar_quote("br[ack]"), "'br[ack]'");
+        assert_eq!(declare_scalar_quote("qu'ote"), "'qu'\\''ote'");
+        // not metacharacters in this context -> stay bare
+        assert_eq!(declare_scalar_quote("ti~lde"), "ti~lde");
+        assert_eq!(declare_scalar_quote("eq=ual"), "eq=ual");
+        assert_eq!(declare_scalar_quote("hash#x"), "hash#x");
+        // control char -> ANSI-C
+        assert_eq!(declare_scalar_quote("ta\tb"), "$'ta\\tb'");
+    }
 
     #[test]
     fn printf_q_quoting() {

@@ -293,7 +293,7 @@ pub(crate) fn xtrace_quote(s: &str) -> String {
 
 /// bash `sh_contains_shell_metas`: does `s` contain a character that requires
 /// quoting to re-read as a single literal word?
-fn contains_shell_metas(s: &str) -> bool {
+pub(crate) fn contains_shell_metas(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         match c {
