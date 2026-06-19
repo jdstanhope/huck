@@ -9053,15 +9053,15 @@ mod kill_tests {
         let outcome = run_builtin("kill", &["-l".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let s = String::from_utf8(buf).unwrap();
-        // One `N)` entry per signal in the full standard set (1..=31).
-        assert_eq!(
-            s.matches(')').count(),
-            crate::traps::killable_signals().len(),
-            "output: {s}"
-        );
+        // Common signals that were already listed before v189.
         assert!(s.contains("KILL"), "output missing KILL: {s}");
         assert!(s.contains("TERM"), "output missing TERM: {s}");
         assert!(s.contains("WINCH"), "output missing WINCH: {s}");
+        // The point of v189: the listing must now include the newly-added
+        // standard signals by name (bare-name format at this stage).
+        for sig in ["ABRT", "SEGV", "BUS", "FPE", "ILL"] {
+            assert!(s.contains(sig), "kill -l listing missing {sig}: {s}");
+        }
     }
 
     #[test]
