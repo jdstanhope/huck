@@ -1134,10 +1134,53 @@ pub(crate) fn reconstruct_array_literal(
 /// `reconstruct_sequence_source`).
 pub(crate) fn reconstruct_word_source(word: &Word) -> String {
     let mut out = String::new();
+    let parts = &word.0;
+    let mut i = 0;
+    while i < parts.len() {
+        if part_is_quoted(&parts[i]) {
+            // Maximal run of quoted parts -> one "..." group (matches bash's
+            // xtrace; the single-vs-double quote char is not recoverable, so
+            // double is used).
+            out.push('"');
+            while i < parts.len() && part_is_quoted(&parts[i]) {
+                reconstruct_part(&parts[i], &mut out);
+                i += 1;
+            }
+            out.push('"');
+        } else {
+            reconstruct_part(&parts[i], &mut out);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Renders a `Word` back to source WITHOUT the top-level quoted-run grouping
+/// that `reconstruct_word_source` applies. Used for sub-words nested inside a
+/// part (arith bodies, `${...}` operands/subscripts): bash's xtrace does not
+/// re-quote those, and the lexer marks their parts `quoted: true` as a side
+/// effect of in-place quote removal (e.g. arith `1+2` -> a quoted Literal), so
+/// running them through the grouping path would spuriously wrap them.
+fn reconstruct_word_source_inner(word: &Word) -> String {
+    let mut out = String::new();
     for part in &word.0 {
         reconstruct_part(part, &mut out);
     }
     out
+}
+
+fn part_is_quoted(part: &WordPart) -> bool {
+    use crate::lexer::WordPart as P;
+    matches!(
+        part,
+        P::Literal { quoted: true, .. }
+            | P::Var { quoted: true, .. }
+            | P::LastStatus { quoted: true }
+            | P::CommandSub { quoted: true, .. }
+            | P::Arith { quoted: true, .. }
+            | P::ParamExpansion { quoted: true, .. }
+            | P::AllArgs { quoted: true, .. }
+    )
 }
 
 fn reconstruct_part(part: &WordPart, out: &mut String) {
@@ -1152,7 +1195,7 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
         P::AllArgs { joined, .. } => out.push_str(if *joined { "$*" } else { "$@" }),
         P::Arith { body, .. } => {
             out.push_str("$((");
-            out.push_str(&reconstruct_word_source(body));
+            out.push_str(&reconstruct_word_source_inner(body));
             out.push_str("))");
         }
         P::Tilde(spec) => out.push_str(&render_tilde_literal(spec)),
@@ -1195,7 +1238,7 @@ fn reconstruct_param_expansion(
         Some(S::Star) => out.push_str("[*]"),
         Some(S::Index(w)) => {
             out.push('[');
-            out.push_str(&reconstruct_word_source(w));
+            out.push_str(&reconstruct_word_source_inner(w));
             out.push(']');
         }
     }
@@ -1203,27 +1246,27 @@ fn reconstruct_param_expansion(
         M::None | M::Length | M::IndirectKeys => {}
         M::UseDefault { word, colon } => {
             out.push_str(if *colon { ":-" } else { "-" });
-            out.push_str(&reconstruct_word_source(word));
+            out.push_str(&reconstruct_word_source_inner(word));
         }
         M::AssignDefault { word, colon } => {
             out.push_str(if *colon { ":=" } else { "=" });
-            out.push_str(&reconstruct_word_source(word));
+            out.push_str(&reconstruct_word_source_inner(word));
         }
         M::ErrorIfUnset { word, colon } => {
             out.push_str(if *colon { ":?" } else { "?" });
-            out.push_str(&reconstruct_word_source(word));
+            out.push_str(&reconstruct_word_source_inner(word));
         }
         M::UseAlternate { word, colon } => {
             out.push_str(if *colon { ":+" } else { "+" });
-            out.push_str(&reconstruct_word_source(word));
+            out.push_str(&reconstruct_word_source_inner(word));
         }
         M::RemovePrefix { pattern, longest } => {
             out.push_str(if *longest { "##" } else { "#" });
-            out.push_str(&reconstruct_word_source(pattern));
+            out.push_str(&reconstruct_word_source_inner(pattern));
         }
         M::RemoveSuffix { pattern, longest } => {
             out.push_str(if *longest { "%%" } else { "%" });
-            out.push_str(&reconstruct_word_source(pattern));
+            out.push_str(&reconstruct_word_source_inner(pattern));
         }
         M::Substitute { pattern, replacement, anchor, all } => {
             out.push('/');
@@ -1233,16 +1276,16 @@ fn reconstruct_param_expansion(
                 SubstAnchor::Prefix => out.push('#'),
                 SubstAnchor::Suffix => out.push('%'),
             }
-            out.push_str(&reconstruct_word_source(pattern));
+            out.push_str(&reconstruct_word_source_inner(pattern));
             out.push('/');
-            out.push_str(&reconstruct_word_source(replacement));
+            out.push_str(&reconstruct_word_source_inner(replacement));
         }
         M::Substring { offset, length } => {
             out.push(':');
-            out.push_str(&reconstruct_word_source(offset));
+            out.push_str(&reconstruct_word_source_inner(offset));
             if let Some(len) = length {
                 out.push(':');
-                out.push_str(&reconstruct_word_source(len));
+                out.push_str(&reconstruct_word_source_inner(len));
             }
         }
         M::Case { direction, all, pattern } => {
@@ -1250,7 +1293,7 @@ fn reconstruct_param_expansion(
             out.push(c);
             if *all { out.push(c); }
             if let Some(p) = pattern {
-                out.push_str(&reconstruct_word_source(p));
+                out.push_str(&reconstruct_word_source_inner(p));
             }
         }
         M::Transform { op } => {
@@ -1924,6 +1967,11 @@ mod tests {
         assert_eq!(rt("$(ls -l)"), "$(ls -l)");
         assert_eq!(rt("$(a && b)"), "$(a && b)");
         assert_eq!(rt("$(a; b)"), "$(a; b)");
+        assert_eq!(rt("\"$x\""), "\"$x\"");
+        assert_eq!(rt("a"), "a");
+        assert_eq!(rt("\"a b\""), "\"a b\"");
+        assert_eq!(rt("pre\"$x\"post"), "pre\"$x\"post");
+        assert_eq!(rt("\"$x$y\""), "\"$x$y\"");
     }
 
     #[test]
