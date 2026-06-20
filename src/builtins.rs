@@ -4633,7 +4633,9 @@ fn print_signal_table(out: &mut dyn Write) {
 /// Returns the canonical name (no SIG prefix) for `signum`, or None
 /// if `signum` is not in the trappable table.
 fn signal_number_to_name(signum: i32) -> Option<String> {
-    crate::traps::name_table().iter().find_map(|(name, n)| {
+    // Full table (incl. KILL/STOP) so a stored KILL/STOP trap disposition
+    // renders by name in `trap -p`, matching bash.
+    crate::traps::killable_signals().iter().find_map(|(name, n)| {
         if *n == signum { Some(name.to_string()) } else { None }
     })
 }
@@ -8240,7 +8242,9 @@ mod tests {
     }
 
     #[test]
-    fn trap_kill_signal_errors_uncatchable() {
+    fn trap_kill_signal_accepted_silently() {
+        // bash accepts `trap … KILL` (rc 0, no error) and stores the
+        // disposition; it just never fires (OS can't catch SIGKILL).
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin(
@@ -8249,7 +8253,9 @@ mod tests {
             &mut buf,
             &mut shell,
         );
-        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert!(matches!(outcome, ExecOutcome::Continue(0)));
+        assert!(buf.is_empty(), "no error output expected, got: {:?}", String::from_utf8_lossy(&buf));
+        assert!(shell.traps.contains_key(&crate::traps::TrapSignal::Real(libc::SIGKILL)));
     }
 
     #[test]

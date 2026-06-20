@@ -149,6 +149,14 @@ pub fn install(shell: &mut Shell, sig: TrapSignal, action: Option<String>) -> Re
             if ignored_at_startup_set().contains(&signum) {
                 return Err(format!("signal {signum}: cannot reset ignored signal"));
             }
+            // SIGKILL/SIGSTOP cannot be caught (sigaction returns EINVAL), so
+            // like bash we only STORE the disposition (so `trap -p` lists it)
+            // and never register an OS handler — the signal keeps its default
+            // action.
+            if signum == libc::SIGKILL || signum == libc::SIGSTOP {
+                shell.traps.insert(TrapSignal::Real(signum), action);
+                return Ok(());
+            }
             // Remove any existing handler before installing a new one
             // so we don't accumulate multiple trap closures per signal.
             if let Some(sigid) = shell.trap_sigids.remove(&signum) {
@@ -298,7 +306,9 @@ pub fn killable_signals() -> &'static [(&'static str, i32)] {
 /// - `"INT"` / `"SIGINT"` / `"2"` → `TrapSignal::Real(2)`
 /// - Same dual-form for every trappable signal.
 ///
-/// Returns an error for `KILL`/`STOP`/unknown names/non-trappable numbers.
+/// `KILL`/`STOP` parse OK (bash stores their disposition without registering an
+/// OS handler — `install` skips registration for them). Returns an error only
+/// for unknown names / out-of-table numbers.
 pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     // EXIT pseudo-signal (case-sensitive to match bash).
     if name == "EXIT" {
@@ -320,15 +330,12 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
         if n == 0 {
             return Ok(TrapSignal::Exit);
         }
-        // Reject uncatchable signals up front.
-        if n == libc::SIGKILL {
-            return Err(format!("{name}: cannot trap"));
-        }
-        if n == libc::SIGSTOP {
-            return Err(format!("{name}: cannot trap"));
-        }
-        // Accept any signal in the trappable table.
-        if name_table().iter().any(|(_, s)| *s == n) {
+        // Accept any signal in the FULL table, including KILL/STOP. bash does
+        // NOT reject `trap … KILL`/`STOP`: it stores the disposition (visible
+        // via `trap -p`) but never registers an OS handler, so the signal still
+        // performs its default action. `install`/`reset` skip OS registration
+        // for these two.
+        if killable_signals().iter().any(|(_, s)| *s == n) {
             return Ok(TrapSignal::Real(n));
         }
         return Err(format!("{name}: invalid signal specification"));
@@ -338,13 +345,8 @@ pub fn parse_trap_signal(name: &str) -> Result<TrapSignal, String> {
     // but not "Sigint").
     let stripped = name.strip_prefix("SIG").unwrap_or(name);
 
-    // Reject KILL/STOP by name.
-    if stripped == "KILL" || stripped == "STOP" {
-        return Err(format!("{name}: cannot trap"));
-    }
-
-    // Look up in the trappable table.
-    for (n, sig) in name_table() {
+    // Look up in the full table (KILL/STOP included — see the numeric branch).
+    for (n, sig) in killable_signals() {
         if *n == stripped {
             return Ok(TrapSignal::Real(*sig));
         }
@@ -479,27 +481,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_trap_signal_kill_by_name_errors() {
-        assert!(matches!(parse_trap_signal("KILL"), Err(s) if s.contains("cannot trap")));
-        assert!(matches!(parse_trap_signal("SIGKILL"), Err(s) if s.contains("cannot trap")));
-    }
-
-    #[test]
-    fn parse_trap_signal_kill_by_number_errors() {
+    fn parse_trap_signal_kill_parses_ok() {
+        // bash accepts `trap … KILL` (stores disposition, no OS handler).
+        assert_eq!(parse_trap_signal("KILL"), Ok(TrapSignal::Real(libc::SIGKILL)));
+        assert_eq!(parse_trap_signal("SIGKILL"), Ok(TrapSignal::Real(libc::SIGKILL)));
         let n = libc::SIGKILL.to_string();
-        assert!(matches!(parse_trap_signal(&n), Err(s) if s.contains("cannot trap")));
+        assert_eq!(parse_trap_signal(&n), Ok(TrapSignal::Real(libc::SIGKILL)));
     }
 
     #[test]
-    fn parse_trap_signal_stop_by_name_errors() {
-        assert!(matches!(parse_trap_signal("STOP"), Err(s) if s.contains("cannot trap")));
-        assert!(matches!(parse_trap_signal("SIGSTOP"), Err(s) if s.contains("cannot trap")));
-    }
-
-    #[test]
-    fn parse_trap_signal_stop_by_number_errors() {
+    fn parse_trap_signal_stop_parses_ok() {
+        assert_eq!(parse_trap_signal("STOP"), Ok(TrapSignal::Real(libc::SIGSTOP)));
+        assert_eq!(parse_trap_signal("SIGSTOP"), Ok(TrapSignal::Real(libc::SIGSTOP)));
         let n = libc::SIGSTOP.to_string();
-        assert!(matches!(parse_trap_signal(&n), Err(s) if s.contains("cannot trap")));
+        assert_eq!(parse_trap_signal(&n), Ok(TrapSignal::Real(libc::SIGSTOP)));
+    }
+
+    #[test]
+    fn install_kill_stores_disposition_without_os_handler() {
+        // install() must NOT attempt OS registration for KILL (sigaction would
+        // EINVAL); it stores the disposition so `trap -p` can list it.
+        let mut shell = Shell::new();
+        assert!(install(&mut shell, TrapSignal::Real(libc::SIGKILL), None).is_ok());
+        assert!(shell.traps.contains_key(&TrapSignal::Real(libc::SIGKILL)));
+        assert!(!shell.trap_sigids.contains_key(&libc::SIGKILL),
+            "KILL must not get an OS sigid");
     }
 
     #[test]
