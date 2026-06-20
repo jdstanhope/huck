@@ -118,11 +118,15 @@ fn trap_l_lists_signals() {
 }
 
 #[test]
-fn trap_uncatchable_kill_errors_exit_1() {
+fn trap_kill_accepted_silently_and_listed() {
+    // bash does NOT reject `trap … KILL`: it silently accepts (no error) and
+    // stores the disposition (visible via `trap -p`), though it never fires.
     let (_out, err, _) = run("trap 'echo nope' KILL\nexit 0\n");
-    assert!(err.contains("cannot trap"), "stderr: {err}");
-    // The `exit 0` after the bad trap still runs; the bad trap returned
-    // status 1 but didn't abort the script.
+    assert!(!err.contains("cannot trap"), "should not error; stderr: {err}");
+    assert!(err.is_empty(), "no stderr expected; got: {err}");
+    let (out, _err, _) = run("trap 'echo nope' KILL\ntrap -p KILL\n");
+    assert!(out.contains("echo nope") && out.contains("KILL"),
+        "trap -p should list the KILL disposition; stdout: {out}");
 }
 
 #[test]

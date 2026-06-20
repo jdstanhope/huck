@@ -4836,7 +4836,9 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
     // argument is "numeric argument required".
     let n: i64 = match args.first() {
         None => 1,
-        Some(s) => match s.parse::<i64>() {
+        // bash parses via strtol, which skips surrounding whitespace; trim to
+        // match (`shift " 2 "` is valid). Overflow still errors like bash.
+        Some(s) => match s.trim().parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
                 eprintln!("huck: shift: {s}: numeric argument required");

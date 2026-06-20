@@ -28,5 +28,9 @@ check "exact count empties"   'set -- a b; shift 2; echo "[$*] rc=$?"'
 check "normal shift"          'set -- a b c; shift 2; echo "$*"'
 check "default shift one"     'set -- a b c; shift; echo "$*"'
 check "shift zero noop"       'set -- a b; shift 0; echo "$*"'
+check "plus-prefixed count"   'set -- a b c; shift +2; echo "[$*]"'
+check "leading/trailing ws"   'set -- a b c; n=" 2 "; shift "$n"; echo "[$*]"'
+check "overflow numeric"      'set -- a b; shift 99999999999999999999; echo done'
+check "hex rejected"          'set -- a b c; shift 0x2; echo "[$*] rc=$?"'
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
