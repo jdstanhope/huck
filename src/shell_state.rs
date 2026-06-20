@@ -444,7 +444,7 @@ pub struct Shell {
     pub last_arg: String,
     /// Unified call stack. Each `call_function` pushes a `Frame` with
     /// `kind == FrameKind::Function`. Replaces the old `function_arg0: Vec<String>`.
-    /// `$0` returns the innermost Function frame name, or `shell_argv0` at top level.
+    /// (`$0` is NOT taken from here — bash keeps `shell_argv0` inside functions.)
     pub call_stack: Vec<Frame>,
     /// Map of function-name → defining source file path. Populated when a
     /// function is defined. Used to fill `Frame.source` and ultimately
@@ -829,14 +829,6 @@ impl Shell {
         self.shopt_options.get("nocasematch").unwrap_or(false)
     }
 
-    /// Returns the innermost real-function frame name (skips `Source`/`Main` frames).
-    /// Used for `$0` inside a function. Returns `None` at top level.
-    pub fn current_function_name(&self) -> Option<String> {
-        self.call_stack.iter().rev()
-            .find(|f| f.kind == FrameKind::Function)
-            .map(|f| f.funcname.clone())
-    }
-
     /// Variable lookup for expansion. Recognises positional names
     /// (`"1"`-`"9"`/`"10"`/..., and `"#"`) before falling back to the
     /// regular variable HashMap. Returns an owned `String` because
@@ -844,9 +836,10 @@ impl Shell {
     pub fn lookup_var(&self, name: &str) -> Option<String> {
         // Special parameters (v26).
         match name {
-            "0" => return Some(
-                self.current_function_name().unwrap_or_else(|| self.shell_argv0.clone())
-            ),
+            // `$0` is the shell/script invocation name and is NOT rebound on
+            // function entry (bash keeps the script name inside functions —
+            // unlike ksh/zsh). Sourced and Main frames already use this too.
+            "0" => return Some(self.shell_argv0.clone()),
             "_" => return Some(self.last_arg.clone()),
             "$" => return Some(self.shell_pid.to_string()),
             "!" => return Some(
@@ -3042,23 +3035,26 @@ mod tests {
     }
 
     #[test]
-    fn lookup_var_zero_in_function_returns_function_name() {
+    fn lookup_var_zero_in_function_keeps_shell_argv0() {
+        // bash: `$0` is NOT rebound on function entry — it stays the script /
+        // shell invocation name, even nested. (Other shells differ; bash does not.)
         let mut shell = Shell::new();
         shell.shell_argv0 = "my-shell".to_string();
         shell.call_stack.push(make_func_frame("myfunc"));
-        assert_eq!(shell.lookup_var("0"), Some("myfunc".to_string()));
+        assert_eq!(shell.lookup_var("0"), Some("my-shell".to_string()));
     }
 
     #[test]
-    fn lookup_var_zero_nested_returns_innermost() {
+    fn lookup_var_zero_nested_keeps_shell_argv0() {
         let mut shell = Shell::new();
+        shell.shell_argv0 = "my-shell".to_string();
         shell.call_stack.push(make_func_frame("outer"));
         shell.call_stack.push(make_func_frame("inner"));
-        assert_eq!(shell.lookup_var("0"), Some("inner".to_string()));
+        assert_eq!(shell.lookup_var("0"), Some("my-shell".to_string()));
         shell.call_stack.pop();
-        assert_eq!(shell.lookup_var("0"), Some("outer".to_string()));
+        assert_eq!(shell.lookup_var("0"), Some("my-shell".to_string()));
         shell.call_stack.pop();
-        assert!(shell.lookup_var("0").is_some());  // falls through to shell_argv0
+        assert_eq!(shell.lookup_var("0"), Some("my-shell".to_string()));
     }
 
     #[test]

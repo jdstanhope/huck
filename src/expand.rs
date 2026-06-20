@@ -216,11 +216,8 @@ fn expand_positional_substring(
     // Bash: `${@:0}` includes `$0`; `${@:1}` is the regular positional list.
     // We model this as: prepend `$0` then take slice with the user's offset.
     let mut values: Vec<String> = Vec::with_capacity(shell.positional_args.len() + 1);
-    values.push(
-        shell
-            .current_function_name()
-            .unwrap_or_else(|| shell.shell_argv0.clone()),
-    );
+    // `$0` (the invocation name) is not rebound inside functions.
+    values.push(shell.shell_argv0.clone());
     values.extend(shell.positional_args.iter().cloned());
     // Evaluate user offset; if it's >= 0, do NOT auto-shift (matches bash:
     // `${@:0}` is the whole list including $0; `${@:1}` starts at $1).
