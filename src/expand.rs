@@ -497,11 +497,62 @@ fn expand_indirect(
     // lookup path and yields empty, matching bash's observable result.
     let n: &str = &through;
     if through.is_empty() {
-        // Empty through-value (source unset OR set-but-empty) is a fatal
-        // "invalid indirect expansion" in bash — and it fires regardless
-        // of `set -u`. Route it through the fatal-PE mechanism so a
+        // Empty through-value: bash distinguishes three cases (verified
+        // against bash 5.x). All route through the fatal-PE mechanism so a
         // non-interactive shell exits and an interactive one aborts the
-        // command (the caller turns `Fatal` into `pending_fatal_pe_error`).
+        // command, EXCEPT the unset-positional case which expands to empty.
+        if subscript.is_none() {
+            // Source SET but empty: the (empty) effective name is invalid —
+            // bash prints "<name>: invalid variable name" (here the effective
+            // name is the empty string).
+            if shell.is_set(name) {
+                eprintln!("huck: : invalid variable name");
+                return ExpansionResult::Fatal { status: 1 };
+            }
+            // Source UNSET and a POSITIONAL parameter ($1.. beyond $#): bash
+            // treats the indirection as unset and expands to empty (so a
+            // `:-`/`:+` modifier sees "unset"). Under `set -u` a bare
+            // reference is fatal "!<name>: unbound variable" (huck's nounset
+            // convention is exit 1, matching `${unset}` here — bash uses 127).
+            if name.bytes().all(|b| b.is_ascii_digit()) {
+                use crate::lexer::ParamModifier as PM;
+                // bash reports the indirect spec under the `!N` name for the
+                // positional path's diagnostics.
+                if shell.shell_options.nounset && matches!(modifier, PM::None) {
+                    eprintln!("huck: !{name}: unbound variable");
+                    return ExpansionResult::Fatal { status: 1 };
+                }
+                match modifier {
+                    // `:=`/`=`: bash rejects assignment to an indirect-unset
+                    // positional ("!N: invalid indirect expansion"). Must NOT
+                    // forward with an empty effective name (would write
+                    // `vars[""]`).
+                    PM::AssignDefault { .. } => {
+                        eprintln!("huck: !{name}: invalid indirect expansion");
+                        return ExpansionResult::Fatal { status: 1 };
+                    }
+                    // `:?`/`?`: the parameter is reported unset under `!N` —
+                    // forwarding that effective name reuses the standard
+                    // ErrorIfUnset rendering ("!N: <msg>" / "!N: parameter …").
+                    PM::ErrorIfUnset { .. } => {
+                        let effname = format!("!{name}");
+                        return crate::param_expansion::expand_modifier_quoted(
+                            &effname, modifier, quoted, shell,
+                        );
+                    }
+                    // Every value-substituting/transforming modifier
+                    // (`:-`/`:+`/`#`/`%`/`/`/`:off:len`/`^`/`,`/None) operates
+                    // on the empty value and yields empty/default.
+                    _ => {
+                        return crate::param_expansion::expand_modifier_quoted(
+                            "", modifier, quoted, shell,
+                        );
+                    }
+                }
+            }
+        }
+        // Source UNSET and a named variable (or a subscripted source): fatal
+        // "invalid indirect expansion".
         eprintln!("huck: {name}: invalid indirect expansion");
         return ExpansionResult::Fatal { status: 1 };
     }
@@ -2770,6 +2821,22 @@ mod array_expansion_tests {
         let mut s = shell_with_a();
         let out = expand_for_test(&mut s, "${#a[0]}");
         assert_eq!(out, "1");
+    }
+
+    #[test]
+    fn indirect_unset_positional_is_empty() {
+        // v195: `${!1}` with no positional parameters expands to empty (like
+        // bash), not a fatal "invalid indirect expansion". `:-` sees it unset.
+        let mut s = Shell::new();
+        assert_eq!(expand_for_test(&mut s, "${!1}"), "");
+        assert_eq!(expand_for_test(&mut s, "${!9}"), "");
+        assert_eq!(expand_for_test(&mut s, "${!1:-DEF}"), "DEF");
+        // A SET positional still indirects through its value.
+        s.positional_args = vec!["HOME".into()];
+        assert_eq!(
+            expand_for_test(&mut s, "${!1}"),
+            std::env::var("HOME").unwrap_or_default()
+        );
     }
 
     #[test]
