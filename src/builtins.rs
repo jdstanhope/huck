@@ -4829,9 +4829,12 @@ fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
 }
 
 fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
-    let n: usize = match args.first() {
+    // bash parses the count as a signed integer: a negative count is a
+    // "shift count out of range" error (naming the value), a non-numeric
+    // argument is "numeric argument required".
+    let n: i64 = match args.first() {
         None => 1,
-        Some(s) => match s.parse::<usize>() {
+        Some(s) => match s.parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
                 eprintln!("huck: shift: {s}: numeric argument required");
@@ -4839,8 +4842,14 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
         },
     };
+    if n < 0 {
+        eprintln!("huck: shift: {n}: shift count out of range");
+        return ExecOutcome::Continue(1);
+    }
+    // A count larger than $# is a SILENT failure in bash (rc 1, no message);
+    // only a negative count is a reported error.
+    let n = n as usize;
     if n > shell.positional_args.len() {
-        eprintln!("huck: shift: shift count out of range");
         return ExecOutcome::Continue(1);
     }
     shell.positional_args.drain(0..n);
@@ -9604,14 +9613,27 @@ mod shift_tests {
     }
 
     #[test]
-    fn shift_too_large_errors_status_1() {
+    fn shift_too_large_fails_status_1_silently() {
+        // bash: an over-range positive count fails (rc 1) SILENTLY — no message.
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string()];
         let mut buf: Vec<u8> = Vec::new();
         let outcome = run_builtin("shift", &["5".to_string()], &mut buf, &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
-        // Positional unchanged after error.
+        // Positional unchanged after the failed shift.
         assert_eq!(shell.positional_args, vec!["a"]);
+    }
+
+    #[test]
+    fn shift_negative_count_errors_status_1() {
+        // bash: a negative count is "shift count out of range" (rc 1), distinct
+        // from the non-numeric "numeric argument required".
+        let mut shell = Shell::new();
+        shell.positional_args = vec!["a".to_string(), "b".to_string()];
+        let mut buf: Vec<u8> = Vec::new();
+        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf, &mut shell);
+        assert!(matches!(outcome, ExecOutcome::Continue(1)));
+        assert_eq!(shell.positional_args, vec!["a", "b"]);
     }
 
     #[test]
