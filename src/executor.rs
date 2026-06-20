@@ -1250,6 +1250,20 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
 
     let mut last = ExecOutcome::Continue(0);
     for value in values {
+        if shell.shell_options.xtrace {
+            let words = clause
+                .words
+                .iter()
+                .map(crate::expand::reconstruct_word_source)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = if clause.has_in {
+                format!("for {} in {}", clause.var, words)
+            } else {
+                format!("for {}", clause.var)
+            };
+            xtrace_compound(shell, &body);
+        }
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
@@ -1376,6 +1390,7 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
 fn run_arith(body: &crate::lexer::Word, shell: &mut Shell) -> ExecOutcome {
+    xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(body)));
     match crate::expand::eval_arith_word(body, shell) {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
@@ -1408,6 +1423,9 @@ fn run_arith_for_inner(
 ) -> ExecOutcome {
 
     // 1. Eval init once (if present).
+    if let Some(init) = &clause.init {
+        xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(init)));
+    }
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
@@ -1422,6 +1440,9 @@ fn run_arith_for_inner(
             return o;
         }
 
+        if let Some(c) = &clause.cond {
+            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(c)));
+        }
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
             None => 1,
@@ -1463,6 +1484,9 @@ fn run_arith_for_inner(
         }
 
         // 4. Eval step (if present).
+        if let Some(step) = &clause.step {
+            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(step)));
+        }
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
@@ -1511,6 +1535,19 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
         }
         None => shell.positional_args.clone(),
     };
+
+    if shell.shell_options.xtrace {
+        let body = match &clause.words {
+            Some(words) => format!(
+                "select {} in {}",
+                clause.var,
+                words.iter().map(crate::expand::reconstruct_word_source)
+                    .collect::<Vec<_>>().join(" ")
+            ),
+            None => format!("select {}", clause.var),
+        };
+        xtrace_compound(shell, &body);
+    }
 
     // 2. Empty list → body never runs (bash returns the loop's last status, 0).
     if items.is_empty() {
@@ -1645,6 +1682,10 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
 /// `case` is not a loop — `break`/`continue` propagate out unchanged.
 fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
     let subject = expand_assignment(&clause.subject, shell);
+    xtrace_compound(
+        shell,
+        &format!("case {} in", crate::expand::reconstruct_word_source(&clause.subject)),
+    );
     let mut last = ExecOutcome::Continue(0);
     let mut i = 0;
     let mut fall_through = false;
@@ -3009,6 +3050,16 @@ fn xtrace_command_line(prefix: &[String], program: &str, args: &[String]) -> Str
     parts.push(xtrace_quote(program));
     parts.extend(args.iter().map(|a| xtrace_quote(a)));
     parts.join(" ")
+}
+
+/// Emit one xtrace line for a compound-command header (gated on `set -x`).
+/// Reuses the simple-command `ps4`/`xtrace_emit` path so depth/PS4/single-write
+/// behavior is identical.
+fn xtrace_compound(shell: &mut Shell, body: &str) {
+    if shell.shell_options.xtrace {
+        let p4 = ps4(shell);
+        xtrace_emit(&format!("{p4}{body}"));
+    }
 }
 
 /// If `w` is an array-literal RHS (`(a b c)`), return its elements for
