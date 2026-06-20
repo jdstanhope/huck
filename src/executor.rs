@@ -1791,7 +1791,69 @@ fn run_double_bracket(
     result
 }
 
+fn test_unary_op_str(op: crate::command::TestUnaryOp) -> &'static str {
+    use crate::command::TestUnaryOp as U;
+    match op {
+        U::FileExists => "-e", U::IsRegFile => "-f", U::IsDir => "-d",
+        U::IsReadable => "-r", U::IsWritable => "-w", U::IsExecutable => "-x",
+        U::IsNonEmpty => "-s", U::IsSymlink => "-L", U::StringNonEmpty => "-n",
+        U::StringEmpty => "-z", U::VarSet => "-v", U::OptEnabled => "-o",
+        U::IsFifo => "-p", U::IsSocket => "-S", U::IsBlockDev => "-b",
+        U::IsCharDev => "-c", U::OwnedByEuid => "-O", U::OwnedByEgid => "-G",
+        U::NewerThanRead => "-N", U::IsSticky => "-k", U::IsSetuid => "-u",
+        U::IsSetgid => "-g", U::IsTerminal => "-t",
+    }
+}
+
+fn test_binary_op_str(op: crate::command::TestBinaryOp) -> &'static str {
+    use crate::command::TestBinaryOp as B;
+    match op {
+        B::StringEq => "==", B::StringNe => "!=", B::StringLt => "<", B::StringGt => ">",
+        B::IntEq => "-eq", B::IntNe => "-ne", B::IntLt => "-lt", B::IntGt => "-gt",
+        B::IntLe => "-le", B::IntGe => "-ge", B::NewerThan => "-nt",
+        B::OlderThan => "-ot", B::SameFile => "-ef",
+    }
+}
+
+/// bash shows an empty `[[ ]]` operand as `''` and a non-empty one raw.
+fn xtrace_operand(s: &str) -> String {
+    if s.is_empty() { "''".to_string() } else { s.to_string() }
+}
+
+/// Render the `[[ … ]]` body for a single leaf (operands EXPANDED), for `set -x`.
+fn render_test_leaf(expr: &TestExpr, shell: &mut Shell) -> String {
+    match expr {
+        TestExpr::Unary { op, operand } => {
+            let s = expand_assignment(operand, shell);
+            format!("{} {}", test_unary_op_str(*op), xtrace_operand(&s))
+        }
+        TestExpr::Binary { op, lhs, rhs } => {
+            let l = expand_assignment(lhs, shell);
+            let r = expand_assignment(rhs, shell);
+            format!("{} {} {}", xtrace_operand(&l), test_binary_op_str(*op), xtrace_operand(&r))
+        }
+        TestExpr::Regex { lhs, pattern } => {
+            let l = expand_assignment(lhs, shell);
+            let p = expand_assignment(pattern, shell);
+            format!("{} =~ {}", xtrace_operand(&l), xtrace_operand(&p))
+        }
+        TestExpr::Not(_) | TestExpr::And(_, _) | TestExpr::Or(_, _) => String::new(),
+    }
+}
+
 fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
+    eval_test_expr_traced(expr, shell, false)
+}
+
+fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> Result<bool, String> {
+    if !suppress
+        && shell.shell_options.xtrace
+        && matches!(expr, TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. })
+    {
+        let body = render_test_leaf(expr, shell);
+        let p4 = ps4(shell);
+        xtrace_emit(&format!("{p4}[[ {body} ]]"));
+    }
     match expr {
         TestExpr::Unary { op, operand } => {
             let s = expand_assignment(operand, shell);
@@ -1836,19 +1898,30 @@ fn eval_test_expr(expr: &TestExpr, shell: &mut Shell) -> Result<bool, String> {
                 }
             }
         }
-        TestExpr::Not(inner) => eval_test_expr(inner, shell).map(|b| !b),
+        TestExpr::Not(inner) => {
+            if !suppress
+                && shell.shell_options.xtrace
+                && matches!(**inner, TestExpr::Unary { .. } | TestExpr::Binary { .. } | TestExpr::Regex { .. })
+            {
+                let body = render_test_leaf(inner, shell);
+                let p4 = ps4(shell);
+                xtrace_emit(&format!("{p4}[[ ! {body} ]]"));
+                return eval_test_expr_traced(inner, shell, true).map(|b| !b);
+            }
+            eval_test_expr_traced(inner, shell, suppress).map(|b| !b)
+        }
         TestExpr::And(a, b) => {
-            if eval_test_expr(a, shell)? {
-                eval_test_expr(b, shell)
+            if eval_test_expr_traced(a, shell, false)? {
+                eval_test_expr_traced(b, shell, false)
             } else {
                 Ok(false)
             }
         }
         TestExpr::Or(a, b) => {
-            if eval_test_expr(a, shell)? {
+            if eval_test_expr_traced(a, shell, false)? {
                 Ok(true)
             } else {
-                eval_test_expr(b, shell)
+                eval_test_expr_traced(b, shell, false)
             }
         }
     }
@@ -6154,6 +6227,23 @@ mod tests {
 
     fn exec_args(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn render_test_leaf_forms() {
+        let mut shell = Shell::new();
+        shell.set("v", "hi".into());
+        let parse_expr = |src: &str| {
+            let toks = crate::lexer::tokenize(src).expect("lex");
+            match crate::command::parse(toks).expect("parse").expect("seq").first {
+                crate::command::Command::DoubleBracket { expr, .. } => *expr,
+                other => panic!("expected [[ ]], got {other:?}"),
+            }
+        };
+        assert_eq!(render_test_leaf(&parse_expr("[[ -n $v ]]"), &mut shell), "-n hi");
+        assert_eq!(render_test_leaf(&parse_expr("[[ -z \"\" ]]"), &mut shell), "-z ''");
+        assert_eq!(render_test_leaf(&parse_expr("[[ $v == h* ]]"), &mut shell), "hi == h*");
+        assert_eq!(render_test_leaf(&parse_expr("[[ 5 -gt 3 ]]"), &mut shell), "5 -gt 3");
     }
 
     #[test]
