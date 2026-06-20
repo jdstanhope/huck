@@ -3082,9 +3082,11 @@ fn skip_line_comment(chars: &mut CharCursor<'_>) {
 }
 
 /// Skips inter-element separators inside an array literal: whitespace, newlines,
-/// and `#` comments. The post-skip position is always an element boundary (after
-/// `(` or inter-element whitespace), so a `#` here is unambiguously a comment —
-/// its body (incl. any `)`) must NOT be read as elements or close the literal.
+/// `\<NL>` line continuations, and `#` comments. The post-skip position is always
+/// an element boundary (after `(` or inter-element whitespace), so a `#` here is
+/// unambiguously a comment — its body (incl. any `)`) must NOT be read as
+/// elements or close the literal. A `\<NL>` between elements (`[a]=1 \<NL>
+/// [b]=2`) is a line continuation, not the start of an element value.
 fn skip_array_literal_separators(
     chars: &mut CharCursor<'_>,
 ) {
@@ -3095,6 +3097,13 @@ fn skip_array_literal_separators(
             } else {
                 break;
             }
+        }
+        // `\<NL>` continuation (only consumes a backslash IMMEDIATELY followed by
+        // a newline — a real escape like `\x` starting an element is left alone).
+        let before = chars.offset();
+        skip_line_continuations(chars);
+        if chars.offset() != before {
+            continue; // consumed a continuation — re-check for more separators
         }
         if chars.peek() == Some(&'#') {
             skip_line_comment(chars);
@@ -7797,6 +7806,27 @@ mod array_parse_tests {
             })
             .expect("ArrayLiteral part present");
         assert_eq!(els.len(), 1);
+    }
+
+    #[test]
+    fn array_assignment_with_line_continuation_between_elements() {
+        // `arr=([a]=1 \<NL> [b]=2)` — the \<NL> BETWEEN elements is a separator,
+        // not the start of a bare element. Both subscripted elements survive
+        // (previously the \<NL> produced a spurious no-subscript element).
+        let assigns = parse_assignments("arr=([a]=1 \\\n [b]=2)");
+        assert_eq!(assigns.len(), 1);
+        let els = assigns[0]
+            .value
+            .0
+            .iter()
+            .find_map(|p| match p {
+                WordPart::ArrayLiteral(els) => Some(els),
+                _ => None,
+            })
+            .expect("ArrayLiteral part present");
+        assert_eq!(els.len(), 2, "two subscripted elements, no spurious one");
+        assert!(els.iter().all(|e| e.subscript.is_some()),
+            "every element keeps its [key]= subscript");
     }
 
     #[test]
