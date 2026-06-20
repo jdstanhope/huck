@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 13 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 14 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -80,6 +80,17 @@ group.
   set variables whose name begins with `prefix`) are not implemented —
   the lexer's `${!` branch handles only the scalar-indirect form (M-91).
   Not used by the bashrc / bash-completion; deferred. M-91 follow-on.
+- **M-93: indirect through `@` / `*` — `${!@}` / `${!*}`** — `[deferred]` low
+  (found during v195). bash treats `${!@}` / `${!*}` as indirect expansion
+  whose source parameter is the positional list: with no args it yields empty
+  (rc 0), and with args it uses the joined value as a name (`set -- a b;
+  ${!@}` → "a b: invalid variable name"). huck rejects both at PARSE
+  (`syntax error: parameter expansion with empty name`) because the lexer's
+  `${!` branch does not accept `@`/`*` as the indirect parameter. Distinct from
+  M-92 (which is the `${!prefix@}` name-LISTING form); this is the bare
+  `@`/`*`-as-indirect-source case. The scalar / positional-digit indirect forms
+  all work (v195 `indirect_unset_positional_diff_check.sh`); only the
+  `@`/`*`-source variant is unparsed. Rare; M-91 follow-on.
 
 ### Globbing
 
