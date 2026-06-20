@@ -7345,12 +7345,13 @@ mod tests {
     }
 
     #[test]
-    fn call_function_pushes_arg0_during_body() {
-        // Define a function whose body reads $0 into a var; verify the var
-        // contains the function name after the call.
+    fn call_function_keeps_arg0_during_body() {
+        // bash: `$0` is NOT rebound to the function name on entry — it stays the
+        // shell/script invocation name throughout the function body.
         let mut shell = Shell::new();
+        shell.shell_argv0 = "my-shell".to_string();
         exec_script("myfunc() { CAPTURED=$0; }\nmyfunc\n", &mut shell);
-        assert_eq!(shell.get("CAPTURED"), Some("myfunc"));
+        assert_eq!(shell.get("CAPTURED"), Some("my-shell"));
     }
 
     #[test]

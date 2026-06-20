@@ -34,30 +34,36 @@ fn dollar_zero_top_level_contains_huck() {
 }
 
 #[test]
-fn dollar_zero_in_function_is_function_name() {
+fn dollar_zero_in_function_keeps_invocation_name() {
+    // bash: `$0` is NOT rebound to the function name on entry — it stays the
+    // shell/script invocation name (which here contains "huck").
     let (out, _) = run("f() { echo $0; }\nf\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "f"), "got: {out}");
+    assert!(out.lines().any(|l| l.contains("huck")), "got: {out}");
+    assert!(
+        !out.lines().any(|l| l.trim() == "f"),
+        "$0 must not be the function name; got: {out}"
+    );
 }
 
 #[test]
-fn dollar_zero_nested_functions() {
+fn dollar_zero_nested_functions_keep_invocation_name() {
     let (out, _) = run("f() { g; echo $0; }\ng() { echo $0; }\nf\nexit\n");
-    let lines: Vec<&str> = out.lines().filter(|l| l.trim() == "f" || l.trim() == "g").collect();
-    assert!(lines.len() >= 2, "got: {out}");
-    // The inner call prints "g" first; the outer prints "f" second.
-    assert_eq!(lines[0].trim(), "g", "got: {out}");
-    assert_eq!(lines[1].trim(), "f", "got: {out}");
+    // Both prints are the invocation name, never the function names.
+    let zero_lines: Vec<&str> = out.lines().filter(|l| l.contains("huck")).collect();
+    assert!(zero_lines.len() >= 2, "expected two $0 prints, got: {out}");
+    assert!(
+        !out.lines().any(|l| l.trim() == "f" || l.trim() == "g"),
+        "$0 must not be a function name; got: {out}"
+    );
 }
 
 #[test]
-fn dollar_zero_returns_to_shell_after_function() {
+fn dollar_zero_same_inside_and_outside_function() {
     let (out, _) = run("f() { echo $0; }\nf\necho $0\nexit\n");
-    let lines: Vec<&str> = out.lines().collect();
-    // First line is "f" from inside the function; second line contains "huck".
-    let in_func = lines.iter().any(|l| l.trim() == "f");
-    let outside_huck = lines.iter().any(|l| l.contains("huck"));
-    assert!(in_func, "expected 'f' line, got: {out}");
-    assert!(outside_huck, "expected huck-containing line outside function, got: {out}");
+    // The in-function and top-level `$0` are the same invocation name.
+    let zero_lines: Vec<&str> = out.lines().filter(|l| l.contains("huck")).collect();
+    assert!(zero_lines.len() >= 2, "expected matching $0 lines, got: {out}");
+    assert_eq!(zero_lines[0].trim(), zero_lines[1].trim(), "got: {out}");
 }
 
 // ---------------------------------------------------------------------------
