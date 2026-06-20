@@ -1390,7 +1390,7 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
 fn run_arith(body: &crate::lexer::Word, shell: &mut Shell) -> ExecOutcome {
-    xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(body)));
+    xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
     match crate::expand::eval_arith_word(body, shell) {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
@@ -1424,7 +1424,7 @@ fn run_arith_for_inner(
 
     // 1. Eval init once (if present).
     if let Some(init) = &clause.init {
-        xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(init)));
+        xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(init)));
     }
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
@@ -1441,7 +1441,7 @@ fn run_arith_for_inner(
         }
 
         if let Some(c) = &clause.cond {
-            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(c)));
+            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(c)));
         }
         // 2. Eval cond. Empty cond = always true (matches bash).
         let cond_value = match &clause.cond {
@@ -1485,7 +1485,7 @@ fn run_arith_for_inner(
 
         // 4. Eval step (if present).
         if let Some(step) = &clause.step {
-            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source(step)));
+            xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(step)));
         }
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)

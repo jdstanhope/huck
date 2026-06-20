@@ -1155,13 +1155,11 @@ pub(crate) fn reconstruct_word_source(word: &Word) -> String {
     out
 }
 
-/// Renders a `Word` back to source WITHOUT the top-level quoted-run grouping
-/// that `reconstruct_word_source` applies. Used for sub-words nested inside a
-/// part (arith bodies, `${...}` operands/subscripts): bash's xtrace does not
-/// re-quote those, and the lexer marks their parts `quoted: true` as a side
-/// effect of in-place quote removal (e.g. arith `1+2` -> a quoted Literal), so
-/// running them through the grouping path would spuriously wrap them.
-fn reconstruct_word_source_inner(word: &Word) -> String {
+/// Like `reconstruct_word_source` but WITHOUT wrapping quoted runs in `"..."`.
+/// Used for nested sub-words and for `(( ))` arith bodies, whose literals are
+/// spuriously marked `quoted` by `arith_string_to_word` (bash shows arith bodies
+/// raw, never quoted).
+pub(crate) fn reconstruct_word_source_inner(word: &Word) -> String {
     let mut out = String::new();
     for part in &word.0 {
         reconstruct_part(part, &mut out);
@@ -1311,9 +1309,6 @@ fn reconstruct_param_expansion(
     out.push('}');
 }
 
-/// Best-effort source for a `$(…)` / `<(…)` body: renders a single pipeline of
-/// simple commands (`cmd a | cmd b`). Compound/multi-connector bodies render
-/// their first command only (documented approximation — rare in a trace header).
 /// Best-effort source for a `$(…)` / `<(…)` body: renders the command list with
 /// its real connectors (`a && b`, `a; b`, `a & b`). A compound command inside the
 /// list falls back to empty per `reconstruct_command_source` (documented
