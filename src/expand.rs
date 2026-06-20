@@ -1125,6 +1125,189 @@ pub(crate) fn reconstruct_array_literal(
     format!("({})", parts.join(" "))
 }
 
+/// Re-render a parsed `Word` back to its (approximate) SOURCE text, UNEXPANDED.
+/// Used for `set -x` traces of compound-command headers (case/for/select/arith),
+/// which bash shows as the raw source word, not the expanded value. Pure — no
+/// `Shell`, no expansion. Quote *style* is not recoverable (`'x'`/`"x"`/`x` all
+/// render as `x`); deeply-nested command substitutions render their inner
+/// command best-effort (single pipeline of simple commands; see
+/// `reconstruct_sequence_source`).
+pub(crate) fn reconstruct_word_source(word: &Word) -> String {
+    let mut out = String::new();
+    for part in &word.0 {
+        reconstruct_part(part, &mut out);
+    }
+    out
+}
+
+fn reconstruct_part(part: &WordPart, out: &mut String) {
+    use crate::lexer::{ProcDir, WordPart as P};
+    match part {
+        P::Literal { text, .. } => out.push_str(text),
+        P::Var { name, .. } => {
+            out.push('$');
+            out.push_str(name);
+        }
+        P::LastStatus { .. } => out.push_str("$?"),
+        P::AllArgs { joined, .. } => out.push_str(if *joined { "$*" } else { "$@" }),
+        P::Arith { body, .. } => {
+            out.push_str("$((");
+            out.push_str(&reconstruct_word_source(body));
+            out.push_str("))");
+        }
+        P::Tilde(spec) => out.push_str(&render_tilde_literal(spec)),
+        P::CommandSub { sequence, .. } => {
+            out.push_str("$(");
+            out.push_str(&reconstruct_sequence_source(sequence));
+            out.push(')');
+        }
+        P::ProcessSub { sequence, dir } => {
+            out.push_str(match dir { ProcDir::In => "<(", ProcDir::Out => ">(" });
+            out.push_str(&reconstruct_sequence_source(sequence));
+            out.push(')');
+        }
+        P::ParamExpansion { name, modifier, subscript, indirect, .. } => {
+            reconstruct_param_expansion(name, modifier, subscript.as_ref(), *indirect, out);
+        }
+        P::AssignPrefix { .. } | P::ArrayLiteral(_) => {}
+    }
+}
+
+fn reconstruct_param_expansion(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    subscript: Option<&crate::lexer::SubscriptKind>,
+    indirect: bool,
+    out: &mut String,
+) {
+    use crate::lexer::{ParamModifier as M, SubstAnchor, CaseDirection, SubscriptKind as S, TransformOp};
+    out.push_str("${");
+    if indirect || matches!(modifier, M::IndirectKeys) {
+        out.push('!');
+    }
+    if matches!(modifier, M::Length) {
+        out.push('#');
+    }
+    out.push_str(name);
+    match subscript {
+        None => {}
+        Some(S::All) => out.push_str("[@]"),
+        Some(S::Star) => out.push_str("[*]"),
+        Some(S::Index(w)) => {
+            out.push('[');
+            out.push_str(&reconstruct_word_source(w));
+            out.push(']');
+        }
+    }
+    match modifier {
+        M::None | M::Length | M::IndirectKeys => {}
+        M::UseDefault { word, colon } => {
+            out.push_str(if *colon { ":-" } else { "-" });
+            out.push_str(&reconstruct_word_source(word));
+        }
+        M::AssignDefault { word, colon } => {
+            out.push_str(if *colon { ":=" } else { "=" });
+            out.push_str(&reconstruct_word_source(word));
+        }
+        M::ErrorIfUnset { word, colon } => {
+            out.push_str(if *colon { ":?" } else { "?" });
+            out.push_str(&reconstruct_word_source(word));
+        }
+        M::UseAlternate { word, colon } => {
+            out.push_str(if *colon { ":+" } else { "+" });
+            out.push_str(&reconstruct_word_source(word));
+        }
+        M::RemovePrefix { pattern, longest } => {
+            out.push_str(if *longest { "##" } else { "#" });
+            out.push_str(&reconstruct_word_source(pattern));
+        }
+        M::RemoveSuffix { pattern, longest } => {
+            out.push_str(if *longest { "%%" } else { "%" });
+            out.push_str(&reconstruct_word_source(pattern));
+        }
+        M::Substitute { pattern, replacement, anchor, all } => {
+            out.push('/');
+            if *all { out.push('/'); }
+            match anchor {
+                SubstAnchor::None => {}
+                SubstAnchor::Prefix => out.push('#'),
+                SubstAnchor::Suffix => out.push('%'),
+            }
+            out.push_str(&reconstruct_word_source(pattern));
+            out.push('/');
+            out.push_str(&reconstruct_word_source(replacement));
+        }
+        M::Substring { offset, length } => {
+            out.push(':');
+            out.push_str(&reconstruct_word_source(offset));
+            if let Some(len) = length {
+                out.push(':');
+                out.push_str(&reconstruct_word_source(len));
+            }
+        }
+        M::Case { direction, all, pattern } => {
+            let c = match direction { CaseDirection::Upper => '^', CaseDirection::Lower => ',' };
+            out.push(c);
+            if *all { out.push(c); }
+            if let Some(p) = pattern {
+                out.push_str(&reconstruct_word_source(p));
+            }
+        }
+        M::Transform { op } => {
+            out.push('@');
+            out.push(match op {
+                TransformOp::PromptExpand => 'P',
+                TransformOp::Quote => 'Q',
+                TransformOp::Upper => 'U',
+                TransformOp::Lower => 'L',
+                TransformOp::UpperFirst => 'u',
+                TransformOp::EscapeExpand => 'E',
+            });
+        }
+    }
+    out.push('}');
+}
+
+/// Best-effort source for a `$(…)` / `<(…)` body: renders a single pipeline of
+/// simple commands (`cmd a | cmd b`). Compound/multi-connector bodies render
+/// their first command only (documented approximation — rare in a trace header).
+/// Best-effort source for a `$(…)` / `<(…)` body: renders the command list with
+/// its real connectors (`a && b`, `a; b`, `a & b`). A compound command inside the
+/// list falls back to empty per `reconstruct_command_source` (documented
+/// approximation — rare in a trace header).
+fn reconstruct_sequence_source(seq: &crate::command::Sequence) -> String {
+    use crate::command::Connector;
+    let mut s = reconstruct_command_source(&seq.first);
+    for (conn, cmd) in &seq.rest {
+        s.push_str(match conn {
+            Connector::Semi => "; ",
+            Connector::And => " && ",
+            Connector::Or => " || ",
+            Connector::Amp => " & ",
+        });
+        s.push_str(&reconstruct_command_source(cmd));
+    }
+    s
+}
+
+fn reconstruct_command_source(cmd: &crate::command::Command) -> String {
+    use crate::command::{Command, SimpleCommand};
+    match cmd {
+        Command::Simple(SimpleCommand::Exec(e)) => {
+            let mut parts = vec![reconstruct_word_source(&e.program)];
+            parts.extend(e.args.iter().map(reconstruct_word_source));
+            parts.join(" ")
+        }
+        Command::Pipeline(p) => p
+            .commands
+            .iter()
+            .map(reconstruct_command_source)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        _ => String::new(),
+    }
+}
+
 /// Expands a `Word` for assignment context: word-splitting is suppressed and
 /// the result is one string. Each `Var`/`LastStatus`/`CommandSub` part
 /// contributes its value verbatim regardless of the `quoted` flag — matching
@@ -1716,6 +1899,31 @@ mod tests {
 
     fn lit(s: &str) -> Word {
         Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+    }
+
+    #[test]
+    fn reconstruct_source_scalars() {
+        use crate::lexer::tokenize;
+        fn rt(src: &str) -> String {
+            let toks = tokenize(src).expect("lex");
+            let w = toks.iter().find_map(|t| match t {
+                crate::lexer::Token::Word(w) => Some(w.clone()),
+                _ => None,
+            }).expect("a Word token");
+            reconstruct_word_source(&w)
+        }
+        assert_eq!(rt("abc"), "abc");
+        assert_eq!(rt("$xs"), "$xs");
+        assert_eq!(rt("a$x.b"), "a$x.b");
+        assert_eq!(rt("${x}"), "$x"); // bare ${x} lexes to Var, brace lost
+        assert_eq!(rt("${x:-d}"), "${x:-d}");
+        assert_eq!(rt("${x##*/}"), "${x##*/}");
+        assert_eq!(rt("${arr[@]}"), "${arr[@]}");
+        assert_eq!(rt("${#x}"), "${#x}");
+        assert_eq!(rt("$((1+2))"), "$((1+2))");
+        assert_eq!(rt("$(ls -l)"), "$(ls -l)");
+        assert_eq!(rt("$(a && b)"), "$(a && b)");
+        assert_eq!(rt("$(a; b)"), "$(a; b)");
     }
 
     #[test]
