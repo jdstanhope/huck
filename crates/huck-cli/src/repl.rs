@@ -14,7 +14,7 @@ use rustyline::{CompletionType, Config, Editor};
 use huck_engine::builtins::ExecOutcome;
 use huck_engine::shell::{
     fire_prompt_command, install_job_control_signals, install_sigchld_handler,
-    install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, run_program, RunMode,
+    install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, RunMode,
 };
 use huck_engine::shell_state::Shell;
 
@@ -67,10 +67,12 @@ pub fn run(args: &[String]) -> i32 {
     // Non-interactive program modes bypass the REPL entirely.
     match opts.mode {
         RunMode::Command { command, argv0, args } => {
-            let label = argv0
-                .clone()
-                .unwrap_or_else(|| shell_cell.borrow().shell_argv0.clone());
-            return run_program(&command, argv0, args, &label, false, &shell_cell);
+            let mut engine = huck_engine::Engine::from_shell_cell(Rc::clone(&shell_cell));
+            if let Some(a0) = argv0 {
+                engine.set_arg0(&a0);
+            }
+            engine.set_args(args);
+            return engine.run(&command);
         }
         RunMode::File { path, args } => {
             let contents = match std::fs::read_to_string(&path) {
@@ -86,7 +88,9 @@ pub fn run(args: &[String]) -> i32 {
                 }
             };
             let label = path.display().to_string();
-            return run_program(&contents, Some(label.clone()), args, &label, true, &shell_cell);
+            let mut engine = huck_engine::Engine::from_shell_cell(Rc::clone(&shell_cell));
+            engine.set_args(args);
+            return engine.run_script(&contents, &label);
         }
         RunMode::Interactive => {}
     }
