@@ -185,19 +185,24 @@ pub fn expand_modifier_with_value(
         }
         ParamModifier::RemovePrefix { pattern, longest } => {
             let v = get_raw(shell).unwrap_or_default();
-            let p = expand_word_to_string(pattern, shell);
+            // `expand_pattern` escapes glob metacharacters contributed by QUOTED
+            // parts, so a quoted `*`/`?`/`[` matches literally (L-54a); unquoted
+            // ones stay active. Same machinery `case`/`[[ == ]]` use.
+            let p = crate::expand::expand_pattern(pattern, shell);
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(remove_prefix(&v, &p, *longest, extglob))
         }
         ParamModifier::RemoveSuffix { pattern, longest } => {
             let v = get_raw(shell).unwrap_or_default();
-            let p = expand_word_to_string(pattern, shell);
+            let p = crate::expand::expand_pattern(pattern, shell);
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(remove_suffix(&v, &p, *longest, extglob))
         }
         ParamModifier::Substitute { pattern, replacement, anchor, all } => {
             let v = get_raw(shell).unwrap_or_default();
-            let pat = expand_word_to_string(pattern, shell);
+            // The PATTERN respects quoting (quoted glob = literal); the
+            // REPLACEMENT is a plain word (no pattern semantics).
+            let pat = crate::expand::expand_pattern(pattern, shell);
             let rep = expand_word_to_string(replacement, shell);
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(substitute(&v, &pat, &rep, *anchor, *all, extglob))
@@ -225,7 +230,9 @@ pub fn expand_modifier_with_value(
         }
         ParamModifier::Case { direction, all, pattern } => {
             let v = lookup_v(shell);
-            let pat_string = pattern.as_ref().map(|w| expand_word_to_string(w, shell));
+            // The case-modification pattern respects quoting (quoted glob =
+            // literal), like the remove/substitute patterns above.
+            let pat_string = pattern.as_ref().map(|w| crate::expand::expand_pattern(w, shell));
             let extglob = shell.shopt_options.get("extglob").unwrap_or(false);
             ExpansionResult::Value(case_modify(&v, *direction, *all, pat_string.as_deref(), extglob))
         }
