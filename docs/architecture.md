@@ -9,22 +9,33 @@ For the iteration history see the table in `README.md`.
 
 ## Module map
 
-The repo is a 2-member Cargo **workspace** (v202). The Shell-free **frontend** —
-`lexer`, `command` (AST + parser), `brace_expand`, and `generate` (AST→source) —
-lives in the **`huck-syntax`** crate under `crates/huck-syntax/src/` (plus its
-`errors.rs` = `lex_error_message`/`parse_error_message` and `util.rs` =
-`escape_double_quote_value`). The **`huck`** crate (root `src/`) holds the runtime
-(expansion, execution, builtins, shell state) and depends on `huck-syntax`
-one-directionally — the dependency cycle is forbidden by Cargo, so the Shell-free
-boundary is **compiler-enforced** (`huck-syntax` cannot `use` anything in `huck`).
-`huck/src/lib.rs` re-exports the frontend modules at the crate root, so existing
-`crate::lexer::` / `crate::command::` / `crate::generate::` paths in the runtime
-resolve unchanged. **Run the suite with `cargo test --workspace`** — a bare
-`cargo test` from the root only runs the `huck` package's tests, not the ~740
-frontend tests in `huck-syntax`.
+The repo is a **4-member Cargo workspace** (v202 → v203), a layered stack with a
+compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bin`:
 
-Two-tier layout: lexer/parser/AST (the `huck-syntax` crate) at the bottom,
-expansion + execution above, builtins at the top.
+- **`huck-syntax`** (`crates/huck-syntax/`) — the Shell-free **frontend**: `lexer`,
+  `command` (AST + parser), `brace_expand`, `generate` (AST→source), plus
+  `errors.rs` (`lex_error_message`/`parse_error_message`) and `util.rs`
+  (`escape_double_quote_value`). No dependencies.
+- **`huck-engine`** (`crates/huck-engine/`) — the **terminal-free execution
+  core**: expansion, execution, builtins, shell state, traps, jobs, completion
+  candidate-generation, the readline keymap *data*, and the headless entry
+  (`huck_engine::shell::run_program` / `process_line`). Depends on `huck-syntax`;
+  **rustyline-free** (a stray `use rustyline` here won't compile) — it is the
+  embeddable, no-terminal interpreter.
+- **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
+  rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
+  completer (`Candidate`→`rustyline::Pair`) and the readline apply
+  (`parse_keyseq`/`function_to_cmd`). Depends on `huck-engine` + `rustyline`.
+- **`huck`** (root) — a thin **binary**: `main.rs` → `huck_cli::run(args)`.
+
+`huck-engine/src/lib.rs` re-exports the frontend (`pub use huck_syntax::{lexer,
+command, …}`) so `crate::lexer::`/`crate::command::` paths inside the engine
+resolve unchanged. **Run the suite with `cargo test --workspace`** — a bare
+`cargo test` from the root only runs the `huck` *bin* package's integration tests,
+not the unit tests in the member crates.
+
+Two-tier layout within the engine: lexer/parser/AST (the `huck-syntax` crate) at
+the bottom, expansion + execution above, builtins at the top.
 
 | Module | Responsibility |
 |---|---|
