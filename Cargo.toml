@@ -9,7 +9,7 @@ homepage = "https://github.com/jdstanhope/huck"
 readme = "README.md"
 
 [workspace]
-members = [".", "crates/huck-syntax"]
+members = [".", "crates/huck-syntax", "crates/huck-engine", "crates/huck-cli"]
 
 [dependencies]
 rustyline = "18.0.0"
