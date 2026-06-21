@@ -2578,12 +2578,31 @@ fn scan_braced_operand(
 /// (unquoted literals, quoted spans/escapes) for future-compatibility and
 /// glob-safety. Matches bash: the operand of `:-`/`:=`/`:?`/`:+` (and
 /// substitution/substring operands) is a word, not a command.
-fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, LexError> {
+fn parse_braced_operand_opts(
+    body: &str,
+    enclosing_dquote: bool,
+    opts: LexerOptions,
+) -> Result<Word, LexError> {
     let mut chars = CharCursor::new(body);
     let mut parts: Vec<WordPart> = Vec::new();
     let mut cur = String::new();
+    // When the `${...}` is itself inside double quotes, a VALUE-substitution
+    // operand (`:-`/`:=`/`:+`) is in double-quote context: single quotes are
+    // LITERAL and backslash is special only before `$ ` " \`. `q` is the
+    // quoted-ness of the bare literal text / expansions.
+    let q = enclosing_dquote;
     while let Some(c) = chars.next() {
         match c {
+            // Double-quote context: backslash is special only before `$ ` " \`;
+            // any other `\x` keeps the backslash literal (so `\*`/`\n` survive).
+            '\\' if enclosing_dquote => match chars.peek().copied() {
+                Some(e @ ('$' | '`' | '"' | '\\')) => {
+                    chars.next();
+                    flush_body_literal(&mut parts, &mut cur, true);
+                    parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
+                }
+                _ => cur.push('\\'),
+            },
             '\\' => {
                 // Backslash escapes the next char: emit it as a quoted literal
                 // (glob-safe, consistent with the main tokenizer). `\` at end of
@@ -2594,14 +2613,16 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
                 }
             }
             '$' => {
-                flush_body_literal(&mut parts, &mut cur, false);
-                scan_dollar_expansion(&mut chars, &mut parts, false, opts)?;
+                flush_body_literal(&mut parts, &mut cur, q);
+                scan_dollar_expansion(&mut chars, &mut parts, q, opts)?;
             }
             '`' => {
-                flush_body_literal(&mut parts, &mut cur, false);
+                flush_body_literal(&mut parts, &mut cur, q);
                 let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: false });
+                parts.push(WordPart::CommandSub { sequence, quoted: q });
             }
+            // In double-quote context a single quote is a LITERAL character.
+            '\'' if enclosing_dquote => cur.push('\''),
             '\'' => {
                 // Single-quoted span: everything literal until the next `'`.
                 flush_body_literal(&mut parts, &mut cur, false);
@@ -2617,7 +2638,7 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
             }
             '"' => {
                 // Double-quoted span: $/`/\ active; everything else literal (quoted).
-                flush_body_literal(&mut parts, &mut cur, false);
+                flush_body_literal(&mut parts, &mut cur, q);
                 loop {
                     match chars.next() {
                         None => return Err(LexError::UnterminatedQuote),
@@ -2647,7 +2668,7 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
             other => cur.push(other),
         }
     }
-    flush_body_literal(&mut parts, &mut cur, false);
+    flush_body_literal(&mut parts, &mut cur, q);
     Ok(Word(parts))
 }
 
@@ -2656,7 +2677,7 @@ fn parse_braced_operand_opts(body: &str, opts: LexerOptions) -> Result<Word, Lex
 /// via `parse_braced_operand_opts`.
 #[cfg(test)]
 fn parse_braced_operand(body: &str) -> Result<Word, LexError> {
-    parse_braced_operand_opts(body, LexerOptions::default())
+    parse_braced_operand_opts(body, false, LexerOptions::default())
 }
 
 /// Reads the body of a `$(...)` substitution. The opening `$(` is already
@@ -3320,25 +3341,25 @@ fn dispatch_braced_modifier(
             match chars.peek().copied() {
                 Some('-') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseDefault { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseDefault { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('=') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::AssignDefault { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('?') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
                 Some('+') => {
                     chars.next();
-                    let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
+                    let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseAlternate { word: w, colon: true })?;
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
@@ -3358,36 +3379,36 @@ fn dispatch_braced_modifier(
             }
         }
         Some('-') => {
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseDefault { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseDefault { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('=') => {
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::AssignDefault { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('?') => {
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::ErrorIfUnset { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('+') => {
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
+            let modifier = modifier_with_operand(chars, quoted, opts, |w| ParamModifier::UseAlternate { word: w, colon: false })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('#') => {
             let longest = chars.peek() == Some(&'#');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('%') => {
             let longest = chars.peek() == Some(&'%');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, opts, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
@@ -3476,6 +3497,7 @@ fn dispatch_braced_modifier(
 /// `Word`. Builds the `ParamModifier` via the caller's closure.
 fn modifier_with_operand<F>(
     chars: &mut CharCursor<'_>,
+    enclosing_dquote: bool,
     opts: LexerOptions,
     build: F,
 ) -> Result<ParamModifier, LexError>
@@ -3483,7 +3505,7 @@ where
     F: FnOnce(Word) -> ParamModifier,
 {
     let body = scan_braced_operand(chars)?;
-    let word = parse_braced_operand_opts(&body, opts)?;
+    let word = parse_braced_operand_opts(&body, enclosing_dquote, opts)?;
     Ok(build(word))
 }
 
@@ -3500,7 +3522,7 @@ fn scan_optional_braced_operand(
     if body.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(parse_braced_operand_opts(&body, opts)?))
+        Ok(Some(parse_braced_operand_opts(&body, false, opts)?))
     }
 }
 
@@ -3517,8 +3539,8 @@ fn scan_substitution_operand(
 ) -> Result<(Word, Word), LexError> {
     let body = scan_braced_operand(chars)?;
     let (pattern_src, replacement_src) = split_substitution_body(&body);
-    let pattern = parse_braced_operand_opts(&pattern_src, opts)?;
-    let replacement = parse_braced_operand_opts(&replacement_src, opts)?;
+    let pattern = parse_braced_operand_opts(&pattern_src, false, opts)?;
+    let replacement = parse_braced_operand_opts(&replacement_src, false, opts)?;
     Ok((pattern, replacement))
 }
 
@@ -3643,9 +3665,9 @@ fn scan_substring_operands(
 ) -> Result<(Word, Option<Word>), LexError> {
     let body = scan_braced_operand(chars)?;
     let (offset_src, length_src) = split_substring_body(&body);
-    let offset = parse_braced_operand_opts(&offset_src, opts)?;
+    let offset = parse_braced_operand_opts(&offset_src, false, opts)?;
     let length = match length_src {
-        Some(s) => Some(parse_braced_operand_opts(&s, opts)?),
+        Some(s) => Some(parse_braced_operand_opts(&s, false, opts)?),
         None => None,
     };
     Ok((offset, length))
@@ -5944,6 +5966,29 @@ mod tests {
         let w = parse_braced_operand("'|;()'").unwrap();
         assert_eq!(operand_lits(&w), "|;()");
         assert!(matches!(w.0.as_slice(), [WordPart::Literal { quoted: true, .. }]));
+    }
+
+    #[test]
+    fn operand_enclosing_dquote_keeps_single_quotes_literal() {
+        // M-15b (v200): with enclosing_dquote=true, single quotes are LITERAL
+        // characters (kept), not a quote span — `'a|b'` → the 5 chars `'a|b'`.
+        let w = parse_braced_operand_opts("'a|b'", true, LexerOptions::default()).unwrap();
+        assert_eq!(operand_lits(&w), "'a|b'");
+        // Control: with enclosing_dquote=false the single quotes are stripped.
+        let w0 = parse_braced_operand_opts("'a|b'", false, LexerOptions::default()).unwrap();
+        assert_eq!(operand_lits(&w0), "a|b");
+    }
+
+    #[test]
+    fn operand_enclosing_dquote_restricts_backslash() {
+        // dquote backslash: special only before `$ ` " \`; `\*`/`\n` keep the
+        // backslash, `\$` drops it.
+        let star = parse_braced_operand_opts("\\*", true, LexerOptions::default()).unwrap();
+        assert_eq!(operand_lits(&star), "\\*");
+        let en = parse_braced_operand_opts("a\\nb", true, LexerOptions::default()).unwrap();
+        assert_eq!(operand_lits(&en), "a\\nb");
+        let dollar = parse_braced_operand_opts("a\\$b", true, LexerOptions::default()).unwrap();
+        assert_eq!(operand_lits(&dollar), "a$b");
     }
 
     #[test]
