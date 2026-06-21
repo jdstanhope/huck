@@ -25,7 +25,10 @@ fn registration_never_errors() {
 fn compgen_setopt_shopt_signal() {
     assert_eq!(run("compgen -A setopt e\n").0, "emacs\nerrexit\nerrtrace\n");
     assert_eq!(run("compgen -A shopt null\n").0, "nullglob\n");
-    assert_eq!(run("compgen -A signal SIGIN\n").0, "SIGINT\n");
+    // Use a prefix that completes to exactly one signal on every platform.
+    // `SIGIN` is ambiguous on BSD/macOS, which also has SIGINFO; `SIGTER`
+    // resolves to just SIGTERM on both Linux and macOS.
+    assert_eq!(run("compgen -A signal SIGTER\n").0, "SIGTERM\n");
 }
 
 #[test]

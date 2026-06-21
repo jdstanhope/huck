@@ -639,7 +639,9 @@ mod tests {
     #[test]
     fn enumerate_signal_helptopic_enabled() {
         let sh = Shell::new();
-        assert!(complete_action(Action::Signal, "SIGIN", &sh) == vec!["SIGINT".to_string()]);
+        // `SIGTER` completes to exactly SIGTERM on every platform. (`SIGIN`
+        // would be ambiguous on BSD/macOS, which also defines SIGINFO.)
+        assert!(complete_action(Action::Signal, "SIGTER", &sh) == vec!["SIGTERM".to_string()]);
         assert!(!complete_action(Action::Helptopic, "", &sh).is_empty());
         assert!(complete_action(Action::Enabled, "ech", &sh).contains(&"echo".to_string()));
     }

@@ -5,16 +5,13 @@ fn huck_binary() -> String {
     env!("CARGO_BIN_EXE_huck").to_string()
 }
 
-/// Path that `cd <p>` will end up printing/storing: huck reads the
-/// post-chdir cwd via `env::current_dir()`, which canonicalizes symlinks.
-/// On Linux `/tmp` is a real directory so this is `/tmp`; on macOS
-/// `/tmp` → `/private/tmp` (and `/var` → `/private/var`). Compute at
-/// runtime so the assertions are portable.
-fn canonical(p: &str) -> String {
-    std::fs::canonicalize(p)
-        .unwrap_or_else(|e| panic!("canonicalize {p}: {e}"))
-        .to_string_lossy()
-        .into_owned()
+/// Path that `cd <p>` prints/stores. huck (like bash in its default
+/// logical mode) keeps the *logical* path you cd'd to — it does NOT
+/// resolve symlinks — so `cd /tmp; pwd` prints `/tmp` on every platform,
+/// even on macOS where `/tmp` → `/private/tmp`. The expected value is
+/// therefore just the literal argument.
+fn logical(p: &str) -> String {
+    p.to_string()
 }
 
 fn run_capture(script: &str) -> (String, String, i32) {
@@ -43,7 +40,7 @@ fn cd_dash_returns_to_previous_directory() {
     let script = "cd /tmp\ncd /var\ncd -\npwd\nexit\n";
     let (out, _err, _) = run_capture(script);
     // The "cd -" line itself prints the new PWD, then `pwd` prints it again.
-    let tmp = canonical("/tmp");
+    let tmp = logical("/tmp");
     let lines: Vec<&str> = out.lines().collect();
     assert!(
         lines.contains(&tmp.as_str()),
@@ -57,7 +54,7 @@ fn cd_dash_returns_to_previous_directory() {
 fn cd_dash_prints_new_pwd() {
     let script = "cd /tmp\ncd /var\ncd -\nexit\n";
     let (out, _err, _) = run_capture(script);
-    let tmp = canonical("/tmp");
+    let tmp = logical("/tmp");
     assert!(
         out.lines().any(|l| l == tmp),
         "expected cd - to print {tmp}, got stdout: {out:?}"
@@ -82,8 +79,8 @@ fn cd_dash_errors_when_oldpwd_unset() {
 fn cd_dash_swaps_pwd_and_oldpwd() {
     let script = "cd /tmp\ncd /var\necho pre PWD=$PWD OLDPWD=$OLDPWD\ncd -\necho post PWD=$PWD OLDPWD=$OLDPWD\nexit\n";
     let (out, _err, _) = run_capture(script);
-    let tmp = canonical("/tmp");
-    let var = canonical("/var");
+    let tmp = logical("/tmp");
+    let var = logical("/var");
     let pre = format!("pre PWD={var} OLDPWD={tmp}");
     let post = format!("post PWD={tmp} OLDPWD={var}");
     assert!(out.lines().any(|l| l == pre), "stdout: {out:?}");

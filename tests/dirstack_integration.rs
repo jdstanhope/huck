@@ -5,14 +5,12 @@ fn huck_binary() -> String {
     env!("CARGO_BIN_EXE_huck").to_string()
 }
 
-/// Resolved form of `p` — what huck's `cd`/`pushd` will end up using
-/// after canonicalizing symlinks via `env::current_dir()`. On Linux
-/// `/tmp` stays `/tmp`; on macOS it becomes `/private/tmp`.
-fn canonical(p: &str) -> String {
-    std::fs::canonicalize(p)
-        .unwrap_or_else(|e| panic!("canonicalize {p}: {e}"))
-        .to_string_lossy()
-        .into_owned()
+/// Path that `pushd <p>` prints/stores. huck (like bash in its default
+/// logical mode) keeps the *logical* path — it does NOT resolve symlinks —
+/// so `pushd /tmp` records `/tmp` on every platform, even on macOS where
+/// `/tmp` → `/private/tmp`. The expected value is just the literal argument.
+fn logical(p: &str) -> String {
+    p.to_string()
 }
 
 fn run_capture(script: &str) -> (String, String, i32) {
@@ -40,7 +38,7 @@ fn run_capture(script: &str) -> (String, String, i32) {
 fn pushd_dir_then_dirs() {
     let (out, _, _) = run_capture("pushd /tmp\ndirs\nexit\n");
     // After pushd, dirs output starts with the resolved /tmp.
-    let tmp = canonical("/tmp");
+    let tmp = logical("/tmp");
     assert!(
         out.lines().any(|l| l.starts_with(tmp.as_str())),
         "stdout: {out:?}",
@@ -66,7 +64,7 @@ fn pushd_no_args_swaps_top_two() {
     let (out, _, _) = run_capture(
         "pushd /tmp\npushd /var\npushd\necho \"AT $PWD\"\nexit\n",
     );
-    let tmp = canonical("/tmp");
+    let tmp = logical("/tmp");
     let want = format!("AT {tmp}");
     assert!(
         out.lines().any(|l| l == want),
