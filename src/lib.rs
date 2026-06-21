@@ -10,21 +10,17 @@
 
 pub mod alias_expand;
 pub mod arith;
-pub mod brace_expand;
 pub mod builtins;
-pub mod command;
 pub mod completion;
 pub mod completion_builtins;
 pub mod completion_spec;
 pub mod continuation;
 pub mod executor;
 pub mod expand;
-pub mod generate;
 pub mod glob_match;
 pub mod history;
 pub mod job_spec;
 pub mod jobs;
-pub mod lexer;
 pub mod param_expansion;
 pub mod prompt;
 pub mod procsub;
@@ -33,6 +29,12 @@ pub mod shell;
 pub mod shell_state;
 pub mod test_builtin;
 pub mod traps;
+
+// Frontend modules live in the `huck-syntax` crate; re-export at the crate root
+// so existing `crate::lexer::`/`crate::command::`/`crate::generate::` paths and
+// the relocated helpers resolve unchanged across the runtime.
+pub use huck_syntax::{brace_expand, command, generate, lexer};
+pub use huck_syntax::{escape_double_quote_value, lex_error_message, parse_error_message};
 
 /// Shared test-only synchronization primitives. Tests across multiple
 /// modules mutate process-global state (CWD, env, FDs); without a shared

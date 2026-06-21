@@ -93,7 +93,7 @@ fn keyword_of(token: &Token) -> Option<Keyword> {
 /// returns the structured `Assignment`. The value is moved (not cloned)
 /// from the input parts. Otherwise returns `Err(word)` handing the
 /// original back unchanged.
-pub(crate) fn try_split_assignment(
+pub fn try_split_assignment(
     word: crate::lexer::Word,
 ) -> Result<Assignment, crate::lexer::Word> {
     use crate::lexer::WordPart;
@@ -167,7 +167,7 @@ pub(crate) fn try_split_assignment(
 /// so the caller can decide whether to take ownership before calling the
 /// real splitter. Detects both the structured `AssignPrefix` form and the
 /// legacy bare `Literal("NAME=…")` form.
-pub(crate) fn is_assignment_word(w: &crate::lexer::Word) -> bool {
+pub fn is_assignment_word(w: &crate::lexer::Word) -> bool {
     use crate::lexer::WordPart;
     if matches!(w.0.first(), Some(WordPart::AssignPrefix { .. })) {
         return true;
@@ -1038,7 +1038,7 @@ fn parse_command_inner(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
-            .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
+            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))?;
         return maybe_wrap_redirects(Command::Arith(body), iter);
     }
 
@@ -1455,7 +1455,7 @@ fn parse_arith_for_header(
         } else {
             crate::lexer::arith_string_to_word(trimmed, opts)
                 .map(Some)
-                .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))
+                .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))
         }
     };
     Ok((
@@ -2310,7 +2310,7 @@ fn parse_next_stage(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
-            .map_err(|e| ParseError::ArithBlock(crate::shell::lex_error_message(e)))?;
+            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))?;
         return Ok((maybe_wrap_redirects(Command::Arith(body), iter)?, false));
     }
 
@@ -2472,7 +2472,7 @@ fn skip_test_newlines(iter: &mut TokenCursor) {
 
 /// Returns the Word's single unquoted Literal text, if it is exactly that shape.
 /// Used to identify operator words like `==`, `!=`, `-eq`, etc.
-pub(crate) fn word_literal_text(w: &Word) -> Option<&str> {
+pub fn word_literal_text(w: &Word) -> Option<&str> {
     if w.0.len() != 1 {
         return None;
     }

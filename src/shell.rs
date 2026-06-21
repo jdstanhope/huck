@@ -11,10 +11,10 @@ use rustyline::{CompletionType, Config, Editor};
 use signal_hook::consts::{SIGCHLD, SIGINT};
 
 use crate::builtins::ExecOutcome;
-use crate::command::{self, ParseError};
+use crate::command::{self};
 use crate::completion::HuckHelper;
 use crate::executor;
-use crate::lexer::{self, LexError};
+use crate::lexer::{self};
 use crate::shell_state::Shell;
 
 const DEFAULT_PS1: &str = "huck> ";
@@ -703,7 +703,7 @@ pub fn process_line_in_sink(
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
-            eprintln!("huck: syntax error{}", lex_error_message(e));
+            eprintln!("huck: syntax error{}", crate::lex_error_message(e));
             return ExecOutcome::Continue(2);
         }
     };
@@ -719,7 +719,7 @@ pub fn process_line_in_sink(
                 (t, l)
             }
             Err(e) => {
-                eprintln!("huck: syntax error{}", lex_error_message(e));
+                eprintln!("huck: syntax error{}", crate::lex_error_message(e));
                 return ExecOutcome::Continue(2);
             }
         }
@@ -731,7 +731,7 @@ pub fn process_line_in_sink(
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
-            eprintln!("huck: syntax error: {}", parse_error_message(e));
+            eprintln!("huck: syntax error: {}", crate::parse_error_message(e));
             ExecOutcome::Continue(2)
         }
     }
@@ -742,98 +742,6 @@ pub fn process_line_in_sink(
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
     process_line_in_sink(line, shell, expand_aliases, &mut sink)
-}
-
-pub(crate) fn parse_error_message(error: ParseError) -> String {
-    match error {
-        ParseError::MissingCommand => "expected a command".to_string(),
-        ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
-        ParseError::RedirectTargetIsOperator => "expected a filename after redirection".to_string(),
-        ParseError::UnexpectedBackground => "'&' not allowed here".to_string(),
-        ParseError::UnterminatedIf => "unterminated 'if' (expected 'then'/'fi')".to_string(),
-        ParseError::UnexpectedKeyword(kw) => format!("unexpected '{kw}'"),
-        ParseError::UnterminatedLoop => "unterminated loop (expected 'do'/'done')".to_string(),
-        ParseError::UnexpectedToken => "unexpected token after command".to_string(),
-        ParseError::ForVariable => "invalid variable name in 'for' loop".to_string(),
-        ParseError::UnterminatedCase => "unterminated 'case' (expected 'esac')".to_string(),
-        ParseError::UnterminatedBrace => "unterminated '{' (expected '}')".to_string(),
-        ParseError::FunctionName => "invalid function name".to_string(),
-        ParseError::FunctionBody => {
-            "function definition: expected '()' and a compound-command body \
-             (`if`/`while`/`for`/`case`/`{ … }`)".to_string()
-        }
-        ParseError::UnterminatedFunction => {
-            "unterminated function definition (expected a compound-command body)".to_string()
-        }
-        ParseError::EmptySubshell => "empty subshell '()' is not allowed".to_string(),
-        ParseError::UnterminatedSubshell => {
-            "unterminated '(' (expected matching ')')".to_string()
-        }
-        ParseError::EmptyDoubleBracket => {
-            "'[[ ]]' with empty body is not allowed".to_string()
-        }
-        ParseError::UnterminatedDoubleBracket => {
-            "unterminated '[[ ]]' (missing ']]')".to_string()
-        }
-        ParseError::TestExprBadOperator(op) => {
-            format!("unrecognised operator in '[[ ]]': '{op}'")
-        }
-        ParseError::TestExprMissingOperand => {
-            "missing operand in '[[ ]]'".to_string()
-        }
-        ParseError::ArithBlock(msg) => {
-            format!("arithmetic '((...))': {msg}")
-        }
-        ParseError::ArithForHeader(msg) => {
-            format!("'for ((...))' header: {msg}")
-        }
-    }
-}
-
-/// Renders a `LexError` into a message that includes its own leading
-/// separator. Most variants start with `": "` so the caller's
-/// `"huck: syntax error"` prefix reads naturally. Substitution-wrapper
-/// variants start with `" in command substitution"` (no colon) so the
-/// rendered line reads `"huck: syntax error in command substitution: ..."`.
-pub(crate) fn lex_error_message(error: LexError) -> String {
-    match error {
-        LexError::UnterminatedQuote => ": unterminated quote".to_string(),
-        LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
-        LexError::UnterminatedBrace => ": unterminated '${...}'".to_string(),
-        LexError::UnterminatedSubstitution => ": unterminated command substitution".to_string(),
-        LexError::UnterminatedArith => ": unterminated arithmetic expansion".to_string(),
-        LexError::UnterminatedLegacyArith => {
-            ": unterminated '$[' arithmetic expansion (expected ']')".to_string()
-        }
-        LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
-        LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
-        LexError::Substitution(inner) => {
-            format!(" in command substitution{}", lex_error_message(*inner))
-        }
-        LexError::SubstitutionParseError(inner) => {
-            format!(" in command substitution: {}", parse_error_message(inner))
-        }
-        LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
-        LexError::AnsiCInvalidCodepoint(v) => {
-            format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)
-        }
-        LexError::BraceExpansionLimit => ": brace expansion: too many elements".to_string(),
-        LexError::UnterminatedSubscript => {
-            ": missing ']' in subscript".to_string()
-        }
-        LexError::UnterminatedArrayLiteral => {
-            ": unterminated array literal '('".to_string()
-        }
-        LexError::ArrayLiteralMissingEquals => {
-            ": array element subscript requires '=' after ']'".to_string()
-        }
-        LexError::UnterminatedArithBlock => {
-            ": unterminated '((' arithmetic block".to_string()
-        }
-        LexError::UnterminatedExtglob => {
-            ": unterminated extglob group".to_string()
-        }
-    }
 }
 
 #[cfg(test)]
