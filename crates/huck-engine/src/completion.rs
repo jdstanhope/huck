@@ -354,59 +354,7 @@ fn is_executable_file(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
-use crate::shell_state::Shell;
-use std::cell::RefCell;
-use std::rc::Rc;
-
-/// rustyline completion helper. Holds an `Rc<RefCell<Shell>>` so the
-/// completion callback can read AND mutate shell state (required by
-/// `-F func` execution during Tab). The Rust-borrow discipline is:
-/// `complete()` acquires `borrow_mut()` for the duration of the call
-/// and releases on return. The main loop must hold NO borrow across
-/// `editor.readline()` so this acquisition succeeds.
-pub struct HuckHelper {
-    shell: Rc<RefCell<Shell>>,
-}
-
-impl HuckHelper {
-    pub fn new(shell: Rc<RefCell<Shell>>) -> Self {
-        Self { shell }
-    }
-}
-
-impl rustyline::completion::Completer for HuckHelper {
-    type Candidate = rustyline::completion::Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let mut shell = self.shell.borrow_mut();
-        let (start, candidates) = dispatch::resolve(line, pos, &mut shell);
-        let pairs = candidates
-            .into_iter()
-            .map(|c| rustyline::completion::Pair {
-                display: c.display,
-                replacement: c.replacement,
-            })
-            .collect();
-        Ok((start, pairs))
-    }
-}
-
-impl rustyline::hint::Hinter for HuckHelper {
-    type Hint = String;
-}
-
-impl rustyline::highlight::Highlighter for HuckHelper {}
-
-impl rustyline::validate::Validator for HuckHelper {}
-
-impl rustyline::Helper for HuckHelper {}
-
-pub(crate) mod dispatch {
+pub mod dispatch {
     //! Tab-time dispatch ladder. Decides which completion source
     //! handles the cursor position: variable, command-pos commands,
     //! a registered -F spec, default-spec fallback, or file completion.
@@ -771,7 +719,10 @@ pub(crate) mod dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_state::Shell;
     use crate::test_support::CWD_LOCK;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn analyze_empty_line_is_command() {
@@ -1231,24 +1182,6 @@ mod tests {
         // not a command.
         let (_, ctx) = analyze("echo > lo", 9);
         assert_eq!(ctx, CompletionContext::File { dir: String::new(), prefix: "lo".to_string() });
-    }
-
-    #[test]
-    fn helper_holds_rc_refcell_shell() {
-        use std::cell::RefCell;
-        let shell = Rc::new(RefCell::new(Shell::new()));
-        let helper = HuckHelper::new(Rc::clone(&shell));
-        // Mutate shell through the cell; helper must see the change live.
-        shell.borrow_mut().set("MY_VAR", "hello".to_string());
-        let history = rustyline::history::FileHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        let (start, pairs) = rustyline::completion::Completer::complete(
-            &helper, "echo $MY_V", 10, &ctx,
-        ).unwrap();
-        assert_eq!(start, 6);
-        let replacements: Vec<&str> = pairs.iter().map(|p| p.replacement.as_str()).collect();
-        assert!(pairs.iter().any(|p| p.replacement == "MY_VAR"),
-                "live var not visible to helper: {replacements:?}");
     }
 
     #[test]
