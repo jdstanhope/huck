@@ -182,6 +182,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "huck-cli"
+version = "0.1.0"
+dependencies = [
+ "expectrl",
+ "huck-engine",
+ "huck-syntax",
+ "libc",
+ "rustyline",
+ "tempfile",
+]
+
+[[package]]
+name = "huck-engine"
+version = "0.1.0"
+dependencies = [
+ "glob",
+ "huck-syntax",
+ "libc",
+ "regex",
+ "signal-hook",
+ "signal-hook-registry",
+ "tempfile",
+]
+
+[[package]]
 name = "huck-syntax"
 version = "0.1.0"
 
