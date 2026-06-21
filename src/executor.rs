@@ -1871,7 +1871,9 @@ fn eval_test_expr_traced(expr: &TestExpr, shell: &mut Shell, suppress: bool) -> 
         }
         TestExpr::Regex { lhs, pattern } => {
             let l = expand_assignment(lhs, shell);
-            let p = expand_assignment(pattern, shell);
+            // A QUOTED span of the operand matches literally (regex metachars
+            // escaped); an unquoted span stays an active regex (bash 3.2+, L-23).
+            let p = crate::expand::expand_regex_operand(pattern, shell);
             let p = if shell.nocasematch() { format!("(?i){p}") } else { p };
             let re = regex::Regex::new(&p).map_err(|e| format!("regex error: {e}"))?;
             match re.captures(&l) {
