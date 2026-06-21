@@ -1539,7 +1539,7 @@ fn collect_heredoc_bodies(
 
 /// True when `s` ends with an odd-length run of backslashes — the final
 /// backslash is unescaped and acts as a line-continuation marker.
-pub(crate) fn ends_with_continuation_backslash(s: &str) -> bool {
+pub fn ends_with_continuation_backslash(s: &str) -> bool {
     s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
@@ -1884,7 +1884,7 @@ fn scan_ansi_c_quoted(
 /// Expands backslash escapes in `v` exactly as `$'...'` (ANSI-C quoting)
 /// does, returning the decoded string. Used by `${var@E}`. Unknown
 /// escapes (`\q`) and trailing `\` are preserved verbatim, matching bash.
-pub(crate) fn decode_ansi_c_escapes(v: &str) -> String {
+pub fn decode_ansi_c_escapes(v: &str) -> String {
     let mut out = String::new();
     let mut chars = CharCursor::new(v);
     while let Some(c) = chars.next() {

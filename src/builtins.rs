@@ -769,20 +769,6 @@ pub(crate) fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, Str
 
 /// Backslash-escape `"`, `\`, `$`, and backtick for safe embedding
 /// inside a double-quoted value (used by `format_declare_line`).
-pub(crate) fn escape_double_quote_value(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' | '\\' | '$' | '`' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// bash's variable-listing quoting (the bare `declare` / `set` / `set -x`
 /// style): bare unless the value needs quoting; a value with a shell
 /// metacharacter is single-quoted (with `'` rewritten `'\''`); a value with a
@@ -858,13 +844,13 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
             if var.nameref && s.is_empty() {
                 String::new()
             } else {
-                format!("=\"{}\"", escape_double_quote_value(s))
+                format!("=\"{}\"", crate::escape_double_quote_value(s))
             }
         }
         VarValue::Indexed(m) => {
             let parts: Vec<String> = m
                 .iter()
-                .map(|(k, v)| format!("[{k}]=\"{}\"", escape_double_quote_value(v)))
+                .map(|(k, v)| format!("[{k}]=\"{}\"", crate::escape_double_quote_value(v)))
                 .collect();
             format!("=({})", parts.join(" "))
         }
@@ -874,8 +860,8 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
                 .map(|(k, v)| {
                     format!(
                         "[\"{}\"]=\"{}\"",
-                        escape_double_quote_value(k),
-                        escape_double_quote_value(v)
+                        crate::escape_double_quote_value(k),
+                        crate::escape_double_quote_value(v)
                     )
                 })
                 .collect();
@@ -6097,7 +6083,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                     "huck: {}: line {}: syntax error{}",
                     path.display(),
                     line_of(start + foff),
-                    crate::shell::lex_error_message(e)
+                    crate::lex_error_message(e)
                 );
                 last_status = 2;
                 start = next_line_start(start + foff);
@@ -6140,7 +6126,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                         "huck: {}: line {}: syntax error{}",
                         path.display(),
                         line_of(start + foff),
-                        crate::shell::lex_error_message(e.clone())
+                        crate::lex_error_message(e.clone())
                     );
                     last_status = 2;
                     start = next_line_start(start + foff);
@@ -6229,7 +6215,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                         "huck: {}: line {}: syntax error{}",
                         path.display(),
                         line_of(start + foff),
-                        crate::shell::lex_error_message(le)
+                        crate::lex_error_message(le)
                     );
                     last_status = 2;
                     start = next_line_start(start + foff);
@@ -6241,7 +6227,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                         "huck: {}: line {}: syntax error: {}",
                         path.display(),
                         line_of(start + offsets[unit_start_idx]),
-                        crate::shell::parse_error_message(e)
+                        crate::parse_error_message(e)
                     );
                     last_status = 2;
                     for t in iter.by_ref() {

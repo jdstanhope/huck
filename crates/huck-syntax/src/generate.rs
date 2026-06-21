@@ -479,7 +479,7 @@ fn part_to_source(part: &WordPart) -> String {
                 if text.is_empty() {
                     "''".to_string()
                 } else {
-                    format!("\"{}\"", crate::builtins::escape_double_quote_value(text))
+                    format!("\"{}\"", crate::escape_double_quote_value(text))
                 }
             } else {
                 escape_bareword(text)
