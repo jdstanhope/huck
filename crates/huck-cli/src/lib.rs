@@ -1,3 +1,6 @@
-//! `huck-cli` — huck's interactive REPL over `rustyline`, plus the line-editor
-//! adapters (completion `HuckHelper`, readline keymap apply). Depends on
-//! `huck-engine` for all execution.
+//! `huck-cli` — huck's interactive REPL + rustyline adapters (see crate docs).
+mod completion_helper;
+mod readline_apply;
+mod repl;
+
+pub use repl::run;

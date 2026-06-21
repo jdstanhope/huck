@@ -1,14 +1,13 @@
-//! Readline key-sequence and function-name parsing for the `bind` builtin.
+//! rustyline-coupled readline mappers for the `bind` builtin's apply path.
 //!
-//! This is the ONLY rustyline-coupled module added in v161. It maps readline
-//! key-sequence notation (e.g. `"\C-x"`, `"\M-f"`, `"\e[A"`) into a rustyline
-//! [`Event`], and readline function names (e.g. `beginning-of-line`) into
-//! rustyline [`Cmd`]s. Everything here is pure and unit-tested; the `bind`
-//! builtin (Task 3) consumes only the `bool` validators so it stays
-//! rustyline-free.
+//! Maps readline key-sequence notation (e.g. `"\C-x"`, `"\M-f"`, `"\e[A"`)
+//! into a rustyline [`Event`], and readline function names (e.g.
+//! `beginning-of-line`) into rustyline [`Cmd`]s. The rustyline-free data
+//! (`DEFAULT_EMACS_BINDS`, `readline_function_names`, the `bool` validators)
+//! lives in `huck_engine::readline_bind`.
 
-use rustyline::{Anchor, At, Cmd, KeyCode, KeyEvent, Modifiers, Movement, Word};
 use rustyline::Event;
+use rustyline::{Anchor, At, Cmd, KeyCode, KeyEvent, Modifiers, Movement, Word};
 
 /// Parses a readline key-sequence string into a rustyline `Event`.
 /// Handles: optional surrounding double-quotes; `\C-x` (control),
@@ -103,31 +102,6 @@ pub fn parse_keyseq(seq: &str) -> Option<Event> {
     Some(KeyEvent::normalize(KeyEvent::new(ch, mods)).into())
 }
 
-/// huck's default emacs key bindings — the standard emacs keys rustyline honors
-/// for huck's supported functions, in bash's `bind -p` keyseq spelling. Each
-/// entry is verified to appear in bash's own default `bind -p` (the harness
-/// enforces this subset relation), so huck never reports a binding bash lacks.
-/// Functions in the honored set with no entry here render as `# … (not bound)`.
-pub const DEFAULT_EMACS_BINDS: &[(&str, &str)] = &[
-    ("\\C-a", "beginning-of-line"), ("\\C-e", "end-of-line"),
-    ("\\C-f", "forward-char"), ("\\C-b", "backward-char"),
-    ("\\ef", "forward-word"), ("\\eb", "backward-word"),
-    ("\\C-k", "kill-line"), ("\\C-u", "unix-line-discard"),
-    ("\\C-w", "unix-word-rubout"), ("\\ed", "kill-word"),
-    ("\\e\\C-?", "backward-kill-word"),
-    ("\\C-l", "clear-screen"), ("\\C-g", "abort"),
-    ("\\C-j", "accept-line"), ("\\C-m", "accept-line"),
-    ("\\C-p", "previous-history"), ("\\C-n", "next-history"),
-    ("\\e<", "beginning-of-history"), ("\\e>", "end-of-history"),
-    ("\\C-r", "reverse-search-history"), ("\\C-s", "forward-search-history"),
-    ("\\C-i", "complete"),
-    ("\\eu", "upcase-word"), ("\\el", "downcase-word"),
-    ("\\ec", "capitalize-word"), ("\\C-t", "transpose-chars"),
-    ("\\et", "transpose-words"), ("\\C-_", "undo"),
-    ("\\C-y", "yank"), ("\\C-d", "delete-char"),
-    ("\\C-?", "backward-delete-char"),
-];
-
 /// Maps a readline function name to the rustyline `Cmd` that implements it.
 /// Returns `None` for unknown or unsupported function names.
 pub fn function_to_cmd(name: &str) -> Option<Cmd> {
@@ -169,55 +143,6 @@ pub fn function_to_cmd(name: &str) -> Option<Cmd> {
     })
 }
 
-/// Whether `name` is a readline function that huck knows how to bind.
-pub fn is_known_function(name: &str) -> bool {
-    function_to_cmd(name).is_some()
-}
-
-/// Whether `seq` parses as a bindable key sequence.
-pub fn keyseq_is_valid(seq: &str) -> bool {
-    parse_keyseq(seq).is_some()
-}
-
-/// The static list of readline function names for `bind -l`.
-pub fn readline_function_names() -> &'static [&'static str] {
-    &[
-        "abort",
-        "accept-line",
-        "backward-char",
-        "backward-delete-char",
-        "backward-kill-line",
-        "backward-kill-word",
-        "backward-word",
-        "beginning-of-history",
-        "beginning-of-line",
-        "capitalize-word",
-        "clear-screen",
-        "complete",
-        "delete-char",
-        "downcase-word",
-        "end-of-history",
-        "end-of-line",
-        "forward-char",
-        "forward-search-history",
-        "forward-word",
-        "history-search-backward",
-        "history-search-forward",
-        "kill-line",
-        "kill-word",
-        "next-history",
-        "previous-history",
-        "reverse-search-history",
-        "transpose-chars",
-        "transpose-words",
-        "undo",
-        "unix-line-discard",
-        "unix-word-rubout",
-        "upcase-word",
-        "yank",
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,22 +170,30 @@ mod tests {
     }
 
     #[test]
-    fn function_map_and_names() {
+    fn parse_keyseq_matches_engine_validity() {
+        // The engine's rustyline-free `keyseq_is_valid` (via parse_keyseq_valid)
+        // must agree with the cli's real `parse_keyseq` on accept/reject for
+        // every input — they are hand-kept in sync across the crate split.
+        let cases = [
+            "\\C-a", "\\M-f", "\\e[A", "\\C-", "", "a", "\\x41", "\\x4",
+            "\\101", "\\C-\\M-a", "\"\\C-a\"", "\\e", "\\t", "\\r", "\\n",
+            "\\b", "\\C-i", "\\C-m", "\\C-h", "\\x7f", "\\xZZ", "abc",
+            "\\C-x", "\\M-\\C-a", "\\0", "\\377",
+        ];
+        for s in cases {
+            assert_eq!(
+                huck_engine::readline_bind::keyseq_is_valid(s),
+                super::parse_keyseq(s).is_some(),
+                "validity divergence on {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn function_map() {
         assert!(function_to_cmd("beginning-of-line").is_some());
         assert!(function_to_cmd("kill-line").is_some());
         assert!(function_to_cmd("accept-line").is_some());
         assert!(function_to_cmd("no-such-function").is_none());
-        assert!(is_known_function("clear-screen"));
-        assert!(!is_known_function("totally-bogus"));
-        assert!(readline_function_names().contains(&"accept-line"));
-    }
-
-    #[test]
-    fn default_emacs_binds_only_reference_honored_functions() {
-        assert!(!DEFAULT_EMACS_BINDS.is_empty());
-        for (seq, func) in DEFAULT_EMACS_BINDS {
-            assert!(is_known_function(func), "default binds a function huck can't honor: {func}");
-            assert!(!seq.is_empty());
-        }
     }
 }

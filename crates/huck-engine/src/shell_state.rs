@@ -2310,10 +2310,10 @@ impl Shell {
         self.last_status = status;
     }
 
-    pub(crate) fn set_last_cmd_sub_status(&mut self, s: Option<i32>) {
+    pub fn set_last_cmd_sub_status(&mut self, s: Option<i32>) {
         self.last_cmd_sub_status = s;
     }
-    pub(crate) fn last_cmd_sub_status(&self) -> Option<i32> {
+    pub fn last_cmd_sub_status(&self) -> Option<i32> {
         self.last_cmd_sub_status
     }
 

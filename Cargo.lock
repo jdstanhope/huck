@@ -171,13 +171,8 @@ name = "huck"
 version = "0.1.0"
 dependencies = [
  "expectrl",
- "glob",
- "huck-syntax",
+ "huck-cli",
  "libc",
- "regex",
- "rustyline",
- "signal-hook",
- "signal-hook-registry",
  "tempfile",
 ]
 
