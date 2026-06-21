@@ -1,0 +1,8 @@
+[package]
+name = "huck-syntax"
+version = "0.1.0"
+edition = "2024"
+description = "huck's Shell-free frontend: lexer, parser, command AST, and source generator"
+license = "MIT"
+
+[dependencies]
