@@ -1,7 +1,11 @@
 # Releasing huck
 
 Releases are self-hosted off GitHub Releases. The single source of version truth
-is `Cargo.toml` `[package] version`; a release is the git tag `v<version>`.
+is the **root** `Cargo.toml` `[package] version` (the `huck` package); a release
+is the git tag `v<version>`. (Since v202 the repo is a Cargo workspace; the
+`crates/huck-syntax/Cargo.toml` version is INTERNAL and independent — it is a
+path dependency, never published, and is NOT the release version. `release.sh`
+reads the root `Cargo.toml` only.)
 
 ## One-time setup
 1. Authenticate gh: `gh auth login`.

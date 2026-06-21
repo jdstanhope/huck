@@ -4,9 +4,11 @@
 //! library-testable. The binary (`src/main.rs`) is a thin shim over
 //! [`shell::run`].
 //!
-//! Modules are published as-is for now; the public surface is expected to be
-//! curated (and pieces extracted into their own crates — e.g. a Shell-free
-//! `huck-syntax` from `lexer` + `command`) in later iterations.
+//! The Shell-free frontend (`lexer`, `command` AST+parser, `brace_expand`,
+//! `generate`) lives in the sibling **`huck-syntax`** workspace crate and is
+//! re-exported at this crate's root, so `crate::lexer::`/`crate::command::`
+//! paths resolve here unchanged. The remaining runtime modules are published
+//! as-is; the public surface may be curated further in later iterations.
 
 pub mod alias_expand;
 pub mod arith;

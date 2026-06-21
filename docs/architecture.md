@@ -9,8 +9,22 @@ For the iteration history see the table in `README.md`.
 
 ## Module map
 
-All source lives under `src/`. Two-tier layout: lexer/parser/AST at
-the bottom, expansion + execution above, builtins at the top.
+The repo is a 2-member Cargo **workspace** (v202). The Shell-free **frontend** —
+`lexer`, `command` (AST + parser), `brace_expand`, and `generate` (AST→source) —
+lives in the **`huck-syntax`** crate under `crates/huck-syntax/src/` (plus its
+`errors.rs` = `lex_error_message`/`parse_error_message` and `util.rs` =
+`escape_double_quote_value`). The **`huck`** crate (root `src/`) holds the runtime
+(expansion, execution, builtins, shell state) and depends on `huck-syntax`
+one-directionally — the dependency cycle is forbidden by Cargo, so the Shell-free
+boundary is **compiler-enforced** (`huck-syntax` cannot `use` anything in `huck`).
+`huck/src/lib.rs` re-exports the frontend modules at the crate root, so existing
+`crate::lexer::` / `crate::command::` / `crate::generate::` paths in the runtime
+resolve unchanged. **Run the suite with `cargo test --workspace`** — a bare
+`cargo test` from the root only runs the `huck` package's tests, not the ~740
+frontend tests in `huck-syntax`.
+
+Two-tier layout: lexer/parser/AST (the `huck-syntax` crate) at the bottom,
+expansion + execution above, builtins at the top.
 
 | Module | Responsibility |
 |---|---|
@@ -32,7 +46,7 @@ the bottom, expansion + execution above, builtins at the top.
 | `completion.rs` | Tab completion (commands, files, variables, arith-context). |
 | `continuation.rs` | Multi-line input handling (backslash-newline, unclosed quotes, partial control structures). |
 | `shell.rs` | Top-level CLI + REPL entry point. `process_line` (the canonical "execute string in current shell" path). |
-| `lib.rs` | Library crate root: declares every module (`pub mod`) so the frontend (`lexer`/`command`) and leaf utilities are reusable/library-testable. Also holds the `#[cfg(test)] test_support` (`CWD_LOCK`) module. |
+| `lib.rs` | `huck` library crate root: declares the runtime modules (`pub mod`) AND re-exports the `huck-syntax` frontend at the crate root (`pub use huck_syntax::{lexer, command, brace_expand, generate, …}`) so `crate::lexer::`/`crate::command::` paths stay valid. Also holds the `#[cfg(test)] test_support` (`CWD_LOCK`) module. |
 | `main.rs` | Thin binary shim: argv parsing + `huck::shell::run` invocation. All logic lives in the `huck` library crate. |
 
 ## Execution pipeline
