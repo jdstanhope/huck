@@ -23,6 +23,23 @@ fn space_inside_parens_matches() {
 }
 
 #[test]
+fn quoted_span_matches_literally() {
+    // v199 (L-23): a QUOTED span of the regex operand matches literally — its
+    // metacharacters are escaped. An unquoted span stays an active regex.
+    // `.` quoted -> literal dot: "axb" does NOT match "a.b".
+    assert_eq!(run("[[ axb =~ \"a.b\" ]] && echo M || echo N\n").0, "N\n");
+    // `.` quoted -> literal dot: "a.b" matches "a.b".
+    assert_eq!(run("[[ a.b =~ \"a.b\" ]] && echo M || echo N\n").0, "M\n");
+    // unquoted `.` stays active: "axb" matches a.b.
+    assert_eq!(run("[[ axb =~ a.b ]] && echo M || echo N\n").0, "M\n");
+    // partial quoting: only the quoted `.` is literal.
+    assert_eq!(run("[[ axb =~ a\".\"b ]] && echo M || echo N\n").0, "N\n");
+    // a quoted `$var` is literal; an unquoted one is active (bash 3.2+).
+    assert_eq!(run("re='a.b'; [[ axb =~ \"$re\" ]] && echo M || echo N\n").0, "N\n");
+    assert_eq!(run("re='a.b'; [[ axb =~ $re ]] && echo M || echo N\n").0, "M\n");
+}
+
+#[test]
 fn line847_shape_parses_and_matches() {
     // bash gives N here: the trailing `.` requires a char after `]`, but
     // the subject "[no-]" ends at `]`, so the overall pattern cannot match.

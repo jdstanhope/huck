@@ -55,7 +55,9 @@ fn dbracket_regex_match() {
 
 #[test]
 fn dbracket_regex_invalid_errors() {
-    let (out, err) = run("[[ x =~ \"[\" ]]\necho $?\nexit\n");
+    // An UNQUOTED invalid regex (unclosed `[`) is a compile error -> rc 2.
+    // (A QUOTED `"["` is a LITERAL `[` and matches normally — see L-23/v199.)
+    let (out, err) = run("[[ x =~ [ ]]\necho $?\nexit\n");
     assert!(out.lines().any(|l| l.trim() == "2"), "got out: {out} err: {err}");
 }
 

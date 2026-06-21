@@ -1517,6 +1517,34 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
     result
 }
 
+/// Expands `word` into a regex string for `[[ … =~ … ]]` matching. Like
+/// `expand_pattern` (no field splitting), but text contributed by a QUOTED part
+/// is `regex::escape`d, so a quoted `.`/`+`/`*`/`(`/`|`/etc. matches LITERALLY
+/// while an unquoted one stays an active regex metacharacter (bash 3.2+). An
+/// unquoted `$var` expands to an active regex; a quoted `"$var"` is literal.
+pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
+    // Snapshot `$?` so `LastStatus` parts read the value at the start of the
+    // expansion (same contract as `expand_pattern`).
+    let snapshot_status = shell.last_status();
+    let mut result = String::new();
+    for part in &word.0 {
+        let text = if matches!(part, WordPart::LastStatus { .. }) {
+            snapshot_status.to_string()
+        } else {
+            expand_assignment(&Word(vec![part.clone()]), shell)
+        };
+        if shell.pending_fatal_pe_error.is_some() {
+            return result;
+        }
+        if word_part_is_quoted(part) {
+            result.push_str(&regex::escape(&text));
+        } else {
+            result.push_str(&text);
+        }
+    }
+    result
+}
+
 /// Runs a sub-sequence as a substituted command: clones the parent `Shell`
 /// (so state mutations don't leak), captures stdout via the executor's
 /// `execute_capturing`, strips trailing newlines, and propagates the
