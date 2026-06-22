@@ -29,6 +29,11 @@ impl<'a> ExecBuilder<'a> {
 
     /// Route the script's fd 2 to fd 1 (bash `2>&1`). Under `.capture()` the
     /// merged bytes land in `Output.stdout` and `Output.stderr` is empty.
+    ///
+    /// For multi-stage pipelines, each non-last stage's fd 2 is aliased to its
+    /// inter-stage pipe (matching bash `2>&1 |` semantics) — so an intermediate
+    /// stage's stderr flows into the next stage's stdin, not directly into the
+    /// captured buffer.
     pub fn merge_stderr(mut self) -> Self {
         self.merge = true;
         self

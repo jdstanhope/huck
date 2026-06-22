@@ -355,6 +355,24 @@ mod tests {
     }
 
     #[test]
+    fn exec_stdin_and_merge_stderr_compose() {
+        let _guard = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        // Read stdin, echo it, then write a separate stderr message.
+        // With merge_stderr, the stderr should fold into the captured stdout.
+        let out = e
+            .exec("read x; echo \"got:$x\"; echo err >&2; echo done")
+            .stdin(b"hello\n".to_vec())
+            .merge_stderr()
+            .capture();
+        assert_eq!(out.stdout, "got:hello\nerr\ndone\n");
+        assert_eq!(out.stderr, "");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[test]
     fn capture_includes_stderr_field() {
         let mut e = Engine::new();
         let out = e.capture("echo a; echo b >&2");
@@ -380,8 +398,8 @@ mod tests {
         assert_eq!(out.stdout, "set-in-first\n");
     }
 
-    // ---- v205 task 7 fixup: in-memory routing must defer to real-fd dup chain
-    // when an earlier file/pipe redirect intercepts the source fd.
+    // in-memory routing must defer to the real-fd dup chain when an earlier
+    // file/pipe redirect targets the source fd.
 
     #[test]
     fn capture_with_file_then_dup_to_one_lets_file_win() {
