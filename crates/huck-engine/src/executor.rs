@@ -1707,10 +1707,17 @@ fn run_select_inner(
         //     line. An empty line reprints the menu; EOF terminates the loop.
         let selection: String = loop {
             if show_menu {
-                eprint!("{}", format_select_menu(&items, cols_width));
+                let mut err = err_writer(err_sink, sink);
+                let _ = write!(&mut *err, "{}", format_select_menu(&items, cols_width));
             }
-            eprint!("{ps3}");
-            let _ = std::io::stderr().flush();
+            {
+                let mut err = err_writer(err_sink, sink);
+                let _ = write!(&mut *err, "{ps3}");
+            }
+            {
+                let mut err = err_writer(err_sink, sink);
+                let _ = err.flush();
+            }
 
             let r = read_line_into_reply(shell);
             if !matches!(r, ExecOutcome::Continue(0)) {
