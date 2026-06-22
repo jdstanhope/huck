@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(out.exit_code, 0);
     }
 
-    // ----- v207 Task 5: external-process poll loop -------------------------
+    // ----- external-process poll loop --------------------------------------
     //
     // These exercise the streaming path through external children:
     // run_subprocess (single external command), the Subshell arm

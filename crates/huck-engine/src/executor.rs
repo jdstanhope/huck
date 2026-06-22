@@ -643,7 +643,7 @@ fn run_command(
             }
 
             if interactive {
-                // Interactive subshell path keeps the pre-v207 dual-drain +
+                // Interactive subshell path keeps the dual-drain +
                 // wait_with_untraced shape. Real-time streaming callbacks are
                 // moot here (sink == Terminal => no capture pipes are open
                 // anyway), and we must keep job-control / stopped-job semantics
@@ -5027,6 +5027,9 @@ fn run_subprocess(
                 }
                 give_terminal_to(pid);
 
+                // wait_with_untraced already waitpid'd the child, so each arm
+                // mem::forget's the Child to keep its Drop from re-reaping
+                // (already-reaped pid would give -ECHILD).
                 match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
                         // Child was stopped (e.g. Ctrl-Z / SIGTSTP).
@@ -6035,7 +6038,7 @@ fn run_multi_stage(
     parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
 
     // Drain stdout AND stderr capture pipes via a single poll loop on the
-    // embedder's thread (v207). Real-time streaming callbacks fire as bytes
+    // embedder's thread. Real-time streaming callbacks fire as bytes
     // arrive; no drainer threads. The loop exits when BOTH pipes hit EOF,
     // which happens once every writer (the last stage for stdout; all stages
     // for the shared stderr pipe) has exited. Capture sink => interactive ==
