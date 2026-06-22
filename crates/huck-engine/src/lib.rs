@@ -28,6 +28,7 @@ pub mod prompt;
 pub mod readline_bind;
 pub mod shell;
 pub mod shell_state;
+pub(crate) mod stdin_pipe;
 pub mod test_builtin;
 pub mod traps;
 
