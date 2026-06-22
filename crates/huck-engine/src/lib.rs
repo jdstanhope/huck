@@ -14,6 +14,7 @@ pub mod completion;
 pub mod completion_builtins;
 pub mod completion_spec;
 pub mod continuation;
+pub(crate) mod cwd_scope;
 pub mod engine;
 pub mod err_thread_local;
 pub mod exec_builder;
