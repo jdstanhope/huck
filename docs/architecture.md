@@ -34,7 +34,18 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   counterpart of `StdoutSink`, threaded through the executor and the
   builtin-dispatch path; engine-level stdin redirection lives in
   `crates/huck-engine/src/stdin_pipe.rs` (CLOEXEC pipe + dup2(r, 0) save/restore
-  guard).
+  guard). Sandbox knobs (v206) layer on top: `.cwd(path)` chdirs for the call
+  (RAII via `cwd_scope.rs`, snapshotting OS cwd + shell `PWD`/`OLDPWD`);
+  `.restricted(true)` enables a bash `rbash`-subset policy (refuses
+  `cd`/`exec`/slash-bearing command names/slash-bearing `source` paths/
+  absolute-or-`..`-redirect targets/assignment to SHELL/PATH/ENV/BASH_ENV/
+  `set +r`) via `restricted.rs`; `.timeout(dur)` spawns a timer thread
+  (`timeout.rs`) that, on deadline, sets `Shell.timeout_flag` (polled by
+  `executor::check_interrupt`) and SIGTERMs every pid in
+  `Shell.live_external_children`, with the call returning exit 124.
+  `ExecOutcome::Interrupted` carries an `InterruptReason::{Sigint,Timeout}`
+  discriminator so the top-level reducer can map to 130 (SIGINT) or 124
+  (timeout).
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply
