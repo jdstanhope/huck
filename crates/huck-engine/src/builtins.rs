@@ -6,6 +6,14 @@ use std::rc::Rc;
 use crate::command::DeclArg;
 use crate::shell_state::{Shell, SHOPT_TABLE};
 
+/// Why an executor run was interrupted. Used to discriminate the top-level
+/// exit code mapping (SIGINT -> 130, ExecBuilder::timeout -> 124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReason {
+    Sigint,
+    Timeout,
+}
+
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,7 +26,9 @@ pub enum ExecOutcome {
     /// v138: an untrapped SIGINT was observed — abort the running command list.
     /// Propagates like `Exit` until a top-level consumer (REPL reprompts with
     /// `$?`=130 and does NOT exit; `-c`/script exits 130).
-    Interrupted,
+    /// v206: carries an `InterruptReason` so the top-level reducer can
+    /// distinguish SIGINT (130) from `ExecBuilder::timeout` (124).
+    Interrupted(InterruptReason),
 }
 
 pub const BUILTIN_NAMES: &[&str] = &[
@@ -6226,7 +6236,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
                             last_status = 0;
                         }
-                        ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+                        ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                     }
 
                     // A command may have flipped `shopt extglob`, which changes

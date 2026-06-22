@@ -194,7 +194,7 @@ pub fn run(args: &[String]) -> i32 {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(0)
                     }
-                    ExecOutcome::Interrupted => {
+                    ExecOutcome::Interrupted(_) => {
                         let mut shell = shell_cell.borrow_mut();
                         shell.set_last_status(130);
                         eprintln!();

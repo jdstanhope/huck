@@ -4,7 +4,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
-use crate::builtins::{self, ExecOutcome};
+use crate::builtins::{self, ExecOutcome, InterruptReason};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
     IfClause, Pipeline, Redirect, RedirFd, RedirOp, Redirection, Sequence, SimpleCommand, TestBinaryOp,
@@ -108,10 +108,10 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
 }
 
 /// Consumes a pending SIGINT and decides whether to abort. Returns
-/// `Some(ExecOutcome::Interrupted)` when an untrapped SIGINT is pending; `None`
-/// when none is pending OR when a user `INT` trap (handler or ignore-form) is
-/// installed — the existing trap dispatch then handles it and execution
-/// continues, matching bash. (v138)
+/// `Some(ExecOutcome::Interrupted(InterruptReason::Sigint))` when an untrapped
+/// SIGINT is pending; `None` when none is pending OR when a user `INT` trap
+/// (handler or ignore-form) is installed — the existing trap dispatch then
+/// handles it and execution continues, matching bash. (v138)
 pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
     use std::sync::atomic::Ordering;
     if shell
@@ -122,7 +122,7 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
         if shell.trap_sigids.contains_key(&libc::SIGINT) {
             return None;
         }
-        return Some(ExecOutcome::Interrupted);
+        return Some(ExecOutcome::Interrupted(InterruptReason::Sigint));
     }
     None
 }
@@ -247,7 +247,7 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
-        ExecOutcome::Interrupted => {
+        ExecOutcome::Interrupted(_) => {
             // An untrapped SIGINT aborted the substitution body. The
             // interrupt was consumed (flag cleared) by the body's own
             // `check_interrupt`; re-raise it on the shared `sigint_flag` so
@@ -283,7 +283,7 @@ fn run_andor_group(
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
     ) {
         return status;
     }
@@ -327,7 +327,7 @@ fn run_andor_group(
             if matches!(
                 status,
                 ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
             ) {
                 return status;
             }
@@ -442,7 +442,7 @@ fn execute_sequence_body(
                     | ExecOutcome::LoopBreak(_, _)
                     | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_)
-                    | ExecOutcome::Interrupted
+                    | ExecOutcome::Interrupted(_)
             ) {
                 return last_status;
             }
@@ -1537,7 +1537,7 @@ fn run_while_inner(
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted => {
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_) => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
@@ -1564,7 +1564,7 @@ fn run_while_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1661,7 +1661,7 @@ fn run_for_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1857,7 +1857,7 @@ fn run_arith_for_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -2023,7 +2023,7 @@ fn run_select_inner(
             }
             ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
         }
 
@@ -2105,7 +2105,7 @@ fn run_case(
                 ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
                 ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-                ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+                ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
             },
         }
@@ -2139,7 +2139,7 @@ fn run_if(
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
     ) {
         return cond;
     }
@@ -2153,7 +2153,7 @@ fn run_if(
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
         ) {
             return elif_cond;
         }
@@ -3403,7 +3403,7 @@ fn run_single(
         ExecOutcome::LoopBreak(_, st) => shell.set_pipestatus(&[st]),
         ExecOutcome::LoopContinue(_) => shell.set_pipestatus(&[0]),
         ExecOutcome::Exit(_) | ExecOutcome::FunctionReturn(_) => {}
-        ExecOutcome::Interrupted => {}
+        ExecOutcome::Interrupted(_) => {}
     }
     outcome
 }
@@ -6628,7 +6628,8 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
             ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
             ExecOutcome::FunctionReturn(n) => n,
-            ExecOutcome::Interrupted => 130,
+            ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
+            ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
         };
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or
