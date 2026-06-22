@@ -461,12 +461,31 @@ fn run_command(
                 },
             };
 
+            // Mirror the stdout fd construction for stderr (v205 task 5):
+            //   Terminal → STDERR_FILENO (inherit).
+            //   Merged   → stdout_fd (kernel-level 2>&1: both streams hit the
+            //              same write-end of whatever fd 1 is — pipe or terminal).
+            //   Capture  → fresh pipe; read end drained in parent post-fork.
+            let (stderr_fd, capture_err_read_fd): (RawFd, Option<RawFd>) = match err_sink {
+                StderrSink::Terminal => (libc::STDERR_FILENO, None),
+                StderrSink::Merged => (stdout_fd, None),
+                StderrSink::Capture(_) => match make_pipe() {
+                    Ok((r, w)) => (w, Some(r)),
+                    Err(e) => {
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
+                        if stdout_fd != libc::STDOUT_FILENO { unsafe { libc::close(stdout_fd); } }
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+
             let pid = match fork_and_run_in_subshell(
                 cmd,
                 shell,
                 libc::STDIN_FILENO,
                 stdout_fd,
-                libc::STDERR_FILENO,
+                stderr_fd,
                 if interactive { 0 } else { NO_PGROUP },
                 &[],
                 None, // no Dup redirect at this call site
@@ -478,8 +497,14 @@ fn run_command(
                     if let Some(r) = capture_read_fd {
                         unsafe { libc::close(r); }
                     }
+                    if let Some(r) = capture_err_read_fd {
+                        unsafe { libc::close(r); }
+                    }
                     if stdout_fd != libc::STDOUT_FILENO {
                         unsafe { libc::close(stdout_fd); }
+                    }
+                    if stderr_fd != libc::STDERR_FILENO && stderr_fd != stdout_fd {
+                        unsafe { libc::close(stderr_fd); }
                     }
                     return ExecOutcome::Continue(1);
                 }
@@ -490,13 +515,51 @@ fn run_command(
             if stdout_fd != libc::STDOUT_FILENO {
                 unsafe { libc::close(stdout_fd); }
             }
+            // Same for the dedicated stderr pipe (skip if it's the merged-stdout
+            // alias; that fd has already been closed above).
+            if matches!(err_sink, StderrSink::Capture(_))
+                && stderr_fd != libc::STDERR_FILENO
+                && stderr_fd != stdout_fd
+            {
+                unsafe { libc::close(stderr_fd); }
+            }
 
-            // Drain capture pipe before waitpid to avoid deadlock.
+            // Drain the stderr pipe in a background thread (concurrent with
+            // the foreground stdout drain) to avoid PIPE_BUF deadlock when the
+            // child writes more than ~64 KiB to either stream. The thread owns
+            // the read fd via File and posts the captured bytes through a
+            // channel; the main thread folds them into err_sink AFTER the
+            // stdout drain releases its &mut sink borrow.
+            let err_drain = if let Some(r) = capture_err_read_fd {
+                use std::os::fd::FromRawFd;
+                let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                let handle = std::thread::spawn(move || {
+                    let mut f = unsafe { File::from_raw_fd(r) };
+                    let mut local = Vec::new();
+                    let _ = io::copy(&mut f, &mut local);
+                    let _ = tx.send(local);
+                });
+                Some((handle, rx))
+            } else {
+                None
+            };
+
+            // Drain stdout capture pipe before waitpid to avoid deadlock.
             if let (Some(r), StdoutSink::Capture(buf)) = (capture_read_fd, &mut *sink) {
                 use std::os::fd::FromRawFd;
                 let mut f = unsafe { File::from_raw_fd(r) };
                 let _ = io::copy(&mut f, *buf);
                 // f is dropped here, closing r.
+            }
+
+            // Now join the stderr drainer and fold bytes into err_sink.
+            if let Some((handle, rx)) = err_drain {
+                let _ = handle.join();
+                if let Ok(bytes) = rx.recv()
+                    && let StderrSink::Capture(buf) = err_sink
+                {
+                    buf.extend_from_slice(&bytes);
+                }
             }
 
             if interactive {
@@ -4528,11 +4591,33 @@ fn run_subprocess(
     // read-ends are in `plan.held` (FD_CLOEXEC, inherited across fork, replayed by
     // the ops above) and their pids are reaped after the child's status.
     let want_capture = matches!(sink, StdoutSink::Capture(_));
+    let want_capture_err = matches!(err_sink, StderrSink::Capture(_));
+    let merged_err = matches!(err_sink, StderrSink::Merged);
     if want_capture {
         // Pipe fd 1 back to the parent for capture. An explicit `>file` (or other
         // fd-1 redirect) in `plan.ops` overrides this in the child replay, so the
         // capture pipe correctly sees EOF when the command redirects its stdout.
         process.stdout(Stdio::piped());
+    }
+    if want_capture_err {
+        // Pipe fd 2 back to the parent for capture. Mirrors the want_capture path
+        // for stderr. An explicit `2>file` in `plan.ops` overrides this in the
+        // child replay (same as stdout).
+        process.stderr(Stdio::piped());
+    } else if merged_err {
+        // StderrSink::Merged: route fd 2 onto fd 1 in the child via a pre_exec
+        // dup2 after std's stdio bridge sets up fd 1. This is the kernel-level
+        // analog of `2>&1`: a single ordered byte stream into whatever fd 1 is
+        // (the inherited terminal OR the capture pipe set by `process.stdout`
+        // above). Bash-compatible byte ordering falls out naturally.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::dup2(1, 2) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     // Flush pending parent stdout before spawning so the child's output is
@@ -4617,13 +4702,52 @@ fn run_subprocess(
                     }
                 }
             } else {
-                // Capture path: use existing child.wait() semantics.
+                // Non-interactive (capture-or-pure) path: drain piped fds, then wait.
+                // When BOTH stdout AND stderr are piped we must drain them concurrently
+                // (spawn a background thread for stderr) or the child can deadlock by
+                // filling whichever pipe we are not currently reading (PIPE_BUF ~64KB
+                // on Linux). When only one is piped, sequential drain is fine.
                 let mut copy_err: Option<io::Error> = None;
+                // Take ownership of the piped stderr (if any) BEFORE the foreground
+                // stdout drain. The stderr drain thread owns the ChildStderr and the
+                // sender; the receiver below collects the bytes after wait().
+                let err_drain_handle = if want_capture_err {
+                    child.stderr.take().map(|mut child_stderr| {
+                        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
+                        let handle = std::thread::spawn(move || {
+                            let mut local = Vec::new();
+                            let res = io::copy(&mut child_stderr, &mut local).map(|_| local);
+                            let _ = tx.send(res);
+                        });
+                        (handle, rx)
+                    })
+                } else {
+                    None
+                };
                 if let StdoutSink::Capture(buf) = sink
                     && let Some(mut child_stdout) = child.stdout.take()
                     && let Err(e) = io::copy(&mut child_stdout, *buf)
                 {
                     copy_err = Some(e);
+                }
+                // Join the stderr drainer (if any) BEFORE wait() so the child's
+                // stderr is fully consumed and the pipe write-end closes.
+                if let Some((handle, rx)) = err_drain_handle {
+                    let _ = handle.join();
+                    if let Ok(result) = rx.recv() {
+                        match result {
+                            Ok(bytes) => {
+                                if let StderrSink::Capture(buf) = err_sink {
+                                    buf.extend_from_slice(&bytes);
+                                }
+                            }
+                            Err(e) => {
+                                if copy_err.is_none() {
+                                    copy_err = Some(e);
+                                }
+                            }
+                        }
+                    }
                 }
                 match child.wait() {
                     Ok(status) => {
@@ -4860,6 +4984,29 @@ fn run_multi_stage(
     // All raw fds the parent currently holds (for the child's
     // parent_fds_to_close list so it doesn't inherit stale pipe ends).
     let mut parent_held: Vec<RawFd> = Vec::new();
+
+    // For StderrSink::Capture: one shared pipe whose write-end is wired into every
+    // stage's fd 2 (bash `pipe1 | pipe2 | … 2>err` semantics — each stage's stderr
+    // lands in the same buffer). For Merged the per-stage stderr_fd is aliased
+    // to the active stdout fd (the inter-stage pipe write-end for non-last stages,
+    // and the final-stage stdout target for the last stage), giving kernel-level
+    // 2>&1 ordering. For Terminal stderr inherits as before. (v205 task 5)
+    let (capture_err_pipe_write_fd, mut capture_err_read_fd): (Option<RawFd>, Option<RawFd>) =
+        if matches!(err_sink, StderrSink::Capture(_)) {
+            match make_pipe() {
+                Ok((r, w)) => {
+                    parent_held.push(r);
+                    parent_held.push(w);
+                    (Some(w), Some(r))
+                }
+                Err(e) => {
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        } else {
+            (None, None)
+        };
 
     // PIDs of forked heredoc/herestring writer processes (M-120); reaped at the
     // pipeline wait point. They are internal helpers — never jobs, never $!,
@@ -5257,7 +5404,50 @@ fn run_multi_stage(
             }
         };
 
-        let stderr_fd = explicit_stderr_fd.unwrap_or(libc::STDERR_FILENO);
+        // ---- Build stderr fd -------------------------------------------------
+        // Priority: explicit redirect (`2>file` / `2>&n`) > sink-derived.
+        //   StderrSink::Terminal → STDERR_FILENO (inherit).
+        //   StderrSink::Merged   → stdout_fd (kernel-level 2>&1; for non-last
+        //                          stages this aliases the inter-stage pipe,
+        //                          matching bash `pipe1 2>&1 | pipe2 2>&1`).
+        //   StderrSink::Capture  → dup of the shared capture_err write-end. We
+        //                          dup PER STAGE because spawn_external_with_fds
+        //                          consumes its stderr_fd via OwnedFd (closes
+        //                          parent's copy) and fork_and_run_in_subshell
+        //                          paths close it explicitly after spawn — both
+        //                          would otherwise destroy the shared write-end
+        //                          after the first stage. (v205 task 5)
+        let stderr_fd = if let Some(fd) = explicit_stderr_fd {
+            fd
+        } else {
+            match err_sink {
+                StderrSink::Terminal => libc::STDERR_FILENO,
+                StderrSink::Merged => stdout_fd,
+                StderrSink::Capture(_) => {
+                    let shared = capture_err_pipe_write_fd
+                        .expect("capture_err_pipe_write_fd set when err_sink is Capture");
+                    let fd = unsafe { libc::dup(shared) };
+                    if fd < 0 {
+                        let e = io::Error::last_os_error();
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: dup: {e}"); }
+                        restore_inline_assignments(snap, shell);
+                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                        if stdout_fd > 2 {
+                            parent_held.retain(|&x| x != stdout_fd);
+                            unsafe { libc::close(stdout_fd); }
+                        }
+                        if let Some(r) = capture_read_fd {
+                            parent_held.retain(|&x| x != r);
+                            unsafe { libc::close(r); }
+                        }
+                        drain_procsubs(shell, procsub_base);
+                        for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+                        return ExecOutcome::Continue(1);
+                    }
+                    fd
+                }
+            }
+        };
 
         // ---- Classify and spawn ----------------------------------------------
         let pgid_target = if interactive { first_pid.unwrap_or(0) } else { NO_PGROUP };
@@ -5433,18 +5623,36 @@ fn run_multi_stage(
     // (e.g., if the last stage had an explicit stdout redirect, prev_pipe_read
     // might still hold a stale value from a stage with a broken pipe — but that
     // shouldn't happen in a well-formed pipeline).
-    // Keep the capture_read_fd open here — it is drained immediately below,
-    // BEFORE the wait (M-119), so it must survive this bulk-close.
+    // Keep the capture_read_fd (stdout) AND capture_err_read_fd open here — both
+    // are drained below BEFORE the wait (M-119), so they must survive this
+    // bulk-close. The capture_err_pipe_write_fd IS closed here (intentional —
+    // every stage has its own dup, so closing the parent's copy is what makes
+    // the read-end see EOF after the last stage exits).
     for fd in parent_held.iter().copied() {
-        // Don't close the capture_read_fd; it is drained just below (pre-wait).
-        if Some(fd) != capture_read_fd {
+        if Some(fd) != capture_read_fd && Some(fd) != capture_err_read_fd {
             unsafe { libc::close(fd); }
         }
     }
-    parent_held.retain(|&fd| Some(fd) == capture_read_fd);
+    parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
 
-    // Drain the capture pipe BEFORE waiting (M-119): the final stage blocks on
-    // write() once it fills the pipe buffer, so nothing draining during the wait
+    // Drain stderr (if captured) concurrently with stdout drain via a background
+    // thread. Without this, a child writing >PIPE_BUF (~64 KiB on Linux) to one
+    // stream while the parent sits in io::copy on the other deadlocks. (v205 task 5)
+    let err_drain = if let Some(r) = capture_err_read_fd.take() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || {
+            let mut f = unsafe { File::from_raw_fd(r) };
+            let mut local = Vec::new();
+            let _ = io::copy(&mut f, &mut local);
+            let _ = tx.send(local);
+        });
+        Some((handle, rx))
+    } else {
+        None
+    };
+
+    // Drain the stdout capture pipe BEFORE waiting (M-119): the final stage blocks
+    // on write() once it fills the pipe buffer, so nothing draining during the wait
     // deadlocks. Reading to EOF here overlaps with the stages writing. Capture
     // sink => interactive == false, so the terminal-handoff/stopped blocks below
     // are no-ops in this case.
@@ -5455,6 +5663,17 @@ fn run_multi_stage(
             // f drops here, closing r.
         } else {
             unsafe { libc::close(r); }
+        }
+    }
+
+    // Join the stderr drain thread and fold its bytes into err_sink (after the
+    // &mut sink borrow above is released).
+    if let Some((handle, rx)) = err_drain {
+        let _ = handle.join();
+        if let Ok(bytes) = rx.recv()
+            && let StderrSink::Capture(buf) = err_sink
+        {
+            buf.extend_from_slice(&bytes);
         }
     }
 
@@ -7510,6 +7729,101 @@ mod tests {
             output.contains("hi-from-subshell"),
             "expected 'hi-from-subshell' in pipe output, got: {output:?}"
         );
+    }
+
+    // ----- external-process stderr capture / Merged (v205 task 5) -------------
+
+    /// `/bin/sh -c 'echo out; echo err >&2'` with split capture sinks:
+    /// stdout lands in `buf_out`, stderr lands in `buf_err`. Exercises the
+    /// `run_subprocess` Capture-stderr branch (Stdio::piped on fd 2 + threaded
+    /// drain). Bash-equivalent: `bash -c '...' 1>out 2>err`.
+    #[test]
+    #[cfg(unix)]
+    fn external_process_stderr_is_captured() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let mut buf_out: Vec<u8> = Vec::new();
+        let mut buf_err: Vec<u8> = Vec::new();
+        let mut shell = Shell::new();
+        {
+            let mut out = StdoutSink::Capture(&mut buf_out);
+            let mut err = StderrSink::Capture(&mut buf_err);
+            let src = "/bin/sh -c 'echo out; echo err >&2'";
+            let tokens = crate::lexer::tokenize(src).expect("lex");
+            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+        }
+        assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
+        assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
+    }
+
+    /// `/bin/sh -c 'printf out; printf err 1>&2; printf out2'` with
+    /// `StderrSink::Merged` routes fd 2 onto fd 1 (the capture pipe) in the
+    /// child via a `pre_exec` dup2(1,2). Both streams hit the same kernel pipe;
+    /// kernel-level ordering matches the source-code writes.
+    /// Bash-equivalent: `bash -c '...' 2>&1`.
+    #[test]
+    #[cfg(unix)]
+    fn external_process_merged_stderr_interleaves_via_kernel() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut shell = Shell::new();
+        {
+            let mut out = StdoutSink::Capture(&mut buf);
+            let mut err = StderrSink::Merged;
+            let src = "/bin/sh -c 'printf out; printf err 1>&2; printf out2'";
+            let tokens = crate::lexer::tokenize(src).expect("lex");
+            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+        }
+        assert_eq!(String::from_utf8_lossy(&buf), "outerrout2");
+    }
+
+    /// Multi-stage pipeline with a stage writing to stderr — the shared
+    /// `StderrSink::Capture` pipe (per-stage dup'd write-end) should collect
+    /// every stage's stderr into the same buffer. Bash-equivalent:
+    /// `bash -c 'echo a; echo err >&2 | cat' 1>out 2>err` (rough analog).
+    #[test]
+    #[cfg(unix)]
+    fn pipeline_stage_stderr_is_captured() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let mut buf_out: Vec<u8> = Vec::new();
+        let mut buf_err: Vec<u8> = Vec::new();
+        let mut shell = Shell::new();
+        {
+            let mut out = StdoutSink::Capture(&mut buf_out);
+            let mut err = StderrSink::Capture(&mut buf_err);
+            // First stage prints to stderr (visible in err buf), pipes nothing.
+            // Second stage `cat` reads (empty) and writes nothing → stdout empty.
+            let src = "/bin/sh -c 'echo err >&2' | cat";
+            let tokens = crate::lexer::tokenize(src).expect("lex");
+            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+        }
+        assert_eq!(String::from_utf8_lossy(&buf_out), "");
+        assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
+    }
+
+    /// `( echo out; echo err >&2 )` — a Subshell command, not an external. The
+    /// subshell branch of `run_command` forks via `fork_and_run_in_subshell`;
+    /// this test exercises the per-fork-site stderr pipe + threaded drain that
+    /// mirrors the stdout-capture pipe pattern. Bash-equivalent: `( … ) 1>out 2>err`.
+    #[test]
+    #[cfg(unix)]
+    fn subshell_stderr_is_captured() {
+        let _g = CWD_LOCK.lock().unwrap();
+        let mut buf_out: Vec<u8> = Vec::new();
+        let mut buf_err: Vec<u8> = Vec::new();
+        let mut shell = Shell::new();
+        {
+            let mut out = StdoutSink::Capture(&mut buf_out);
+            let mut err = StderrSink::Capture(&mut buf_err);
+            let src = "( echo out; echo err >&2 )";
+            let tokens = crate::lexer::tokenize(src).expect("lex");
+            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
+        }
+        assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
+        assert_eq!(String::from_utf8_lossy(&buf_err), "err\n");
     }
 
     // ----- classify_stage unit tests (Task 4) ----------------------------------
