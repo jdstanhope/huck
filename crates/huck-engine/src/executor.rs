@@ -4,7 +4,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
-use crate::builtins::{self, ExecOutcome};
+use crate::builtins::{self, ExecOutcome, InterruptReason};
 use crate::command::{
     CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, FileMode, ForClause,
     IfClause, Pipeline, Redirect, RedirFd, RedirOp, Redirection, Sequence, SimpleCommand, TestBinaryOp,
@@ -39,6 +39,36 @@ pub enum StderrSink<'a> {
 /// per call site — stderr is best-effort and small, so the heap hit is fine.
 /// Each call-site brace-scopes the writer to release the `err_sink` / `sink`
 /// borrows before subsequent code runs (`{ let mut err = err_writer(...); e!(...) }`).
+/// Restricted-mode gate for a write-style redirect target path. Returns
+/// `Err(())` after emitting the diagnostic when the shell is in restricted
+/// mode, the `mode` is write-style (Truncate/Append/Clobber/ReadWrite), and
+/// the path is absolute or contains a `..` component. Input-only modes
+/// (`ReadOnly`) are NEVER refused.
+#[inline]
+fn check_restricted_redirect(
+    mode: &FileMode,
+    path: &str,
+    shell: &Shell,
+    sink: &mut StdoutSink<'_>,
+    err_sink: &mut StderrSink<'_>,
+) -> Result<(), ()> {
+    if !crate::restricted::is_restricted(shell) {
+        return Ok(());
+    }
+    if !matches!(
+        mode,
+        FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite
+    ) {
+        return Ok(());
+    }
+    if let Err(msg) = crate::restricted::check_redirect_path(path) {
+        let mut err = err_writer(err_sink, sink);
+        e!(&mut *err, "{msg}");
+        return Err(());
+    }
+    Ok(())
+}
+
 pub(crate) fn err_writer<'a>(
     err_sink: &'a mut StderrSink<'_>,
     out_sink: &'a mut StdoutSink<'_>,
@@ -77,11 +107,33 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
     }
 }
 
+/// RAII guard that pops a pid from the `Shell::live_external_children` registry
+/// when the surrounding scope ends — including early returns and panics. Pushed
+/// at every external-fork site so the timeout timer thread (see `timeout.rs`)
+/// has an accurate snapshot of which children to SIGTERM if the deadline fires.
+struct LiveChildGuard<'a> {
+    pids: &'a std::sync::Arc<std::sync::Mutex<Vec<libc::pid_t>>>,
+    pid: libc::pid_t,
+}
+
+impl Drop for LiveChildGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.pids.lock() {
+            // Remove the first match — multiple distinct pids can coexist in the
+            // registry (e.g. concurrent pipeline stages), but the same pid
+            // appears at most once for a given live child.
+            if let Some(idx) = g.iter().position(|&p| p == self.pid) {
+                g.swap_remove(idx);
+            }
+        }
+    }
+}
+
 /// Consumes a pending SIGINT and decides whether to abort. Returns
-/// `Some(ExecOutcome::Interrupted)` when an untrapped SIGINT is pending; `None`
-/// when none is pending OR when a user `INT` trap (handler or ignore-form) is
-/// installed — the existing trap dispatch then handles it and execution
-/// continues, matching bash. (v138)
+/// `Some(ExecOutcome::Interrupted(InterruptReason::Sigint))` when an untrapped
+/// SIGINT is pending; `None` when none is pending OR when a user `INT` trap
+/// (handler or ignore-form) is installed — the existing trap dispatch then
+/// handles it and execution continues, matching bash. (v138)
 pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
     use std::sync::atomic::Ordering;
     if shell
@@ -92,7 +144,12 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
         if shell.trap_sigids.contains_key(&libc::SIGINT) {
             return None;
         }
-        return Some(ExecOutcome::Interrupted);
+        return Some(ExecOutcome::Interrupted(InterruptReason::Sigint));
+    }
+    // Timeout poll. The flag stays set — the builder's epilogue does a single
+    // `swap(false)` at the run boundary to override the exit code to 124.
+    if shell.timeout_flag.load(Ordering::Relaxed) {
+        return Some(ExecOutcome::Interrupted(InterruptReason::Timeout));
     }
     None
 }
@@ -217,17 +274,32 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
-        ExecOutcome::Interrupted => {
-            // An untrapped SIGINT aborted the substitution body. The
-            // interrupt was consumed (flag cleared) by the body's own
-            // `check_interrupt`; re-raise it on the shared `sigint_flag` so
-            // the enclosing command list observes it and aborts too —
-            // matching bash, where `x=$(... kill -INT $$ ...); echo after`
-            // never runs `after`. (v138)
-            shell
-                .sigint_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            130
+        ExecOutcome::Interrupted(reason) => {
+            // The substitution body was aborted by `check_interrupt`. Re-raise
+            // the originating flag on the shared `Shell` so the enclosing
+            // command list observes it and aborts too — matching bash, where
+            // `x=$(... kill -INT $$ ...); echo after` never runs `after`. (v138)
+            //
+            // SIGINT: `check_interrupt` already cleared `sigint_flag`, so we
+            // re-store it. Timeout: `check_interrupt` does NOT clear
+            // `timeout_flag` (the builder epilogue is the single reader at the
+            // run boundary), so re-storing is logically a no-op — but doing it
+            // explicitly keeps the reason-propagation symmetric and robust to
+            // future changes.
+            match reason {
+                InterruptReason::Sigint => {
+                    shell
+                        .sigint_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    130
+                }
+                InterruptReason::Timeout => {
+                    shell
+                        .timeout_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    124
+                }
+            }
         }
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
@@ -253,7 +325,7 @@ fn run_andor_group(
     if matches!(
         status,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
     ) {
         return status;
     }
@@ -297,7 +369,7 @@ fn run_andor_group(
             if matches!(
                 status,
                 ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+                    | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
             ) {
                 return status;
             }
@@ -412,7 +484,7 @@ fn execute_sequence_body(
                     | ExecOutcome::LoopBreak(_, _)
                     | ExecOutcome::LoopContinue(_)
                     | ExecOutcome::FunctionReturn(_)
-                    | ExecOutcome::Interrupted
+                    | ExecOutcome::Interrupted(_)
             ) {
                 return last_status;
             }
@@ -509,6 +581,13 @@ fn run_command(
                     return ExecOutcome::Continue(1);
                 }
             };
+
+            // Register the subshell child in the live-children registry so the
+            // timeout timer thread can SIGTERM it if the deadline fires. The
+            // guard pops on every exit path (including early returns / panics).
+            let live_pids = shell.live_external_children.clone();
+            live_pids.lock().unwrap().push(pid as libc::pid_t);
+            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
 
             // Close the write-end in the parent so the child's write-end is
             // the only writer; once the child exits, the read-end sees EOF.
@@ -745,6 +824,9 @@ impl RedirectScope {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(ExecOutcome::Continue(1));
+                }
                 let new_fd: RawFd = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
@@ -913,6 +995,9 @@ impl RedirectScope {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(ExecOutcome::Continue(1));
+                }
                 let fd: RawFd = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
@@ -1501,7 +1586,7 @@ fn run_while_inner(
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted => {
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_) => {
                 return cond;
             }
             ExecOutcome::Continue(c) => {
@@ -1528,7 +1613,7 @@ fn run_while_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1625,7 +1710,7 @@ fn run_for_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1821,7 +1906,7 @@ fn run_arith_for_inner(
                 return ExecOutcome::LoopContinue(n - 1);
             }
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => {
                 last = ExecOutcome::Continue(c);
             }
@@ -1987,7 +2072,7 @@ fn run_select_inner(
             }
             ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n - 1),
             ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-            ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+            ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
             ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
         }
 
@@ -2069,7 +2154,7 @@ fn run_case(
                 ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
                 ExecOutcome::FunctionReturn(code) => return ExecOutcome::FunctionReturn(code),
-                ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+                ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                 ExecOutcome::Continue(c) => last = ExecOutcome::Continue(c),
             },
         }
@@ -2103,7 +2188,7 @@ fn run_if(
     if matches!(
         cond,
         ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+            | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
     ) {
         return cond;
     }
@@ -2117,7 +2202,7 @@ fn run_if(
         if matches!(
             elif_cond,
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
-                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted
+                | ExecOutcome::FunctionReturn(_) | ExecOutcome::Interrupted(_)
         ) {
             return elif_cond;
         }
@@ -3367,7 +3452,7 @@ fn run_single(
         ExecOutcome::LoopBreak(_, st) => shell.set_pipestatus(&[st]),
         ExecOutcome::LoopContinue(_) => shell.set_pipestatus(&[0]),
         ExecOutcome::Exit(_) | ExecOutcome::FunctionReturn(_) => {}
-        ExecOutcome::Interrupted => {}
+        ExecOutcome::Interrupted(_) => {}
     }
     outcome
 }
@@ -3960,9 +4045,27 @@ fn run_exec_single(
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
+        if crate::restricted::is_restricted(shell)
+            && let Err(msg) = crate::restricted::check_exec()
+        {
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+            drain_procsubs(shell, procsub_base);
+            return ExecOutcome::Continue(1);
+        }
         let outcome = run_exec_builtin(&resolved, cmd, shell, sink, err_sink);
         drain_procsubs(shell, procsub_base);
         return outcome;
+    }
+
+    if crate::restricted::is_restricted(shell)
+        && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
+    {
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+        if !persistent {
+            restore_inline_assignments(snap, shell);
+        }
+        drain_procsubs(shell, procsub_base);
+        return ExecOutcome::Continue(1);
     }
 
     // 1. Control builtins always win — they cannot be shadowed by functions.
@@ -4435,6 +4538,9 @@ fn build_child_redir_plan(
                         Ok(p) => p,
                         Err(()) => return Err(1),
                     };
+                    if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                        return Err(1);
+                    }
                     let file: File = match mode {
                         FileMode::ReadOnly => match File::open(&path) {
                             Ok(f) => f,
@@ -4524,6 +4630,9 @@ fn build_child_redir_plan(
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(1);
+                }
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
@@ -4638,6 +4747,9 @@ fn build_child_extra_ops(
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(1);
+                }
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
@@ -4774,6 +4886,13 @@ fn run_subprocess(
             // write here. The writer pids are reaped after the child's status.
 
             let pid = child.id() as i32;
+
+            // Register pid in the live-children registry so the timeout timer
+            // thread can SIGTERM it if the deadline fires. The guard pops on
+            // every exit path (including early returns / panics).
+            let live_pids = shell.live_external_children.clone();
+            live_pids.lock().unwrap().push(pid as libc::pid_t);
+            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
 
             let outcome = if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
@@ -5113,6 +5232,11 @@ fn run_multi_stage(
     let mut first_pid: Option<i32> = None;
     let mut stage_pids: Vec<i32> = Vec::with_capacity(n);
 
+    // Live-children registry: every stage pid is published while the pipeline
+    // is running so the timeout timer thread can SIGTERM all stages in one pass
+    // when the deadline fires. Cleared in one bulk pass after wait_pipeline_raw.
+    let live_pids_arc = shell.live_external_children.clone();
+
     // All forked stages (pid + optional inline exit status for Done stages).
     let mut pipeline_stages: Vec<PipelineStage> = Vec::with_capacity(n);
 
@@ -5230,6 +5354,7 @@ fn run_multi_stage(
                         first_pid = Some(pid);
                     }
                     stage_pids.push(pid);
+                    live_pids_arc.lock().unwrap().push(pid as libc::pid_t);
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
@@ -5754,6 +5879,7 @@ fn run_multi_stage(
             first_pid = Some(pid);
         }
         stage_pids.push(pid);
+        live_pids_arc.lock().unwrap().push(pid as libc::pid_t);
         pipeline_stages.push(PipelineStage::Forked(pid));
     }
 
@@ -5822,6 +5948,14 @@ fn run_multi_stage(
 
     // ---- Wait for all stages ------------------------------------------------
     let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, sink, err_sink, interactive);
+
+    // Clear this pipeline's stage pids from the live-children registry in one
+    // pass. They were published per-stage above so the timeout timer thread
+    // could SIGTERM every stage on a deadline fire.
+    {
+        let mut guard = live_pids_arc.lock().unwrap();
+        guard.retain(|p| !stage_pids.iter().any(|s| (*s as libc::pid_t) == *p));
+    }
 
     // Reap any forked heredoc/herestring writer processes (M-120). They are not
     // pipeline stages, so they are excluded from $PIPESTATUS and the wait above;
@@ -6565,7 +6699,8 @@ pub fn fork_and_run_in_subshell(
             ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
             ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
             ExecOutcome::FunctionReturn(n) => n,
-            ExecOutcome::Interrupted => 130,
+            ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
+            ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
         };
         let status = status.rem_euclid(256);
         // Flush the builtin's buffered stdout to the dup2'd fd 1 (pipe or

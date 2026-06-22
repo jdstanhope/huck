@@ -14,6 +14,7 @@ pub mod completion;
 pub mod completion_builtins;
 pub mod completion_spec;
 pub mod continuation;
+pub(crate) mod cwd_scope;
 pub mod engine;
 pub mod err_thread_local;
 pub mod exec_builder;
@@ -27,10 +28,12 @@ pub mod param_expansion;
 pub mod procsub;
 pub mod prompt;
 pub mod readline_bind;
+pub(crate) mod restricted;
 pub mod shell;
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
 pub mod test_builtin;
+pub(crate) mod timeout;
 pub mod traps;
 
 #[cfg(test)]

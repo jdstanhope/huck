@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crate::completion_spec::{CompletionSpec, CompletionSpecs};
@@ -420,6 +421,17 @@ pub struct Shell {
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
     pub sigint_flag: Arc<AtomicBool>,
+    /// Set by a timer thread when an `ExecBuilder::timeout` deadline elapses.
+    /// Polled by `executor::check_interrupt`; when seen, the executor aborts the
+    /// current run with `ExecOutcome::Interrupted(InterruptReason::Timeout)`.
+    pub timeout_flag: Arc<AtomicBool>,
+    /// PIDs of external children currently being waited on. Pushed at fork
+    /// sites, popped after `waitpid` success. The timeout timer thread iterates
+    /// this list to send SIGTERM when the deadline fires.
+    pub live_external_children: Arc<Mutex<Vec<libc::pid_t>>>,
+    /// True while the current `ExecBuilder::run`/`capture` call is running
+    /// under `.restricted(true)`. Snapshot-and-restored by the builder.
+    pub restricted: bool,
     pub shell_pgid: i32,
     /// Command history. `Rc` so cloning the Shell (per command substitution) is
     /// O(1); the rare mutation (append/load/clear) uses `Rc::make_mut` (COW).
@@ -721,6 +733,9 @@ impl Shell {
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
+            timeout_flag: Arc::new(AtomicBool::new(false)),
+            live_external_children: Arc::new(Mutex::new(Vec::new())),
+            restricted: false,
             shell_pgid: unsafe { libc::getpgrp() },
             history: Rc::new(crate::history::History::new()),
             shell_pid,
@@ -934,7 +949,18 @@ impl Shell {
     /// When the existing value is an `Indexed` array, only element 0 is
     /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
     /// User-facing assignments must use `assign()` / `try_set` instead.
+    ///
+    /// In restricted mode, assignment to SHELL/PATH/ENV/BASH_ENV is refused
+    /// with a diagnostic emitted via `err_thread_local::with_err`; if no
+    /// executor sink is installed (e.g. direct unit tests), the diagnostic
+    /// falls through to `io::stderr()`.
     pub fn set(&mut self, name: &str, value: String) {
+        if self.restricted
+            && let Err(msg) = crate::restricted::check_special_assign(name)
+        {
+            crate::err_thread_local::with_err(|err| e!(err, "{msg}"));
+            return;
+        }
         self.store_scalar(name, value);
     }
 
@@ -1525,6 +1551,17 @@ impl Shell {
             None => return Ok(()), // cycle: warning emitted, write dropped (rc 0)
         };
         let name = dest.name().to_string();
+
+        // Restricted-mode gate: refuse assignment to SHELL/PATH/ENV/BASH_ENV.
+        // Mirrors the gate in `Shell::set`, but covers the user-facing path
+        // (script `PATH=...` or `declare PATH=...`) which routes through here
+        // rather than the leaf `set`.
+        if self.restricted
+            && let Err(msg) = crate::restricted::check_special_assign(&name)
+        {
+            with_err(|err| e!(err, "{msg}"));
+            return Err(AssignErr::Readonly);
+        }
 
         // The single readonly check, before any store (no partial array
         // writes); the storage primitives do not re-check.
@@ -2957,6 +2994,24 @@ mod tests {
     fn new_initializes_sigint_flag_to_false() {
         let s = Shell::new();
         assert!(!s.sigint_flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn new_initializes_timeout_flag_to_false() {
+        let s = Shell::new();
+        assert!(!s.timeout_flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn new_initializes_live_external_children_empty() {
+        let s = Shell::new();
+        assert!(s.live_external_children.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_initializes_restricted_to_false() {
+        let s = Shell::new();
+        assert!(!s.restricted);
     }
 
     #[test]

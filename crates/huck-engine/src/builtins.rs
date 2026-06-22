@@ -6,6 +6,14 @@ use std::rc::Rc;
 use crate::command::DeclArg;
 use crate::shell_state::{Shell, SHOPT_TABLE};
 
+/// Why an executor run was interrupted. Used to discriminate the top-level
+/// exit code mapping (SIGINT -> 130, ExecBuilder::timeout -> 124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReason {
+    Sigint,
+    Timeout,
+}
+
 /// The result of running a command — either the shell continues (carrying the
 /// command's exit status) or the shell should terminate with a code.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,7 +26,9 @@ pub enum ExecOutcome {
     /// v138: an untrapped SIGINT was observed — abort the running command list.
     /// Propagates like `Exit` until a top-level consumer (REPL reprompts with
     /// `$?`=130 and does NOT exit; `-c`/script exits 130).
-    Interrupted,
+    /// v206: carries an `InterruptReason` so the top-level reducer can
+    /// distinguish SIGINT (130) from `ExecBuilder::timeout` (124).
+    Interrupted(InterruptReason),
 }
 
 pub const BUILTIN_NAMES: &[&str] = &[
@@ -317,6 +327,12 @@ fn normalize_logical(path: &str) -> String {
 }
 
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && let Err(msg) = crate::restricted::check_cd()
+    {
+        e!(err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
     //    is the OLDPWD shortcut / target).
     let mut physical_flag: Option<bool> = None;
@@ -4984,6 +5000,13 @@ fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && args.iter().any(|a| a == "+r")
+        && let Err(msg) = crate::restricted::check_set_plus_r()
+    {
+        e!(err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
         names.sort();
@@ -5952,6 +5975,14 @@ pub(crate) fn source_in_sink(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && let Some(path) = args.first()
+        && let Err(msg) = crate::restricted::check_source_path(path)
+    {
+        let mut err = crate::executor::err_writer(err_sink, sink);
+        e!(&mut *err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     // Materialize a fallback err writer for the early-bail diagnostics that don't
     // recurse into the executor.
     {
@@ -6205,7 +6236,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => {
                             last_status = 0;
                         }
-                        ExecOutcome::Interrupted => return ExecOutcome::Interrupted,
+                        ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                     }
 
                     // A command may have flipped `shopt extglob`, which changes

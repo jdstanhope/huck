@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use signal_hook::consts::{SIGCHLD, SIGINT};
 
-use crate::builtins::ExecOutcome;
+use crate::builtins::{ExecOutcome, InterruptReason};
 use crate::command::{self};
 use crate::executor;
 use crate::lexer::{self};
@@ -233,7 +233,8 @@ pub fn run_program_in_sinks(
         ExecOutcome::FunctionReturn(n) => n,
         ExecOutcome::Continue(s) => shell.take_pending_fatal_pe_error().unwrap_or(s),
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
-        ExecOutcome::Interrupted => 130,
+        ExecOutcome::Interrupted(InterruptReason::Sigint) => 130,
+        ExecOutcome::Interrupted(InterruptReason::Timeout) => 124,
     };
     crate::traps::fire_exit_trap(&mut shell);
     shell.hangup_jobs();
