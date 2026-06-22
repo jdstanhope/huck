@@ -24,6 +24,7 @@ pub mod glob_match;
 pub mod history;
 pub mod job_spec;
 pub mod jobs;
+pub(crate) mod line_buf;
 pub mod param_expansion;
 pub mod procsub;
 pub mod prompt;
