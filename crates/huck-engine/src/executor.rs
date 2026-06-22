@@ -39,6 +39,36 @@ pub enum StderrSink<'a> {
 /// per call site — stderr is best-effort and small, so the heap hit is fine.
 /// Each call-site brace-scopes the writer to release the `err_sink` / `sink`
 /// borrows before subsequent code runs (`{ let mut err = err_writer(...); e!(...) }`).
+/// Restricted-mode gate for a write-style redirect target path. Returns
+/// `Err(())` after emitting the diagnostic when the shell is in restricted
+/// mode, the `mode` is write-style (Truncate/Append/Clobber/ReadWrite), and
+/// the path is absolute or contains a `..` component. Input-only modes
+/// (`ReadOnly`) are NEVER refused.
+#[inline]
+fn check_restricted_redirect(
+    mode: &FileMode,
+    path: &str,
+    shell: &Shell,
+    sink: &mut StdoutSink<'_>,
+    err_sink: &mut StderrSink<'_>,
+) -> Result<(), ()> {
+    if !crate::restricted::is_restricted(shell) {
+        return Ok(());
+    }
+    if !matches!(
+        mode,
+        FileMode::Truncate | FileMode::Append | FileMode::Clobber | FileMode::ReadWrite
+    ) {
+        return Ok(());
+    }
+    if let Err(msg) = crate::restricted::check_redirect_path(path) {
+        let mut err = err_writer(err_sink, sink);
+        e!(&mut *err, "{msg}");
+        return Err(());
+    }
+    Ok(())
+}
+
 pub(crate) fn err_writer<'a>(
     err_sink: &'a mut StderrSink<'_>,
     out_sink: &'a mut StdoutSink<'_>,
@@ -745,6 +775,9 @@ impl RedirectScope {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(ExecOutcome::Continue(1));
+                }
                 let new_fd: RawFd = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
@@ -913,6 +946,9 @@ impl RedirectScope {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(ExecOutcome::Continue(1));
+                }
                 let fd: RawFd = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
@@ -3960,9 +3996,27 @@ fn run_exec_single(
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
+        if crate::restricted::is_restricted(shell)
+            && let Err(msg) = crate::restricted::check_exec()
+        {
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+            drain_procsubs(shell, procsub_base);
+            return ExecOutcome::Continue(1);
+        }
         let outcome = run_exec_builtin(&resolved, cmd, shell, sink, err_sink);
         drain_procsubs(shell, procsub_base);
         return outcome;
+    }
+
+    if crate::restricted::is_restricted(shell)
+        && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
+    {
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+        if !persistent {
+            restore_inline_assignments(snap, shell);
+        }
+        drain_procsubs(shell, procsub_base);
+        return ExecOutcome::Continue(1);
     }
 
     // 1. Control builtins always win — they cannot be shadowed by functions.
@@ -4435,6 +4489,9 @@ fn build_child_redir_plan(
                         Ok(p) => p,
                         Err(()) => return Err(1),
                     };
+                    if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                        return Err(1);
+                    }
                     let file: File = match mode {
                         FileMode::ReadOnly => match File::open(&path) {
                             Ok(f) => f,
@@ -4524,6 +4581,9 @@ fn build_child_redir_plan(
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(1);
+                }
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
@@ -4638,6 +4698,9 @@ fn build_child_extra_ops(
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
+                if check_restricted_redirect(mode, &path, shell, sink, err_sink).is_err() {
+                    return Err(1);
+                }
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,

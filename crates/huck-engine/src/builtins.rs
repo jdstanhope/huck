@@ -317,6 +317,12 @@ fn normalize_logical(path: &str) -> String {
 }
 
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && let Err(msg) = crate::restricted::check_cd()
+    {
+        e!(err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
     //    is the OLDPWD shortcut / target).
     let mut physical_flag: Option<bool> = None;
@@ -4984,6 +4990,13 @@ fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && args.iter().any(|a| a == "+r")
+        && let Err(msg) = crate::restricted::check_set_plus_r()
+    {
+        e!(err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
         names.sort();
@@ -5952,6 +5965,14 @@ pub(crate) fn source_in_sink(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
+    if crate::restricted::is_restricted(shell)
+        && let Some(path) = args.first()
+        && let Err(msg) = crate::restricted::check_source_path(path)
+    {
+        let mut err = crate::executor::err_writer(err_sink, sink);
+        e!(&mut *err, "{msg}");
+        return ExecOutcome::Continue(1);
+    }
     // Materialize a fallback err writer for the early-bail diagnostics that don't
     // recurse into the executor.
     {

@@ -950,6 +950,12 @@ impl Shell {
     /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
     /// User-facing assignments must use `assign()` / `try_set` instead.
     pub fn set(&mut self, name: &str, value: String) {
+        if self.restricted
+            && let Err(msg) = crate::restricted::check_special_assign(name)
+        {
+            crate::err_thread_local::with_err(|err| e!(err, "{msg}"));
+            return;
+        }
         self.store_scalar(name, value);
     }
 

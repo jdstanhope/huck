@@ -28,6 +28,7 @@ pub mod param_expansion;
 pub mod procsub;
 pub mod prompt;
 pub mod readline_bind;
+pub(crate) mod restricted;
 pub mod shell;
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
