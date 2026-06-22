@@ -325,6 +325,9 @@ mod tests {
 
     #[test]
     fn exec_feeds_stdin() {
+        // Gate on STDIN_LOCK: this test swaps the process-global fd 0 via
+        // `with_stdin_fd0`, racing with stdin_pipe's own tests if not serialized.
+        let _guard = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut e = Engine::new();
         let out = e
             .exec("read x; read y; echo \"$x-$y\"")
@@ -337,6 +340,9 @@ mod tests {
     fn exec_large_stdin_uses_writer_thread() {
         // Feeds 5 KiB - above the 4 KiB inline threshold; ensures the writer-thread
         // path completes the read.
+        // Gate on STDIN_LOCK: this test swaps the process-global fd 0 via
+        // `with_stdin_fd0`, racing with stdin_pipe's own tests if not serialized.
+        let _guard = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let big: Vec<u8> = std::iter::repeat_n(b'a', 5000)
             .chain(std::iter::once(b'\n'))
             .collect();
@@ -372,5 +378,62 @@ mod tests {
         e.exec("x=set-in-first").run();
         let out = e.exec("echo \"$x\"").capture();
         assert_eq!(out.stdout, "set-in-first\n");
+    }
+
+    // ---- v205 task 7 fixup: in-memory routing must defer to real-fd dup chain
+    // when an earlier file/pipe redirect intercepts the source fd.
+
+    #[test]
+    fn capture_with_file_then_dup_to_one_lets_file_win() {
+        // bash: cmd >file 2>&1 — file gets the bytes; nothing captured.
+        // Earlier `is_trailing_dup_to` predicate misfired here: it saw the
+        // trailing `2>&1` and routed the builtin's stderr to the in-memory
+        // stdout sink, leaving the file empty.
+        use std::io::Read;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut e = Engine::new();
+        let out = e.capture(&format!("echo HI > {path} 2>&1"));
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
+        let mut s = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "HI\n");
+    }
+
+    #[test]
+    fn capture_with_file_then_dup_to_two_lets_file_win() {
+        // Symmetric: cmd 2>file >&2 — file gets the bytes; nothing captured.
+        use std::io::Read;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let mut e = Engine::new();
+        let out = e.capture(&format!("echo HI 2> {path} >&2"));
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
+        let mut s = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "HI\n");
+    }
+
+    #[test]
+    fn capture_bare_dup_to_one_routes_to_stdout_sink() {
+        // The fixup must not regress Task 7's bare-builtin in-memory routing.
+        //
+        // route_out_to_err: a builtin's `>&2` under stderr capture lands in
+        // the separate stderr buffer (not the embedder's terminal).
+        let mut e = Engine::new();
+        let out = e.exec("echo out; echo err >&2").capture();
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+
+        // route_err_to_out: a builtin's `2>&1` under stdout capture folds
+        // stderr writes into the stdout buffer. Use a builtin whose primary
+        // output goes to stderr — `declare -p UNSET_NAME` writes the "not
+        // found" diagnostic to fd 2.
+        let mut e = Engine::new();
+        let out = e.exec("declare -p NOPE_NOT_DEFINED 2>&1").capture();
+        assert_eq!(out.stderr, "");
+        assert!(out.stdout.contains("NOPE_NOT_DEFINED"), "got stdout=[{:?}]", out.stdout);
     }
 }

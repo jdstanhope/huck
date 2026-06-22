@@ -1077,33 +1077,60 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
     })
 }
 
-/// True iff the LAST redirect on `target` is a `RedirOp::Dup` whose source word
-/// expands to the literal number `source`. Used by the builtin-redirect path to
-/// detect a trailing `>&2` (target=1, source=2) or `2>&1` (target=2, source=1)
-/// so an in-memory stderr/stdout sink can be routed in software (the real-fd
-/// dup would target the embedder's terminal fd, missing the buffer).
+/// The final effective destination of a fd after applying a redirect list
+/// left-to-right (source order). Used by `final_dests_for_1_2` to decide
+/// whether the builtin-redirect path's in-memory `>&2` / `2>&1` software
+/// routing applies — it must fire ONLY when no earlier file/pipe redirect
+/// already intercepted the source fd.
+enum RedirectDest {
+    /// No redirect on this fd: inherits whatever the active sink provides.
+    Sink,
+    /// Any non-`Dup` redirect on this fd (file, here-doc, here-string, close,
+    /// etc.). The real-fd scope owns this destination; software routing must
+    /// NOT short-circuit it.
+    External,
+    /// `>&N` / `<&N`: this fd follows whatever fd `N` points to at apply time.
+    /// Carries the literal source fd resolved from the redirect word.
+    Follows(u32),
+}
+
+/// Walk `redirs` in source order and return the FINAL effective destination of
+/// fd 1 and fd 2 — i.e. what the real-fd scope will actually leave fd 1 and
+/// fd 2 pointing at AFTER all redirects are applied. Used by
+/// `run_builtin_with_redirects` to decide whether software in-memory routing
+/// can stand in for a `>&2` / `2>&1` dup, or whether an earlier file/pipe
+/// redirect on the same fd means the real-fd dup must run as-is.
 ///
-/// "Trailing" means no later redirect on the same target fd overrides it. Other
-/// redirects targeting different fds don't disqualify; they're applied normally
-/// at the real-fd level.
-fn is_trailing_dup_to(
+/// Source words on `Dup` are resolved via `resolve_fd_target`; an unresolvable
+/// source falls back to `External` (conservative: the real-fd scope will
+/// report the error and we want to skip software routing).
+fn final_dests_for_1_2(
     redirs: &[Redirection],
-    target: u16,
-    source: i32,
     shell: &mut Shell,
-) -> bool {
-    let mut last_on_target: Option<&Redirection> = None;
+) -> (RedirectDest, RedirectDest) {
+    let mut fd1 = RedirectDest::Sink;
+    let mut fd2 = RedirectDest::Sink;
     for r in redirs {
-        if r.target_fd() == Some(target) {
-            last_on_target = Some(r);
+        let Some(fd) = r.target_fd() else { continue };
+        if fd != 1 && fd != 2 { continue; }
+        let dest = match &r.op {
+            RedirOp::Dup { source: src_word, output: true } => {
+                match resolve_fd_target(src_word, shell) {
+                    Ok(n) if n >= 0 => RedirectDest::Follows(n as u32),
+                    _ => RedirectDest::External,
+                }
+            }
+            // Any other op (File, Close, Heredoc, HereString, Dup{output:false})
+            // hands the fd to the real-fd scope.
+            _ => RedirectDest::External,
+        };
+        match fd {
+            1 => fd1 = dest,
+            2 => fd2 = dest,
+            _ => {}
         }
     }
-    let Some(r) = last_on_target else { return false };
-    let RedirOp::Dup { source: src_word, output: true } = &r.op else {
-        return false;
-    };
-    // Resolve the source fd word against the shell to handle `>&2` vs `>&$X`.
-    matches!(resolve_fd_target(src_word, shell), Ok(n) if n == source)
+    (fd1, fd2)
 }
 
 /// Returns the redirections NOT consumed by the pipeline-stage 0/1/2 slot
@@ -1273,15 +1300,23 @@ fn run_builtin_with_redirects(
     let _ = io::stdout().flush();
 
     // Detect in-memory dup re-routing BEFORE applying the real-fd scope.
-    // - `route_out_to_err`: trailing `>&2` (fd 1 → fd 2) AND stderr is in-memory.
-    // - `route_err_to_out`: trailing `2>&1` (fd 2 → fd 1) AND stdout is in-memory.
-    //   ("Trailing" = no later redirect targets the same fd at the real-fd level
-    //   in a way that would re-dup it elsewhere — i.e. no later file redirect or
-    //   different dup on that target fd.)
+    // - `route_out_to_err`: final `>&2` (fd 1 follows fd 2) where fd 2's final
+    //   destination is the sink (no earlier file/pipe on fd 2 to intercept it)
+    //   AND stderr is in-memory.
+    // - `route_err_to_out`: final `2>&1` (fd 2 follows fd 1) where fd 1's final
+    //   destination is the sink AND stdout is in-memory.
+    //
+    // The walk over `redirs` computes each fd's FINAL effective destination so
+    // we don't over-fire on `>file 2>&1` (where fd 1's earlier `>file` makes the
+    // real-fd dup chain the right path: software routing would steal the bytes
+    // from the file).
+    let (final_1, final_2) = final_dests_for_1_2(redirs, shell);
     let route_out_to_err = matches!(err_sink, StderrSink::Capture(_) | StderrSink::Merged)
-        && is_trailing_dup_to(redirs, /*target=*/ 1, /*source=*/ 2, shell);
+        && matches!(final_2, RedirectDest::Sink)
+        && matches!(final_1, RedirectDest::Follows(2));
     let route_err_to_out = matches!(sink, StdoutSink::Capture(_))
-        && is_trailing_dup_to(redirs, /*target=*/ 2, /*source=*/ 1, shell);
+        && matches!(final_1, RedirectDest::Sink)
+        && matches!(final_2, RedirectDest::Follows(1));
 
     let mut scope = RedirectScope::new();
     for r in redirs {
