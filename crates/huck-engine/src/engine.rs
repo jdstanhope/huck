@@ -21,6 +21,15 @@
 //!     .stdin(b"hello\n".to_vec())
 //!     .capture();
 //! assert_eq!(out.stdout, "got=hello\n");
+//!
+//! // Sandboxed run: tmpdir cwd, restricted mode, 5-second budget.
+//! # let sandbox_dir = std::env::temp_dir();
+//! # let generated_script = "echo hi";
+//! let out = e.exec(generated_script)
+//!     .cwd(sandbox_dir)
+//!     .restricted(true)
+//!     .timeout(std::time::Duration::from_secs(5))
+//!     .capture();
 //! ```
 use std::cell::RefCell;
 use std::path::Path;
@@ -453,5 +462,291 @@ mod tests {
         let out = e.exec("declare -p NOPE_NOT_DEFINED 2>&1").capture();
         assert_eq!(out.stderr, "");
         assert!(out.stdout.contains("NOPE_NOT_DEFINED"), "got stdout=[{:?}]", out.stdout);
+    }
+
+    // ============== CWD ==============
+
+    #[test]
+    fn exec_cwd_runs_script_in_path() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut e = Engine::new();
+        let out = e.exec("pwd").cwd(tmp.path()).capture();
+        assert_eq!(
+            out.stdout.trim(),
+            canonical.display().to_string(),
+            "stderr={:?}", out.stderr
+        );
+    }
+
+    #[test]
+    fn exec_cwd_restores_engine_pwd() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = Engine::new();
+        e.set_var("PWD", "before");
+        let _ = e.exec("cd /; echo \"in:$PWD\"").cwd(tmp.path()).capture();
+        assert_eq!(e.var("PWD").as_deref(), Some("before"));
+    }
+
+    #[test]
+    fn exec_cwd_chdir_failure_is_best_effort() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        // .capture() routes the script's stderr into out.stderr, but the
+        // chdir diagnostic in `with_cwd` goes to the PROCESS stderr (real fd
+        // 2) via `eprintln!` — by design, since the cwd guard runs OUTSIDE
+        // the executor's sink installation. We assert exit code and stdout
+        // here; the diagnostic itself lands on the test runner's stderr.
+        let out = e.exec("echo hi").cwd("/no/such/huck/v206").capture();
+        assert_eq!(out.stdout, "hi\n");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    // ============== RESTRICTED ==============
+
+    #[test]
+    fn restricted_off_by_default() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.exec("cd /tmp; echo $PWD").capture();
+        assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
+        let canonical_tmp = std::fs::canonicalize("/tmp")
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "/tmp".to_string());
+        let got = out.stdout.trim();
+        assert!(
+            got == "/tmp" || got == canonical_tmp,
+            "expected /tmp or canonical, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn restricted_refuses_cd() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.exec("cd /tmp; echo \"$PWD\"").restricted(true).capture();
+        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+        // The script keeps running after the refused cd; echo still fires.
+        assert!(out.stdout.ends_with("\n"));
+    }
+
+    #[test]
+    fn restricted_refuses_exec() {
+        let mut e = Engine::new();
+        let out = e.exec("exec /bin/true").restricted(true).capture();
+        assert!(out.stderr.contains("restricted: exec"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_refuses_command_name_with_slash() {
+        let mut e = Engine::new();
+        let out = e.exec("/bin/echo hi").restricted(true).capture();
+        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+        assert_eq!(out.stdout, "");
+    }
+
+    #[test]
+    fn restricted_accepts_command_name_without_slash() {
+        let mut e = Engine::new();
+        let out = e.exec("true").restricted(true).capture();
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[test]
+    fn restricted_refuses_source_with_slash() {
+        let mut e = Engine::new();
+        let out = e.exec(". /etc/profile").restricted(true).capture();
+        assert!(out.stderr.contains("restricted: source"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_refuses_absolute_redirect() {
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo hi > /tmp/v206-restricted-test")
+            .restricted(true)
+            .capture();
+        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+        // The file MUST NOT have been written.
+        let target = std::path::Path::new("/tmp/v206-restricted-test");
+        assert!(
+            !target.exists()
+                || std::fs::read(target).map(|b| b.is_empty()).unwrap_or(true),
+            "the refused redirect wrote a file"
+        );
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[test]
+    fn restricted_refuses_parent_dir_redirect() {
+        let mut e = Engine::new();
+        let out = e.exec("echo hi > ../escape").restricted(true).capture();
+        assert!(out.stderr.contains("restricted:"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_refuses_path_assignment() {
+        let mut e = Engine::new();
+        let out = e.exec("PATH=/tmp; echo done").restricted(true).capture();
+        assert!(out.stderr.contains("restricted: PATH"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_refuses_shell_assignment() {
+        let mut e = Engine::new();
+        let out = e
+            .exec("SHELL=/bin/bash; echo done")
+            .restricted(true)
+            .capture();
+        assert!(out.stderr.contains("restricted: SHELL"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_refuses_set_plus_r() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.exec("set +r; cd /tmp").restricted(true).capture();
+        assert!(
+            out.stderr.contains("restricted: cannot turn off") || out.stderr.contains("restricted:"),
+            "stderr={:?}", out.stderr
+        );
+        // cd should STILL be refused after the refused `set +r`.
+        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_propagates_to_function() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let out = e.exec("f() { cd /tmp; }; f").restricted(true).capture();
+        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+    }
+
+    #[test]
+    fn restricted_lifts_after_call() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        let _ = e.exec("cd /tmp; pwd").restricted(true).capture();
+        // Next call, no restricted: cd works.
+        let out = e.exec("cd /; pwd").capture();
+        assert_eq!(out.stdout, "/\n", "stderr={:?}", out.stderr);
+    }
+
+    // ============== TIMEOUT ==============
+
+    #[test]
+    fn exec_timeout_kills_infinite_loop() {
+        use std::time::{Duration, Instant};
+        let mut e = Engine::new();
+        let start = Instant::now();
+        let code = e
+            .exec("while true; do :; done")
+            .timeout(Duration::from_millis(100))
+            .run();
+        let elapsed = start.elapsed();
+        assert_eq!(code, 124, "expected 124, got {code}");
+        assert!(elapsed < Duration::from_millis(2000), "took too long: {elapsed:?}");
+    }
+
+    #[test]
+    fn exec_timeout_short_script_completes_normally() {
+        use std::time::Duration;
+        let mut e = Engine::new();
+        let out = e.exec("echo hi").timeout(Duration::from_secs(5)).capture();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, "hi\n");
+    }
+
+    #[test]
+    fn exec_timeout_kills_sleeping_external() {
+        use std::time::{Duration, Instant};
+        let mut e = Engine::new();
+        let start = Instant::now();
+        let code = e
+            .exec("/bin/sleep 5")
+            .timeout(Duration::from_millis(100))
+            .run();
+        let elapsed = start.elapsed();
+        assert_eq!(code, 124);
+        assert!(elapsed < Duration::from_millis(2000), "took too long: {elapsed:?}");
+    }
+
+    #[test]
+    fn exec_timeout_exit_code_overrides_natural() {
+        use std::time::Duration;
+        let mut e = Engine::new();
+        // Long sleep then `exit 0` — the timeout fires first.
+        let code = e
+            .exec("/bin/sleep 5; exit 0")
+            .timeout(Duration::from_millis(100))
+            .run();
+        assert_eq!(code, 124);
+    }
+
+    #[test]
+    fn exec_timeout_zero_returns_124() {
+        use std::time::Duration;
+        let mut e = Engine::new();
+        let out = e.exec("echo hi").timeout(Duration::ZERO).capture();
+        assert_eq!(out.exit_code, 124);
+    }
+
+    // ============== COMPOSITION ==============
+
+    #[test]
+    fn exec_all_knobs_compose() {
+        use std::time::Duration;
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = Engine::new();
+        let out = e
+            .exec("read x; echo \"got:$x\"")
+            .cwd(tmp.path())
+            .restricted(true)
+            .timeout(Duration::from_secs(2))
+            .stdin(b"hello\n".to_vec())
+            .capture();
+        assert_eq!(out.exit_code, 0, "stderr={:?}", out.stderr);
+        assert_eq!(out.stdout, "got:hello\n");
+    }
+
+    #[test]
+    fn exec_cwd_and_restricted() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = Engine::new();
+        // `pwd` works inside restricted; `cd` doesn't.
+        let out = e.exec("pwd; cd /").cwd(tmp.path()).restricted(true).capture();
+        assert!(out.stderr.contains("restricted: cd"), "stderr={:?}", out.stderr);
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap().display().to_string();
+        let raw_tmp = tmp.path().display().to_string();
+        assert!(
+            out.stdout.contains(&canonical_tmp) || out.stdout.contains(&raw_tmp),
+            "stdout={:?} expected to contain {:?} or {:?}",
+            out.stdout, raw_tmp, canonical_tmp
+        );
+    }
+
+    #[test]
+    fn exec_stdin_with_timeout_blocking_read_times_out() {
+        use std::time::Duration;
+        let _g = crate::test_support::STDIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut e = Engine::new();
+        // Stdin is fed but the script also sleeps — verifying stdin+timeout
+        // compose (with_stdin_fd0 fires correctly before the timer aborts).
+        // (Truly blocking the script's read on stdin requires a stdin source
+        // that never produces EOF; our with_stdin_fd0 helper writes finite
+        // bytes and closes. Use sleep as a stand-in for "stuck after read".)
+        let code = e
+            .exec("read x; /bin/sleep 5; echo \"$x\"")
+            .stdin(b"data\n".to_vec())
+            .timeout(Duration::from_millis(100))
+            .run();
+        assert_eq!(code, 124);
     }
 }

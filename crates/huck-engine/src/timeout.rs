@@ -4,9 +4,7 @@
 //! a dangling sleeping thread).
 //!
 //! The public surface (`spawn_timer` / `TimerHandle::cancel`) is consumed by
-//! the `ExecBuilder::timeout` epilogue. Cargo flags it dead until that wiring
-//! lands; allow it here so the module can ship independently.
-#![allow(dead_code)]
+//! the `ExecBuilder::timeout` epilogue.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
@@ -29,11 +27,20 @@ impl TimerHandle {
 
 /// Spawn a timer thread. When `dur` elapses without a cancel, sets `flag` to
 /// true and sends SIGTERM to every pid currently in `pids`.
+///
+/// `Duration::ZERO` is handled specially: the flag is set synchronously
+/// before the thread spawns, so callers that immediately invoke a fast
+/// builtin (with no command-boundary checkpoints) still see the timeout.
 pub fn spawn_timer(
     dur: Duration,
     flag: Arc<AtomicBool>,
     pids: Arc<Mutex<Vec<libc::pid_t>>>,
 ) -> TimerHandle {
+    // ZERO duration: latch the flag immediately so the builder's epilogue
+    // observes it even if the timer thread loses the race with `cancel()`.
+    if dur.is_zero() {
+        flag.store(true, Ordering::Relaxed);
+    }
     let (cancel_tx, cancel_rx) = channel::<()>();
     let handle = std::thread::spawn(move || {
         match cancel_rx.recv_timeout(dur) {

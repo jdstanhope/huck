@@ -1552,6 +1552,17 @@ impl Shell {
         };
         let name = dest.name().to_string();
 
+        // Restricted-mode gate: refuse assignment to SHELL/PATH/ENV/BASH_ENV.
+        // Mirrors the gate in `Shell::set`, but covers the user-facing path
+        // (script `PATH=...` or `declare PATH=...`) which routes through here
+        // rather than the leaf `set`.
+        if self.restricted
+            && let Err(msg) = crate::restricted::check_special_assign(&name)
+        {
+            with_err(|err| e!(err, "{msg}"));
+            return Err(AssignErr::Readonly);
+        }
+
         // The single readonly check, before any store (no partial array
         // writes); the storage primitives do not re-check.
         if self.is_readonly(&name) {

@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 /// shared state it needs through normal channels (e.g. `Rc<RefCell<Shell>>`).
 /// This shape lets callers drop the `&mut Shell` borrow before invoking `f`,
 /// avoiding borrow conflicts when `f` itself needs to re-borrow the shell.
-#[allow(dead_code)]
 pub fn with_cwd<R>(path: &Path, shell: &mut Shell, f: impl FnOnce() -> R) -> R {
     let saved_os = std::env::current_dir().ok();
     let saved_pwd = shell.lookup_var("PWD");
