@@ -7,6 +7,8 @@
 //! state transitions to `Done` or `Signaled` based on the LAST stage's
 //! status (matching bash's pipeline exit-status rule without `pipefail`).
 
+use crate::err_thread_local::with_err;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     Running,
@@ -345,7 +347,7 @@ pub fn reap_and_notify(shell: &mut crate::shell_state::Shell) {
         };
         // bash suppresses automatic job notices inside a subshell environment / completion funcs
         if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-            eprintln!("{}", notification_line(&job, flag));
+            with_err(|err| e!(err, "{}", notification_line(&job, flag)));
         }
     }
     shell.jobs.remove_notified();

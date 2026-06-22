@@ -181,12 +181,17 @@ fn apply_option(opts: &mut CompOptions, name: &str, off: bool) -> Result<(), Fla
 }
 
 /// `complete` builtin.
-pub fn builtin_complete(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+pub fn builtin_complete(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let parsed = match parse_flags(args, true) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}", e.diag("complete"));
-            return ExecOutcome::Continue(e.status());
+        Err(pe) => {
+            e!(err, "{}", pe.diag("complete"));
+            return ExecOutcome::Continue(pe.status());
         }
     };
 
@@ -197,15 +202,16 @@ pub fn builtin_complete(args: &[String], out: &mut dyn Write, shell: &mut Shell)
             parsed.is_default,
             parsed.is_empty,
             out,
+            err,
             shell,
         );
     }
     // Mode: remove
     if parsed.remove {
-        return remove_complete(&parsed.positional, &parsed, shell);
+        return remove_complete(&parsed.positional, &parsed, err, shell);
     }
     // Mode: register
-    register_complete(&parsed, shell)
+    register_complete(&parsed, err, shell)
 }
 
 fn is_bare(parsed: &ParsedFlags) -> bool {
@@ -222,6 +228,7 @@ fn print_complete(
     is_default: bool,
     is_empty: bool,
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &Shell,
 ) -> ExecOutcome {
     let specs = &shell.completion_specs;
@@ -234,18 +241,18 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
             }
             None => {
-                eprintln!("huck: complete: no completion specification for -D");
+                e!(err, "huck: complete: no completion specification for -D");
                 status = 1;
             }
         }
     }
     if is_empty {
         match &specs.empty_spec {
-            Some(e) => {
-                let _ = writeln!(out, "{}", format_spec_for_print(e, None, Some("-E")));
+            Some(es) => {
+                let _ = writeln!(out, "{}", format_spec_for_print(es, None, Some("-E")));
             }
             None => {
-                eprintln!("huck: complete: no completion specification for -E");
+                e!(err, "huck: complete: no completion specification for -E");
                 status = 1;
             }
         }
@@ -268,8 +275,8 @@ fn print_complete(
         if let Some(d) = &specs.default_spec {
             let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
         }
-        if let Some(e) = &specs.empty_spec {
-            let _ = writeln!(out, "{}", format_spec_for_print(e, None, Some("-E")));
+        if let Some(es) = &specs.empty_spec {
+            let _ = writeln!(out, "{}", format_spec_for_print(es, None, Some("-E")));
         }
     } else {
         for n in names {
@@ -278,7 +285,7 @@ fn print_complete(
                     let _ = writeln!(out, "{}", format_spec_for_print(s, Some(n.as_str()), None));
                 }
                 None => {
-                    eprintln!("huck: complete: {n}: no completion specification");
+                    e!(err, "huck: complete: {n}: no completion specification");
                     status = 1;
                 }
             }
@@ -287,7 +294,12 @@ fn print_complete(
     ExecOutcome::Continue(status)
 }
 
-fn remove_complete(names: &[String], parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
+fn remove_complete(
+    names: &[String],
+    parsed: &ParsedFlags,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let mut status = 0;
     let specs = Rc::make_mut(&mut shell.completion_specs);
     if parsed.is_default {
@@ -304,7 +316,7 @@ fn remove_complete(names: &[String], parsed: &ParsedFlags, shell: &mut Shell) ->
                 && !parsed.is_default
                 && !parsed.is_empty
             {
-                eprintln!("huck: complete: {n}: no completion specification");
+                e!(err, "huck: complete: {n}: no completion specification");
                 status = 1;
             }
         }
@@ -312,16 +324,16 @@ fn remove_complete(names: &[String], parsed: &ParsedFlags, shell: &mut Shell) ->
     ExecOutcome::Continue(status)
 }
 
-fn register_complete(parsed: &ParsedFlags, shell: &mut Shell) -> ExecOutcome {
+fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if (parsed.is_default || parsed.is_empty) && !parsed.positional.is_empty() {
-        eprintln!("huck: complete: cannot use -D or -E with command names");
+        e!(err, "huck: complete: cannot use -D or -E with command names");
         return ExecOutcome::Continue(2);
     }
     if !parsed.positional.is_empty()
         && parsed.spec == CompletionSpec::default()
         && !parsed.options_touched
     {
-        eprintln!("huck: complete: nothing to complete");
+        e!(err, "huck: complete: nothing to complete");
         return ExecOutcome::Continue(1);
     }
     let specs = Rc::make_mut(&mut shell.completion_specs);
@@ -410,12 +422,17 @@ fn format_spec_for_print(
 }
 
 /// `compgen` builtin.
-pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+pub fn builtin_compgen(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let parsed = match parse_flags(args, false) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}", e.diag("compgen"));
-            return ExecOutcome::Continue(e.status());
+        Err(pe) => {
+            e!(err, "{}", pe.diag("compgen"));
+            return ExecOutcome::Continue(pe.status());
         }
     };
 
@@ -463,7 +480,12 @@ pub fn builtin_compgen(args: &[String], out: &mut dyn Write, shell: &mut Shell) 
 /// `-D` / `-E` (mutate default/empty specs from within a function) are
 /// recognized as flags but rejected with status 2 (parse-time error,
 /// like any other unsupported flag) — "not yet supported".
-pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+pub fn builtin_compopt(
+    args: &[String],
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+    shell: &mut Shell,
+) -> ExecOutcome {
     let mut i = 0;
     let mut option_set: Vec<(String, bool)> = Vec::new();
     let mut is_default = false;
@@ -479,7 +501,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
             break;
         }
         if arg == "-" || arg == "+" {
-            eprintln!("huck: compopt: bad option: {arg}");
+            e!(err, "huck: compopt: bad option: {arg}");
             return ExecOutcome::Continue(2);
         }
         let leading = arg.chars().next().unwrap();
@@ -498,14 +520,14 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
                         ci = chars.len();
                         args[i].clone()
                     } else {
-                        eprintln!("huck: compopt: -o: option requires an argument");
+                        e!(err, "huck: compopt: -o: option requires an argument");
                         return ExecOutcome::Continue(2);
                     };
                     let off = leading == '+';
                     if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
                         .contains(&arg_value.as_str())
                     {
-                        eprintln!("huck: compopt: {arg_value}: invalid completion option");
+                        e!(err, "huck: compopt: {arg_value}: invalid completion option");
                         return ExecOutcome::Continue(2);
                     }
                     option_set.push((arg_value, off));
@@ -517,7 +539,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
                     is_empty = true;
                 }
                 other => {
-                    eprintln!("huck: compopt: -{other}: invalid option");
+                    e!(err, "huck: compopt: -{other}: invalid option");
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -528,7 +550,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
     let names: Vec<String> = args[i..].to_vec();
 
     if is_default || is_empty {
-        eprintln!("huck: compopt: -D/-E not yet supported");
+        e!(err, "huck: compopt: -D/-E not yet supported");
         return ExecOutcome::Continue(2);
     }
 
@@ -538,7 +560,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
         // it out, mutate, and put it back so dispatch's later .take()
         // observes the change.
         let Some(mut live) = shell.current_completion_spec.take() else {
-            eprintln!("huck: compopt: not currently executing completion function");
+            e!(err, "huck: compopt: not currently executing completion function");
             return ExecOutcome::Continue(1);
         };
         apply_compopt_options(&mut live.options, &option_set);
@@ -552,7 +574,7 @@ pub fn builtin_compopt(args: &[String], _out: &mut dyn Write, shell: &mut Shell)
         match Rc::make_mut(&mut shell.completion_specs).by_command.get_mut(n) {
             Some(spec) => apply_compopt_options(&mut spec.options, &option_set),
             None => {
-                eprintln!("huck: compopt: {n}: no completion specification");
+                e!(err, "huck: compopt: {n}: no completion specification");
                 status = 1;
             }
         }
@@ -585,7 +607,8 @@ mod tests {
     fn run_complete(args: &[&str], shell: &mut Shell) -> (String, i32) {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut out = Vec::<u8>::new();
-        let outcome = builtin_complete(&argv, &mut out, shell);
+        let mut err = Vec::<u8>::new();
+        let outcome = builtin_complete(&argv, &mut out, &mut err, shell);
         let s = String::from_utf8(out).unwrap();
         let code = match outcome {
             ExecOutcome::Continue(n) => n,
@@ -597,7 +620,8 @@ mod tests {
     fn run_compgen(args: &[&str], shell: &mut Shell) -> (String, i32) {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut out = Vec::<u8>::new();
-        let outcome = builtin_compgen(&argv, &mut out, shell);
+        let mut err = Vec::<u8>::new();
+        let outcome = builtin_compgen(&argv, &mut out, &mut err, shell);
         let s = String::from_utf8(out).unwrap();
         let code = match outcome {
             ExecOutcome::Continue(n) => n,
@@ -609,7 +633,8 @@ mod tests {
     fn run_compopt(args: &[&str], shell: &mut Shell) -> (String, i32) {
         let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut out = Vec::<u8>::new();
-        let outcome = builtin_compopt(&argv, &mut out, shell);
+        let mut err = Vec::<u8>::new();
+        let outcome = builtin_compopt(&argv, &mut out, &mut err, shell);
         let s = String::from_utf8(out).unwrap();
         let code = match outcome {
             ExecOutcome::Continue(n) => n,

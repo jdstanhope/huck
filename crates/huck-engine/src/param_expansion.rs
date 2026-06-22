@@ -1,5 +1,6 @@
 //! Parameter-expansion modifier evaluation (`${var:-w}`, `${#var}`, etc.).
 
+use crate::err_thread_local::with_err;
 use crate::lexer::{CaseDirection, ParamModifier, SubstAnchor, Word};
 use crate::shell_state::Shell;
 
@@ -146,7 +147,7 @@ pub fn expand_modifier_with_value(
                 if matches!(source, ParamLookup::Scalar)
                     && shell.try_set(name, v.clone()).is_err()
                 {
-                    eprintln!("huck: {name}: readonly variable");
+                    with_err(|err| e!(err, "huck: {name}: readonly variable"));
                     return ExpansionResult::Fatal { status: 1 };
                 }
                 ExpansionResult::Value(v)
@@ -164,9 +165,9 @@ pub fn expand_modifier_with_value(
                     } else {
                         "parameter not set"
                     };
-                    eprintln!("huck: {}: {}", name, default);
+                    with_err(|err| e!(err, "huck: {}: {}", name, default));
                 } else {
-                    eprintln!("huck: {}: {}", name, msg);
+                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
                 }
                 ExpansionResult::Fatal { status: 1 }
             } else {
@@ -223,7 +224,7 @@ pub fn expand_modifier_with_value(
             match substring(&value, off_n, len_n) {
                 Ok(s) => ExpansionResult::Value(s),
                 Err(msg) => {
-                    eprintln!("huck: {}: {}", name, msg);
+                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
                     ExpansionResult::Fatal { status: 1 }
                 }
             }
@@ -354,7 +355,7 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     let expr = match crate::arith::parse(&s) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("huck: arithmetic: {}", e);
+            with_err(|err| e!(err, "huck: arithmetic: {}", e));
             shell.set_last_status(1);
             return Err(());
         }
@@ -362,7 +363,7 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     match crate::arith::eval(&expr, shell) {
         Ok(n) => Ok(n),
         Err(e) => {
-            eprintln!("huck: arithmetic: {}", e);
+            with_err(|err| e!(err, "huck: arithmetic: {}", e));
             shell.set_last_status(1);
             Err(())
         }

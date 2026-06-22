@@ -15,6 +15,7 @@ pub mod completion_builtins;
 pub mod completion_spec;
 pub mod continuation;
 pub mod engine;
+pub mod err_thread_local;
 pub mod executor;
 pub mod expand;
 pub mod glob_match;

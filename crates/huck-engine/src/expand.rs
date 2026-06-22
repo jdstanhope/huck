@@ -1,4 +1,5 @@
 use crate::command::Sequence;
+use crate::err_thread_local::with_err;
 use crate::executor;
 use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
@@ -225,7 +226,7 @@ fn expand_positional_substring(
     let off_n = match crate::arith::parse(&off_s).and_then(|e| crate::arith::eval(&e, shell)) {
         Ok(n) => n,
         Err(_) => {
-            eprintln!("huck: {name}: bad slice offset");
+            with_err(|err| e!(err, "huck: {name}: bad slice offset"));
             return ExpansionResult::Fatal { status: 1 };
         }
     };
@@ -252,7 +253,7 @@ fn expand_positional_substring(
             let len_n = match crate::arith::parse(&len_s).and_then(|e| crate::arith::eval(&e, shell)) {
                 Ok(n) => n,
                 Err(_) => {
-                    eprintln!("huck: {name}: bad slice length");
+                    with_err(|err| e!(err, "huck: {name}: bad slice length"));
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -315,7 +316,7 @@ fn expand_assoc_param(
             let key = eval_subscript_key(w, shell);
             let val = shell.lookup_associative_element(name, &key);
             if val.is_none() && shell.shell_options.nounset {
-                eprintln!("huck: {name}[{key}]: unbound variable");
+                with_err(|err| e!(err, "huck: {name}[{key}]: unbound variable"));
                 shell.pending_fatal_pe_error = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
@@ -356,7 +357,7 @@ fn expand_assoc_param(
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("huck: {name}: {e}");
+                    with_err(|err| e!(err, "huck: {name}: {e}"));
                     shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -437,10 +438,10 @@ fn expand_assoc_param(
         // Other scalar modifiers on @/* — explicit error for v72 scope
         // (per-element modifiers across the whole array are deferred).
         (other, SK::All | SK::Star) => {
-            eprintln!(
+            with_err(|err| e!(err,
                 "huck: ${{{name}[…]}}: modifier {:?} not supported on associative array in v72",
                 other
-            );
+            ));
             ExpansionResult::Value(String::new())
         }
     }
@@ -503,7 +504,7 @@ fn expand_indirect(
             // bash prints "<name>: invalid variable name" (here the effective
             // name is the empty string).
             if shell.is_set(name) {
-                eprintln!("huck: : invalid variable name");
+                with_err(|err| e!(err, "huck: : invalid variable name"));
                 return ExpansionResult::Fatal { status: 1 };
             }
             // Source UNSET and a POSITIONAL parameter ($1.. beyond $#): bash
@@ -516,7 +517,7 @@ fn expand_indirect(
                 // bash reports the indirect spec under the `!N` name for the
                 // positional path's diagnostics.
                 if shell.shell_options.nounset && matches!(modifier, PM::None) {
-                    eprintln!("huck: !{name}: unbound variable");
+                    with_err(|err| e!(err, "huck: !{name}: unbound variable"));
                     return ExpansionResult::Fatal { status: 1 };
                 }
                 match modifier {
@@ -525,7 +526,7 @@ fn expand_indirect(
                     // forward with an empty effective name (would write
                     // `vars[""]`).
                     PM::AssignDefault { .. } => {
-                        eprintln!("huck: !{name}: invalid indirect expansion");
+                        with_err(|err| e!(err, "huck: !{name}: invalid indirect expansion"));
                         return ExpansionResult::Fatal { status: 1 };
                     }
                     // `:?`/`?`: the parameter is reported unset under `!N` —
@@ -550,7 +551,7 @@ fn expand_indirect(
         }
         // Source UNSET and a named variable (or a subscripted source): fatal
         // "invalid indirect expansion".
-        eprintln!("huck: {name}: invalid indirect expansion");
+        with_err(|err| e!(err, "huck: {name}: invalid indirect expansion"));
         return ExpansionResult::Fatal { status: 1 };
     }
     // Step 2: parse N into (effective_name, effective_subscript) and
@@ -571,7 +572,7 @@ fn expand_indirect(
         && shell.shell_options.nounset
         && shell.lookup_var(n).is_none()
     {
-        eprintln!("huck: {n}: unbound variable");
+        with_err(|err| e!(err, "huck: {n}: unbound variable"));
         return ExpansionResult::Fatal { status: 1 };
     }
     crate::param_expansion::expand_modifier_quoted(n, modifier, quoted, shell)
@@ -676,14 +677,14 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("huck: {e}");
+                    with_err(|err| e!(err, "huck: {e}"));
                     shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
             let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
-                eprintln!("huck: {name}[{idx}]: unbound variable");
+                with_err(|err| e!(err, "huck: {name}[{idx}]: unbound variable"));
                 shell.pending_fatal_pe_error = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
@@ -698,7 +699,7 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    eprintln!("huck: {e}");
+                    with_err(|err| e!(err, "huck: {e}"));
                     shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -729,7 +730,7 @@ fn expand_array_param(
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("huck: {name}: {e}");
+                    with_err(|err| e!(err, "huck: {name}: {e}"));
                     shell.pending_fatal_pe_error = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -816,10 +817,10 @@ fn expand_array_param(
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
         (other, SK::All | SK::Star) => {
-            eprintln!(
+            with_err(|err| e!(err,
                 "huck: ${{{name}[…]}}: modifier {:?} not supported on array in v71",
                 other
-            );
+            ));
             ExpansionResult::Value(String::new())
         }
     }
@@ -864,7 +865,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     Some(value) => current.push_str(&value, true),
                     None => {
                         if shell.shell_options.nounset {
-                            eprintln!("huck: {name}: unbound variable");
+                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
                             shell.pending_fatal_pe_error = Some(1);
                             return result;
                         }
@@ -883,7 +884,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     Some(v) => v,
                     None => {
                         if shell.shell_options.nounset {
-                            eprintln!("huck: {name}: unbound variable");
+                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
                             shell.pending_fatal_pe_error = Some(1);
                             return result;
                         }
@@ -954,7 +955,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         has_emitted = true;
                     }
                     Err(e) => {
-                        eprintln!("huck: arithmetic: {}", e);
+                        with_err(|err| e!(err, "huck: arithmetic: {}", e));
                         shell.pending_fatal_pe_error = Some(1);
                         return result;
                     }
@@ -1065,7 +1066,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         has_emitted = true;
                     }
                     Err(e) => {
-                        eprintln!("huck: process substitution: {e}");
+                        with_err(|err| e!(err, "huck: process substitution: {e}"));
                         // Emit nothing; the field stays empty if no other parts.
                     }
                 }
@@ -1369,7 +1370,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     Some(value) => result.push_str(&value),
                     None => {
                         if shell.shell_options.nounset {
-                            eprintln!("huck: {name}: unbound variable");
+                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
                             shell.pending_fatal_pe_error = Some(1);
                             return result;
                         }
@@ -1386,7 +1387,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match eval_arith_word(body, shell) {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
-                        eprintln!("huck: arithmetic: {}", e);
+                        with_err(|err| e!(err, "huck: arithmetic: {}", e));
                         shell.pending_fatal_pe_error = Some(1);
                         return result;
                     }
@@ -1837,7 +1838,7 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
                         let Ok(path) = entry else { continue };
                         match path.into_os_string().into_string() {
                             Ok(s) => m.push(s),
-                            Err(_) => eprintln!("huck: skipping non-UTF8 path"),
+                            Err(_) => with_err(|err| e!(err, "huck: skipping non-UTF8 path")),
                         }
                     }
                     // Defensive: filter `.` and `..` if the glob crate ever emits

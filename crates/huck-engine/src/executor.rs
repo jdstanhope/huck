@@ -108,6 +108,27 @@ pub fn execute_with_sink(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // Install the sinks as the thread-local err sinks so deep call chains
+    // (`expand`, `param_expansion`, `Shell` methods, `jobs`) route their
+    // diagnostics through `with_err` to the active sink. The Guard inside
+    // `install_err_sinks` clears the pointer on scope exit (including panic).
+    // SAFETY contract: see `err_thread_local` module docs. We use the unsafe
+    // raw-pointer-install variant so the executor body can keep using its own
+    // `&mut sink`/`&mut err_sink` directly (the thread-local is consulted only
+    // by `with_err` in tight, leaf scopes).
+    let guard = unsafe { crate::err_thread_local::install_err_sinks_raw(sink, err_sink) };
+    let r = execute_with_sink_inner(seq, shell, source, sink, err_sink);
+    drop(guard);
+    r
+}
+
+fn execute_with_sink_inner(
+    seq: &Sequence,
+    shell: &mut Shell,
+    source: &str,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
     // job-display label for the common `cmd &` / `a && b &` / `a | b &` forms.

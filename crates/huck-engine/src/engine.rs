@@ -137,7 +137,7 @@ impl Engine {
         // stderr always inherits the process here; the public `Engine::exec`
         // builder will let callers opt into Capture/Merged later.
         let mut err_sink = StderrSink::Terminal;
-        let code = crate::shell::run_program_in_sink(
+        let code = crate::shell::run_program_in_sinks(
             src,
             None,
             args,

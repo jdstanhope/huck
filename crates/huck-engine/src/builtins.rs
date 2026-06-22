@@ -106,9 +106,9 @@ pub fn run_builtin(
         "eval" => builtin_eval(args, shell),
         "let" => builtin_let(args, err, shell),
         "help" => builtin_help(args, out, err, shell),
-        "complete" => crate::completion_builtins::builtin_complete(args, out, shell),
-        "compgen" => crate::completion_builtins::builtin_compgen(args, out, shell),
-        "compopt" => crate::completion_builtins::builtin_compopt(args, out, shell),
+        "complete" => crate::completion_builtins::builtin_complete(args, out, err, shell),
+        "compgen" => crate::completion_builtins::builtin_compgen(args, out, err, shell),
+        "compopt" => crate::completion_builtins::builtin_compopt(args, out, err, shell),
         "alias" => builtin_alias(args, out, err, shell),
         "unalias" => builtin_unalias(args, err, shell),
         ":" => builtin_colon(args, shell),
@@ -5342,7 +5342,7 @@ pub(crate) fn eval_in_sink(
     // `+ eval '…'` line was already emitted at the outer depth before dispatch.
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
-    let r = crate::shell::process_line_in_sink(&joined, shell, true, sink, err_sink);
+    let r = crate::shell::process_line_in_sinks(&joined, shell, true, sink, err_sink);
     shell.xtrace_depth = saved;
     r
 }
@@ -5997,7 +5997,7 @@ pub(crate) fn source_in_sink(
         kind: crate::shell_state::FrameKind::Source,
     });
     shell.sync_call_arrays();
-    let result = run_sourced_contents_in_sink(&contents, &path, shell, sink, err_sink);
+    let result = run_sourced_contents_in_sinks(&contents, &path, shell, sink, err_sink);
     shell.call_stack.pop();
     shell.sync_call_arrays();
     shell.source_depth -= 1;
@@ -6055,7 +6055,7 @@ fn is_unterminated(e: &crate::command::ParseError) -> bool {
     )
 }
 
-pub(crate) fn run_sourced_contents_in_sink(
+pub(crate) fn run_sourced_contents_in_sinks(
     contents: &str,
     path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
@@ -6287,7 +6287,7 @@ pub(crate) fn run_sourced_contents_in_sink(
     ExecOutcome::Continue(last_status)
 }
 
-/// Terminal-sink wrapper around [`run_sourced_contents_in_sink`] — used by
+/// Terminal-sink wrapper around [`run_sourced_contents_in_sinks`] — used by
 /// script/`-c` mode (top-level sourcing, stdout → terminal).
 pub(crate) fn run_sourced_contents(
     contents: &str,
@@ -6295,10 +6295,10 @@ pub(crate) fn run_sourced_contents(
     err: &mut dyn Write,
     shell: &mut crate::shell_state::Shell,
 ) -> ExecOutcome {
-    let _ = err; // err is unused: in-sink fn materializes writer from sinks.
+    let _ = err; // err is unused: in-sinks fn materializes writer from sinks.
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
-    run_sourced_contents_in_sink(contents, path, shell, &mut sink, &mut err_sink)
+    run_sourced_contents_in_sinks(contents, path, shell, &mut sink, &mut err_sink)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
