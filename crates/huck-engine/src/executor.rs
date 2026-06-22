@@ -25,6 +25,15 @@ pub enum StdoutSink<'a> {
     Capture(&'a mut Vec<u8>),
 }
 
+/// Where the active "errored" output stream goes. Symmetric to `StdoutSink`,
+/// except for the extra `Merged` variant which routes stderr writes through
+/// the active stdout writer (the `2>&1` analog).
+pub enum StderrSink<'a> {
+    Terminal,
+    Merged,
+    Capture(&'a mut Vec<u8>),
+}
+
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
 /// partial line is held back) before handing fd 1 to another process. A fork
 /// child would otherwise inherit — and possibly duplicate — the pending bytes,

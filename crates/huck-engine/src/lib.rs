@@ -4,6 +4,9 @@
 //! with NO terminal/line-editor dependency. MUST NOT depend on `rustyline` —
 //! the REPL + line-editor adapters live in `huck-cli`.
 
+#[macro_use]
+mod macros;
+
 pub mod alias_expand;
 pub mod arith;
 pub mod builtins;
