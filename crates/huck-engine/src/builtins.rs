@@ -3645,7 +3645,7 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
     Ok(WaitArgs { wait_any, pid_var, targets })
 }
 
-fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_wait(args: &[String], _out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let parsed = match parse_wait_args(args, err, shell) {
         Ok(p) => p,
         Err(outcome) => return outcome,
