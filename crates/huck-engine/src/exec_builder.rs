@@ -17,6 +17,70 @@ use crate::shell_state::Shell;
 
 type LineCallback<'a> = Box<dyn FnMut(&str) + 'a>;
 
+/// Streaming callbacks owned by the builder for the call's duration.
+/// `'cb` is the builder's lifetime — closures may borrow caller state for
+/// that duration.
+pub(crate) struct Callbacks<'cb> {
+    pub stdout: Option<LineCallback<'cb>>,
+    pub stderr: Option<LineCallback<'cb>>,
+    pub line_buf_out: crate::line_buf::LineBuf,
+    pub line_buf_err: crate::line_buf::LineBuf,
+}
+
+impl<'cb> Callbacks<'cb> {
+    pub fn new(
+        stdout: Option<LineCallback<'cb>>,
+        stderr: Option<LineCallback<'cb>>,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            line_buf_out: crate::line_buf::LineBuf::new(),
+            line_buf_err: crate::line_buf::LineBuf::new(),
+        }
+    }
+
+    pub fn any_set(&self) -> bool {
+        self.stdout.is_some() || self.stderr.is_some()
+    }
+
+    /// Push raw stdout bytes; dispatch any complete lines via the stdout callback.
+    pub fn push_stdout(&mut self, bytes: &[u8]) {
+        if self.stdout.is_none() {
+            return;
+        }
+        self.line_buf_out.push(bytes);
+        while let Some(line) = self.line_buf_out.next_line() {
+            if let Some(cb) = &mut self.stdout {
+                cb(&line);
+            }
+        }
+    }
+
+    /// Push raw stderr bytes; dispatch any complete lines via the stderr callback.
+    pub fn push_stderr(&mut self, bytes: &[u8]) {
+        if self.stderr.is_none() {
+            return;
+        }
+        self.line_buf_err.push(bytes);
+        while let Some(line) = self.line_buf_err.next_line() {
+            if let Some(cb) = &mut self.stderr {
+                cb(&line);
+            }
+        }
+    }
+
+    /// Flush partial-at-EOF lines for both streams.
+    pub fn flush_partials(&mut self) {
+        if let (Some(line), Some(cb)) = (self.line_buf_out.drain_final(), self.stdout.as_mut()) {
+            cb(&line);
+        }
+        if let (Some(line), Some(cb)) = (self.line_buf_err.drain_final(), self.stderr.as_mut()) {
+            cb(&line);
+        }
+    }
+}
+
 pub struct ExecBuilder<'a> {
     engine: &'a mut Engine,
     src: String,
@@ -25,9 +89,7 @@ pub struct ExecBuilder<'a> {
     cwd: Option<PathBuf>,
     restricted: bool,
     timeout: Option<Duration>,
-    #[allow(dead_code)]
     on_stdout_line: Option<LineCallback<'a>>,
-    #[allow(dead_code)]
     on_stderr_line: Option<LineCallback<'a>>,
 }
 
@@ -153,41 +215,66 @@ impl<'a> ExecBuilder<'a> {
             cwd,
             restricted,
             timeout,
-            on_stdout_line: _,
-            on_stderr_line: _,
+            on_stdout_line,
+            on_stderr_line,
         } = self;
         let cell = engine.shell_cell().clone();
 
-        // 1. Spawn timer (if requested). Defend against a prior call leaving
-        // the timeout_flag set.
-        let timer = timeout.map(|dur| {
-            let flag = cell.borrow().timeout_flag.clone();
-            let pids = cell.borrow().live_external_children.clone();
-            flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            crate::timeout::spawn_timer(dur, flag, pids)
-        });
+        // Build callbacks; install thread-local pointer for the duration of
+        // the run if any callback was set. (See `callbacks_thread_local`.)
+        let mut callbacks = Callbacks::new(on_stdout_line, on_stderr_line);
+        let any_callbacks = callbacks.any_set();
 
-        // 2. Compose stdin -> cwd -> restricted+run via nested matches.
-        let code = match stdin {
-            Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, || {
-                run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err)
-            }),
-            None => run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err),
+        let code = {
+            // SAFETY: `callbacks` lives until the end of run_with_sinks; the
+            // guard's Drop runs before this scope exits, clearing the pointer.
+            let _cb_guard = if any_callbacks {
+                Some(unsafe { crate::callbacks_thread_local::install(&mut callbacks) })
+            } else {
+                None
+            };
+
+            // 1. Spawn timer (if requested). Defend against a prior call leaving
+            // the timeout_flag set.
+            let timer = timeout.map(|dur| {
+                let flag = cell.borrow().timeout_flag.clone();
+                let pids = cell.borrow().live_external_children.clone();
+                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                crate::timeout::spawn_timer(dur, flag, pids)
+            });
+
+            // 2. Compose stdin -> cwd -> restricted+run via nested matches.
+            let code = match stdin {
+                Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, || {
+                    run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err)
+                }),
+                None => run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err),
+            };
+
+            // 3. Cancel timer (joins the thread).
+            if let Some(t) = timer {
+                t.cancel();
+            }
+
+            // 4. If the timeout flag is set, override the natural exit code to 124.
+            if cell
+                .borrow()
+                .timeout_flag
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                124
+            } else {
+                code
+            }
         };
 
-        // 3. Cancel timer (joins the thread).
-        if let Some(t) = timer {
-            t.cancel();
+        // After the run (and after the guard's Drop has cleared the
+        // thread-local), flush any partial-at-EOF lines through the
+        // user-supplied callbacks.
+        if any_callbacks {
+            callbacks.flush_partials();
         }
 
-        // 4. If the timeout flag is set, override the natural exit code to 124.
-        if cell
-            .borrow()
-            .timeout_flag
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return 124;
-        }
         code
     }
 }

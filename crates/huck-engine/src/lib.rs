@@ -10,6 +10,7 @@ mod macros;
 pub mod alias_expand;
 pub mod arith;
 pub mod builtins;
+pub(crate) mod callbacks_thread_local;
 pub mod completion;
 pub mod completion_builtins;
 pub mod completion_spec;

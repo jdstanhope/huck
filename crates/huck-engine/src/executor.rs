@@ -69,16 +69,56 @@ fn check_restricted_redirect(
     Ok(())
 }
 
+/// Stream identifier for `LineDispatchWriter`.
+#[derive(Clone, Copy)]
+pub(crate) enum LineStream {
+    Stdout,
+    Stderr,
+}
+
+/// Writer that wraps an inner `Vec<u8>` AND notifies the active callbacks
+/// thread-local of any bytes written, so streaming line callbacks fire as
+/// builtins write to their capture buffer.
+pub(crate) struct LineDispatchWriter<'a> {
+    pub inner: &'a mut Vec<u8>,
+    pub stream: LineStream,
+}
+
+impl std::io::Write for LineDispatchWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.extend_from_slice(bytes);
+        let stream = self.stream;
+        crate::callbacks_thread_local::with_callbacks(|cb| {
+            if let Some(cb) = cb {
+                match stream {
+                    LineStream::Stdout => cb.push_stdout(bytes),
+                    LineStream::Stderr => cb.push_stderr(bytes),
+                }
+            }
+        });
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn err_writer<'a>(
     err_sink: &'a mut StderrSink<'_>,
     out_sink: &'a mut StdoutSink<'_>,
 ) -> Box<dyn std::io::Write + 'a> {
     match err_sink {
         StderrSink::Terminal => Box::new(std::io::stderr()),
-        StderrSink::Capture(buf) => Box::new(&mut **buf),
+        StderrSink::Capture(buf) => Box::new(LineDispatchWriter {
+            inner: buf,
+            stream: LineStream::Stderr,
+        }),
         StderrSink::Merged => match out_sink {
             StdoutSink::Terminal => Box::new(std::io::stdout()),
-            StdoutSink::Capture(buf) => Box::new(&mut **buf),
+            StdoutSink::Capture(buf) => Box::new(LineDispatchWriter {
+                inner: buf,
+                stream: LineStream::Stdout,
+            }),
         },
     }
 }
@@ -1449,7 +1489,13 @@ fn run_builtin_with_redirects(
                 // go to it. (Borrow ebuf only once; route both writers via a
                 // side buf for the err side to avoid aliasing.)
                 let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*ebuf, &mut side_err, shell);
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: ebuf,
+                        stream: LineStream::Stderr,
+                    };
+                    run(&mut out_w, &mut side_err, shell)
+                };
                 ebuf.extend_from_slice(&side_err);
                 outcome
             }
@@ -1458,7 +1504,13 @@ fn run_builtin_with_redirects(
                 // the capture buf). So out writes (via `>&2` → merged → buf) AND
                 // err writes both go to obuf.
                 let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*obuf, &mut side_err, shell);
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: obuf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err, shell)
+                };
                 obuf.extend_from_slice(&side_err);
                 outcome
             }
@@ -1481,7 +1533,13 @@ fn run_builtin_with_redirects(
                 // `2>&1` swap). Aliasing: borrow obuf once for out; use a side
                 // buf for err and append.
                 let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*obuf, &mut side_err, shell);
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: obuf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err, shell)
+                };
                 obuf.extend_from_slice(&side_err);
                 outcome
             }
@@ -1499,11 +1557,22 @@ fn run_builtin_with_redirects(
             StdoutSink::Capture(buf) => match err_sink {
                 StderrSink::Terminal => {
                     let mut err = io::stderr();
-                    run(*buf, &mut err, shell)
+                    let mut out_w = LineDispatchWriter {
+                        inner: buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut err, shell)
                 }
                 StderrSink::Capture(ebuf) => {
-                    let mut err: &mut Vec<u8> = ebuf;
-                    run(*buf, &mut err, shell)
+                    let mut out_w = LineDispatchWriter {
+                        inner: buf,
+                        stream: LineStream::Stdout,
+                    };
+                    let mut err_w = LineDispatchWriter {
+                        inner: ebuf,
+                        stream: LineStream::Stderr,
+                    };
+                    run(&mut out_w, &mut err_w, shell)
                 }
                 StderrSink::Merged => {
                     // Both stdout and stderr converge on the same capture buf.
@@ -1514,7 +1583,13 @@ fn run_builtin_with_redirects(
                     // in series in practice); not byte-strict-interleaved but
                     // matches a single-writer line discipline well enough.
                     let mut side: Vec<u8> = Vec::new();
-                    let outcome = run(*buf, &mut side, shell);
+                    let outcome = {
+                        let mut out_w = LineDispatchWriter {
+                            inner: buf,
+                            stream: LineStream::Stdout,
+                        };
+                        run(&mut out_w, &mut side, shell)
+                    };
                     buf.extend_from_slice(&side);
                     outcome
                 }

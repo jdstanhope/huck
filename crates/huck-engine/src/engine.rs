@@ -749,4 +749,72 @@ mod tests {
             .run();
         assert_eq!(code, 124);
     }
+
+    #[test]
+    fn on_stdout_line_fires_per_line() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo a; echo b; echo c")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn on_stdout_line_empty_line() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo \"\"")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn on_stdout_line_partial_at_eof() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("printf 'no-newline'")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["no-newline"]);
+    }
+
+    #[test]
+    fn on_stderr_line_fires_per_line() {
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo hi; echo err >&2")
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out_lines, vec!["hi"]);
+        assert_eq!(err_lines, vec!["err"]);
+    }
+
+    #[test]
+    fn on_stdout_line_captures_too() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo a; echo b")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        // Tee: BOTH the buffer AND the callback have the lines.
+        assert_eq!(out.stdout, "a\nb\n");
+        assert_eq!(lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn on_stdout_line_no_callback_capture_unchanged() {
+        let mut e = Engine::new();
+        let out = e.capture("echo unchanged");
+        // Sanity: no-callback capture is exactly v205/v206 behavior.
+        assert_eq!(out.stdout, "unchanged\n");
+        assert_eq!(out.stderr, "");
+        assert_eq!(out.exit_code, 0);
+    }
 }
