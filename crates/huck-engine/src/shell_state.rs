@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::completion_spec::{CompletionSpec, CompletionSpecs};
+use crate::err_thread_local::with_err;
 use crate::jobs::JobTable;
 
 /// What kind of call-stack frame this is.
@@ -1401,7 +1402,7 @@ impl Shell {
                     v.value = VarValue::Indexed(m);
                 }
                 VarValue::Associative(_) => {
-                    eprintln!("huck: {name}: set_indexed_element on associative variable");
+                    with_err(|err| e!(err, "huck: {name}: set_indexed_element on associative variable"));
                     return Err(AssignErr::TypeMismatch);
                 }
             },
@@ -1454,7 +1455,7 @@ impl Shell {
             for (idx, val) in entries { m.insert(idx, val); }
             Ok(())
         } else {
-            eprintln!("huck: {name}: cannot append array literal to associative array");
+            with_err(|err| e!(err, "huck: {name}: cannot append array literal to associative array"));
             Err(AssignErr::TypeMismatch)
         }
     }
@@ -1472,12 +1473,12 @@ impl Shell {
                     }
                 }
                 _ => {
-                    eprintln!("huck: {name}: set_associative_element on non-associative variable");
+                    with_err(|err| e!(err, "huck: {name}: set_associative_element on non-associative variable"));
                     return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
-                eprintln!("huck: {name}: set_associative_element on unset variable");
+                with_err(|err| e!(err, "huck: {name}: set_associative_element on unset variable"));
                 return Err(AssignErr::TypeMismatch);
             }
         }
@@ -1528,7 +1529,7 @@ impl Shell {
         // The single readonly check, before any store (no partial array
         // writes); the storage primitives do not re-check.
         if self.is_readonly(&name) {
-            eprintln!("huck: {name}: readonly variable");
+            with_err(|err| e!(err, "huck: {name}: readonly variable"));
             return Err(AssignErr::Readonly);
         }
 
@@ -1778,7 +1779,7 @@ impl Shell {
         let mut visited = std::collections::HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
-                eprintln!("huck: warning: {current}: circular name reference");
+                with_err(|err| e!(err, "huck: warning: {current}: circular name reference"));
                 return ResolvedName::Cycle;
             }
             match self.vars.get(&current) {
@@ -2168,7 +2169,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            eprintln!("huck: {name}: readonly variable");
+            with_err(|err| e!(err, "huck: {name}: readonly variable"));
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2249,7 +2250,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            eprintln!("huck: {name}: readonly variable");
+            with_err(|err| e!(err, "huck: {name}: readonly variable"));
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2420,7 +2421,7 @@ fn install_scalar_value(existing: &mut Variable, value: String) {
             existing.value = VarValue::Scalar(value);
         }
         VarValue::Associative(_) => {
-            eprintln!("huck: internal: install_scalar_value on associative array");
+            with_err(|err| e!(err, "huck: internal: install_scalar_value on associative array"));
         }
     }
 }

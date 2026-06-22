@@ -4,6 +4,9 @@
 //! with NO terminal/line-editor dependency. MUST NOT depend on `rustyline` —
 //! the REPL + line-editor adapters live in `huck-cli`.
 
+#[macro_use]
+mod macros;
+
 pub mod alias_expand;
 pub mod arith;
 pub mod builtins;
@@ -12,6 +15,8 @@ pub mod completion_builtins;
 pub mod completion_spec;
 pub mod continuation;
 pub mod engine;
+pub mod err_thread_local;
+pub mod exec_builder;
 pub mod executor;
 pub mod expand;
 pub mod glob_match;
@@ -24,6 +29,7 @@ pub mod prompt;
 pub mod readline_bind;
 pub mod shell;
 pub mod shell_state;
+pub(crate) mod stdin_pipe;
 pub mod test_builtin;
 pub mod traps;
 
@@ -31,6 +37,8 @@ pub mod traps;
 pub mod test_support;
 
 pub use engine::{Engine, EngineBuilder, Output};
+pub use exec_builder::ExecBuilder;
+pub use executor::{StderrSink, StdoutSink};
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
 pub use huck_syntax::{brace_expand, command, generate, lexer};

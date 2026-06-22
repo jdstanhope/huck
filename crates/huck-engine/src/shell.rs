@@ -159,7 +159,8 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
             return Some(1);
         }
     };
-    match crate::builtins::run_sourced_contents(&contents, &path, shell) {
+    let mut err = std::io::stderr();
+    match crate::builtins::run_sourced_contents(&contents, &path, &mut err, shell) {
         crate::builtins::ExecOutcome::Exit(code) => Some(code),
         crate::builtins::ExecOutcome::Continue(status) => {
             shell.set_last_status(status);
@@ -173,7 +174,7 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
 /// contents) and returns the process exit code, sending stdout to `sink`. Sets
 /// $0 and the positional parameters, marks the shell non-interactive (so the rc
 /// file is skipped), runs the program through the shared
-/// `run_sourced_contents_in_sink` engine, fires the EXIT trap, and hangs up
+/// `run_sourced_contents_in_sinks` engine, fires the EXIT trap, and hangs up
 /// jobs. Does NOT touch interactive history or the line editor.
 ///
 /// `run_program` is the `Terminal`-sink wrapper; the engine's `capture` passes a
@@ -184,13 +185,15 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
 /// frame is pushed before executing and popped after, so that BASH_SOURCE and
 /// BASH_LINENO are populated at the top level and FUNCNAME gains the `main`
 /// entry inside functions. For `-c` and other non-file modes pass `false`.
-pub fn run_program_in_sink(
+#[allow(clippy::too_many_arguments)]
+pub fn run_program_in_sinks(
     contents: &str,
     argv0: Option<String>,
     args: Vec<String>,
     label: &str,
     push_main_frame: bool,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
@@ -210,11 +213,12 @@ pub fn run_program_in_sink(
         shell.sync_call_arrays();
     }
 
-    let outcome = crate::builtins::run_sourced_contents_in_sink(
+    let outcome = crate::builtins::run_sourced_contents_in_sinks(
         contents,
         std::path::Path::new(label),
         &mut shell,
         sink,
+        err_sink,
     );
 
     if push_main_frame {
@@ -246,7 +250,33 @@ pub fn run_program(
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    run_program_in_sink(contents, argv0, args, label, push_main_frame, &mut sink, shell_cell)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    run_program_in_sinks(contents, argv0, args, label, push_main_frame, &mut sink, &mut err_sink, shell_cell)
+}
+
+/// Backward-compat wrapper kept for v204 callers that pre-date the `_in_sinks`
+/// rename. Forwards to [`run_program_in_sinks`] with `StderrSink::Terminal`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_program_in_sink(
+    contents: &str,
+    argv0: Option<String>,
+    args: Vec<String>,
+    label: &str,
+    push_main_frame: bool,
+    sink: &mut crate::executor::StdoutSink,
+    shell_cell: &Rc<RefCell<Shell>>,
+) -> i32 {
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    run_program_in_sinks(
+        contents,
+        argv0,
+        args,
+        label,
+        push_main_frame,
+        sink,
+        &mut err_sink,
+        shell_cell,
+    )
 }
 
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
@@ -331,17 +361,18 @@ pub fn fire_prompt_command(shell: &mut Shell) -> Option<i32> {
 }
 
 /// Tokenizes, parses, and executes a single input line.
-pub fn process_line_in_sink(
+pub fn process_line_in_sinks(
     line: &str,
     shell: &mut Shell,
     expand_aliases: bool,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) };
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
-            eprintln!("huck: syntax error{}", crate::lex_error_message(e));
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
             return ExecOutcome::Continue(2);
         }
     };
@@ -357,7 +388,7 @@ pub fn process_line_in_sink(
                 (t, l)
             }
             Err(e) => {
-                eprintln!("huck: syntax error{}", crate::lex_error_message(e));
+                { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
                 return ExecOutcome::Continue(2);
             }
         }
@@ -366,20 +397,33 @@ pub fn process_line_in_sink(
     };
 
     match command::parse_with_lines(tokens, lines) {
-        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink),
+        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
-            eprintln!("huck: syntax error: {}", crate::parse_error_message(e));
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error: {}", crate::parse_error_message(e)); }
             ExecOutcome::Continue(2)
         }
     }
 }
 
-/// Terminal-sink wrapper around [`process_line_in_sink`] — the entry point for
+/// Terminal-sink wrapper around [`process_line_in_sinks`] — the entry point for
 /// callers (REPL, traps, helpers) that run at top level (stdout → terminal).
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    process_line_in_sink(line, shell, expand_aliases, &mut sink)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    process_line_in_sinks(line, shell, expand_aliases, &mut sink, &mut err_sink)
+}
+
+/// Backward-compat wrapper kept for v204 callers that pre-date the `_in_sinks`
+/// rename. Forwards to [`process_line_in_sinks`] with `StderrSink::Terminal`.
+pub fn process_line_in_sink(
+    line: &str,
+    shell: &mut Shell,
+    expand_aliases: bool,
+    sink: &mut crate::executor::StdoutSink,
+) -> ExecOutcome {
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    process_line_in_sinks(line, shell, expand_aliases, sink, &mut err_sink)
 }
 
 #[cfg(test)]

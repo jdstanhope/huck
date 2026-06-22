@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 13 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 39 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -328,15 +328,6 @@ than silently producing invalid UTF-8.
 - **bash**: (a) `set -v` echoes exactly the physical lines as read; (b) bash's own error-recovery boundaries.
 - **Why intentional**: both are negligible and only affect the already-divergent-from-bash verbose / error edges; unit boundaries are intentionally `&&`/`||`/`;`-on-a-line / top-level-newline so the one-command-at-a-time linear reader (M-99) stays O(n). Normal execution output is identical.
 - **Workaround**: none needed; put `set -v` / `set +v` on its own line (no trailing `;`/`&`) for an exact bash-matching echo boundary.
-
-### L-25: a builtin's `2>&1` inside a capture context can't capture stderr
-
-- **Status**: `[intentional]`, low (noted v109)
-- **Severity**: low
-- **huck**: a builtin's `2>&1` inside a CAPTURE context (`r=$(declare -p X 2>&1)`) does not capture the builtin's stderr. The M-90 redirect guard dup2's the dup-target onto the real fd 2, but a Capture sink writes the builtin's stdout to a Rust buffer (not real fd 1), so fd-level `2>&1` can't reach it. The file/pipe cases (`2>file`, `2>&1 | cmd`) work. Also applies to a function-call's `2>&1` under capture (`r=$(func 2>&1)`) — same in-memory-buffer cause; v125's function-call redirects fixed the divert/suppress directions but not capture-of-stderr.
-- **bash**: the builtin's stderr is merged into the captured stdout.
-- **Why intentional**: capturing a builtin's stdout via a Rust buffer (rather than a real fd 1) is the design that makes `$(builtin …)` work without forking; a real `dup2(1,2)` has no in-buffer fd 1 to target. The file/pipe redirect cases (the common ones) are correct.
-- **Workaround**: redirect the builtin's stderr to a file and read the file, or run the builtin in a forked subshell.
 
 ### L-26: `getopts` verbose error messages use huck's program-name prefix
 

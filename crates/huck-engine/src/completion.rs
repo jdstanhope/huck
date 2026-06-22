@@ -721,7 +721,6 @@ mod tests {
     use super::*;
     use crate::shell_state::Shell;
     use crate::test_support::CWD_LOCK;
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     #[test]

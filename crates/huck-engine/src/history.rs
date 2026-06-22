@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::err_thread_local::with_err;
+
 pub(crate) const HISTORY_MAX: usize = 1000;
 
 /// A history-expansion failure. The shell prints these and refuses to
@@ -139,7 +141,7 @@ impl History {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                eprintln!("huck: warning: could not read history file: {e}");
+                with_err(|err| e!(err, "huck: warning: could not read history file: {e}"));
             }
         }
     }
@@ -161,7 +163,7 @@ impl History {
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
-            eprintln!("huck: warning: could not write history file: {e}");
+            with_err(|err| e!(err, "huck: warning: could not write history file: {e}"));
         }
     }
 
