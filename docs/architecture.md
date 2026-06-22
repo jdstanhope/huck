@@ -18,10 +18,14 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   (`escape_double_quote_value`). No dependencies.
 - **`huck-engine`** (`crates/huck-engine/`) — the **terminal-free execution
   core**: expansion, execution, builtins, shell state, traps, jobs, completion
-  candidate-generation, the readline keymap *data*, and the headless entry
-  (`huck_engine::shell::run_program` / `process_line`). Depends on `huck-syntax`;
+  candidate-generation, the readline keymap *data*, and the low-level headless
+  runners (`huck_engine::shell::run_program` / `process_line`). Depends on `huck-syntax`;
   **rustyline-free** (a stray `use rustyline` here won't compile) — it is the
-  embeddable, no-terminal interpreter.
+  embeddable, no-terminal interpreter. The embedding entry point is
+  `huck_engine::Engine` (`new` / `builder` → `run` / `capture` / `run_file` +
+  `var` / `set_var` / `set_args`), and the `huck` binary's headless `-c` / script
+  path runs through it (`run` = `bash -c` semantics, `run_file` / `run_script` =
+  script semantics).
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply

@@ -170,22 +170,27 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
 }
 
 /// Executes a non-interactive program (a `-c` string or a script file's
-/// contents) and returns the process exit code. Sets $0 and the positional
-/// parameters, marks the shell non-interactive (so the rc file is skipped),
-/// runs the program through the shared `run_sourced_contents` engine, fires the
-/// EXIT trap, and hangs up jobs. Does NOT touch interactive history or the
-/// line editor.
+/// contents) and returns the process exit code, sending stdout to `sink`. Sets
+/// $0 and the positional parameters, marks the shell non-interactive (so the rc
+/// file is skipped), runs the program through the shared
+/// `run_sourced_contents_in_sink` engine, fires the EXIT trap, and hangs up
+/// jobs. Does NOT touch interactive history or the line editor.
+///
+/// `run_program` is the `Terminal`-sink wrapper; the engine's `capture` passes a
+/// `Capture` sink. Behavior with `Terminal` is identical to the old
+/// `run_program`.
 ///
 /// When `push_main_frame` is true (script-file mode), a base `FrameKind::Main`
 /// frame is pushed before executing and popped after, so that BASH_SOURCE and
 /// BASH_LINENO are populated at the top level and FUNCNAME gains the `main`
 /// entry inside functions. For `-c` and other non-file modes pass `false`.
-pub fn run_program(
+pub fn run_program_in_sink(
     contents: &str,
     argv0: Option<String>,
     args: Vec<String>,
     label: &str,
     push_main_frame: bool,
+    sink: &mut crate::executor::StdoutSink,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
@@ -205,10 +210,11 @@ pub fn run_program(
         shell.sync_call_arrays();
     }
 
-    let outcome = crate::builtins::run_sourced_contents(
+    let outcome = crate::builtins::run_sourced_contents_in_sink(
         contents,
         std::path::Path::new(label),
         &mut shell,
+        sink,
     );
 
     if push_main_frame {
@@ -228,6 +234,19 @@ pub fn run_program(
     crate::traps::fire_exit_trap(&mut shell);
     shell.hangup_jobs();
     code
+}
+
+/// Run a program/script with stdout going to the terminal (the default).
+pub fn run_program(
+    contents: &str,
+    argv0: Option<String>,
+    args: Vec<String>,
+    label: &str,
+    push_main_frame: bool,
+    shell_cell: &Rc<RefCell<Shell>>,
+) -> i32 {
+    let mut sink = crate::executor::StdoutSink::Terminal;
+    run_program_in_sink(contents, argv0, args, label, push_main_frame, &mut sink, shell_cell)
 }
 
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
