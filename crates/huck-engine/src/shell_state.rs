@@ -949,6 +949,11 @@ impl Shell {
     /// When the existing value is an `Indexed` array, only element 0 is
     /// overwritten — the rest of the map is preserved (bash's `a=v` rule).
     /// User-facing assignments must use `assign()` / `try_set` instead.
+    ///
+    /// In restricted mode, assignment to SHELL/PATH/ENV/BASH_ENV is refused
+    /// with a diagnostic emitted via `err_thread_local::with_err`; if no
+    /// executor sink is installed (e.g. direct unit tests), the diagnostic
+    /// falls through to `io::stderr()`.
     pub fn set(&mut self, name: &str, value: String) {
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(name)
