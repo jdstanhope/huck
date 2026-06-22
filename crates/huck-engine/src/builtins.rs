@@ -5251,6 +5251,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
 }
 
 /// The `-o` bridge: every `shopt` form operates on the `set -o` namespace.
+#[allow(clippy::too_many_arguments)]
 fn shopt_o_bridge(
     names: &[String], set_f: bool, unset_f: bool, quiet: bool, print_f: bool,
     out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell,
