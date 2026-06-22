@@ -4,7 +4,7 @@
 //! Capture) routes correctly. The write is fallible (ignored) because stderr
 //! is best-effort and a write error here must not abort the shell.
 
-#[macro_export]
+#[allow(unused_macros)]
 macro_rules! e {
     ($err:expr, $($arg:tt)*) => {{
         let _ = ::std::io::Write::write_fmt($err, format_args!($($arg)*));
