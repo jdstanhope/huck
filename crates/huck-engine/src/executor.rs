@@ -461,7 +461,7 @@ fn run_command(
                 },
             };
 
-            // Mirror the stdout fd construction for stderr (v205 task 5):
+            // Mirror the stdout fd construction for stderr:
             //   Terminal → STDERR_FILENO (inherit).
             //   Merged   → stdout_fd (kernel-level 2>&1: both streams hit the
             //              same write-end of whatever fd 1 is — pipe or terminal).
@@ -4990,7 +4990,7 @@ fn run_multi_stage(
     // lands in the same buffer). For Merged the per-stage stderr_fd is aliased
     // to the active stdout fd (the inter-stage pipe write-end for non-last stages,
     // and the final-stage stdout target for the last stage), giving kernel-level
-    // 2>&1 ordering. For Terminal stderr inherits as before. (v205 task 5)
+    // 2>&1 ordering. For Terminal stderr inherits as before.
     let (capture_err_pipe_write_fd, mut capture_err_read_fd): (Option<RawFd>, Option<RawFd>) =
         if matches!(err_sink, StderrSink::Capture(_)) {
             match make_pipe() {
@@ -5416,7 +5416,7 @@ fn run_multi_stage(
         //                          parent's copy) and fork_and_run_in_subshell
         //                          paths close it explicitly after spawn — both
         //                          would otherwise destroy the shared write-end
-        //                          after the first stage. (v205 task 5)
+        //                          after the first stage.
         let stderr_fd = if let Some(fd) = explicit_stderr_fd {
             fd
         } else {
@@ -5637,7 +5637,7 @@ fn run_multi_stage(
 
     // Drain stderr (if captured) concurrently with stdout drain via a background
     // thread. Without this, a child writing >PIPE_BUF (~64 KiB on Linux) to one
-    // stream while the parent sits in io::copy on the other deadlocks. (v205 task 5)
+    // stream while the parent sits in io::copy on the other deadlocks.
     let err_drain = if let Some(r) = capture_err_read_fd.take() {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let handle = std::thread::spawn(move || {
@@ -7731,7 +7731,7 @@ mod tests {
         );
     }
 
-    // ----- external-process stderr capture / Merged (v205 task 5) -------------
+    // ----- external-process stderr capture / Merged --------------------------
 
     /// `/bin/sh -c 'echo out; echo err >&2'` with split capture sinks:
     /// stdout lands in `buf_out`, stderr lands in `buf_err`. Exercises the
