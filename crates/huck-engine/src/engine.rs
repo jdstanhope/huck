@@ -134,8 +134,8 @@ impl Engine {
     ) -> i32 {
         // Preserve the shell's current $0 + positionals (don't clobber them).
         let args = self.cell.borrow().positional_args.clone();
-        // Task 3: stderr always inherits the process today. Task 7 will introduce
-        // the public `Engine::exec` builder that lets callers ask for Capture/Merged.
+        // stderr always inherits the process here; the public `Engine::exec`
+        // builder will let callers opt into Capture/Merged later.
         let mut err_sink = StderrSink::Terminal;
         let code = crate::shell::run_program_in_sink(
             src,

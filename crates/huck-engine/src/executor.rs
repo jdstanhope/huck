@@ -187,8 +187,8 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
         let mut sink = StdoutSink::Capture(&mut buf);
-        // Task 3: stderr inside $() still inherits the process (Terminal). Task 5
-        // may revisit if we want $() to capture stderr too — out of scope here.
+        // stderr inside $() still inherits the process (Terminal); capturing
+        // stderr through command substitution isn't plumbed here yet.
         let mut err_sink = StderrSink::Terminal;
         execute_sequence_body(&sanitized, shell, &mut sink, &mut err_sink)
     };
@@ -1706,16 +1706,12 @@ fn run_select_inner(
         // 3b. select_query: (re)print menu when show_menu, prompt, read one
         //     line. An empty line reprints the menu; EOF terminates the loop.
         let selection: String = loop {
-            if show_menu {
-                let mut err = err_writer(err_sink, sink);
-                let _ = write!(&mut *err, "{}", format_select_menu(&items, cols_width));
-            }
             {
                 let mut err = err_writer(err_sink, sink);
+                if show_menu {
+                    let _ = write!(&mut *err, "{}", format_select_menu(&items, cols_width));
+                }
                 let _ = write!(&mut *err, "{ps3}");
-            }
-            {
-                let mut err = err_writer(err_sink, sink);
                 let _ = err.flush();
             }
 
