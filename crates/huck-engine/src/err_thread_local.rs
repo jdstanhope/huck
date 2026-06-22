@@ -18,7 +18,7 @@
 //! # Safety
 //!
 //! The thread-local holds raw `NonNull<StdoutSink>` / `NonNull<StderrSink>`.
-//! Soundness rests on three invariants, all enforced by the executor's
+//! Soundness rests on four invariants, all enforced by the executor's
 //! single-threaded contract:
 //!
 //! 1. `Engine` is neither `Send` nor `Sync`; only one OS thread runs the
@@ -34,7 +34,7 @@
 //!    return). The executor MUST NOT call any function that itself touches
 //!    the sinks (e.g. nested `err_writer`) while another `with_err` is
 //!    active. Since `with_err` is leaf-level (it writes a message and
-//!    returns), this composability is uphold by construction.
+//!    returns), this composability is upheld by construction.
 
 use std::cell::Cell;
 use std::io::Write;
