@@ -33,6 +33,7 @@ pub mod shell;
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
 pub mod test_builtin;
+pub(crate) mod timeout;
 pub mod traps;
 
 #[cfg(test)]

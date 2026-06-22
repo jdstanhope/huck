@@ -107,6 +107,28 @@ fn maybe_errexit(shell: &Shell, status: i32) -> Option<ExecOutcome> {
     }
 }
 
+/// RAII guard that pops a pid from the `Shell::live_external_children` registry
+/// when the surrounding scope ends — including early returns and panics. Pushed
+/// at every external-fork site so the timeout timer thread (see `timeout.rs`)
+/// has an accurate snapshot of which children to SIGTERM if the deadline fires.
+struct LiveChildGuard<'a> {
+    pids: &'a std::sync::Arc<std::sync::Mutex<Vec<libc::pid_t>>>,
+    pid: libc::pid_t,
+}
+
+impl Drop for LiveChildGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.pids.lock() {
+            // Remove the first match — multiple distinct pids can coexist in the
+            // registry (e.g. concurrent pipeline stages), but the same pid
+            // appears at most once for a given live child.
+            if let Some(idx) = g.iter().position(|&p| p == self.pid) {
+                g.swap_remove(idx);
+            }
+        }
+    }
+}
+
 /// Consumes a pending SIGINT and decides whether to abort. Returns
 /// `Some(ExecOutcome::Interrupted(InterruptReason::Sigint))` when an untrapped
 /// SIGINT is pending; `None` when none is pending OR when a user `INT` trap
@@ -123,6 +145,11 @@ pub(crate) fn check_interrupt(shell: &Shell) -> Option<ExecOutcome> {
             return None;
         }
         return Some(ExecOutcome::Interrupted(InterruptReason::Sigint));
+    }
+    // Timeout poll. The flag stays set — the builder's epilogue does a single
+    // `swap(false)` at the run boundary to override the exit code to 124.
+    if shell.timeout_flag.load(Ordering::Relaxed) {
+        return Some(ExecOutcome::Interrupted(InterruptReason::Timeout));
     }
     None
 }
@@ -247,17 +274,32 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
         ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_) => 0,
         ExecOutcome::FunctionReturn(n) => n,
-        ExecOutcome::Interrupted(_) => {
-            // An untrapped SIGINT aborted the substitution body. The
-            // interrupt was consumed (flag cleared) by the body's own
-            // `check_interrupt`; re-raise it on the shared `sigint_flag` so
-            // the enclosing command list observes it and aborts too —
-            // matching bash, where `x=$(... kill -INT $$ ...); echo after`
-            // never runs `after`. (v138)
-            shell
-                .sigint_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            130
+        ExecOutcome::Interrupted(reason) => {
+            // The substitution body was aborted by `check_interrupt`. Re-raise
+            // the originating flag on the shared `Shell` so the enclosing
+            // command list observes it and aborts too — matching bash, where
+            // `x=$(... kill -INT $$ ...); echo after` never runs `after`. (v138)
+            //
+            // SIGINT: `check_interrupt` already cleared `sigint_flag`, so we
+            // re-store it. Timeout: `check_interrupt` does NOT clear
+            // `timeout_flag` (the builder epilogue is the single reader at the
+            // run boundary), so re-storing is logically a no-op — but doing it
+            // explicitly keeps the reason-propagation symmetric and robust to
+            // future changes.
+            match reason {
+                InterruptReason::Sigint => {
+                    shell
+                        .sigint_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    130
+                }
+                InterruptReason::Timeout => {
+                    shell
+                        .timeout_flag
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    124
+                }
+            }
         }
     };
     (String::from_utf8_lossy(&buf).into_owned(), status)
@@ -539,6 +581,13 @@ fn run_command(
                     return ExecOutcome::Continue(1);
                 }
             };
+
+            // Register the subshell child in the live-children registry so the
+            // timeout timer thread can SIGTERM it if the deadline fires. The
+            // guard pops on every exit path (including early returns / panics).
+            let live_pids = shell.live_external_children.clone();
+            live_pids.lock().unwrap().push(pid as libc::pid_t);
+            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
 
             // Close the write-end in the parent so the child's write-end is
             // the only writer; once the child exits, the read-end sees EOF.
@@ -4838,6 +4887,13 @@ fn run_subprocess(
 
             let pid = child.id() as i32;
 
+            // Register pid in the live-children registry so the timeout timer
+            // thread can SIGTERM it if the deadline fires. The guard pops on
+            // every exit path (including early returns / panics).
+            let live_pids = shell.live_external_children.clone();
+            live_pids.lock().unwrap().push(pid as libc::pid_t);
+            let _pid_guard = LiveChildGuard { pids: &live_pids, pid: pid as libc::pid_t };
+
             let outcome = if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
@@ -5176,6 +5232,11 @@ fn run_multi_stage(
     let mut first_pid: Option<i32> = None;
     let mut stage_pids: Vec<i32> = Vec::with_capacity(n);
 
+    // Live-children registry: every stage pid is published while the pipeline
+    // is running so the timeout timer thread can SIGTERM all stages in one pass
+    // when the deadline fires. Cleared in one bulk pass after wait_pipeline_raw.
+    let live_pids_arc = shell.live_external_children.clone();
+
     // All forked stages (pid + optional inline exit status for Done stages).
     let mut pipeline_stages: Vec<PipelineStage> = Vec::with_capacity(n);
 
@@ -5293,6 +5354,7 @@ fn run_multi_stage(
                         first_pid = Some(pid);
                     }
                     stage_pids.push(pid);
+                    live_pids_arc.lock().unwrap().push(pid as libc::pid_t);
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
@@ -5817,6 +5879,7 @@ fn run_multi_stage(
             first_pid = Some(pid);
         }
         stage_pids.push(pid);
+        live_pids_arc.lock().unwrap().push(pid as libc::pid_t);
         pipeline_stages.push(PipelineStage::Forked(pid));
     }
 
@@ -5885,6 +5948,14 @@ fn run_multi_stage(
 
     // ---- Wait for all stages ------------------------------------------------
     let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, sink, err_sink, interactive);
+
+    // Clear this pipeline's stage pids from the live-children registry in one
+    // pass. They were published per-stage above so the timeout timer thread
+    // could SIGTERM every stage on a deadline fire.
+    {
+        let mut guard = live_pids_arc.lock().unwrap();
+        guard.retain(|p| !stage_pids.iter().any(|s| (*s as libc::pid_t) == *p));
+    }
 
     // Reap any forked heredoc/herestring writer processes (M-120). They are not
     // pipeline stages, so they are excluded from $PIPESTATUS and the wait above;
