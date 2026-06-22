@@ -10,10 +10,17 @@
 //! let mut e = Engine::new();
 //! e.set_var("NAME", "world");
 //! assert_eq!(e.run("echo \"hi $NAME\""), 0);          // prints: hi world
-//! let out = e.capture("echo $((6 * 7))");
+//! let out = e.capture("echo $((6 * 7)); echo done >&2");
 //! assert_eq!(out.stdout, "42\n");
+//! assert_eq!(out.stderr, "done\n");
 //! assert_eq!(out.exit_code, 0);
 //! assert_eq!(e.var("NAME").as_deref(), Some("world"));
+//!
+//! // For stdin + stderr capture:
+//! let out = e.exec("read x; printf 'got=%s\\n' \"$x\"")
+//!     .stdin(b"hello\n".to_vec())
+//!     .capture();
+//! assert_eq!(out.stdout, "got=hello\n");
 //! ```
 use std::cell::RefCell;
 use std::path::Path;
@@ -22,11 +29,17 @@ use std::rc::Rc;
 use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
-/// The captured result of [`Engine::capture`].
+/// The captured result of [`Engine::capture`] (or [`ExecBuilder::capture`]).
+///
+/// [`ExecBuilder::capture`]: crate::exec_builder::ExecBuilder::capture
 #[derive(Debug, Clone)]
 pub struct Output {
-    /// Everything the script wrote to stdout (stderr inherits the process).
+    /// Everything the script wrote to stdout. Under `merge_stderr` this also
+    /// contains the script's stderr bytes, interleaved in execution order.
     pub stdout: String,
+    /// Everything the script wrote to stderr. Empty when none was written, or
+    /// when `merge_stderr` routed it into `stdout`.
+    pub stderr: String,
     /// The script's exit status.
     pub exit_code: i32,
 }
@@ -60,15 +73,18 @@ impl Engine {
         self.run_with(src, false, &mut sink)
     }
 
-    /// Run a script string, capturing stdout (stderr still inherits). `bash -c`
-    /// semantics; returns `{ stdout, exit_code }`.
+    /// Run a script string, capturing stdout and stderr into separate buffers.
+    /// `bash -c` semantics; returns `{ stdout, stderr, exit_code }`.
     pub fn capture(&mut self, src: &str) -> Output {
-        let mut buf: Vec<u8> = Vec::new();
-        let exit_code = {
-            let mut sink = StdoutSink::Capture(&mut buf);
-            self.run_with(src, false, &mut sink)
-        };
-        Output { stdout: String::from_utf8_lossy(&buf).into_owned(), exit_code }
+        self.exec(src).capture()
+    }
+
+    /// Start an advanced execution chain. Borrows `&mut self` for the chain's
+    /// lifetime. See [`ExecBuilder`].
+    ///
+    /// [`ExecBuilder`]: crate::exec_builder::ExecBuilder
+    pub fn exec(&mut self, src: &str) -> crate::exec_builder::ExecBuilder<'_> {
+        crate::exec_builder::ExecBuilder::new(self, src.to_string())
     }
 
     /// Run a script STRING with script semantics (a "main" frame; `$0` = `arg0`).
@@ -285,5 +301,76 @@ mod tests {
             .build();
         let out = e.capture("echo \"$GREETING $0 $1\"");
         assert_eq!(out.stdout, "yo prog x\n");
+    }
+
+    #[test]
+    fn exec_capture_stdout_and_stderr_separately() {
+        let mut e = Engine::new();
+        let out = e.exec("echo hi; echo err >&2").capture();
+        assert_eq!(out.stdout, "hi\n");
+        assert_eq!(out.stderr, "err\n");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[test]
+    fn exec_merge_stderr_interleaves_into_stdout() {
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo hi; echo err >&2; echo bye")
+            .merge_stderr()
+            .capture();
+        assert_eq!(out.stdout, "hi\nerr\nbye\n");
+        assert_eq!(out.stderr, "");
+    }
+
+    #[test]
+    fn exec_feeds_stdin() {
+        let mut e = Engine::new();
+        let out = e
+            .exec("read x; read y; echo \"$x-$y\"")
+            .stdin(b"hello\nworld\n".to_vec())
+            .capture();
+        assert_eq!(out.stdout, "hello-world\n");
+    }
+
+    #[test]
+    fn exec_large_stdin_uses_writer_thread() {
+        // Feeds 5 KiB - above the 4 KiB inline threshold; ensures the writer-thread
+        // path completes the read.
+        let big: Vec<u8> = std::iter::repeat_n(b'a', 5000)
+            .chain(std::iter::once(b'\n'))
+            .collect();
+        let mut e = Engine::new();
+        let out = e
+            .exec("read line; echo \"len=${#line}\"")
+            .stdin(big)
+            .capture();
+        assert_eq!(out.stdout, "len=5000\n");
+    }
+
+    #[test]
+    fn capture_includes_stderr_field() {
+        let mut e = Engine::new();
+        let out = e.capture("echo a; echo b >&2");
+        assert_eq!(out.stdout, "a\n");
+        assert_eq!(out.stderr, "b\n");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[test]
+    fn parse_error_diagnostic_in_stderr() {
+        let mut e = Engine::new();
+        let out = e.capture("if [");
+        assert_eq!(out.exit_code, 2);
+        assert!(out.stderr.contains("syntax error"), "got: {:?}", out.stderr);
+    }
+
+    #[test]
+    fn exec_run_inherits_then_exec_capture_works() {
+        // Borrow discipline: back-to-back exec chains compile and work.
+        let mut e = Engine::new();
+        e.exec("x=set-in-first").run();
+        let out = e.exec("echo \"$x\"").capture();
+        assert_eq!(out.stdout, "set-in-first\n");
     }
 }

@@ -1077,6 +1077,35 @@ fn redirs_write_stdout(redirs: &[Redirection]) -> bool {
     })
 }
 
+/// True iff the LAST redirect on `target` is a `RedirOp::Dup` whose source word
+/// expands to the literal number `source`. Used by the builtin-redirect path to
+/// detect a trailing `>&2` (target=1, source=2) or `2>&1` (target=2, source=1)
+/// so an in-memory stderr/stdout sink can be routed in software (the real-fd
+/// dup would target the embedder's terminal fd, missing the buffer).
+///
+/// "Trailing" means no later redirect on the same target fd overrides it. Other
+/// redirects targeting different fds don't disqualify; they're applied normally
+/// at the real-fd level.
+fn is_trailing_dup_to(
+    redirs: &[Redirection],
+    target: u16,
+    source: i32,
+    shell: &mut Shell,
+) -> bool {
+    let mut last_on_target: Option<&Redirection> = None;
+    for r in redirs {
+        if r.target_fd() == Some(target) {
+            last_on_target = Some(r);
+        }
+    }
+    let Some(r) = last_on_target else { return false };
+    let RedirOp::Dup { source: src_word, output: true } = &r.op else {
+        return false;
+    };
+    // Resolve the source fd word against the shell to handle `>&2` vs `>&$X`.
+    matches!(resolve_fd_target(src_word, shell), Ok(n) if n == source)
+}
+
 /// Returns the redirections NOT consumed by the pipeline-stage 0/1/2 slot
 /// fast-path (`slots_for_simple_path`): fd>2, `<&` dup-in, `N>&-` close, `<>`
 /// ReadWrite, and the cross-direction combos the fast-path drops. The fast-path
@@ -1219,10 +1248,16 @@ where
 /// `io::stdout()` (= fd 1 = the redirect target) and an outer capture correctly
 /// receives nothing for the diverted stream. Otherwise the enclosing `sink` is
 /// kept, so `r=$(builtin)` still captures the builtin's stdout into the buffer.
-/// (The L-25 residual — capture-mode `$(builtin 2>&1)` cannot fold in-memory
-/// stdout into the captured stream — is preserved: `2>&1` alone does not force
-/// Terminal, so the builtin still writes to the capture buf while fd 2 is duped
-/// to fd 1 at the real-fd level, which the buf does not observe.)
+///
+/// **In-memory `>&2` / `2>&1` routing (v205):** A `>&2` (fd 1 → fd 2) under a
+/// `StderrSink::Capture` or `StderrSink::Merged` sink — and the symmetric
+/// `2>&1` (fd 2 → fd 1) under a `StdoutSink::Capture` sink — would, when applied
+/// at the real-fd level, dup to the embedder's terminal fd, missing the
+/// in-memory buffer. To hit the buffer we detect a TRAILING `>&2` / `2>&1` (no
+/// later override of the target fd) and route the builtin's writer to the other
+/// sink IN SOFTWARE; the redirect is still applied at the real-fd level (cheap
+/// no-op for the builtin's writer choice — external children below would not
+/// see the swap and we are an in-process builtin). Resolves L-25.
 ///
 /// `read`'s stdin (`<`, `<<`, `<<<`) lands on fd 0 via the scope, so the builtin
 /// reads from the redirected descriptor. Heredoc/here-string writer pids spawned
@@ -1236,6 +1271,17 @@ fn run_builtin_with_redirects(
 ) -> ExecOutcome {
     let procsub_base = shell.procsub_pending.len();
     let _ = io::stdout().flush();
+
+    // Detect in-memory dup re-routing BEFORE applying the real-fd scope.
+    // - `route_out_to_err`: trailing `>&2` (fd 1 → fd 2) AND stderr is in-memory.
+    // - `route_err_to_out`: trailing `2>&1` (fd 2 → fd 1) AND stdout is in-memory.
+    //   ("Trailing" = no later redirect targets the same fd at the real-fd level
+    //   in a way that would re-dup it elsewhere — i.e. no later file redirect or
+    //   different dup on that target fd.)
+    let route_out_to_err = matches!(err_sink, StderrSink::Capture(_) | StderrSink::Merged)
+        && is_trailing_dup_to(redirs, /*target=*/ 1, /*source=*/ 2, shell);
+    let route_err_to_out = matches!(sink, StdoutSink::Capture(_))
+        && is_trailing_dup_to(redirs, /*target=*/ 2, /*source=*/ 1, shell);
 
     let mut scope = RedirectScope::new();
     for r in redirs {
@@ -1251,7 +1297,13 @@ fn run_builtin_with_redirects(
     // Terminal sink so the builtin writes there (= fd 1 = the target) instead of
     // into an outer capture buf. A capture sink with NO stdout redirect keeps
     // writing to the buf so `r=$(builtin)` still captures.
-    let write_to_fd1 = redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal);
+    //
+    // EXCEPT when `route_out_to_err` is set: the `>&2` Dup would normally make
+    // `redirs_write_stdout` true and force fd-1 writes, but we want to route
+    // the builtin's stdout to the in-memory stderr sink instead. The `if
+    // route_out_to_err` arm below handles this; suppress `write_to_fd1` here.
+    let write_to_fd1 = !route_out_to_err
+        && (redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal));
     let run = |out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, shell: &mut Shell| {
         if let Some(da) = resolved.decl_args.as_deref() {
             builtins::run_declaration_builtin(&resolved.program, da, out, err, shell)
@@ -1264,7 +1316,58 @@ fn run_builtin_with_redirects(
     // `*buf` (used as `out`) is already a mutable borrow of `sink`; the helper
     // `err_writer` (which takes both sinks) would conflict. So in the capture
     // arm we hand-roll the err writer here, mirroring `err_writer`'s logic.
-    let outcome = if write_to_fd1 {
+    let outcome = if route_out_to_err {
+        // `>&2` under captured/merged stderr: route the builtin's stdout into
+        // the (effective) stderr destination. The `err` writer is io::stderr()
+        // — the builtin's own direct stderr writes (e.g. an error diagnostic)
+        // still land in the embedder's stderr if err_sink is Terminal, but
+        // err_sink isn't Terminal here (the route_out_to_err guard requires
+        // Capture or Merged), so we materialize err from those.
+        match (&mut *sink, &mut *err_sink) {
+            (_, StderrSink::Capture(ebuf)) => {
+                // out writes go to the stderr capture buffer; err writes also
+                // go to it. (Borrow ebuf only once; route both writers via a
+                // side buf for the err side to avoid aliasing.)
+                let mut side_err: Vec<u8> = Vec::new();
+                let outcome = run(*ebuf, &mut side_err, shell);
+                ebuf.extend_from_slice(&side_err);
+                outcome
+            }
+            (StdoutSink::Capture(obuf), StderrSink::Merged) => {
+                // Merged means stderr is routed to the active stdout sink (here:
+                // the capture buf). So out writes (via `>&2` → merged → buf) AND
+                // err writes both go to obuf.
+                let mut side_err: Vec<u8> = Vec::new();
+                let outcome = run(*obuf, &mut side_err, shell);
+                obuf.extend_from_slice(&side_err);
+                outcome
+            }
+            (StdoutSink::Terminal, StderrSink::Merged) => {
+                // Merged + terminal stdout: writes go to real fd 1 (which the
+                // redirect dup'd from real fd 2, so → real fd 2). This matches
+                // the non-routed path, so just fall back to the standard write.
+                let mut out = io::stdout();
+                let mut err = err_writer(err_sink, sink);
+                run(&mut out, &mut *err, shell)
+            }
+            (_, StderrSink::Terminal) => unreachable!("route_out_to_err requires non-Terminal err_sink"),
+        }
+    } else if route_err_to_out {
+        // `2>&1` under captured stdout: route the builtin's stderr into the
+        // stdout capture buf. (L-25 resolution.)
+        match sink {
+            StdoutSink::Capture(obuf) => {
+                // out → obuf (the standard capture path), err → obuf (via the
+                // `2>&1` swap). Aliasing: borrow obuf once for out; use a side
+                // buf for err and append.
+                let mut side_err: Vec<u8> = Vec::new();
+                let outcome = run(*obuf, &mut side_err, shell);
+                obuf.extend_from_slice(&side_err);
+                outcome
+            }
+            StdoutSink::Terminal => unreachable!("route_err_to_out requires Capture stdout"),
+        }
+    } else if write_to_fd1 {
         let mut out = io::stdout();
         let mut err = err_writer(err_sink, sink);
         run(&mut out, &mut *err, shell)

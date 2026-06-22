@@ -14,12 +14,10 @@
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 
-#[allow(dead_code)]
 const INLINE_STDIN_THRESHOLD: usize = 4096;
 
 /// Runs `f` with fd 0 backed by `input`. fd 0 is restored to its pre-call
 /// value on return (even on panic).
-#[allow(dead_code)]
 pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
     let (r, w) = match make_pipe() {
         Ok(pair) => pair,
@@ -95,7 +93,6 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
     }
 }
 
-#[allow(dead_code)]
 fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     let mut fds = [0; 2];
     let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };

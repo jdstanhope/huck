@@ -16,6 +16,7 @@ pub mod completion_spec;
 pub mod continuation;
 pub mod engine;
 pub mod err_thread_local;
+pub mod exec_builder;
 pub mod executor;
 pub mod expand;
 pub mod glob_match;
@@ -36,6 +37,8 @@ pub mod traps;
 pub mod test_support;
 
 pub use engine::{Engine, EngineBuilder, Output};
+pub use exec_builder::ExecBuilder;
+pub use executor::{StderrSink, StdoutSink};
 
 // Re-export the frontend so `huck_engine::lexer::`/`::command::` resolve downstream.
 pub use huck_syntax::{brace_expand, command, generate, lexer};
