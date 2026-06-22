@@ -25,7 +25,16 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `huck_engine::Engine` (`new` / `builder` → `run` / `capture` / `run_file` +
   `var` / `set_var` / `set_args`), and the `huck` binary's headless `-c` / script
   path runs through it (`run` = `bash -c` semantics, `run_file` / `run_script` =
-  script semantics).
+  script semantics). The advanced embedding path is `huck_engine::ExecBuilder`
+  returned from `Engine::exec(src)` — it supports stdin feed (`.stdin(bytes)`)
+  and stderr-as-merged into stdout (`.merge_stderr()`), then runs either as
+  `.run() -> i32` (fd 1/2 inherit) or `.capture() -> Output { stdout, stderr,
+  exit_code }` (both buffers populated). Internally,
+  `huck_engine::StderrSink::{Terminal, Merged, Capture}` is the symmetric
+  counterpart of `StdoutSink`, threaded through the executor and the
+  builtin-dispatch path; engine-level stdin redirection lives in
+  `crates/huck-engine/src/stdin_pipe.rs` (CLOEXEC pipe + dup2(r, 0) save/restore
+  guard).
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply
