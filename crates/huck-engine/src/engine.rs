@@ -959,4 +959,110 @@ mod tests {
             .capture();
         assert!(got_len >= 50_000, "expected long line, got {got_len}");
     }
+
+    // ----- composition: streaming callbacks + v205/v206 knobs --------------
+
+    #[test]
+    fn on_stdout_line_with_stdin() {
+        let _g = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("read x; echo \"got:$x\"")
+            .stdin(b"hi\n".to_vec())
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["got:hi"]);
+    }
+
+    #[test]
+    fn on_stdout_line_with_cwd() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("pwd")
+            .cwd(tmp.path())
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(lines, vec![canonical.display().to_string()]);
+    }
+
+    #[test]
+    fn on_stdout_line_with_restricted() {
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("cd /tmp")
+            .restricted(true)
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert!(err_lines.iter().any(|l| l.contains("restricted: cd")));
+    }
+
+    #[test]
+    fn on_stdout_line_with_timeout_fires_during_run() {
+        use std::time::Duration;
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let code = e.exec("/bin/sh -c 'echo before; sleep 5'")
+            .timeout(Duration::from_millis(200))
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture()
+            .exit_code;
+        assert_eq!(code, 124);
+        assert_eq!(lines, vec!["before"]);
+    }
+
+    #[test]
+    fn all_knobs_compose() {
+        use std::time::Duration;
+        let _g1 = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e.exec("read x; echo \"got:$x\"")
+            .cwd(tmp.path())
+            .restricted(true)
+            .timeout(Duration::from_secs(2))
+            .stdin(b"hello\n".to_vec())
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out_lines, vec!["got:hello"]);
+    }
+
+    // ----- robustness: panic + backpressure --------------------------------
+
+    #[test]
+    fn callback_panic_propagates_and_engine_recovers() {
+        let mut e = Engine::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            e.exec("echo a; echo b; echo c")
+                .on_stdout_line(|line| {
+                    if line == "b" { panic!("test panic"); }
+                })
+                .capture()
+        }));
+        assert!(r.is_err(), "expected panic to propagate out of .capture()");
+        // Engine is still usable for the next call (no state corruption).
+        let out = e.capture("echo recovered");
+        assert_eq!(out.stdout, "recovered\n");
+    }
+
+    #[test]
+    fn callback_can_be_slow_backpressure_works() {
+        use std::time::{Duration, Instant};
+        let mut e = Engine::new();
+        let start = Instant::now();
+        let _ = e.exec("for i in $(seq 1 20); do echo $i; done")
+            .on_stdout_line(|_| std::thread::sleep(Duration::from_millis(20)))
+            .capture();
+        let elapsed = start.elapsed();
+        // 20 lines × 20ms = 400ms minimum.
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "expected backpressure to slow run, elapsed: {elapsed:?}"
+        );
+    }
 }
