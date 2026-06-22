@@ -15,6 +15,8 @@ use crate::engine::{Engine, Output};
 use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
+type LineCallback<'a> = Box<dyn FnMut(&str) + 'a>;
+
 pub struct ExecBuilder<'a> {
     engine: &'a mut Engine,
     src: String,
@@ -23,6 +25,10 @@ pub struct ExecBuilder<'a> {
     cwd: Option<PathBuf>,
     restricted: bool,
     timeout: Option<Duration>,
+    #[allow(dead_code)]
+    on_stdout_line: Option<LineCallback<'a>>,
+    #[allow(dead_code)]
+    on_stderr_line: Option<LineCallback<'a>>,
 }
 
 impl<'a> ExecBuilder<'a> {
@@ -35,6 +41,8 @@ impl<'a> ExecBuilder<'a> {
             cwd: None,
             restricted: false,
             timeout: None,
+            on_stdout_line: None,
+            on_stderr_line: None,
         }
     }
 
@@ -88,6 +96,22 @@ impl<'a> ExecBuilder<'a> {
         self
     }
 
+    /// Invoke `f(line)` for each complete line written to stdout. Trailing
+    /// `\n` stripped. Final partial line (if no trailing newline at EOF) fires
+    /// once at stream close. Callback runs on the caller's thread.
+    pub fn on_stdout_line<F: FnMut(&str) + 'a>(mut self, f: F) -> Self {
+        self.on_stdout_line = Some(Box::new(f));
+        self
+    }
+
+    /// Same for stderr. Under `.merge_stderr()`, stderr is dup2'd onto stdout
+    /// at the fd level — this callback never fires; all output flows through
+    /// `on_stdout_line`.
+    pub fn on_stderr_line<F: FnMut(&str) + 'a>(mut self, f: F) -> Self {
+        self.on_stderr_line = Some(Box::new(f));
+        self
+    }
+
     /// Run the script; fd 1 and fd 2 inherit (or merged-to-fd1 if `merge_stderr`).
     pub fn run(self) -> i32 {
         let mut out = StdoutSink::Terminal;
@@ -121,7 +145,17 @@ impl<'a> ExecBuilder<'a> {
     }
 
     fn run_with_sinks(self, out: &mut StdoutSink, err: &mut StderrSink) -> i32 {
-        let ExecBuilder { engine, src, stdin, merge: _, cwd, restricted, timeout } = self;
+        let ExecBuilder {
+            engine,
+            src,
+            stdin,
+            merge: _,
+            cwd,
+            restricted,
+            timeout,
+            on_stdout_line: _,
+            on_stderr_line: _,
+        } = self;
         let cell = engine.shell_cell().clone();
 
         // 1. Spawn timer (if requested). Defend against a prior call leaving
