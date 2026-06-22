@@ -34,6 +34,25 @@ pub enum StderrSink<'a> {
     Capture(&'a mut Vec<u8>),
 }
 
+/// Materialize a `Box<dyn Write>` for the active `StderrSink`, with `out_sink`
+/// supplied so `Merged` can route through the active stdout writer. Allocates
+/// per call site — stderr is best-effort and small, so the heap hit is fine.
+/// Each call-site brace-scopes the writer to release the `err_sink` / `sink`
+/// borrows before subsequent code runs (`{ let mut err = err_writer(...); e!(...) }`).
+pub(crate) fn err_writer<'a>(
+    err_sink: &'a mut StderrSink<'_>,
+    out_sink: &'a mut StdoutSink<'_>,
+) -> Box<dyn std::io::Write + 'a> {
+    match err_sink {
+        StderrSink::Terminal => Box::new(std::io::stderr()),
+        StderrSink::Capture(buf) => Box::new(&mut **buf),
+        StderrSink::Merged => match out_sink {
+            StdoutSink::Terminal => Box::new(std::io::stdout()),
+            StdoutSink::Capture(buf) => Box::new(&mut **buf),
+        },
+    }
+}
+
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
 /// partial line is held back) before handing fd 1 to another process. A fork
 /// child would otherwise inherit — and possibly duplicate — the pending bytes,
@@ -87,6 +106,7 @@ pub fn execute_with_sink(
     shell: &mut Shell,
     source: &str,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     // Fast path: a trailing-`&` that backgrounds a SINGLE and-or group (no
     // `&`-separators inside the list). This preserves the real source-derived
@@ -98,10 +118,10 @@ pub fn execute_with_sink(
         if seq.rest.is_empty() {
             // Single-pipeline or subshell backgrounded — existing paths.
             if let Command::Pipeline(p) = &seq.first {
-                return run_background_sequence(p, shell, sink, source);
+                return run_background_sequence(p, shell, sink, err_sink, source);
             }
             if let Command::Subshell { .. } = &seq.first {
-                return run_background_subshell(&seq.first, shell, sink, source);
+                return run_background_subshell(&seq.first, shell, sink, err_sink, source);
             }
         } else if seq
             .rest
@@ -120,17 +140,18 @@ pub fn execute_with_sink(
                 background: false,
             };
             let subshell = Command::Subshell { body: Box::new(inner) };
-            return run_background_subshell(&subshell, shell, sink, source);
+            return run_background_subshell(&subshell, shell, sink, err_sink, source);
         }
     }
-    execute_sequence_body(seq, shell, sink)
+    execute_sequence_body(seq, shell, sink, err_sink)
 }
 
 /// Runs a top-level sequence with stdout going to the terminal. Thin wrapper
 /// over `execute_with_sink` with a Terminal sink.
 pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
     let mut sink = StdoutSink::Terminal;
-    execute_with_sink(seq, shell, source, &mut sink)
+    let mut err_sink = StderrSink::Terminal;
+    execute_with_sink(seq, shell, source, &mut sink, &mut err_sink)
 }
 
 /// Runs a sequence with stdout captured to a buffer. Used by command
@@ -166,7 +187,10 @@ pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
     let mut buf: Vec<u8> = Vec::new();
     let outcome = {
         let mut sink = StdoutSink::Capture(&mut buf);
-        execute_sequence_body(&sanitized, shell, &mut sink)
+        // Task 3: stderr inside $() still inherits the process (Terminal). Task 5
+        // may revisit if we want $() to capture stderr too — out of scope here.
+        let mut err_sink = StderrSink::Terminal;
+        execute_sequence_body(&sanitized, shell, &mut sink, &mut err_sink)
     };
     let status = match outcome {
         ExecOutcome::Continue(c) | ExecOutcome::Exit(c) => c,
@@ -199,8 +223,9 @@ fn run_andor_group(
     rest: &[(Connector, &Command)],
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    let mut status = run_command(first, shell, sink);
+    let mut status = run_command(first, shell, sink, err_sink);
     if let Some(o) = check_interrupt(shell) {
         return o;
     }
@@ -244,7 +269,7 @@ fn run_andor_group(
             Connector::Semi | Connector::Amp => true,
         };
         if should_run {
-            status = run_command(command, shell, sink);
+            status = run_command(command, shell, sink, err_sink);
             if let Some(o) = check_interrupt(shell) {
                 return o;
             }
@@ -322,7 +347,12 @@ fn partition_into_groups(seq: &Sequence) -> Vec<AndOrGroup<'_>> {
     groups
 }
 
-fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn execute_sequence_body(
+    seq: &Sequence,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let groups = partition_into_groups(seq);
     // The status of the most recent FOREGROUND group; a list that ends with a
     // backgrounded group reports the launch status 0.
@@ -351,9 +381,9 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
             let subshell = Command::Subshell { body: Box::new(inner) };
             // Launch; ignore the Continue(0) it returns — the foreground status
             // is unchanged by a background launch.
-            run_background_subshell(&subshell, shell, sink, &source);
+            run_background_subshell(&subshell, shell, sink, err_sink, &source);
         } else {
-            last_status = run_andor_group(group.first, &group.rest, shell, sink);
+            last_status = run_andor_group(group.first, &group.rest, shell, sink, err_sink);
             // Propagate control-flow outcomes immediately.
             if matches!(
                 last_status,
@@ -371,7 +401,12 @@ fn execute_sequence_body(seq: &Sequence, shell: &mut Shell, sink: &mut StdoutSin
 }
 
 /// Dispatches a single sequence element.
-fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_command(
+    cmd: &Command,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     // `set -n` / `-n` (noexec): read and parse but do not execute. Per-command
     // and non-interactive only (bash ignores -n interactively). Parsing already
     // happened (the reader caught any syntax error) — we simply skip running.
@@ -381,13 +416,13 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
         return ExecOutcome::Continue(0);
     }
     match cmd {
-        Command::Pipeline(p) => run_pipeline(p, shell, sink),
-        Command::Simple(s) => run_single(s, shell, sink),
-        Command::If(clause) => run_if(clause, shell, sink),
-        Command::While(clause) => run_while(clause, shell, sink),
-        Command::For(clause) => run_for(clause, shell, sink),
-        Command::Case(clause) => run_case(clause, shell, sink),
-        Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink),
+        Command::Pipeline(p) => run_pipeline(p, shell, sink, err_sink),
+        Command::Simple(s) => run_single(s, shell, sink, err_sink),
+        Command::If(clause) => run_if(clause, shell, sink, err_sink),
+        Command::While(clause) => run_while(clause, shell, sink, err_sink),
+        Command::For(clause) => run_for(clause, shell, sink, err_sink),
+        Command::Case(clause) => run_case(clause, shell, sink, err_sink),
+        Command::BraceGroup(seq) => execute_sequence_body(seq, shell, sink, err_sink),
         Command::Subshell { .. } => {
             let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
             // Determine stdout fd for the child.  For Terminal (the common
@@ -399,7 +434,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                 StdoutSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        eprintln!("huck: pipe: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -418,7 +453,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("huck: fork: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
                     if let Some(r) = capture_read_fd {
                         unsafe { libc::close(r); }
                     }
@@ -475,7 +510,7 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
                             .find(|j| j.id == job_id)
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
-                        eprintln!("\n{line}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
                         128 + sig
                     }
                     Ok((raw_status, false)) => {
@@ -528,15 +563,15 @@ fn run_command(cmd: &Command, shell: &mut Shell, sink: &mut StdoutSink) -> ExecO
             ExecOutcome::Continue(0)
         }
         Command::DoubleBracket { expr, inline_assignments } => {
-            run_double_bracket(expr, inline_assignments, shell)
+            run_double_bracket(expr, inline_assignments, shell, sink, err_sink)
         }
-        Command::ArithFor(clause) => run_arith_for(clause, shell, sink),
-        Command::Arith(expr) => run_arith(expr, shell),
-        Command::Select(clause) => run_select(clause, shell, sink),
+        Command::ArithFor(clause) => run_arith_for(clause, shell, sink, err_sink),
+        Command::Arith(expr) => run_arith(expr, shell, sink, err_sink),
+        Command::Select(clause) => run_select(clause, shell, sink, err_sink),
         Command::Redirected { inner, redirects } => {
-            run_redirected(inner, redirects, shell, sink)
+            run_redirected(inner, redirects, shell, sink, err_sink)
         }
-        Command::Coproc { name, body } => run_coproc(name, body, shell),
+        Command::Coproc { name, body } => run_coproc(name, body, shell, sink, err_sink),
     }
 }
 
@@ -566,14 +601,20 @@ impl RedirectScope {
     /// `target_fd` is not currently open, the saved slot is recorded as `-1`
     /// (Drop closes it back to unopened) — bash leaves a fresh high fd open
     /// only for the command's duration.
-    fn redirect(&mut self, new_fd: RawFd, target_fd: RawFd) -> Result<(), ()> {
+    fn redirect(
+        &mut self,
+        new_fd: RawFd,
+        target_fd: RawFd,
+        sink: &mut StdoutSink,
+        err_sink: &mut StderrSink,
+    ) -> Result<(), ()> {
         unsafe {
             // `dup` fails with EBADF when target_fd is not open (e.g. a fresh
             // fd>2 like `>&3` when fd 3 was never opened). That is fine — record
             // -1 so Drop closes target_fd back to its unopened state.
             let saved = libc::dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
-                eprintln!("huck: dup2: {}", io::Error::last_os_error());
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: dup2: {}", io::Error::last_os_error()); }
                 if saved >= 0 {
                     libc::close(saved);
                 }
@@ -597,20 +638,26 @@ impl RedirectScope {
 
     /// Apply one redirection to the real fds, saving the prior target for
     /// restore. Returns `Err(outcome)` on failure (diagnostic already printed).
-    fn apply(&mut self, redir: &Redirection, shell: &mut Shell) -> Result<(), ExecOutcome> {
+    fn apply(
+        &mut self,
+        redir: &Redirection,
+        shell: &mut Shell,
+        sink: &mut StdoutSink,
+        err_sink: &mut StderrSink,
+    ) -> Result<(), ExecOutcome> {
         use std::os::unix::io::IntoRawFd;
         if let RedirFd::Var(name) = &redir.fd {
-            return self.apply_var(name, redir, shell);
+            return self.apply_var(name, redir, shell, sink, err_sink);
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            eprintln!("huck: ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ambiguous redirect"); }
             return Err(ExecOutcome::Continue(1));
         };
         let target = target as RawFd;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell) {
+                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
@@ -618,7 +665,7 @@ impl RedirectScope {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            eprintln!("huck: {path}: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                             return Err(ExecOutcome::Continue(1));
                         }
                     },
@@ -635,7 +682,7 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                eprintln!("huck: {}: {e}", resolved_path(&resolved));
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -646,7 +693,7 @@ impl RedirectScope {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -665,7 +712,7 @@ impl RedirectScope {
                     // closed), dup2 the opened file onto the target, then close
                     // the temp fd. `redirect()` already records saved=-1 when
                     // dup(target) returns EBADF (target was free but not lowest).
-                    if self.redirect(new_fd, target).is_err() {
+                    if self.redirect(new_fd, target, sink, err_sink).is_err() {
                         unsafe { libc::close(new_fd) };
                         return Err(ExecOutcome::Continue(1));
                     }
@@ -680,16 +727,16 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        eprintln!("huck: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 // Validate the source fd is open before dup2 (bash: bad fd error).
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    eprintln!("huck: {src}: Bad file descriptor");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {src}: Bad file descriptor"); }
                     return Err(ExecOutcome::Continue(1));
                 }
-                if self.redirect(src, target).is_err() {
+                if self.redirect(src, target, sink, err_sink).is_err() {
                     return Err(ExecOutcome::Continue(1));
                 }
                 Ok(())
@@ -707,7 +754,7 @@ impl RedirectScope {
                 match spawn_heredoc_writer(&bytes) {
                     Ok((rfd, pid)) => {
                         self.heredoc_writers.push(pid);
-                        if self.redirect(rfd, target).is_err() {
+                        if self.redirect(rfd, target, sink, err_sink).is_err() {
                             unsafe { libc::close(rfd) };
                             return Err(ExecOutcome::Continue(1));
                         }
@@ -715,7 +762,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        eprintln!("huck: heredoc: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -726,7 +773,7 @@ impl RedirectScope {
                 match spawn_heredoc_writer(&bytes) {
                     Ok((rfd, pid)) => {
                         self.heredoc_writers.push(pid);
-                        if self.redirect(rfd, target).is_err() {
+                        if self.redirect(rfd, target, sink, err_sink).is_err() {
                             unsafe { libc::close(rfd) };
                             return Err(ExecOutcome::Continue(1));
                         }
@@ -734,7 +781,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        eprintln!("huck: heredoc: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -749,7 +796,14 @@ impl RedirectScope {
     /// shell process until an explicit `{var}>&-` (Close) or shell exit, so Drop
     /// must NOT close it. Explicit close via `{var}>&-` is handled in the
     /// `RedirOp::Close` arm above.
-    fn apply_var(&mut self, name: &str, redir: &Redirection, shell: &mut Shell) -> Result<(), ExecOutcome> {
+    fn apply_var(
+        &mut self,
+        name: &str,
+        redir: &Redirection,
+        shell: &mut Shell,
+        sink: &mut StdoutSink,
+        err_sink: &mut StderrSink,
+    ) -> Result<(), ExecOutcome> {
         use std::os::unix::io::IntoRawFd;
         // `{var}>&-` / `{var}<&-`: close the fd currently named by $var.
         if matches!(&redir.op, RedirOp::Close) {
@@ -757,7 +811,7 @@ impl RedirectScope {
             let fd: RawFd = match cur.trim().parse::<i32>() {
                 Ok(n) if n >= 0 => n,
                 _ => {
-                    eprintln!("huck: {name}: ambiguous redirect");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: ambiguous redirect"); }
                     return Err(ExecOutcome::Continue(1));
                 }
             };
@@ -771,7 +825,7 @@ impl RedirectScope {
         // a Dup source belongs to the shell and is left alone.
         let (src, owns_src): (RawFd, bool) = match &redir.op {
             RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell) {
+                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
                     Err(()) => return Err(ExecOutcome::Continue(1)),
                 };
@@ -779,7 +833,7 @@ impl RedirectScope {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            eprintln!("huck: {path}: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                             return Err(ExecOutcome::Continue(1));
                         }
                     },
@@ -795,7 +849,7 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                eprintln!("huck: {}: {e}", resolved_path(&resolved));
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -804,7 +858,7 @@ impl RedirectScope {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -816,12 +870,12 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        eprintln!("huck: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    eprintln!("huck: {src}: Bad file descriptor");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {src}: Bad file descriptor"); }
                     return Err(ExecOutcome::Continue(1));
                 }
                 (src, false)
@@ -834,7 +888,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        eprintln!("huck: heredoc: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -848,7 +902,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        eprintln!("huck: heredoc: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -864,7 +918,7 @@ impl RedirectScope {
                 if owns_src {
                     unsafe { libc::close(src) };
                 }
-                eprintln!("huck: {name}: {e}");
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {e}"); }
                 return Err(ExecOutcome::Continue(1));
             }
         };
@@ -991,10 +1045,11 @@ fn with_redirect_scope<F>(
     redirs: &[Redirection],
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
     run_inner: F,
 ) -> ExecOutcome
 where
-    F: FnOnce(&mut Shell, &mut StdoutSink) -> ExecOutcome,
+    F: FnOnce(&mut Shell, &mut StdoutSink, &mut StderrSink) -> ExecOutcome,
 {
     // Snapshot the procsub stack BEFORE expanding any redirect-target words.
     // Any process substitutions realized while expanding redirect words (e.g.
@@ -1015,7 +1070,7 @@ where
     // back the entries already applied (atomic, matching pre-v156 behavior).
     let force_terminal = redirs_write_stdout(redirs);
     for r in redirs {
-        if let Err(outcome) = scope.apply(r, shell) {
+        if let Err(outcome) = scope.apply(r, shell, sink, err_sink) {
             scope.reap_heredoc_writers();
             drop(scope);
             drain_procsubs(shell, procsub_base);
@@ -1041,7 +1096,7 @@ where
     } else {
         sink
     };
-    let outcome = run_inner(shell, inner_sink);
+    let outcome = run_inner(shell, inner_sink, err_sink);
     let _ = io::stdout().flush();
     // Reap the forked heredoc/herestring writers now that the inner body has run
     // (the consumer has drained and closed its read end, so the writers have
@@ -1093,13 +1148,14 @@ fn run_builtin_with_redirects(
     redirs: &[Redirection],
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let procsub_base = shell.procsub_pending.len();
     let _ = io::stdout().flush();
 
     let mut scope = RedirectScope::new();
     for r in redirs {
-        if let Err(outcome) = scope.apply(r, shell) {
+        if let Err(outcome) = scope.apply(r, shell, sink, err_sink) {
             scope.reap_heredoc_writers();
             drop(scope);
             drain_procsubs(shell, procsub_base);
@@ -1119,18 +1175,43 @@ fn run_builtin_with_redirects(
             builtins::run_builtin(&resolved.program, &resolved.args, out, err, shell)
         }
     };
+    // Materialize the stderr writer from the err_sink. In the capture-stdout
+    // arm below we MUST split the `sink` and `err_sink` borrows manually because
+    // `*buf` (used as `out`) is already a mutable borrow of `sink`; the helper
+    // `err_writer` (which takes both sinks) would conflict. So in the capture
+    // arm we hand-roll the err writer here, mirroring `err_writer`'s logic.
     let outcome = if write_to_fd1 {
         let mut out = io::stdout();
-        let mut err = io::stderr();
-        run(&mut out, &mut err, shell)
+        let mut err = err_writer(err_sink, sink);
+        run(&mut out, &mut *err, shell)
     } else {
+        // Capture stdout sink with no fd-1 redirect. Mirror `err_writer` inline
+        // so the `*buf` borrow for `out` doesn't fight the err_sink construction.
         match sink {
-            // Unreachable Terminal arm folded into `write_to_fd1` above.
             StdoutSink::Terminal => unreachable!("Terminal handled by write_to_fd1"),
-            StdoutSink::Capture(buf) => {
-                let mut err = io::stderr();
-                run(*buf, &mut err, shell)
-            }
+            StdoutSink::Capture(buf) => match err_sink {
+                StderrSink::Terminal => {
+                    let mut err = io::stderr();
+                    run(*buf, &mut err, shell)
+                }
+                StderrSink::Capture(ebuf) => {
+                    let mut err: &mut Vec<u8> = ebuf;
+                    run(*buf, &mut err, shell)
+                }
+                StderrSink::Merged => {
+                    // Both stdout and stderr converge on the same capture buf.
+                    // Rust's aliasing rules forbid handing `&mut *buf` to both
+                    // `out` and `err`; route them through a thread-local-style
+                    // side buffer for stderr then append after the call. Order
+                    // is preserved as out-then-err (builtins use fd 1 then fd 2
+                    // in series in practice); not byte-strict-interleaved but
+                    // matches a single-writer line discipline well enough.
+                    let mut side: Vec<u8> = Vec::new();
+                    let outcome = run(*buf, &mut side, shell);
+                    buf.extend_from_slice(&side);
+                    outcome
+                }
+            },
         }
     };
     let _ = io::stdout().flush();
@@ -1159,9 +1240,10 @@ fn run_redirected(
     redirects: &[crate::command::Redirection],
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    with_redirect_scope(redirects, shell, sink, |shell, inner_sink| {
-        run_command(inner, shell, inner_sink)
+    with_redirect_scope(redirects, shell, sink, err_sink, |shell, inner_sink, inner_err_sink| {
+        run_command(inner, shell, inner_sink, inner_err_sink)
     })
 }
 
@@ -1169,21 +1251,31 @@ fn run_redirected(
 /// exit status satisfies the loop's polarity. `break` ends the loop;
 /// `continue` jumps to the next condition test; `exit` propagates; a
 /// pending SIGINT (Ctrl-C) ends the loop with status 130.
-fn run_while(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_while(
+    clause: &WhileClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_while_inner(clause, shell, sink);
+    let result = run_while_inner(clause, shell, sink, err_sink);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_while_inner(
+    clause: &WhileClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let mut last = ExecOutcome::Continue(0);
     loop {
         if let Some(o) = check_interrupt(shell) {
             return o;
         }
         shell.err_suppressed_depth += 1;
-        let cond = execute_sequence_body(&clause.condition, shell, sink);
+        let cond = execute_sequence_body(&clause.condition, shell, sink, err_sink);
         shell.err_suppressed_depth -= 1;
         let keep_going = match cond {
             ExecOutcome::Exit(_) | ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
@@ -1197,7 +1289,7 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
         if !keep_going {
             break;
         }
-        match execute_sequence_body(&clause.body, shell, sink) {
+        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1228,20 +1320,30 @@ fn run_while_inner(clause: &WhileClause, shell: &mut Shell, sink: &mut StdoutSin
 /// `break` ends the loop, `continue` advances to the next value,
 /// `exit` propagates, and a pending SIGINT (Ctrl-C) ends the loop
 /// with status 130.
-fn run_for(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_for(
+    clause: &ForClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_for_inner(clause, shell, sink);
+    let result = run_for_inner(clause, shell, sink, err_sink);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_for_inner(
+    clause: &ForClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     // bash accepts any word as the loop variable at parse time but requires a
     // valid identifier at runtime; a bad name is a NON-FATAL error (status 1,
     // body not run, the surrounding list continues). Reserved words like `if`
     // are valid identifiers and fall through to run normally.
     if !crate::builtins::is_valid_name(&clause.var) {
-        eprintln!("huck: `{}': not a valid identifier", clause.var);
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: `{}': not a valid identifier", clause.var); }
         return ExecOutcome::Continue(1);
     }
 
@@ -1252,7 +1354,7 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
     let mut values: Vec<String> = Vec::new();
     if clause.has_in {
         for word in &clause.words {
-            match glob_expand_word(word, shell) {
+            match glob_expand_word(word, shell, &mut *err_writer(err_sink, sink)) {
                 Ok(v) => values.extend(v),
                 Err(()) => return ExecOutcome::Continue(1),
             }
@@ -1281,10 +1383,10 @@ fn run_for_inner(clause: &ForClause, shell: &mut Shell, sink: &mut StdoutSink) -
             return o;
         }
         if shell.try_set(&clause.var, value).is_err() {
-            eprintln!("huck: {}: readonly variable", clause.var);
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: readonly variable", clause.var); }
             return ExecOutcome::Continue(1);
         }
-        match execute_sequence_body(&clause.body, shell, sink) {
+        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1402,13 +1504,18 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 /// Runs a standalone `((expr))` arith command. Per bash semantics, the
 /// command exits 0 if the expression's value is non-zero, 1 if zero;
 /// arith errors emit a diagnostic to stderr and exit 1.
-fn run_arith(body: &crate::lexer::Word, shell: &mut Shell) -> ExecOutcome {
+fn run_arith(
+    body: &crate::lexer::Word,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
     match crate::expand::eval_arith_word(body, shell) {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
-            eprintln!("huck: ((: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ((: {e}"); }
             ExecOutcome::Continue(1)
         }
     }
@@ -1422,9 +1529,10 @@ fn run_arith_for(
     clause: &crate::command::ArithForClause,
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_arith_for_inner(clause, shell, sink);
+    let result = run_arith_for_inner(clause, shell, sink, err_sink);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
@@ -1433,6 +1541,7 @@ fn run_arith_for_inner(
     clause: &crate::command::ArithForClause,
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
 
     // 1. Eval init once (if present).
@@ -1442,7 +1551,7 @@ fn run_arith_for_inner(
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
-        eprintln!("huck: ((: {e}");
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ((: {e}"); }
         return ExecOutcome::Continue(1);
     }
 
@@ -1462,7 +1571,7 @@ fn run_arith_for_inner(
             Some(c) => match crate::expand::eval_arith_word(c, shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("huck: ((: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ((: {e}"); }
                     return ExecOutcome::Continue(1);
                 }
             },
@@ -1472,7 +1581,7 @@ fn run_arith_for_inner(
         }
 
         // 3. Execute body.
-        match execute_sequence_body(&clause.body, shell, sink) {
+        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1503,7 +1612,7 @@ fn run_arith_for_inner(
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
-            eprintln!("huck: ((: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ((: {e}"); }
             return ExecOutcome::Continue(1);
         }
     }
@@ -1526,21 +1635,31 @@ fn read_line_into_reply(shell: &mut Shell) -> ExecOutcome {
 /// is read into `REPLY` per prompt via the `read` builtin. An empty list
 /// runs the body zero times; `break`/`continue N` bubble via the v79
 /// loop infrastructure. Wrapped to keep a single `loop_depth` return path.
-fn run_select(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_select(
+    clause: &crate::command::SelectClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     shell.loop_depth = shell.loop_depth.saturating_add(1);
-    let result = run_select_inner(clause, shell, sink);
+    let result = run_select_inner(clause, shell, sink, err_sink);
     shell.loop_depth = shell.loop_depth.saturating_sub(1);
     result
 }
 
-fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_select_inner(
+    clause: &crate::command::SelectClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
 
     // 1. Build the item list: expand `in WORDS` (Some), or "$@" (None).
     let items: Vec<String> = match &clause.words {
         Some(words) => {
             let mut v = Vec::new();
             for w in words {
-                match glob_expand_word(w, shell) {
+                match glob_expand_word(w, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(g) => v.extend(g),
                     Err(()) => return ExecOutcome::Continue(1),
                 }
@@ -1620,7 +1739,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
 
         // 3c. Bind NAME (honor readonly like the other loop runners).
         if shell.try_set(&clause.var, selection).is_err() {
-            eprintln!("huck: {}: readonly variable", clause.var);
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: readonly variable", clause.var); }
             return ExecOutcome::Continue(1);
         }
 
@@ -1630,7 +1749,7 @@ fn run_select_inner(clause: &crate::command::SelectClause, shell: &mut Shell, si
         }
 
         // 3e. Run the body; bubble flow with the v79 decrement-and-bubble pattern.
-        match execute_sequence_body(&clause.body, shell, sink) {
+        match execute_sequence_body(&clause.body, shell, sink, err_sink) {
             ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
             ExecOutcome::LoopBreak(1, st) => {
                 last = ExecOutcome::Continue(st);
@@ -1694,7 +1813,12 @@ fn case_item_matches(item: &CaseItem, subject: &str, shell: &mut Shell) -> bool 
 /// terminator decides what happens: `;;` stops, `;&` runs the next
 /// clause's body unconditionally, `;;&` resumes pattern-testing.
 /// `case` is not a loop — `break`/`continue` propagate out unchanged.
-fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_case(
+    clause: &CaseClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let subject = expand_assignment(&clause.subject, shell);
     xtrace_compound(
         shell,
@@ -1715,7 +1839,7 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
         }
         match &item.body {
             None => last = ExecOutcome::Continue(0),
-            Some(body) => match execute_sequence_body(body, shell, sink) {
+            Some(body) => match execute_sequence_body(body, shell, sink, err_sink) {
                 ExecOutcome::Exit(code) => return ExecOutcome::Exit(code),
                 ExecOutcome::LoopBreak(n, st) => return ExecOutcome::LoopBreak(n, st),
                 ExecOutcome::LoopContinue(n) => return ExecOutcome::LoopContinue(n),
@@ -1742,9 +1866,14 @@ fn run_case(clause: &CaseClause, shell: &mut Shell, sink: &mut StdoutSink) -> Ex
 /// Runs an `if` clause: evaluate the condition, then run the first
 /// branch whose condition succeeds (exit 0), or the `else` body, or
 /// nothing (status 0). An `exit` anywhere inside propagates.
-fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_if(
+    clause: &IfClause,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     shell.err_suppressed_depth += 1;
-    let cond = execute_sequence_body(&clause.condition, shell, sink);
+    let cond = execute_sequence_body(&clause.condition, shell, sink, err_sink);
     shell.err_suppressed_depth -= 1;
     if matches!(
         cond,
@@ -1754,11 +1883,11 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
         return cond;
     }
     if matches!(cond, ExecOutcome::Continue(0)) {
-        return execute_sequence_body(&clause.then_body, shell, sink);
+        return execute_sequence_body(&clause.then_body, shell, sink, err_sink);
     }
     for elif in &clause.elif_branches {
         shell.err_suppressed_depth += 1;
-        let elif_cond = execute_sequence_body(&elif.condition, shell, sink);
+        let elif_cond = execute_sequence_body(&elif.condition, shell, sink, err_sink);
         shell.err_suppressed_depth -= 1;
         if matches!(
             elif_cond,
@@ -1768,11 +1897,11 @@ fn run_if(clause: &IfClause, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOu
             return elif_cond;
         }
         if matches!(elif_cond, ExecOutcome::Continue(0)) {
-            return execute_sequence_body(&elif.body, shell, sink);
+            return execute_sequence_body(&elif.body, shell, sink, err_sink);
         }
     }
     if let Some(else_body) = &clause.else_body {
-        return execute_sequence_body(else_body, shell, sink);
+        return execute_sequence_body(else_body, shell, sink, err_sink);
     }
     ExecOutcome::Continue(0)
 }
@@ -1785,8 +1914,10 @@ fn run_double_bracket(
     expr: &TestExpr,
     inline_assignments: &[crate::command::Assignment],
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    let snap = match apply_inline_assignments(inline_assignments, shell) {
+    let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
@@ -1797,7 +1928,7 @@ fn run_double_bracket(
         Ok(true)  => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg)  => {
-            eprintln!("huck: [[: {msg}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: [[: {msg}"); }
             ExecOutcome::Continue(2)
         }
     };
@@ -2056,13 +2187,18 @@ fn eval_binary(
     }
 }
 
-fn run_pipeline(pipeline: &Pipeline, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_pipeline(
+    pipeline: &Pipeline,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let outcome = if pipeline.commands.len() == 1 {
         // Single-stage pipeline: run directly in the parent shell (no fork needed).
         // This covers both Simple commands and compound commands as single stages.
-        run_command(&pipeline.commands[0], shell, sink)
+        run_command(&pipeline.commands[0], shell, sink, err_sink)
     } else {
-        run_multi_stage(&pipeline.commands, shell, sink)
+        run_multi_stage(&pipeline.commands, shell, sink, err_sink)
     };
     if pipeline.negate {
         // Negate the exit status only; $PIPESTATUS (set by the stage(s) above)
@@ -2088,7 +2224,8 @@ fn is_negated_pipeline(cmd: &Command) -> bool {
 fn run_background_subshell(
     cmd: &Command,
     shell: &mut Shell,
-    _sink: &mut StdoutSink,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
@@ -2111,12 +2248,12 @@ fn run_background_subshell(
             let id = shell.jobs.add_with_pgroup(pid, vec![pid], display, job_control);
             // bash suppresses automatic job notices inside a subshell environment / completion funcs
             if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-                eprintln!("[{id}] {pid}");
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "[{id}] {pid}"); }
             }
             ExecOutcome::Continue(0)
         }
         Err(e) => {
-            eprintln!("huck: fork: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
             ExecOutcome::Continue(1)
         }
     }
@@ -2125,7 +2262,8 @@ fn run_background_subshell(
 fn run_background_sequence(
     pipeline: &Pipeline,
     shell: &mut Shell,
-    _sink: &mut StdoutSink,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
     source: &str,
 ) -> ExecOutcome {
     let display = display_command(source);
@@ -2153,7 +2291,7 @@ fn run_background_sequence(
         match File::open("/dev/null") {
             Ok(f) => f.into_raw_fd(),
             Err(e) => {
-                eprintln!("huck: /dev/null: {e}");
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: /dev/null: {e}"); }
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2193,7 +2331,7 @@ fn run_background_sequence(
                         w
                     }
                     Err(e) => {
-                        eprintln!("huck: pipe: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                         drain_procsubs(shell, procsub_base);
                         cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -2227,7 +2365,7 @@ fn run_background_sequence(
                     spawned_pids.push(pid);
                 }
                 Err(e) => {
-                    eprintln!("huck: fork: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
                     drain_procsubs(shell, procsub_base);
                     cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2245,7 +2383,7 @@ fn run_background_sequence(
             } else {
                 &[]
             };
-        let snap = match apply_inline_assignments(inline_assignments, shell) {
+        let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
@@ -2267,7 +2405,7 @@ fn run_background_sequence(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    let path = match expand_single(word, shell) {
+                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
@@ -2281,7 +2419,7 @@ fn run_background_sequence(
                     match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            eprintln!("huck: {path}: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2303,7 +2441,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            eprintln!("huck: heredoc: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2324,7 +2462,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            eprintln!("huck: heredoc: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2348,7 +2486,7 @@ fn run_background_sequence(
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -2365,7 +2503,7 @@ fn run_background_sequence(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -2376,7 +2514,7 @@ fn run_background_sequence(
                         }
                     }
                     Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -2391,7 +2529,7 @@ fn run_background_sequence(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -2412,7 +2550,7 @@ fn run_background_sequence(
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -2430,7 +2568,7 @@ fn run_background_sequence(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -2442,7 +2580,7 @@ fn run_background_sequence(
                         }
                     }
                     Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -2458,7 +2596,7 @@ fn run_background_sequence(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -2487,7 +2625,7 @@ fn run_background_sequence(
                     w
                 }
                 Err(e) => {
-                    eprintln!("huck: pipe: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -2522,7 +2660,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                eprintln!("huck: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -2539,7 +2677,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                eprintln!("huck: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -2560,7 +2698,7 @@ fn run_background_sequence(
         let spawn_result = match classify_stage(stage_cmd, shell) {
             StageKind::External(simple) => {
                 went_external = true;
-                spawn_external_with_fds(simple, shell, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child)
+                spawn_external_with_fds(simple, shell, sink, err_sink, stdin_fd, stdout_fd, stderr_fd, pgid_target, &fds_to_close_in_child)
             }
             StageKind::InProcess(cmd) => {
                 went_external = false;
@@ -2573,7 +2711,7 @@ fn run_background_sequence(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("huck: {e}");
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                 if !went_external {
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
@@ -2649,7 +2787,7 @@ fn run_background_sequence(
     let id = shell.jobs.add_with_pgroup(pgid, spawned_pids, display, job_control);
     // bash suppresses automatic job notices inside a subshell environment / completion funcs
     if shell.is_interactive && !shell.in_subshell && !shell.in_completion {
-        eprintln!("[{id}] {last_pid}");
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "[{id}] {last_pid}"); }
     }
     // Non-blocking drain: close parent fds and attempt WNOHANG reap of inner
     // procsub children. We don't block here because a long-running inner producer
@@ -2740,7 +2878,11 @@ enum ResolvedRedirect {
     Append(String),
 }
 
-fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String, ()> {
+fn expand_single(
+    word: &crate::lexer::Word,
+    shell: &mut Shell,
+    err: &mut dyn std::io::Write,
+) -> Result<String, ()> {
     // Redirect targets do NOT undergo pathname expansion in v10 (per spec).
     // We call `expand` directly and require exactly one field, preserving the
     // ambiguous-redirect contract for word-splitting that produces 0 or >1.
@@ -2748,7 +2890,7 @@ fn expand_single(word: &crate::lexer::Word, shell: &mut Shell) -> Result<String,
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        eprintln!("huck: ambiguous redirect");
+        e!(err, "huck: ambiguous redirect");
         Err(())
     }
 }
@@ -2766,21 +2908,29 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
 /// Glob-expands one word honoring `shopt` flags. On a `failglob` no-match,
 /// prints the bash-style "no match" error to stderr and returns `Err(())`,
 /// signaling the caller to abort the command/loop with status 1.
-fn glob_expand_word(word: &crate::lexer::Word, shell: &mut Shell) -> Result<Vec<String>, ()> {
+fn glob_expand_word(
+    word: &crate::lexer::Word,
+    shell: &mut Shell,
+    err: &mut dyn std::io::Write,
+) -> Result<Vec<String>, ()> {
     // Borrow note: take the owned `Copy` opts before the mutable `expand`
     // borrow, so the immutable borrow ends first.
     let opts = shell.glob_opts();
     let fields = expand(word, shell);
     let exp = glob_expand_fields_opts(fields, opts);
     if !exp.failglob_unmatched.is_empty() {
-        eprintln!("huck: no match: {}", exp.failglob_unmatched.join(" "));
+        e!(err, "huck: no match: {}", exp.failglob_unmatched.join(" "));
         return Err(());
     }
     Ok(exp.words)
 }
 
-fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32> {
-    let prog_fields = match glob_expand_word(&cmd.program, shell) {
+fn resolve(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    err: &mut dyn std::io::Write,
+) -> Result<ResolvedCommand, i32> {
+    let prog_fields = match glob_expand_word(&cmd.program, shell, err) {
         Ok(v) => v,
         Err(()) => return Err(1),
     };
@@ -2788,7 +2938,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
         return Err(status);
     }
     if prog_fields.is_empty() {
-        eprintln!("huck: command not found:");
+        e!(err, "huck: command not found:");
         return Err(127);
     }
     let mut iter = prog_fields.into_iter();
@@ -2825,7 +2975,7 @@ fn resolve(cmd: &ExecCommand, shell: &mut Shell) -> Result<ResolvedCommand, i32>
             }
             continue;
         }
-        let fields = match glob_expand_word(word, shell) {
+        let fields = match glob_expand_word(word, shell, err) {
             Ok(v) => v,
             Err(()) => return Err(1),
         };
@@ -2966,15 +3116,20 @@ fn status_code(status: &ExitStatus) -> i32 {
 // commands do. This matches bash: after `if cond; then ...; fi`, `$PIPESTATUS`
 // reflects the last inner pipeline (e.g. `cond`), not the `if` itself. Do NOT
 // add a set_pipestatus call to a compound runner.
-fn run_single(cmd: &SimpleCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_single(
+    cmd: &SimpleCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     let outcome = match cmd {
-        SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink),
+        SimpleCommand::Exec(exec) => run_exec_single(exec, shell, sink, err_sink),
         SimpleCommand::Assign(items, line) => {
             // Stamp $LINENO before expanding RHS so it reflects this assignment's line.
             if *line != 0 {
                 shell.current_lineno = *line;
             }
-            ExecOutcome::Continue(run_assignment_list(items, shell))
+            ExecOutcome::Continue(run_assignment_list(items, shell, sink, err_sink))
         }
     };
     // $PIPESTATUS reflects this leaf command's exit status. break/continue
@@ -3013,6 +3168,7 @@ pub(crate) fn call_function(
     args: Vec<String>,
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let saved = std::mem::take(&mut shell.positional_args);
     let saved_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
@@ -3034,7 +3190,7 @@ pub(crate) fn call_function(
     shell.sync_call_arrays();
     shell.local_scopes.push(std::collections::HashMap::new());
 
-    let result = run_command(&body, shell, sink);
+    let result = run_command(&body, shell, sink, err_sink);
 
     // RETURN trap fires with $? set to the function's status AND the
     // function's positional args still in scope. After the action runs,
@@ -3084,7 +3240,8 @@ pub(crate) fn call_function_body(
         None => return ExecOutcome::Continue(1),
     };
     let mut sink = StdoutSink::Terminal;
-    call_function(name, body, args, shell, &mut sink)
+    let mut err_sink = StderrSink::Terminal;
+    call_function(name, body, args, shell, &mut sink, &mut err_sink)
 }
 
 fn ps4(shell: &mut Shell) -> String {
@@ -3204,7 +3361,12 @@ fn drain_procsubs_nonblocking(shell: &mut Shell, base: usize) {
 /// error keeps status 1). Shared by `SimpleCommand::Assign` (a bare assignment)
 /// and the assignment/redirect-only `ExecCommand` (empty program word, e.g.
 /// `VAR=val 2>err`).
-fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) -> i32 {
+fn run_assignment_list(
+    items: &[crate::command::Assignment],
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> i32 {
     // Reset so only THESE assignments' RHS command substitutions count.
     shell.set_last_cmd_sub_status(None);
     let mut st = 0;
@@ -3213,11 +3375,11 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
         // For namerefs, skip the early readonly check and let assign() check the
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            eprintln!("huck: {name}: readonly variable");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: readonly variable"); }
             st = 1;
             break;
         }
-        if apply_one_assignment(a, shell).is_err() {
+        if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
             st = 1;
             break;
         }
@@ -3236,7 +3398,12 @@ fn run_assignment_list(items: &[crate::command::Assignment], shell: &mut Shell) 
     st
 }
 
-fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) -> ExecOutcome {
+fn run_exec_single(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     // Stamp $LINENO from the parse-time source line before any expansion.
     // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
     // from clobbering a real current line.
@@ -3273,7 +3440,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single(&inner, shell, sink);
+        return run_exec_single(&inner, shell, sink, err_sink);
     }
 
     // `builtin <decl-builtin> …` (v142): a declaration builtin reached via `builtin`
@@ -3300,7 +3467,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single(&inner, shell, sink);
+        return run_exec_single(&inner, shell, sink, err_sink);
     }
 
     // Assignment/redirect-only command: no program word, just inline assignments
@@ -3327,7 +3494,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
             if let RedirOp::File { mode: crate::command::FileMode::ReadOnly, target } = &redir.op
                 && redir.target_fd() == Some(0)
             {
-                let path = match expand_single(target, shell) {
+                let path = match expand_single(target, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
                     Err(()) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(1); }
                 };
@@ -3339,7 +3506,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                         ExecOutcome::Continue(0)
                     }
                     Err(e) => {
-                        eprintln!("huck: {path}: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                         ExecOutcome::Continue(1)
                     }
                 };
@@ -3356,18 +3523,19 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // applied but makes the status reflect the open failure (bash:
         // `x=1 </missing` → `x` is set, rc 1) — with_redirect_scope returns the
         // open failure before running the body, so its status wins.
-        let st = run_assignment_list(&cmd.inline_assignments, shell);
+        let st = run_assignment_list(&cmd.inline_assignments, shell, sink, err_sink);
         let outcome = with_redirect_scope(
             &cmd.redirects,
             shell,
             sink,
-            move |_shell, _sink| ExecOutcome::Continue(st),
+            err_sink,
+            move |_shell, _sink, _err_sink| ExecOutcome::Continue(st),
         );
         drain_procsubs(shell, procsub_base);
         return outcome;
     }
 
-    let mut resolved = match resolve(cmd, shell) {
+    let mut resolved = match resolve(cmd, shell, &mut *err_writer(err_sink, sink)) {
         Ok(r) => r,
         Err(code) => { drain_procsubs(shell, procsub_base); return ExecOutcome::Continue(code); }
     };
@@ -3393,7 +3561,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
                     break;
                 }
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
-                    eprintln!("huck: command: {s}: invalid option");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: command: {s}: invalid option"); }
                     drain_procsubs(shell, procsub_base);
                     return ExecOutcome::Continue(2);
                 }
@@ -3449,15 +3617,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // a documented divergence — bash runs it. The `builtin`-led forms are handled
     // by the pre-resolve interception with decl_args rebuilt.)
     if require_builtin && builtins::is_declaration_command(&resolved.program) {
-        eprintln!(
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err,
             "huck: builtin: {}: declaration builtins must not be wrapped by `command builtin`",
             resolved.program
-        );
+        ); }
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
-        eprintln!("huck: builtin: {}: not a shell builtin", resolved.program);
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: builtin: {}: not a shell builtin", resolved.program); }
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -3481,7 +3649,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // targets (regular builtins and externals). Persistent-scope targets
     // (control builtins, special builtins per POSIX 2.14, and functions per
     // POSIX 2.9.1) skip the restore step.
-    let snap = match apply_inline_assignments(&cmd.inline_assignments, shell) {
+    let snap = match apply_inline_assignments(&cmd.inline_assignments, shell, sink, err_sink) {
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
@@ -3567,7 +3735,7 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     // after xtrace, but before the dispatch machinery. Its inline assignments
     // persist (special builtin), so no restore on return.
     if resolved.program == "exec" {
-        let outcome = run_exec_builtin(&resolved, cmd, shell);
+        let outcome = run_exec_builtin(&resolved, cmd, shell, sink, err_sink);
         drain_procsubs(shell, procsub_base);
         return outcome;
     }
@@ -3582,15 +3750,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // exactly like compounds/externals. Control builtins persist their inline
         // assignments (POSIX special-builtin), so no restore on the redirect-open
         // failure path inside the helper.
-        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink)
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink, err_sink)
     } else if !bypass_functions && let Some(body) = shell.functions.get(&resolved.program).cloned() {
         let name = resolved.program.clone();
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink,
-                move |shell, inner_sink| call_function(&name, body, args, shell, inner_sink))
+            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
+                move |shell, inner_sink, inner_err_sink| call_function(&name, body, args, shell, inner_sink, inner_err_sink))
         } else {
-            call_function(&name, body, args, shell, sink)
+            call_function(&name, body, args, shell, sink, err_sink)
         }
     // eval/source must run their commands with the ENCLOSING sink (so `$(eval …)`
     // / `$(source …)` captures the output) and honour redirects — like a function
@@ -3600,22 +3768,20 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
     } else if resolved.program == "eval" {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink,
-                move |shell, inner_sink| builtins::eval_in_sink(&args, shell, inner_sink))
+            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
+                move |shell, inner_sink, inner_err_sink| builtins::eval_in_sink(&args, shell, inner_sink, inner_err_sink))
         } else {
-            builtins::eval_in_sink(&args, shell, sink)
+            builtins::eval_in_sink(&args, shell, sink, err_sink)
         }
     } else if resolved.program == "source" || resolved.program == "." {
         let args = resolved.args;
         if has_any_redirect(cmd) {
-            with_redirect_scope(&cmd.redirects, shell, sink,
-                move |shell, inner_sink| {
-                    let mut err = io::stderr();
-                    builtins::source_in_sink(&args, &mut err, shell, inner_sink)
+            with_redirect_scope(&cmd.redirects, shell, sink, err_sink,
+                move |shell, inner_sink, inner_err_sink| {
+                    builtins::source_in_sink(&args, shell, inner_sink, inner_err_sink)
                 })
         } else {
-            let mut err = io::stderr();
-            builtins::source_in_sink(&args, &mut err, shell, sink)
+            builtins::source_in_sink(&args, shell, sink, err_sink)
         }
     } else if builtins::is_builtin(&resolved.program) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
@@ -3624,15 +3790,15 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         // honor source order and fd>2 uniformly — no more last-wins bridge. On a
         // redirect-open failure the helper rolls back and returns Continue(1); we
         // still owe the inline-assignment restore for temporary-scope targets.
-        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink)
+        run_builtin_with_redirects(&resolved, &cmd.redirects, shell, sink, err_sink)
     } else {
         // v156 task 4: lower the FULL ordered redirect list (on the original
         // ExecCommand, not the bridged ResolvedCommand) into a child replay plan.
         // Files are opened (and heredoc writers forked) in the parent here; the
         // child replays the dup2/close ops in source order. This handles fd>2,
         // `<&` dup-in, `N>&-` close, and `<>` uniformly with fds 0/1/2.
-        match build_child_redir_plan(&cmd.redirects, shell) {
-            Ok(plan) => run_subprocess(&resolved, plan, shell, sink),
+        match build_child_redir_plan(&cmd.redirects, shell, sink, err_sink) {
+            Ok(plan) => run_subprocess(&resolved, plan, shell, sink, err_sink),
             Err(code) => {
                 if !persistent {
                     restore_inline_assignments(snap, shell);
@@ -3764,7 +3930,12 @@ unsafe fn restore_exec_signals(prev: [libc::sighandler_t; 3]) {
 /// originals instead of restoring them. A redirect that fails to open prints a
 /// diagnostic, rolls back any already-applied redirects (the scope's Drop), and
 /// returns `Err` (atomic: all-or-nothing).
-fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(), ()> {
+fn apply_redirects_permanently(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> Result<(), ()> {
     let mut scope = RedirectScope::new();
 
     // Apply each redirection in source order via the ordered RedirectScope
@@ -3773,7 +3944,7 @@ fn apply_redirects_permanently(cmd: &ExecCommand, shell: &mut Shell) -> Result<(
     // On failure, `scope` Drop rolls back any already-applied redirects
     // atomically (temporary semantics) and we return Err(()) to the caller.
     for redir in &cmd.redirects {
-        if scope.apply(redir, shell).is_err() {
+        if scope.apply(redir, shell, sink, err_sink).is_err() {
             // Reap any heredoc writers spawned by already-applied redirs before
             // the scope drops (Drop is writer-agnostic) — else a zombie until
             // shell exit. Mirrors with_redirect_scope's error path.
@@ -3820,11 +3991,13 @@ fn run_exec_builtin(
     resolved: &ResolvedCommand,
     cmd: &ExecCommand,
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let flags = match parse_exec_flags(&resolved.args) {
         Ok(f) => f,
         Err(msg) => {
-            eprintln!("huck: {msg}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {msg}"); }
             return ExecOutcome::Continue(2);
         }
     };
@@ -3838,7 +4011,7 @@ fn run_exec_builtin(
     };
     if has_any_redirect(cmd) {
         flush_stdout();
-        if apply_redirects_permanently(cmd, shell).is_err() {
+        if apply_redirects_permanently(cmd, shell, sink, err_sink).is_err() {
             return ExecOutcome::Continue(1);
         }
     }
@@ -3858,7 +4031,7 @@ fn run_exec_builtin(
             } else {
                 ("not found", 127)
             };
-            eprintln!("huck: exec: {name}: {msg}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: exec: {name}: {msg}"); }
             return exit_or_continue(code, shell);
         }
     };
@@ -3887,7 +4060,7 @@ fn run_exec_builtin(
         Some(libc::ENOENT) => 127,
         _ => 126, // EACCES / ENOEXEC / EISDIR / etc.: "cannot execute".
     };
-    eprintln!("huck: exec: {name}: {err}");
+    { let mut errw = err_writer(err_sink, sink); e!(&mut *errw, "huck: exec: {name}: {err}"); }
     exit_or_continue(code, shell)
 }
 
@@ -4003,6 +4176,8 @@ fn alloc_high_fd(src_fd: RawFd) -> io::Result<RawFd> {
 fn build_child_redir_plan(
     redirects: &[Redirection],
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> Result<ChildRedirPlan, i32> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     let mut plan = ChildRedirPlan { ops: Vec::new(), held: Vec::new(), heredoc_writers: Vec::new() };
@@ -4019,7 +4194,7 @@ fn build_child_redir_plan(
                 let fd: i32 = match cur.trim().parse::<i32>() {
                     Ok(n) if n >= 0 => n,
                     _ => {
-                        eprintln!("huck: {name}: ambiguous redirect");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: ambiguous redirect"); }
                         return Err(1);
                     }
                 };
@@ -4031,14 +4206,14 @@ fn build_child_redir_plan(
             // duping to `high`; a Dup source belongs to the shell.
             let (src, owns_src): (RawFd, bool) = match &redir.op {
                 RedirOp::File { mode, target: word } => {
-                    let path = match expand_single(word, shell) {
+                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                         Ok(p) => p,
                         Err(()) => return Err(1),
                     };
                     let file: File = match mode {
                         FileMode::ReadOnly => match File::open(&path) {
                             Ok(f) => f,
-                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                         },
                         FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                             let resolved = match mode {
@@ -4051,13 +4226,13 @@ fn build_child_redir_plan(
                             };
                             match open_resolved(&resolved) {
                                 Ok(f) => f,
-                                Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                                Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
                             }
                         }
                         FileMode::ReadWrite => {
                             match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                                 Ok(f) => f,
-                                Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                                Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                             }
                         }
                     };
@@ -4066,7 +4241,7 @@ fn build_child_redir_plan(
                 RedirOp::Dup { source, .. } => {
                     let src = match resolve_fd_target(source, shell) {
                         Ok(fd) => fd,
-                        Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
                     };
                     (src, false)
                 }
@@ -4074,7 +4249,7 @@ fn build_child_redir_plan(
                     let bytes = expand_assignment(body, shell).into_bytes();
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
                     }
                 }
                 RedirOp::HereString(w) => {
@@ -4082,7 +4257,7 @@ fn build_child_redir_plan(
                     bytes.push(b'\n');
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
                     }
                 }
                 RedirOp::Close => unreachable!("Close handled above"),
@@ -4091,7 +4266,7 @@ fn build_child_redir_plan(
                 Ok(h) => h,
                 Err(e) => {
                     if owns_src { unsafe { libc::close(src) }; }
-                    eprintln!("huck: {name}: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {e}"); }
                     return Err(1);
                 }
             };
@@ -4114,20 +4289,20 @@ fn build_child_redir_plan(
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            eprintln!("huck: ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ambiguous redirect"); }
             return Err(1);
         };
         let target = target as i32;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell) {
+                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
-                        Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                     },
                     FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                         let resolved = match mode {
@@ -4140,13 +4315,13 @@ fn build_child_redir_plan(
                         };
                         match open_resolved(&resolved) {
                             Ok(f) => f,
-                            Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
                         }
                     }
                     FileMode::ReadWrite => {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f,
-                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                         }
                     }
                 };
@@ -4163,7 +4338,7 @@ fn build_child_redir_plan(
                 // number is valid in the child after fork.
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
                 };
                 plan.ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -4180,7 +4355,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
                 }
             }
             RedirOp::HereString(w) => {
@@ -4194,7 +4369,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { eprintln!("huck: heredoc: {e}"); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
                 }
             }
         }
@@ -4219,6 +4394,8 @@ fn build_child_redir_plan(
 fn build_child_extra_ops(
     redirects: &[Redirection],
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> Result<(Vec<ChildRedirOp>, Vec<std::os::fd::OwnedFd>), i32> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     let extra = stage_extra_redirects(redirects);
@@ -4226,20 +4403,20 @@ fn build_child_extra_ops(
     let mut held: Vec<OwnedFd> = Vec::new();
     for redir in &extra {
         let Some(target) = redir.target_fd() else {
-            eprintln!("huck: ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ambiguous redirect"); }
             return Err(1);
         };
         let target = target as i32;
         match &redir.op {
             RedirOp::File { mode, target: word } => {
-                let path = match expand_single(word, shell) {
+                let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                     Ok(p) => p,
                     Err(()) => return Err(1),
                 };
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
-                        Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                     },
                     FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                         let resolved = match mode {
@@ -4250,13 +4427,13 @@ fn build_child_extra_ops(
                         };
                         match open_resolved(&resolved) {
                             Ok(f) => f,
-                            Err(e) => { eprintln!("huck: {}: {e}", resolved_path(&resolved)); return Err(1); }
+                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
                         }
                     }
                     FileMode::ReadWrite => {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f,
-                            Err(e) => { eprintln!("huck: {path}: {e}"); return Err(1); }
+                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
                         }
                     }
                 };
@@ -4267,7 +4444,7 @@ fn build_child_extra_ops(
             RedirOp::Dup { source, .. } => {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { eprintln!("huck: {e}"); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
                 };
                 ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -4294,6 +4471,7 @@ fn run_subprocess(
     mut plan: ChildRedirPlan,
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     let interactive = shell.job_control_active() && matches!(sink, StdoutSink::Terminal);
 
@@ -4380,7 +4558,7 @@ fn run_subprocess(
                             .find(|j| j.id == job_id)
                             .map(|j| crate::jobs::notification_line(j, '+'))
                             .unwrap_or_default();
-                        eprintln!("\n{line}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
                         // The command was STOPPED: its process substitutions are
                         // still alive (tied to the stopped job), so the drain in
                         // run_exec_single's epilogue must be non-blocking.
@@ -4426,14 +4604,14 @@ fn run_subprocess(
                 match child.wait() {
                     Ok(status) => {
                         if let Some(e) = copy_err {
-                            eprintln!("huck: {}: {e}", cmd.program);
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
                             ExecOutcome::Continue(1)
                         } else {
                             ExecOutcome::Continue(status_code(&status))
                         }
                     }
                     Err(e) => {
-                        eprintln!("huck: {}: {e}", cmd.program);
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
                         ExecOutcome::Continue(1)
                     }
                 }
@@ -4452,7 +4630,7 @@ fn run_subprocess(
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
-            eprintln!("huck: command not found: {}", cmd.program);
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: command not found: {}", cmd.program); }
             ExecOutcome::Continue(127)
         }
         Err(e) => {
@@ -4460,7 +4638,7 @@ fn run_subprocess(
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
-            eprintln!("huck: {}: {e}", cmd.program);
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
             ExecOutcome::Continue(1)
         }
     }
@@ -4478,13 +4656,19 @@ enum PipelineStage {
 /// NAME[1] (write), publish NAME_PID, $!, and a job. Returns 0 on a successful
 /// spawn (the coproc runs asynchronously), 1 on pipe/fork failure. coproc
 /// ALWAYS forks (no builtin/function fast-path).
-fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
+fn run_coproc(
+    name: &str,
+    body: &Command,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+) -> ExecOutcome {
     // v157 single-active: warn (but proceed) if a coproc is already live.
     if let Some(existing) = shell.coprocs.first() {
-        eprintln!(
+        { let mut err = err_writer(err_sink, sink); e!(&mut *err,
             "huck: warning: execute_coproc: coproc [{}:{}] still exists",
             existing.pid, existing.name
-        );
+        ); }
     }
     // make_pipe() returns (read_end, write_end).
     // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
@@ -4492,7 +4676,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
     let (in_r, in_w) = match make_pipe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("huck: coproc: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -4503,7 +4687,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
                 libc::close(in_r);
                 libc::close(in_w);
             }
-            eprintln!("huck: coproc: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -4529,7 +4713,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
                 libc::close(out_r);
                 libc::close(out_w);
             }
-            eprintln!("huck: coproc: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -4551,7 +4735,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
                 libc::close(out_r);
                 libc::close(in_w);
             }
-            eprintln!("huck: coproc: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -4568,7 +4752,7 @@ fn run_coproc(name: &str, body: &Command, shell: &mut Shell) -> ExecOutcome {
                 libc::close(read_fd);
                 libc::close(in_w);
             }
-            eprintln!("huck: coproc: {e}");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -4624,6 +4808,7 @@ fn run_multi_stage(
     commands: &[Command],
     shell: &mut Shell,
     sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     use std::os::fd::FromRawFd;
 
@@ -4694,7 +4879,7 @@ fn run_multi_stage(
                         w
                     }
                     Err(e) => {
-                        eprintln!("huck: pipe: {e}");
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                         // Clean up all held fds.
                         drain_procsubs(shell, procsub_base);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -4711,7 +4896,7 @@ fn run_multi_stage(
                                 w
                             }
                             Err(e) => {
-                                eprintln!("huck: pipe: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                                 drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -4739,7 +4924,7 @@ fn run_multi_stage(
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
-                    eprintln!("huck: fork: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
                     drain_procsubs(shell, procsub_base);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
@@ -4755,7 +4940,7 @@ fn run_multi_stage(
             } else {
                 &[]
             };
-        let snap = match apply_inline_assignments(inline_assignments, shell) {
+        let snap = match apply_inline_assignments(inline_assignments, shell, sink, err_sink) {
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
@@ -4786,7 +4971,7 @@ fn run_multi_stage(
                         parent_held.retain(|&fd| fd != r);
                         unsafe { libc::close(r); }
                     }
-                    let path = match expand_single(word, shell) {
+                    let path = match expand_single(word, shell, &mut *err_writer(err_sink, sink)) {
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
@@ -4799,7 +4984,7 @@ fn run_multi_stage(
                     match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            eprintln!("huck: {path}: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -4827,7 +5012,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            eprintln!("huck: heredoc: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -4852,7 +5037,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            eprintln!("huck: heredoc: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -4881,7 +5066,7 @@ fn run_multi_stage(
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stdout() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -4897,7 +5082,7 @@ fn run_multi_stage(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -4907,7 +5092,7 @@ fn run_multi_stage(
                         }
                     }
                     Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -4921,7 +5106,7 @@ fn run_multi_stage(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -4941,7 +5126,7 @@ fn run_multi_stage(
             if let Command::Simple(SimpleCommand::Exec(exec)) = stage_cmd {
                 match &exec.slot_stderr() {
                     Some(r @ (Redirect::Truncate(w) | Redirect::Clobber(w))) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -4958,7 +5143,7 @@ fn run_multi_stage(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -4969,7 +5154,7 @@ fn run_multi_stage(
                         }
                     }
                     Some(Redirect::Append(w)) => {
-                        let path = match expand_single(w, shell) {
+                        let path = match expand_single(w, shell, &mut *err_writer(err_sink, sink)) {
                             Ok(p) => p,
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
@@ -4984,7 +5169,7 @@ fn run_multi_stage(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                eprintln!("huck: {path}: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -5015,7 +5200,7 @@ fn run_multi_stage(
                     w
                 }
                 Err(e) => {
-                    eprintln!("huck: pipe: {e}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -5034,7 +5219,7 @@ fn run_multi_stage(
                             w
                         }
                         Err(e) => {
-                            eprintln!("huck: pipe: {e}");
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -5073,7 +5258,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                eprintln!("huck: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -5093,7 +5278,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                eprintln!("huck: {e}");
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -5127,6 +5312,8 @@ fn run_multi_stage(
                 spawn_external_with_fds(
                     simple,
                     shell,
+                    sink,
+                    err_sink,
                     stdin_fd,
                     stdout_fd,
                     stderr_fd,
@@ -5156,7 +5343,7 @@ fn run_multi_stage(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("huck: {e}");
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
                 // For InProcess (fork failed), close the fds we were going to
                 // pass. For External, they were already consumed by OwnedFd.
                 if !went_external {
@@ -5253,7 +5440,7 @@ fn run_multi_stage(
     }
 
     // ---- Wait for all stages ------------------------------------------------
-    let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, interactive);
+    let last_status = wait_pipeline_raw(&pipeline_stages, &stage_pids, first_pid, shell, sink, err_sink, interactive);
 
     // Reap any forked heredoc/herestring writer processes (M-120). They are not
     // pipeline stages, so they are excluded from $PIPESTATUS and the wait above;
@@ -5313,11 +5500,14 @@ enum PipelineWaitResult {
 /// `Stopped`. The terminal is NOT reclaimed here — the caller does it.
 ///
 /// For non-interactive pipelines: waits on each pid sequentially.
+#[allow(clippy::too_many_arguments)]
 fn wait_pipeline_raw(
     stages: &[PipelineStage],
     stage_pids: &[i32],
     first_pid: Option<i32>,
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
     interactive: bool,
 ) -> PipelineWaitResult {
     // All stages are Forked; initialize status slots to None.
@@ -5371,7 +5561,7 @@ fn wait_pipeline_raw(
                         .find(|j| j.id == job_id)
                         .map(|j| crate::jobs::notification_line(j, '+'))
                         .unwrap_or_default();
-                    eprintln!("\n{line}");
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "\n{line}"); }
                     return PipelineWaitResult::Stopped(sig);
                 }
                 if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
@@ -5442,6 +5632,8 @@ type AssignmentSnapshot = Vec<(String, Option<crate::shell_state::Variable>)>;
 fn apply_inline_assignments(
     assignments: &[crate::command::Assignment],
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> Result<AssignmentSnapshot, AssignmentSnapshot> {
     let mut snap: AssignmentSnapshot = Vec::with_capacity(assignments.len());
     for a in assignments {
@@ -5469,10 +5661,10 @@ fn apply_inline_assignments(
         let prior = shell.snapshot_var(&snap_name);
         // For namerefs, skip the early readonly check; assign() checks the resolved target.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            eprintln!("huck: {name}: readonly variable");
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: readonly variable"); }
             return Err(snap);
         }
-        if apply_one_assignment(a, shell).is_err() {
+        if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
             return Err(snap);
         }
         // Bash semantics: inline-prefix assignments are exported for the
@@ -5567,6 +5759,7 @@ fn is_array_value_word(word: &crate::lexer::Word) -> bool {
 pub(crate) fn apply_one_assignment(
     a: &crate::command::Assignment,
     shell: &mut Shell,
+    err: &mut dyn std::io::Write,
 ) -> Result<(), ()> {
     use crate::command::AssignTarget;
 
@@ -5598,10 +5791,10 @@ pub(crate) fn apply_one_assignment(
                     // Skip for namerefs — the individual element writes go through
                     // assign() which checks the resolved target.
                     if !shell.is_nameref(target_name) && shell.is_readonly(target_name) {
-                        eprintln!("huck: {target_name}: readonly variable");
+                        e!(err, "huck: {target_name}: readonly variable");
                         return Err(());
                     }
-                    let new_pairs = build_associative_map(elements, shell)?;
+                    let new_pairs = build_associative_map(elements, shell, err)?;
                     for (k, v) in new_pairs {
                         shell
                             .set_associative_element(name, k, v)
@@ -5609,12 +5802,12 @@ pub(crate) fn apply_one_assignment(
                     }
                     return Ok(());
                 } else {
-                    let pairs = build_associative_map(elements, shell)?;
+                    let pairs = build_associative_map(elements, shell, err)?;
                     return shell.replace_associative(name, pairs).map_err(|_| ());
                 }
             }
             (AssignTarget::Bare(name), None) => {
-                eprintln!(
+                e!(err,
                     "huck: {name}: {} not valid on associative array",
                     if a.append { "scalar append" } else { "scalar assignment" }
                 );
@@ -5634,7 +5827,7 @@ pub(crate) fn apply_one_assignment(
                 }
             }
             (AssignTarget::Indexed { name, .. }, Some(_)) => {
-                eprintln!(
+                e!(err,
                     "huck: {name}: cannot assign array literal to associative array element"
                 );
                 return Err(());
@@ -5651,7 +5844,7 @@ pub(crate) fn apply_one_assignment(
                 // [i]=v elements. Readonly pre-check avoids a partial write.
                 // Skip for namerefs — assign() checks the resolved target.
                 if !shell.is_nameref(name) && shell.is_readonly(name) {
-                    eprintln!("huck: {name}: readonly variable");
+                    e!(err, "huck: {name}: readonly variable");
                     return Err(());
                 }
                 // Starting auto-index: max+1 for an existing array; 1 for a
@@ -5666,11 +5859,11 @@ pub(crate) fn apply_one_assignment(
                 } else {
                     0
                 };
-                let map = expand_array_elements(elements, name, shell, start)?;
+                let map = expand_array_elements(elements, name, shell, start, err)?;
                 shell.extend_indexed(name, map).map_err(|_| ())
             } else {
                 // a=(elements): replace whole array.
-                let map = build_array_map(elements, name, shell)?;
+                let map = build_array_map(elements, name, shell, err)?;
                 shell.replace_indexed(name, map).map_err(|_| ())
             }
         }
@@ -5718,8 +5911,8 @@ pub(crate) fn apply_one_assignment(
         (AssignTarget::Indexed { name, subscript }, None) => {
             let idx = match crate::expand::eval_subscript(subscript, shell, name) {
                 Ok(i) => i,
-                Err(e) => {
-                    eprintln!("huck: {e}");
+                Err(msg) => {
+                    e!(err, "huck: {msg}");
                     return Err(());
                 }
             };
@@ -5741,7 +5934,7 @@ pub(crate) fn apply_one_assignment(
         }
         // Subscripted lvalue + compound array RHS: bash rejects this.
         (AssignTarget::Indexed { name, .. }, Some(_)) => {
-            eprintln!("huck: {name}: cannot assign array literal to array element");
+            e!(err, "huck: {name}: cannot assign array literal to array element");
             Err(())
         }
     }
@@ -5753,17 +5946,18 @@ pub(crate) fn apply_one_assignment(
 fn build_associative_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     shell: &mut Shell,
+    err: &mut dyn std::io::Write,
 ) -> Result<Vec<(String, String)>, ()> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for e in elements {
-        let key = match &e.subscript {
+    for elem in elements {
+        let key = match &elem.subscript {
             Some(sw) => crate::expand::eval_subscript_key(sw, shell),
             None => {
-                eprintln!("huck: associative array initializer requires [key]=value form");
+                e!(err, "huck: associative array initializer requires [key]=value form");
                 return Err(());
             }
         };
-        let val = crate::param_expansion::expand_word_to_string(&e.value, shell);
+        let val = crate::param_expansion::expand_word_to_string(&elem.value, shell);
         if let Some(slot) = out.iter_mut().find(|(k, _)| k == &key) {
             slot.1 = val;
         } else {
@@ -5792,27 +5986,28 @@ fn expand_array_elements(
     name: &str,
     shell: &mut Shell,
     start: usize,
+    err: &mut dyn std::io::Write,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
     let mut map: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     let mut implicit = start;
-    for e in elements {
-        match &e.subscript {
+    for elem in elements {
+        match &elem.subscript {
             Some(sw) => {
                 let idx = match crate::expand::eval_subscript(sw, shell, name) {
                     Ok(i) => i,
                     Err(msg) => {
-                        eprintln!("huck: {msg}");
+                        e!(err, "huck: {msg}");
                         return Err(());
                     }
                 };
-                map.insert(idx, expand_assignment(&e.value, shell));
+                map.insert(idx, expand_assignment(&elem.value, shell));
                 implicit = idx + 1;
                 if shell.pending_fatal_pe_error.is_some() {
                     return Err(());
                 }
             }
             None => {
-                for field in glob_expand_word(&e.value, shell)? {
+                for field in glob_expand_word(&elem.value, shell, err)? {
                     map.insert(implicit, field);
                     implicit += 1;
                 }
@@ -5829,8 +6024,9 @@ fn build_array_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     name: &str,
     shell: &mut Shell,
+    err: &mut dyn std::io::Write,
 ) -> Result<std::collections::BTreeMap<usize, String>, ()> {
-    expand_array_elements(elements, name, shell, 0)
+    expand_array_elements(elements, name, shell, 0, err)
 }
 
 // ----- job-control helpers -------------------------------------------------
@@ -5971,6 +6167,7 @@ pub fn fork_and_run_in_subshell(
         //    The child's stdout is now fd 1 (the dup2'd pipe end), so
         //    StdoutSink::Terminal routes writes to the right destination.
         let mut sink = StdoutSink::Terminal;
+        let mut err_sink = StderrSink::Terminal;
         // Anti-recursion guard: when a Command::Subshell is used as a
         // pipeline stage, the pipeline forks via this helper.  If we called
         // run_command here, it would fork AGAIN.  Instead, dispatch via
@@ -5980,7 +6177,7 @@ pub fn fork_and_run_in_subshell(
         // (the common case), preserving the single-fork invariant.
         let outcome = match cmd {
             Command::Subshell { body } => execute(body, shell, "(subshell)"),
-            other => run_command(other, shell, &mut sink),
+            other => run_command(other, shell, &mut sink, &mut err_sink),
         };
         // 9. Translate outcome to an 8-bit exit status.
         let status: i32 = match outcome {
@@ -6056,9 +6253,12 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
 /// Returns the child's pid. The `Child` handle is `mem::forget`'d (matching
 /// the B-09 pattern) since the caller is responsible for `waitpid`.
 ///
+#[allow(clippy::too_many_arguments)]
 fn spawn_external_with_fds(
     cmd: &SimpleCommand,
     shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
     stdin_fd: RawFd,
     stdout_fd: RawFd,
     stderr_fd: RawFd,
@@ -6078,7 +6278,7 @@ fn spawn_external_with_fds(
     };
 
     // Resolve (expand) the command — same path as run_exec_single / run_multi_stage.
-    let resolved = resolve(exec, shell)
+    let resolved = resolve(exec, shell, &mut *err_writer(err_sink, sink))
         .map_err(|code| io::Error::other(format!("resolve failed with code {code}")))?;
 
     if shell.shell_options.xtrace {
@@ -6102,7 +6302,7 @@ fn spawn_external_with_fds(
     // consume (fd>2, `<&` dup-in, `N>&-` close, `<>`) into an ordered replay
     // applied in the child AFTER the bridge stdio/dup. `extra_held` keeps the
     // parent-opened files alive (FD_CLOEXEC) until after spawn.
-    let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell)
+    let (extra_ops, extra_held) = build_child_extra_ops(&exec.redirects, shell, sink, err_sink)
         .map_err(|code| io::Error::other(format!("redirect failed with code {code}")))?;
 
     let mut process = ProcessCommand::new(&resolved.program);
@@ -6700,7 +6900,7 @@ mod tests {
             crate::lexer::WordPart::Literal { text: "*".to_string(), quoted: false }
         ]);
         let mut shell = crate::shell_state::Shell::new();
-        let result = expand_single(&word, &mut shell);
+        let result = expand_single(&word, &mut shell, &mut std::io::stderr());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -7105,7 +7305,7 @@ mod tests {
             bare_assign("A", lit_word("1")),
             bare_assign("B", Word(vec![WordPart::Var { name: "A".to_string(), quoted: false }])),
         ];
-        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
+        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
         assert_eq!(shell.get("A"), Some("1"));
         assert_eq!(shell.get("B"), Some("1"));
         assert!(shell.is_exported("A"));
@@ -7117,7 +7317,7 @@ mod tests {
     fn restore_inline_assignments_restores_prior_unset_state() {
         let mut shell = Shell::new();
         let assigns = vec![bare_assign("FOO", lit_word("bar"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
+        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
         assert_eq!(shell.get("FOO"), Some("bar"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), None);
@@ -7129,7 +7329,7 @@ mod tests {
         shell.set("FOO", "outer".to_string());
         assert!(!shell.is_exported("FOO"));
         let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
+        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
         assert_eq!(shell.get("FOO"), Some("inner"));
         assert!(shell.is_exported("FOO"));
         restore_inline_assignments(snap, &mut shell);
@@ -7142,7 +7342,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("FOO", "outer".to_string());
         let assigns = vec![bare_assign("FOO", lit_word("inner"))];
-        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
+        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));
         assert!(shell.is_exported("FOO"));
@@ -7156,7 +7356,7 @@ mod tests {
             bare_assign("FOO", lit_word("a")),
             bare_assign("FOO", lit_word("b")),
         ];
-        let snap = apply_inline_assignments(&assigns, &mut shell).expect("ok");
+        let snap = { let mut sink = StdoutSink::Terminal; let mut err_sink = StderrSink::Terminal; apply_inline_assignments(&assigns, &mut shell, &mut sink, &mut err_sink) }.expect("ok");
         assert_eq!(shell.get("FOO"), Some("b"));
         restore_inline_assignments(snap, &mut shell);
         assert_eq!(shell.get("FOO"), Some("outer"));

@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::executor::StdoutSink;
+use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
 /// The captured result of [`Engine::capture`].
@@ -134,6 +134,9 @@ impl Engine {
     ) -> i32 {
         // Preserve the shell's current $0 + positionals (don't clobber them).
         let args = self.cell.borrow().positional_args.clone();
+        // Task 3: stderr always inherits the process today. Task 7 will introduce
+        // the public `Engine::exec` builder that lets callers ask for Capture/Merged.
+        let mut err_sink = StderrSink::Terminal;
         let code = crate::shell::run_program_in_sink(
             src,
             None,
@@ -141,6 +144,7 @@ impl Engine {
             label,
             push_main_frame,
             sink,
+            &mut err_sink,
             &self.cell,
         );
         // Mirror the run's exit code into `$?` so `last_status()` reflects it even

@@ -185,6 +185,7 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
 /// frame is pushed before executing and popped after, so that BASH_SOURCE and
 /// BASH_LINENO are populated at the top level and FUNCNAME gains the `main`
 /// entry inside functions. For `-c` and other non-file modes pass `false`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_program_in_sink(
     contents: &str,
     argv0: Option<String>,
@@ -192,6 +193,7 @@ pub fn run_program_in_sink(
     label: &str,
     push_main_frame: bool,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut shell = shell_cell.borrow_mut();
@@ -211,13 +213,12 @@ pub fn run_program_in_sink(
         shell.sync_call_arrays();
     }
 
-    let mut err = std::io::stderr();
     let outcome = crate::builtins::run_sourced_contents_in_sink(
         contents,
         std::path::Path::new(label),
-        &mut err,
         &mut shell,
         sink,
+        err_sink,
     );
 
     if push_main_frame {
@@ -249,7 +250,8 @@ pub fn run_program(
     shell_cell: &Rc<RefCell<Shell>>,
 ) -> i32 {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    run_program_in_sink(contents, argv0, args, label, push_main_frame, &mut sink, shell_cell)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    run_program_in_sink(contents, argv0, args, label, push_main_frame, &mut sink, &mut err_sink, shell_cell)
 }
 
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
@@ -339,12 +341,13 @@ pub fn process_line_in_sink(
     shell: &mut Shell,
     expand_aliases: bool,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) };
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
-            eprintln!("huck: syntax error{}", crate::lex_error_message(e));
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
             return ExecOutcome::Continue(2);
         }
     };
@@ -360,7 +363,7 @@ pub fn process_line_in_sink(
                 (t, l)
             }
             Err(e) => {
-                eprintln!("huck: syntax error{}", crate::lex_error_message(e));
+                { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
                 return ExecOutcome::Continue(2);
             }
         }
@@ -369,10 +372,10 @@ pub fn process_line_in_sink(
     };
 
     match command::parse_with_lines(tokens, lines) {
-        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink),
+        Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
-            eprintln!("huck: syntax error: {}", crate::parse_error_message(e));
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error: {}", crate::parse_error_message(e)); }
             ExecOutcome::Continue(2)
         }
     }
@@ -382,7 +385,8 @@ pub fn process_line_in_sink(
 /// callers (REPL, traps, helpers) that run at top level (stdout → terminal).
 pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    process_line_in_sink(line, shell, expand_aliases, &mut sink)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    process_line_in_sink(line, shell, expand_aliases, &mut sink, &mut err_sink)
 }
 
 #[cfg(test)]

@@ -1186,7 +1186,7 @@ fn builtin_export_decl(
                     any_error = true;
                     continue;
                 }
-                if crate::executor::apply_one_assignment(a, shell).is_err() {
+                if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                     any_error = true;
                     continue;
                 }
@@ -1448,7 +1448,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                 if let Some(fold) = minus_case_fold {
                     shell.set_case_fold(&name, fold);
                 }
-                if crate::executor::apply_one_assignment(a, shell).is_err() {
+                if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                     exit = 1;
                     continue;
                 }
@@ -1571,7 +1571,7 @@ fn builtin_readonly_decl(
                         exit = 1;
                         continue;
                     }
-                    if crate::executor::apply_one_assignment(a, shell).is_err() {
+                    if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                         exit = 1;
                         continue;
                     }
@@ -1970,7 +1970,7 @@ fn builtin_declare_decl(
                 exit = 1;
                 continue;
             }
-            if crate::executor::apply_one_assignment(a, shell).is_err() {
+            if crate::executor::apply_one_assignment(a, shell, err).is_err() {
                 exit = 1;
                 continue;
             }
@@ -3421,7 +3421,7 @@ fn builtin_printf(
                 ]),
                 append: false,
             };
-            if crate::executor::apply_one_assignment(&assignment, shell).is_err() {
+            if crate::executor::apply_one_assignment(&assignment, shell, err).is_err() {
                 // apply_one_assignment already printed the specific diagnostic
                 // (readonly / type mismatch / bad subscript).
                 return ExecOutcome::Continue(1);
@@ -5329,6 +5329,7 @@ pub(crate) fn eval_in_sink(
     args: &[String],
     shell: &mut Shell,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     if args.is_empty() {
         return ExecOutcome::Continue(0);
@@ -5341,14 +5342,15 @@ pub(crate) fn eval_in_sink(
     // `+ eval '…'` line was already emitted at the outer depth before dispatch.
     let saved = shell.xtrace_depth;
     shell.xtrace_depth += 1;
-    let r = crate::shell::process_line_in_sink(&joined, shell, true, sink);
+    let r = crate::shell::process_line_in_sink(&joined, shell, true, sink, err_sink);
     shell.xtrace_depth = saved;
     r
 }
 
 fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    eval_in_sink(args, shell, &mut sink)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    eval_in_sink(args, shell, &mut sink, &mut err_sink)
 }
 
 /// `let EXPR...` — evaluate each argument as an arithmetic expression,
@@ -5946,30 +5948,35 @@ fn builtin_help(
 
 pub(crate) fn source_in_sink(
     args: &[String],
-    err: &mut dyn Write,
     shell: &mut Shell,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    if args.is_empty() {
-        e!(err, "huck: .: usage: . filename [arguments]");
-        return ExecOutcome::Continue(2);
-    }
-    if shell.source_depth >= 64 {
-        e!(err, "huck: .: maximum source depth (64) exceeded");
-        return ExecOutcome::Continue(1);
+    // Materialize a fallback err writer for the early-bail diagnostics that don't
+    // recurse into the executor.
+    {
+        let mut err = crate::executor::err_writer(err_sink, sink);
+        if args.is_empty() {
+            e!(&mut *err, "huck: .: usage: . filename [arguments]");
+            return ExecOutcome::Continue(2);
+        }
+        if shell.source_depth >= 64 {
+            e!(&mut *err, "huck: .: maximum source depth (64) exceeded");
+            return ExecOutcome::Continue(1);
+        }
     }
     let filename = &args[0];
     let path = match resolve_source_path(filename, shell) {
         Some(p) => p,
         None => {
-            e!(err, "huck: .: {filename}: file not found");
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: .: {filename}: file not found"); }
             return ExecOutcome::Continue(1);
         }
     };
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            e!(err, "huck: .: {}: {e}", path.display());
+            { let mut errw = crate::executor::err_writer(err_sink, sink); e!(&mut *errw, "huck: .: {}: {e}", path.display()); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5990,7 +5997,7 @@ pub(crate) fn source_in_sink(
         kind: crate::shell_state::FrameKind::Source,
     });
     shell.sync_call_arrays();
-    let result = run_sourced_contents_in_sink(&contents, &path, err, shell, sink);
+    let result = run_sourced_contents_in_sink(&contents, &path, shell, sink, err_sink);
     shell.call_stack.pop();
     shell.sync_call_arrays();
     shell.source_depth -= 1;
@@ -6002,8 +6009,10 @@ pub(crate) fn source_in_sink(
 }
 
 fn builtin_source(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let _ = err; // err writer not used: source_in_sink materializes from sinks
     let mut sink = crate::executor::StdoutSink::Terminal;
-    source_in_sink(args, err, shell, &mut sink)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    source_in_sink(args, shell, &mut sink, &mut err_sink)
 }
 
 fn resolve_source_path(
@@ -6049,9 +6058,9 @@ fn is_unterminated(e: &crate::command::ParseError) -> bool {
 pub(crate) fn run_sourced_contents_in_sink(
     contents: &str,
     path: &std::path::Path,
-    err: &mut dyn Write,
     shell: &mut crate::shell_state::Shell,
     sink: &mut crate::executor::StdoutSink,
+    err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let mut last_status = shell.last_status();
 
@@ -6094,12 +6103,15 @@ pub(crate) fn run_sourced_contents_in_sink(
         let total = tokens.len();
         if total == 0 {
             if let Some((le, foff)) = terr {
-                e!(err,
-                    "huck: {}: line {}: syntax error{}",
-                    path.display(),
-                    line_of(start + foff),
-                    crate::lex_error_message(le)
-                );
+                {
+                    let mut err = crate::executor::err_writer(err_sink, sink);
+                    e!(&mut *err,
+                        "huck: {}: line {}: syntax error{}",
+                        path.display(),
+                        line_of(start + foff),
+                        crate::lex_error_message(le)
+                    );
+                }
                 last_status = 2;
                 start = next_line_start(start + foff);
                 prev_end = start;
@@ -6137,12 +6149,15 @@ pub(crate) fn run_sourced_contents_in_sink(
                         prev_end = start;
                         continue 'outer;
                     }
-                    e!(err,
-                        "huck: {}: line {}: syntax error{}",
-                        path.display(),
-                        line_of(start + foff),
-                        crate::lex_error_message(le.clone())
-                    );
+                    {
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        e!(&mut *err,
+                            "huck: {}: line {}: syntax error{}",
+                            path.display(),
+                            line_of(start + foff),
+                            crate::lex_error_message(le.clone())
+                        );
+                    }
                     last_status = 2;
                     start = next_line_start(start + foff);
                     prev_end = start;
@@ -6160,12 +6175,13 @@ pub(crate) fn run_sourced_contents_in_sink(
                     let unit_end_abs = start + offsets[unit_end_idx];
 
                     if shell.shell_options.verbose {
-                        let _ = write!(err, "{}", &contents[prev_end..unit_end_abs]);
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        let _ = write!(&mut *err, "{}", &contents[prev_end..unit_end_abs]);
                     }
                     prev_end = unit_end_abs;
 
                     let span = &contents[unit_start_abs..unit_end_abs];
-                    let outcome = crate::executor::execute_with_sink(&seq, shell, span, sink);
+                    let outcome = crate::executor::execute_with_sink(&seq, shell, span, sink, err_sink);
 
                     match outcome {
                         ExecOutcome::Continue(c) => {
@@ -6226,24 +6242,30 @@ pub(crate) fn run_sourced_contents_in_sink(
                         continue 'outer;
                     }
                     let (le, foff) = terr.clone().unwrap();
-                    e!(err,
-                        "huck: {}: line {}: syntax error{}",
-                        path.display(),
-                        line_of(start + foff),
-                        crate::lex_error_message(le)
-                    );
+                    {
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        e!(&mut *err,
+                            "huck: {}: line {}: syntax error{}",
+                            path.display(),
+                            line_of(start + foff),
+                            crate::lex_error_message(le)
+                        );
+                    }
                     last_status = 2;
                     start = next_line_start(start + foff);
                     prev_end = start;
                     continue 'outer;
                 }
                 Err(e) => {
-                    e!(err,
-                        "huck: {}: line {}: syntax error: {}",
-                        path.display(),
-                        line_of(start + offsets[unit_start_idx]),
-                        crate::parse_error_message(e)
-                    );
+                    {
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        e!(&mut *err,
+                            "huck: {}: line {}: syntax error: {}",
+                            path.display(),
+                            line_of(start + offsets[unit_start_idx]),
+                            crate::parse_error_message(e)
+                        );
+                    }
                     last_status = 2;
                     for t in iter.by_ref() {
                         if matches!(t, crate::lexer::Token::Newline) {
@@ -6273,8 +6295,10 @@ pub(crate) fn run_sourced_contents(
     err: &mut dyn Write,
     shell: &mut crate::shell_state::Shell,
 ) -> ExecOutcome {
+    let _ = err; // err is unused: in-sink fn materializes writer from sinks.
     let mut sink = crate::executor::StdoutSink::Terminal;
-    run_sourced_contents_in_sink(contents, path, err, shell, &mut sink)
+    let mut err_sink = crate::executor::StderrSink::Terminal;
+    run_sourced_contents_in_sink(contents, path, shell, &mut sink, &mut err_sink)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
