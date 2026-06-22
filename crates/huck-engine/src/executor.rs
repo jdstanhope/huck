@@ -2106,7 +2106,14 @@ fn run_select_inner(
                     StdoutSink::Terminal => {
                         let _ = writeln!(io::stdout());
                     }
-                    StdoutSink::Capture(buf) => buf.push(b'\n'),
+                    StdoutSink::Capture(buf) => {
+                        buf.push(b'\n');
+                        crate::callbacks_thread_local::with_callbacks(|cb| {
+                            if let Some(cb) = cb {
+                                cb.push_stdout(b"\n");
+                            }
+                        });
+                    }
                 }
                 return last;
             }
@@ -3887,6 +3894,11 @@ fn run_exec_single(
                     Ok(bytes) => {
                         if let StdoutSink::Capture(buf) = sink {
                             buf.extend_from_slice(&bytes);
+                            crate::callbacks_thread_local::with_callbacks(|cb| {
+                                if let Some(cb) = cb {
+                                    cb.push_stdout(&bytes);
+                                }
+                            });
                         }
                         ExecOutcome::Continue(0)
                     }
