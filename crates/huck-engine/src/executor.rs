@@ -276,7 +276,17 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// must complete before their output is interpolated. Spawning real
 /// background children whose pids the parent's JobTable doesn't track
 /// would let them escape `wait`/`jobs` and litter the terminal.
+///
+/// Streaming-callback contract (v207 fixup): command substitution captures
+/// inner output and interpolates it back into the parent's command line — the
+/// bytes never reach the script's OUTERMOST stdout. So for the duration of
+/// this call we suspend the thread-local callbacks pointer; otherwise the
+/// builtin-path `LineDispatchWriter` and the external-path `with_callbacks`
+/// dispatch in `stream_loop::external_capture_loop` would leak hidden bytes
+/// (e.g. `$(echo hidden)`) into `on_stdout_line` callbacks. The guard's Drop
+/// restores the pointer on every exit path (including panics).
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    let _suspend = crate::callbacks_thread_local::suspend();
     // Command substitution must complete before its output is interpolated, so
     // ALL backgrounding is ignored here: the trailing `&` (seq.background) and
     // any mid-list `&` separators (Connector::Amp) are run synchronously.

@@ -61,3 +61,25 @@ pub(crate) fn with_callbacks<R>(f: impl FnOnce(Option<&mut Callbacks<'_>>) -> R)
         None => f(None),
     })
 }
+
+/// Suspend callback dispatch for the duration of the returned guard. The
+/// thread-local pointer is saved on entry and restored on Drop. Used by
+/// inner-capture scopes (command substitution `$(…)`, backticks `` `…` ``) so
+/// their captured output doesn't reach the embedder's streaming callbacks —
+/// the contract is that callbacks fire only for bytes that flow to the
+/// script's OUTERMOST stdout (the one that becomes `Output.stdout`).
+#[must_use = "guard must be held for the synchronous duration of the inner-capture scope"]
+pub(crate) struct SuspendGuard {
+    prev: Option<CallbacksPtr>,
+}
+
+impl Drop for SuspendGuard {
+    fn drop(&mut self) {
+        CALLBACKS_PTR.with(|c| c.set(self.prev));
+    }
+}
+
+pub(crate) fn suspend() -> SuspendGuard {
+    let prev = CALLBACKS_PTR.with(|c| c.replace(None));
+    SuspendGuard { prev }
+}

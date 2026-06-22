@@ -39,7 +39,12 @@ check 'external-only'   '/bin/sh -c "echo x; echo y"'
 check 'mixed'           'echo bi; /bin/sh -c "echo ext"; echo bo'
 check 'pipeline'        'echo hi | tr a-z A-Z'
 check 'redirect-2to1'   'echo a; echo b 2>&1'
-check 'long-output'     'for i in {1..50}; do echo line-$i; done'
+# `$(seq 1 50)` exercises an inner-capture cmdsub — its output must NOT leak
+# into the streaming callbacks (only `line-$i` from the for-body should).
+check 'long-output'     'for i in $(seq 1 50); do echo line-$i; done'
+# Regression guard for the v207 task-8 fixup: the executor must suspend
+# callbacks across $(…) so hidden cmdsub output never reaches on_stdout_line.
+check 'cmdsub-no-leak'  'x=$(echo hidden); echo visible'
 
 if [ $FAIL -ne 0 ]; then
     echo "engine_stream_consistency_check FAILED" >&2
