@@ -36,6 +36,7 @@ pub(crate) mod stdin_pipe;
 pub mod test_builtin;
 pub(crate) mod timeout;
 pub mod traps;
+pub(crate) mod wait_loop;
 
 #[cfg(test)]
 pub mod test_support;
