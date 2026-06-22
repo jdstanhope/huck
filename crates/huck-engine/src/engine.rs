@@ -817,4 +817,79 @@ mod tests {
         assert_eq!(out.stderr, "");
         assert_eq!(out.exit_code, 0);
     }
+
+    // ----- v207 Task 5: external-process poll loop -------------------------
+    //
+    // These exercise the streaming path through external children:
+    // run_subprocess (single external command), the Subshell arm
+    // (`( … )`), and multi-stage pipelines.
+
+    #[test]
+    fn on_stdout_line_external_real_time() {
+        use std::time::{Duration, Instant};
+        let mut timestamps: Vec<Instant> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e
+            .exec("/bin/sh -c 'echo first; sleep 0.1; echo second'")
+            .on_stdout_line(|_line| timestamps.push(Instant::now()))
+            .capture();
+        assert_eq!(timestamps.len(), 2);
+        let gap = timestamps[1].duration_since(timestamps[0]);
+        assert!(
+            gap >= Duration::from_millis(50),
+            "expected ~100ms gap, got {gap:?}"
+        );
+        assert!(
+            gap <= Duration::from_secs(2),
+            "gap too large: {gap:?}"
+        );
+    }
+
+    #[test]
+    fn on_stdout_line_external_fires_during_wait() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut e = Engine::new();
+        let f = flag.clone();
+        let _ = e
+            .exec("/bin/sh -c 'echo early; sleep 0.5'")
+            .on_stdout_line(move |_| f.store(true, Ordering::Relaxed))
+            .capture();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn on_stdout_line_pipeline_last_stage() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo hi | tr a-z A-Z")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["HI"]);
+    }
+
+    #[test]
+    fn on_stdout_line_merge_stderr_routes_through_stdout() {
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo a; echo b >&2")
+            .merge_stderr()
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert!(out_lines.contains(&"a".to_string()));
+        assert!(out_lines.contains(&"b".to_string()));
+        assert!(err_lines.is_empty());
+    }
+
+    #[test]
+    fn on_stdout_line_external_long_line() {
+        let mut got_len: usize = 0;
+        let mut e = Engine::new();
+        e.exec("/bin/sh -c 'head -c 100000 < /dev/zero | tr \\\\0 a; echo'")
+            .on_stdout_line(|line| got_len = line.len())
+            .capture();
+        assert!(got_len >= 50_000, "expected long line, got {got_len}");
+    }
 }

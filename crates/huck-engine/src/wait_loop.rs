@@ -40,6 +40,13 @@ mod linux {
             Ok(())
         }
 
+        /// Stop polling `fd`. The fd itself is NOT closed; caller manages
+        /// lifetime. Useful when a pipe has reached EOF and would otherwise
+        /// cause poll to busy-spin on the latched POLLHUP.
+        pub fn unregister_pipe(&mut self, fd: RawFd) {
+            self.pipes.retain(|&f| f != fd);
+        }
+
         pub fn register_sigchld(&mut self) -> io::Result<()> {
             // signalfd requires SIGCHLD blocked. Block on the calling thread.
             // SAFETY: zero-init sigset_t then sigaddset is standard libc usage.
@@ -170,6 +177,24 @@ mod macos {
             }
             self.pipes.push(fd);
             Ok(())
+        }
+
+        /// Stop polling `fd`. The fd itself is NOT closed; caller manages
+        /// lifetime. Mirrors the Linux unregister: kqueue's EV_DELETE removes
+        /// the registration so we don't loop on the latched EOF.
+        pub fn unregister_pipe(&mut self, fd: RawFd) {
+            let kev = libc::kevent {
+                ident: fd as usize,
+                filter: libc::EVFILT_READ,
+                flags: libc::EV_DELETE,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let _ = unsafe {
+                libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+            self.pipes.retain(|&f| f != fd);
         }
 
         pub fn register_sigchld(&mut self) -> io::Result<()> {

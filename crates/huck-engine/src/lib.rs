@@ -34,6 +34,7 @@ pub(crate) mod restricted;
 pub mod shell;
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
+pub(crate) mod stream_loop;
 pub mod test_builtin;
 pub(crate) mod timeout;
 pub mod traps;
