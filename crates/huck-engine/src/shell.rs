@@ -159,7 +159,8 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
             return Some(1);
         }
     };
-    match crate::builtins::run_sourced_contents(&contents, &path, shell) {
+    let mut err = std::io::stderr();
+    match crate::builtins::run_sourced_contents(&contents, &path, &mut err, shell) {
         crate::builtins::ExecOutcome::Exit(code) => Some(code),
         crate::builtins::ExecOutcome::Continue(status) => {
             shell.set_last_status(status);
@@ -210,9 +211,11 @@ pub fn run_program_in_sink(
         shell.sync_call_arrays();
     }
 
+    let mut err = std::io::stderr();
     let outcome = crate::builtins::run_sourced_contents_in_sink(
         contents,
         std::path::Path::new(label),
+        &mut err,
         &mut shell,
         sink,
     );

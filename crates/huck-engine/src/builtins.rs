@@ -70,6 +70,7 @@ pub fn run_builtin(
     name: &str,
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Declaration commands (`declare`, `typeset`, `local`, `readonly`,
@@ -84,36 +85,36 @@ pub fn run_builtin(
         "declaration command `{name}` reached run_builtin; should have been routed to run_declaration_builtin",
     );
     match name {
-        "cd" => builtin_cd(args, out, shell),
-        "pwd" => builtin_pwd(args, out, shell),
-        "echo" => builtin_echo(args, out),
-        "exit" => builtin_exit(args, shell),
-        "unset" => builtin_unset(args, shell),
-        "jobs" => builtin_jobs(args, out, shell),
-        "wait" => builtin_wait(args, out, shell),
-        "fg" => builtin_fg(args, shell),
-        "bg" => builtin_bg(args, out, shell),
-        "kill" => builtin_kill(args, out, shell),
-        "disown" => builtin_disown(args, shell),
-        "history" => builtin_history(args, out, shell),
-        "trap" => builtin_trap(args, out, shell),
-        "set" => builtin_set(args, out, shell),
-        "shopt" => builtin_shopt(args, out, shell),
-        "shift" => builtin_shift(args, shell),
-        "getopts" => builtin_getopts(args, shell),
-        "." | "source" => builtin_source(args, shell),
+        "cd" => builtin_cd(args, out, err, shell),
+        "pwd" => builtin_pwd(args, out, err, shell),
+        "echo" => builtin_echo(args, out, err),
+        "exit" => builtin_exit(args, err, shell),
+        "unset" => builtin_unset(args, err, shell),
+        "jobs" => builtin_jobs(args, out, err, shell),
+        "wait" => builtin_wait(args, out, err, shell),
+        "fg" => builtin_fg(args, err, shell),
+        "bg" => builtin_bg(args, out, err, shell),
+        "kill" => builtin_kill(args, out, err, shell),
+        "disown" => builtin_disown(args, err, shell),
+        "history" => builtin_history(args, out, err, shell),
+        "trap" => builtin_trap(args, out, err, shell),
+        "set" => builtin_set(args, out, err, shell),
+        "shopt" => builtin_shopt(args, out, err, shell),
+        "shift" => builtin_shift(args, err, shell),
+        "getopts" => builtin_getopts(args, err, shell),
+        "." | "source" => builtin_source(args, err, shell),
         "eval" => builtin_eval(args, shell),
-        "let" => builtin_let(args, shell),
-        "help" => builtin_help(args, out, shell),
+        "let" => builtin_let(args, err, shell),
+        "help" => builtin_help(args, out, err, shell),
         "complete" => crate::completion_builtins::builtin_complete(args, out, shell),
         "compgen" => crate::completion_builtins::builtin_compgen(args, out, shell),
         "compopt" => crate::completion_builtins::builtin_compopt(args, out, shell),
-        "alias" => builtin_alias(args, out, shell),
-        "unalias" => builtin_unalias(args, shell),
+        "alias" => builtin_alias(args, out, err, shell),
+        "unalias" => builtin_unalias(args, err, shell),
         ":" => builtin_colon(args, shell),
         "true" => builtin_true(args, shell),
         "false" => builtin_false(args, shell),
-        "command" => builtin_command(args, out, shell),
+        "command" => builtin_command(args, out, err, shell),
         // `builtin` is normally consumed by the executor's strip loop before
         // dispatch; this guards a bare `builtin` that reaches run_builtin.
         "builtin" => ExecOutcome::Continue(0),
@@ -122,22 +123,22 @@ pub fn run_builtin(
         // this (name, args, out, shell) signature can't express. Guard against a
         // future refactor routing it here so it degrades instead of panicking.
         "exec" => {
-            eprintln!("huck: exec: not supported in this context");
+            e!(err, "huck: exec: not supported in this context");
             ExecOutcome::Continue(1)
         }
-        "type" => builtin_type(args, out, shell),
-        "hash" => builtin_hash(args, out, shell),
-        "pushd" => builtin_pushd(args, out, shell),
-        "popd" => builtin_popd(args, out, shell),
-        "dirs" => builtin_dirs(args, out, shell),
-        "read" => builtin_read(args, out, shell),
-        "mapfile" | "readarray" => builtin_mapfile(args, shell),
-        "printf" => builtin_printf(args, out, shell),
-        "test" | "[" => builtin_test(name, args, shell),
-        "break" => builtin_break(args, shell),
-        "continue" => builtin_continue(args, shell),
+        "type" => builtin_type(args, out, err, shell),
+        "hash" => builtin_hash(args, out, err, shell),
+        "pushd" => builtin_pushd(args, out, err, shell),
+        "popd" => builtin_popd(args, out, err, shell),
+        "dirs" => builtin_dirs(args, out, err, shell),
+        "read" => builtin_read(args, out, err, shell),
+        "mapfile" | "readarray" => builtin_mapfile(args, err, shell),
+        "printf" => builtin_printf(args, out, err, shell),
+        "test" | "[" => builtin_test(name, args, err, shell),
+        "break" => builtin_break(args, err, shell),
+        "continue" => builtin_continue(args, err, shell),
         "return" => builtin_return(args, shell),
-        "bind" => builtin_bind(args, out, shell),
+        "bind" => builtin_bind(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -164,43 +165,43 @@ enum LoopArg {
 
 /// Classifies break/continue args per bash 5.2, printing the matching
 /// diagnostic. Caller has already verified loop_depth > 0.
-fn classify_loop_arg(args: &[String], cmd: &str) -> LoopArg {
+fn classify_loop_arg(args: &[String], cmd: &str, err: &mut dyn Write) -> LoopArg {
     if args.len() > 1 {
-        eprintln!("huck: {cmd}: too many arguments");
+        e!(err, "huck: {cmd}: too many arguments");
         return LoopArg::BreakAll;
     }
     let Some(arg) = args.first() else { return LoopArg::Level(1) };
     match arg.parse::<i64>() {
         Ok(n) if n >= 1 => LoopArg::Level(n.min(u32::MAX as i64) as u32),
         Ok(_) => {
-            eprintln!("huck: {cmd}: {arg}: loop count out of range");
+            e!(err, "huck: {cmd}: {arg}: loop count out of range");
             LoopArg::BreakAll
         }
         Err(_) => {
-            eprintln!("huck: {cmd}: {arg}: numeric argument required");
+            e!(err, "huck: {cmd}: {arg}: numeric argument required");
             LoopArg::Fatal
         }
     }
 }
 
-fn builtin_break(args: &[String], shell: &Shell) -> ExecOutcome {
+fn builtin_break(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
-        eprintln!("huck: break: only meaningful in a `for', `while', or `until' loop");
+        e!(err, "huck: break: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    match classify_loop_arg(args, "break") {
+    match classify_loop_arg(args, "break", err) {
         LoopArg::Level(n) => ExecOutcome::LoopBreak(n.min(shell.loop_depth), 0),
         LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
         LoopArg::Fatal => ExecOutcome::Exit(128),
     }
 }
 
-fn builtin_continue(args: &[String], shell: &Shell) -> ExecOutcome {
+fn builtin_continue(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
-        eprintln!("huck: continue: only meaningful in a `for', `while', or `until' loop");
+        e!(err, "huck: continue: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    match classify_loop_arg(args, "continue") {
+    match classify_loop_arg(args, "continue", err) {
         LoopArg::Level(n) => ExecOutcome::LoopContinue(n.min(shell.loop_depth)),
         // out-of-range/too-many continue breaks all loops, like bash
         LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
@@ -234,6 +235,7 @@ pub(crate) fn run_declaration_builtin_strs(
     name: &str,
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     use crate::command::{Assignment, AssignTarget};
@@ -263,7 +265,7 @@ pub(crate) fn run_declaration_builtin_strs(
             _ => DeclArg::Plain(s.clone()),
         })
         .collect();
-    run_declaration_builtin(name, &decl_args, out, shell)
+    run_declaration_builtin(name, &decl_args, out, err, shell)
 }
 
 /// Entry point for declaration commands (`declare` / `typeset` / `local` /
@@ -276,13 +278,14 @@ pub fn run_declaration_builtin(
     name: &str,
     decl_args: &[DeclArg],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     match name {
-        "declare" | "typeset" => builtin_declare_decl(decl_args, out, shell),
-        "local" => builtin_local_decl(decl_args, shell),
-        "readonly" => builtin_readonly_decl(decl_args, out, shell),
-        "export" => builtin_export_decl(decl_args, out, shell),
+        "declare" | "typeset" => builtin_declare_decl(decl_args, out, err, shell),
+        "local" => builtin_local_decl(decl_args, err, shell),
+        "readonly" => builtin_readonly_decl(decl_args, out, err, shell),
+        "export" => builtin_export_decl(decl_args, out, err, shell),
         _ => unreachable!("run_declaration_builtin called with non-declaration: {name}"),
     }
 }
@@ -313,7 +316,7 @@ fn normalize_logical(path: &str) -> String {
     }
 }
 
-pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
     //    is the OLDPWD shortcut / target).
     let mut physical_flag: Option<bool> = None;
@@ -325,8 +328,8 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
             "--" => { idx += 1; break; }
             "-" => break, // OLDPWD shortcut, handled as the target below
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: cd: {s}: invalid option");
-                eprintln!("huck: cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                e!(err, "huck: cd: {s}: invalid option");
+                e!(err, "huck: cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
                 return ExecOutcome::Continue(2);
             }
             _ => break, // a target
@@ -334,7 +337,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
     }
     let rest = &args[idx..];
     if rest.len() > 1 {
-        eprintln!("huck: cd: too many arguments");
+        e!(err, "huck: cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
 
@@ -346,12 +349,12 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
     let target = match rest.first() {
         Some(dir) if dir == "-" => match shell.get("OLDPWD") {
             Some(oldpwd) if !oldpwd.is_empty() => { print_new_pwd = true; oldpwd.to_string() }
-            _ => { eprintln!("huck: cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
+            _ => { e!(err, "huck: cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
         },
         Some(dir) => dir.clone(),
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
-            None => { eprintln!("huck: cd: HOME not set"); return ExecOutcome::Continue(1); }
+            None => { e!(err, "huck: cd: HOME not set"); return ExecOutcome::Continue(1); }
         },
     };
 
@@ -360,13 +363,13 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
-            eprintln!("huck: cd: {target}: {e}");
+            e!(err, "huck: cd: {target}: {e}");
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(e) => {
-                eprintln!("huck: cd: warning: could not read current dir: {e}");
+                e!(err, "huck: cd: warning: could not read current dir: {e}");
                 prev_pwd.clone().unwrap_or_default()
             }
         }
@@ -383,7 +386,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
         };
         let normalized = normalize_logical(&curpath);
         if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            eprintln!("huck: cd: {target}: {e}");
+            e!(err, "huck: cd: {target}: {e}");
             return ExecOutcome::Continue(1);
         }
         normalized
@@ -399,13 +402,13 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, shell: &mut Shell
     if print_new_pwd
         && let Err(e) = writeln!(out, "{new_pwd}")
     {
-        eprintln!("huck: cd: {e}");
+        e!(err, "huck: cd: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
 
-fn builtin_pwd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_pwd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // Parse -L/-P (last wins); `--` ends flags; non-flag args are ignored
     // (bash prints pwd anyway). Unknown flag → invalid option, rc 2.
     let mut physical_flag: Option<bool> = None;
@@ -415,8 +418,8 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             "-P" => physical_flag = Some(true),
             "--" => break,
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: pwd: {s}: invalid option");
-                eprintln!("huck: pwd: usage: pwd [-LP]");
+                e!(err, "huck: pwd: {s}: invalid option");
+                e!(err, "huck: pwd: usage: pwd [-LP]");
                 return ExecOutcome::Continue(2);
             }
             _ => {} // ignore non-flag args
@@ -457,13 +460,13 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
     };
 
     if let Err(e) = writeln!(out, "{path}") {
-        eprintln!("huck: pwd: {e}");
+        e!(err, "huck: pwd: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
 
-fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
+fn builtin_echo(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExecOutcome {
     let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
     let joined = args[consumed..].join(" ");
     let bytes = if process_escapes {
@@ -477,13 +480,13 @@ fn builtin_echo(args: &[String], out: &mut dyn Write) -> ExecOutcome {
     };
 
     if let Err(e) = out.write_all(&bytes) {
-        eprintln!("huck: echo: {e}");
+        e!(err, "huck: echo: {e}");
         return ExecOutcome::Continue(1);
     }
     if !suppress_newline
         && let Err(e) = out.write_all(b"\n")
     {
-        eprintln!("huck: echo: {e}");
+        e!(err, "huck: echo: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -571,13 +574,13 @@ fn process_echo_escapes(s: &str) -> (Vec<u8>, bool) {
     (out, false)
 }
 
-fn builtin_exit(args: &[String], shell: &Shell) -> ExecOutcome {
+fn builtin_exit(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     match args.first() {
         None => ExecOutcome::Exit(shell.last_status()),
         Some(code_str) => match code_str.parse::<i32>() {
             Ok(code) => ExecOutcome::Exit(code.rem_euclid(256)),
             Err(_) => {
-                eprintln!("huck: exit: {code_str}: numeric argument required");
+                e!(err, "huck: exit: {code_str}: numeric argument required");
                 ExecOutcome::Continue(2)
             }
         },
@@ -593,7 +596,7 @@ pub(crate) fn is_valid_name(s: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // Leading flags select the namespace and apply to all following names:
     // `-f` => function namespace, `-v` (or no flag) => variable namespace.
     // `-n` => variable namespace but unset the nameref variable ITSELF (no deref).
@@ -619,7 +622,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 break;
             }
             s if s.len() > 1 && s.starts_with('-') => {
-                eprintln!("huck: unset: {s}: invalid option");
+                e!(err, "huck: unset: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -634,7 +637,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             // absent function name is success (no error), matching bash. No
             // readonly/array-subscript handling applies here.
             if !is_valid_name(arg) {
-                eprintln!("huck: unset: '{arg}': not a valid identifier");
+                e!(err, "huck: unset: '{arg}': not a valid identifier");
                 any_error = true;
                 continue;
             }
@@ -649,12 +652,12 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                 continue;
             }
             if !is_valid_name(arg) {
-                eprintln!("huck: unset: '{arg}': not a valid identifier");
+                e!(err, "huck: unset: '{arg}': not a valid identifier");
                 any_error = true;
                 continue;
             }
             if shell.is_readonly(arg) {
-                eprintln!("huck: unset: {arg}: readonly variable");
+                e!(err, "huck: unset: {arg}: readonly variable");
                 any_error = true;
                 continue;
             }
@@ -705,7 +708,7 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
                             }
                         }
                         Err(e) => {
-                            eprintln!("huck: unset: {e}");
+                            e!(err, "huck: unset: {e}");
                             any_error = true;
                         }
                     }
@@ -714,18 +717,18 @@ fn builtin_unset(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("huck: unset: {e}");
+                e!(err, "huck: unset: {e}");
                 any_error = true;
                 continue;
             }
         }
         if !is_valid_name(effective_arg) {
-            eprintln!("huck: unset: '{effective_arg}': not a valid identifier");
+            e!(err, "huck: unset: '{effective_arg}': not a valid identifier");
             any_error = true;
             continue;
         }
         if shell.is_readonly(effective_arg) {
-            eprintln!("huck: unset: {effective_arg}: readonly variable");
+            e!(err, "huck: unset: {effective_arg}: readonly variable");
             any_error = true;
             continue;
         }
@@ -893,13 +896,13 @@ fn format_declare_bare_line(name: &str, var: &crate::shell_state::Variable) -> S
 /// Lists every EXPORTED variable, sorted by name, as bash's
 /// `declare -x NAME="value"` (reuses `format_declare_line` for attr order +
 /// value quoting). Used by bare `export` / `export -p`.
-fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     let mut entries: Vec<(&String, &crate::shell_state::Variable)> =
         shell.iter_vars().filter(|(_, v)| v.exported).collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
-            eprintln!("huck: export: {e}");
+            e!(err, "huck: export: {e}");
             return ExecOutcome::Continue(1);
         }
     }
@@ -907,13 +910,13 @@ fn list_exported(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 /// Lists exported functions (sorted) as `generate` body + `declare -fx NAME`.
-fn list_exported_functions(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
+fn list_exported_functions(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     for name in shell.exported_function_names() {
         if let Some(body) = shell.functions.get(&name)
             && (writeln!(out, "{}", crate::generate::function_to_source(&name, body)).is_err()
                 || writeln!(out, "declare -fx {name}").is_err())
         {
-            eprintln!("huck: export: write error");
+            e!(err, "huck: export: write error");
             return ExecOutcome::Continue(1);
         }
     }
@@ -1051,6 +1054,7 @@ fn assign_value_is_array(a: &crate::command::Assignment) -> bool {
 fn builtin_export_decl(
     args: &[DeclArg],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Parse leading flags. `-a` is a huck-specific no-op (mise emits
@@ -1076,8 +1080,8 @@ fn builtin_export_decl(
                             'n' => unexport = true,
                             'f' => func = true,
                             _ => {
-                                eprintln!("huck: export: -{c}: invalid option");
-                                eprintln!(
+                                e!(err, "huck: export: -{c}: invalid option");
+                                e!(err,
                                     "export: usage: export [-fn] [name[=value] ...] or export -p"
                                 );
                                 return ExecOutcome::Continue(2);
@@ -1102,12 +1106,12 @@ fn builtin_export_decl(
         // accommodation) suppresses the var listing: rc 0, no output.
         // Otherwise list exported variables (bare `export` or `-p`).
         if func && !saw_p {
-            return list_exported_functions(out, shell);
+            return list_exported_functions(out, err, shell);
         }
         if saw_a && !saw_p {
             return ExecOutcome::Continue(0);
         }
-        return list_exported(out, shell);
+        return list_exported(out, err, shell);
     }
 
     let mut any_error = false;
@@ -1124,7 +1128,7 @@ fn builtin_export_decl(
             } else if shell.functions.contains_key(name) {
                 shell.mark_function_exported(name);
             } else {
-                eprintln!("huck: export: {name}: not a function");
+                e!(err, "huck: export: {name}: not a function");
                 any_error = true;
             }
             continue;
@@ -1135,12 +1139,12 @@ fn builtin_export_decl(
                     let name = &s[..eq];
                     let value = &s[eq + 1..];
                     if !is_valid_name(name) {
-                        eprintln!("huck: export: '{s}': not a valid identifier");
+                        e!(err, "huck: export: '{s}': not a valid identifier");
                         any_error = true;
                         continue;
                     }
                     if shell.is_readonly(name) {
-                        eprintln!("huck: export: {name}: readonly variable");
+                        e!(err, "huck: export: {name}: readonly variable");
                         any_error = true;
                         continue;
                     }
@@ -1153,7 +1157,7 @@ fn builtin_export_decl(
                 }
                 None => {
                     if !is_valid_name(s) {
-                        eprintln!("huck: export: '{s}': not a valid identifier");
+                        e!(err, "huck: export: '{s}': not a valid identifier");
                         any_error = true;
                         continue;
                     }
@@ -1166,19 +1170,19 @@ fn builtin_export_decl(
             },
             DeclArg::Assign(a) => {
                 if assign_value_is_array(a) {
-                    eprintln!("huck: export: cannot export arrays");
+                    e!(err, "huck: export: cannot export arrays");
                     any_error = true;
                     continue;
                 }
                 if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
                     let name = a.target.name();
-                    eprintln!("huck: export: `{name}': not a valid identifier");
+                    e!(err, "huck: export: `{name}': not a valid identifier");
                     any_error = true;
                     continue;
                 }
                 let name = a.target.name().to_string();
                 if shell.is_readonly(&name) {
-                    eprintln!("huck: export: {name}: readonly variable");
+                    e!(err, "huck: export: {name}: readonly variable");
                     any_error = true;
                     continue;
                 }
@@ -1205,9 +1209,9 @@ fn builtin_export_decl(
 /// declaration; routes compound-RHS through `apply_one_assignment` while
 /// re-using the existing per-frame snapshot machinery for unwind on
 /// function return.
-fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
+fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if shell.local_scopes.is_empty() {
-        eprintln!("huck: local: can only be used in a function");
+        e!(err, "huck: local: can only be used in a function");
         return ExecOutcome::Continue(1);
     }
     let mut want_array = false;
@@ -1239,7 +1243,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 b'u' => saw_minus_u = true,
                 b'n' => saw_minus_n = true,
                 other => {
-                    eprintln!("huck: local: -{}: invalid option", other as char);
+                    e!(err, "huck: local: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -1247,7 +1251,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
         idx += 1;
     }
     if want_array && want_associative {
-        eprintln!("huck: local: cannot specify both -a and -A");
+        e!(err, "huck: local: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
     }
 
@@ -1272,12 +1276,12 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                 // as an invalid identifier.
                 let name = s.as_str();
                 if !is_valid_name(name) {
-                    eprintln!("huck: local: `{s}': not a valid identifier");
+                    e!(err, "huck: local: `{s}': not a valid identifier");
                     exit = 1;
                     continue;
                 }
                 if shell.is_readonly(name) {
-                    eprintln!("huck: local: {name}: readonly variable");
+                    e!(err, "huck: local: {name}: readonly variable");
                     exit = 1;
                     continue;
                 }
@@ -1320,7 +1324,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     if shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        eprintln!(
+                        e!(err,
                             "{}",
                             crate::shell_state::declare_err_message("local", name, &e)
                         );
@@ -1374,14 +1378,14 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
             DeclArg::Assign(a) => {
                 let name = a.target.name().to_string();
                 if !is_valid_name(&name) {
-                    eprintln!(
+                    e!(err,
                         "huck: local: `{name}': not a valid identifier"
                     );
                     exit = 1;
                     continue;
                 }
                 if shell.is_readonly(&name) {
-                    eprintln!("huck: local: {name}: readonly variable");
+                    e!(err, "huck: local: {name}: readonly variable");
                     exit = 1;
                     continue;
                 }
@@ -1392,7 +1396,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     // Expand the RHS word to obtain the target name string.
                     let target = crate::expand::expand_assignment(&a.value, shell);
                     if target == name {
-                        eprintln!(
+                        e!(err,
                             "huck: local: {name}: nameref variable self references not allowed"
                         );
                         exit = 1;
@@ -1401,7 +1405,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     let valid = is_valid_name(&target)
                         || matches!(parse_subscripted_arg(&target), Ok(Some((b, _))) if is_valid_name(b));
                     if !valid {
-                        eprintln!(
+                        e!(err,
                             "huck: local: `{target}': invalid variable name for name reference"
                         );
                         exit = 1;
@@ -1426,7 +1430,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
                     && shell.get_associative(&name).is_none()
                     && let Err(e) = shell.declare_associative(&name)
                 {
-                    eprintln!(
+                    e!(err,
                         "{}",
                         crate::shell_state::declare_err_message("local", &name, &e)
                     );
@@ -1464,6 +1468,7 @@ fn builtin_local_decl(args: &[DeclArg], shell: &mut Shell) -> ExecOutcome {
 fn builtin_readonly_decl(
     args: &[DeclArg],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Parse leading flags (-p, -A). `--` terminates option processing.
@@ -1486,7 +1491,7 @@ fn builtin_readonly_decl(
                 break;
             }
             o if o.starts_with('-') && o.len() > 1 => {
-                eprintln!("huck: readonly: {o}: invalid option");
+                e!(err, "huck: readonly: {o}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -1509,7 +1514,7 @@ fn builtin_readonly_decl(
                 }
             };
             if let Err(e) = writeln!(out, "{line}") {
-                eprintln!("huck: readonly: {e}");
+                e!(err, "huck: readonly: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -1522,7 +1527,7 @@ fn builtin_readonly_decl(
             DeclArg::Plain(s) => {
                 let name = s.as_str();
                 if !is_valid_name(name) {
-                    eprintln!(
+                    e!(err,
                         "huck: readonly: `{s}': not a valid identifier"
                     );
                     exit = 1;
@@ -1534,7 +1539,7 @@ fn builtin_readonly_decl(
                     && shell.get_associative(name).is_none()
                     && let Err(e) = shell.declare_associative(name)
                 {
-                    eprintln!(
+                    e!(err,
                         "{}",
                         crate::shell_state::declare_err_message("readonly", name, &e)
                     );
@@ -1546,7 +1551,7 @@ fn builtin_readonly_decl(
             DeclArg::Assign(a) => match &a.target {
                 crate::command::AssignTarget::Bare(name) => {
                     if shell.is_readonly(name) {
-                        eprintln!(
+                        e!(err,
                             "huck: readonly: {name}: readonly variable"
                         );
                         exit = 1;
@@ -1559,7 +1564,7 @@ fn builtin_readonly_decl(
                         && shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        eprintln!(
+                        e!(err,
                             "{}",
                             crate::shell_state::declare_err_message("readonly", name, &e)
                         );
@@ -1573,7 +1578,7 @@ fn builtin_readonly_decl(
                     shell.mark_readonly(name);
                 }
                 crate::command::AssignTarget::Indexed { name, .. } => {
-                    eprintln!(
+                    e!(err,
                         "huck: readonly: `{name}': cannot make subscripted-assignment target readonly"
                     );
                     exit = 1;
@@ -1588,6 +1593,7 @@ fn builtin_readonly_decl(
 fn builtin_declare_decl(
     args: &[DeclArg],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut want_readonly = false;
@@ -1626,7 +1632,7 @@ fn builtin_declare_decl(
             match c {
                 b'r' if minus => want_readonly = true,
                 b'r' if plus => {
-                    eprintln!(
+                    e!(err,
                         "huck: declare: +r: readonly attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
@@ -1637,7 +1643,7 @@ fn builtin_declare_decl(
                 b'i' if plus => want_remove_integer = true,
                 b'a' if minus => want_array = true,
                 b'a' if plus => {
-                    eprintln!(
+                    e!(err,
                         "huck: declare: +a: array attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
@@ -1649,7 +1655,7 @@ fn builtin_declare_decl(
                     // removed once set). We mirror `+a`'s conservative
                     // rejection for now; revisit if real scripts need
                     // silent-ignore behavior.
-                    eprintln!(
+                    e!(err,
                         "huck: declare: +A: associative attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
@@ -1669,7 +1675,7 @@ fn builtin_declare_decl(
                 b'g' if minus => global = true,
                 other => {
                     let sign = if plus { '+' } else { '-' };
-                    eprintln!(
+                    e!(err,
                         "huck: declare: {sign}{}: invalid option",
                         other as char
                     );
@@ -1695,7 +1701,7 @@ fn builtin_declare_decl(
 
     // Reject the combinations we haven't implemented yet.
     if want_array && want_associative {
-        eprintln!("huck: declare: cannot specify both -a and -A");
+        e!(err, "huck: declare: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
     }
 
@@ -1711,7 +1717,7 @@ fn builtin_declare_decl(
             })
             .collect();
         if plain_names.is_empty() {
-            return list_exported_functions(out, shell);
+            return list_exported_functions(out, err, shell);
         }
         let mut any_error = false;
         for name in &plain_names {
@@ -1781,7 +1787,7 @@ fn builtin_declare_decl(
             DeclArg::Assign(a) => (a.target.name(), Some(a)),
         };
         if !is_valid_name(name) {
-            eprintln!("huck: declare: `{name}': not a valid identifier");
+            e!(err, "huck: declare: `{name}': not a valid identifier");
             exit = 1;
             continue;
         }
@@ -1792,7 +1798,7 @@ fn builtin_declare_decl(
                     let _ = writeln!(out, "{}", format_declare_line(name, &var));
                 }
                 None => {
-                    eprintln!("huck: declare: {name}: not found");
+                    e!(err, "huck: declare: {name}: not found");
                     exit = 1;
                 }
             }
@@ -1811,7 +1817,7 @@ fn builtin_declare_decl(
 
         // Integer-attribute changes on readonly variable are rejected.
         if (want_integer || want_remove_integer) && shell.is_readonly(name) {
-            eprintln!("huck: declare: {name}: readonly variable");
+            e!(err, "huck: declare: {name}: readonly variable");
             exit = 1;
             continue;
         }
@@ -1839,7 +1845,7 @@ fn builtin_declare_decl(
                 empty.insert(0, scalar.to_string());
             }
             if shell.replace_indexed(name, empty).is_err() {
-                eprintln!("huck: declare: {name}: readonly variable");
+                e!(err, "huck: declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -1853,7 +1859,7 @@ fn builtin_declare_decl(
             && shell.get_associative(name).is_none()
             && let Err(e) = shell.declare_associative(name)
         {
-            eprintln!(
+            e!(err,
                 "{}",
                 crate::shell_state::declare_err_message("declare", name, &e)
             );
@@ -1895,7 +1901,7 @@ fn builtin_declare_decl(
             if let Some(ref target) = target_opt {
                 // Direct self-reference is a hard error.
                 if target == name {
-                    eprintln!(
+                    e!(err,
                         "huck: declare: {name}: nameref variable self references not allowed"
                     );
                     exit = 1;
@@ -1905,7 +1911,7 @@ fn builtin_declare_decl(
                 let valid = is_valid_name(target)
                     || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
                 if !valid {
-                    eprintln!(
+                    e!(err,
                         "huck: declare: `{target}': invalid variable name for name reference"
                     );
                     exit = 1;
@@ -1955,12 +1961,12 @@ fn builtin_declare_decl(
             // readonly. Other =VALUE assignments rely on
             // apply_one_assignment's internal readonly check.
             if want_readonly && shell.is_readonly(name) {
-                eprintln!("huck: declare: {name}: readonly variable");
+                e!(err, "huck: declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
             if shell.is_readonly(name) {
-                eprintln!("huck: {name}: readonly variable");
+                e!(err, "huck: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -2304,7 +2310,7 @@ impl std::io::Read for RawStdinReader {
 /// (alias `readarray`). Reads delimiter-separated records from stdin into the
 /// indexed array ARRAY (default MAPFILE). Core option set (v140); `-u`/`-C`/`-c`
 /// are not implemented.
-fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut delim: u8 = b'\n';
     let mut strip_t = false;
     let mut count: usize = 0; // 0 = unlimited
@@ -2313,13 +2319,13 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
     let mut i = 0;
 
     // Parse a numeric option value (rest-of-arg or next arg).
-    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char) -> Result<usize, ()> {
+    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char, err: &mut dyn Write) -> Result<usize, ()> {
         let s = if j + 1 < bytes.len() {
             String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
         } else {
             *i += 1;
             if *i >= args.len() {
-                eprintln!("huck: mapfile: -{opt}: option requires an argument");
+                e!(err, "huck: mapfile: -{opt}: option requires an argument");
                 return Err(());
             }
             args[*i].clone()
@@ -2327,7 +2333,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
         match s.trim().parse::<usize>() {
             Ok(n) => Ok(n),
             Err(_) => {
-                eprintln!("huck: mapfile: {s}: invalid number");
+                e!(err, "huck: mapfile: {s}: invalid number");
                 Err(())
             }
         }
@@ -2354,7 +2360,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
                     } else {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("huck: mapfile: -d: option requires an argument");
+                            e!(err, "huck: mapfile: -d: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         args[i].clone()
@@ -2362,20 +2368,20 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
                     delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
                     consumed_rest = true;
                 }
-                b'n' => match num_val(args, &mut i, j, bytes, 'n') {
+                b'n' => match num_val(args, &mut i, j, bytes, 'n', err) {
                     Ok(n) => { count = n; consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
-                b's' => match num_val(args, &mut i, j, bytes, 's') {
+                b's' => match num_val(args, &mut i, j, bytes, 's', err) {
                     Ok(n) => { skip = n; consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
-                b'O' => match num_val(args, &mut i, j, bytes, 'O') {
+                b'O' => match num_val(args, &mut i, j, bytes, 'O', err) {
                     Ok(n) => { origin = Some(n); consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
                 c => {
-                    eprintln!("huck: mapfile: -{}: invalid option", c as char);
+                    e!(err, "huck: mapfile: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -2389,7 +2395,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
 
     let array_name = args.get(i).cloned().unwrap_or_else(|| "MAPFILE".to_string());
     if !is_valid_name(&array_name) {
-        eprintln!("huck: mapfile: `{array_name}': not a valid array name");
+        e!(err, "huck: mapfile: `{array_name}': not a valid array name");
         return ExecOutcome::Continue(1);
     }
 
@@ -2400,7 +2406,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
-                eprintln!("huck: mapfile: {e}");
+                e!(err, "huck: mapfile: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2421,7 +2427,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
             }
             Ok(None) => break,
             Err(e) => {
-                eprintln!("huck: mapfile: {e}");
+                e!(err, "huck: mapfile: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2458,6 +2464,7 @@ fn builtin_mapfile(args: &[String], shell: &mut Shell) -> ExecOutcome {
 fn builtin_read(
     args: &[String],
     _out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut raw = false;
@@ -2490,7 +2497,7 @@ fn builtin_read(
                     } else {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("huck: read: -p: option requires an argument");
+                            e!(err, "huck: read: -p: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         prompt = Some(args[i].clone());
@@ -2503,7 +2510,7 @@ fn builtin_read(
                     } else {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("huck: read: -d: option requires an argument");
+                            e!(err, "huck: read: -d: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         args[i].clone()
@@ -2518,7 +2525,7 @@ fn builtin_read(
                     } else {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("huck: read: -a: option requires an argument");
+                            e!(err, "huck: read: -a: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         args[i].clone()
@@ -2527,7 +2534,7 @@ fn builtin_read(
                     break;
                 }
                 c => {
-                    eprintln!("huck: read: -{}: invalid option", c as char);
+                    e!(err, "huck: read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -2540,14 +2547,14 @@ fn builtin_read(
     // Validate names BEFORE reading (POSIX ordering).
     for name in &names {
         if !is_valid_name(name) {
-            eprintln!("huck: read: `{name}': not a valid identifier");
+            e!(err, "huck: read: `{name}': not a valid identifier");
             return ExecOutcome::Continue(1);
         }
     }
     if let Some(arr) = &array_name
         && !is_valid_name(arr)
     {
-        eprintln!("huck: read: `{arr}': not a valid identifier");
+        e!(err, "huck: read: `{arr}': not a valid identifier");
         return ExecOutcome::Continue(1);
     }
 
@@ -2555,8 +2562,8 @@ fn builtin_read(
     if let Some(p) = &prompt {
         use std::io::IsTerminal;
         if std::io::stdin().is_terminal() {
-            eprint!("{p}");
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let _ = write!(err, "{p}");
+            let _ = err.flush();
         }
     }
 
@@ -2579,7 +2586,7 @@ fn builtin_read(
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
-            eprintln!("huck: read: {e}");
+            e!(err, "huck: read: {e}");
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
@@ -2606,7 +2613,7 @@ fn builtin_read(
         }
     }
     if was_silenced {
-        eprintln!();
+        e!(err, "");
     }
 
     let line = match line_opt {
@@ -2634,7 +2641,7 @@ fn builtin_read(
     let mut exit = 0;
     for (name, value) in assignments {
         if shell.try_set(&name, value).is_err() {
-            eprintln!("huck: read: {name}: readonly variable");
+            e!(err, "huck: read: {name}: readonly variable");
             exit = 1;
         }
     }
@@ -3256,6 +3263,7 @@ fn format_one(spec: &ConvSpec, arg: &str, out: &mut Vec<u8>) -> Result<bool, Str
 fn builtin_printf(
     args: &[String],
     out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Parse leading flags: -v VAR, -- end-of-flags.
@@ -3266,7 +3274,7 @@ fn builtin_printf(
             "-v" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("huck: printf: -v: option requires an argument");
+                    e!(err, "huck: printf: -v: option requires an argument");
                     return ExecOutcome::Continue(2);
                 }
                 let target = &args[i];
@@ -3275,7 +3283,7 @@ fn builtin_printf(
                         .map(|(name, sub)| is_valid_name(&name) && !sub.is_empty())
                         .unwrap_or(false);
                 if !valid {
-                    eprintln!("huck: printf: `{target}': not a valid identifier");
+                    e!(err, "huck: printf: `{target}': not a valid identifier");
                     return ExecOutcome::Continue(1);
                 }
                 v_var = Some(target.clone());
@@ -3288,7 +3296,7 @@ fn builtin_printf(
             s if s.starts_with('-') && s.len() > 1 && s != "-" => {
                 // Bash's printf rejects unknown flags but accepts a
                 // lone "-" as a format. We do the same.
-                eprintln!("huck: printf: {s}: invalid option");
+                e!(err, "huck: printf: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -3296,7 +3304,7 @@ fn builtin_printf(
     }
 
     if i >= args.len() {
-        eprintln!("huck: printf: usage: printf [-v var] format [arguments]");
+        e!(err, "huck: printf: usage: printf [-v var] format [arguments]");
         return ExecOutcome::Continue(2);
     }
 
@@ -3306,7 +3314,7 @@ fn builtin_printf(
     let parts = match parse_format(&format) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("huck: printf: {e}");
+            e!(err, "huck: printf: {e}");
             return ExecOutcome::Continue(1);
         }
     };
@@ -3349,9 +3357,9 @@ fn builtin_printf(
                         a
                     };
                     if spec.width_star {
-                        let (n, err) = parse_printf_int(next_arg(&mut arg_idx));
-                        if let Some(msg) = err {
-                            eprintln!("huck: printf: {msg}");
+                        let (n, perr) = parse_printf_int(next_arg(&mut arg_idx));
+                        if let Some(msg) = perr {
+                            e!(err, "huck: printf: {msg}");
                             exit = 1;
                         }
                         if n < 0 {
@@ -3362,9 +3370,9 @@ fn builtin_printf(
                         }
                     }
                     if spec.prec_star {
-                        let (n, err) = parse_printf_int(next_arg(&mut arg_idx));
-                        if let Some(msg) = err {
-                            eprintln!("huck: printf: {msg}");
+                        let (n, perr) = parse_printf_int(next_arg(&mut arg_idx));
+                        if let Some(msg) = perr {
+                            e!(err, "huck: printf: {msg}");
                             exit = 1;
                         }
                         spec.precision = if n < 0 { None } else { Some(n as usize) };
@@ -3374,7 +3382,7 @@ fn builtin_printf(
                         Ok(true) => {}
                         Ok(false) => halted = true,
                         Err(msg) => {
-                            eprintln!("huck: printf: {msg}");
+                            e!(err, "huck: printf: {msg}");
                             exit = 1;
                         }
                     }
@@ -3419,11 +3427,11 @@ fn builtin_printf(
                 return ExecOutcome::Continue(1);
             }
         } else if shell.try_set(&var, s).is_err() {
-            eprintln!("huck: printf: {var}: readonly variable");
+            e!(err, "huck: printf: {var}: readonly variable");
             return ExecOutcome::Continue(1);
         }
     } else if let Err(e) = out.write_all(&buf) {
-        eprintln!("huck: printf: {e}");
+        e!(err, "huck: printf: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(exit)
@@ -3442,7 +3450,7 @@ struct JobsArgs {
 /// Parses `jobs`'s argv into flags + target ids. Returns
 /// `Err(ExecOutcome)` on any usage / lookup failure with the error
 /// already printed.
-fn parse_jobs_args(args: &[String], shell: &Shell) -> Result<JobsArgs, ExecOutcome> {
+fn parse_jobs_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Result<JobsArgs, ExecOutcome> {
     let mut long = false;
     let mut pids_only = false;
     let mut only_new = false;
@@ -3468,8 +3476,8 @@ fn parse_jobs_args(args: &[String], shell: &Shell) -> Result<JobsArgs, ExecOutco
                     'r' => only_running = true,
                     's' => only_stopped = true,
                     _ => {
-                        eprintln!("huck: jobs: -{c}: invalid option");
-                        eprintln!("huck: jobs: usage: jobs [-lpnrs] [%spec ...]");
+                        e!(err, "huck: jobs: -{c}: invalid option");
+                        e!(err, "huck: jobs: usage: jobs [-lpnrs] [%spec ...]");
                         return Err(ExecOutcome::Continue(2));
                     }
                 }
@@ -3483,10 +3491,10 @@ fn parse_jobs_args(args: &[String], shell: &Shell) -> Result<JobsArgs, ExecOutco
     let mut targets = Vec::new();
     for arg in &args[idx..] {
         if !arg.starts_with('%') {
-            eprintln!("huck: jobs: {arg}: no such job");
+            e!(err, "huck: jobs: {arg}: no such job");
             return Err(ExecOutcome::Continue(1));
         }
-        let id = resolve_spec_or_error(arg, "jobs", shell)?;
+        let id = resolve_spec_or_error(arg, "jobs", err, shell)?;
         targets.push(id);
     }
 
@@ -3517,8 +3525,8 @@ fn matches_jobs_filter(parsed: &JobsArgs, job: &crate::jobs::Job) -> bool {
     true
 }
 
-fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    let parsed = match parse_jobs_args(args, shell) {
+fn builtin_jobs(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let parsed = match parse_jobs_args(args, err, shell) {
         Ok(p) => p,
         Err(outcome) => return outcome,
     };
@@ -3550,7 +3558,7 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             writeln!(out, "{}", crate::jobs::notification_line(job, flag))
         };
         if let Err(e) = write_result {
-            eprintln!("huck: jobs: {e}");
+            e!(err, "huck: jobs: {e}");
             return ExecOutcome::Continue(1);
         }
         printed_ids.push(job.id);
@@ -3578,7 +3586,7 @@ struct WaitArgs {
 /// Parses `wait`'s argv into flags + targets. Returns `Err(ExecOutcome)`
 /// on any usage / parse failure, with the appropriate stderr message
 /// already printed.
-fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutcome> {
+fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Result<WaitArgs, ExecOutcome> {
     let mut wait_any = false;
     let mut pid_var: Option<String> = None;
     let mut idx = 0;
@@ -3592,7 +3600,7 @@ fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutco
             }
             "-p" => {
                 if idx + 1 >= args.len() {
-                    eprintln!("huck: wait: -p: option requires a variable name");
+                    e!(err, "huck: wait: -p: option requires a variable name");
                     return Err(ExecOutcome::Continue(2));
                 }
                 pid_var = Some(args[idx + 1].clone());
@@ -3603,8 +3611,8 @@ fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutco
                 break;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: wait: {s}: invalid option");
-                eprintln!("huck: wait: usage: wait [-n] [-p var] [id ...]");
+                e!(err, "huck: wait: {s}: invalid option");
+                e!(err, "huck: wait: usage: wait [-n] [-p var] [id ...]");
                 return Err(ExecOutcome::Continue(2));
             }
             _ => break,
@@ -3612,7 +3620,7 @@ fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutco
     }
 
     if pid_var.is_some() && !wait_any {
-        eprintln!("huck: wait: -p: option requires -n");
+        e!(err, "huck: wait: -p: option requires -n");
         return Err(ExecOutcome::Continue(2));
     }
 
@@ -3620,13 +3628,13 @@ fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutco
     while idx < args.len() {
         let arg = &args[idx];
         if arg.starts_with('%') {
-            let id = resolve_spec_or_error(arg, "wait", shell)?;
+            let id = resolve_spec_or_error(arg, "wait", err, shell)?;
             targets.push(WaitTarget::Job(id));
         } else {
             match arg.parse::<i32>() {
                 Ok(pid) if pid > 0 => targets.push(WaitTarget::Pid(pid)),
                 _ => {
-                    eprintln!("huck: wait: {arg}: not a pid or valid job spec");
+                    e!(err, "huck: wait: {arg}: not a pid or valid job spec");
                     return Err(ExecOutcome::Continue(2));
                 }
             }
@@ -3637,8 +3645,8 @@ fn parse_wait_args(args: &[String], shell: &Shell) -> Result<WaitArgs, ExecOutco
     Ok(WaitArgs { wait_any, pid_var, targets })
 }
 
-fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
-    let parsed = match parse_wait_args(args, shell) {
+fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let parsed = match parse_wait_args(args, err, shell) {
         Ok(p) => p,
         Err(outcome) => return outcome,
     };
@@ -3647,9 +3655,9 @@ fn builtin_wait(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shel
         (false, 0) => wait_all(shell),
         (false, 1) => match &parsed.targets[0] {
             WaitTarget::Job(id) => wait_for_job(*id, shell),
-            WaitTarget::Pid(pid) => wait_for_pid(*pid, shell),
+            WaitTarget::Pid(pid) => wait_for_pid(*pid, err, shell),
         },
-        (false, _) => wait_for_all(parsed.targets, shell),
+        (false, _) => wait_for_all(parsed.targets, err, shell),
         (true, 0) => wait_any_pending(parsed.pid_var, shell),
         (true, _) => wait_any_of(parsed.targets, parsed.pid_var, shell),
     }
@@ -3705,7 +3713,7 @@ fn wait_for_job(id: u32, shell: &mut Shell) -> ExecOutcome {
     }
 }
 
-fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
+fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut first = true;
     loop {
         if let Some(o) = crate::executor::check_interrupt(shell) {
@@ -3737,7 +3745,7 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
             // surface as "not a child." On a subsequent call, treat as a
             // race we can't recover from.
             if first {
-                eprintln!("huck: wait: pid {pid} is not a child of this shell");
+                e!(err, "huck: wait: pid {pid} is not a child of this shell");
                 return ExecOutcome::Continue(127);
             }
             return ExecOutcome::Continue(1);
@@ -3749,12 +3757,12 @@ fn wait_for_pid(pid: i32, shell: &mut Shell) -> ExecOutcome {
 
 /// Multi-arg `wait` (M-38): wait sequentially for each target. Return
 /// the status of the LAST target waited.
-fn wait_for_all(targets: Vec<WaitTarget>, shell: &mut Shell) -> ExecOutcome {
+fn wait_for_all(targets: Vec<WaitTarget>, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut last = 0;
     for t in targets {
         let outcome = match t {
             WaitTarget::Job(id) => wait_for_job(id, shell),
-            WaitTarget::Pid(pid) => wait_for_pid(pid, shell),
+            WaitTarget::Pid(pid) => wait_for_pid(pid, err, shell),
         };
         match outcome {
             ExecOutcome::Continue(c) => last = c,
@@ -3963,7 +3971,7 @@ fn print_sig_listing(out: &mut dyn Write, table: &[(&str, i32)]) {
     }
 }
 
-fn handle_kill_l(args: &[String], out: &mut dyn Write) -> ExecOutcome {
+fn handle_kill_l(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExecOutcome {
     if args.is_empty() {
         print_killable_table(out);
         return ExecOutcome::Continue(0);
@@ -3980,7 +3988,7 @@ fn handle_kill_l(args: &[String], out: &mut dyn Write) -> ExecOutcome {
                     let _ = writeln!(out, "{name}");
                 }
                 None => {
-                    eprintln!("huck: kill: {arg}: invalid signal specification");
+                    e!(err, "huck: kill: {arg}: invalid signal specification");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -3995,7 +4003,7 @@ fn handle_kill_l(args: &[String], out: &mut dyn Write) -> ExecOutcome {
                     let _ = writeln!(out, "{num}");
                 }
                 None => {
-                    eprintln!("huck: kill: {arg}: invalid signal specification");
+                    e!(err, "huck: kill: {arg}: invalid signal specification");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -4024,32 +4032,33 @@ fn signal_by_name(s: &str) -> Option<i32> {
 fn resolve_spec_or_error(
     arg: &str,
     builtin: &str,
+    err: &mut dyn Write,
     shell: &Shell,
 ) -> Result<u32, ExecOutcome> {
     let spec = crate::job_spec::parse_job_spec(arg).map_err(|_| {
-        eprintln!("huck: {builtin}: {arg}: bad job spec");
+        e!(err, "huck: {builtin}: {arg}: bad job spec");
         ExecOutcome::Continue(1)
     })?;
     match shell.jobs.resolve(&spec) {
         Ok(id) => Ok(id),
         Err(crate::jobs::JobSpecResolveError::NotFound) => {
-            eprintln!("huck: {builtin}: {arg}: no such job");
+            e!(err, "huck: {builtin}: {arg}: no such job");
             Err(ExecOutcome::Continue(1))
         }
         Err(crate::jobs::JobSpecResolveError::Ambiguous) => {
-            eprintln!("huck: {builtin}: {arg}: ambiguous job spec");
+            e!(err, "huck: {builtin}: {arg}: ambiguous job spec");
             Err(ExecOutcome::Continue(1))
         }
     }
 }
 
-fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if matches!(args.first().map(|s| s.as_str()), Some("-l")) {
-        return handle_kill_l(&args[1..], out);
+        return handle_kill_l(&args[1..], out, err);
     }
     match args.first().map(|s| s.as_str()) {
-        Some("-s") => return kill_with_s_flag(&args[1..], shell),
-        Some("-n") => return kill_with_n_flag(&args[1..], shell),
+        Some("-s") => return kill_with_s_flag(&args[1..], err, shell),
+        Some("-n") => return kill_with_n_flag(&args[1..], err, shell),
         _ => {}
     }
     let (sig, targets) = if let Some(first) = args.first() {
@@ -4058,19 +4067,19 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             let sig = match rest.parse::<i32>() {
                 Ok(n) if (0..=64).contains(&n) => n,
                 Ok(_) => {
-                    eprintln!("huck: kill: {rest}: invalid signal number");
+                    e!(err, "huck: kill: {rest}: invalid signal number");
                     return ExecOutcome::Continue(1);
                 }
                 Err(_) => match signal_by_name(rest) {
                     Some(n) => n,
                     None => {
-                        eprintln!("huck: kill: {rest}: invalid signal");
+                        e!(err, "huck: kill: {rest}: invalid signal");
                         return ExecOutcome::Continue(1);
                     }
                 },
             };
             if args.len() < 2 {
-                eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+                e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
                 return ExecOutcome::Continue(2);
             }
             (sig, &args[1..])
@@ -4078,53 +4087,53 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             (libc::SIGTERM, args)
         }
     } else {
-        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     };
 
-    send_signal_to_targets(sig, targets, shell)
+    send_signal_to_targets(sig, targets, err, shell)
 }
 
 /// Handles `kill -s SIGNAME [targets...]`. The `-s` token has already
 /// been consumed by the dispatcher; `args` is everything after it.
-fn kill_with_s_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let name = match args.first() {
         Some(n) => n,
         None => {
-            eprintln!("huck: kill: -s: option requires an argument");
+            e!(err, "huck: kill: -s: option requires an argument");
             return ExecOutcome::Continue(2);
         }
     };
     let sig = match signal_by_name(name) {
         Some(n) => n,
         None => {
-            eprintln!("huck: kill: {name}: invalid signal specification");
+            e!(err, "huck: kill: {name}: invalid signal specification");
             return ExecOutcome::Continue(1);
         }
     };
     let targets = &args[1..];
     if targets.is_empty() {
-        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
-    send_signal_to_targets(sig, targets, shell)
+    send_signal_to_targets(sig, targets, err, shell)
 }
 
 /// Handles `kill -n SIGNUM [targets...]`. The `-n` token has already
 /// been consumed by the dispatcher; `args` is everything after it.
 /// Number must be in `killable_signals()` (matching `kill -l`'s set).
-fn kill_with_n_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let num_arg = match args.first() {
         Some(s) => s,
         None => {
-            eprintln!("huck: kill: -n: option requires an argument");
+            e!(err, "huck: kill: -n: option requires an argument");
             return ExecOutcome::Continue(2);
         }
     };
     let n = match num_arg.parse::<i32>() {
         Ok(n) if (1..=64).contains(&n) => n,
         _ => {
-            eprintln!("huck: kill: {num_arg}: invalid signal specification");
+            e!(err, "huck: kill: {num_arg}: invalid signal specification");
             return ExecOutcome::Continue(1);
         }
     };
@@ -4132,15 +4141,15 @@ fn kill_with_n_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
         .iter()
         .any(|(_, num)| *num == n)
     {
-        eprintln!("huck: kill: {num_arg}: invalid signal specification");
+        e!(err, "huck: kill: {num_arg}: invalid signal specification");
         return ExecOutcome::Continue(1);
     }
     let targets = &args[1..];
     if targets.is_empty() {
-        eprintln!("huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
-    send_signal_to_targets(n, targets, shell)
+    send_signal_to_targets(n, targets, err, shell)
 }
 
 /// Sends `sig` to each target (`%spec` or PID). Returns `Continue(1)`
@@ -4149,12 +4158,13 @@ fn kill_with_n_flag(args: &[String], shell: &mut Shell) -> ExecOutcome {
 fn send_signal_to_targets(
     sig: i32,
     targets: &[String],
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut any_failed = false;
     for target in targets {
         if let Some(_rest) = target.strip_prefix('%') {
-            let id = match resolve_spec_or_error(target, "kill", shell) {
+            let id = match resolve_spec_or_error(target, "kill", err, shell) {
                 Ok(id) => id,
                 Err(_) => {
                     any_failed = true;
@@ -4164,7 +4174,7 @@ fn send_signal_to_targets(
             let (own_pgroup, pgid, pids) = match shell.jobs.iter().find(|j| j.id == id) {
                 Some(j) => (j.own_pgroup, j.pgid, j.pids.clone()),
                 None => {
-                    eprintln!("huck: kill: {target}: no such job");
+                    e!(err, "huck: kill: {target}: no such job");
                     any_failed = true;
                     continue;
                 }
@@ -4185,7 +4195,7 @@ fn send_signal_to_targets(
             };
             if rc != 0 {
                 let errno = std::io::Error::last_os_error();
-                eprintln!("huck: kill: ({target}) - {errno}");
+                e!(err, "huck: kill: ({target}) - {errno}");
                 any_failed = true;
             }
         } else {
@@ -4194,12 +4204,12 @@ fn send_signal_to_targets(
                     let rc = unsafe { libc::kill(pid, sig) };
                     if rc != 0 {
                         let errno = std::io::Error::last_os_error();
-                        eprintln!("huck: kill: ({pid}) - {errno}");
+                        e!(err, "huck: kill: ({pid}) - {errno}");
                         any_failed = true;
                     }
                 }
                 _ => {
-                    eprintln!("huck: kill: {target}: arguments must be process or job IDs");
+                    e!(err, "huck: kill: {target}: arguments must be process or job IDs");
                     any_failed = true;
                 }
             }
@@ -4212,7 +4222,7 @@ fn send_signal_to_targets(
     }
 }
 
-fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut all = false;
     let mut running_only = false;
     let mut mark_nohup = false;
@@ -4233,8 +4243,8 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
                     'r' => running_only = true,
                     'h' => mark_nohup = true,
                     _ => {
-                        eprintln!("huck: disown: -{c}: invalid option");
-                        eprintln!("huck: disown: usage: disown [-ahr] [%job ...]");
+                        e!(err, "huck: disown: -{c}: invalid option");
+                        e!(err, "huck: disown: usage: disown [-ahr] [%job ...]");
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -4253,7 +4263,7 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
         let mut ids = Vec::new();
         for arg in positional {
             if arg.starts_with('%') {
-                match resolve_spec_or_error(arg, "disown", shell) {
+                match resolve_spec_or_error(arg, "disown", err, shell) {
                     Ok(id) => ids.push(id),
                     Err(outcome) => return outcome,
                 }
@@ -4263,13 +4273,13 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
                         match shell.jobs.iter().find(|j| j.pids.contains(&pid)) {
                             Some(job) => ids.push(job.id),
                             None => {
-                                eprintln!("huck: disown: {arg}: no such job");
+                                e!(err, "huck: disown: {arg}: no such job");
                                 return ExecOutcome::Continue(1);
                             }
                         }
                     }
                     _ => {
-                        eprintln!("huck: disown: {arg}: not a valid job spec");
+                        e!(err, "huck: disown: {arg}: not a valid job spec");
                         return ExecOutcome::Continue(1);
                     }
                 }
@@ -4283,7 +4293,7 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
         match shell.jobs.current_id() {
             Some(id) => vec![id],
             None => {
-                eprintln!("huck: disown: no current job");
+                e!(err, "huck: disown: no current job");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4314,21 +4324,21 @@ fn builtin_disown(args: &[String], shell: &mut Shell) -> ExecOutcome {
     ExecOutcome::Continue(0)
 }
 
-fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let id = match args.len() {
         0 => match shell.jobs.current_id() {
             Some(id) => id,
             None => {
-                eprintln!("huck: fg: no current job");
+                e!(err, "huck: fg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
-        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "fg", shell) {
+        1 if args[0].starts_with('%') => match resolve_spec_or_error(&args[0], "fg", err, shell) {
             Ok(id) => id,
             Err(outcome) => return outcome,
         },
         _ => {
-            eprintln!("huck: fg: usage: fg [%job]");
+            e!(err, "huck: fg: usage: fg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4338,12 +4348,12 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
             job.notified = true;
             (job.pgid, job.pids.clone(), job.command.clone())
         } else {
-            eprintln!("huck: fg: no current job");
+            e!(err, "huck: fg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
 
-    eprintln!("{command}");
+    e!(err, "{command}");
 
     unsafe {
         libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
@@ -4390,7 +4400,7 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
             .find(|j| j.id == id)
             .map(|j| crate::jobs::notification_line(j, '+'))
             .unwrap_or_default();
-        eprintln!("\n{line}");
+        e!(err, "\n{line}");
         return ExecOutcome::Continue(128 + sig);
     }
 
@@ -4403,17 +4413,17 @@ fn builtin_fg(args: &[String], shell: &mut Shell) -> ExecOutcome {
     ExecOutcome::Continue(last_status)
 }
 
-fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let id = match args.len() {
         0 => match shell.jobs.current_stopped_id() {
             Some(id) => id,
             None => {
-                eprintln!("huck: bg: no current job");
+                e!(err, "huck: bg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
         1 if args[0].starts_with('%') => {
-            let id = match resolve_spec_or_error(&args[0], "bg", shell) {
+            let id = match resolve_spec_or_error(&args[0], "bg", err, shell) {
                 Ok(id) => id,
                 Err(outcome) => return outcome,
             };
@@ -4423,13 +4433,13 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
                 .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
                 .unwrap_or(false);
             if !is_stopped {
-                eprintln!("huck: bg: job %{id} already running");
+                e!(err, "huck: bg: job %{id} already running");
                 return ExecOutcome::Continue(1);
             }
             id
         }
         _ => {
-            eprintln!("huck: bg: usage: bg [%job]");
+            e!(err, "huck: bg: usage: bg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4439,20 +4449,21 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, shell: &mut Shell)
             job.notified = true;
             (job.pgid, job.command.clone())
         } else {
-            eprintln!("huck: bg: no current job");
+            e!(err, "huck: bg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
 
     unsafe { libc::killpg(pgid, libc::SIGCONT); }
 
-    eprintln!("[{id}]+ {command} &");
+    e!(err, "[{id}]+ {command} &");
     ExecOutcome::Continue(0)
 }
 
 fn builtin_history(
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     match args.first().map(|s| s.as_str()) {
@@ -4469,13 +4480,13 @@ fn builtin_history(
             ExecOutcome::Continue(0)
         }
         Some(other) => {
-            eprintln!("huck: history: {other}: invalid option");
+            e!(err, "huck: history: {other}: invalid option");
             ExecOutcome::Continue(1)
         }
     }
 }
 
-fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     use crate::traps::{TrapSignal, install, reset, parse_trap_signal};
 
     // No args: same as `trap -p`.
@@ -4487,7 +4498,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     // -l: list signal name/number pairs.
     if args[0] == "-l" {
         if args.len() != 1 {
-            eprintln!("huck: trap: -l takes no arguments");
+            e!(err, "huck: trap: -l takes no arguments");
             return ExecOutcome::Continue(1);
         }
         print_signal_table(out);
@@ -4505,7 +4516,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
             match parse_trap_signal(name) {
                 Ok(sig) => filter.push(sig),
                 Err(msg) => {
-                    eprintln!("huck: trap: {msg}");
+                    e!(err, "huck: trap: {msg}");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -4517,19 +4528,19 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
     // `trap - SIGNAL...`: reset each signal.
     if args[0] == "-" {
         if args.len() < 2 {
-            eprintln!("huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+            e!(err, "huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
             return ExecOutcome::Continue(1);
         }
         for name in &args[1..] {
             let sig = match parse_trap_signal(name) {
                 Ok(s) => s,
                 Err(msg) => {
-                    eprintln!("huck: trap: {msg}");
+                    e!(err, "huck: trap: {msg}");
                     return ExecOutcome::Continue(1);
                 }
             };
             if let Err(msg) = reset(shell, sig) {
-                eprintln!("huck: trap: {msg}");
+                e!(err, "huck: trap: {msg}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4538,7 +4549,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
 
     // `trap ACTION SIGNAL...`: install action for each signal.
     if args.len() < 2 {
-        eprintln!("huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        e!(err, "huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
         return ExecOutcome::Continue(1);
     }
     let action_text = args[0].clone();
@@ -4551,12 +4562,12 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
         let sig = match parse_trap_signal(name) {
             Ok(s) => s,
             Err(msg) => {
-                eprintln!("huck: trap: {msg}");
+                e!(err, "huck: trap: {msg}");
                 return ExecOutcome::Continue(1);
             }
         };
         if let Err(msg) = install(shell, sig, action.clone()) {
-            eprintln!("huck: trap: {msg}");
+            e!(err, "huck: trap: {msg}");
             return ExecOutcome::Continue(1);
         }
     }
@@ -4768,15 +4779,15 @@ fn optstring_takes_arg(optstring: &str, c: char) -> bool {
 /// `getopts optstring name [arg ...]` — POSIX option parser (M-106). Reads/
 /// writes OPTIND/OPTARG/OPTERR + the matched-letter `name`, holding the
 /// within-word cursor in Shell. Delegates the state machine to `getopts_step`.
-fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.len() < 2 {
-        eprintln!("huck: getopts: usage: getopts optstring name [arg]");
+        e!(err, "huck: getopts: usage: getopts optstring name [arg]");
         return ExecOutcome::Continue(2);
     }
     let optstring = args[0].clone();
     let name = args[1].clone();
     if !is_valid_name(&name) {
-        eprintln!("huck: getopts: `{name}': not a valid identifier");
+        e!(err, "huck: getopts: `{name}': not a valid identifier");
         return ExecOutcome::Continue(2);
     }
     // Parse explicit args if given, else the current positional parameters.
@@ -4811,12 +4822,12 @@ fn builtin_getopts(args: &[String], shell: &mut Shell) -> ExecOutcome {
     if let Some(body) = step.error
         && shell.lookup_var("OPTERR").as_deref() != Some("0")
     {
-        eprintln!("huck: {body}");
+        e!(err, "huck: {body}");
     }
     ExecOutcome::Continue(if step.done { 1 } else { 0 })
 }
 
-fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_shift(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     // bash parses the count as a signed integer: a negative count is a
     // "shift count out of range" error (naming the value), a non-numeric
     // argument is "numeric argument required".
@@ -4827,13 +4838,13 @@ fn builtin_shift(args: &[String], shell: &mut Shell) -> ExecOutcome {
         Some(s) => match s.trim().parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
-                eprintln!("huck: shift: {s}: numeric argument required");
+                e!(err, "huck: shift: {s}: numeric argument required");
                 return ExecOutcome::Continue(1);
             }
         },
     };
     if n < 0 {
-        eprintln!("huck: shift: {n}: shift count out of range");
+        e!(err, "huck: shift: {n}: shift count out of range");
         return ExecOutcome::Continue(1);
     }
     // A count larger than $# is a SILENT failure in bash (rc 1, no message);
@@ -4972,7 +4983,7 @@ fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     ExecOutcome::Continue(0)
 }
 
-fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
         let mut names: Vec<String> = shell.var_names().map(|s| s.to_string()).collect();
         names.sort();
@@ -5005,11 +5016,11 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             match option_set(shell, &args[i], true) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    e!(err, "huck: set: {}: not yet supported in this version", args[i]);
                     return ExecOutcome::Continue(2);
                 }
                 Err(OptSetErr::Unknown) => {
-                    eprintln!("huck: set: -o: invalid option name: {}", args[i]);
+                    e!(err, "huck: set: -o: invalid option name: {}", args[i]);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5024,11 +5035,11 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
             match option_set(shell, &args[i], false) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    eprintln!("huck: set: {}: not yet supported in this version", args[i]);
+                    e!(err, "huck: set: {}: not yet supported in this version", args[i]);
                     return ExecOutcome::Continue(2);
                 }
                 Err(OptSetErr::Unknown) => {
-                    eprintln!("huck: set: +o: invalid option name: {}", args[i]);
+                    e!(err, "huck: set: +o: invalid option name: {}", args[i]);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5056,14 +5067,14 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         match option_set(shell, &args[i], true) {
                             Ok(()) => {}
                             Err(OptSetErr::Unimplemented) => {
-                                eprintln!(
+                                e!(err,
                                     "huck: set: {}: not yet supported in this version",
                                     args[i]
                                 );
                                 return ExecOutcome::Continue(2);
                             }
                             Err(OptSetErr::Unknown) => {
-                                eprintln!(
+                                e!(err,
                                     "huck: set: -o: invalid option name: {}",
                                     args[i]
                                 );
@@ -5072,7 +5083,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         }
                     }
                     other => {
-                        eprintln!(
+                        e!(err,
                             "huck: set: -{}: not yet supported in this version",
                             other as char
                         );
@@ -5101,14 +5112,14 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         match option_set(shell, &args[i], false) {
                             Ok(()) => {}
                             Err(OptSetErr::Unimplemented) => {
-                                eprintln!(
+                                e!(err,
                                     "huck: set: {}: not yet supported in this version",
                                     args[i]
                                 );
                                 return ExecOutcome::Continue(2);
                             }
                             Err(OptSetErr::Unknown) => {
-                                eprintln!(
+                                e!(err,
                                     "huck: set: +o: invalid option name: {}",
                                     args[i]
                                 );
@@ -5117,7 +5128,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecO
                         }
                     }
                     other => {
-                        eprintln!(
+                        e!(err,
                             "huck: set: +{}: not yet supported in this version",
                             other as char
                         );
@@ -5149,7 +5160,7 @@ fn fmt_opt_line(name: &str, on: bool) -> String {
 
 /// `shopt` builtin. Operates on the `shopt` option namespace, or — with
 /// `-o` — bridges to the `set -o` namespace (`SETO_TABLE`).
-fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let (mut set_f, mut unset_f, mut quiet, mut print_f, mut o_bridge) =
         (false, false, false, false, false);
     let mut i = 0;
@@ -5165,8 +5176,8 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
                     'p' => print_f = true,
                     'o' => o_bridge = true,
                     _ => {
-                        eprintln!("huck: shopt: -{c}: invalid option");
-                        eprintln!("shopt: usage: shopt [-pqsu] [-o] [optname ...]");
+                        e!(err, "huck: shopt: -{c}: invalid option");
+                        e!(err, "shopt: usage: shopt [-pqsu] [-o] [optname ...]");
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -5177,13 +5188,13 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
         }
     }
     if set_f && unset_f {
-        eprintln!("huck: shopt: cannot set and unset shell options simultaneously");
+        e!(err, "huck: shopt: cannot set and unset shell options simultaneously");
         return ExecOutcome::Continue(1);
     }
     let names = &args[i..];
 
     if o_bridge {
-        return shopt_o_bridge(names, set_f, unset_f, quiet, print_f, out, shell);
+        return shopt_o_bridge(names, set_f, unset_f, quiet, print_f, out, err, shell);
     }
 
     // ---- shopt namespace ----
@@ -5209,7 +5220,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
         let mut rc = 0;
         for name in names {
             if !shell.shopt_options.set(name, set_f) {
-                eprintln!("huck: shopt: {name}: invalid shell option name");
+                e!(err, "huck: shopt: {name}: invalid shell option name");
                 rc = 1;
             }
         }
@@ -5231,7 +5242,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
                 }
             }
             None => {
-                eprintln!("huck: shopt: {name}: invalid shell option name");
+                e!(err, "huck: shopt: {name}: invalid shell option name");
                 all_set = false;
             }
         }
@@ -5242,7 +5253,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
 /// The `-o` bridge: every `shopt` form operates on the `set -o` namespace.
 fn shopt_o_bridge(
     names: &[String], set_f: bool, unset_f: bool, quiet: bool, print_f: bool,
-    out: &mut dyn Write, shell: &mut Shell,
+    out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell,
 ) -> ExecOutcome {
     if names.is_empty() {
         if quiet {
@@ -5268,11 +5279,11 @@ fn shopt_o_bridge(
             match option_set(shell, name, set_f) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    eprintln!("huck: shopt: {name}: not yet supported in this version");
+                    e!(err, "huck: shopt: {name}: not yet supported in this version");
                     rc = 1;
                 }
                 Err(OptSetErr::Unknown) => {
-                    eprintln!("huck: shopt: {name}: invalid shell option name");
+                    e!(err, "huck: shopt: {name}: invalid shell option name");
                     rc = 1;
                 }
             }
@@ -5295,7 +5306,7 @@ fn shopt_o_bridge(
                 }
             }
             None => {
-                eprintln!("huck: shopt: {name}: invalid shell option name");
+                e!(err, "huck: shopt: {name}: invalid shell option name");
                 all_set = false;
             }
         }
@@ -5344,9 +5355,9 @@ fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
 /// Exit status is 0 if the LAST expression's value is non-zero, 1 if it is
 /// zero — like `(( ))`. With no args, bash prints an error and exits 1.
 /// Not a special builtin.
-fn builtin_let(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
-        eprintln!("huck: let: expression expected");
+        e!(err, "huck: let: expression expected");
         return ExecOutcome::Continue(1);
     }
     let mut last: i64 = 0;
@@ -5354,7 +5365,7 @@ fn builtin_let(args: &[String], shell: &mut Shell) -> ExecOutcome {
         match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
             Ok(v) => last = v,
             Err(e) => {
-                eprintln!("huck: let: {a}: {e}");
+                e!(err, "huck: let: {a}: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -5875,6 +5886,7 @@ fn emit_help_entry(
 fn builtin_help(
     args: &[String],
     out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     _shell: &mut Shell,
 ) -> ExecOutcome {
     let mut want_synopsis = false;
@@ -5896,7 +5908,7 @@ fn builtin_help(
                 b'd' => want_description = true,
                 b'm' => want_man = true,
                 other => {
-                    eprintln!("huck: help: -{}: invalid option", other as char);
+                    e!(err, "huck: help: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5923,7 +5935,7 @@ fn builtin_help(
                 want_man,
             ),
             None => {
-                eprintln!("huck: help: no help topics match `{name}'");
+                e!(err, "huck: help: no help topics match `{name}'");
                 exit = 1;
             }
         }
@@ -5933,29 +5945,30 @@ fn builtin_help(
 
 pub(crate) fn source_in_sink(
     args: &[String],
+    err: &mut dyn Write,
     shell: &mut Shell,
     sink: &mut crate::executor::StdoutSink,
 ) -> ExecOutcome {
     if args.is_empty() {
-        eprintln!("huck: .: usage: . filename [arguments]");
+        e!(err, "huck: .: usage: . filename [arguments]");
         return ExecOutcome::Continue(2);
     }
     if shell.source_depth >= 64 {
-        eprintln!("huck: .: maximum source depth (64) exceeded");
+        e!(err, "huck: .: maximum source depth (64) exceeded");
         return ExecOutcome::Continue(1);
     }
     let filename = &args[0];
     let path = match resolve_source_path(filename, shell) {
         Some(p) => p,
         None => {
-            eprintln!("huck: .: {filename}: file not found");
+            e!(err, "huck: .: {filename}: file not found");
             return ExecOutcome::Continue(1);
         }
     };
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("huck: .: {}: {e}", path.display());
+            e!(err, "huck: .: {}: {e}", path.display());
             return ExecOutcome::Continue(1);
         }
     };
@@ -5976,7 +5989,7 @@ pub(crate) fn source_in_sink(
         kind: crate::shell_state::FrameKind::Source,
     });
     shell.sync_call_arrays();
-    let result = run_sourced_contents_in_sink(&contents, &path, shell, sink);
+    let result = run_sourced_contents_in_sink(&contents, &path, err, shell, sink);
     shell.call_stack.pop();
     shell.sync_call_arrays();
     shell.source_depth -= 1;
@@ -5987,9 +6000,9 @@ pub(crate) fn source_in_sink(
     result
 }
 
-fn builtin_source(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_source(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    source_in_sink(args, shell, &mut sink)
+    source_in_sink(args, err, shell, &mut sink)
 }
 
 fn resolve_source_path(
@@ -6035,6 +6048,7 @@ fn is_unterminated(e: &crate::command::ParseError) -> bool {
 pub(crate) fn run_sourced_contents_in_sink(
     contents: &str,
     path: &std::path::Path,
+    err: &mut dyn Write,
     shell: &mut crate::shell_state::Shell,
     sink: &mut crate::executor::StdoutSink,
 ) -> ExecOutcome {
@@ -6078,12 +6092,12 @@ pub(crate) fn run_sourced_contents_in_sink(
         );
         let total = tokens.len();
         if total == 0 {
-            if let Some((e, foff)) = terr {
-                eprintln!(
+            if let Some((le, foff)) = terr {
+                e!(err,
                     "huck: {}: line {}: syntax error{}",
                     path.display(),
                     line_of(start + foff),
-                    crate::lex_error_message(e)
+                    crate::lex_error_message(le)
                 );
                 last_status = 2;
                 start = next_line_start(start + foff);
@@ -6111,7 +6125,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                 // last executed unit). Re-lex that tail ONLY if a command in this
                 // chunk flipped extglob — otherwise re-lexing would fail
                 // identically (an infinite loop), so report the error instead.
-                if let Some((e, foff)) = &terr {
+                if let Some((le, foff)) = &terr {
                     let now_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
                     // Resume from the start of the failing line (a clean boundary)
                     // rather than `prev_end`, which may be the mid-construct lex
@@ -6122,11 +6136,11 @@ pub(crate) fn run_sourced_contents_in_sink(
                         prev_end = start;
                         continue 'outer;
                     }
-                    eprintln!(
+                    e!(err,
                         "huck: {}: line {}: syntax error{}",
                         path.display(),
                         line_of(start + foff),
-                        crate::lex_error_message(e.clone())
+                        crate::lex_error_message(le.clone())
                     );
                     last_status = 2;
                     start = next_line_start(start + foff);
@@ -6145,7 +6159,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                     let unit_end_abs = start + offsets[unit_end_idx];
 
                     if shell.shell_options.verbose {
-                        eprint!("{}", &contents[prev_end..unit_end_abs]);
+                        let _ = write!(err, "{}", &contents[prev_end..unit_end_abs]);
                     }
                     prev_end = unit_end_abs;
 
@@ -6211,7 +6225,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                         continue 'outer;
                     }
                     let (le, foff) = terr.clone().unwrap();
-                    eprintln!(
+                    e!(err,
                         "huck: {}: line {}: syntax error{}",
                         path.display(),
                         line_of(start + foff),
@@ -6223,7 +6237,7 @@ pub(crate) fn run_sourced_contents_in_sink(
                     continue 'outer;
                 }
                 Err(e) => {
-                    eprintln!(
+                    e!(err,
                         "huck: {}: line {}: syntax error: {}",
                         path.display(),
                         line_of(start + offsets[unit_start_idx]),
@@ -6255,10 +6269,11 @@ pub(crate) fn run_sourced_contents_in_sink(
 pub(crate) fn run_sourced_contents(
     contents: &str,
     path: &std::path::Path,
+    err: &mut dyn Write,
     shell: &mut crate::shell_state::Shell,
 ) -> ExecOutcome {
     let mut sink = crate::executor::StdoutSink::Terminal;
-    run_sourced_contents_in_sink(contents, path, shell, &mut sink)
+    run_sourced_contents_in_sink(contents, path, err, shell, &mut sink)
 }
 
 fn is_valid_alias_name(s: &str) -> bool {
@@ -6273,7 +6288,7 @@ pub(crate) fn escape_alias_value(v: &str) -> String {
     v.replace('\'', r#"'\''"#)
 }
 
-fn builtin_alias(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
         let mut names: Vec<&String> = shell.aliases.keys().collect();
         names.sort();
@@ -6283,14 +6298,14 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
         }
         return ExecOutcome::Continue(0);
     }
-    let mut any_err = false;
+    let mut any_failed = false;
     for arg in args {
         if let Some(eq) = arg.find('=') {
             let name = &arg[..eq];
             let value = &arg[eq + 1..];
             if !is_valid_alias_name(name) {
-                eprintln!("huck: alias: `{name}': invalid alias name");
-                any_err = true;
+                e!(err, "huck: alias: `{name}': invalid alias name");
+                any_failed = true;
                 continue;
             }
             shell.aliases.insert(name.to_string(), value.to_string());
@@ -6300,32 +6315,32 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exe
                     let _ = writeln!(out, "alias {}='{}'", arg, escape_alias_value(v));
                 }
                 None => {
-                    eprintln!("huck: alias: {arg}: not found");
-                    any_err = true;
+                    e!(err, "huck: alias: {arg}: not found");
+                    any_failed = true;
                 }
             }
         }
     }
-    ExecOutcome::Continue(if any_err { 1 } else { 0 })
+    ExecOutcome::Continue(if any_failed { 1 } else { 0 })
 }
 
-fn builtin_unalias(args: &[String], shell: &mut Shell) -> ExecOutcome {
+fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
-        eprintln!("huck: unalias: usage: unalias [-a] name [name ...]");
+        e!(err, "huck: unalias: usage: unalias [-a] name [name ...]");
         return ExecOutcome::Continue(2);
     }
     if args[0] == "-a" {
         shell.aliases.clear();
         return ExecOutcome::Continue(0);
     }
-    let mut any_err = false;
+    let mut any_failed = false;
     for name in args {
         if shell.aliases.remove(name).is_none() {
-            eprintln!("huck: unalias: {name}: not found");
-            any_err = true;
+            e!(err, "huck: unalias: {name}: not found");
+            any_failed = true;
         }
     }
-    ExecOutcome::Continue(if any_err { 1 } else { 0 })
+    ExecOutcome::Continue(if any_failed { 1 } else { 0 })
 }
 
 fn builtin_colon(_args: &[String], _shell: &mut Shell) -> ExecOutcome {
@@ -6534,6 +6549,7 @@ fn emit_type_entry(
 fn builtin_type(
     args: &[String],
     out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut all = false;
@@ -6562,7 +6578,7 @@ fn builtin_type(
                 }
                 b'f' => skip_func = true,
                 other => {
-                    eprintln!("huck: type: -{}: invalid option", other as char);
+                    e!(err, "huck: type: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -6592,7 +6608,7 @@ fn builtin_type(
 
         if resolutions.is_empty() {
             if !type_only && !path_only {
-                eprintln!("huck: type: {name}: not found");
+                e!(err, "huck: type: {name}: not found");
             }
             exit = 1;
             continue;
@@ -6607,6 +6623,7 @@ fn builtin_type(
 fn builtin_hash(
     args: &[String],
     out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     // Mode-selector flags. Priority when multiple set:
@@ -6650,7 +6667,7 @@ fn builtin_hash(
                         // -p separate: next arg
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("huck: hash: -p: option requires an argument");
+                            e!(err, "huck: hash: -p: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         explicit_path = Some(args[i].clone());
@@ -6658,7 +6675,7 @@ fn builtin_hash(
                     }
                 }
                 c => {
-                    eprintln!("huck: hash: -{}: invalid option", c as char);
+                    e!(err, "huck: hash: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -6675,14 +6692,14 @@ fn builtin_hash(
 
     if delete {
         if names.is_empty() {
-            eprintln!("huck: hash: -d: at least one name required");
+            e!(err, "huck: hash: -d: at least one name required");
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
         let h = Rc::make_mut(&mut shell.command_hash);
         for name in names {
             if h.remove(name).is_none() {
-                eprintln!("huck: hash: {name}: not found");
+                e!(err, "huck: hash: {name}: not found");
                 exit = 1;
             }
         }
@@ -6692,12 +6709,12 @@ fn builtin_hash(
     if set_path {
         // Exactly one name required.
         if names.len() != 1 {
-            eprintln!("huck: hash: -p: exactly one name required");
+            e!(err, "huck: hash: -p: exactly one name required");
             return ExecOutcome::Continue(2);
         }
         let name = &names[0];
         if name.contains('/') {
-            eprintln!("huck: hash: {name}: must not contain `/'");
+            e!(err, "huck: hash: {name}: must not contain `/'");
             return ExecOutcome::Continue(1);
         }
         let path = explicit_path.unwrap(); // safe: set_path implies Some
@@ -6721,7 +6738,7 @@ fn builtin_hash(
 
     if type_only {
         if names.is_empty() {
-            eprintln!("huck: hash: -t: at least one name required");
+            e!(err, "huck: hash: -t: at least one name required");
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
@@ -6735,7 +6752,7 @@ fn builtin_hash(
                     }
                 }
                 None => {
-                    eprintln!("huck: hash: {name}: not found");
+                    e!(err, "huck: hash: {name}: not found");
                     exit = 1;
                 }
             }
@@ -6762,7 +6779,7 @@ fn builtin_hash(
     let mut exit: i32 = 0;
     for name in names {
         if name.contains('/') {
-            eprintln!("huck: hash: {name}: must not contain `/'");
+            e!(err, "huck: hash: {name}: must not contain `/'");
             exit = 1;
             continue;
         }
@@ -6771,7 +6788,7 @@ fn builtin_hash(
                 Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
             }
             None => {
-                eprintln!("huck: hash: {name}: not found");
+                e!(err, "huck: hash: {name}: not found");
                 exit = 1;
             }
         }
@@ -6782,6 +6799,7 @@ fn builtin_hash(
 fn builtin_command(
     args: &[String],
     out: &mut dyn std::io::Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     let mut concise = false;
@@ -6794,7 +6812,7 @@ fn builtin_command(
             "-p" => { i += 1; } // accept; introspection uses current $PATH
             "--" => { i += 1; break; }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: command: {s}: invalid option");
+                e!(err, "huck: command: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -6809,7 +6827,7 @@ fn builtin_command(
         if names.is_empty() {
             return ExecOutcome::Continue(0);
         }
-        eprintln!(
+        e!(err,
             "huck: command: bare form (without -v/-V) is not supported in this version"
         );
         return ExecOutcome::Continue(2);
@@ -6860,7 +6878,7 @@ fn builtin_command(
             CommandResolution::NotFound => {
                 any_not_found = true;
                 if verbose {
-                    eprintln!("huck: command: {name}: not found");
+                    e!(err, "huck: command: {name}: not found");
                 }
             }
         }
@@ -6868,12 +6886,12 @@ fn builtin_command(
     ExecOutcome::Continue(if any_not_found { 1 } else { 0 })
 }
 
-fn builtin_test(name: &str, args: &[String], shell: &Shell) -> ExecOutcome {
+fn builtin_test(name: &str, args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     let eval_args: &[String] = if name == "[" {
         match args.last() {
             Some(last) if last == "]" => &args[..args.len() - 1],
             _ => {
-                eprintln!("huck: [: missing ']'");
+                e!(err, "huck: [: missing ']'");
                 return ExecOutcome::Continue(2);
             }
         }
@@ -6884,7 +6902,7 @@ fn builtin_test(name: &str, args: &[String], shell: &Shell) -> ExecOutcome {
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {
-            eprintln!("huck: {name}: {msg}");
+            e!(err, "huck: {name}: {msg}");
             ExecOutcome::Continue(2)
         }
     }
@@ -7000,6 +7018,7 @@ fn is_signed_index_arg(s: &str) -> bool {
 fn builtin_pushd(
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     sync_stack_top(shell);
@@ -7007,13 +7026,13 @@ fn builtin_pushd(
     if args.is_empty() {
         // Swap top two.
         if shell.dir_stack.len() < 2 {
-            eprintln!("huck: pushd: no other directory");
+            e!(err, "huck: pushd: no other directory");
             return ExecOutcome::Continue(1);
         }
         shell.dir_stack.swap(0, 1);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
             && c != 0
         {
             // Undo the swap on failure.
@@ -7028,7 +7047,7 @@ fn builtin_pushd(
         let idx = match parse_signed_index(arg, shell.dir_stack.len()) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("huck: pushd: {e}");
+                e!(err, "huck: pushd: {e}");
                 return ExecOutcome::Continue(1);
             }
         };
@@ -7038,7 +7057,7 @@ fn builtin_pushd(
         shell.dir_stack.rotate_left(idx);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
             && c != 0
         {
             // Undo rotation on cd failure.
@@ -7050,7 +7069,7 @@ fn builtin_pushd(
 
     // pushd DIR
     let cd_args = vec![arg.clone()];
-    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
+    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
         && c != 0
     {
         return ExecOutcome::Continue(c);
@@ -7067,11 +7086,12 @@ fn builtin_pushd(
 fn builtin_popd(
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     sync_stack_top(shell);
     if shell.dir_stack.len() <= 1 {
-        eprintln!("huck: popd: directory stack empty");
+        e!(err, "huck: popd: directory stack empty");
         return ExecOutcome::Continue(1);
     }
 
@@ -7080,13 +7100,13 @@ fn builtin_popd(
     } else {
         let arg = &args[0];
         if !is_signed_index_arg(arg) {
-            eprintln!("huck: popd: {arg}: invalid argument");
+            e!(err, "huck: popd: {arg}: invalid argument");
             return ExecOutcome::Continue(1);
         }
         match parse_signed_index(arg, shell.dir_stack.len()) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("huck: popd: {e}");
+                e!(err, "huck: popd: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -7101,7 +7121,7 @@ fn builtin_popd(
     if idx == 0 {
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
             && c != 0
         {
             // Restore the entry we just popped so the stack is
@@ -7116,6 +7136,7 @@ fn builtin_popd(
 fn builtin_dirs(
     args: &[String],
     out: &mut dyn Write,
+    err: &mut dyn Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
     sync_stack_top(shell);
@@ -7151,14 +7172,14 @@ fn builtin_dirs(
                 match parse_signed_index(s, shell.dir_stack.len()) {
                     Ok(idx) => index = Some(idx),
                     Err(e) => {
-                        eprintln!("huck: dirs: {e}");
+                        e!(err, "huck: dirs: {e}");
                         return ExecOutcome::Continue(1);
                     }
                 }
                 i += 1;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: dirs: {s}: invalid option");
+                e!(err, "huck: dirs: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -7177,7 +7198,7 @@ fn builtin_dirs(
     print_stack(out, shell, collapse, per_line, numbered)
 }
 
-fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     use crate::readline_bind::{is_known_function, keyseq_is_valid, readline_function_names};
     const USAGE: &str = "bind: usage: bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]";
 
@@ -7198,14 +7219,14 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
                 if let Some(seq) = args.get(i) {
                     shell.add_unbind(seq);
                 } else {
-                    eprintln!("huck: bind: -r: option requires an argument");
+                    e!(err, "huck: bind: -r: option requires an argument");
                     rc = 2;
                 }
             }
             "-x" => { i += 1; /* keyseq:shell-command — deferred no-op */ }
             s if s.starts_with('-') && s.len() > 1 => {
-                eprintln!("huck: bind: {s}: invalid option");
-                eprintln!("huck: {USAGE}");
+                e!(err, "huck: bind: {s}: invalid option");
+                e!(err, "huck: {USAGE}");
                 return ExecOutcome::Continue(2);
             }
             // Non-flag argument: `set VAR VALUE` (3-arg or inline), or `keyseq:function`.
@@ -7216,7 +7237,7 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
                     let val = args.get(i + 2).cloned();
                     if let (Some(var), Some(val)) = (var, val) {
                         if !validate_readline_var(&var, &val) {
-                            eprintln!("huck: bind: {val}: invalid value for {var}");
+                            e!(err, "huck: bind: {val}: invalid value for {var}");
                             rc = 1;
                         } else {
                             shell.set_readline_var(&var, &val);
@@ -7228,7 +7249,7 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
                     let mut it = rest.split_whitespace();
                     if let (Some(var), Some(val)) = (it.next(), it.next()) {
                         if !validate_readline_var(var, val) {
-                            eprintln!("huck: bind: {val}: invalid value for {var}");
+                            e!(err, "huck: bind: {val}: invalid value for {var}");
                             rc = 1;
                         } else {
                             shell.set_readline_var(var, val);
@@ -7236,16 +7257,16 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, shell: &mut Shell) -> Exec
                     }
                 } else if let Some((seq, func)) = a.split_once(':') {
                     if !keyseq_is_valid(seq) {
-                        eprintln!("huck: bind: {seq}: cannot parse key sequence");
+                        e!(err, "huck: bind: {seq}: cannot parse key sequence");
                         rc = 1;
                     } else if !is_known_function(func) {
-                        eprintln!("huck: bind: {func}: unknown function name");
+                        e!(err, "huck: bind: {func}: unknown function name");
                         rc = 1;
                     } else {
                         shell.add_bind(seq, func);
                     }
                 } else {
-                    eprintln!("huck: bind: {a}: unknown command");
+                    e!(err, "huck: bind: {a}: unknown command");
                     rc = 1;
                 }
             }
@@ -7328,7 +7349,7 @@ mod tests {
         let _ =
             crate::shell::process_line("zf(){ echo hi; }", &mut shell, false);
         let mut buf: Vec<u8> = Vec::new();
-        let _ = run_declaration_builtin("declare", &[], &mut buf, &mut shell);
+        let _ = run_declaration_builtin("declare", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         let s = String::from_utf8(buf).unwrap();
         assert!(
             s.contains("zsv=hello"),
@@ -7397,14 +7418,14 @@ mod tests {
     #[test]
     fn exit_with_no_args() {
         let shell = crate::shell_state::Shell::new();
-        assert!(matches!(builtin_exit(&[], &shell), ExecOutcome::Exit(0)));
+        assert!(matches!(builtin_exit(&[],&mut std::io::stderr(),  &shell), ExecOutcome::Exit(0)));
     }
 
     #[test]
     fn exit_with_code() {
         let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["3".to_string()], &shell),
+            builtin_exit(&["3".to_string()],&mut std::io::stderr(),  &shell),
             ExecOutcome::Exit(3)
         ));
     }
@@ -7413,7 +7434,7 @@ mod tests {
     fn exit_with_bad_code_continues() {
         let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["abc".to_string()], &shell),
+            builtin_exit(&["abc".to_string()],&mut std::io::stderr(),  &shell),
             ExecOutcome::Continue(_)
         ));
     }
@@ -7422,7 +7443,7 @@ mod tests {
     fn exit_masks_value_greater_than_255() {
         let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["300".to_string()], &shell),
+            builtin_exit(&["300".to_string()],&mut std::io::stderr(),  &shell),
             ExecOutcome::Exit(44)
         ));
     }
@@ -7431,7 +7452,7 @@ mod tests {
     fn exit_masks_negative_value() {
         let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["-1".to_string()], &shell),
+            builtin_exit(&["-1".to_string()],&mut std::io::stderr(),  &shell),
             ExecOutcome::Exit(255)
         ));
     }
@@ -7440,7 +7461,7 @@ mod tests {
     fn exit_masks_exact_256_to_zero() {
         let shell = crate::shell_state::Shell::new();
         assert!(matches!(
-            builtin_exit(&["256".to_string()], &shell),
+            builtin_exit(&["256".to_string()],&mut std::io::stderr(),  &shell),
             ExecOutcome::Exit(0)
         ));
     }
@@ -7448,7 +7469,7 @@ mod tests {
     #[test]
     fn echo_writes_args_joined_by_spaces() {
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_echo(&["hello".to_string(), "world".to_string()], &mut out);
+        let outcome = builtin_echo(&["hello".to_string(), "world".to_string()], &mut out, &mut std::io::stderr());
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(out, b"hello world\n");
     }
@@ -7456,56 +7477,56 @@ mod tests {
     #[test]
     fn echo_with_no_args_writes_a_blank_line() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&[], &mut out);
+        builtin_echo(&[], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"\n");
     }
 
     #[test]
     fn echo_n_suppresses_trailing_newline() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-n".to_string(), "hello".to_string()], &mut out);
+        builtin_echo(&["-n".to_string(), "hello".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"hello");
     }
 
     #[test]
     fn echo_n_alone_writes_nothing() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-n".to_string()], &mut out);
+        builtin_echo(&["-n".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"");
     }
 
     #[test]
     fn echo_e_processes_basic_escapes() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"a\tb\nc".to_string()], &mut out);
+        builtin_echo(&["-e".to_string(), r"a\tb\nc".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"a\tb\nc\n");
     }
 
     #[test]
     fn echo_capital_e_keeps_backslashes_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-E".to_string(), r"a\tb".to_string()], &mut out);
+        builtin_echo(&["-E".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"a\\tb\n");
     }
 
     #[test]
     fn echo_default_keeps_backslashes_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&[r"a\tb".to_string()], &mut out);
+        builtin_echo(&[r"a\tb".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"a\\tb\n");
     }
 
     #[test]
     fn echo_combined_ne_flag() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-ne".to_string(), r"a\tb".to_string()], &mut out);
+        builtin_echo(&["-ne".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"a\tb");
     }
 
     #[test]
     fn echo_e_then_capital_e_disables_escapes() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-eE".to_string(), r"a\tb".to_string()], &mut out);
+        builtin_echo(&["-eE".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"a\\tb\n");
     }
 
@@ -7514,7 +7535,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         builtin_echo(
             &["-n".to_string(), "foo".to_string(), "-n".to_string(), "bar".to_string()],
-            &mut out,
+            &mut out, &mut std::io::stderr(),
         );
         assert_eq!(out, b"foo -n bar");
     }
@@ -7522,49 +7543,49 @@ mod tests {
     #[test]
     fn echo_unknown_flag_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-x".to_string(), "foo".to_string()], &mut out);
+        builtin_echo(&["-x".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"-x foo\n");
     }
 
     #[test]
     fn echo_single_dash_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-".to_string()], &mut out);
+        builtin_echo(&["-".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"-\n");
     }
 
     #[test]
     fn echo_double_dash_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["--".to_string(), "foo".to_string()], &mut out);
+        builtin_echo(&["--".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"-- foo\n");
     }
 
     #[test]
     fn echo_e_c_escape_terminates_output() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"abc\cdef".to_string()], &mut out);
+        builtin_echo(&["-e".to_string(), r"abc\cdef".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"abc");
     }
 
     #[test]
     fn echo_e_octal_escape() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\0101".to_string()], &mut out);
+        builtin_echo(&["-e".to_string(), r"\0101".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"A\n");
     }
 
     #[test]
     fn echo_e_hex_escape() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\x41".to_string()], &mut out);
+        builtin_echo(&["-e".to_string(), r"\x41".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"A\n");
     }
 
     #[test]
     fn echo_e_unknown_escape_keeps_backslash() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\z".to_string()], &mut out);
+        builtin_echo(&["-e".to_string(), r"\z".to_string()], &mut out, &mut std::io::stderr());
         assert_eq!(out, b"\\z\n");
     }
 
@@ -7572,7 +7593,7 @@ mod tests {
     fn pwd_writes_the_current_directory() {
         let mut out: Vec<u8> = Vec::new();
         let mut shell = Shell::new();
-        let outcome = builtin_pwd(&[], &mut out, &mut shell);
+        let outcome = builtin_pwd(&[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let written = String::from_utf8(out).unwrap();
         // With no $PWD set, logical mode falls back to getcwd.
@@ -7592,7 +7613,7 @@ mod tests {
         assert!(shell.is_function_exported("uf"));
         let mut out = Vec::new();
         // export -nf uf  -> remove the export mark
-        let oc = builtin_export_decl(&[dp("-n"), dp("-f"), dp("uf")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-n"), dp("-f"), dp("uf")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
         assert!(
             !shell.is_function_exported("uf"),
@@ -7620,7 +7641,7 @@ mod tests {
         shell.mark_function_exported("dfn2");
         // capture stdout of `declare -fx`: route through builtin_declare_decl directly.
         let mut out = Vec::new();
-        let oc = builtin_declare_decl(&[dp("-fx")], &mut out, &mut shell);
+        let oc = builtin_declare_decl(&[dp("-fx")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)), "{oc:?}");
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("dfn2 ()"), "{s}");
@@ -7633,7 +7654,7 @@ mod tests {
         shell.export_set("EXP_A", "1".to_string());
         shell.export_set("EXP_B", "two".to_string());
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-p")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-p")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("declare -x EXP_A=\"1\""), "{s}");
@@ -7646,7 +7667,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("EXP_C", "z".to_string());
         let mut out = Vec::new();
-        let _ = builtin_export_decl(&[], &mut out, &mut shell);
+        let _ = builtin_export_decl(&[], &mut out,&mut std::io::stderr(),  &mut shell);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("declare -x EXP_C=\"z\""), "{s}");
     }
@@ -7657,7 +7678,7 @@ mod tests {
         shell.export_set("EXP_D", "keep".to_string());
         assert!(shell.is_exported("EXP_D"));
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-n"), dp("EXP_D")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-n"), dp("EXP_D")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(!shell.is_exported("EXP_D"), "must be unexported");
         assert_eq!(shell.get("EXP_D"), Some("keep"), "value kept");
@@ -7668,7 +7689,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("EXP_E", "1".to_string());
         let mut out = Vec::new();
-        let _ = builtin_export_decl(&[dp("-n"), dp("EXP_E=2")], &mut out, &mut shell);
+        let _ = builtin_export_decl(&[dp("-n"), dp("EXP_E=2")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(!shell.is_exported("EXP_E"));
         assert_eq!(shell.get("EXP_E"), Some("2"));
     }
@@ -7677,7 +7698,7 @@ mod tests {
     fn export_n_unset_name_is_noop() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-n"), dp("NOPE_X")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-n"), dp("NOPE_X")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(!shell.is_exported("NOPE_X"));
     }
@@ -7686,7 +7707,7 @@ mod tests {
     fn export_invalid_flag_rc2() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-z")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-z")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(2)), "{oc:?}");
     }
 
@@ -7696,7 +7717,7 @@ mod tests {
         shell.set("EXP_F", "v".to_string());
         assert!(!shell.is_exported("EXP_F"));
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-p"), dp("EXP_F")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-p"), dp("EXP_F")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(
             shell.is_exported("EXP_F"),
@@ -7713,7 +7734,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out = Vec::new();
         // `export -f somefunc` for a nonexistent function: rc 1, no variable.
-        let oc = builtin_export_decl(&[dp("-f"), dp("somefunc")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-f"), dp("somefunc")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)));
         assert!(shell.get("somefunc").is_none(), "must NOT create a variable");
         assert!(!shell.is_exported("somefunc"));
@@ -7724,7 +7745,7 @@ mod tests {
         let mut shell = Shell::new();
         let _ = crate::shell::process_line("myfn(){ echo hi; }", &mut shell, false);
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-f"), dp("myfn")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-f"), dp("myfn")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(shell.is_function_exported("myfn"));
     }
@@ -7733,7 +7754,7 @@ mod tests {
     fn export_f_not_a_function_rc1() {
         let mut shell = Shell::new();
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-f"), dp("nope")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-f"), dp("nope")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(1)), "{oc:?}");
         assert!(!shell.is_function_exported("nope"));
     }
@@ -7744,7 +7765,7 @@ mod tests {
         let _ = crate::shell::process_line("af(){ echo hi; }", &mut shell, false);
         shell.mark_function_exported("af");
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-f")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("af ()"), "{s}");
@@ -7756,7 +7777,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("EXP_HIDE", "1".to_string());
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-a")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-a")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(String::from_utf8(out).unwrap().is_empty(), "export -a must NOT list");
     }
@@ -7766,7 +7787,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.export_set("EXP_HIDE2", "1".to_string());
         let mut out = Vec::new();
-        let oc = builtin_export_decl(&[dp("-f")], &mut out, &mut shell);
+        let oc = builtin_export_decl(&[dp("-f")], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert!(String::from_utf8(out).unwrap().is_empty(), "export -f must NOT list vars");
     }
@@ -7775,7 +7796,7 @@ mod tests {
     fn unset_removes_variable() {
         let mut shell = Shell::new();
         shell.set("HUCK_RM", "v".to_string());
-        let outcome = builtin_unset(&["HUCK_RM".to_string()], &mut shell);
+        let outcome = builtin_unset(&["HUCK_RM".to_string()],&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("HUCK_RM"), None);
     }
@@ -7783,14 +7804,14 @@ mod tests {
     #[test]
     fn unset_invalid_name_is_error() {
         let mut shell = Shell::new();
-        let outcome = builtin_unset(&["1BAD".to_string()], &mut shell);
+        let outcome = builtin_unset(&["1BAD".to_string()],&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
     #[test]
     fn unset_unknown_name_is_silent_ok() {
         let mut shell = Shell::new();
-        let outcome = builtin_unset(&["NEVER_SET_HUCK_XYZ".to_string()], &mut shell);
+        let outcome = builtin_unset(&["NEVER_SET_HUCK_XYZ".to_string()],&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -7798,7 +7819,7 @@ mod tests {
     fn jobs_with_empty_table_prints_nothing_and_returns_zero() {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_jobs(&[], &mut out, &mut shell);
+        let outcome = builtin_jobs(&[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(out.is_empty());
     }
@@ -7808,7 +7829,7 @@ mod tests {
         let mut shell = Shell::new();
         let _ = shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_jobs(&[], &mut out, &mut shell);
+        let outcome = builtin_jobs(&[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("[1]"));
@@ -7822,7 +7843,7 @@ mod tests {
         shell.jobs.add(100, vec![100], "sleep 100".to_string());
         shell.jobs.jobs_mut()[0].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("Stopped"), "got: {out:?}");
@@ -7834,7 +7855,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.jobs.add(1234, vec![1234], "sleep 30".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("1234"), "expected pid 1234 in: {out:?}");
@@ -7846,7 +7867,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.jobs.add(1234, vec![1234, 1235, 1236], "a | b | c".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-l".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("1234"), "missing 1234 in: {out:?}");
@@ -7862,7 +7883,7 @@ mod tests {
         shell.jobs.add(1234, vec![1234], "a".to_string());
         shell.jobs.add(2345, vec![2345], "b".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-p".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-p".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -7881,7 +7902,7 @@ mod tests {
         shell.jobs.add(1234, vec![1234], "running_cmd".to_string()); // %1 Running
         shell.jobs.add_synthetic_done("done_cmd".to_string(), 0);     // %2 Done
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-r".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-r".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("running_cmd"), "missing running_cmd: {out:?}");
@@ -7895,7 +7916,7 @@ mod tests {
         shell.jobs.add(2345, vec![2345], "stopped_cmd".to_string()); // %2 then forced Stopped
         shell.jobs.jobs_mut()[1].state = crate::jobs::JobState::Stopped(libc::SIGTSTP);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-s".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-s".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("stopped_cmd"), "missing stopped_cmd: {out:?}");
@@ -7908,7 +7929,7 @@ mod tests {
         shell.jobs.add(1234, vec![1234], "a".to_string()); // notified=false default
         shell.jobs.add(2345, vec![2345], "b".to_string()); // notified=false default
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-n".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-n".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("[1]"), "first call should show [1]: {out:?}");
@@ -7916,7 +7937,7 @@ mod tests {
 
         // Second call: both jobs are now marked notified -> empty output.
         let mut buf2: Vec<u8> = Vec::new();
-        let outcome2 = run_builtin("jobs", &["-n".to_string()], &mut buf2, &mut shell);
+        let outcome2 = run_builtin("jobs", &["-n".to_string()], &mut buf2,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome2, ExecOutcome::Continue(0)));
         let out2 = String::from_utf8(buf2).unwrap();
         assert!(out2.is_empty(), "second call should be empty: {out2:?}");
@@ -7929,7 +7950,7 @@ mod tests {
         shell.jobs.add(2345, vec![2345], "second_cmd".to_string()); // %2
         shell.jobs.add(3456, vec![3456], "third_cmd".to_string());  // %3
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["%2".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["%2".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("second_cmd"), "missing second_cmd: {out:?}");
@@ -7941,7 +7962,7 @@ mod tests {
     fn jobs_invalid_flag_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-x".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-x".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -7950,7 +7971,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.jobs.add(1234, vec![1234], "sleep".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("jobs", &["-lp".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("jobs", &["-lp".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         // -p output is just digits + newline, no [N] prefix.
@@ -7962,7 +7983,7 @@ mod tests {
     fn wait_with_no_jobs_returns_zero_immediately() {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_wait(&[], &mut out, &mut shell);
+        let outcome = builtin_wait(&[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -7990,7 +8011,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         let args = vec!["-n".to_string(), "x".to_string()];
-        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        let outcome = run_builtin("test", &args, &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -7999,7 +8020,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         let args = vec!["-z".to_string(), "x".to_string()];
-        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        let outcome = run_builtin("test", &args, &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8008,7 +8029,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         let args = vec!["3".to_string(), "-eq".to_string(), "abc".to_string()];
-        let outcome = run_builtin("test", &args, &mut out, &mut shell);
+        let outcome = run_builtin("test", &args, &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8021,7 +8042,7 @@ mod tests {
             "x".to_string(),
             "]".to_string(),
         ];
-        let outcome = run_builtin("[", &args, &mut out, &mut shell);
+        let outcome = run_builtin("[", &args, &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -8030,7 +8051,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         let args = vec!["-n".to_string(), "x".to_string()];
-        let outcome = run_builtin("[", &args, &mut out, &mut shell);
+        let outcome = run_builtin("[", &args, &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8038,7 +8059,7 @@ mod tests {
     fn builtin_bracket_empty_is_error() {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("[", &[], &mut out, &mut shell);
+        let outcome = run_builtin("[", &[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8047,7 +8068,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.loop_depth = 1;
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("break", &[], &mut out, &mut shell);
+        let outcome = run_builtin("break", &[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert_eq!(outcome, ExecOutcome::LoopBreak(1, 0));
     }
 
@@ -8056,7 +8077,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.loop_depth = 1;
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("continue", &[], &mut out, &mut shell);
+        let outcome = run_builtin("continue", &[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
     }
 
@@ -8065,7 +8086,7 @@ mod tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            run_builtin("return", &["7".to_string()], &mut out, &mut shell),
+            run_builtin("return", &["7".to_string()], &mut out,&mut std::io::stderr(),  &mut shell),
             ExecOutcome::FunctionReturn(7)
         );
     }
@@ -8076,7 +8097,7 @@ mod tests {
         shell.set_last_status(42);
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            run_builtin("return", &[], &mut out, &mut shell),
+            run_builtin("return", &[], &mut out,&mut std::io::stderr(),  &mut shell),
             ExecOutcome::FunctionReturn(42)
         );
     }
@@ -8087,7 +8108,7 @@ mod tests {
         shell.set_last_status(13);
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            run_builtin("return", &["not-a-num".to_string()], &mut out, &mut shell),
+            run_builtin("return", &["not-a-num".to_string()], &mut out,&mut std::io::stderr(),  &mut shell),
             ExecOutcome::FunctionReturn(13)
         );
     }
@@ -8109,7 +8130,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["echo bye".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8123,7 +8144,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8141,14 +8162,14 @@ mod tests {
         let _ = run_builtin(
             "trap",
             &["echo bye".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         // Then reset.
         let outcome = run_builtin(
             "trap",
             &["-".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8163,7 +8184,7 @@ mod tests {
         let _ = run_builtin(
             "trap",
             &["echo bye".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         // Clear the buffer (the install printed nothing, but be defensive).
@@ -8172,7 +8193,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["-p".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8190,11 +8211,11 @@ mod tests {
         let _ = run_builtin(
             "trap",
             &["echo bye".to_string(), "EXIT".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         buf.clear();
-        let outcome = run_builtin("trap", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("trap", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("trap -- 'echo bye' EXIT"));
@@ -8207,7 +8228,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["-l".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8223,7 +8244,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["echo bye".to_string(), "NOPE".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8238,7 +8259,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["echo nope".to_string(), "KILL".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8253,7 +8274,7 @@ mod tests {
         let outcome = run_builtin(
             "trap",
             &["echo bye".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8269,7 +8290,7 @@ mod fg_bg_tests {
     fn fg_with_no_jobs_errors() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("fg", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("fg", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8277,7 +8298,7 @@ mod fg_bg_tests {
     fn bg_with_no_jobs_errors() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8285,7 +8306,7 @@ mod fg_bg_tests {
     fn fg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("fg", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("fg", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8293,7 +8314,7 @@ mod fg_bg_tests {
     fn bg_with_percent_spec_arg_and_no_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8302,7 +8323,7 @@ mod fg_bg_tests {
         let mut shell = Shell::new();
         shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8316,7 +8337,7 @@ mod fg_bg_tests {
     fn fg_with_bad_job_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("fg", &["%abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("fg", &["%abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8324,7 +8345,7 @@ mod fg_bg_tests {
     fn fg_with_no_such_job_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("fg", &["%99".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("fg", &["%99".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8332,7 +8353,7 @@ mod fg_bg_tests {
     fn fg_with_non_percent_arg_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("fg", &["1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("fg", &["1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8343,7 +8364,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "fg",
             &["%1".to_string(), "%2".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8353,7 +8374,7 @@ mod fg_bg_tests {
     fn bg_with_bad_job_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &["%abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &["%abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8361,7 +8382,7 @@ mod fg_bg_tests {
     fn bg_with_no_such_job_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &["%99".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &["%99".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8370,7 +8391,7 @@ mod fg_bg_tests {
         let mut shell = Shell::new();
         shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("bg", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8381,7 +8402,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "bg",
             &["%1".to_string(), "%2".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8391,7 +8412,7 @@ mod fg_bg_tests {
     fn wait_with_bad_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["%abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["%abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8399,7 +8420,7 @@ mod fg_bg_tests {
     fn wait_with_no_such_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["%99".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["%99".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8411,7 +8432,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["1234".to_string(), "abc".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8421,7 +8442,7 @@ mod fg_bg_tests {
     fn wait_with_unparseable_pid_arg_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8432,7 +8453,7 @@ mod fg_bg_tests {
         // return decode(0) → 0 without blocking.
         shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -8441,7 +8462,7 @@ mod fg_bg_tests {
         let mut shell = Shell::new();
         shell.jobs.add_synthetic_done("false".to_string(), 1);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8454,7 +8475,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["%1".to_string(), "%2".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(5)));
@@ -8468,7 +8489,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["%1".to_string(), "abc".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8478,7 +8499,7 @@ mod fg_bg_tests {
     fn wait_n_with_no_jobs_returns_127() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(127)));
     }
 
@@ -8487,7 +8508,7 @@ mod fg_bg_tests {
         let mut shell = Shell::new();
         shell.jobs.add_synthetic_done("true".to_string(), 0);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["-n".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(127)));
     }
 
@@ -8499,7 +8520,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["-n".to_string(), "%1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(7)));
@@ -8518,7 +8539,7 @@ mod fg_bg_tests {
                 "PID".to_string(),
                 "%1".to_string(),
             ],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8532,7 +8553,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["-p".to_string(), "PID".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8545,7 +8566,7 @@ mod fg_bg_tests {
         let outcome = run_builtin(
             "wait",
             &["-n".to_string(), "-p".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8555,7 +8576,7 @@ mod fg_bg_tests {
     fn wait_invalid_flag_is_usage_error() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("wait", &["-x".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("wait", &["-x".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
@@ -8574,7 +8595,7 @@ mod kill_tests {
     fn kill_no_args_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8582,7 +8603,7 @@ mod kill_tests {
     fn kill_sig_flag_with_no_targets_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["-TERM".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["-TERM".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8593,7 +8614,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-ABC".to_string(), "%1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8606,7 +8627,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-9999".to_string(), "%1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8616,7 +8637,7 @@ mod kill_tests {
     fn kill_unparseable_target_returns_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8624,7 +8645,7 @@ mod kill_tests {
     fn kill_no_such_job_spec_returns_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["%99".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["%99".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -8657,7 +8678,7 @@ mod kill_tests {
         let mut buf: Vec<u8> = Vec::new();
         // No targets after the signal → usage(2) — but the signal itself
         // must parse without "invalid signal number" status 1.
-        let outcome = run_builtin("kill", &["-0".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["-0".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)),
             "kill -0 (no targets) should reach usage check, not signal check");
     }
@@ -8666,7 +8687,7 @@ mod kill_tests {
     fn kill_l_no_args_lists_all_standard_signals() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["-l".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["-l".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let s = String::from_utf8(buf).unwrap();
         // Common signals that were already listed before v189.
@@ -8700,7 +8721,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), "TERM".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8715,7 +8736,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), "SIGTERM".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8730,7 +8751,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), "term".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8745,7 +8766,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), libc::SIGTERM.to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8761,7 +8782,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), arg],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8776,7 +8797,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), "xyz".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8789,7 +8810,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-l".to_string(), "99".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8807,7 +8828,7 @@ mod kill_tests {
                 libc::SIGKILL.to_string(),
                 libc::SIGTERM.to_string(),
             ],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8831,7 +8852,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-s".to_string(), "WINCH".to_string(), pid],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8845,7 +8866,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-s".to_string(), "SIGWINCH".to_string(), pid],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8859,7 +8880,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-s".to_string(), "winch".to_string(), pid],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8869,7 +8890,7 @@ mod kill_tests {
     fn kill_s_missing_arg_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["-s".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["-s".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8880,7 +8901,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-s".to_string(), "BOGUS".to_string(), "99999".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8893,7 +8914,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-s".to_string(), "TERM".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
@@ -8911,7 +8932,7 @@ mod kill_tests {
                 libc::SIGWINCH.to_string(),
                 pid,
             ],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8921,7 +8942,7 @@ mod kill_tests {
     fn kill_n_missing_arg_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("kill", &["-n".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("kill", &["-n".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -8932,7 +8953,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-n".to_string(), "99".to_string(), "12345".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -8946,7 +8967,7 @@ mod kill_tests {
         let outcome = run_builtin(
             "kill",
             &["-WINCH".to_string(), pid],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8971,7 +8992,7 @@ mod cd_pwd_tests {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         // Restore for any other tests.
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -8989,7 +9010,7 @@ mod cd_pwd_tests {
         shell.export_set("PWD", "/var".to_string());
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), Some("/var"));
@@ -9004,7 +9025,7 @@ mod cd_pwd_tests {
         shell.unset("OLDPWD");
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["/tmp".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["/tmp".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.get("OLDPWD"), None);
@@ -9021,7 +9042,7 @@ mod cd_pwd_tests {
         shell.export_set("PWD", "/var".to_string());
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["-".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // Logical PWD (v162): `cd /tmp` stores the logical path, not the
@@ -9038,7 +9059,7 @@ mod cd_pwd_tests {
         shell.export_set("PWD", "/var".to_string());
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["-".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // `cd -` echoes the logical PWD (v162): the OLDPWD value as-typed.
@@ -9051,7 +9072,7 @@ mod cd_pwd_tests {
         shell.unset("OLDPWD");
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["-".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert!(out.is_empty());
@@ -9063,7 +9084,7 @@ mod cd_pwd_tests {
         shell.export_set("OLDPWD", String::new());
         let mut out: Vec<u8> = Vec::new();
         let prev = std::env::current_dir().unwrap();
-        let outcome = builtin_cd(&["-".to_string()], &mut out, &mut shell);
+        let outcome = builtin_cd(&["-".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         let _ = std::env::set_current_dir(&prev);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert!(out.is_empty());
@@ -9084,7 +9105,7 @@ mod disown_tests {
     fn disown_no_args_with_no_current_job_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9093,7 +9114,7 @@ mod disown_tests {
         let mut shell = Shell::new();
         shell.jobs.add(4242, vec![4242], "sleep 100".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }
@@ -9104,7 +9125,7 @@ mod disown_tests {
         shell.jobs.add(100, vec![100], "a".to_string());
         shell.jobs.add(200, vec![200], "b".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let remaining: Vec<u32> = shell.jobs.iter().map(|j| j.id).collect();
         assert_eq!(remaining, vec![2]);
@@ -9114,7 +9135,7 @@ mod disown_tests {
     fn disown_with_bad_spec_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["%abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["%abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9122,7 +9143,7 @@ mod disown_tests {
     fn disown_with_non_percent_arg_returns_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9134,7 +9155,7 @@ mod disown_tests {
         // suppress that notification.
         shell.jobs.add_synthetic_done("echo hi".to_string(), 0);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["%1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }
@@ -9148,7 +9169,7 @@ mod disown_tests {
         shell.jobs.add_synthetic_done("b".to_string(), 0);
         shell.jobs.add_synthetic_done("c".to_string(), 0);
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-a".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-a".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }
@@ -9162,7 +9183,7 @@ mod disown_tests {
         shell.jobs.add(1235, vec![1235], "sleep b".to_string()); // %2 Running
         shell.jobs.add_synthetic_done("c".to_string(), 0);       // %3 Done
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-r".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-r".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // Both Running jobs gone; only %3 (Done) remains.
         let states: Vec<JobState> = shell.jobs.iter().map(|j| j.state.clone()).collect();
@@ -9178,7 +9199,7 @@ mod disown_tests {
         let outcome = run_builtin(
             "disown",
             &["-h".to_string(), "%1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9196,7 +9217,7 @@ mod disown_tests {
         let outcome = run_builtin(
             "disown",
             &["%1".to_string(), "%2".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9210,7 +9231,7 @@ mod disown_tests {
         let id1 = shell.jobs.add(1234, vec![1234], "a".to_string());
         let id2 = shell.jobs.add(1235, vec![1235], "b".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-ah".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-ah".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 2);
         assert!(shell.jobs.iter().find(|j| j.id == id1).unwrap().marked_for_nohup);
@@ -9224,7 +9245,7 @@ mod disown_tests {
         shell.jobs.add(1235, vec![1235], "b".to_string()); // %2 Running
         shell.jobs.add_synthetic_done("c".to_string(), 0); // %3 Done
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-ar".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-ar".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let states: Vec<JobState> = shell.jobs.iter().map(|j| j.state.clone()).collect();
         assert_eq!(states.len(), 1);
@@ -9238,7 +9259,7 @@ mod disown_tests {
         shell.jobs.add(1235, vec![1235], "b".to_string()); // %2 Running
         shell.jobs.add_synthetic_done("c".to_string(), 0); // %3 Done
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-arh".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-arh".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 3);
         for job in shell.jobs.iter() {
@@ -9253,7 +9274,7 @@ mod disown_tests {
     fn disown_invalid_flag_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["-x".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["-x".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -9267,7 +9288,7 @@ mod disown_tests {
         let outcome = run_builtin(
             "disown",
             &["-a".to_string(), "%1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9279,7 +9300,7 @@ mod disown_tests {
         let mut shell = Shell::new();
         shell.jobs.add(1234, vec![1234], "sleep".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["1234".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["1234".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }
@@ -9289,7 +9310,7 @@ mod disown_tests {
         let mut shell = Shell::new();
         shell.jobs.add(1234, vec![1234, 1235, 1236], "a | b | c".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["1235".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["1235".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.jobs.iter().count(), 0);
     }
@@ -9298,7 +9319,7 @@ mod disown_tests {
     fn disown_unknown_pid_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("disown", &["99999".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("disown", &["99999".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9310,7 +9331,7 @@ mod disown_tests {
         let outcome = run_builtin(
             "disown",
             &["-h".to_string(), "1234".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9330,7 +9351,7 @@ mod history_tests {
         Rc::make_mut(&mut shell.history).add("first cmd".to_string());
         Rc::make_mut(&mut shell.history).add("second cmd".to_string());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("history", &[], &mut out, &mut shell);
+        let outcome = run_builtin("history", &[], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("first cmd"), "output: {text}");
@@ -9343,7 +9364,7 @@ mod history_tests {
         let mut shell = Shell::new();
         Rc::make_mut(&mut shell.history).add("doomed".to_string());
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("history", &["-c".to_string()], &mut out, &mut shell);
+        let outcome = run_builtin("history", &["-c".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.history.last(), None);
     }
@@ -9352,7 +9373,7 @@ mod history_tests {
     fn history_invalid_option_errors() {
         let mut shell = Shell::new();
         let mut out: Vec<u8> = Vec::new();
-        let outcome = run_builtin("history", &["--bogus".to_string()], &mut out, &mut shell);
+        let outcome = run_builtin("history", &["--bogus".to_string()], &mut out,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 }
@@ -9388,7 +9409,7 @@ mod special_builtin_tests {
         let outcome = run_builtin(
             "trap",
             &["echo err".to_string(), "ERR".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9402,7 +9423,7 @@ mod special_builtin_tests {
         let outcome = run_builtin(
             "trap",
             &["echo dbg".to_string(), "DEBUG".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9416,7 +9437,7 @@ mod special_builtin_tests {
         let outcome = run_builtin(
             "trap",
             &["echo ret".to_string(), "RETURN".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9437,12 +9458,12 @@ mod special_builtin_tests {
             let _ = run_builtin(
                 "trap",
                 &[action.to_string(), sig.to_string()],
-                &mut buf,
+                &mut buf,&mut std::io::stderr(), 
                 &mut shell,
             );
         }
         buf.clear();
-        let outcome = run_builtin("trap", &["-p".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("trap", &["-p".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -9467,7 +9488,7 @@ mod alias_tests {
     fn alias_no_args_lists_empty() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("alias", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("alias", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(buf.is_empty(), "expected empty output, got {:?}", String::from_utf8_lossy(&buf));
     }
@@ -9479,7 +9500,7 @@ mod alias_tests {
         shell.aliases.insert("la".to_string(), "ls -A".to_string());
         shell.aliases.insert("l".to_string(), "ls".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("alias", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("alias", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -9500,7 +9521,7 @@ mod alias_tests {
         let outcome = run_builtin(
             "alias",
             &["ll=ls -l".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9512,7 +9533,7 @@ mod alias_tests {
         let mut shell = Shell::new();
         shell.aliases.insert("ll".to_string(), "ls -l".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("alias", &["ll".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("alias", &["ll".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out, "alias ll='ls -l'\n");
@@ -9522,7 +9543,7 @@ mod alias_tests {
     fn alias_lookup_missing_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("alias", &["xyz".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("alias", &["xyz".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9531,7 +9552,7 @@ mod alias_tests {
         let mut shell = Shell::new();
         shell.aliases.insert("ll".to_string(), "ls -l".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("unalias", &["ll".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("unalias", &["ll".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(!shell.aliases.contains_key("ll"));
     }
@@ -9540,7 +9561,7 @@ mod alias_tests {
     fn unalias_missing_errors_status_1() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("unalias", &["xyz".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("unalias", &["xyz".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -9550,7 +9571,7 @@ mod alias_tests {
         shell.aliases.insert("ll".to_string(), "ls -l".to_string());
         shell.aliases.insert("la".to_string(), "ls -A".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("unalias", &["-a".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("unalias", &["-a".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(shell.aliases.is_empty());
     }
@@ -9559,7 +9580,7 @@ mod alias_tests {
     fn unalias_no_args_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("unalias", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("unalias", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 }
@@ -9574,7 +9595,7 @@ mod shift_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.positional_args, vec!["b", "c"]);
     }
@@ -9586,7 +9607,7 @@ mod shift_tests {
             "a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(),
         ];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &["2".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["2".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.positional_args, vec!["c", "d"]);
     }
@@ -9599,8 +9620,8 @@ mod shift_tests {
         shell_b.positional_args = vec!["x".to_string(), "y".to_string()];
 
         let mut buf: Vec<u8> = Vec::new();
-        let _ = run_builtin("shift", &[], &mut buf, &mut shell_a);
-        let _ = run_builtin("shift", &["1".to_string()], &mut buf, &mut shell_b);
+        let _ = run_builtin("shift", &[], &mut buf,&mut std::io::stderr(),  &mut shell_a);
+        let _ = run_builtin("shift", &["1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell_b);
 
         assert_eq!(shell_a.positional_args, shell_b.positional_args);
         assert_eq!(shell_a.positional_args, vec!["y"]);
@@ -9612,7 +9633,7 @@ mod shift_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &["5".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["5".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         // Positional unchanged after the failed shift.
         assert_eq!(shell.positional_args, vec!["a"]);
@@ -9625,7 +9646,7 @@ mod shift_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert_eq!(shell.positional_args, vec!["a", "b"]);
     }
@@ -9635,7 +9656,7 @@ mod shift_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &["0".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["0".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.positional_args, vec!["a", "b"]);
     }
@@ -9645,7 +9666,7 @@ mod shift_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("shift", &["abc".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["abc".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert_eq!(shell.positional_args, vec!["a"]);
     }
@@ -9656,7 +9677,7 @@ mod shift_tests {
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
         let mut buf: Vec<u8> = Vec::new();
         // `-1` fails parse::<usize>() because usize can't be negative.
-        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("shift", &["-1".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert_eq!(shell.positional_args, vec!["a", "b"]);
     }
@@ -9675,7 +9696,7 @@ mod set_tests {
         shell.set("ZZTEST_A", "one".to_string());
         shell.set("ZZTEST_B", "two".to_string());
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("set", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         // Find the three target lines and confirm they appear in
@@ -9694,7 +9715,7 @@ mod set_tests {
         let mut shell = Shell::new();
         shell.positional_args = vec!["a".to_string(), "b".to_string()];
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &["--".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("set", &["--".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(shell.positional_args.is_empty());
     }
@@ -9706,7 +9727,7 @@ mod set_tests {
         let outcome = run_builtin(
             "set",
             &["--".to_string(), "one".to_string(), "two".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9720,7 +9741,7 @@ mod set_tests {
         let outcome = run_builtin(
             "set",
             &["one".to_string(), "two".to_string(), "three".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9732,7 +9753,7 @@ mod set_tests {
         // -x (xtrace) implemented in v103.
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &["-x".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("set", &["-x".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(shell.shell_options.xtrace);
     }
@@ -9742,7 +9763,7 @@ mod set_tests {
         let mut shell = Shell::new();
         shell.shell_options.xtrace = true;
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &["+x".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("set", &["+x".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert!(!shell.shell_options.xtrace);
     }
@@ -9757,7 +9778,7 @@ mod source_tests {
     fn source_no_args_returns_usage_status_2() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(".", &[], &mut buf, &mut shell);
+        let outcome = run_builtin(".", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -9768,7 +9789,7 @@ mod source_tests {
         let outcome = run_builtin(
             ".",
             &["/nonexistent/file/path/huck-v51-test".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -9784,7 +9805,7 @@ mod source_tests {
         let outcome = run_builtin(
             ".",
             &["/etc/hostname".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -9819,7 +9840,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["X=hi".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -9833,7 +9854,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T1=hi".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9855,7 +9876,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T2".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9871,7 +9892,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T3=inner".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9899,7 +9920,7 @@ mod local_tests {
         let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=first".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         // Second `local` for the same name in the same frame: must NOT
@@ -9908,7 +9929,7 @@ mod local_tests {
         let _ = run_declaration_builtin_strs(
             "local",
             &["XYZ_LOCAL_T4=second".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         // Current value reflects the second assignment.
@@ -9933,7 +9954,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["1foo=bar".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -9949,7 +9970,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["-i".to_string(), "XYZ_LI=3+4".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9966,7 +9987,7 @@ mod local_tests {
         let _ = run_declaration_builtin_strs(
             "local",
             &["-i".to_string(), "XYZ_LIB".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(shell.is_integer("XYZ_LIB"));
@@ -9982,7 +10003,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["-r".to_string(), "XYZ_LR=fixed".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -9999,7 +10020,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["-ri".to_string(), "XYZ_LRI=5+5".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -10017,7 +10038,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["-n".to_string(), "XYZ_LU=1".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -10032,7 +10053,7 @@ mod local_tests {
         let outcome = run_declaration_builtin_strs(
             "local",
             &["-l".to_string(), "V=HELLO".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -10045,7 +10066,7 @@ mod local_tests {
         let outcome2 = run_declaration_builtin_strs(
             "local",
             &["-u".to_string(), "W=hello".to_string()],
-            &mut buf2,
+            &mut buf2,&mut std::io::stderr(), 
             &mut shell2,
         );
         assert!(matches!(outcome2, ExecOutcome::Continue(0)));
@@ -10062,7 +10083,7 @@ mod colon_tests {
     fn colon_exits_zero() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin(":", &[], &mut buf, &mut shell);
+        let outcome = run_builtin(":", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -10071,7 +10092,7 @@ mod colon_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["one".to_string(), "two".to_string()];
-        let outcome = run_builtin(":", &args, &mut buf, &mut shell);
+        let outcome = run_builtin(":", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 }
@@ -10085,7 +10106,7 @@ mod true_false_tests {
     fn true_exits_zero() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("true", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("true", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -10093,7 +10114,7 @@ mod true_false_tests {
     fn false_exits_one() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("false", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("false", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
     }
 
@@ -10102,8 +10123,8 @@ mod true_false_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["ignored".to_string()];
-        let t = run_builtin("true", &args, &mut buf, &mut shell);
-        let f = run_builtin("false", &args, &mut buf, &mut shell);
+        let t = run_builtin("true", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
+        let f = run_builtin("false", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(t, ExecOutcome::Continue(0)));
         assert!(matches!(f, ExecOutcome::Continue(1)));
     }
@@ -10118,7 +10139,7 @@ mod command_tests {
     fn command_no_args_exits_zero() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("command", &[], &mut buf, &mut shell);
+        let outcome = run_builtin("command", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
     }
 
@@ -10132,7 +10153,7 @@ mod command_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["echo".to_string(), "hi".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(2)));
     }
 
@@ -10141,7 +10162,7 @@ mod command_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "echo".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), "echo");
@@ -10152,7 +10173,7 @@ mod command_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "__no_such_cmd_xyzzy__".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.is_empty(), "expected silent stdout, got: {out:?}");
@@ -10163,7 +10184,7 @@ mod command_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-V".to_string(), "echo".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), "echo is a shell builtin");
@@ -10174,7 +10195,7 @@ mod command_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-V".to_string(), "if".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), "if is a shell keyword");
@@ -10191,7 +10212,7 @@ mod command_tests {
         shell.define_function("myfn".to_string(), body);
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "myfn".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), "myfn");
@@ -10205,7 +10226,7 @@ mod command_tests {
             .insert("greet".to_string(), "echo it's me".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["-v".to_string(), "greet".to_string()];
-        let outcome = run_builtin("command", &args, &mut buf, &mut shell);
+        let outcome = run_builtin("command", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.trim_end(), r"alias greet='echo it'\''s me'");
@@ -10222,7 +10243,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X=hi".to_string()];
-        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("hi"));
         assert!(shell.is_readonly("X"));
@@ -10233,7 +10254,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some(""));
         assert!(shell.is_readonly("X"));
@@ -10245,7 +10266,7 @@ mod readonly_tests {
         shell.set("X", "prev".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["X".to_string()];
-        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("prev"));
         assert!(shell.is_readonly("X"));
@@ -10257,7 +10278,7 @@ mod readonly_tests {
         shell.set("B", "had".to_string());
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["A=1".to_string(), "B".to_string(), "C=3".to_string()];
-        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("A").as_deref(), Some("1"));
         assert_eq!(shell.lookup_var("B").as_deref(), Some("had"));
@@ -10272,7 +10293,7 @@ mod readonly_tests {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
         let args = vec!["1foo=bar".to_string()];
-        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &args, &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert!(shell.lookup_var("1foo").is_none());
     }
@@ -10285,7 +10306,7 @@ mod readonly_tests {
         shell.set("Y", "w".to_string());
         shell.mark_readonly("Y");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_declaration_builtin_strs("readonly", &[], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         // declare -p style listing; scalars render with `-r` attrs.
@@ -10300,7 +10321,7 @@ mod readonly_tests {
         shell.set("X", "v".to_string());
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_declaration_builtin_strs("readonly", &["-p".to_string()], &mut buf, &mut shell);
+        let outcome = run_declaration_builtin_strs("readonly", &["-p".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert!(out.lines().any(|l| l == r#"declare -r X="v""#));
@@ -10310,11 +10331,11 @@ mod readonly_tests {
     fn readonly_overwrite_existing_readonly_errors() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        run_declaration_builtin_strs("readonly", &["X=first".to_string()], &mut buf, &mut shell);
+        run_declaration_builtin_strs("readonly", &["X=first".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         let outcome = run_declaration_builtin_strs(
             "readonly",
             &["X=second".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
@@ -10328,7 +10349,7 @@ mod readonly_tests {
         shell.set("X", "v".to_string());
         shell.mark_readonly("X");
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("unset", &["X".to_string()], &mut buf, &mut shell);
+        let outcome = run_builtin("unset", &["X".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(outcome, ExecOutcome::Continue(1)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
     }
@@ -10343,13 +10364,13 @@ mod readonly_tests {
         let bad = run_declaration_builtin_strs(
             "export",
             &["X=newval".to_string()],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut shell,
         );
         assert!(matches!(bad, ExecOutcome::Continue(1)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         // `export X` (bare) should succeed and flip the export flag.
-        let bare = run_declaration_builtin_strs("export", &["X".to_string()], &mut buf, &mut shell);
+        let bare = run_declaration_builtin_strs("export", &["X".to_string()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(bare, ExecOutcome::Continue(0)));
         assert_eq!(shell.lookup_var("X").as_deref(), Some("v"));
         assert!(shell.is_readonly("X"));
@@ -10877,14 +10898,14 @@ mod exit_tests {
     fn exit_no_args_inherits_last_status() {
         let mut shell = Shell::new();
         shell.set_last_status(42);
-        let outcome = builtin_exit(&[], &shell);
+        let outcome = builtin_exit(&[],&mut std::io::stderr(),  &shell);
         assert!(matches!(outcome, ExecOutcome::Exit(42)));
     }
 
     #[test]
     fn exit_no_args_inherits_zero_when_clean() {
         let shell = Shell::new();
-        let outcome = builtin_exit(&[], &shell);
+        let outcome = builtin_exit(&[],&mut std::io::stderr(),  &shell);
         assert!(matches!(outcome, ExecOutcome::Exit(0)));
     }
 }
@@ -10897,7 +10918,7 @@ mod type_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("type", &args_owned, &mut buf, shell);
+        let outcome = run_builtin("type", &args_owned, &mut buf,&mut std::io::stderr(),  shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -11061,7 +11082,7 @@ mod hash_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("hash", &args_owned, &mut buf, shell);
+        let outcome = run_builtin("hash", &args_owned, &mut buf,&mut std::io::stderr(),  shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -11304,14 +11325,14 @@ mod declare_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf,&mut std::io::stderr(),  shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
     fn run_typeset(args: &[&str], shell: &mut Shell) -> ExecOutcome {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        run_declaration_builtin_strs("typeset", &args_owned, &mut buf, shell)
+        run_declaration_builtin_strs("typeset", &args_owned, &mut buf,&mut std::io::stderr(),  shell)
     }
 
     #[test]
@@ -11637,7 +11658,7 @@ mod integer_attr_tests {
     fn run_declare(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf, shell);
+        let outcome = run_declaration_builtin_strs("declare", &args_owned, &mut buf,&mut std::io::stderr(),  shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -11711,7 +11732,7 @@ mod eval_tests {
     fn run(args: &[&str], shell: &mut Shell) -> ExecOutcome {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        run_builtin("eval", &args_owned, &mut buf, shell)
+        run_builtin("eval", &args_owned, &mut buf,&mut std::io::stderr(),  shell)
     }
 
     #[test]
@@ -11768,7 +11789,7 @@ mod help_tests {
         let mut shell = Shell::new();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("help", &args_owned, &mut buf, &mut shell);
+        let outcome = run_builtin("help", &args_owned, &mut buf,&mut std::io::stderr(),  &mut shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -11867,7 +11888,7 @@ mod set_options_tests {
     fn run(args: &[&str], shell: &mut Shell) -> (ExecOutcome, String) {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let mut buf: Vec<u8> = Vec::new();
-        let outcome = run_builtin("set", &args_owned, &mut buf, shell);
+        let outcome = run_builtin("set", &args_owned, &mut buf,&mut std::io::stderr(),  shell);
         (outcome, String::from_utf8(buf).unwrap())
     }
 
@@ -12191,7 +12212,7 @@ mod array_declare_tests {
         let outcome = run_declaration_builtin(
             "readonly",
             &[DeclArg::Plain("-p".to_string())],
-            &mut buf,
+            &mut buf,&mut std::io::stderr(), 
             &mut s,
         );
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
@@ -12313,7 +12334,7 @@ mod loop_levels_tests {
     fn break_no_args_emits_level_1_status_0() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&[], &sh);
+        let outcome = builtin_break(&[],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(1, 0));
     }
 
@@ -12321,7 +12342,7 @@ mod loop_levels_tests {
     fn break_with_arg_n_emits_level_n_when_in_loop() {
         let mut sh = Shell::new();
         sh.loop_depth = 3;
-        let outcome = builtin_break(&["2".to_string()], &sh);
+        let outcome = builtin_break(&["2".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 0));
     }
 
@@ -12329,7 +12350,7 @@ mod loop_levels_tests {
     fn break_caps_to_loop_depth() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_break(&["999".to_string()], &sh);
+        let outcome = builtin_break(&["999".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 0));
     }
 
@@ -12342,11 +12363,11 @@ mod loop_levels_tests {
         // Bash 5.2: break/continue outside a loop prints the diagnostic to
         // stderr but returns $? = 0 and does NOT break anything. Arg
         // validation is skipped entirely.
-        assert_eq!(builtin_break(&[], &sh), ExecOutcome::Continue(0));
-        assert_eq!(builtin_break(&["abc".to_string()], &sh), ExecOutcome::Continue(0));
-        assert_eq!(builtin_break(&["0".to_string()], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_break(&[],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_break(&["abc".to_string()],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_break(&["0".to_string()],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
         assert_eq!(
-            builtin_break(&["1".to_string(), "2".to_string(), "3".to_string()], &sh),
+            builtin_break(&["1".to_string(), "2".to_string(), "3".to_string()],&mut std::io::stderr(),  &sh),
             ExecOutcome::Continue(0)
         );
     }
@@ -12357,7 +12378,7 @@ mod loop_levels_tests {
     fn break_zero_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_break(&["0".to_string()], &sh);
+        let outcome = builtin_break(&["0".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
     }
 
@@ -12365,7 +12386,7 @@ mod loop_levels_tests {
     fn break_negative_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&["-1".to_string()], &sh);
+        let outcome = builtin_break(&["-1".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(1, 1));
     }
 
@@ -12375,7 +12396,7 @@ mod loop_levels_tests {
     fn break_too_many_args_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_break(&["1".to_string(), "2".to_string()], &sh);
+        let outcome = builtin_break(&["1".to_string(), "2".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
     }
 
@@ -12385,7 +12406,7 @@ mod loop_levels_tests {
     fn break_non_numeric_exits_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_break(&["abc".to_string()], &sh);
+        let outcome = builtin_break(&["abc".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::Exit(128));
     }
 
@@ -12395,7 +12416,7 @@ mod loop_levels_tests {
     fn continue_no_args_emits_level_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_continue(&[], &sh);
+        let outcome = builtin_continue(&[],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
     }
 
@@ -12403,7 +12424,7 @@ mod loop_levels_tests {
     fn continue_caps_to_loop_depth() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_continue(&["5".to_string()], &sh);
+        let outcome = builtin_continue(&["5".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopContinue(1));
     }
 
@@ -12412,9 +12433,9 @@ mod loop_levels_tests {
     #[test]
     fn continue_outside_loop_errors_with_status_0() {
         let sh = Shell::new();
-        assert_eq!(builtin_continue(&[], &sh), ExecOutcome::Continue(0));
-        assert_eq!(builtin_continue(&["abc".to_string()], &sh), ExecOutcome::Continue(0));
-        assert_eq!(builtin_continue(&["0".to_string()], &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_continue(&[],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_continue(&["abc".to_string()],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
+        assert_eq!(builtin_continue(&["0".to_string()],&mut std::io::stderr(),  &sh), ExecOutcome::Continue(0));
     }
 
     // ----- continue: malformed N<=0 / too-many → break ALL loops, $? = 1 -----
@@ -12423,7 +12444,7 @@ mod loop_levels_tests {
     fn continue_zero_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_continue(&["0".to_string()], &sh);
+        let outcome = builtin_continue(&["0".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
     }
 
@@ -12431,7 +12452,7 @@ mod loop_levels_tests {
     fn continue_negative_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 3;
-        let outcome = builtin_continue(&["-5".to_string()], &sh);
+        let outcome = builtin_continue(&["-5".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(3, 1));
     }
 
@@ -12439,7 +12460,7 @@ mod loop_levels_tests {
     fn continue_too_many_args_breaks_all_loops_status_1() {
         let mut sh = Shell::new();
         sh.loop_depth = 2;
-        let outcome = builtin_continue(&["1".to_string(), "2".to_string()], &sh);
+        let outcome = builtin_continue(&["1".to_string(), "2".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::LoopBreak(2, 1));
     }
 
@@ -12449,7 +12470,7 @@ mod loop_levels_tests {
     fn continue_non_numeric_exits_with_status_128() {
         let mut sh = Shell::new();
         sh.loop_depth = 1;
-        let outcome = builtin_continue(&["abc".to_string()], &sh);
+        let outcome = builtin_continue(&["abc".to_string()],&mut std::io::stderr(),  &sh);
         assert_eq!(outcome, ExecOutcome::Exit(128));
     }
 }
@@ -12487,7 +12508,7 @@ mod pipefail_option_tests {
     fn shopt_bare_lists_all_57() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let oc = builtin_shopt(&[], &mut buf, &mut shell);
+        let oc = builtin_shopt(&[], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.lines().count(), 57);
@@ -12500,7 +12521,7 @@ mod pipefail_option_tests {
     fn shopt_o_lists_27() {
         let mut shell = Shell::new();
         let mut buf: Vec<u8> = Vec::new();
-        let oc = builtin_shopt(&["-o".into()], &mut buf, &mut shell);
+        let oc = builtin_shopt(&["-o".into()], &mut buf,&mut std::io::stderr(),  &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
         assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 27);
     }

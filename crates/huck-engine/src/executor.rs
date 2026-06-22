@@ -1112,21 +1112,25 @@ fn run_builtin_with_redirects(
     // into an outer capture buf. A capture sink with NO stdout redirect keeps
     // writing to the buf so `r=$(builtin)` still captures.
     let write_to_fd1 = redirs_write_stdout(redirs) || matches!(sink, StdoutSink::Terminal);
-    let run = |out: &mut dyn std::io::Write, shell: &mut Shell| {
+    let run = |out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, shell: &mut Shell| {
         if let Some(da) = resolved.decl_args.as_deref() {
-            builtins::run_declaration_builtin(&resolved.program, da, out, shell)
+            builtins::run_declaration_builtin(&resolved.program, da, out, err, shell)
         } else {
-            builtins::run_builtin(&resolved.program, &resolved.args, out, shell)
+            builtins::run_builtin(&resolved.program, &resolved.args, out, err, shell)
         }
     };
     let outcome = if write_to_fd1 {
         let mut out = io::stdout();
-        run(&mut out, shell)
+        let mut err = io::stderr();
+        run(&mut out, &mut err, shell)
     } else {
         match sink {
             // Unreachable Terminal arm folded into `write_to_fd1` above.
             StdoutSink::Terminal => unreachable!("Terminal handled by write_to_fd1"),
-            StdoutSink::Capture(buf) => run(*buf, shell),
+            StdoutSink::Capture(buf) => {
+                let mut err = io::stderr();
+                run(*buf, &mut err, shell)
+            }
         }
     };
     let _ = io::stdout().flush();
@@ -1512,7 +1516,8 @@ fn run_arith_for_inner(
 /// (nothing read).
 fn read_line_into_reply(shell: &mut Shell) -> ExecOutcome {
     let mut devnull: Vec<u8> = Vec::new();
-    crate::builtins::run_builtin("read", &[], &mut devnull, shell)
+    let mut err = io::stderr();
+    crate::builtins::run_builtin("read", &[], &mut devnull, &mut err, shell)
 }
 
 /// Runs a `select NAME [in WORDS]; do BODY; done` menu loop, mirroring
@@ -3604,9 +3609,13 @@ fn run_exec_single(cmd: &ExecCommand, shell: &mut Shell, sink: &mut StdoutSink) 
         let args = resolved.args;
         if has_any_redirect(cmd) {
             with_redirect_scope(&cmd.redirects, shell, sink,
-                move |shell, inner_sink| builtins::source_in_sink(&args, shell, inner_sink))
+                move |shell, inner_sink| {
+                    let mut err = io::stderr();
+                    builtins::source_in_sink(&args, &mut err, shell, inner_sink)
+                })
         } else {
-            builtins::source_in_sink(&args, shell, sink)
+            let mut err = io::stderr();
+            builtins::source_in_sink(&args, &mut err, shell, sink)
         }
     } else if builtins::is_builtin(&resolved.program) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
