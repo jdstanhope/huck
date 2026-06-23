@@ -131,24 +131,142 @@ fn always_quote(v: &str) -> String {
 
 /// `${var@K}` — k/v pairs as a single quoted-internally string.
 #[allow(dead_code)]
-pub(crate) fn kv_string(_name: &str, _scope: ScopeMode, _shell: &Shell) -> String {
-    // Body lands in a later commit.
-    String::new()
+pub(crate) fn kv_string(name: &str, scope: ScopeMode, shell: &Shell) -> String {
+    let Some(var) = shell.get_var(name) else {
+        return String::new();
+    };
+    match scope {
+        ScopeMode::Whole => kv_string_whole(var),
+        ScopeMode::ScalarOrElement(val) => {
+            if val.is_empty() {
+                String::new()
+            } else {
+                always_quote(&val)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn kv_string_whole(var: &Variable) -> String {
+    match &var.value {
+        VarValue::Indexed(m) => {
+            let parts: Vec<String> = m
+                .iter()
+                .map(|(k, v)| format!("{k} \"{}\"", crate::escape_double_quote_value(v)))
+                .collect();
+            parts.join(" ")
+        }
+        VarValue::Associative(pairs) => {
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{} \"{}\"",
+                        quote_subscript_key_local(k),
+                        crate::escape_double_quote_value(v)
+                    )
+                })
+                .collect();
+            if parts.is_empty() {
+                String::new()
+            } else {
+                // Bash adds trailing space after the final value for
+                // assoc @K — mirrors the @A assoc body inconsistency.
+                format!("{} ", parts.join(" "))
+            }
+        }
+        VarValue::Scalar(_) => String::new(),
+    }
+}
+
+/// Bareword-when-safe subscript-key formatter. Mirrors the policy in
+/// `builtins::quote_subscript_key`; kept local since exposing as
+/// pub(crate) would add a public dependency for a 1-site caller.
+#[allow(dead_code)]
+fn quote_subscript_key_local(k: &str) -> String {
+    if !k.is_empty()
+        && k.bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+    {
+        k.to_string()
+    } else {
+        format!("\"{}\"", crate::escape_double_quote_value(k))
+    }
 }
 
 /// `${var@k}` — k/v pairs as a word list (each k and v a separate
 /// field when used under quoted `[@]`).
 #[allow(dead_code)]
-pub(crate) fn kv_words(_name: &str, _scope: ScopeMode, _shell: &Shell) -> Vec<String> {
-    // Body lands in a later commit.
-    Vec::new()
+pub(crate) fn kv_words(name: &str, scope: ScopeMode, shell: &Shell) -> Vec<String> {
+    let Some(var) = shell.get_var(name) else {
+        return Vec::new();
+    };
+    match scope {
+        ScopeMode::Whole => kv_words_whole(var),
+        ScopeMode::ScalarOrElement(val) => {
+            if val.is_empty() {
+                Vec::new()
+            } else {
+                vec![always_quote(&val)]
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn kv_words_whole(var: &Variable) -> Vec<String> {
+    match &var.value {
+        VarValue::Indexed(m) => {
+            let mut out = Vec::with_capacity(m.len() * 2);
+            for (k, v) in m {
+                out.push(k.to_string());
+                out.push(v.clone());
+            }
+            out
+        }
+        VarValue::Associative(pairs) => {
+            let mut out = Vec::with_capacity(pairs.len() * 2);
+            for (k, v) in pairs {
+                out.push(k.clone());
+                out.push(v.clone());
+            }
+            out
+        }
+        VarValue::Scalar(_) => Vec::new(),
+    }
 }
 
 /// `${var@a}` — attribute flag letters in canonical order, or empty.
 #[allow(dead_code)]
-pub(crate) fn attr_flags(_name: &str, _shell: &Shell) -> String {
-    // Body lands in a later commit.
-    String::new()
+pub(crate) fn attr_flags(name: &str, shell: &Shell) -> String {
+    let Some(var) = shell.get_var(name) else {
+        return String::new();
+    };
+    let mut flags = String::new();
+    if var.nameref {
+        flags.push('n');
+    }
+    match &var.value {
+        VarValue::Indexed(_) => flags.push('a'),
+        VarValue::Associative(_) => flags.push('A'),
+        VarValue::Scalar(_) => {}
+    }
+    if var.integer {
+        flags.push('i');
+    }
+    if var.readonly {
+        flags.push('r');
+    }
+    if var.exported {
+        flags.push('x');
+    }
+    match var.case_fold {
+        Some(crate::shell_state::CaseFold::Lower) => flags.push('l'),
+        Some(crate::shell_state::CaseFold::Upper) => flags.push('u'),
+        None => {}
+    }
+    flags
 }
 
 #[cfg(test)]
@@ -218,5 +336,93 @@ mod tests {
         // ${m@A} (no subscript) → scalar_view is empty → no body.
         let out = assign_decl("m", ScopeMode::ScalarOrElement(String::new()), &shell);
         assert_eq!(out, "declare -A m");
+    }
+
+    #[test]
+    fn kv_string_indexed_whole() {
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
+        let out = kv_string("a", ScopeMode::Whole, &shell);
+        assert_eq!(out, r#"0 "x" 1 "y""#);
+    }
+
+    #[test]
+    fn kv_string_assoc_whole_has_trailing_space() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell
+            .set_associative_element("m", "k".to_string(), "v1".to_string())
+            .unwrap();
+        let out = kv_string("m", ScopeMode::Whole, &shell);
+        assert_eq!(out, r#"k "v1" "#);
+    }
+
+    #[test]
+    fn kv_string_scalar_quotes() {
+        let mut shell = Shell::new();
+        shell.set("s", "hello".to_string());
+        let out = kv_string("s", ScopeMode::ScalarOrElement("hello".into()), &shell);
+        assert_eq!(out, "'hello'");
+    }
+
+    #[test]
+    fn kv_words_indexed_whole_yields_alternating() {
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
+        let out = kv_words("a", ScopeMode::Whole, &shell);
+        assert_eq!(out, vec!["0", "x", "1", "y"]);
+    }
+
+    #[test]
+    fn kv_words_unset_is_empty() {
+        let shell = Shell::new();
+        let out = kv_words("nope", ScopeMode::ScalarOrElement(String::new()), &shell);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn attr_flags_indexed_is_a() {
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        let out = attr_flags("a", &shell);
+        assert_eq!(out, "a");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn attr_flags_assoc_is_A() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        let out = attr_flags("m", &shell);
+        assert_eq!(out, "A");
+    }
+
+    #[test]
+    fn attr_flags_scalar_no_attrs_is_empty() {
+        let mut shell = Shell::new();
+        shell.set("s", "x".to_string());
+        let out = attr_flags("s", &shell);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn attr_flags_unset_is_empty() {
+        let shell = Shell::new();
+        let out = attr_flags("nope", &shell);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn attr_flags_multi() {
+        let mut shell = Shell::new();
+        shell.set("n", "5".to_string());
+        shell.mark_integer("n");
+        shell.mark_readonly("n");
+        shell.export("n");
+        let out = attr_flags("n", &shell);
+        // Letter order: n, a/A, i, r, x, l/u → "irx".
+        assert_eq!(out, "irx");
     }
 }
