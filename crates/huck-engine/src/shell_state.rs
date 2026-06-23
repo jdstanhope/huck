@@ -904,6 +904,29 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
+    /// Return the raw `Variable` (value + attribute flags) for `name`,
+    /// following nameref chains. Used by `array_transforms` to read the
+    /// var kind (`Scalar`/`Indexed`/`Associative`) and the per-var
+    /// attribute flags (`exported`/`readonly`/`integer`/etc.) when
+    /// rendering `${var@A}` / `${var@K}` / `${var@k}` / `${var@a}`.
+    /// Returns `None` for an unset variable.
+    // `#[allow(dead_code)]` is temporary — the first caller lands in
+    // the next task wiring up `array_transforms` dispatch. Remove the
+    // attribute when that caller is added.
+    #[allow(dead_code)]
+    pub(crate) fn get_var(&self, name: &str) -> Option<&Variable> {
+        let resolved = if self.is_nameref(name) {
+            match self.resolve_nameref(name) {
+                ResolvedName::Name(n) => n,
+                ResolvedName::Element { name: arr, .. } => arr,
+                ResolvedName::Unbound(_) | ResolvedName::Cycle => return None,
+            }
+        } else {
+            name.to_string()
+        };
+        self.vars.get(&resolved)
+    }
+
     /// Returns the current value of `$IFS`.
     ///
     /// - Unset → POSIX default `" \t\n"`.
