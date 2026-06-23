@@ -1073,4 +1073,36 @@ mod tests {
             "expected backpressure to slow run, elapsed: {elapsed:?}"
         );
     }
+
+    #[test]
+    fn on_stderr_line_builtin_redirect_to_err() {
+        // builtin >&2 with on_stderr_line — must fire. (v207 fixup: previously
+        // the side_err Vec<u8> aliasing-avoidance buffer bypassed
+        // LineDispatchWriter so streaming callbacks didn't see these bytes.)
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e.exec("echo hi >&2")
+            .on_stderr_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.stderr, "hi\n");
+        assert_eq!(lines, vec!["hi"]);
+    }
+
+    #[test]
+    fn on_stdout_line_builtin_redirect_2to1() {
+        // builtin 2>&1 with on_stdout_line — must fire for what was originally
+        // stderr. Use `declare -p` on an undefined var to emit a builtin stderr
+        // diagnostic; the `2>&1` routes it to fd 1 so the embedder should see
+        // it as a stdout-stream event.
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("declare -p NOPE_NOT_DEFINED 2>&1")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        // The diagnostic should arrive via on_stdout_line.
+        assert!(
+            lines.iter().any(|l| l.contains("NOPE_NOT_DEFINED")),
+            "expected stderr-redirected-to-stdout line via callback, got {lines:?}"
+        );
+    }
 }

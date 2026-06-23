@@ -1535,31 +1535,43 @@ fn run_builtin_with_redirects(
             (_, StderrSink::Capture(ebuf)) => {
                 // out writes go to the stderr capture buffer; err writes also
                 // go to it. (Borrow ebuf only once; route both writers via a
-                // side buf for the err side to avoid aliasing.)
-                let mut side_err: Vec<u8> = Vec::new();
+                // side buf for the err side to avoid aliasing.) The side buf
+                // is wrapped in a LineDispatchWriter tagged Stderr so streaming
+                // callbacks fire for the builtin's direct stderr writes too.
+                let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
                     let mut out_w = LineDispatchWriter {
                         inner: ebuf,
                         stream: LineStream::Stderr,
                     };
-                    run(&mut out_w, &mut side_err, shell)
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stderr,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
                 };
-                ebuf.extend_from_slice(&side_err);
+                ebuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             (StdoutSink::Capture(obuf), StderrSink::Merged) => {
                 // Merged means stderr is routed to the active stdout sink (here:
                 // the capture buf). So out writes (via `>&2` → merged → buf) AND
-                // err writes both go to obuf.
-                let mut side_err: Vec<u8> = Vec::new();
+                // err writes both go to obuf. Tag the side buf Stdout so the
+                // embedder sees these bytes as stdout-stream events (Merged
+                // means stderr converges on stdout from the embedder's view).
+                let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
                     let mut out_w = LineDispatchWriter {
                         inner: obuf,
                         stream: LineStream::Stdout,
                     };
-                    run(&mut out_w, &mut side_err, shell)
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
                 };
-                obuf.extend_from_slice(&side_err);
+                obuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             (StdoutSink::Terminal, StderrSink::Merged) => {
@@ -1579,16 +1591,22 @@ fn run_builtin_with_redirects(
             StdoutSink::Capture(obuf) => {
                 // out → obuf (the standard capture path), err → obuf (via the
                 // `2>&1` swap). Aliasing: borrow obuf once for out; use a side
-                // buf for err and append.
-                let mut side_err: Vec<u8> = Vec::new();
+                // buf for err and append. Tag the side buf Stdout — the script
+                // redirected fd 2 to fd 1, so the embedder sees these bytes as
+                // stdout-stream events.
+                let mut side_err_buf: Vec<u8> = Vec::new();
                 let outcome = {
                     let mut out_w = LineDispatchWriter {
                         inner: obuf,
                         stream: LineStream::Stdout,
                     };
-                    run(&mut out_w, &mut side_err, shell)
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
                 };
-                obuf.extend_from_slice(&side_err);
+                obuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             StdoutSink::Terminal => unreachable!("route_err_to_out requires Capture stdout"),
@@ -1629,14 +1647,20 @@ fn run_builtin_with_redirects(
                     // side buffer for stderr then append after the call. Order
                     // is preserved as out-then-err (builtins use fd 1 then fd 2
                     // in series in practice); not byte-strict-interleaved but
-                    // matches a single-writer line discipline well enough.
+                    // matches a single-writer line discipline well enough. Tag
+                    // the side buf Stdout — Merged means stderr converges on
+                    // stdout from the embedder's view.
                     let mut side: Vec<u8> = Vec::new();
                     let outcome = {
                         let mut out_w = LineDispatchWriter {
                             inner: buf,
                             stream: LineStream::Stdout,
                         };
-                        run(&mut out_w, &mut side, shell)
+                        let mut side_w = LineDispatchWriter {
+                            inner: &mut side,
+                            stream: LineStream::Stdout,
+                        };
+                        run(&mut out_w, &mut side_w, shell)
                     };
                     buf.extend_from_slice(&side);
                     outcome
