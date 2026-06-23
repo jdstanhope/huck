@@ -51,6 +51,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::completion::Candidate;
 use crate::executor::{StderrSink, StdoutSink};
 use crate::shell_state::Shell;
 
@@ -77,8 +78,8 @@ pub struct Completion {
     /// `replacement` when the user picks it. `start <= cursor`.
     pub start: usize,
     /// Candidates in the order huck would offer them at the prompt.
-    /// Alphabetical within each kind.
-    pub candidates: Vec<crate::completion::Candidate>,
+    /// Alphabetical within each kind; `complete -F` results respect `-o nosort`.
+    pub candidates: Vec<Candidate>,
 }
 
 /// A persistent, embeddable huck shell session.
