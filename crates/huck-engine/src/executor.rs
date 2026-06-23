@@ -1,8 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::io::RawFd;
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::builtins::{self, ExecOutcome, InterruptReason};
 use crate::command::{
@@ -69,16 +68,56 @@ fn check_restricted_redirect(
     Ok(())
 }
 
+/// Stream identifier for `LineDispatchWriter`.
+#[derive(Clone, Copy)]
+pub(crate) enum LineStream {
+    Stdout,
+    Stderr,
+}
+
+/// Writer that wraps an inner `Vec<u8>` AND notifies the active callbacks
+/// thread-local of any bytes written, so streaming line callbacks fire as
+/// builtins write to their capture buffer.
+pub(crate) struct LineDispatchWriter<'a> {
+    pub inner: &'a mut Vec<u8>,
+    pub stream: LineStream,
+}
+
+impl std::io::Write for LineDispatchWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.extend_from_slice(bytes);
+        let stream = self.stream;
+        crate::callbacks_thread_local::with_callbacks(|cb| {
+            if let Some(cb) = cb {
+                match stream {
+                    LineStream::Stdout => cb.push_stdout(bytes),
+                    LineStream::Stderr => cb.push_stderr(bytes),
+                }
+            }
+        });
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn err_writer<'a>(
     err_sink: &'a mut StderrSink<'_>,
     out_sink: &'a mut StdoutSink<'_>,
 ) -> Box<dyn std::io::Write + 'a> {
     match err_sink {
         StderrSink::Terminal => Box::new(std::io::stderr()),
-        StderrSink::Capture(buf) => Box::new(&mut **buf),
+        StderrSink::Capture(buf) => Box::new(LineDispatchWriter {
+            inner: buf,
+            stream: LineStream::Stderr,
+        }),
         StderrSink::Merged => match out_sink {
             StdoutSink::Terminal => Box::new(std::io::stdout()),
-            StdoutSink::Capture(buf) => Box::new(&mut **buf),
+            StdoutSink::Capture(buf) => Box::new(LineDispatchWriter {
+                inner: buf,
+                stream: LineStream::Stdout,
+            }),
         },
     }
 }
@@ -237,7 +276,17 @@ pub fn execute(seq: &Sequence, shell: &mut Shell, source: &str) -> ExecOutcome {
 /// must complete before their output is interpolated. Spawning real
 /// background children whose pids the parent's JobTable doesn't track
 /// would let them escape `wait`/`jobs` and litter the terminal.
+///
+/// Streaming-callback contract (v207 fixup): command substitution captures
+/// inner output and interpolates it back into the parent's command line — the
+/// bytes never reach the script's OUTERMOST stdout. So for the duration of
+/// this call we suspend the thread-local callbacks pointer; otherwise the
+/// builtin-path `LineDispatchWriter` and the external-path `with_callbacks`
+/// dispatch in `stream_loop::external_capture_loop` would leak hidden bytes
+/// (e.g. `$(echo hidden)`) into `on_stdout_line` callbacks. The guard's Drop
+/// restores the pointer on every exit path (including panics).
 pub fn execute_capturing(seq: &Sequence, shell: &mut Shell) -> (String, i32) {
+    let _suspend = crate::callbacks_thread_local::suspend();
     // Command substitution must complete before its output is interpolated, so
     // ALL backgrounding is ignored here: the trailing `&` (seq.background) and
     // any mid-list `&` separators (Connector::Amp) are run synchronously.
@@ -603,45 +652,48 @@ fn run_command(
                 unsafe { libc::close(stderr_fd); }
             }
 
-            // Drain the stderr pipe in a background thread (concurrent with
-            // the foreground stdout drain) to avoid PIPE_BUF deadlock when the
-            // child writes more than ~64 KiB to either stream. The thread owns
-            // the read fd via File and posts the captured bytes through a
-            // channel; the main thread folds them into err_sink AFTER the
-            // stdout drain releases its &mut sink borrow.
-            let err_drain = if let Some(r) = capture_err_read_fd {
-                use std::os::fd::FromRawFd;
-                let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                let handle = std::thread::spawn(move || {
-                    let mut f = unsafe { File::from_raw_fd(r) };
-                    let mut local = Vec::new();
-                    let _ = io::copy(&mut f, &mut local);
-                    let _ = tx.send(local);
-                });
-                Some((handle, rx))
-            } else {
-                None
-            };
-
-            // Drain stdout capture pipe before waitpid to avoid deadlock.
-            if let (Some(r), StdoutSink::Capture(buf)) = (capture_read_fd, &mut *sink) {
-                use std::os::fd::FromRawFd;
-                let mut f = unsafe { File::from_raw_fd(r) };
-                let _ = io::copy(&mut f, *buf);
-                // f is dropped here, closing r.
-            }
-
-            // Now join the stderr drainer and fold bytes into err_sink.
-            if let Some((handle, rx)) = err_drain {
-                let _ = handle.join();
-                if let Ok(bytes) = rx.recv()
-                    && let StderrSink::Capture(buf) = err_sink
-                {
-                    buf.extend_from_slice(&bytes);
-                }
-            }
-
             if interactive {
+                // Interactive subshell path keeps the dual-drain +
+                // wait_with_untraced shape. Real-time streaming callbacks are
+                // moot here (sink == Terminal => no capture pipes are open
+                // anyway), and we must keep job-control / stopped-job semantics
+                // intact for the REPL.
+
+                // Drain the stderr pipe in a background thread (concurrent with
+                // the foreground stdout drain) to avoid PIPE_BUF deadlock when
+                // the child writes more than ~64 KiB to either stream.
+                let err_drain = if let Some(r) = capture_err_read_fd {
+                    use std::os::fd::FromRawFd;
+                    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    let handle = std::thread::spawn(move || {
+                        let mut f = unsafe { File::from_raw_fd(r) };
+                        let mut local = Vec::new();
+                        let _ = io::copy(&mut f, &mut local);
+                        let _ = tx.send(local);
+                    });
+                    Some((handle, rx))
+                } else {
+                    None
+                };
+
+                // Drain stdout capture pipe before waitpid to avoid deadlock.
+                if let (Some(r), StdoutSink::Capture(buf)) = (capture_read_fd, &mut *sink) {
+                    use std::os::fd::FromRawFd;
+                    let mut f = unsafe { File::from_raw_fd(r) };
+                    let _ = io::copy(&mut f, *buf);
+                    // f is dropped here, closing r.
+                }
+
+                // Now join the stderr drainer and fold bytes into err_sink.
+                if let Some((handle, rx)) = err_drain {
+                    let _ = handle.join();
+                    if let Ok(bytes) = rx.recv()
+                        && let StderrSink::Capture(buf) = err_sink
+                    {
+                        buf.extend_from_slice(&bytes);
+                    }
+                }
+
                 // Foreground subshell: make it a job that owns the terminal,
                 // mirroring the single-command/pipeline dance. Without this the
                 // subshell runs in a background pgroup and deadlocks on tty I/O.
@@ -698,11 +750,47 @@ fn run_command(
                 ExecOutcome::Continue(outcome)
             } else {
                 // Non-interactive (script), capture (`$( ( … ) )`), nested
-                // subshell, or completion: plain reap, no terminal handoff.
-                let mut raw_status: libc::c_int = 0;
-                let r = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
-                if r < 0 {
-                    return ExecOutcome::Continue(1);
+                // subshell, or completion: poll-based wait via
+                // stream_loop::external_capture_loop. Runs on the embedder's
+                // thread; streaming callbacks fire in real time.
+                let pipe_out: RawFd = capture_read_fd.unwrap_or(-1);
+                let pipe_err: RawFd = capture_err_read_fd.unwrap_or(-1);
+                let mut stderr_capture: Vec<u8> = Vec::new();
+                let stdout_sink_buf: Option<&mut Vec<u8>> = match &mut *sink {
+                    StdoutSink::Capture(buf) => Some(*buf),
+                    StdoutSink::Terminal => None,
+                };
+                let stderr_sink_buf: Option<&mut Vec<u8>> = if matches!(err_sink, StderrSink::Capture(_)) {
+                    Some(&mut stderr_capture)
+                } else {
+                    None
+                };
+                let sinks = crate::stream_loop::CaptureSinks {
+                    stdout: stdout_sink_buf,
+                    stderr: stderr_sink_buf,
+                };
+                let loop_result = crate::stream_loop::external_capture_loop(
+                    pid as libc::pid_t,
+                    pipe_out,
+                    pipe_err,
+                    sinks,
+                    || None,
+                );
+                // Close pipe read-ends we owned.
+                if pipe_out >= 0 {
+                    unsafe { libc::close(pipe_out); }
+                }
+                if pipe_err >= 0 {
+                    unsafe { libc::close(pipe_err); }
+                }
+                let raw_status = match loop_result {
+                    Ok(s) => s,
+                    Err(_) => return ExecOutcome::Continue(1),
+                };
+                // Fold captured stderr bytes into err_sink now that &mut sink
+                // is released.
+                if let StderrSink::Capture(buf) = err_sink {
+                    buf.extend_from_slice(&stderr_capture);
                 }
                 let code = if libc::WIFEXITED(raw_status) {
                     libc::WEXITSTATUS(raw_status)
@@ -1447,19 +1535,43 @@ fn run_builtin_with_redirects(
             (_, StderrSink::Capture(ebuf)) => {
                 // out writes go to the stderr capture buffer; err writes also
                 // go to it. (Borrow ebuf only once; route both writers via a
-                // side buf for the err side to avoid aliasing.)
-                let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*ebuf, &mut side_err, shell);
-                ebuf.extend_from_slice(&side_err);
+                // side buf for the err side to avoid aliasing.) The side buf
+                // is wrapped in a LineDispatchWriter tagged Stderr so streaming
+                // callbacks fire for the builtin's direct stderr writes too.
+                let mut side_err_buf: Vec<u8> = Vec::new();
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: ebuf,
+                        stream: LineStream::Stderr,
+                    };
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stderr,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
+                };
+                ebuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             (StdoutSink::Capture(obuf), StderrSink::Merged) => {
                 // Merged means stderr is routed to the active stdout sink (here:
                 // the capture buf). So out writes (via `>&2` → merged → buf) AND
-                // err writes both go to obuf.
-                let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*obuf, &mut side_err, shell);
-                obuf.extend_from_slice(&side_err);
+                // err writes both go to obuf. Tag the side buf Stdout so the
+                // embedder sees these bytes as stdout-stream events (Merged
+                // means stderr converges on stdout from the embedder's view).
+                let mut side_err_buf: Vec<u8> = Vec::new();
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: obuf,
+                        stream: LineStream::Stdout,
+                    };
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
+                };
+                obuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             (StdoutSink::Terminal, StderrSink::Merged) => {
@@ -1479,10 +1591,22 @@ fn run_builtin_with_redirects(
             StdoutSink::Capture(obuf) => {
                 // out → obuf (the standard capture path), err → obuf (via the
                 // `2>&1` swap). Aliasing: borrow obuf once for out; use a side
-                // buf for err and append.
-                let mut side_err: Vec<u8> = Vec::new();
-                let outcome = run(*obuf, &mut side_err, shell);
-                obuf.extend_from_slice(&side_err);
+                // buf for err and append. Tag the side buf Stdout — the script
+                // redirected fd 2 to fd 1, so the embedder sees these bytes as
+                // stdout-stream events.
+                let mut side_err_buf: Vec<u8> = Vec::new();
+                let outcome = {
+                    let mut out_w = LineDispatchWriter {
+                        inner: obuf,
+                        stream: LineStream::Stdout,
+                    };
+                    let mut side_err_w = LineDispatchWriter {
+                        inner: &mut side_err_buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut side_err_w, shell)
+                };
+                obuf.extend_from_slice(&side_err_buf);
                 outcome
             }
             StdoutSink::Terminal => unreachable!("route_err_to_out requires Capture stdout"),
@@ -1499,11 +1623,22 @@ fn run_builtin_with_redirects(
             StdoutSink::Capture(buf) => match err_sink {
                 StderrSink::Terminal => {
                     let mut err = io::stderr();
-                    run(*buf, &mut err, shell)
+                    let mut out_w = LineDispatchWriter {
+                        inner: buf,
+                        stream: LineStream::Stdout,
+                    };
+                    run(&mut out_w, &mut err, shell)
                 }
                 StderrSink::Capture(ebuf) => {
-                    let mut err: &mut Vec<u8> = ebuf;
-                    run(*buf, &mut err, shell)
+                    let mut out_w = LineDispatchWriter {
+                        inner: buf,
+                        stream: LineStream::Stdout,
+                    };
+                    let mut err_w = LineDispatchWriter {
+                        inner: ebuf,
+                        stream: LineStream::Stderr,
+                    };
+                    run(&mut out_w, &mut err_w, shell)
                 }
                 StderrSink::Merged => {
                     // Both stdout and stderr converge on the same capture buf.
@@ -1512,9 +1647,21 @@ fn run_builtin_with_redirects(
                     // side buffer for stderr then append after the call. Order
                     // is preserved as out-then-err (builtins use fd 1 then fd 2
                     // in series in practice); not byte-strict-interleaved but
-                    // matches a single-writer line discipline well enough.
+                    // matches a single-writer line discipline well enough. Tag
+                    // the side buf Stdout — Merged means stderr converges on
+                    // stdout from the embedder's view.
                     let mut side: Vec<u8> = Vec::new();
-                    let outcome = run(*buf, &mut side, shell);
+                    let outcome = {
+                        let mut out_w = LineDispatchWriter {
+                            inner: buf,
+                            stream: LineStream::Stdout,
+                        };
+                        let mut side_w = LineDispatchWriter {
+                            inner: &mut side,
+                            stream: LineStream::Stdout,
+                        };
+                        run(&mut out_w, &mut side_w, shell)
+                    };
                     buf.extend_from_slice(&side);
                     outcome
                 }
@@ -2031,7 +2178,14 @@ fn run_select_inner(
                     StdoutSink::Terminal => {
                         let _ = writeln!(io::stdout());
                     }
-                    StdoutSink::Capture(buf) => buf.push(b'\n'),
+                    StdoutSink::Capture(buf) => {
+                        buf.push(b'\n');
+                        crate::callbacks_thread_local::with_callbacks(|cb| {
+                            if let Some(cb) = cb {
+                                cb.push_stdout(b"\n");
+                            }
+                        });
+                    }
                 }
                 return last;
             }
@@ -3411,12 +3565,6 @@ fn resolved_path(redirect: &ResolvedRedirect) -> &str {
     }
 }
 
-fn status_code(status: &ExitStatus) -> i32 {
-    status
-        .code()
-        .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(1))
-}
-
 // ----- single command -------------------------------------------------------
 
 // $PIPESTATUS leaf-site rule (M-50, v83): ONLY `run_single`, `run_multi_stage`,
@@ -3812,6 +3960,11 @@ fn run_exec_single(
                     Ok(bytes) => {
                         if let StdoutSink::Capture(buf) = sink {
                             buf.extend_from_slice(&bytes);
+                            crate::callbacks_thread_local::with_callbacks(|cb| {
+                                if let Some(cb) = cb {
+                                    cb.push_stdout(&bytes);
+                                }
+                            });
                         }
                         ExecOutcome::Continue(0)
                     }
@@ -4908,6 +5061,9 @@ fn run_subprocess(
                 }
                 give_terminal_to(pid);
 
+                // wait_with_untraced already waitpid'd the child, so each arm
+                // mem::forget's the Child to keep its Drop from re-reaping
+                // (already-reaped pid would give -ECHILD).
                 match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
                         // Child was stopped (e.g. Ctrl-Z / SIGTSTP).
@@ -4959,61 +5115,79 @@ fn run_subprocess(
                     }
                 }
             } else {
-                // Non-interactive (capture-or-pure) path: drain piped fds, then wait.
-                // When BOTH stdout AND stderr are piped we must drain them concurrently
-                // (spawn a background thread for stderr) or the child can deadlock by
-                // filling whichever pipe we are not currently reading (PIPE_BUF ~64KB
-                // on Linux). When only one is piped, sequential drain is fine.
-                let mut copy_err: Option<io::Error> = None;
-                // Take ownership of the piped stderr (if any) BEFORE the foreground
-                // stdout drain. The stderr drain thread owns the ChildStderr and the
-                // sender; the receiver below collects the bytes after wait().
-                let err_drain_handle = if want_capture_err {
-                    child.stderr.take().map(|mut child_stderr| {
-                        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
-                        let handle = std::thread::spawn(move || {
-                            let mut local = Vec::new();
-                            let res = io::copy(&mut child_stderr, &mut local).map(|_| local);
-                            let _ = tx.send(res);
-                        });
-                        (handle, rx)
-                    })
+                // Non-interactive (capture-or-pure) path: poll piped fds AND wait
+                // on the child concurrently via stream_loop::external_capture_loop.
+                // This runs on the embedder's thread (no drainer thread), so
+                // streaming callbacks fire in real time as bytes arrive.
+                use std::os::fd::IntoRawFd;
+                let pipe_out: RawFd = child
+                    .stdout
+                    .take()
+                    .map(|cs| cs.into_raw_fd())
+                    .unwrap_or(-1);
+                let pipe_err: RawFd = child
+                    .stderr
+                    .take()
+                    .map(|cs| cs.into_raw_fd())
+                    .unwrap_or(-1);
+                // Stash a separate capture buffer for stderr so we don't have to
+                // juggle two &mut Vec<u8> borrows of the *sink/err_sink enums
+                // simultaneously inside CaptureSinks.
+                let mut stderr_capture: Vec<u8> = Vec::new();
+                let stdout_sink_buf: Option<&mut Vec<u8>> = match sink {
+                    StdoutSink::Capture(buf) => Some(*buf),
+                    StdoutSink::Terminal => None,
+                };
+                let stderr_sink_buf: Option<&mut Vec<u8>> = if want_capture_err {
+                    Some(&mut stderr_capture)
                 } else {
                     None
                 };
-                if let StdoutSink::Capture(buf) = sink
-                    && let Some(mut child_stdout) = child.stdout.take()
-                    && let Err(e) = io::copy(&mut child_stdout, *buf)
-                {
-                    copy_err = Some(e);
+                let sinks = crate::stream_loop::CaptureSinks {
+                    stdout: stdout_sink_buf,
+                    stderr: stderr_sink_buf,
+                };
+                let loop_result = crate::stream_loop::external_capture_loop(
+                    pid as libc::pid_t,
+                    pipe_out,
+                    pipe_err,
+                    sinks,
+                    || None,
+                );
+                // Close pipe fds we took ownership of.
+                if pipe_out >= 0 {
+                    unsafe { libc::close(pipe_out); }
                 }
-                // Join the stderr drainer (if any) BEFORE wait() so the child's
-                // stderr is fully consumed and the pipe write-end closes.
-                if let Some((handle, rx)) = err_drain_handle {
-                    let _ = handle.join();
-                    if let Ok(result) = rx.recv() {
-                        match result {
-                            Ok(bytes) => {
-                                if let StderrSink::Capture(buf) = err_sink {
-                                    buf.extend_from_slice(&bytes);
-                                }
-                            }
-                            Err(e) => {
-                                if copy_err.is_none() {
-                                    copy_err = Some(e);
-                                }
-                            }
+                if pipe_err >= 0 {
+                    unsafe { libc::close(pipe_err); }
+                }
+                // We have already reaped the child via waitpid(WNOHANG) inside
+                // the loop. Tell `Child` not to reap (or wait on) again — the
+                // pid has been collected and would otherwise be -ECHILD.
+                std::mem::forget(child);
+                match loop_result {
+                    Ok(raw_status) => {
+                        // Fold the separately-captured stderr bytes into err_sink
+                        // now that the stdout &mut borrow is released.
+                        if want_capture_err
+                            && let StderrSink::Capture(buf) = err_sink
+                        {
+                            buf.extend_from_slice(&stderr_capture);
                         }
-                    }
-                }
-                match child.wait() {
-                    Ok(status) => {
-                        if let Some(e) = copy_err {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
-                            ExecOutcome::Continue(1)
+                        let code = if libc::WIFEXITED(raw_status) {
+                            libc::WEXITSTATUS(raw_status)
+                        } else if libc::WIFSIGNALED(raw_status) {
+                            let sig = libc::WTERMSIG(raw_status);
+                            if sig == libc::SIGINT {
+                                shell
+                                    .sigint_flag
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            128 + sig
                         } else {
-                            ExecOutcome::Continue(status_code(&status))
-                        }
+                            1
+                        };
+                        ExecOutcome::Continue(code)
                     }
                     Err(e) => {
                         { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
@@ -5215,8 +5389,6 @@ fn run_multi_stage(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
-    use std::os::fd::FromRawFd;
-
     // Job-control process-grouping is only correct in the top-level shell. Inside
     // a forked subshell it places the inner pipeline in a background process group
     // with default SIGTTOU/SIGTTIN handling, deadlocking the subshell's wait on a
@@ -5899,46 +6071,40 @@ fn run_multi_stage(
     }
     parent_held.retain(|&fd| Some(fd) == capture_read_fd || Some(fd) == capture_err_read_fd);
 
-    // Drain stderr (if captured) concurrently with stdout drain via a background
-    // thread. Without this, a child writing >PIPE_BUF (~64 KiB on Linux) to one
-    // stream while the parent sits in io::copy on the other deadlocks.
-    let err_drain = if let Some(r) = capture_err_read_fd.take() {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let handle = std::thread::spawn(move || {
-            let mut f = unsafe { File::from_raw_fd(r) };
-            let mut local = Vec::new();
-            let _ = io::copy(&mut f, &mut local);
-            let _ = tx.send(local);
-        });
-        Some((handle, rx))
-    } else {
-        None
-    };
-
-    // Drain the stdout capture pipe BEFORE waiting (M-119): the final stage blocks
-    // on write() once it fills the pipe buffer, so nothing draining during the wait
-    // deadlocks. Reading to EOF here overlaps with the stages writing. Capture
-    // sink => interactive == false, so the terminal-handoff/stopped blocks below
-    // are no-ops in this case.
-    if let Some(r) = capture_read_fd.take() {
-        if let StdoutSink::Capture(buf) = sink {
-            let mut f = unsafe { File::from_raw_fd(r) };
-            let _ = io::copy(&mut f, *buf);
-            // f drops here, closing r.
+    // Drain stdout AND stderr capture pipes via a single poll loop on the
+    // embedder's thread. Real-time streaming callbacks fire as bytes
+    // arrive; no drainer threads. The loop exits when BOTH pipes hit EOF,
+    // which happens once every writer (the last stage for stdout; all stages
+    // for the shared stderr pipe) has exited. Capture sink => interactive ==
+    // false, so the terminal-handoff/stopped blocks below are no-ops.
+    let pipe_out: RawFd = capture_read_fd.take().unwrap_or(-1);
+    let pipe_err: RawFd = capture_err_read_fd.take().unwrap_or(-1);
+    let mut stderr_capture: Vec<u8> = Vec::new();
+    if pipe_out >= 0 || pipe_err >= 0 {
+        let stdout_sink_buf: Option<&mut Vec<u8>> = match &mut *sink {
+            StdoutSink::Capture(buf) => Some(*buf),
+            StdoutSink::Terminal => None,
+        };
+        let stderr_sink_buf: Option<&mut Vec<u8>> = if matches!(err_sink, StderrSink::Capture(_)) {
+            Some(&mut stderr_capture)
         } else {
-            unsafe { libc::close(r); }
-        }
+            None
+        };
+        let sinks = crate::stream_loop::CaptureSinks {
+            stdout: stdout_sink_buf,
+            stderr: stderr_sink_buf,
+        };
+        let _ = crate::stream_loop::pipeline_drain_loop(pipe_out, pipe_err, sinks);
     }
-
-    // Join the stderr drain thread and fold its bytes into err_sink (after the
-    // &mut sink borrow above is released).
-    if let Some((handle, rx)) = err_drain {
-        let _ = handle.join();
-        if let Ok(bytes) = rx.recv()
-            && let StderrSink::Capture(buf) = err_sink
-        {
-            buf.extend_from_slice(&bytes);
-        }
+    if pipe_out >= 0 {
+        unsafe { libc::close(pipe_out); }
+    }
+    if pipe_err >= 0 {
+        unsafe { libc::close(pipe_err); }
+    }
+    // Fold captured stderr bytes into err_sink now that &mut sink is released.
+    if let StderrSink::Capture(buf) = err_sink {
+        buf.extend_from_slice(&stderr_capture);
     }
 
     // Give the terminal to the pipeline's process group if interactive.

@@ -10,6 +10,7 @@ mod macros;
 pub mod alias_expand;
 pub mod arith;
 pub mod builtins;
+pub(crate) mod callbacks_thread_local;
 pub mod completion;
 pub mod completion_builtins;
 pub mod completion_spec;
@@ -24,6 +25,7 @@ pub mod glob_match;
 pub mod history;
 pub mod job_spec;
 pub mod jobs;
+pub(crate) mod line_buf;
 pub mod param_expansion;
 pub mod procsub;
 pub mod prompt;
@@ -32,9 +34,11 @@ pub(crate) mod restricted;
 pub mod shell;
 pub mod shell_state;
 pub(crate) mod stdin_pipe;
+pub(crate) mod stream_loop;
 pub mod test_builtin;
 pub(crate) mod timeout;
 pub mod traps;
+pub(crate) mod wait_loop;
 
 #[cfg(test)]
 pub mod test_support;

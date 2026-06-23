@@ -46,6 +46,18 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   `ExecOutcome::Interrupted` carries an `InterruptReason::{Sigint,Timeout}`
   discriminator so the top-level reducer can map to 130 (SIGINT) or 124
   (timeout).
+  Streaming callbacks (v207) layer on top: `.on_stdout_line(|line| …)` and
+  `.on_stderr_line(…)` fire per complete line, on the embedder's thread (no
+  `Send` bound), in real time even for external processes. Internally, builtin
+  writes go through a thread-local `Callbacks` pointer that line-buffers via
+  `line_buf.rs`; external-process waits use a new poll-based loop
+  (`stream_loop.rs` + `wait_loop.rs` — `signalfd`/`poll` on Linux, `kqueue` on
+  macOS) that replaces v205/v206's blocking `waitpid` + drainer-thread.
+  Callbacks tee with `.run()` and `.capture()` — output still reaches the
+  embedder's terminal / `Output.stdout` buffer in addition to firing events.
+  Inner-capture scopes (command substitution `$(...)` and backticks)
+  suspend callback dispatch via `callbacks_thread_local::suspend()` so the
+  substitution's captured bytes don't leak to the embedder's view.
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply

@@ -30,6 +30,14 @@
 //!     .restricted(true)
 //!     .timeout(std::time::Duration::from_secs(5))
 //!     .capture();
+//!
+//! // Stream output as the script runs.
+//! let mut lines: Vec<String> = Vec::new();
+//! let exit = e.exec("for i in 1 2 3; do echo $i; done")
+//!     .on_stdout_line(|line| lines.push(line.to_string()))
+//!     .run();
+//! assert_eq!(exit, 0);
+//! assert_eq!(lines, vec!["1", "2", "3"]);
 //! ```
 use std::cell::RefCell;
 use std::path::Path;
@@ -748,5 +756,353 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .run();
         assert_eq!(code, 124);
+    }
+
+    #[test]
+    fn on_stdout_line_fires_per_line() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo a; echo b; echo c")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn on_stdout_line_empty_line() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo \"\"")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn on_stdout_line_partial_at_eof() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("printf 'no-newline'")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["no-newline"]);
+    }
+
+    #[test]
+    fn on_stderr_line_fires_per_line() {
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo hi; echo err >&2")
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out_lines, vec!["hi"]);
+        assert_eq!(err_lines, vec!["err"]);
+    }
+
+    #[test]
+    fn on_stdout_line_captures_too() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e
+            .exec("echo a; echo b")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        // Tee: BOTH the buffer AND the callback have the lines.
+        assert_eq!(out.stdout, "a\nb\n");
+        assert_eq!(lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn on_stdout_line_no_callback_capture_unchanged() {
+        let mut e = Engine::new();
+        let out = e.capture("echo unchanged");
+        // Sanity: no-callback capture is exactly v205/v206 behavior.
+        assert_eq!(out.stdout, "unchanged\n");
+        assert_eq!(out.stderr, "");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    // ----- external-process poll loop --------------------------------------
+    //
+    // These exercise the streaming path through external children:
+    // run_subprocess (single external command), the Subshell arm
+    // (`( … )`), and multi-stage pipelines.
+
+    #[test]
+    fn on_stdout_line_external_real_time() {
+        use std::time::{Duration, Instant};
+        let mut timestamps: Vec<Instant> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e
+            .exec("/bin/sh -c 'echo first; sleep 0.1; echo second'")
+            .on_stdout_line(|_line| timestamps.push(Instant::now()))
+            .capture();
+        assert_eq!(timestamps.len(), 2);
+        let gap = timestamps[1].duration_since(timestamps[0]);
+        assert!(
+            gap >= Duration::from_millis(50),
+            "expected ~100ms gap, got {gap:?}"
+        );
+        assert!(
+            gap <= Duration::from_secs(2),
+            "gap too large: {gap:?}"
+        );
+    }
+
+    #[test]
+    fn on_stdout_line_external_fires_during_wait() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut e = Engine::new();
+        let f = flag.clone();
+        let _ = e
+            .exec("/bin/sh -c 'echo early; sleep 0.5'")
+            .on_stdout_line(move |_| f.store(true, Ordering::Relaxed))
+            .capture();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn on_stdout_line_pipeline_last_stage() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo hi | tr a-z A-Z")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["HI"]);
+    }
+
+    #[test]
+    fn on_stdout_line_merge_stderr_routes_through_stdout() {
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        e.exec("echo a; echo b >&2")
+            .merge_stderr()
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert!(out_lines.contains(&"a".to_string()));
+        assert!(out_lines.contains(&"b".to_string()));
+        assert!(err_lines.is_empty());
+    }
+
+    #[test]
+    fn on_stdout_line_run_inherits_via_tee() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        // Redirect real fd 1 to a pipe so we can verify the tee re-write.
+        let mut fds = [0; 2];
+        let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(r, 0);
+        let pipe_r = fds[0];
+        let pipe_w = fds[1];
+
+        let saved = unsafe { libc::dup(1) };
+        unsafe { libc::dup2(pipe_w, 1); libc::close(pipe_w); }
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("echo tee-hi")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .run();
+
+        unsafe { libc::dup2(saved, 1); libc::close(saved); }
+
+        let mut buf = String::new();
+        let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+        file.read_to_string(&mut buf).unwrap();
+
+        assert_eq!(lines, vec!["tee-hi"]);
+        assert_eq!(buf, "tee-hi\n", "embedder's real fd 1 should also see the line");
+    }
+
+    #[test]
+    fn on_stdout_line_run_no_callback_no_pipe() {
+        // Sanity: no callback under run() takes the fast path.
+        let mut e = Engine::new();
+        let code = e.exec("true").run();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn on_stderr_line_run_inherits_via_tee() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        let r = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(r, 0);
+        let pipe_r = fds[0];
+        let pipe_w = fds[1];
+
+        let saved = unsafe { libc::dup(2) };
+        unsafe { libc::dup2(pipe_w, 2); libc::close(pipe_w); }
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("echo err >&2")
+            .on_stderr_line(|line| lines.push(line.to_string()))
+            .run();
+
+        unsafe { libc::dup2(saved, 2); libc::close(saved); }
+
+        let mut buf = String::new();
+        let mut file = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+        file.read_to_string(&mut buf).unwrap();
+
+        assert_eq!(lines, vec!["err"]);
+        assert_eq!(buf, "err\n");
+    }
+
+    #[test]
+    fn on_stdout_line_external_long_line() {
+        let mut got_len: usize = 0;
+        let mut e = Engine::new();
+        e.exec("/bin/sh -c 'head -c 100000 < /dev/zero | tr \\\\0 a; echo'")
+            .on_stdout_line(|line| got_len = line.len())
+            .capture();
+        assert!(got_len >= 50_000, "expected long line, got {got_len}");
+    }
+
+    // ----- composition: streaming callbacks + v205/v206 knobs --------------
+
+    #[test]
+    fn on_stdout_line_with_stdin() {
+        let _g = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("read x; echo \"got:$x\"")
+            .stdin(b"hi\n".to_vec())
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(lines, vec!["got:hi"]);
+    }
+
+    #[test]
+    fn on_stdout_line_with_cwd() {
+        let _g = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("pwd")
+            .cwd(tmp.path())
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(lines, vec![canonical.display().to_string()]);
+    }
+
+    #[test]
+    fn on_stdout_line_with_restricted() {
+        let mut err_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("cd /tmp")
+            .restricted(true)
+            .on_stderr_line(|line| err_lines.push(line.to_string()))
+            .capture();
+        assert!(err_lines.iter().any(|l| l.contains("restricted: cd")));
+    }
+
+    #[test]
+    fn on_stdout_line_with_timeout_fires_during_run() {
+        use std::time::Duration;
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let code = e.exec("/bin/sh -c 'echo before; sleep 5'")
+            .timeout(Duration::from_millis(200))
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture()
+            .exit_code;
+        assert_eq!(code, 124);
+        assert_eq!(lines, vec!["before"]);
+    }
+
+    #[test]
+    fn all_knobs_compose() {
+        use std::time::Duration;
+        let _g1 = crate::test_support::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::test_support::STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e.exec("read x; echo \"got:$x\"")
+            .cwd(tmp.path())
+            .restricted(true)
+            .timeout(Duration::from_secs(2))
+            .stdin(b"hello\n".to_vec())
+            .on_stdout_line(|line| out_lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out_lines, vec!["got:hello"]);
+    }
+
+    // ----- robustness: panic + backpressure --------------------------------
+
+    #[test]
+    fn callback_panic_propagates_and_engine_recovers() {
+        let mut e = Engine::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            e.exec("echo a; echo b; echo c")
+                .on_stdout_line(|line| {
+                    if line == "b" { panic!("test panic"); }
+                })
+                .capture()
+        }));
+        assert!(r.is_err(), "expected panic to propagate out of .capture()");
+        // Engine is still usable for the next call (no state corruption).
+        let out = e.capture("echo recovered");
+        assert_eq!(out.stdout, "recovered\n");
+    }
+
+    #[test]
+    fn callback_can_be_slow_backpressure_works() {
+        use std::time::{Duration, Instant};
+        let mut e = Engine::new();
+        let start = Instant::now();
+        let _ = e.exec("for i in $(seq 1 20); do echo $i; done")
+            .on_stdout_line(|_| std::thread::sleep(Duration::from_millis(20)))
+            .capture();
+        let elapsed = start.elapsed();
+        // 20 lines × 20ms = 400ms minimum.
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "expected backpressure to slow run, elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn on_stderr_line_builtin_redirect_to_err() {
+        // builtin >&2 with on_stderr_line — must fire. (v207 fixup: previously
+        // the side_err Vec<u8> aliasing-avoidance buffer bypassed
+        // LineDispatchWriter so streaming callbacks didn't see these bytes.)
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let out = e.exec("echo hi >&2")
+            .on_stderr_line(|line| lines.push(line.to_string()))
+            .capture();
+        assert_eq!(out.stderr, "hi\n");
+        assert_eq!(lines, vec!["hi"]);
+    }
+
+    #[test]
+    fn on_stdout_line_builtin_redirect_2to1() {
+        // builtin 2>&1 with on_stdout_line — must fire for what was originally
+        // stderr. Use `declare -p` on an undefined var to emit a builtin stderr
+        // diagnostic; the `2>&1` routes it to fd 1 so the embedder should see
+        // it as a stdout-stream event.
+        let mut lines: Vec<String> = Vec::new();
+        let mut e = Engine::new();
+        let _ = e.exec("declare -p NOPE_NOT_DEFINED 2>&1")
+            .on_stdout_line(|line| lines.push(line.to_string()))
+            .capture();
+        // The diagnostic should arrive via on_stdout_line.
+        assert!(
+            lines.iter().any(|l| l.contains("NOPE_NOT_DEFINED")),
+            "expected stderr-redirected-to-stdout line via callback, got {lines:?}"
+        );
     }
 }
