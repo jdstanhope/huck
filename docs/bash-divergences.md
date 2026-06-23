@@ -28,7 +28,7 @@ stays in sync.
 | Tier | Count | Notes |
 | --- | --- | --- |
 | Bugs (Tier 1) | 0 | None open. |
-| Missing features (Tier 2) | 13 | Deferred bash-compat backlog, ranked by severity within each group. |
+| Missing features (Tier 2) | 12 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
 | Low-impact (Tier 4) | 39 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
@@ -54,7 +54,6 @@ group.
 ### Parameter expansion modifiers
 
 - **M-93: `${var@OP}` array/attribute transforms (`@A`/`@K`/`@k`/`@a`)** — `[deferred]` low. huck: the assignment-statement form `@A`, the key/value array forms `@K`/`@k`, and the attribute-flags form `@a` error (unsupported `@`-operator). bash: `@A` reproduces a `declare`-style assignment string, `@a` lists attribute flags, `@K`/`@k` expand associative-array key/value pairs. M-86 follow-on; the scalar transforms (`@P`/`@Q`/`@U`/`@L`/`@u`/`@E`) shipped in v96.
-- **M-127: case modification on a whole array (`${a[@]^^}` / `${a[@],,}` / `${a[@]^}` / `${a[@],}`)** — `[deferred]` low (found in the v157 runtime sweep, batch 4). huck errors `${a[…]}: modifier Case { … } not supported on array in v71` when a case-modification modifier (`^^`/`,,`/`^`/`,`, with or without a pattern) is applied to the `[@]`/`[*]` form. bash applies the case fold to EVERY element (`a=(foo bar); echo "${a[@]^^}"` → `FOO BAR`). The per-element form `${a[1]^^}` and the scalar form `${v^^}` both already work (v37), so the case-fold machinery exists — the gap is that the array-iteration path in the modifier dispatch doesn't map the `Case` modifier over each element the way it does for substring/replace. Fix: in the `[@]`/`[*]` modifier branch, apply `case_modify` per element (mirroring how the other per-element modifiers are handled). The same v71 "not supported on array" guard also rejects a few other modifiers on `[@]`; only `Case` was observed in the sweep.
 
 ### Redirects
 
