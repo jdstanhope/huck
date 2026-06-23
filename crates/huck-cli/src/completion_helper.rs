@@ -44,6 +44,7 @@ impl Completer for HuckHelper {
             .map(|c: Candidate| Pair {
                 display: c.display,
                 replacement: c.replacement,
+                // c.kind dropped — rustyline doesn't model completion kinds.
             })
             .collect();
         Ok((start, pairs))
