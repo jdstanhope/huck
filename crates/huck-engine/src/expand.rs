@@ -3220,6 +3220,47 @@ mod tests {
             other => panic!("expected WordList, got {other:?}"),
         }
     }
+
+    #[test]
+    fn assign_default_on_array_still_errors() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
+        let word = Word(vec![WordPart::Literal { text: "default".into(), quoted: false }]);
+        let result = expand_array_param(
+            "a",
+            &PM::AssignDefault { word, colon: true },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, ""),
+            other => panic!("expected empty Value (catchall rejection), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_if_unset_on_array_still_errors() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Literal { text: "msg".into(), quoted: false }]);
+        let result = expand_array_param(
+            "a",
+            &PM::ErrorIfUnset { word, colon: true },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, ""),
+            other => panic!("expected empty Value (catchall rejection), got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
