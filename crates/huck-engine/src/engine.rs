@@ -38,6 +38,14 @@
 //!     .run();
 //! assert_eq!(exit, 0);
 //! assert_eq!(lines, vec!["1", "2", "3"]);
+//!
+//! // Tab-completion query: what would complete at the cursor?
+//! let line = "echo $HO";
+//! let comp = e.complete(line, line.len());
+//! for c in &comp.candidates {
+//!     println!("[{:?}] {}", c.kind, c.display);
+//! }
+//! // Prints lines like:  [Variable] HOME, [Variable] HOSTNAME (if set), etc.
 //! ```
 use std::cell::RefCell;
 use std::path::Path;

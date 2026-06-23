@@ -58,6 +58,14 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
   Inner-capture scopes (command substitution `$(...)` and backticks)
   suspend callback dispatch via `callbacks_thread_local::suspend()` so the
   substitution's captured bytes don't leak to the embedder's view.
+  Completion (v208) is exposed as `Engine::complete(line, cursor) -> Completion
+  { start, candidates }`. `Candidate` gains a `kind: CandidateKind` tag
+  (`Command` / `Variable` / `File` / `Directory` / `Custom`) so IDE / TUI
+  embedders can render icons or sort by kind. Thin wrapper over the existing
+  `completion::dispatch::resolve` internal API; `&mut self` because
+  `complete -F func` callbacks may mutate shell state. The CLI's `HuckHelper`
+  rustyline adapter drops `kind` (rustyline has no kind concept) — REPL
+  behavior unchanged.
 - **`huck-cli`** (`crates/huck-cli/`) — the interactive **REPL** (`run` + the
   rustyline `Editor` loop) and the line-editor *adapters*: the `HuckHelper`
   completer (`Candidate`→`rustyline::Pair`) and the readline apply
