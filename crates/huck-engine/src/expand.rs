@@ -278,6 +278,54 @@ fn expand_positional_substring(
     }
 }
 
+/// Whether this modifier can sensibly apply per-element across a whole
+/// array. Used by `expand_array_param` / `expand_assoc_param` to dispatch
+/// to the per-element arm rather than the catchall "not supported on array"
+/// rejection. The whole-array Transform ops (@A / @K / @k / @a) are NOT
+/// currently in TransformOp — when M-93 adds them, this predicate will
+/// need a sub-check on the op.
+fn is_per_element_modifier(m: &crate::lexer::ParamModifier) -> bool {
+    use crate::lexer::ParamModifier as PM;
+    matches!(
+        m,
+        PM::Case { .. }
+            | PM::RemovePrefix { .. }
+            | PM::RemoveSuffix { .. }
+            | PM::Substitute { .. }
+            | PM::Transform { .. }
+    )
+}
+
+/// Apply a scalar modifier to one element's value via the existing
+/// `expand_modifier_with_value` scalar path. Wraps the element in
+/// `ParamLookup::Element(Some(_))` so default/error modifiers see a present
+/// element (every element here has a concrete value — even an empty
+/// string).
+///
+/// Used by the per-element arm in `expand_array_param` / `expand_assoc_param`.
+/// Falls through to empty-string output for non-Value results; per-element
+/// scalar modifiers should never produce WordList/Fields/Fatal in practice.
+fn scalar_apply_per_element(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    element: &str,
+    quoted: bool,
+    shell: &mut crate::shell_state::Shell,
+) -> String {
+    use crate::param_expansion::{expand_modifier_with_value, ExpansionResult, ParamLookup};
+    match expand_modifier_with_value(
+        name,
+        modifier,
+        ParamLookup::Element(Some(element)),
+        quoted,
+        shell,
+    ) {
+        ExpansionResult::Value(s) => s,
+        ExpansionResult::Empty => String::new(),
+        _ => String::new(),
+    }
+}
+
 /// Dispatches `${m[...]}` forms when `m` is an associative array.
 /// String-key subscripts (no arith), insertion-order iteration for
 /// `@`/`*`, and string keys for `${!m[@]}`. Routed from
@@ -433,6 +481,19 @@ fn expand_assoc_param(
             } else {
                 // Unset, unquoted outer: emit the default word's own fields.
                 ExpansionResult::Fields(expand(word, shell))
+            }
+        }
+        (modif, SK::All | SK::Star) if is_per_element_modifier(modif) => {
+            let transformed: Vec<String> = values
+                .iter()
+                .map(|v| scalar_apply_per_element(name, modif, v, quoted, shell))
+                .collect();
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(transformed)
+            } else {
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
+                ExpansionResult::Value(transformed.join(&sep))
             }
         }
         // Other scalar modifiers on @/* — explicit error for v72 scope
@@ -813,6 +874,20 @@ fn expand_array_param(
             } else {
                 // Unset, unquoted outer: emit the default word's own fields.
                 ExpansionResult::Fields(expand(word, shell))
+            }
+        }
+        (modif, SK::All | SK::Star) if is_per_element_modifier(modif) => {
+            let values = collect_values(shell);
+            let transformed: Vec<String> = values
+                .iter()
+                .map(|v| scalar_apply_per_element(name, modif, v, quoted, shell))
+                .collect();
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(transformed)
+            } else {
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
+                ExpansionResult::Value(transformed.join(&sep))
             }
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
@@ -2990,6 +3065,201 @@ mod tests {
         assert_eq!(fields[0].chars, "hello");
         assert_eq!(fields[1].chars, "world");
         assert_eq!(fields[2].chars, "x");
+    }
+
+    #[test]
+    fn case_modifier_on_indexed_array_at() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "bar".to_string()).unwrap();
+        let result = expand_array_param(
+            "a",
+            &crate::lexer::ParamModifier::Case {
+                direction: crate::lexer::CaseDirection::Upper,
+                all: true,
+                pattern: None,
+            },
+            &crate::lexer::SubscriptKind::All,
+            true, // quoted
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => assert_eq!(words, vec!["FOO", "BAR"]),
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_modifier_on_indexed_array_star() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "bar".to_string()).unwrap();
+        let result = expand_array_param(
+            "a",
+            &crate::lexer::ParamModifier::Case {
+                direction: crate::lexer::CaseDirection::Upper,
+                all: true,
+                pattern: None,
+            },
+            &crate::lexer::SubscriptKind::Star,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, "FOO BAR"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_suffix_per_element_indexed() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "foo.txt".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "bar.md".to_string()).unwrap();
+        let pat = Word(vec![WordPart::Literal { text: ".*".into(), quoted: false }]);
+        let result = expand_array_param(
+            "a",
+            &PM::RemoveSuffix { pattern: pat, longest: false },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => assert_eq!(words, vec!["foo", "bar"]),
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_array_per_element_modifier() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        let result = expand_array_param(
+            "a",
+            &crate::lexer::ParamModifier::Case {
+                direction: crate::lexer::CaseDirection::Upper,
+                all: true,
+                pattern: None,
+            },
+            &crate::lexer::SubscriptKind::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => assert!(words.is_empty(), "expected empty WordList, got {words:?}"),
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_modifier_on_associative_array() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
+        shell.set_associative_element("m", "j".to_string(), "bar".to_string()).unwrap();
+        let result = expand_array_param(
+            "m",
+            &crate::lexer::ParamModifier::Case {
+                direction: crate::lexer::CaseDirection::Upper,
+                all: true,
+                pattern: None,
+            },
+            &crate::lexer::SubscriptKind::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => {
+                let mut sorted = words.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec!["BAR", "FOO"]);
+            }
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substitute_per_element_assoc() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, SubstAnchor, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
+        shell.set_associative_element("m", "j".to_string(), "boo".to_string()).unwrap();
+        let pat = Word(vec![WordPart::Literal { text: "o".into(), quoted: false }]);
+        let repl = Word(vec![WordPart::Literal { text: "X".into(), quoted: false }]);
+        let result = expand_array_param(
+            "m",
+            &PM::Substitute {
+                pattern: pat,
+                replacement: repl,
+                anchor: SubstAnchor::None,
+                all: false,
+            },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => {
+                let mut sorted = words.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec!["bXo", "fXo"]);
+            }
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_default_on_array_still_errors() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "foo".to_string()).unwrap();
+        let word = Word(vec![WordPart::Literal { text: "default".into(), quoted: false }]);
+        let result = expand_array_param(
+            "a",
+            &PM::AssignDefault { word, colon: true },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, ""),
+            other => panic!("expected empty Value (catchall rejection), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_if_unset_on_array_still_errors() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        let word = Word(vec![WordPart::Literal { text: "msg".into(), quoted: false }]);
+        let result = expand_array_param(
+            "a",
+            &PM::ErrorIfUnset { word, colon: true },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, ""),
+            other => panic!("expected empty Value (catchall rejection), got {other:?}"),
+        }
     }
 }
 
