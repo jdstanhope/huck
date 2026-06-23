@@ -43,7 +43,8 @@ pub(crate) mod wait_loop;
 #[cfg(test)]
 pub mod test_support;
 
-pub use engine::{Engine, EngineBuilder, Output};
+pub use completion::{Candidate, CandidateKind};
+pub use engine::{Completion, Engine, EngineBuilder, Output};
 pub use exec_builder::ExecBuilder;
 pub use executor::{StderrSink, StdoutSink};
 

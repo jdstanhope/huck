@@ -61,6 +61,18 @@ pub struct Output {
     pub exit_code: i32,
 }
 
+/// The result of a completion query — see [`Engine::complete`].
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Byte offset in the input line where the replacement starts.
+    /// Embedders substitute `line[start..cursor]` with each candidate's
+    /// `replacement` when the user picks it. `start <= cursor`.
+    pub start: usize,
+    /// Candidates in the order huck would offer them at the prompt.
+    /// Alphabetical within each kind.
+    pub candidates: Vec<crate::completion::Candidate>,
+}
+
 /// A persistent, embeddable huck shell session.
 pub struct Engine {
     cell: Rc<RefCell<Shell>>,
@@ -102,6 +114,23 @@ impl Engine {
     /// [`ExecBuilder`]: crate::exec_builder::ExecBuilder
     pub fn exec(&mut self, src: &str) -> crate::exec_builder::ExecBuilder<'_> {
         crate::exec_builder::ExecBuilder::new(self, src.to_string())
+    }
+
+    /// Return the completion candidates at `cursor` (byte offset) in `line`.
+    /// The embedder substitutes `line[start..cursor]` with each candidate's
+    /// `replacement` when the user picks it.
+    ///
+    /// `cursor` is clamped to `line.len()`. Passing a cursor inside a
+    /// multi-byte UTF-8 sequence panics (same as `&str` slicing).
+    ///
+    /// `&mut self` is required because `complete -F func` callbacks may
+    /// mutate shell state.
+    pub fn complete(&mut self, line: &str, cursor: usize) -> Completion {
+        let clamped = cursor.min(line.len());
+        let mut shell = self.cell.borrow_mut();
+        let (start, candidates) =
+            crate::completion::dispatch::resolve(line, clamped, &mut shell);
+        Completion { start, candidates }
     }
 
     /// Run a script STRING with script semantics (a "main" frame; `$0` = `arg0`).
