@@ -2,12 +2,29 @@
 
 use std::collections::BTreeSet;
 
+/// What kind of completion a `Candidate` represents. Useful for embedders
+/// rendering icons or sorting by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// Command position: executable on PATH, shell function, builtin, or alias.
+    Command,
+    /// `$x`-style variable name.
+    Variable,
+    /// Regular file in an argument position.
+    File,
+    /// Directory in an argument position (display includes trailing `/`).
+    Directory,
+    /// Returned from a `complete -F func` callback — underlying kind unknown.
+    Custom,
+}
+
 /// One completion candidate. `display` is shown in the Tab-Tab list;
 /// `replacement` is the (possibly escaped) text inserted into the line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub display: String,
     pub replacement: String,
+    pub kind: CandidateKind,
 }
 
 /// What the cursor is positioned to complete.
@@ -244,7 +261,11 @@ pub fn complete_command(
 
     names
         .into_iter()
-        .map(|n| Candidate { display: n.clone(), replacement: escape_filename(&n) })
+        .map(|n| Candidate {
+            display: n.clone(),
+            replacement: escape_filename(&n),
+            kind: CandidateKind::Command,
+        })
         .collect()
 }
 
@@ -259,7 +280,11 @@ pub fn complete_variable(prefix: &str, var_names: &[String]) -> Vec<Candidate> {
     matches.dedup();
     matches
         .into_iter()
-        .map(|n| Candidate { display: n.clone(), replacement: n })
+        .map(|n| Candidate {
+            display: n.clone(),
+            replacement: n,
+            kind: CandidateKind::Variable,
+        })
         .collect()
 }
 
@@ -294,11 +319,18 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
             .unwrap_or(false);
         let mut display = name.to_string();
         let mut replacement = escape_filename(name);
-        if is_dir {
+        let kind = if is_dir {
             display.push('/');
             replacement.push('/');
-        }
-        candidates.push(Candidate { display, replacement });
+            CandidateKind::Directory
+        } else {
+            CandidateKind::File
+        };
+        candidates.push(Candidate {
+            display,
+            replacement,
+            kind,
+        });
     }
     candidates.sort_by(|a, b| a.display.cmp(&b.display));
     candidates
@@ -509,13 +541,21 @@ pub mod dispatch {
                     if is_dir {
                         replacement.push('/');
                     }
-                    Candidate { display, replacement }
+                    Candidate {
+                        display,
+                        replacement,
+                        kind: CandidateKind::Custom,
+                    }
                 })
                 .collect()
         } else {
             after_fallback
                 .into_iter()
-                .map(|s| Candidate { display: s.clone(), replacement: s })
+                .map(|s| Candidate {
+                    display: s.clone(),
+                    replacement: s,
+                    kind: CandidateKind::Custom,
+                })
                 .collect()
         };
 
