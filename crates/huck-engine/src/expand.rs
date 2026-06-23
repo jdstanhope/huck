@@ -1379,6 +1379,10 @@ fn reconstruct_param_expansion(
                 TransformOp::Lower => 'L',
                 TransformOp::UpperFirst => 'u',
                 TransformOp::EscapeExpand => 'E',
+                TransformOp::AssignDecl => 'A',
+                TransformOp::KvString => 'K',
+                TransformOp::KvWords => 'k',
+                TransformOp::AttrFlags => 'a',
             });
         }
     }

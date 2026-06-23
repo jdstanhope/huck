@@ -265,6 +265,7 @@ pub fn expand_modifier_with_value(
                 crate::lexer::TransformOp::PromptExpand => {
                     crate::prompt::expand_prompt(&v, shell)
                 }
+                _ => String::new(),
             };
             ExpansionResult::Value(out)
         }
