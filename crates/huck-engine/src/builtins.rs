@@ -794,7 +794,7 @@ pub(crate) fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, Str
 /// control char uses ANSI-C `$'…'`; the EMPTY value is bare (`name=`). This is
 /// NOT `${v@Q}` (which always quotes); it mirrors bash's `sh_contains_shell_metas`
 /// + `sh_single_quote`.
-fn declare_scalar_quote(v: &str) -> String {
+pub(crate) fn declare_scalar_quote(v: &str) -> String {
     if v.is_empty() {
         return String::new();
     }
@@ -812,7 +812,7 @@ fn declare_scalar_quote(v: &str) -> String {
 /// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
 /// For indexed-array variables, the value is rendered as
 /// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
-fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
