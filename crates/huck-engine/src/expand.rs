@@ -278,6 +278,56 @@ fn expand_positional_substring(
     }
 }
 
+/// Whether this modifier can sensibly apply per-element across a whole
+/// array. Used by `expand_array_param` / `expand_assoc_param` to dispatch
+/// to the per-element arm rather than the catchall "not supported on array"
+/// rejection. The whole-array Transform ops (@A / @K / @k / @a) are NOT
+/// currently in TransformOp — when M-93 adds them, this predicate will
+/// need a sub-check on the op.
+#[allow(dead_code)]
+fn is_per_element_modifier(m: &crate::lexer::ParamModifier) -> bool {
+    use crate::lexer::ParamModifier as PM;
+    matches!(
+        m,
+        PM::Case { .. }
+            | PM::RemovePrefix { .. }
+            | PM::RemoveSuffix { .. }
+            | PM::Substitute { .. }
+            | PM::Transform { .. }
+    )
+}
+
+/// Apply a scalar modifier to one element's value via the existing
+/// `expand_modifier_with_value` scalar path. Wraps the element in
+/// `ParamLookup::Element(Some(_))` so default/error modifiers see a present
+/// element (every element here has a concrete value — even an empty
+/// string).
+///
+/// Used by the per-element arm in `expand_array_param` / `expand_assoc_param`.
+/// Falls through to empty-string output for non-Value results; per-element
+/// scalar modifiers should never produce WordList/Fields/Fatal in practice.
+#[allow(dead_code)]
+fn scalar_apply_per_element(
+    name: &str,
+    modifier: &crate::lexer::ParamModifier,
+    element: &str,
+    quoted: bool,
+    shell: &mut crate::shell_state::Shell,
+) -> String {
+    use crate::param_expansion::{expand_modifier_with_value, ExpansionResult, ParamLookup};
+    match expand_modifier_with_value(
+        name,
+        modifier,
+        ParamLookup::Element(Some(element)),
+        quoted,
+        shell,
+    ) {
+        ExpansionResult::Value(s) => s,
+        ExpansionResult::Empty => String::new(),
+        _ => String::new(),
+    }
+}
+
 /// Dispatches `${m[...]}` forms when `m` is an associative array.
 /// String-key subscripts (no arith), insertion-order iteration for
 /// `@`/`*`, and string keys for `${!m[@]}`. Routed from
