@@ -1134,4 +1134,121 @@ mod tests {
             "expected stderr-redirected-to-stdout line via callback, got {lines:?}"
         );
     }
+
+    // ===== Completion API (v208) =====
+
+    #[test]
+    fn complete_returns_struct() {
+        let mut e = Engine::new();
+        let comp = e.complete("", 0);
+        assert_eq!(comp.start, 0);
+        // Empty-prefix command position: at minimum some builtins are present.
+        assert!(!comp.candidates.is_empty(), "expected some builtins, got {:?}", comp.candidates);
+    }
+
+    #[test]
+    fn complete_at_end_of_line() {
+        let mut e = Engine::new();
+        let line = "echo $HO";
+        let comp = e.complete(line, line.len());
+        assert!(
+            comp.candidates.iter().any(|c| c.display == "HOME"),
+            "expected HOME in {:?}", comp.candidates
+        );
+    }
+
+    #[test]
+    fn complete_with_cursor_beyond_line_len() {
+        let mut e = Engine::new();
+        let line = "ec";
+        let at_end = e.complete(line, line.len());
+        let beyond = e.complete(line, 9999);
+        assert_eq!(beyond.start, at_end.start);
+        assert_eq!(
+            beyond.candidates.iter().map(|c| c.display.as_str()).collect::<Vec<_>>(),
+            at_end.candidates.iter().map(|c| c.display.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn complete_command_position_stamps_command() {
+        let mut e = Engine::new();
+        let comp = e.complete("ec", 2);
+        let echo = comp.candidates.iter().find(|c| c.display == "echo")
+            .expect("echo should complete");
+        assert_eq!(echo.kind, crate::CandidateKind::Command);
+    }
+
+    #[test]
+    fn complete_variable_stamps_variable() {
+        let mut e = Engine::new();
+        e.set_var("MY_V208_TEST_VAR", "x");
+        let line = "echo $MY_V208_T";
+        let comp = e.complete(line, line.len());
+        let v = comp.candidates.iter().find(|c| c.display == "MY_V208_TEST_VAR")
+            .expect("var should complete");
+        assert_eq!(v.kind, crate::CandidateKind::Variable);
+    }
+
+    #[test]
+    fn complete_file_stamps_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("v208_test_file.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let mut e = Engine::new();
+        let line = format!("ls {}/v208_test", tmp.path().display());
+        let comp = e.complete(&line, line.len());
+        let cand = comp.candidates.iter()
+            .find(|c| c.display == "v208_test_file.txt")
+            .expect("file should complete");
+        assert_eq!(cand.kind, crate::CandidateKind::File);
+    }
+
+    #[test]
+    fn complete_directory_stamps_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("v208_test_dir");
+        std::fs::create_dir(&d).unwrap();
+        let mut e = Engine::new();
+        let line = format!("ls {}/v208_test", tmp.path().display());
+        let comp = e.complete(&line, line.len());
+        let cand = comp.candidates.iter()
+            .find(|c| c.display == "v208_test_dir/")
+            .expect("dir should complete with trailing /");
+        assert_eq!(cand.kind, crate::CandidateKind::Directory);
+    }
+
+    #[test]
+    fn complete_custom_stamps_custom() {
+        let mut e = Engine::new();
+        // Register a -F func that produces a single candidate.
+        let _ = e.run("_my_v208_completer() { COMPREPLY=( custom_v208_result ); }; complete -F _my_v208_completer mycmd");
+        let comp = e.complete("mycmd ", 6);
+        let cand = comp.candidates.iter()
+            .find(|c| c.display == "custom_v208_result")
+            .expect("custom result should appear");
+        assert_eq!(cand.kind, crate::CandidateKind::Custom);
+    }
+
+    #[test]
+    fn complete_does_not_modify_last_status() {
+        let mut e = Engine::new();
+        let _ = e.run("false");
+        assert_eq!(e.last_status(), 1);
+        let _ = e.complete("ec", 2);
+        assert_eq!(e.last_status(), 1, "complete() must not alter $?");
+    }
+
+    #[test]
+    fn complete_sees_engine_vars() {
+        let mut e = Engine::new();
+        e.set_var("MY_V208_VAR", "x");
+        let line = "echo $MY_V208_V";
+        let comp = e.complete(line, line.len());
+        assert!(
+            comp.candidates.iter().any(|c| c.display == "MY_V208_VAR"),
+            "live engine var should be visible to complete(), got {:?}",
+            comp.candidates,
+        );
+    }
 }
