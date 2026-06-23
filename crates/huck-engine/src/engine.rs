@@ -30,6 +30,14 @@
 //!     .restricted(true)
 //!     .timeout(std::time::Duration::from_secs(5))
 //!     .capture();
+//!
+//! // Stream output as the script runs.
+//! let mut lines: Vec<String> = Vec::new();
+//! let exit = e.exec("for i in 1 2 3; do echo $i; done")
+//!     .on_stdout_line(|line| lines.push(line.to_string()))
+//!     .run();
+//! assert_eq!(exit, 0);
+//! assert_eq!(lines, vec!["1", "2", "3"]);
 //! ```
 use std::cell::RefCell;
 use std::path::Path;
