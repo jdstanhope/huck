@@ -283,7 +283,7 @@ pub fn complete_variable(prefix: &str, var_names: &[String]) -> Vec<Candidate> {
         .map(|n| Candidate {
             display: n.clone(),
             replacement: n,
-            kind: CandidateKind::Command,
+            kind: CandidateKind::Variable,
         })
         .collect()
 }
@@ -319,14 +319,17 @@ pub fn complete_file(dir: &str, prefix: &str, home: &str) -> Vec<Candidate> {
             .unwrap_or(false);
         let mut display = name.to_string();
         let mut replacement = escape_filename(name);
-        if is_dir {
+        let kind = if is_dir {
             display.push('/');
             replacement.push('/');
-        }
+            CandidateKind::Directory
+        } else {
+            CandidateKind::File
+        };
         candidates.push(Candidate {
             display,
             replacement,
-            kind: CandidateKind::Command,
+            kind,
         });
     }
     candidates.sort_by(|a, b| a.display.cmp(&b.display));
@@ -541,7 +544,7 @@ pub mod dispatch {
                     Candidate {
                         display,
                         replacement,
-                        kind: CandidateKind::Command,
+                        kind: CandidateKind::Custom,
                     }
                 })
                 .collect()
@@ -551,7 +554,7 @@ pub mod dispatch {
                 .map(|s| Candidate {
                     display: s.clone(),
                     replacement: s,
-                    kind: CandidateKind::Command,
+                    kind: CandidateKind::Custom,
                 })
                 .collect()
         };
