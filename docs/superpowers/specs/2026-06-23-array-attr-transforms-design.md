@@ -314,10 +314,13 @@ Three sites consume the new renderer:
 
 ### Rules baked into the renderer
 
-- **Subscript key quoting**:
-  - Bareword if `^[A-Za-z_][A-Za-z0-9_]*$` (identifier) or `^-?\d+$`
-    (integer literal).
-  - Else single-quoted with `'\''` rewrite.
+- **Subscript key quoting** (matches bash via probe):
+  - Bareword if the key matches `^[A-Za-z0-9_-]+$` (letters, digits,
+    underscore, dash — covers identifiers, integers including
+    negative, and dashed identifiers like `key-1`).
+  - Else **double-quoted** with `\$`/`\\`/`\"`/`` \` `` escapes
+    (the same escape policy as values inside `(…)`). Bash uses
+    double-quoting for special-char keys, not single-quoting.
 - **Value quoting in array body**: always double-quoted (`"v1"`),
   bash's convention inside `(…)`.
 - **Value quoting in scalar `name='value'` form**: always single-quoted
