@@ -483,6 +483,19 @@ fn expand_assoc_param(
                 ExpansionResult::Fields(expand(word, shell))
             }
         }
+        (modif, SK::All | SK::Star) if is_per_element_modifier(modif) => {
+            let transformed: Vec<String> = values
+                .iter()
+                .map(|v| scalar_apply_per_element(name, modif, v, quoted, shell))
+                .collect();
+            if matches!(subscript, SK::All) && quoted {
+                ExpansionResult::WordList(transformed)
+            } else {
+                let ifs = shell.ifs();
+                let sep = ifs_join_sep(&ifs);
+                ExpansionResult::Value(transformed.join(&sep))
+            }
+        }
         // Other scalar modifiers on @/* — explicit error for v72 scope
         // (per-element modifiers across the whole array are deferred).
         (other, SK::All | SK::Star) => {
@@ -3142,6 +3155,68 @@ mod tests {
         );
         match result {
             ExpansionResult::WordList(words) => assert!(words.is_empty(), "expected empty WordList, got {words:?}"),
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn case_modifier_on_associative_array() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
+        shell.set_associative_element("m", "j".to_string(), "bar".to_string()).unwrap();
+        let result = expand_array_param(
+            "m",
+            &crate::lexer::ParamModifier::Case {
+                direction: crate::lexer::CaseDirection::Upper,
+                all: true,
+                pattern: None,
+            },
+            &crate::lexer::SubscriptKind::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => {
+                let mut sorted = words.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec!["BAR", "FOO"]);
+            }
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substitute_per_element_assoc() {
+        use crate::shell_state::Shell;
+        use crate::lexer::{ParamModifier as PM, SubscriptKind as SK, SubstAnchor, Word, WordPart};
+        use crate::param_expansion::ExpansionResult;
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".to_string(), "foo".to_string()).unwrap();
+        shell.set_associative_element("m", "j".to_string(), "boo".to_string()).unwrap();
+        let pat = Word(vec![WordPart::Literal { text: "o".into(), quoted: false }]);
+        let repl = Word(vec![WordPart::Literal { text: "X".into(), quoted: false }]);
+        let result = expand_array_param(
+            "m",
+            &PM::Substitute {
+                pattern: pat,
+                replacement: repl,
+                anchor: SubstAnchor::None,
+                all: false,
+            },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => {
+                let mut sorted = words.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec!["bXo", "fXo"]);
+            }
             other => panic!("expected WordList, got {other:?}"),
         }
     }
