@@ -5365,6 +5365,20 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
+/// Create an inter-stage pipe for a downstream pipeline reader, where
+/// the upstream stage's stdout is going elsewhere (an explicit file
+/// redirect). Closes the write-end immediately so the downstream reader
+/// sees EOF instead of inheriting parent stdin or blocking on an
+/// orphaned write-end. Returns the read-end fd to thread into
+/// `prev_pipe_read`. On `make_pipe` failure, the caller propagates the
+/// error.
+#[allow(dead_code)]
+fn make_orphan_pipe_for_eof_reader() -> io::Result<RawFd> {
+    let (r, w) = make_pipe()?;
+    unsafe { libc::close(w); }
+    Ok(r)
+}
+
 /// Rewrites `run_multi_stage` around raw `libc::pipe` fds.
 ///
 /// Each stage is classified via `classify_stage`:
@@ -8693,6 +8707,18 @@ mod tests {
             "redirected `echo HI` should appear as a line in the file, got {content:?}",
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn make_orphan_pipe_for_eof_reader_yields_immediate_eof() {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        let r = make_orphan_pipe_for_eof_reader().expect("pipe");
+        // Read should return 0 bytes (EOF) immediately, not block.
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        let mut buf = [0u8; 8];
+        let n = f.read(&mut buf).expect("read");
+        assert_eq!(n, 0, "expected EOF, got {n} bytes");
     }
 }
 
