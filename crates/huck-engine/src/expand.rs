@@ -278,22 +278,37 @@ fn expand_positional_substring(
     }
 }
 
-/// Whether this modifier can sensibly apply per-element across a whole
-/// array. Used by `expand_array_param` / `expand_assoc_param` to dispatch
-/// to the per-element arm rather than the catchall "not supported on array"
-/// rejection. The whole-array Transform ops (@A / @K / @k / @a) are NOT
-/// currently in TransformOp — when M-93 adds them, this predicate will
-/// need a sub-check on the op.
+/// Whether this modifier dispatches to the per-element arm.
+/// Case / RemovePrefix / RemoveSuffix / Substitute always do;
+/// Transform dispatches per-element ONLY for the 6 scalar-style ops
+/// (P/Q/U/L/u/E). The 4 whole-array ops (A/K/k/a) route through the
+/// sibling whole-array arm; see `is_whole_array_transform_op`.
 fn is_per_element_modifier(m: &crate::lexer::ParamModifier) -> bool {
     use crate::lexer::ParamModifier as PM;
-    matches!(
-        m,
+    match m {
         PM::Case { .. }
-            | PM::RemovePrefix { .. }
-            | PM::RemoveSuffix { .. }
-            | PM::Substitute { .. }
-            | PM::Transform { .. }
-    )
+        | PM::RemovePrefix { .. }
+        | PM::RemoveSuffix { .. }
+        | PM::Substitute { .. } => true,
+        PM::Transform { op } => is_per_element_transform_op(*op),
+        _ => false,
+    }
+}
+
+/// `${var@OP}` ops that operate on a single value (per-element when
+/// applied across an array): P (prompt-expand), Q (shell-quote),
+/// U (upper), L (lower), u (upper-first), E (escape-expand).
+fn is_per_element_transform_op(op: crate::lexer::TransformOp) -> bool {
+    use crate::lexer::TransformOp::*;
+    matches!(op, PromptExpand | Quote | Upper | Lower | UpperFirst | EscapeExpand)
+}
+
+/// `${var@OP}` ops that operate on the whole array (KEYS+VALUES or
+/// type info): A (declare-style), K (k/v string), k (k/v word list),
+/// a (attribute flags).
+fn is_whole_array_transform_op(op: crate::lexer::TransformOp) -> bool {
+    use crate::lexer::TransformOp::*;
+    matches!(op, AssignDecl | KvString | KvWords | AttrFlags)
 }
 
 /// Apply a scalar modifier to one element's value via the existing
@@ -494,6 +509,37 @@ fn expand_assoc_param(
                 let ifs = shell.ifs();
                 let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(transformed.join(&sep))
+            }
+        }
+        (crate::lexer::ParamModifier::Transform { op }, sub)
+            if is_whole_array_transform_op(*op) =>
+        {
+            use crate::array_transforms::{self as at, ScopeMode};
+            use crate::lexer::TransformOp::*;
+            let scope = if matches!(sub, SK::All | SK::Star) {
+                ScopeMode::Whole
+            } else {
+                let val = match sub {
+                    SK::Index(_) => values.first().cloned().unwrap_or_default(),
+                    _ => String::new(),
+                };
+                ScopeMode::ScalarOrElement(val)
+            };
+            match op {
+                AssignDecl => ExpansionResult::Value(at::assign_decl(name, scope, shell)),
+                KvString => ExpansionResult::Value(at::kv_string(name, scope, shell)),
+                KvWords => {
+                    let words = at::kv_words(name, scope, shell);
+                    if matches!(sub, SK::All) && quoted {
+                        ExpansionResult::WordList(words)
+                    } else {
+                        let ifs = shell.ifs();
+                        let sep = ifs_join_sep(&ifs);
+                        ExpansionResult::Value(words.join(&sep))
+                    }
+                }
+                AttrFlags => ExpansionResult::Value(at::attr_flags(name, shell)),
+                _ => unreachable!("guarded by is_whole_array_transform_op"),
             }
         }
         // Other scalar modifiers on @/* — explicit error for v72 scope
@@ -888,6 +934,47 @@ fn expand_array_param(
                 let ifs = shell.ifs();
                 let sep = ifs_join_sep(&ifs);
                 ExpansionResult::Value(transformed.join(&sep))
+            }
+        }
+        (crate::lexer::ParamModifier::Transform { op }, sub)
+            if is_whole_array_transform_op(*op) =>
+        {
+            use crate::array_transforms::{self as at, ScopeMode};
+            use crate::lexer::TransformOp::*;
+            let scope = if matches!(sub, SK::All | SK::Star) {
+                ScopeMode::Whole
+            } else {
+                // Specific subscript or no subscript → scalar-or-
+                // element form. For [i], the value is the element
+                // at that subscript; for no subscript, the scalar
+                // view (already resolved by collect_values to
+                // values[0] or empty).
+                let val = match sub {
+                    SK::Index(_) => {
+                        let vs = collect_values(shell);
+                        vs.into_iter().next().unwrap_or_default()
+                    }
+                    _ => {
+                        shell.lookup_var(name).unwrap_or_default()
+                    }
+                };
+                ScopeMode::ScalarOrElement(val)
+            };
+            match op {
+                AssignDecl => ExpansionResult::Value(at::assign_decl(name, scope, shell)),
+                KvString => ExpansionResult::Value(at::kv_string(name, scope, shell)),
+                KvWords => {
+                    let words = at::kv_words(name, scope, shell);
+                    if matches!(sub, SK::All) && quoted {
+                        ExpansionResult::WordList(words)
+                    } else {
+                        let ifs = shell.ifs();
+                        let sep = ifs_join_sep(&ifs);
+                        ExpansionResult::Value(words.join(&sep))
+                    }
+                }
+                AttrFlags => ExpansionResult::Value(at::attr_flags(name, shell)),
+                _ => unreachable!("guarded by is_whole_array_transform_op"),
             }
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
@@ -1379,6 +1466,10 @@ fn reconstruct_param_expansion(
                 TransformOp::Lower => 'L',
                 TransformOp::UpperFirst => 'u',
                 TransformOp::EscapeExpand => 'E',
+                TransformOp::AssignDecl => 'A',
+                TransformOp::KvString => 'K',
+                TransformOp::KvWords => 'k',
+                TransformOp::AttrFlags => 'a',
             });
         }
     }
@@ -3259,6 +3350,89 @@ mod tests {
         match result {
             ExpansionResult::Value(v) => assert_eq!(v, ""),
             other => panic!("expected empty Value (catchall rejection), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_assign_decl_on_indexed_at() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
+        let result = expand_array_param(
+            "a",
+            &PM::Transform { op: TransformOp::AssignDecl },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, r#"declare -a a=([0]="x" [1]="y")"#),
+            other => panic!("expected Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_kv_words_on_indexed_yields_wordlist() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        shell.set_indexed_element("a", 1, "y".to_string()).unwrap();
+        let result = expand_array_param(
+            "a",
+            &PM::Transform { op: TransformOp::KvWords },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::WordList(words) => assert_eq!(words, vec!["0", "x", "1", "y"]),
+            other => panic!("expected WordList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_attr_flags_indexed_yields_a() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        let mut shell = Shell::new();
+        shell.set_indexed_element("a", 0, "x".to_string()).unwrap();
+        let result = expand_array_param(
+            "a",
+            &PM::Transform { op: TransformOp::AttrFlags },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, "a"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_assign_decl_on_assoc_at() {
+        use crate::shell_state::Shell;
+        use crate::param_expansion::ExpansionResult;
+        use crate::lexer::{ParamModifier as PM, TransformOp, SubscriptKind as SK};
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell.set_associative_element("m", "k".to_string(), "v1".to_string()).unwrap();
+        let result = expand_array_param(
+            "m",
+            &PM::Transform { op: TransformOp::AssignDecl },
+            &SK::All,
+            true,
+            &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, r#"declare -A m=([k]="v1" )"#),
+            other => panic!("expected Value, got {other:?}"),
         }
     }
 }

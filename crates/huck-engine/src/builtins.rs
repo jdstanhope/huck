@@ -794,7 +794,7 @@ pub(crate) fn parse_subscripted_arg(s: &str) -> Result<Option<(&str, &str)>, Str
 /// control char uses ANSI-C `$'…'`; the EMPTY value is bare (`name=`). This is
 /// NOT `${v@Q}` (which always quotes); it mirrors bash's `sh_contains_shell_metas`
 /// + `sh_single_quote`.
-fn declare_scalar_quote(v: &str) -> String {
+pub(crate) fn declare_scalar_quote(v: &str) -> String {
     if v.is_empty() {
         return String::new();
     }
@@ -812,7 +812,7 @@ fn declare_scalar_quote(v: &str) -> String {
 /// bash's display (e.g. `-a`, `-ai`, `-i`, `-ir`, `-irx`, `-rx`).
 /// For indexed-array variables, the value is rendered as
 /// `([0]="v0" [1]="v1" ...)` over the keys in ascending order.
-fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
+pub(crate) fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String {
     use crate::shell_state::VarValue;
 
     let mut attrs = String::new();
@@ -852,6 +852,23 @@ fn format_declare_line(name: &str, var: &crate::shell_state::Variable) -> String
     format!("declare {flag_str} {name}{value_part}")
 }
 
+/// Renders an associative-array subscript key for `declare`-style
+/// output. Bash uses bareword when the key matches `[A-Za-z0-9_-]+`
+/// (covers identifiers, integers including negative, dashed words);
+/// otherwise double-quoted with `\$`/`\\`/`\"`/`` \` `` escapes
+/// (same policy as values inside `(…)`). Resolves L-44(a).
+fn quote_subscript_key(k: &str) -> String {
+    if !k.is_empty()
+        && k.bytes().all(|b| {
+            matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+        })
+    {
+        k.to_string()
+    } else {
+        format!("\"{}\"", crate::escape_double_quote_value(k))
+    }
+}
+
 /// Renders the `=<value>` suffix of a declare line: `="v"` for a scalar,
 /// `=([k]="v" …)` for arrays. Shared by `format_declare_line` (the `-p` form)
 /// and `format_declare_bare_line` (arrays only).
@@ -878,13 +895,19 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
                 .iter()
                 .map(|(k, v)| {
                     format!(
-                        "[\"{}\"]=\"{}\"",
-                        crate::escape_double_quote_value(k),
+                        "[{}]=\"{}\"",
+                        quote_subscript_key(k),
                         crate::escape_double_quote_value(v)
                     )
                 })
                 .collect();
-            format!("=({})", parts.join(" "))
+            if parts.is_empty() {
+                "=()".to_string()
+            } else {
+                // Bash assoc body has a trailing space before `)`.
+                // Indexed body does NOT (mirrors bash's inconsistency).
+                format!("=({} )", parts.join(" "))
+            }
         }
     }
 }
@@ -7398,6 +7421,55 @@ mod tests {
     }
 
     #[test]
+    fn assoc_key_bareword_for_identifier() {
+        use crate::shell_state::{VarValue, Variable};
+        let var = Variable {
+            value: VarValue::Associative(vec![("foo".into(), "v".into())]),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        };
+        let out = render_declare_value_part(&var);
+        assert_eq!(out, r#"=([foo]="v" )"#);
+    }
+
+    #[test]
+    fn assoc_key_quoted_for_metachar() {
+        use crate::shell_state::{VarValue, Variable};
+        let var = Variable {
+            value: VarValue::Associative(vec![("a b".into(), "v".into())]),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        };
+        let out = render_declare_value_part(&var);
+        assert_eq!(out, r#"=(["a b"]="v" )"#);
+    }
+
+    #[test]
+    fn indexed_has_no_trailing_space() {
+        use std::collections::BTreeMap;
+        use crate::shell_state::{VarValue, Variable};
+        let mut m = BTreeMap::new();
+        m.insert(0usize, "x".to_string());
+        m.insert(1usize, "y".to_string());
+        let var = Variable {
+            value: VarValue::Indexed(m),
+            exported: false,
+            readonly: false,
+            integer: false,
+            case_fold: None,
+            nameref: false,
+        };
+        let out = render_declare_value_part(&var);
+        assert_eq!(out, r#"=([0]="x" [1]="y")"#);
+    }
+
+    #[test]
     fn bare_declare_lists_name_value_and_functions() {
         let mut shell = crate::shell_state::Shell::new();
         // Set a scalar and define a function via the normal command path.
@@ -12314,7 +12386,7 @@ mod assoc_declare_tests {
         s.set_associative_element("m", "k2".into(), "v2".into()).unwrap();
         let v = s.iter_vars().find(|(n, _)| n.as_str() == "m").unwrap().1;
         let line = format_declare_line("m", v);
-        assert_eq!(line, r#"declare -A m=(["k1"]="v1" ["k2"]="v2")"#);
+        assert_eq!(line, r#"declare -A m=([k1]="v1" [k2]="v2" )"#);
     }
 
     #[test]

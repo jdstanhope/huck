@@ -141,16 +141,22 @@ pub enum CaseDirection {
     Lower,  // , / ,,
 }
 
-/// Scalar `${var@OP}` transform operators (bash 5.x). Array/attribute
-/// forms `@A`/`@K`/`@k`/`@a` are deferred (lexer rejects them).
+/// Scalar and whole-array `${var@OP}` transform operators (bash 5.x).
+/// Per-element across arrays via the per-element arm in expand.rs;
+/// whole-array via the sibling whole-array arm; scalar via the
+/// param_expansion path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformOp {
     PromptExpand, // @P — prompt-string expansion of the value
-    Quote,        // @Q — shell-quote so it re-reads as the same value
+    Quote,        // @Q — shell-quote so the result re-reads as the same value
     Upper,        // @U — uppercase all
     Lower,        // @L — lowercase all
     UpperFirst,   // @u — uppercase first char
     EscapeExpand, // @E — expand backslash escapes ($'...' style)
+    AssignDecl,   // @A — declare-style assignment string
+    KvString,     // @K — k/v pairs as one quoted-internally string
+    KvWords,      // @k — k/v pairs as word list
+    AttrFlags,    // @a — attribute flag letters
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3464,9 +3470,12 @@ fn dispatch_braced_modifier(
                 Some('L') => TransformOp::Lower,
                 Some('u') => TransformOp::UpperFirst,
                 Some('E') => TransformOp::EscapeExpand,
+                Some('A') => TransformOp::AssignDecl,
+                Some('K') => TransformOp::KvString,
+                Some('k') => TransformOp::KvWords,
+                Some('a') => TransformOp::AttrFlags,
                 other => {
-                    // `@A`/`@K`/`@k`/`@a` (deferred) and unknown letters
-                    // are a bad substitution.
+                    // Unknown letter — bad substitution.
                     return Err(LexError::InvalidBraceModifier(format!(
                         "@{}",
                         other.map(|c| c.to_string()).unwrap_or_default()
@@ -8062,6 +8071,10 @@ mod array_parse_tests {
             ("${v@L}", TransformOp::Lower),
             ("${v@u}", TransformOp::UpperFirst),
             ("${v@E}", TransformOp::EscapeExpand),
+            ("${v@A}", TransformOp::AssignDecl),
+            ("${v@K}", TransformOp::KvString),
+            ("${v@k}", TransformOp::KvWords),
+            ("${v@a}", TransformOp::AttrFlags),
         ] {
             let parts = match &tokenize(src).unwrap()[0] {
                 Token::Word(Word(p)) => p.clone(),
@@ -8076,9 +8089,8 @@ mod array_parse_tests {
             };
             assert_eq!(*op, want);
         }
-        // `@Z` and other operators (incl. deferred `@A`) are bad subst.
+        // `@Z` and other unknown letters are bad subst.
         assert!(tokenize("${v@Z}").is_err());
-        assert!(tokenize("${v@A}").is_err());
     }
 
     fn array_lit(w: &Word) -> &[ArrayLiteralElement] {
