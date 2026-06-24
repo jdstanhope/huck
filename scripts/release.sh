@@ -33,7 +33,7 @@ fi
 run "sh '$ROOT/packaging/deb/build-deb.sh'"
 run "git -C '$ROOT' tag '$TAG'"
 run "git -C '$ROOT' push origin '$TAG'"
-run "gh release create '$TAG' '$ROOT'/dist/huck_*.deb --title '$TAG' --notes-file '$NOTES_FILE'"
+run "gh release create '$TAG' '$ROOT'/dist/huck_${VERSION}_*.deb --title '$TAG' --notes-file '$NOTES_FILE'"
 
 if [ "$DRY_RUN" = 1 ]; then
     printf '+ compute sha256 of %s\n' "$TARBALL_URL"
