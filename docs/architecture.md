@@ -242,6 +242,9 @@ These appear in many call-site signatures; learn them once.
   `ifs_diff_check.sh` (v74), `test_combinators_diff_check.sh` (v75).
   Adding a new feature with a `*_diff_check.sh` is the gold standard
   for bash-compat verification.
+- **Bash test-suite integration** — opt-in runner at `tests/bash-test-suite/`
+  that consumes upstream bash's own test suite via `$BASH_SOURCE_DIR`;
+  baseline triaged at `docs/bash-test-suite-baseline.md`.
 - **Test layout** — unit tests live in `#[cfg(test)] mod` blocks at
   the bottom of each source file. Integration tests are binary-driven
   scripts in `tests/*.rs` using the `run_capture` helper pattern
