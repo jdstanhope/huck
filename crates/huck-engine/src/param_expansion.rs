@@ -294,8 +294,16 @@ pub fn expand_modifier_with_value(
                 crate::lexer::TransformOp::AttrFlags => {
                     crate::array_transforms::attr_flags(name, shell)
                 }
+                _ => {
+                    // Forward-compatible: unknown TransformOp yields empty.
+                    String::new()
+                }
             };
             ExpansionResult::Value(out)
+        }
+        _ => {
+            // Forward-compatible: unknown ParamModifier yields empty.
+            ExpansionResult::Empty
         }
     }
 }

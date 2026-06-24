@@ -6163,7 +6163,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         "huck: {}: line {}: syntax error{}",
                         path.display(),
                         line_of(start + foff),
-                        crate::lex_error_message(le)
+                        crate::lex_error_message(&le)
                     );
                 }
                 last_status = 2;
@@ -6209,7 +6209,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             "huck: {}: line {}: syntax error{}",
                             path.display(),
                             line_of(start + foff),
-                            crate::lex_error_message(le.clone())
+                            crate::lex_error_message(le)
                         );
                     }
                     last_status = 2;
@@ -6302,7 +6302,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             "huck: {}: line {}: syntax error{}",
                             path.display(),
                             line_of(start + foff),
-                            crate::lex_error_message(le)
+                            crate::lex_error_message(&le)
                         );
                     }
                     last_status = 2;
@@ -6317,7 +6317,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             "huck: {}: line {}: syntax error: {}",
                             path.display(),
                             line_of(start + offsets[unit_start_idx]),
-                            crate::parse_error_message(e)
+                            crate::parse_error_message(&e)
                         );
                     }
                     last_status = 2;

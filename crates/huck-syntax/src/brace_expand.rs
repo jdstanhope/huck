@@ -11,9 +11,20 @@
 const MAX_ELEMENTS: usize = 65_536;
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BraceError {
     TooManyElements,
 }
+
+impl std::fmt::Display for BraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BraceError::TooManyElements => f.write_str("brace expansion: too many elements"),
+        }
+    }
+}
+
+impl std::error::Error for BraceError {}
 
 pub fn expand(input: &str) -> Result<Vec<String>, BraceError> {
     let mut out = Vec::new();

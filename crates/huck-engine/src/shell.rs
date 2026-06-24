@@ -373,7 +373,7 @@ pub fn process_line_in_sinks(
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
-            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
             return ExecOutcome::Continue(2);
         }
     };
@@ -389,7 +389,7 @@ pub fn process_line_in_sinks(
                 (t, l)
             }
             Err(e) => {
-                { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(e)); }
+                { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
                 return ExecOutcome::Continue(2);
             }
         }
@@ -401,7 +401,7 @@ pub fn process_line_in_sinks(
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
-            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error: {}", crate::parse_error_message(e)); }
+            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error: {}", crate::parse_error_message(&e)); }
             ExecOutcome::Continue(2)
         }
     }

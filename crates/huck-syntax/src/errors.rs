@@ -1,9 +1,24 @@
-//! Renders `ParseError`/`LexError` values into human-readable messages.
+//! Error message rendering for huck-syntax's lex and parse stages.
+//!
+//! The canonical rendering lives in `lex_error_message_impl` /
+//! `parse_error_message_impl` (crate-private). The error types
+//! `LexError` / `ParseError` delegate their `Display` impls here.
+//! The historical public free functions [`lex_error_message`] /
+//! [`parse_error_message`] are kept as thin wrappers but now take
+//! `&LexError` / `&ParseError` so callers can render without moving.
 
 use crate::command::ParseError;
 use crate::lexer::LexError;
 
-pub fn parse_error_message(error: ParseError) -> String {
+pub fn lex_error_message(error: &LexError) -> String {
+    lex_error_message_impl(error)
+}
+
+pub fn parse_error_message(error: &ParseError) -> String {
+    parse_error_message_impl(error)
+}
+
+pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
     match error {
         ParseError::MissingCommand => "expected a command".to_string(),
         ParseError::MissingRedirectTarget => "expected a filename after redirection".to_string(),
@@ -54,7 +69,7 @@ pub fn parse_error_message(error: ParseError) -> String {
 /// `"huck: syntax error"` prefix reads naturally. Substitution-wrapper
 /// variants start with `" in command substitution"` (no colon) so the
 /// rendered line reads `"huck: syntax error in command substitution: ..."`.
-pub fn lex_error_message(error: LexError) -> String {
+pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
     match error {
         LexError::UnterminatedQuote => ": unterminated quote".to_string(),
         LexError::InvalidVarName => ": invalid variable name in '${...}'".to_string(),
@@ -67,10 +82,10 @@ pub fn lex_error_message(error: LexError) -> String {
         LexError::InvalidBraceModifier(c) => format!(": invalid parameter-expansion modifier: {c}"),
         LexError::EmptyParamName => ": parameter expansion with empty name".to_string(),
         LexError::Substitution(inner) => {
-            format!(" in command substitution{}", lex_error_message(*inner))
+            format!(" in command substitution{}", lex_error_message_impl(inner))
         }
         LexError::SubstitutionParseError(inner) => {
-            format!(" in command substitution: {}", parse_error_message(inner))
+            format!(" in command substitution: {}", parse_error_message_impl(inner))
         }
         LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
         LexError::AnsiCInvalidCodepoint(v) => {
@@ -92,5 +107,34 @@ pub fn lex_error_message(error: LexError) -> String {
         LexError::UnterminatedExtglob => {
             ": unterminated extglob group".to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brace_expand::BraceError;
+    use crate::command::ParseError;
+    use crate::lexer::LexError;
+
+    #[test]
+    fn lex_error_display_equals_free_function() {
+        let err = LexError::UnterminatedHeredoc;
+        assert_eq!(format!("{err}"), lex_error_message(&err));
+    }
+
+    #[test]
+    fn parse_error_display_equals_free_function() {
+        let err = ParseError::MissingCommand;
+        assert_eq!(format!("{err}"), parse_error_message(&err));
+    }
+
+    #[test]
+    fn brace_error_implements_display_and_error() {
+        fn assert_traits<E: std::fmt::Display + std::error::Error>(_e: &E) {}
+        let err = BraceError::TooManyElements;
+        assert_traits(&err);
+        // Sanity: Display produces a non-empty message.
+        assert!(!format!("{err}").is_empty());
     }
 }
