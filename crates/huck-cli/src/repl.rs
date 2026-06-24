@@ -92,6 +92,7 @@ pub fn run(args: &[String]) -> i32 {
             engine.set_args(args);
             return engine.run_script(&contents, &label);
         }
+        RunMode::PrintVersion => return 0,
         RunMode::Interactive => {}
     }
 

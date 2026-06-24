@@ -22,6 +22,8 @@ pub enum RunMode {
     Command { command: String, argv0: Option<String>, args: Vec<String> },
     /// `SCRIPT [ARG...]`: $0 = path, args = the rest.
     File { path: PathBuf, args: Vec<String> },
+    /// `--version` / `-V`: print "huck {version}" and exit 0.
+    PrintVersion,
 }
 
 pub struct CliOptions {
@@ -86,6 +88,14 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             "--" => {
                 i += 1;
                 break;
+            }
+            "--version" | "-V" => {
+                return Ok(CliOptions {
+                    rcfile_path: None,
+                    norc: false,
+                    noexec: false,
+                    mode: RunMode::PrintVersion,
+                });
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unrecognized option: {s}"));
@@ -667,6 +677,18 @@ mod rc_tests {
         let o = parse_cli(&["--norc".into(), "s.sh".into()]).unwrap();
         assert!(o.norc);
         assert_eq!(o.mode, RunMode::File { path: "s.sh".into(), args: vec![] });
+    }
+
+    #[test]
+    fn parse_cli_version_long() {
+        let opts = parse_cli(&["--version".to_string()]).expect("parse");
+        assert!(matches!(opts.mode, RunMode::PrintVersion));
+    }
+
+    #[test]
+    fn parse_cli_version_short() {
+        let opts = parse_cli(&["-V".to_string()]).expect("parse");
+        assert!(matches!(opts.mode, RunMode::PrintVersion));
     }
 
     // ── rc loader ──────────────────────────────────────────────
