@@ -198,8 +198,7 @@ fn is_decl_command(program: &Word) -> bool {
 /// public `try_split_assignment` helper from `huck_syntax::command`,
 /// which already knows the rules.
 fn try_parse_decl_arg_assignment(w: &Word) -> Option<Assignment> {
-    // `try_split_assignment` takes by value; clone the Word.
-    huck_syntax::command::try_split_assignment(w.clone()).ok()
+    huck_syntax::command::try_split_assignment_ref(w)
 }
 
 fn record_from_assign(site: &'static str, a: &Assignment) -> Record {

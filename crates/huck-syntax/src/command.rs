@@ -162,6 +162,18 @@ pub fn try_split_assignment(
     })
 }
 
+/// Peek variant of [`try_split_assignment`] that does not consume the
+/// input. Returns `Some(Assignment)` if `word` has assignment shape
+/// (the relevant parts are cloned), else `None`.
+///
+/// Use this when you have a `&Word` reference and need to detect
+/// assignment shape without taking ownership. For the consuming form
+/// (which avoids the clone when you can hand over the word), see
+/// [`try_split_assignment`].
+pub fn try_split_assignment_ref(word: &crate::lexer::Word) -> Option<Assignment> {
+    try_split_assignment(word.clone()).ok()
+}
+
 /// Returns `true` if `w` looks like an assignment word without
 /// consuming or cloning it. Mirrors the shape check in `try_split_assignment`
 /// so the caller can decide whether to take ownership before calling the
@@ -6053,5 +6065,20 @@ mod tests {
             }
         }
         // A parse error (UnexpectedToken / UnexpectedKeyword) is also acceptable.
+    }
+
+    #[test]
+    fn try_split_assignment_ref_parity_with_consuming_form() {
+        let scalar = Word(vec![WordPart::Literal { text: "name=hello".into(), quoted: false }]);
+
+        // Peek then consume — both should agree on outcome.
+        let peek = try_split_assignment_ref(&scalar);
+        let consume = try_split_assignment(scalar.clone()).ok();
+        assert_eq!(peek, consume);
+        assert!(peek.is_some());
+
+        // Negative: word that's not an assignment.
+        let plain = Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]);
+        assert!(try_split_assignment_ref(&plain).is_none());
     }
 }
