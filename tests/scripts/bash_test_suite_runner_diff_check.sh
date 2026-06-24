@@ -40,7 +40,7 @@ fi
 # Validate the status is a recognized value — pins runner classifies correctly.
 case "$status" in
     PASS|FAIL|TIMEOUT|ERROR)
-        echo "PASS [bash_test_suite_runner_check] runner mechanics OK (arith=$status)"
+        echo "PASS [bash_test_suite_runner_diff_check] runner mechanics OK (arith=$status)"
         exit 0
         ;;
     *)

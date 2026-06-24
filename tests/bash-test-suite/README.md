@@ -85,7 +85,7 @@ The existing `tests/scripts/*_diff_check.sh` sweep loop runs every
 harness as a regression guard. The bash-test-suite runner is **opt-in**
 (requires `$BASH_SOURCE_DIR` to be set) and most categories FAIL today;
 running it in CI would block every commit. The smoke harness
-`tests/scripts/bash_test_suite_runner_check.sh` is a tiny shim that
+`tests/scripts/bash_test_suite_runner_diff_check.sh` is a tiny shim that
 exercises the runner mechanics against a single known-passing category
 when `$BASH_SOURCE_DIR` is set, and skips harmlessly otherwise — so the
 sweep loop stays green on machines without bash sources.
