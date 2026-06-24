@@ -845,6 +845,29 @@ impl Shell {
         self.shopt_options.get("nocasematch").unwrap_or(false)
     }
 
+    /// Bash-compatible error prologue: `<name>: [line N: ][cmd: ]`.
+    /// Mirrors bash `get_name_for_error` + `error_prolog`/`builtin_error_prolog`.
+    /// `cmd` is the command context (`let`, `((`) or `None` for `$(( ))`.
+    pub fn error_prefix(&self, cmd: Option<&str>) -> String {
+        let name = if !self.is_interactive {
+            self.get_indexed("BASH_SOURCE")
+                .and_then(|m| m.get(&0))
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| self.shell_argv0.clone())
+        } else {
+            "huck".to_string()
+        };
+        let mut out = format!("{name}: ");
+        if !self.is_interactive && self.current_lineno > 0 {
+            out.push_str(&format!("line {}: ", self.current_lineno));
+        }
+        if let Some(c) = cmd {
+            out.push_str(&format!("{c}: "));
+        }
+        out
+    }
+
     /// Variable lookup for expansion. Recognises positional names
     /// (`"1"`-`"9"`/`"10"`/..., and `"#"`) before falling back to the
     /// regular variable HashMap. Returns an owned `String` because
@@ -3850,5 +3873,36 @@ mod shopt_tests {
         // record a binding + list it
         shell.add_bind("\"\\C-x\"", "kill-line");
         assert_eq!(shell.readline_settings.pending_binds, vec![("\"\\C-x\"".to_string(), "kill-line".to_string())]);
+    }
+
+    #[test]
+    fn error_prefix_noninteractive_script_with_line_and_cmd() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "./arith.tests".to_string();
+        sh.current_lineno = 168;
+        assert_eq!(sh.error_prefix(None), "./arith.tests: line 168: ");
+        assert_eq!(sh.error_prefix(Some("let")), "./arith.tests: line 168: let: ");
+        assert_eq!(sh.error_prefix(Some("((")), "./arith.tests: line 168: ((: ");
+    }
+
+    #[test]
+    fn error_prefix_interactive_keeps_huck_no_line() {
+        let mut sh = Shell::new();
+        sh.is_interactive = true;
+        sh.shell_argv0 = "huck".to_string();
+        sh.current_lineno = 5;
+        assert_eq!(sh.error_prefix(None), "huck: ");
+        assert_eq!(sh.error_prefix(Some("((")), "huck: ((: ");
+    }
+
+    #[test]
+    fn error_prefix_prefers_bash_source_zero() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "huck".to_string();
+        sh.current_lineno = 3;
+        sh.seed_array_for_tests("BASH_SOURCE", &[(0, "./sourced.sh")]);
+        assert_eq!(sh.error_prefix(None), "./sourced.sh: line 3: ");
     }
 }
