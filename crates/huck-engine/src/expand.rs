@@ -1117,9 +1117,13 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         has_emitted = true;
                     }
                     Err(e) => {
+                        // Print the error but DO NOT set pending_fatal_pe_error —
+                        // bash script-file mode prints and continues. The empty
+                        // contribution here matches bash's empty $((..)) value
+                        // on error. (-c mode divergence: L-55 in
+                        // bash-divergences.md.)
                         with_err(|err| e!(err, "huck: arithmetic: {}", e));
-                        shell.pending_fatal_pe_error = Some(1);
-                        return result;
+                        has_emitted = true;
                     }
                 }
             }
@@ -1565,9 +1569,11 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 match eval_arith_word(body, shell) {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
+                        // Print the error but DO NOT halt — bash script-file
+                        // mode prints and continues. Empty contribution to
+                        // the assignment value matches bash. (-c mode
+                        // divergence: L-55.)
                         with_err(|err| e!(err, "huck: arithmetic: {}", e));
-                        shell.pending_fatal_pe_error = Some(1);
-                        return result;
                     }
                 }
             }
@@ -2915,14 +2921,27 @@ mod tests {
     }
 
     #[test]
-    fn expand_arith_part_division_by_zero_is_fatal() {
-        // v178: an arithmetic eval error (e.g. division by zero) in $((…)) is a
-        // FATAL expansion error — it sets pending_fatal_pe_error so the command
-        // aborts (matching bash), instead of yielding an empty field + status 0.
+    fn expand_arith_part_division_by_zero_is_nonfatal() {
+        // An arith eval error (e.g. division by zero) in $((…)) is NO LONGER
+        // a fatal expansion error — bash script-file mode prints the error
+        // and continues. The error still surfaces via stderr;
+        // pending_fatal_pe_error stays None so the surrounding command list
+        // runs to completion. The `-c` mode divergence is tracked as L-55.
         let mut shell = Shell::new();
         let word = Word(vec![arith_part("1 / 0")]);
         let _ = expand(&word, &mut shell);
-        assert_eq!(shell.pending_fatal_pe_error, Some(1));
+        assert_eq!(shell.pending_fatal_pe_error, None);
+    }
+
+    #[test]
+    fn expand_arith_part_invalid_lhs_assignment_is_nonfatal() {
+        // A parse-time arith error (e.g. assignment to a non-lvalue) is also
+        // non-fatal. The expansion contributes empty; pending_fatal_pe_error
+        // stays None.
+        let mut shell = Shell::new();
+        let word = Word(vec![arith_part("1 + 2 = 3")]);
+        let _ = expand(&word, &mut shell);
+        assert_eq!(shell.pending_fatal_pe_error, None);
     }
 
     #[test]
