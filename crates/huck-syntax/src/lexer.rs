@@ -28,6 +28,14 @@ pub enum LexError {
     UnterminatedExtglob,
 }
 
+impl std::fmt::Display for LexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::errors::lex_error_message_impl(self))
+    }
+}
+
+impl std::error::Error for LexError {}
+
 /// A char cursor over a `&str` that also tracks the byte offset and 1-based
 /// line number of the next char to be produced. Drop-in for the
 /// `Peekable<Chars>` the lexer used: implements `Iterator<Item = char>`, a

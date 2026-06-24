@@ -743,6 +743,14 @@ pub enum ParseError {
     ArithForHeader(String),
 }
 
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::errors::parse_error_message_impl(self))
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// A token stream the parser consumes, carrying each token's 1-based source
 /// line in parallel. Replaces `Peekable<vec::IntoIter<Token>>`: same
 /// `peek`/`next`/`len`, plus `current_line()` (the line of the NEXT
@@ -1038,7 +1046,7 @@ fn parse_command_inner(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
-            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))?;
+            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(&e)))?;
         return maybe_wrap_redirects(Command::Arith(body), iter);
     }
 
@@ -1455,7 +1463,7 @@ fn parse_arith_for_header(
         } else {
             crate::lexer::arith_string_to_word(trimmed, opts)
                 .map(Some)
-                .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))
+                .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(&e)))
         }
     };
     Ok((
@@ -2310,7 +2318,7 @@ fn parse_next_stage(
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
-            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(e)))?;
+            .map_err(|e| ParseError::ArithBlock(crate::lex_error_message(&e)))?;
         return Ok((maybe_wrap_redirects(Command::Arith(body), iter)?, false));
     }
 
