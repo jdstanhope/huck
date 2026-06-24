@@ -15,7 +15,11 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
 - **`huck-syntax`** (`crates/huck-syntax/`) — the Shell-free **frontend**: `lexer`,
   `command` (AST + parser), `brace_expand`, `generate` (AST→source), plus
   `errors.rs` (`lex_error_message`/`parse_error_message`) and `util.rs`
-  (`escape_double_quote_value`). No dependencies.
+  (`escape_double_quote_value`). No dependencies. As of v211 it ships polished
+  public-API ergonomics (`Display` + `std::error::Error` on the error types,
+  `#[non_exhaustive]` on the AST enums, `try_split_assignment_ref` peek variant,
+  curated root re-exports + module-level doc with a runnable Quick example) and
+  is publication-ready as a standalone crate.
 - **`huck-engine`** (`crates/huck-engine/`) — the **terminal-free execution
   core**: expansion, execution, builtins, shell state, traps, jobs, completion
   candidate-generation, the readline keymap *data*, and the low-level headless
