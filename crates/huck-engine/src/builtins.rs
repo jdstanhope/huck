@@ -4995,6 +4995,16 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
         "noexec" => { shell.shell_options.noexec = value; Ok(()) }
         "physical" => { shell.shell_options.physical = value; Ok(()) }
+        "posix" => {
+            // Accept as a silent no-op. huck is POSIX-respecting by default;
+            // `set +o posix` is a no-op against that default, and `set -o
+            // posix` does not unlock additional strict-POSIX semantics.
+            // Scripts that toggle the option for bash compatibility pass
+            // through cleanly. The "huck doesn't implement strict POSIX
+            // mode" gap is a known minor divergence.
+            let _ = value;
+            Ok(())
+        }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)
@@ -12123,6 +12133,20 @@ mod set_options_tests {
         assert_eq!(option_get(&shell, "xtrace"), Some(true));
         assert!(option_set(&mut shell, "xtrace", false).is_ok());
         assert_eq!(option_get(&shell, "xtrace"), Some(false));
+    }
+
+    #[test]
+    fn set_posix_option_is_accepted_as_noop_via_option_set() {
+        let mut shell = Shell::new();
+        assert!(option_set(&mut shell, "posix", true).is_ok());
+        assert!(option_set(&mut shell, "posix", false).is_ok());
+    }
+
+    #[test]
+    fn option_get_posix_returns_table_default() {
+        let shell = Shell::new();
+        // SETO_TABLE default for posix is `false`.
+        assert_eq!(option_get(&shell, "posix"), Some(false));
     }
 
     #[test]
