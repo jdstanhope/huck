@@ -238,6 +238,7 @@ pub struct EngineBuilder {
     arg0: Option<String>,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    version: Option<String>,
 }
 
 impl EngineBuilder {
@@ -256,6 +257,13 @@ impl EngineBuilder {
         self.args = args;
         self
     }
+    /// Override `$HUCK_VERSION` with the embedder's release-version
+    /// string. When unset, the engine's default (its own crate version)
+    /// is used.
+    pub fn with_version(mut self, version: &str) -> Self {
+        self.version = Some(version.to_string());
+        self
+    }
     /// Build the engine.
     pub fn build(self) -> Engine {
         let mut e = Engine::new();
@@ -265,6 +273,9 @@ impl EngineBuilder {
         e.set_args(self.args);
         for (k, v) in self.env {
             e.set_var(&k, &v);
+        }
+        if let Some(v) = self.version {
+            e.set_var("HUCK_VERSION", &v);
         }
         e
     }
@@ -1259,5 +1270,13 @@ mod tests {
             "live engine var should be visible to complete(), got {:?}",
             comp.candidates,
         );
+    }
+
+    #[test]
+    fn builder_with_version_sets_huck_version() {
+        let mut e = Engine::builder().with_version("9.9.9").build();
+        let out = e.capture("echo $HUCK_VERSION");
+        assert_eq!(out.stdout.trim(), "9.9.9");
+        assert_eq!(out.exit_code, 0);
     }
 }

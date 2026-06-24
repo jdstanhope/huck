@@ -59,13 +59,7 @@ fn ids_match_bash() {
 fn bash_version_and_huck_version() {
     assert_eq!(huck("[ -n \"$BASH_VERSION\" ] && echo yes").trim(), "yes");
     assert_eq!(huck("echo ${BASH_VERSINFO[0]}").trim(), "5");
-    // HUCK_VERSION currently reports huck-engine's crate version, not the
-    // root huck package version. Diverges after the v202 workspace split;
-    // tracked as a follow-on. Pin against the engine value the shell really
-    // produces, not env!("CARGO_PKG_VERSION") of this test crate.
-    let v = huck("echo $HUCK_VERSION").trim().to_string();
-    assert!(!v.is_empty(), "$HUCK_VERSION should be non-empty");
-    assert!(v.chars().next().unwrap().is_ascii_digit(), "$HUCK_VERSION = {v:?}");
+    assert_eq!(huck("echo $HUCK_VERSION").trim(), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

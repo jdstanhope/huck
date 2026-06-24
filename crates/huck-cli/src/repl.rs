@@ -40,7 +40,7 @@ enum ReadResult {
 }
 
 /// Runs the interactive shell loop. Returns the process exit code.
-pub fn run(args: &[String]) -> i32 {
+pub fn run(args: &[String], version: &str) -> i32 {
     let opts = match parse_cli(args) {
         Ok(o) => o,
         Err(e) => {
@@ -49,9 +49,20 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
+    // Short-circuit: --version / -V.
+    if matches!(opts.mode, RunMode::PrintVersion) {
+        println!("huck {version}");
+        return 0;
+    }
+
     install_job_control_signals();
 
     let shell_cell = Rc::new(RefCell::new(Shell::new()));
+
+    {
+        let mut shell = shell_cell.borrow_mut();
+        shell.set("HUCK_VERSION", version.to_string());
+    }
 
     {
         let shell = shell_cell.borrow();
@@ -92,6 +103,7 @@ pub fn run(args: &[String]) -> i32 {
             engine.set_args(args);
             return engine.run_script(&contents, &label);
         }
+        RunMode::PrintVersion => return 0,
         RunMode::Interactive => {}
     }
 
