@@ -1233,6 +1233,11 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                     }
                 }
             }
+            _ => {
+                // Forward-compatible catchall for future WordPart variants
+                // added by huck-syntax. Emit nothing — preserves the
+                // has_emitted state without producing spurious fields.
+            }
         }
     }
 
@@ -1374,6 +1379,9 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
             reconstruct_param_expansion(name, modifier, subscript.as_ref(), *indirect, out);
         }
         P::AssignPrefix { .. } | P::ArrayLiteral(_) => {}
+        _ => {
+            // Forward-compatible: unknown future WordPart renders as nothing.
+        }
     }
 }
 
@@ -1470,7 +1478,11 @@ fn reconstruct_param_expansion(
                 TransformOp::KvString => 'K',
                 TransformOp::KvWords => 'k',
                 TransformOp::AttrFlags => 'a',
+                _ => '?',
             });
+        }
+        _ => {
+            // Forward-compatible: unknown future ParamModifier renders as bare.
         }
     }
     out.push('}');
@@ -1617,6 +1629,10 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // it here (assignment context, no command to consume the fd)
                 // would leak an fd and a child process with no benefit. No-op.
             }
+            _ => {
+                // Forward-compatible: unknown future WordPart contributes nothing
+                // to the assignment value.
+            }
         }
     }
     result
@@ -1638,6 +1654,8 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         // ProcessSub expands to a single /dev/fd/N path — treated as quoted
         // (no IFS-splitting, no glob expansion of the realized path).
         WordPart::ProcessSub { .. } => true,
+        // Forward-compatible: future WordPart variants default to unquoted.
+        _ => false,
     }
 }
 

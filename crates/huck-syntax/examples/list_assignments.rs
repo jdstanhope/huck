@@ -126,6 +126,9 @@ fn walk_command(cmd: &Command, sink: &mut Vec<Record>) {
         // `((expr))` standalone has no assignments at the AST level
         // (the expression itself is not an Assignment AST node).
         Command::Arith(_) => {}
+        // Forward-compatible: future Command variants contribute no
+        // assignments by default.
+        _ => {}
     }
 }
 

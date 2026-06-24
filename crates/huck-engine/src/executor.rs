@@ -823,6 +823,10 @@ fn run_command(
             run_redirected(inner, redirects, shell, sink, err_sink)
         }
         Command::Coproc { name, body } => run_coproc(name, body, shell, sink, err_sink),
+        _ => {
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: unsupported command variant"); }
+            ExecOutcome::Continue(1)
+        }
     }
 }
 

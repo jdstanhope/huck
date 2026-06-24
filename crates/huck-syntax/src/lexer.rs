@@ -1,4 +1,5 @@
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum LexError {
     UnterminatedQuote,
     InvalidVarName,
@@ -154,6 +155,7 @@ pub enum CaseDirection {
 /// whole-array via the sibling whole-array arm; scalar via the
 /// param_expansion path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransformOp {
     PromptExpand, // @P — prompt-string expansion of the value
     Quote,        // @Q — shell-quote so the result re-reads as the same value
@@ -168,6 +170,7 @@ pub enum TransformOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParamModifier {
     /// No scalar-style modifier — bare `${a[i]}`, `${a[@]}`, `${a[*]}`.
     /// Expansion path treats this as a pure lookup (and, for subscripted
@@ -239,6 +242,7 @@ pub enum ProcDir {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum WordPart {
     Literal { text: String, quoted: bool },
     Tilde(TildeSpec),
@@ -287,6 +291,7 @@ pub enum WordPart {
 pub struct Word(pub Vec<WordPart>);
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum Token {
     Word(Word),
     Op(Operator),

@@ -56,6 +56,7 @@ fn token_label(t: &Token) -> String {
         Token::Newline => "Newline".to_string(),
         Token::ArithBlock(body, _opts) => format!("ArithBlock      ((  {body}  ))"),
         Token::RedirFd(fd) => format!("RedirFd         {fd:?}"),
+        _ => "Token           <unknown>".to_string(),
     }
 }
 
@@ -115,6 +116,7 @@ fn part_label(p: &WordPart) -> String {
         WordPart::ArrayLiteral(elems) => {
             format!("ArrayLiteral({} elements)", elems.len())
         }
+        _ => "WordPart(<unknown>)".to_string(),
     }
 }
 

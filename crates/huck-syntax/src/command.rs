@@ -603,6 +603,7 @@ pub enum TestExpr {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum Command {
     Pipeline(Pipeline),
     Simple(SimpleCommand), // NEW (v25 Shape A): pipeline stage wrapping a SimpleCommand
@@ -726,6 +727,7 @@ pub struct Sequence {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[non_exhaustive]
 pub enum ParseError {
     MissingCommand,
     MissingRedirectTarget,

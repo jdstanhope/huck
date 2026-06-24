@@ -11,6 +11,7 @@
 const MAX_ELEMENTS: usize = 65_536;
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BraceError {
     TooManyElements,
 }
