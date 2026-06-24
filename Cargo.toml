@@ -1,6 +1,6 @@
 [package]
 name = "huck"
-version = "0.2.0"
+version = "0.3.0-dev"
 edition = "2024"
 description = "A POSIX-ish shell written in Rust"
 license = "MIT"
