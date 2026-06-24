@@ -5834,6 +5834,27 @@ fn run_multi_stage(
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
         let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+            // Upstream stdout goes to the file. For a non-final stage we
+            // STILL need to create an inter-stage pipe so the downstream
+            // stage reads EOF instead of inheriting parent stdin (M-125).
+            if !is_last {
+                match make_orphan_pipe_for_eof_reader() {
+                    Ok(r) => {
+                        prev_pipe_read = Some(r);
+                        parent_held.push(r);
+                    }
+                    Err(e) => {
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        restore_inline_assignments(snap, shell);
+                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                        if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
+                        unsafe { libc::close(fd); } // close the open file fd we won't use
+                        drain_procsubs(shell, procsub_base);
+                        for pfd in parent_held.drain(..) { unsafe { libc::close(pfd); } }
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
             fd
         } else if !is_last {
             // Create the inter-stage pipe.
