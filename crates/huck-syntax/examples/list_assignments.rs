@@ -19,11 +19,11 @@
 
 use std::io::Read;
 
-use huck_syntax::command::{
-    parse, AssignTarget, Assignment, Command, ExecCommand, IfClause, Sequence, SimpleCommand,
-    WhileClause,
+use huck_syntax::command::{IfClause, WhileClause};
+use huck_syntax::{
+    parse, tokenize_with_opts, AssignTarget, Assignment, Command, ExecCommand, LexerOptions,
+    Sequence, SimpleCommand, Word, WordPart,
 };
-use huck_syntax::lexer::{tokenize_with_opts, LexerOptions, Word, WordPart};
 
 fn main() {
     let mut input = String::new();
@@ -201,7 +201,7 @@ fn is_decl_command(program: &Word) -> bool {
 /// public `try_split_assignment` helper from `huck_syntax::command`,
 /// which already knows the rules.
 fn try_parse_decl_arg_assignment(w: &Word) -> Option<Assignment> {
-    huck_syntax::command::try_split_assignment_ref(w)
+    huck_syntax::try_split_assignment_ref(w)
 }
 
 fn record_from_assign(site: &'static str, a: &Assignment) -> Record {

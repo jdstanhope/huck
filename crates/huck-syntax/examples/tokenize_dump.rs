@@ -12,7 +12,7 @@
 
 use std::io::Read;
 
-use huck_syntax::lexer::{tokenize_with_opts, LexerOptions, Token, Word, WordPart};
+use huck_syntax::{tokenize_with_opts, LexerOptions, Token, Word, WordPart};
 
 fn main() {
     let mut input = String::new();
