@@ -10,7 +10,6 @@ use crate::shell_state::{Shell, VarValue, Variable};
 /// Where the modifier was applied: a whole array (`[@]` / `[*]`
 /// subscript) or a single value (scalar variable, no subscript, or
 /// specific `[i]` subscript).
-#[allow(dead_code)]
 pub(crate) enum ScopeMode {
     /// `[@]` or `[*]` — operate on the whole array's key/value pairs.
     Whole,
@@ -23,7 +22,6 @@ pub(crate) enum ScopeMode {
 }
 
 /// `${var@A}` — declare-style assignment string.
-#[allow(dead_code)]
 pub(crate) fn assign_decl(name: &str, scope: ScopeMode, shell: &Shell) -> String {
     let Some(var) = shell.get_var(name) else {
         return String::new();
@@ -130,7 +128,6 @@ fn always_quote(v: &str) -> String {
 }
 
 /// `${var@K}` — k/v pairs as a single quoted-internally string.
-#[allow(dead_code)]
 pub(crate) fn kv_string(name: &str, scope: ScopeMode, shell: &Shell) -> String {
     let Some(var) = shell.get_var(name) else {
         return String::new();
@@ -197,7 +194,6 @@ fn quote_subscript_key_local(k: &str) -> String {
 
 /// `${var@k}` — k/v pairs as a word list (each k and v a separate
 /// field when used under quoted `[@]`).
-#[allow(dead_code)]
 pub(crate) fn kv_words(name: &str, scope: ScopeMode, shell: &Shell) -> Vec<String> {
     let Some(var) = shell.get_var(name) else {
         return Vec::new();
@@ -238,7 +234,6 @@ fn kv_words_whole(var: &Variable) -> Vec<String> {
 }
 
 /// `${var@a}` — attribute flag letters in canonical order, or empty.
-#[allow(dead_code)]
 pub(crate) fn attr_flags(name: &str, shell: &Shell) -> String {
     let Some(var) = shell.get_var(name) else {
         return String::new();

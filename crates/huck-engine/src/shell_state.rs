@@ -910,10 +910,6 @@ impl Shell {
     /// attribute flags (`exported`/`readonly`/`integer`/etc.) when
     /// rendering `${var@A}` / `${var@K}` / `${var@k}` / `${var@a}`.
     /// Returns `None` for an unset variable.
-    // `#[allow(dead_code)]` is temporary — the dispatch wiring lands
-    // in a later task. Remove the attribute when the production caller
-    // is added.
-    #[allow(dead_code)]
     pub(crate) fn get_var(&self, name: &str) -> Option<&Variable> {
         let resolved = if self.is_nameref(name) {
             match self.resolve_nameref(name) {
