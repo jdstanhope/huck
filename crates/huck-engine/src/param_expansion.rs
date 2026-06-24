@@ -265,7 +265,35 @@ pub fn expand_modifier_with_value(
                 crate::lexer::TransformOp::PromptExpand => {
                     crate::prompt::expand_prompt(&v, shell)
                 }
-                _ => String::new(),
+                crate::lexer::TransformOp::AssignDecl => {
+                    crate::array_transforms::assign_decl(
+                        name,
+                        crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
+                        shell,
+                    )
+                }
+                crate::lexer::TransformOp::KvString => {
+                    crate::array_transforms::kv_string(
+                        name,
+                        crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
+                        shell,
+                    )
+                }
+                crate::lexer::TransformOp::KvWords => {
+                    // Scalar/element form returns a single-word Vec
+                    // (since there's no [@] under scalar dispatch).
+                    // Join with IFS sep (effectively just the one word).
+                    let words = crate::array_transforms::kv_words(
+                        name,
+                        crate::array_transforms::ScopeMode::ScalarOrElement(v.clone()),
+                        shell,
+                    );
+                    let sep = crate::expand::ifs_join_sep(&shell.ifs());
+                    words.join(&sep)
+                }
+                crate::lexer::TransformOp::AttrFlags => {
+                    crate::array_transforms::attr_flags(name, shell)
+                }
             };
             ExpansionResult::Value(out)
         }
@@ -1470,6 +1498,82 @@ mod tests {
         };
         let r = expand_modifier("HUCK_TEST_PE_CASE_UNSET", &m, &mut shell);
         assert_eq!(r, ExpansionResult::Value("".to_string()));
+    }
+
+    #[test]
+    fn transform_assign_decl_on_scalar() {
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        shell.set("s", "hello".to_string());
+        let m = crate::lexer::ParamModifier::Transform {
+            op: crate::lexer::TransformOp::AssignDecl,
+        };
+        let result = expand_modifier_with_value(
+            "s", &m, ParamLookup::Element(Some("hello")),
+            false, &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, "s='hello'"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_assign_decl_on_attributed_scalar() {
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        shell.set("ev", "42".to_string());
+        shell.export("ev");
+        let m = crate::lexer::ParamModifier::Transform {
+            op: crate::lexer::TransformOp::AssignDecl,
+        };
+        let result = expand_modifier_with_value(
+            "ev", &m, ParamLookup::Element(Some("42")),
+            false, &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, "declare -x ev='42'"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_assign_decl_on_unset_is_empty() {
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        let m = crate::lexer::ParamModifier::Transform {
+            op: crate::lexer::TransformOp::AssignDecl,
+        };
+        let result = expand_modifier_with_value(
+            "nope", &m, ParamLookup::Element(None),
+            false, &mut shell,
+        );
+        // Both Empty and Value("") are bash-faithful for unset.
+        // Bash byte output is empty either way.
+        match result {
+            ExpansionResult::Empty => {}
+            ExpansionResult::Value(v) if v.is_empty() => {}
+            other => panic!("expected Empty or Value(\"\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transform_attr_flags_on_exported() {
+        use crate::shell_state::Shell;
+        let mut shell = Shell::new();
+        shell.set("ev", "42".to_string());
+        shell.export("ev");
+        let m = crate::lexer::ParamModifier::Transform {
+            op: crate::lexer::TransformOp::AttrFlags,
+        };
+        let result = expand_modifier_with_value(
+            "ev", &m, ParamLookup::Element(Some("42")),
+            false, &mut shell,
+        );
+        match result {
+            ExpansionResult::Value(v) => assert_eq!(v, "x"),
+            other => panic!("expected Value, got {other:?}"),
+        }
     }
 }
 
