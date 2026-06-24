@@ -3083,6 +3083,28 @@ fn run_background_sequence(
 
         // ---- Stdout fd -------------------------------------------------------
         let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+            // Upstream stdout goes to the file. For a non-final stage we
+            // STILL need to create an inter-stage pipe so the downstream
+            // stage reads EOF instead of inheriting parent stdin (M-125).
+            if !is_last {
+                match make_orphan_pipe_for_eof_reader() {
+                    Ok(r) => {
+                        prev_pipe_read = Some(r);
+                        parent_held.push(r);
+                    }
+                    Err(e) => {
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        restore_inline_assignments(snap, shell);
+                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                        if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
+                        unsafe { libc::close(fd); } // close the open file fd we won't use
+                        drain_procsubs(shell, procsub_base);
+                        cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
+                        for pfd in parent_held.drain(..) { unsafe { libc::close(pfd); } }
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
             fd
         } else if !is_last {
             match make_pipe() {
@@ -5365,6 +5387,20 @@ fn make_pipe() -> io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
+/// Create an inter-stage pipe for a downstream pipeline reader, where
+/// the upstream stage's stdout is going elsewhere (an explicit file
+/// redirect). Closes the write-end immediately so the downstream reader
+/// sees EOF instead of inheriting parent stdin or blocking on an
+/// orphaned write-end. Returns the read-end fd to thread into
+/// `prev_pipe_read`. On `make_pipe` failure, the caller propagates the
+/// error.
+#[allow(dead_code)]
+fn make_orphan_pipe_for_eof_reader() -> io::Result<RawFd> {
+    let (r, w) = make_pipe()?;
+    unsafe { libc::close(w); }
+    Ok(r)
+}
+
 /// Rewrites `run_multi_stage` around raw `libc::pipe` fds.
 ///
 /// Each stage is classified via `classify_stage`:
@@ -5798,6 +5834,27 @@ fn run_multi_stage(
         // ---- Build stdout fd -------------------------------------------------
         // Priority: explicit redirect > inter-stage pipe > Capture sink pipe > STDOUT_FILENO.
         let stdout_fd: RawFd = if let Some(fd) = explicit_stdout_fd {
+            // Upstream stdout goes to the file. For a non-final stage we
+            // STILL need to create an inter-stage pipe so the downstream
+            // stage reads EOF instead of inheriting parent stdin (M-125).
+            if !is_last {
+                match make_orphan_pipe_for_eof_reader() {
+                    Ok(r) => {
+                        prev_pipe_read = Some(r);
+                        parent_held.push(r);
+                    }
+                    Err(e) => {
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        restore_inline_assignments(snap, shell);
+                        if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
+                        if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
+                        unsafe { libc::close(fd); } // close the open file fd we won't use
+                        drain_procsubs(shell, procsub_base);
+                        for pfd in parent_held.drain(..) { unsafe { libc::close(pfd); } }
+                        return ExecOutcome::Continue(1);
+                    }
+                }
+            }
             fd
         } else if !is_last {
             // Create the inter-stage pipe.
@@ -8693,6 +8750,18 @@ mod tests {
             "redirected `echo HI` should appear as a line in the file, got {content:?}",
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn make_orphan_pipe_for_eof_reader_yields_immediate_eof() {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+        let r = make_orphan_pipe_for_eof_reader().expect("pipe");
+        // Read should return 0 bytes (EOF) immediately, not block.
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        let mut buf = [0u8; 8];
+        let n = f.read(&mut buf).expect("read");
+        assert_eq!(n, 0, "expected EOF, got {n} bytes");
     }
 }
 
