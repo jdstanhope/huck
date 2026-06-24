@@ -1,0 +1,8 @@
+# Categories from bash's tests/ directory that we intentionally skip.
+# Format: one category name per line, optional comment after #.
+# A "category" here is the suffix of run-<category> in bash's tests/ dir.
+# Update via the v214+ baseline triage as more skips are identified.
+
+loadable          # huck has no loadable-builtin support; bash-specific
+intl              # depends on locale/i18n; out of huck's compat scope
+strict-posix      # depends on POSIX-strict mode huck doesn't implement
