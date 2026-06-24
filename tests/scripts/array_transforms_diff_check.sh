@@ -63,6 +63,11 @@ check 'a-indexed'             'a=(x); echo "${a@a}"'
 check 'a-assoc'               'declare -A m=([k]=v); echo "${m@a}"'
 check 'a-unset'               'echo "[${u@a}]"'
 
+# === Subscript + nameref edges (review follow-ons) ===
+check 'A-indexed-i-sub-bash'  'a=(x y z); echo "${a[1]@A}"'
+check 'A-assoc-k-sub'         'declare -A m=([k]=v1); echo "${m[k]@A}"'
+check 'A-via-nameref'         'target=hello; declare -n ref=target; echo "${ref@A}"'
+
 # === Combined / round-trip via eval ===
 check 'A-round-trip'          'a=(x y); s="${a[@]@A}"; unset a; eval "$s"; echo "${a[@]}"'
 

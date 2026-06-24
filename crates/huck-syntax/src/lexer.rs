@@ -142,8 +142,9 @@ pub enum CaseDirection {
 }
 
 /// Scalar and whole-array `${var@OP}` transform operators (bash 5.x).
-/// Per-element across arrays via v209's per-element arm; whole-array
-/// via v210's whole-array arm; scalar via the param_expansion path.
+/// Per-element across arrays via the per-element arm in expand.rs;
+/// whole-array via the sibling whole-array arm; scalar via the
+/// param_expansion path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransformOp {
     PromptExpand, // @P — prompt-string expansion of the value

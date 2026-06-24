@@ -5,7 +5,24 @@
 //! forms and from `param_expansion::expand_modifier_with_value`'s
 //! `Transform { op }` arm for the scalar / single-element forms.
 
-use crate::shell_state::{Shell, VarValue, Variable};
+use crate::shell_state::{ResolvedName, Shell, VarValue, Variable};
+
+/// If `name` is a nameref, follow the chain to the target var name.
+/// Otherwise return `name` unchanged. Matches bash's `@A` behavior of
+/// emitting the resolved target name in the declare-style string
+/// (e.g. `declare -n ref=target; "${ref@A}"` → `target='hello'`,
+/// not `ref='hello'`). Only `@A` cares about the emitted NAME —
+/// `@K`/`@k` emit only values, and `@a` emits only flag letters.
+fn resolve_target_name(name: &str, shell: &Shell) -> String {
+    if shell.is_nameref(name) {
+        match shell.resolve_nameref(name) {
+            ResolvedName::Name(n) => n,
+            _ => name.to_string(),
+        }
+    } else {
+        name.to_string()
+    }
+}
 
 /// Where the modifier was applied: a whole array (`[@]` / `[*]`
 /// subscript) or a single value (scalar variable, no subscript, or
@@ -26,9 +43,15 @@ pub(crate) fn assign_decl(name: &str, scope: ScopeMode, shell: &Shell) -> String
     let Some(var) = shell.get_var(name) else {
         return String::new();
     };
+    // Use the resolved name (target of any nameref chain) for output:
+    // `declare -n ref=target` makes `${ref@A}` emit `target='…'`, not
+    // `ref='…'`. Non-namerefs pass through unchanged.
+    let resolved_name = resolve_target_name(name, shell);
     match scope {
-        ScopeMode::Whole => assign_decl_whole(name, var),
-        ScopeMode::ScalarOrElement(val) => assign_decl_scalar_or_element(name, var, &val),
+        ScopeMode::Whole => assign_decl_whole(&resolved_name, var),
+        ScopeMode::ScalarOrElement(val) => {
+            assign_decl_scalar_or_element(&resolved_name, var, &val)
+        }
     }
 }
 
@@ -68,7 +91,13 @@ fn assign_decl_scalar_or_element(name: &str, var: &Variable, val: &str) -> Strin
         }
         VarValue::Associative(_) => {
             let attrs = render_attr_prefix(var, true);
-            format!("declare {attrs} {name}")
+            if val.is_empty() {
+                // ${m@A} (no subscript): scalar_view is empty → no body.
+                format!("declare {attrs} {name}")
+            } else {
+                // ${m[k]@A}: specific-key element → `declare -A m='val'`.
+                format!("declare {attrs} {name}={}", always_quote(val))
+            }
         }
     }
 }
@@ -319,6 +348,35 @@ mod tests {
             .unwrap();
         let out = assign_decl("m", ScopeMode::Whole, &shell);
         assert_eq!(out, r#"declare -A m=([k]="v1" )"#);
+    }
+
+    #[test]
+    fn assign_decl_assoc_specific_key_has_body() {
+        let mut shell = Shell::new();
+        shell.declare_associative("m").unwrap();
+        shell
+            .set_associative_element("m", "k".to_string(), "v1".to_string())
+            .unwrap();
+        // ${m[k]@A}: specific-key element → `declare -A m='v1'` (body).
+        let out = assign_decl("m", ScopeMode::ScalarOrElement("v1".into()), &shell);
+        assert_eq!(out, "declare -A m='v1'");
+    }
+
+    #[test]
+    fn assign_decl_through_nameref_uses_target_name() {
+        let mut shell = Shell::new();
+        shell.set("target", "hello".to_string());
+        // Set up `declare -n ref=target` via the canonical nameref pair:
+        // mark nameref attribute, then store the target name as the
+        // nameref's own scalar value (see builtins.rs declare path).
+        shell.set_nameref("ref", true);
+        shell.set("ref", "target".to_string());
+        let out = assign_decl(
+            "ref",
+            ScopeMode::ScalarOrElement("hello".into()),
+            &shell,
+        );
+        assert_eq!(out, "target='hello'");
     }
 
     #[test]
