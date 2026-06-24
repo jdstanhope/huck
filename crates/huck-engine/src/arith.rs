@@ -46,10 +46,10 @@ fn parse_hex_digits(
         }
     }
     if s.is_empty() {
-        return Err(ArithError::Parse("hex literal requires at least one digit".to_string()));
+        return Err(ArithError::parse("hex literal requires at least one digit"));
     }
     i64::from_str_radix(&s, 16).map_err(|_|
-        ArithError::Parse(format!("hex literal out of range: 0x{s}")))
+        ArithError::parse(format!("hex literal out of range: 0x{s}")))
 }
 
 /// Parses base-N digits after the `N#` prefix has been consumed. The
@@ -85,21 +85,21 @@ fn parse_base_n_digits(
             _ => break,
         };
         if digit >= base {
-            return Err(ArithError::Parse(format!(
+            return Err(ArithError::parse(format!(
                 "invalid digit for base {base}: '{c}'"
             )));
         }
         value = value
             .checked_mul(base as i64)
             .and_then(|v| v.checked_add(digit as i64))
-            .ok_or_else(|| ArithError::Parse(format!(
+            .ok_or_else(|| ArithError::parse(format!(
                 "base-{base} literal out of range"
             )))?;
         any_digit = true;
         chars.next();
     }
     if !any_digit {
-        return Err(ArithError::Parse(format!(
+        return Err(ArithError::parse(format!(
             "base-{base} literal requires at least one digit"
         )));
     }
@@ -122,9 +122,9 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                     // Base-N literal: leading digits parsed as decimal base.
                     chars.next();
                     let base: u32 = digits.parse()
-                        .map_err(|_| ArithError::Parse(format!("invalid base: {digits}")))?;
+                        .map_err(|_| ArithError::parse(format!("invalid base: {digits}")))?;
                     if !(2..=64).contains(&base) {
-                        return Err(ArithError::Parse(format!(
+                        return Err(ArithError::parse(format!(
                             "base must be 2-64, got {base}"
                         )));
                     }
@@ -136,12 +136,12 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                 } else if digits.len() > 1 && digits.starts_with('0') {
                     // Octal literal: 010 → 8. All digits must be 0-7.
                     i64::from_str_radix(&digits, 8)
-                        .map_err(|_| ArithError::Parse(format!(
+                        .map_err(|_| ArithError::parse(format!(
                             "invalid octal literal: {digits}"
                         )))?
                 } else {
                     digits.parse()
-                        .map_err(|_| ArithError::Parse(format!(
+                        .map_err(|_| ArithError::parse(format!(
                             "integer literal out of range: {digits}"
                         )))?
                 };
@@ -160,8 +160,8 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                     } else { break; }
                 }
                 if s.is_empty() {
-                    return Err(ArithError::Parse(
-                        "expected identifier after '$'".to_string()));
+                    return Err(ArithError::parse(
+                        "expected identifier after '$'"));
                 }
                 out.push(ArithToken::Ident(s));
             }
@@ -325,7 +325,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
                 out.push(ArithToken::Tilde);
             }
             other => {
-                return Err(ArithError::Parse(format!("unexpected character: {other:?}")));
+                return Err(ArithError::parse(format!("unexpected character: {other:?}")));
             }
         }
     }
@@ -403,8 +403,22 @@ pub enum ArithExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArithError {
+pub enum ArithErrorKind {
+    // Legacy free-form parse message (kept for sites not yet bash-mapped).
     Parse(String),
+    // Bash-mapped parse/lex errors (each renders a fixed bash string):
+    AssignToNonVar,          // "attempted assignment to non-variable"
+    InvalidBase,             // "invalid arithmetic base"
+    InvalidIntegerConstant,  // "invalid integer constant"
+    ValueTooGreatForBase,    // "value too great for base"
+    InvalidNumber,           // "invalid number"
+    MissingCloseParen,       // "missing `)'"
+    OperandExpected,         // "syntax error: operand expected"
+    ExpressionExpected,      // "expression expected"
+    ColonExpected,           // "`:' expected for conditional expression"
+    SyntaxErrorInExpression, // "syntax error in expression"
+    BadArraySubscript,       // "bad array subscript"
+    // Eval-time:
     DivisionByZero,
     ModuloByZero,
     NotAnInteger { var: String, value: String },
@@ -413,18 +427,63 @@ pub enum ArithError {
     ReadonlyVar(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithError {
+    pub kind: ArithErrorKind,
+    /// Byte offset into the parsed source of the error token (bash `lasttp`).
+    pub offset: Option<usize>,
+}
+
+impl ArithError {
+    /// Legacy free-form parse error, no position.
+    pub fn parse(msg: impl Into<String>) -> Self {
+        ArithError { kind: ArithErrorKind::Parse(msg.into()), offset: None }
+    }
+    /// A bash-mapped error with a token offset.
+    pub fn at(kind: ArithErrorKind, offset: usize) -> Self {
+        ArithError { kind, offset: Some(offset) }
+    }
+    /// The text bash prints after the `<expr>: ` echo.
+    pub fn bash_message(&self) -> String {
+        use ArithErrorKind::*;
+        match &self.kind {
+            Parse(m) => m.clone(),
+            AssignToNonVar => "attempted assignment to non-variable".into(),
+            InvalidBase => "invalid arithmetic base".into(),
+            InvalidIntegerConstant => "invalid integer constant".into(),
+            ValueTooGreatForBase => "value too great for base".into(),
+            InvalidNumber => "invalid number".into(),
+            MissingCloseParen => "missing `)'".into(),
+            OperandExpected => "syntax error: operand expected".into(),
+            ExpressionExpected => "expression expected".into(),
+            ColonExpected => "`:' expected for conditional expression".into(),
+            SyntaxErrorInExpression => "syntax error in expression".into(),
+            BadArraySubscript => "bad array subscript".into(),
+            DivisionByZero | ModuloByZero => "division by 0".into(),
+            NotAnInteger { value, .. } => format!("{value}: syntax error: operand expected"),
+            NegativeExponent => "exponent less than 0".into(),
+            ShiftCountOutOfRange { .. } => "shift count out of range".into(),
+            ReadonlyVar(name) => format!("{name}: readonly variable"),
+        }
+    }
+}
+
 impl std::fmt::Display for ArithError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parse(m) => write!(f, "{m}"),
-            Self::DivisionByZero => write!(f, "division by zero"),
-            Self::ModuloByZero => write!(f, "modulo by zero"),
-            Self::NotAnInteger { var, value } =>
+        // Legacy rendering kept so existing `{e}` callers compile unchanged
+        // until Task 5 swaps the emission sites to bash formatting.
+        use ArithErrorKind::*;
+        match &self.kind {
+            Parse(m) => write!(f, "{m}"),
+            DivisionByZero => write!(f, "division by zero"),
+            ModuloByZero => write!(f, "modulo by zero"),
+            NotAnInteger { var, value } =>
                 write!(f, "variable '{var}' is not an integer: '{value}'"),
-            Self::NegativeExponent => write!(f, "exponentiation with negative exponent"),
-            Self::ShiftCountOutOfRange { count } =>
-                write!(f, "shift count out of range: {count}"),
-            Self::ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
+            NegativeExponent => write!(f, "exponentiation with negative exponent"),
+            ShiftCountOutOfRange { count } => write!(f, "shift count out of range: {count}"),
+            ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
+            // Bash-mapped kinds render their bash text under Display too.
+            other => write!(f, "{}", ArithError { kind: other.clone(), offset: None }.bash_message()),
         }
     }
 }
@@ -434,7 +493,7 @@ pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
     let mut p = Parser { tokens, pos: 0 };
     let expr = p.parse_comma_expr()?;
     if p.pos < p.tokens.len() {
-        return Err(ArithError::Parse(format!(
+        return Err(ArithError::parse(format!(
             "unexpected token after expression: {:?}", p.tokens[p.pos]
         )));
     }
@@ -516,8 +575,8 @@ impl Parser {
                 self.bump();
                 let target = match expr_to_lvalue(lhs) {
                     Some(t) => t,
-                    None => return Err(ArithError::Parse(
-                        "postfix ++/-- requires variable on LHS".to_string()
+                    None => return Err(ArithError::parse(
+                        "postfix ++/-- requires variable on LHS"
                     )),
                 };
                 lhs = match op {
@@ -534,8 +593,8 @@ impl Parser {
                 self.bump();
                 let target = match expr_to_lvalue(lhs) {
                     Some(t) => t,
-                    None => return Err(ArithError::Parse(
-                        "assignment requires variable on LHS".to_string()
+                    None => return Err(ArithError::parse(
+                        "assignment requires variable on LHS"
                     )),
                 };
                 let rhs = self.parse_expr(1)?;  // rbp = 1 allows cascading assigns
@@ -549,7 +608,7 @@ impl Parser {
                 let then_branch = self.parse_expr(0)?;
                 match self.bump() {
                     Some(ArithToken::Colon) => {}
-                    other => return Err(ArithError::Parse(format!(
+                    other => return Err(ArithError::parse(format!(
                         "expected ':' in ternary, got {other:?}"
                     ))),
                 }
@@ -604,14 +663,14 @@ impl Parser {
     fn parse_subscript(&mut self) -> Result<(ArithExpr, String), ArithError> {
         let raw = match self.bump() {
             Some(ArithToken::LBracket(raw)) => raw,
-            other => return Err(ArithError::Parse(format!(
+            other => return Err(ArithError::parse(format!(
                 "expected '[', got {other:?}"
             ))),
         };
         let subscript = self.parse_comma_expr()?;
         match self.bump() {
             Some(ArithToken::RBracket) => {}
-            other => return Err(ArithError::Parse(format!(
+            other => return Err(ArithError::parse(format!(
                 "expected ']' after array subscript, got {other:?}"
             ))),
         }
@@ -650,8 +709,8 @@ impl Parser {
                 let inner = self.parse_prefix()?;
                 match expr_to_lvalue(inner) {
                     Some(target) => Ok(ArithExpr::PreInc(target)),
-                    None => Err(ArithError::Parse(
-                        "prefix ++ requires variable".to_string()
+                    None => Err(ArithError::parse(
+                        "prefix ++ requires variable"
                     )),
                 }
             }
@@ -660,8 +719,8 @@ impl Parser {
                 let inner = self.parse_prefix()?;
                 match expr_to_lvalue(inner) {
                     Some(target) => Ok(ArithExpr::PreDec(target)),
-                    None => Err(ArithError::Parse(
-                        "prefix -- requires variable".to_string()
+                    None => Err(ArithError::parse(
+                        "prefix -- requires variable"
                     )),
                 }
             }
@@ -669,15 +728,15 @@ impl Parser {
                 let inner = self.parse_comma_expr()?;
                 match self.bump() {
                     Some(ArithToken::RParen) => Ok(inner),
-                    other => Err(ArithError::Parse(format!(
+                    other => Err(ArithError::parse(format!(
                         "expected ')', got {:?}", other
                     ))),
                 }
             }
-            Some(t) => Err(ArithError::Parse(format!(
+            Some(t) => Err(ArithError::parse(format!(
                 "expected expression, got {:?}", t
             ))),
-            None => Err(ArithError::Parse("unexpected end of input".to_string())),
+            None => Err(ArithError::parse("unexpected end of input")),
         }
     }
 }
@@ -691,16 +750,16 @@ fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
     if raw.is_empty() {
         return Ok(0);
     }
-    raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+    raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw,
-    })
+    }, offset: None })
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
 fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithError> {
     shell.try_set(name, value.to_string())
-        .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+        .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
 }
 
 /// Arith-evaluates an element's raw string value to an i64, exactly like a
@@ -719,10 +778,10 @@ fn element_string_to_i64(
         return Ok(n);
     }
     // Non-numeric: arith-evaluate recursively (an element may hold "1+1").
-    let parsed = parse(&raw).map_err(|_| ArithError::NotAnInteger {
+    let parsed = parse(&raw).map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw.clone(),
-    })?;
+    }, offset: None })?;
     eval(&parsed, shell)
 }
 
@@ -752,12 +811,12 @@ fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<()
             if shell.get_associative(name).is_some() {
                 shell
                     .set_associative_element(name, subscript_raw.clone(), value.to_string())
-                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
             } else {
                 let idx = eval(subscript, shell)?;
                 shell
                     .set_indexed_element(name, idx as usize, value.to_string())
-                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
             }
         }
     }
@@ -771,10 +830,10 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             if raw.is_empty() {
                 Ok(0)
             } else {
-                raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+                raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
                     var: name.clone(),
                     value: raw.to_string(),
-                })
+                }, offset: None })
             }
         }
         ArithExpr::Index { name, subscript, subscript_raw } => {
@@ -792,13 +851,13 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
         ArithExpr::Div(a, b) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError::DivisionByZero); }
+            if rhs == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }); }
             Ok(lhs.wrapping_div(rhs))
         }
         ArithExpr::Mod(a, b) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError::ModuloByZero); }
+            if rhs == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }); }
             Ok(lhs.wrapping_rem(rhs))
         }
         ArithExpr::Eq(a, b) => Ok(bool_to_i64(eval(a, shell)? == eval(b, shell)?)),
@@ -840,7 +899,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None });
             }
             Ok(lhs.wrapping_shl(rhs as u32))
         }
@@ -848,7 +907,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None });
             }
             Ok(lhs.wrapping_shr(rhs as u32))
         }
@@ -856,7 +915,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let base = eval(a, shell)?;
             let exp = eval(b, shell)?;
             if exp < 0 {
-                return Err(ArithError::NegativeExponent);
+                return Err(ArithError { kind: ArithErrorKind::NegativeExponent, offset: None });
             }
             Ok(base.wrapping_pow(exp as u32))
         }
@@ -869,25 +928,25 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 AssignOp::Mul    => read_lvalue_i64(shell, target)?.wrapping_mul(rhs_val),
                 AssignOp::Div => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError::DivisionByZero); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }); }
                     lhs.wrapping_div(rhs_val)
                 }
                 AssignOp::Mod => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError::ModuloByZero); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }); }
                     lhs.wrapping_rem(rhs_val)
                 }
                 AssignOp::Shl => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None });
                     }
                     lhs.wrapping_shl(rhs_val as u32)
                 }
                 AssignOp::Shr => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None });
                     }
                     lhs.wrapping_shr(rhs_val as u32)
                 }
@@ -931,26 +990,26 @@ mod tests {
 
     #[test]
     fn display_division_by_zero() {
-        assert_eq!(ArithError::DivisionByZero.to_string(), "division by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }.to_string(), "division by zero");
     }
 
     #[test]
     fn display_modulo_by_zero() {
-        assert_eq!(ArithError::ModuloByZero.to_string(), "modulo by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }.to_string(), "modulo by zero");
     }
 
     #[test]
     fn display_parse_error_is_bare_message() {
-        let e = ArithError::Parse("unexpected end of input".to_string());
+        let e = ArithError::parse("unexpected end of input");
         assert_eq!(e.to_string(), "unexpected end of input");
     }
 
     #[test]
     fn display_not_an_integer_quotes_var_and_value() {
-        let e = ArithError::NotAnInteger {
+        let e = ArithError { kind: ArithErrorKind::NotAnInteger {
             var: "x".to_string(),
             value: "abc".to_string(),
-        };
+        }, offset: None };
         assert_eq!(e.to_string(), "variable 'x' is not an integer: 'abc'");
     }
 
@@ -975,7 +1034,7 @@ mod tests {
     #[test]
     fn tokenize_number_overflow_is_parse_error() {
         let err = tokenize("99999999999999999999").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)), "got {:?}", err);
+        assert!(matches!(err.kind, ArithErrorKind::Parse(_)), "got {:?}", err);
     }
 
     #[test]
@@ -1028,7 +1087,7 @@ mod tests {
     #[test]
     fn tokenize_unknown_char_is_parse_error() {
         let err = tokenize("1 @ 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+        assert!(matches!(err.kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
@@ -1198,7 +1257,7 @@ mod tests {
     fn parse_double_minus_with_number_is_prefix_dec_error() {
         // v38: -- is now MinusMinus (prefix decrement), which requires a
         // variable name after it. --5 → parse error.
-        assert!(matches!(parse("--5"), Err(ArithError::Parse(_))));
+        assert!(matches!(parse("--5"), Err(ref e) if matches!(e.kind, ArithErrorKind::Parse(_))));
     }
 
     #[test]
@@ -1243,22 +1302,22 @@ mod tests {
 
     #[test]
     fn parse_empty_is_error() {
-        assert!(matches!(parse("").unwrap_err(), ArithError::Parse(_)));
+        assert!(matches!(parse("").unwrap_err().kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
     fn parse_trailing_junk_is_error() {
-        assert!(matches!(parse("1+2 3").unwrap_err(), ArithError::Parse(_)));
+        assert!(matches!(parse("1+2 3").unwrap_err().kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
     fn parse_unbalanced_paren_is_error() {
-        assert!(matches!(parse("(1+2").unwrap_err(), ArithError::Parse(_)));
+        assert!(matches!(parse("(1+2").unwrap_err().kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
     fn parse_missing_rhs_is_error() {
-        assert!(matches!(parse("1+").unwrap_err(), ArithError::Parse(_)));
+        assert!(matches!(parse("1+").unwrap_err().kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
@@ -1315,13 +1374,13 @@ mod tests {
     #[test]
     fn parse_assignment_lhs_must_be_var() {
         // (a + b) = 5 → parse error (LHS not a Var).
-        assert!(matches!(parse("(a + b) = 5"), Err(ArithError::Parse(_))));
+        assert!(matches!(parse("(a + b) = 5"), Err(ref e) if matches!(e.kind, ArithErrorKind::Parse(_))));
     }
 
     #[test]
     fn parse_postfix_lhs_must_be_var() {
         // (a + b)++ → parse error.
-        assert!(matches!(parse("(a + b)++"), Err(ArithError::Parse(_))));
+        assert!(matches!(parse("(a + b)++"), Err(ref e) if matches!(e.kind, ArithErrorKind::Parse(_))));
     }
 
     #[test]
@@ -1473,13 +1532,13 @@ mod tests {
     #[test]
     fn eval_division_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError::DivisionByZero);
+        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: None });
     }
 
     #[test]
     fn eval_modulo_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError::ModuloByZero);
+        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: None });
     }
 
     #[test]
@@ -1573,10 +1632,10 @@ mod tests {
         let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap_err();
         assert_eq!(
             err,
-            ArithError::NotAnInteger {
+            ArithError { kind: ArithErrorKind::NotAnInteger {
                 var: "HUCK_TEST_ARITH_BAD".to_string(),
                 value: "abc".to_string()
-            }
+            }, offset: None }
         );
     }
 
@@ -1626,7 +1685,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("1 << -1", &mut s),
-            Err(ArithError::ShiftCountOutOfRange { count: -1 })
+            Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: -1 }, .. })
         ));
     }
 
@@ -1635,7 +1694,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("1 << 64", &mut s),
-            Err(ArithError::ShiftCountOutOfRange { count: 64 })
+            Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: 64 }, .. })
         ));
     }
 
@@ -1657,7 +1716,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("2 ** -1", &mut s),
-            Err(ArithError::NegativeExponent)
+            Err(ArithError { kind: ArithErrorKind::NegativeExponent, .. })
         ));
     }
 
@@ -1680,7 +1739,7 @@ mod tests {
     fn eval_assign_div_by_zero_errors() {
         let mut s = Shell::new();
         s.set("a", "10".to_string());
-        assert!(matches!(eval_str("a /= 0", &mut s), Err(ArithError::DivisionByZero)));
+        assert!(matches!(eval_str("a /= 0", &mut s), Err(ArithError { kind: ArithErrorKind::DivisionByZero, .. })));
     }
 
     #[test]
@@ -1769,5 +1828,22 @@ mod tests {
         s.set("a", "5".to_string());
         assert_eq!(eval_str("a++", &mut s).unwrap(), 5);
         assert_eq!(s.lookup_var("a"), Some("6".to_string()));
+    }
+
+    #[test]
+    fn arith_error_bash_message_mapping() {
+        use ArithErrorKind::*;
+        let mk = |k| ArithError { kind: k, offset: None };
+        assert_eq!(mk(AssignToNonVar).bash_message(), "attempted assignment to non-variable");
+        assert_eq!(mk(DivisionByZero).bash_message(), "division by 0");
+        assert_eq!(mk(InvalidBase).bash_message(), "invalid arithmetic base");
+        assert_eq!(mk(InvalidIntegerConstant).bash_message(), "invalid integer constant");
+        assert_eq!(mk(ValueTooGreatForBase).bash_message(), "value too great for base");
+        assert_eq!(mk(MissingCloseParen).bash_message(), "missing `)'");
+        assert_eq!(mk(OperandExpected).bash_message(), "syntax error: operand expected");
+        assert_eq!(mk(ExpressionExpected).bash_message(), "expression expected");
+        assert_eq!(mk(ColonExpected).bash_message(), "`:' expected for conditional expression");
+        assert_eq!(mk(SyntaxErrorInExpression).bash_message(), "syntax error in expression");
+        assert_eq!(mk(InvalidNumber).bash_message(), "invalid number");
     }
 }
