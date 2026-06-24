@@ -6,3 +6,4 @@
 loadable          # huck has no loadable-builtin support; bash-specific
 intl              # depends on locale/i18n; out of huck's compat scope
 strict-posix      # depends on POSIX-strict mode huck doesn't implement
+rsh               # restricted shell (set -r) not implemented; not a huck feature
