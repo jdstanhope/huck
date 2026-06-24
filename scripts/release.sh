@@ -13,6 +13,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=$(pack_version "$ROOT/Cargo.toml")
 TAG=$(pack_tag "$VERSION")
 TARBALL_URL="https://github.com/jdstanhope/huck/archive/refs/tags/$TAG.tar.gz"
+NOTES_FILE="$ROOT/docs/releases/$VERSION.md"
 
 run() {
     if [ "$DRY_RUN" = 1 ]; then printf '+ %s\n' "$*"; else eval "$@"; fi
@@ -26,12 +27,13 @@ if [ "$DRY_RUN" = 0 ]; then
     [ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)" = "main" ] || { echo "release: not on main" >&2; exit 1; }
     if git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1; then echo "release: tag $TAG already exists" >&2; exit 1; fi
     command -v gh >/dev/null 2>&1 || { echo "release: gh not found" >&2; exit 1; }
+    [ -f "$NOTES_FILE" ] || { echo "release: release notes file not found at $NOTES_FILE" >&2; exit 1; }
 fi
 
 run "sh '$ROOT/packaging/deb/build-deb.sh'"
 run "git -C '$ROOT' tag '$TAG'"
 run "git -C '$ROOT' push origin '$TAG'"
-run "gh release create '$TAG' '$ROOT'/dist/huck_*.deb --title '$TAG' --notes 'huck $VERSION'"
+run "gh release create '$TAG' '$ROOT'/dist/huck_*.deb --title '$TAG' --notes-file '$NOTES_FILE'"
 
 if [ "$DRY_RUN" = 1 ]; then
     printf '+ compute sha256 of %s\n' "$TARBALL_URL"
