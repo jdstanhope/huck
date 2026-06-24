@@ -1,7 +1,7 @@
 # bash 5.2.21 test-suite baseline
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
-huck commit: d9677e5.
+huck commit: 8b75908.
 Sweep date: 2026-06-24 UTC.
 
 ## Summary
@@ -19,8 +19,8 @@ Sweep date: 2026-06-24 UTC.
 |---|---|---|
 | alias | FAIL | Error-message format divergence — huck uses its own name as the command-not-found prefix rather than the running script's filename; also some alias-expansion differences in non-interactive script mode. |
 | appendop | FAIL | Multiple gaps: an array-element append subscript form that huck fails to parse; assoc-array iteration-order divergence (L-44); and readonly-assignment abort difference (L-43). |
-| arith | FAIL | Many cascading failures triggered by `set -o posix` not being supported (missing set option aborts the test preamble). Separately, arithmetic LHS-assignment parsing diverges from bash on some corner-case expressions. |
-| arith-for | FAIL | `declare -f` function-definition trailing-space format divergence — bash appends a trailing space to the name-and-parens and opening-brace tokens; huck omits it. Cosmetic output difference affecting all function-print comparisons. |
+| arith | FAIL | The `set -o posix` / `set +o posix` cascade is resolved in v215; the test suite now runs end-to-end. Remaining failures are genuine arithmetic divergences: error-message format differs throughout (huck omits the source-file and line-number context and uses different category wording, while bash includes the originating line reference and an error-token excerpt); signed-integer overflow is rejected by huck as out-of-range while bash wraps silently to the minimum signed value; increment/decrement on non-lvalue literals, assignment in short-circuit arithmetic contexts, and ternary-expression error cases each produce mismatched output. |
+| arith-for | FAIL | `declare -f` trailing-space format divergence remains (bash appends a trailing space after the function-name-and-parens and opening-brace tokens; huck omits it). Functions whose bodies contain arith-for constructs with non-standard headers may fail to be defined in huck, causing `declare -f` to emit nothing where bash outputs the full reformatted body. Error-message text for intentionally invalid `for ((` headers (wrong section count or a quoted string as a section value) differs between huck and bash. |
 | array | FAIL | `set +a` (all-export off) not supported, misconfiguring the test environment. Also an array literal whose element contains a background `&` operator is parsed differently than bash expects. |
 | array2 | FAIL | Test infrastructure: requires `recho` helper binary compiled from bash source. That binary is not present, so most test cases fail before reaching the array operations themselves. |
 | assoc | FAIL | `BASH_ALIASES` and `BASH_CMDS` built-in assoc arrays are not present in huck. Also L-46 (bare attribute-only `declare -A` prints an empty-string assignment in `declare -p`) and L-44 (assoc-array iteration order). |
