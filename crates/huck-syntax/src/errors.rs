@@ -1,7 +1,7 @@
 //! Error message rendering for huck-syntax's lex and parse stages.
 //!
-//! The canonical rendering lives in [`lex_error_message_impl`] /
-//! [`parse_error_message_impl`] (crate-private). The error types
+//! The canonical rendering lives in `lex_error_message_impl` /
+//! `parse_error_message_impl` (crate-private). The error types
 //! `LexError` / `ParseError` delegate their `Display` impls here.
 //! The historical public free functions [`lex_error_message`] /
 //! [`parse_error_message`] are kept as thin wrappers but now take
