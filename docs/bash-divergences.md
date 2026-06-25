@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 10 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 40 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 41 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -330,3 +330,28 @@ than silently producing invalid UTF-8.
 - **bash**: prefixes the same message body with `$0` (or the script name).
 - **Why intentional**: the same program-name-prefix class as L-13/L-15/L-16 (`huck:` vs `bash:`); rc and the `name`/`OPTARG`/`OPTIND` outputs that scripts key off match bash exactly.
 - **Workaround**: none needed for rc/variable-driven scripts; use the silent error mode (leading `:` in the optstring) to suppress the message entirely.
+
+### L-56: Remaining arithmetic behavioral divergences (post-v216)
+
+- **Status**: `[deferred]`
+- **Severity**: medium (items a–d); low (items e–h)
+
+v216 aligned arith error-message FORMAT with bash (`Shell::error_prefix` prologue + leading-trimmed expression echo + `(error token is "...")` suffix — verified 10/10 by `arith_error_diff_check.sh`). The following BEHAVIORAL divergences remain:
+
+(a) **Integer-literal overflow wrapping** — literals ≥ 2^63 (`9223372036854775808`) wrap two's-complement to the minimum signed value (`-9223372036854775808`) in bash; huck rejects them as `integer literal out of range`. Affects `$(( ))`, `(( ))`, and `let`. Medium: breaks scripts that rely on signed overflow.
+
+(b) **`++`/`--` before a non-lvalue literal** — bash treats a leading `++` or `--` applied to a bare integer literal (`++7`, `-- 7`) as repeated unary `+` / `-` (yields the value unchanged); huck errors with `prefix ++ requires variable`. Postfix on a non-lvalue (`7++`, `7--`) also diverges in error wording. Medium: some scripts apply prefix `++` to constants defensively.
+
+(c) **Lazy / short-circuit dead-branch evaluation** — `((0 ? x : 0))` must not evaluate `x`; if `x` is unset and `set -u` is active, bash yields 0 silently while huck may evaluate the dead branch and error. Medium: needed for correct `set -u` interaction in ternary arith.
+
+(d) **Array-element lvalue expressions** — `(( a[n]=n++ ))`, `0 ? arr[a=1] : 0` and similar expressions that use an array element as an lvalue inside arith diverge or error in huck. Medium: used in real-world indexed-array manipulation patterns.
+
+(e) **Substring offset/length with arith ternary colons** — `${PARAM:1?4:2:1}` (a ternary expression as the `${var:off:len}` offset or length) produces different results or parse errors. Low.
+
+(f) **Expression-echo shows pre-expansion form** — when huck emits the arith expression in an error message it may show the un-expanded form (e.g. `$iv`) where bash shows the expanded value (e.g. `\29`). This is because huck echoes the expression string BEFORE variable substitution completes. Low; related to L-54 (single-quote stripping in arith string builders). Cross-reference L-54.
+
+(g) **Standalone `(( ))` command missing `line N:` in script mode** — `Command::Arith` carries no source-line number, so huck either omits the `line N:` segment or reports an inaccurate line when a standalone `(( ))` command errors in a script. This is a broader LINENO-stamping gap (compound-command AST nodes do not carry their source line); it is also why `arith_error_diff_check.sh` covers only `$(( ))` / `let` forms and not standalone `(( ))`. Low.
+
+(h) **Malformed second-`#` base-N number error kind** — `2#110#11` (a valid-prefix base-N literal with a spurious second `#`) maps to `invalid integer constant` in huck vs bash's `invalid number`; the fatal outcome is the same and only the wording differs. Low.
+
+Note: `Shell::error_prefix(cmd: Option<&str>) -> String` (v216) is the bash-compatible error-prologue foundation (`<name>: [line N: ][cmd: ]`). Arith is the first emission site converted; shell-wide adoption (builtins, parser, command-not-found, and the ~400 remaining `huck:`-prefixed error sites) is staged across future iterations.

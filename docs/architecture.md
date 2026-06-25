@@ -249,6 +249,18 @@ These appear in many call-site signatures; learn them once.
   the bottom of each source file. Integration tests are binary-driven
   scripts in `tests/*.rs` using the `run_capture` helper pattern
   (spawn `huck_binary()`, write to stdin, capture stdout/stderr/exit).
+- **Error-message prologue** — bash's `name: [line N: ][cmd: ]` prefix
+  is produced by `Shell::error_prefix(cmd: Option<&str>) -> String`
+  (`shell_state.rs`). `name` is `BASH_SOURCE[0]` / `$0` in script mode
+  or `"huck"` in interactive mode; `line N:` appears only in script mode;
+  `cmd:` is the command context (e.g. `Some("let")` for `let`, `None` for
+  `$(( ))`). Arith error bodies are rendered by
+  `arith::render_error_body(expr: &str, err: &ArithError) -> String`
+  (leading-trimmed expression + `(error token is "tok")`). v216 converted
+  the four arith emission sites (`$(( ))`, `(( ))` command, `let`, and
+  substring offset/length); shell-wide adoption of `error_prefix` for
+  builtins, parser, and other `huck:`-prefixed sites is staged across
+  future iterations.
 
 ## Naming conventions
 
@@ -317,6 +329,7 @@ The "(1M context)" parenthetical is canonical — do not remove it.
 | New `set -o` option | `shell_state.rs::ShellOptions`: add the bool field. `builtins.rs::builtin_set`: add to the OptionInfo registry and the get/set/print helpers. Wire into the executor at the relevant action site. |
 | New trap signal / pseudo-signal | `traps.rs`: add to the signal name table. `executor.rs`: add a `fire_*_trap` call at the appropriate spot. |
 | Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_indexed_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
+| Bash-compatible error prologue | Call `Shell::error_prefix(cmd)` for the `name: [line N: ][cmd: ]` prefix. For arith errors, use `arith::render_error_body(expr, err)` for the body. See the error-message prologue note in Cross-cutting conventions above. |
 
 ## Pointers for new sessions
 

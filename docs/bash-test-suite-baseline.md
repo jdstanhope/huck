@@ -1,8 +1,8 @@
 # bash 5.2.21 test-suite baseline
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
-huck commit: 8b75908.
-Sweep date: 2026-06-24 UTC.
+huck commit: 168a37b (arith full sweep re-run 2026-06-25; other categories unchanged from 8b75908).
+Sweep date: 2026-06-24 UTC (full); arith re-triaged 2026-06-25 UTC after v216.
 
 ## Summary
 
@@ -19,7 +19,7 @@ Sweep date: 2026-06-24 UTC.
 |---|---|---|
 | alias | FAIL | Error-message format divergence — huck uses its own name as the command-not-found prefix rather than the running script's filename; also some alias-expansion differences in non-interactive script mode. |
 | appendop | FAIL | Multiple gaps: an array-element append subscript form that huck fails to parse; assoc-array iteration-order divergence (L-44); and readonly-assignment abort difference (L-43). |
-| arith | FAIL | The `set -o posix` / `set +o posix` cascade is resolved in v215; the test suite now runs end-to-end. Remaining failures are genuine arithmetic divergences: error-message format differs throughout (huck omits the source-file and line-number context and uses different category wording, while bash includes the originating line reference and an error-token excerpt); signed-integer overflow is rejected by huck as out-of-range while bash wraps silently to the minimum signed value; increment/decrement on non-lvalue literals, assignment in short-circuit arithmetic contexts, and ternary-expression error cases each produce mismatched output. |
+| arith | FAIL | The `set -o posix` cascade was resolved in v215 (test now runs end-to-end). v216 aligns arith error-message format with bash: the source-file + line-number prologue, leading-trimmed expression echo, and `(error token is "...")` suffix now match byte-for-byte for the both-error cases verified by `arith_error_diff_check.sh` (10/10 PASS). Remaining failures are the behavioral divergences catalogued in L-56: signed-integer overflow wrapping (literals ≥ 2^63 wrap to min-int in bash; huck rejects as out-of-range); `++`/`--` applied to non-lvalue literals (bash treats as repeated unary `+`/`-` and yields the number; huck errors); lazy dead-branch evaluation in ternary expressions (dead branch must not be evaluated even if it contains an unset variable); array-element lvalue expressions inside arith (`a[n]=n++`); substring offset/length with arith ternary colons; standalone `(( ))` command line-number attribution (off vs bash because `Command::Arith` carries no source line); and minor error-kind wording for malformed base-N numbers. |
 | arith-for | FAIL | `declare -f` trailing-space format divergence remains (bash appends a trailing space after the function-name-and-parens and opening-brace tokens; huck omits it). Functions whose bodies contain arith-for constructs with non-standard headers may fail to be defined in huck, causing `declare -f` to emit nothing where bash outputs the full reformatted body. Error-message text for intentionally invalid `for ((` headers (wrong section count or a quoted string as a section value) differs between huck and bash. |
 | array | FAIL | `set +a` (all-export off) not supported, misconfiguring the test environment. Also an array literal whose element contains a background `&` operator is parsed differently than bash expects. |
 | array2 | FAIL | Test infrastructure: requires `recho` helper binary compiled from bash source. That binary is not present, so most test cases fail before reaching the array operations themselves. |
