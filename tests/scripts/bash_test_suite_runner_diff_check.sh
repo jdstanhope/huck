@@ -40,6 +40,23 @@ fi
 # Validate the status is a recognized value — pins runner classifies correctly.
 case "$status" in
     PASS|FAIL|TIMEOUT|ERROR)
+        # v217: nquote5 exercises recho heavily; it PASSes only when the runner
+        # provisions the recho/zecho/printenv helpers. This asserts the helper
+        # provisioning end-to-end.
+        DOUT=$(HUCK_BASH_TEST_CATEGORY=nquote5 bash tests/bash-test-suite/runner.sh 2>&1)
+        drc=$?
+        if [ "$drc" -ne 0 ]; then
+            echo "FAIL: runner exited $drc for nquote5"
+            echo "$DOUT"
+            exit 1
+        fi
+        dstatus=$(printf '%s\n' "$DOUT" | awk -F'|' '/^\| nquote5 / { gsub(/ /, "", $3); print $3 }')
+        if [ "$dstatus" != "PASS" ]; then
+            echo "FAIL: nquote5=$dstatus (expected PASS) — recho/zecho/printenv helpers not provisioned?"
+            echo "$DOUT"
+            exit 1
+        fi
+        echo "PASS [bash_test_suite_runner_diff_check] helpers provisioned (nquote5=PASS)"
         echo "PASS [bash_test_suite_runner_diff_check] runner mechanics OK (arith=$status)"
         exit 0
         ;;
