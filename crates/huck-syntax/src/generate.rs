@@ -3,9 +3,9 @@
 //! is round-trip idempotence (see tests). Built across v146 Tasks 1-3.
 #![allow(dead_code)] // entry points wired in Task 4; some helpers land in Tasks 2-3
 use crate::command::{
-    Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ExecCommand, ForClause,
-    IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp, TestExpr,
-    TestUnaryOp, WhileClause,
+    Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ElifBranch, ExecCommand,
+    ForClause, IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp,
+    TestExpr, TestUnaryOp, WhileClause,
 };
 use crate::lexer::{
     CaseDirection, ParamModifier, SubscriptKind, SubstAnchor, TildeSpec, TransformOp, Word,
@@ -34,16 +34,13 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
         Command::ArithFor(c) => arith_for_to_source(c, indent),
         Command::Select(c) => select_to_source(c, indent),
         Command::Case(c) => case_to_source(c, indent),
-        Command::BraceGroup(seq) => format!(
-            "{{\n{}{}}}",
-            body_block(seq, indent + 1),
-            pad(indent)
-        ),
-        Command::Subshell { body } => format!(
-            "(\n{}{})",
-            body_block(body, indent + 1),
-            pad(indent)
-        ),
+        Command::BraceGroup(seq) => {
+            format!("{{ \n{}{}}}", group_body(seq, indent + 1), pad(indent))
+        }
+        Command::Subshell { body } => {
+            // bash prints subshells inline at the SAME indent: `( <body> )`.
+            format!("( {} )", sequence_to_source(body, indent))
+        }
         Command::Arith(word) => format!("(({}))", arith_body_to_source(word)),
         Command::DoubleBracket {
             expr,
@@ -58,7 +55,21 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             s
         }
         Command::FunctionDef { name, body } => {
-            format!("{name} ()\n{}", command_to_source(body, indent))
+            // bash always wraps the body in `{ }`; a brace-group body is
+            // unwrapped (its inner sequence printed) to avoid double-bracing.
+            let inner = match body.as_ref() {
+                Command::BraceGroup(seq) => *seq.clone(),
+                other => Sequence {
+                    first: other.clone(),
+                    rest: Vec::new(),
+                    background: false,
+                },
+            };
+            format!(
+                "{name} () \n{p}{{ \n{}{p}}}",
+                group_body(&inner, indent + 1),
+                p = pad(indent)
+            )
         }
         Command::Coproc { name, body } => {
             let body_src = command_to_source(body, indent);
@@ -91,11 +102,19 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
     }
 }
 
-/// Render a compound-command body as one indented, `;`-terminated region:
-/// `<pad(indent)><sequence>;\n`. The body's own multi-command separators are
-/// handled by `sequence_to_source`; this just positions + terminates it.
-fn body_block(seq: &Sequence, indent: usize) -> String {
-    format!("{}{};\n", pad(indent), sequence_to_source(seq, indent))
+/// Group / function / subshell / case body: indented sequence, NO trailing
+/// `;`, terminated by a newline. (bash: these bodies never call `semicolon()`.)
+fn group_body(seq: &Sequence, indent: usize) -> String {
+    format!("{}{}\n", pad(indent), sequence_to_source(seq, indent))
+}
+
+/// if / while / until / for / arith-for / select body: indented sequence with
+/// bash's `semicolon()` terminator — a trailing `;` UNLESS the rendered body
+/// already ends in `&` (a background command) or `\n` (e.g. a heredoc).
+fn loop_body(seq: &Sequence, indent: usize) -> String {
+    let inner = sequence_to_source(seq, indent);
+    let semi = if inner.ends_with('&') || inner.ends_with('\n') { "" } else { ";" };
+    format!("{}{}{}\n", pad(indent), inner, semi)
 }
 
 /// Render a condition/header sequence inline (no indentation, no trailing
@@ -106,26 +125,42 @@ fn inline_seq(seq: &Sequence) -> String {
 
 fn if_to_source(c: &IfClause, indent: usize) -> String {
     let mut s = format!("if {}; then\n", inline_seq(&c.condition));
-    s.push_str(&body_block(&c.then_body, indent + 1));
-    for e in &c.elif_branches {
-        s.push_str(&pad(indent));
-        s.push_str(&format!("elif {}; then\n", inline_seq(&e.condition)));
-        s.push_str(&body_block(&e.body, indent + 1));
-    }
-    if let Some(eb) = &c.else_body {
-        s.push_str(&pad(indent));
-        s.push_str("else\n");
-        s.push_str(&body_block(eb, indent + 1));
-    }
+    s.push_str(&loop_body(&c.then_body, indent + 1));
+    s.push_str(&nested_elif(&c.elif_branches, &c.else_body, indent));
     s.push_str(&pad(indent));
     s.push_str("fi");
     s
 }
 
+/// bash has no `elif` node — it renders `elif` as a nested `else { if … fi; }`,
+/// deepening one indent level per branch. The inner `fi` takes a `;` (the outer
+/// `semicolon()`); the outermost `fi` (emitted by `if_to_source`) does not.
+fn nested_elif(
+    elifs: &[ElifBranch],
+    else_body: &Option<Sequence>,
+    indent: usize,
+) -> String {
+    if let Some((head, tail)) = elifs.split_first() {
+        let inner = indent + 1;
+        let mut s = format!("{}else\n", pad(indent));
+        s.push_str(&pad(inner));
+        s.push_str(&format!("if {}; then\n", inline_seq(&head.condition)));
+        s.push_str(&loop_body(&head.body, inner + 1));
+        s.push_str(&nested_elif(tail, else_body, inner));
+        s.push_str(&pad(inner));
+        s.push_str("fi;\n");
+        s
+    } else if let Some(eb) = else_body {
+        format!("{}else\n{}", pad(indent), loop_body(eb, indent + 1))
+    } else {
+        String::new()
+    }
+}
+
 fn while_to_source(c: &WhileClause, indent: usize) -> String {
     let kw = if c.until { "until" } else { "while" };
     let mut s = format!("{kw} {}; do\n", inline_seq(&c.condition));
-    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&loop_body(&c.body, indent + 1));
     s.push_str(&pad(indent));
     s.push_str("done");
     s
@@ -139,23 +174,29 @@ fn for_to_source(c: &ForClause, indent: usize) -> String {
             header.push(' ');
             header.push_str(&word_to_source(w));
         }
+    } else {
+        // bash desugars the no-`in` form to `in "$@"`; semantically identical.
+        header.push_str(" in \"$@\"");
     }
-    let mut s = format!("{header}; do\n");
-    s.push_str(&body_block(&c.body, indent + 1));
+    let mut s = format!("{header};\n{}do\n", pad(indent));
+    s.push_str(&loop_body(&c.body, indent + 1));
     s.push_str(&pad(indent));
     s.push_str("done");
     s
 }
 
 fn arith_for_to_source(c: &crate::command::ArithForClause, indent: usize) -> String {
-    let sec = |w: &Option<crate::lexer::Word>| w.as_ref().map(word_to_source).unwrap_or_default();
+    let sec = |w: &Option<crate::lexer::Word>| {
+        w.as_ref().map(arith_body_to_source).unwrap_or_default()
+    };
     let mut s = format!(
-        "for (({}; {}; {})); do\n",
+        "for (({}; {}; {}))\n{}do\n",
         sec(&c.init),
         sec(&c.cond),
-        sec(&c.step)
+        sec(&c.step),
+        pad(indent)
     );
-    s.push_str(&body_block(&c.body, indent + 1));
+    s.push_str(&loop_body(&c.body, indent + 1));
     s.push_str(&pad(indent));
     s.push_str("done");
     s
@@ -170,15 +211,15 @@ fn select_to_source(c: &SelectClause, indent: usize) -> String {
             header.push_str(&word_to_source(w));
         }
     }
-    let mut s = format!("{header}; do\n");
-    s.push_str(&body_block(&c.body, indent + 1));
+    let mut s = format!("{header};\n{}do\n", pad(indent));
+    s.push_str(&loop_body(&c.body, indent + 1));
     s.push_str(&pad(indent));
     s.push_str("done");
     s
 }
 
 fn case_to_source(c: &CaseClause, indent: usize) -> String {
-    let mut s = format!("case {} in\n", word_to_source(&c.subject));
+    let mut s = format!("case {} in \n", word_to_source(&c.subject));
     for item in &c.items {
         s.push_str(&case_item_to_source(item, indent + 1));
     }
@@ -196,7 +237,7 @@ fn case_item_to_source(item: &CaseItem, indent: usize) -> String {
         .join(" | ");
     let mut s = format!("{}{patterns})\n", pad(indent));
     if let Some(body) = &item.body {
-        s.push_str(&body_block(body, indent + 1));
+        s.push_str(&group_body(body, indent + 1)); // case body: no trailing `;`
     }
     let term = match item.terminator {
         CaseTerminator::Break => ";;",
@@ -331,10 +372,7 @@ fn sequence_to_source(seq: &Sequence, indent: usize) -> String {
             }
             Connector::And => out.push_str(" && "),
             Connector::Or => out.push_str(" || "),
-            Connector::Amp => {
-                out.push_str(" &\n");
-                out.push_str(&pad(indent));
-            }
+            Connector::Amp => out.push_str(" & "),
         }
         out.push_str(&command_to_source(cmd, indent));
     }
@@ -1096,5 +1134,106 @@ mod tests {
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
         assert!(s.contains("(( x + $y ))"), "got: {s:?}");
+    }
+
+    // ── Task 2 (v218): bash print_cmd.c exact-match tests ──
+    fn declf(src: &str) -> String {
+        use crate::{command, lexer};
+        let seq = command::parse(lexer::tokenize(src).unwrap()).unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else {
+            panic!("expected a function def")
+        };
+        function_to_source(&name, &body)
+    }
+
+    #[test]
+    fn declf_simple_last_semi_suppressed() {
+        assert_eq!(declf("f(){ echo a; echo b; }"),
+            "f () \n{ \n    echo a;\n    echo b\n}");
+    }
+    #[test]
+    fn declf_subshell_inline() {
+        assert_eq!(declf("f(){ ( exit 1 ); }"),
+            "f () \n{ \n    ( exit 1 )\n}");
+    }
+    #[test]
+    fn declf_subshell_multi() {
+        assert_eq!(declf("f(){ ( a; b ); }"),
+            "f () \n{ \n    ( a;\n    b )\n}");
+    }
+    #[test]
+    fn declf_group_multiline() {
+        assert_eq!(declf("f(){ { echo a; }; }"),
+            "f () \n{ \n    { \n        echo a\n    }\n}");
+    }
+    #[test]
+    fn declf_andor_inline() {
+        assert_eq!(declf("f(){ a && b || c; }"),
+            "f () \n{ \n    a && b || c\n}");
+    }
+    #[test]
+    fn declf_mid_background_inline() {
+        assert_eq!(declf("f(){ echo bg >/dev/null & echo next; }"),
+            "f () \n{ \n    echo bg > /dev/null & echo next\n}");
+    }
+    #[test]
+    fn declf_if() {
+        assert_eq!(declf("f(){ if a; then b; fi; }"),
+            "f () \n{ \n    if a; then\n        b;\n    fi\n}");
+    }
+    #[test]
+    fn declf_if_elif_else() {
+        assert_eq!(declf("f(){ if a; then b; elif c; then d; else e; fi; }"),
+            "f () \n{ \n    if a; then\n        b;\n    else\n        if c; then\n            d;\n        else\n            e;\n        fi;\n    fi\n}");
+    }
+    #[test]
+    fn declf_while() {
+        assert_eq!(declf("f(){ while a; do b; done; }"),
+            "f () \n{ \n    while a; do\n        b;\n    done\n}");
+    }
+    #[test]
+    fn declf_until() {
+        assert_eq!(declf("f(){ until a; do b; done; }"),
+            "f () \n{ \n    until a; do\n        b;\n    done\n}");
+    }
+    #[test]
+    fn declf_for_in() {
+        assert_eq!(declf("f(){ for x in 1 2; do echo $x; done; }"),
+            "f () \n{ \n    for x in 1 2;\n    do\n        echo $x;\n    done\n}");
+    }
+    #[test]
+    fn declf_for_noin() {
+        assert_eq!(declf("f(){ for x; do echo $x; done; }"),
+            "f () \n{ \n    for x in \"$@\";\n    do\n        echo $x;\n    done\n}");
+    }
+    #[test]
+    fn declf_arith_for() {
+        assert_eq!(declf("f(){ for ((i=0; i<3; i++)); do echo $i; done; }"),
+            "f () \n{ \n    for ((i=0; i<3; i++))\n    do\n        echo $i;\n    done\n}");
+    }
+    #[test]
+    fn declf_select() {
+        assert_eq!(declf("f(){ select x in a b; do echo $x; done; }"),
+            "f () \n{ \n    select x in a b;\n    do\n        echo $x;\n    done\n}");
+    }
+    #[test]
+    fn declf_case() {
+        assert_eq!(declf("f(){ case $x in a) echo A;; b|c) echo BC;; esac; }"),
+            "f () \n{ \n    case $x in \n        a)\n            echo A\n        ;;\n        b | c)\n            echo BC\n        ;;\n    esac\n}");
+    }
+    #[test]
+    fn declf_loop_bg_tail_no_semi() {
+        assert_eq!(declf("f(){ while a; do b & done; }"),
+            "f () \n{ \n    while a; do\n        b &\n    done\n}");
+    }
+    #[test]
+    fn declf_nested_compound_tail_gets_semi() {
+        assert_eq!(declf("f(){ while a; do for x in 1; do b; done; done; }"),
+            "f () \n{ \n    while a; do\n        for x in 1;\n        do\n            b;\n        done;\n    done\n}");
+    }
+    #[test]
+    fn declf_subshell_body_wrapped() {
+        assert_eq!(declf("f() ( echo hi )"),
+            "f () \n{ \n    ( echo hi )\n}");
     }
 }
