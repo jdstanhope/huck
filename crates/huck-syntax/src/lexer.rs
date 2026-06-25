@@ -4856,13 +4856,6 @@ mod tests {
         }]))
     }
 
-    fn vword_quoted(name: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Var {
-            name: name.to_string(),
-            quoted: true,
-        }]))
-    }
-
     #[test]
     fn tokenize_dollar_var_unquoted() {
         assert_eq!(tokenize("$FOO").unwrap(), vec![vword_unquoted("FOO")]);
