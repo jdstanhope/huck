@@ -1037,6 +1037,7 @@ fn declare_list_all_vars(
 fn declare_list_functions(
     names: &[String],
     names_only: bool,
+    want_export: bool,
     out: &mut dyn std::io::Write,
     shell: &mut Shell,
 ) -> ExecOutcome {
@@ -1044,6 +1045,10 @@ fn declare_list_functions(
         let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
         fnames.sort();
         for n in &fnames {
+            // bash applies the `-x` export filter only to the bulk listing.
+            if want_export && !shell.is_function_exported(n) {
+                continue;
+            }
             emit_function(n, names_only, false, out, shell); // listing: not explicit
         }
         return ExecOutcome::Continue(0);
@@ -1079,8 +1084,13 @@ fn emit_function(
             // bash `declare -F NAME` (specific name) → bare name.
             let _ = writeln!(out, "{name}");
         } else {
-            // bash `declare -F` (listing) → re-declarable header form.
-            let _ = writeln!(out, "declare -f {name}");
+            // bash `declare -F` (listing) → re-declarable header form;
+            // the listing reflects the export attribute.
+            if shell.is_function_exported(name) {
+                let _ = writeln!(out, "declare -fx {name}");
+            } else {
+                let _ = writeln!(out, "declare -f {name}");
+            }
         }
     } else if let Some(body) = shell.functions.get(name) {
         let _ = writeln!(out, "{}", crate::generate::function_to_source(name, body));
@@ -1804,7 +1814,13 @@ fn builtin_declare_decl(
                 DeclArg::Assign(_) => None,
             })
             .collect();
-        return declare_list_functions(&plain_names, function_names_only, out, shell);
+        return declare_list_functions(
+            &plain_names,
+            function_names_only,
+            want_export,
+            out,
+            shell,
+        );
     }
 
     // Bare `declare` (or `declare -p`) with no names: list everything.
@@ -11716,6 +11732,27 @@ mod declare_tests {
         let args = vec!["-F".to_string()];
         run_declaration_builtin_strs("declare", &args, &mut out, &mut err, &mut shell);
         assert_eq!(String::from_utf8(out).unwrap(), "declare -f f\ndeclare -f g\n");
+    }
+
+    #[test]
+    fn declare_big_f_listing_reflects_export_attr_and_filter() {
+        let mut shell = Shell::new();
+        define_fn(&mut shell, "a(){ :; }");
+        define_fn(&mut shell, "zf(){ :; }");
+        shell.mark_function_exported("zf");
+
+        // -F listing (want_export=false): plain `declare -f a`, exported `declare -fx zf`.
+        let mut out: Vec<u8> = Vec::new();
+        declare_list_functions(&[], true, false, &mut out, &mut shell);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "declare -f a\ndeclare -fx zf\n"
+        );
+
+        // -xF listing (want_export=true): only the exported function.
+        let mut out2: Vec<u8> = Vec::new();
+        declare_list_functions(&[], true, true, &mut out2, &mut shell);
+        assert_eq!(String::from_utf8(out2).unwrap(), "declare -fx zf\n");
     }
 
     #[test]

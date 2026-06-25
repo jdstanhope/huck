@@ -680,6 +680,13 @@ fn random_next(state: &std::cell::Cell<u64>) -> u32 {
     ((s >> 33) as u32) & 0x7fff
 }
 
+/// Variables the shell maintains itself and whose user writes bash silently
+/// discards (rc 0, no error). Currently FUNCNAME only; BASH_SOURCE/BASH_LINENO
+/// share the behavior but are top-level-populated and deferred.
+fn is_write_protected_var(name: &str) -> bool {
+    name == "FUNCNAME"
+}
+
 /// Special variables that are valid/known but not always present in the vars table
 /// (computed dynamics + the sometimes-unset call-stack arrays). Surfaced in variable-name
 /// completion and `compgen -v` so they complete like bash even when unset.
@@ -997,6 +1004,9 @@ impl Shell {
     /// executor sink is installed (e.g. direct unit tests), the diagnostic
     /// falls through to `io::stderr()`.
     pub fn set(&mut self, name: &str, value: String) {
+        if is_write_protected_var(name) {
+            return; // bash silently discards writes to FUNCNAME
+        }
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(name)
         {
@@ -1593,6 +1603,9 @@ impl Shell {
             None => return Ok(()), // cycle: warning emitted, write dropped (rc 0)
         };
         let name = dest.name().to_string();
+        if is_write_protected_var(&name) {
+            return Ok(()); // bash silently discards writes to FUNCNAME
+        }
 
         // Restricted-mode gate: refuse assignment to SHELL/PATH/ENV/BASH_ENV.
         // Mirrors the gate in `Shell::set`, but covers the user-facing path
@@ -2655,6 +2668,26 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funcname_assignment_is_silently_discarded() {
+        let mut sh = Shell::new();
+        // `set` path (used by `for`, internal writers).
+        sh.set("FUNCNAME", "7".to_string());
+        assert_eq!(sh.lookup_var("FUNCNAME"), None, "set must not write FUNCNAME");
+        // `assign` path (used by `FOO=v`, inline, declare, read via try_set).
+        let _ = sh.try_set("FUNCNAME", "9".to_string());
+        assert_eq!(sh.lookup_var("FUNCNAME"), None, "assign must not write FUNCNAME");
+    }
+
+    #[test]
+    fn non_protected_var_still_writes() {
+        let mut sh = Shell::new();
+        sh.set("FOO", "x".to_string());
+        assert_eq!(sh.lookup_var("FOO"), Some("x".to_string()));
+        let _ = sh.try_set("BAR", "y".to_string());
+        assert_eq!(sh.lookup_var("BAR"), Some("y".to_string()));
+    }
 
     #[test]
     fn glob_opts_reads_globstar_shopt() {
