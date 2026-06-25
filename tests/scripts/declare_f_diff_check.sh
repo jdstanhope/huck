@@ -41,6 +41,12 @@ fragments=(
   'f(){ echo hi; }; declare -F f'
   'f(){ for ((i=0; i<3; i++)); do echo $i; done; }; type f'
   'f(){ echo a; echo b; }; command -V f'
+  'f(){ echo "$a $b"; }; declare -f f'
+  "f(){ echo 'what a fabulous window treatment'; }; declare -f f"
+  'f(){ echo \$PWD in \$PATH; }; declare -f f'
+  "f(){ echo \\&\\|'()'; }; declare -f f"
+  'f(){ echo "a b""c d"; }; declare -f f'
+  "f(){ echo ab'cd'ef; }; declare -f f"
 )
 
 for frag in "${fragments[@]}"; do

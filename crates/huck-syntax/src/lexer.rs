@@ -450,7 +450,6 @@ fn tokenize_partial_inner(
     }
     let mut parts: Vec<WordPart> = Vec::new();
     let mut current = String::new();
-    let mut quoted_current = String::new();
     let mut has_token = false;
     let mut token_start: usize = 0;
     let mut token_start_line: u32 = 1;
@@ -555,25 +554,24 @@ fn tokenize_partial_inner(
             '\'' => {
                 has_token = true;
                 flush_literal(&mut parts, &mut current, false);
-                let parts_len_before = parts.len();
+                let mut run: Vec<WordPart> = Vec::new();
+                let mut buf = String::new();
                 loop {
                     match chars.next() {
                         Some('\'') => break,
-                        Some(ch) => quoted_current.push(ch),
+                        Some(ch) => buf.push(ch),
                         None => return Err(LexError::UnterminatedQuote),
                     }
                 }
-                flush_literal(&mut parts, &mut quoted_current, true);
-                if parts.len() == parts_len_before {
-                    // Empty `''` — preserve the empty-token contract by
-                    // emitting an empty quoted Literal.
-                    parts.push(WordPart::Literal { text: String::new(), quoted: true });
-                }
+                // empty '' still yields one empty quoted Literal (empty-token contract)
+                run.push(WordPart::Literal { text: buf, quoted: true });
+                parts.push(WordPart::Quoted { style: QuoteStyle::Single, parts: run });
             }
             '"' => {
                 has_token = true;
                 flush_literal(&mut parts, &mut current, false);
-                let parts_len_before = parts.len();
+                let mut run: Vec<WordPart> = Vec::new();
+                let mut qbuf = String::new();
                 loop {
                     match chars.next() {
                         Some('"') => break,
@@ -581,37 +579,38 @@ fn tokenize_partial_inner(
                             // POSIX: inside `"..."`, backslash is special only
                             // before `$`, `, `"`, `\`, and newline. For other
                             // characters, the backslash is retained literally.
-                            Some(esc @ ('"' | '\\' | '$' | '`')) => quoted_current.push(esc),
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => qbuf.push(esc),
                             // POSIX 2.2.3: `\<NL>` inside double quotes is also
                             // line continuation — both characters deleted.
                             Some('\n') => {}
                             Some(other) => {
-                                quoted_current.push('\\');
-                                quoted_current.push(other);
+                                qbuf.push('\\');
+                                qbuf.push(other);
                             }
                             None => return Err(LexError::UnterminatedQuote),
                         },
                         Some('$') => {
                             // Expansion inside double quotes (quoted: true).
-                            flush_literal(&mut parts, &mut quoted_current, true);
-                            scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
+                            flush_literal(&mut run, &mut qbuf, true);
+                            scan_dollar_expansion(&mut chars, &mut run, true, opts)?;
                         }
                         Some('`') => {
                             // Backtick substitution inside double quotes (quoted: true).
-                            flush_literal(&mut parts, &mut quoted_current, true);
+                            flush_literal(&mut run, &mut qbuf, true);
                             let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                            parts.push(WordPart::CommandSub { sequence, quoted: true });
+                            run.push(WordPart::CommandSub { sequence, quoted: true });
                         }
-                        Some(ch) => quoted_current.push(ch),
+                        Some(ch) => qbuf.push(ch),
                         None => return Err(LexError::UnterminatedQuote),
                     }
                 }
-                flush_literal(&mut parts, &mut quoted_current, true);
-                if parts.len() == parts_len_before {
+                flush_literal(&mut run, &mut qbuf, true);
+                if run.is_empty() {
                     // Empty `""` — preserve the empty-token contract by
                     // emitting an empty quoted Literal.
-                    parts.push(WordPart::Literal { text: String::new(), quoted: true });
+                    run.push(WordPart::Literal { text: String::new(), quoted: true });
                 }
+                parts.push(WordPart::Quoted { style: QuoteStyle::Double, parts: run });
             }
             '\\' => match chars.next() {
                 Some('\n') => {
@@ -622,12 +621,17 @@ fn tokenize_partial_inner(
                 }
                 Some(ch) => {
                     // Flush any accumulated unquoted text, then push the
-                    // escaped char as a one-char quoted Literal. This is
-                    // what makes `\*` survive pathname expansion as a
-                    // literal `*` (the `quoted` flag inhibits globbing).
+                    // escaped char as a one-char quoted Literal wrapped in a
+                    // Backslash run. This is what makes `\*` survive pathname
+                    // expansion as a literal `*` (the `quoted` flag inhibits
+                    // globbing) while recording the backslash quote style for
+                    // byte-exact reconstruction.
                     has_token = true;
                     flush_literal(&mut parts, &mut current, false);
-                    parts.push(WordPart::Literal { text: ch.to_string(), quoted: true });
+                    parts.push(WordPart::Quoted {
+                        style: QuoteStyle::Backslash,
+                        parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
+                    });
                 }
                 None => {
                     has_token = true;
@@ -1845,7 +1849,10 @@ fn scan_dollar_expansion(
         Some('\'') if !quoted => {
             chars.next();
             let text = scan_ansi_c_quoted(chars)?;
-            parts.push(WordPart::Literal { text, quoted: true });
+            parts.push(WordPart::Quoted {
+                style: QuoteStyle::AnsiC,
+                parts: vec![WordPart::Literal { text, quoted: true }],
+            });
         }
         // `$"…"` is bash's locale-translation quoting, special only outside double
         // quotes. huck has no message catalog, so the translation is the identity:
@@ -4263,8 +4270,51 @@ mod tests {
     }
 
     /// Builds a Token that holds a single quoted-Literal Word.
+    /// A single-quoted word: `'s'` → `Quoted{Single, [Literal{s, true}]}`.
     fn wq(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: true }]))
+        Token::Word(Word(vec![qsingle(s)]))
+    }
+    /// A double-quoted word with a single literal body: `"s"`.
+    fn wqd(s: &str) -> Token {
+        Token::Word(Word(vec![qdouble(vec![WordPart::Literal {
+            text: s.to_string(),
+            quoted: true,
+        }])]))
+    }
+    /// A backslash-escaped single char as a word: `\s`.
+    fn wqb(s: &str) -> Token {
+        Token::Word(Word(vec![qbackslash(s)]))
+    }
+    /// An ANSI-C quoted word: `$'s'` (s already decoded).
+    fn wqa(s: &str) -> Token {
+        Token::Word(Word(vec![WordPart::Quoted {
+            style: QuoteStyle::AnsiC,
+            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
+        }]))
+    }
+    /// A single-quote run as a `WordPart`.
+    fn qsingle(s: &str) -> WordPart {
+        WordPart::Quoted {
+            style: QuoteStyle::Single,
+            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
+        }
+    }
+    /// A double-quote run as a `WordPart`, given its inner parts.
+    fn qdouble(parts: Vec<WordPart>) -> WordPart {
+        WordPart::Quoted { style: QuoteStyle::Double, parts }
+    }
+    /// A backslash-escaped single char as a `WordPart`.
+    fn qbackslash(s: &str) -> WordPart {
+        WordPart::Quoted {
+            style: QuoteStyle::Backslash,
+            parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
+        }
+    }
+    /// Unwrap a `$'…'` (AnsiC) run, returning its single inner part.
+    fn ansi_c_inner(part: &WordPart) -> &WordPart {
+        let WordPart::Quoted { style: QuoteStyle::AnsiC, parts } = part
+        else { panic!("expected AnsiC run, got {part:?}") };
+        &parts[0]
     }
 
     /// Builds a Vec<Token> of all-Literal words.
@@ -4284,7 +4334,15 @@ mod tests {
             Token::Word(w) => w,
             other => panic!("expected Word, got {:?}", other),
         };
-        word.0.into_iter().next().expect("non-empty word")
+        let part = word.0.into_iter().next().expect("non-empty word");
+        // A `"${…}"` word wraps the expansion in a double-quote run; unwrap it
+        // so callers see the inner expansion part directly.
+        match part {
+            WordPart::Quoted { parts, .. } => {
+                parts.into_iter().next().expect("non-empty quoted run")
+            }
+            other => other,
+        }
     }
 
     /// Flattens the literal text parts of a `Word`, ignoring non-literal
@@ -4372,7 +4430,7 @@ mod tests {
     fn tokenize_hash_inside_double_quotes_is_literal() {
         assert_eq!(
             tokenize("echo \"# inside\"").unwrap(),
-            vec![w("echo"), wq("# inside")]
+            vec![w("echo"), wqd("# inside")]
         );
     }
 
@@ -4399,7 +4457,7 @@ mod tests {
         // POSIX 2.2.3: \<NL> retains its special meaning inside "...".
         assert_eq!(
             tokenize("\"foo\\\nbar\"").unwrap(),
-            vec![wq("foobar")]
+            vec![wqd("foobar")]
         );
     }
 
@@ -4423,7 +4481,7 @@ mod tests {
         // Was a bug: huck only recognized `\"`, `\\`, `\$` as escapes.
         assert_eq!(
             tokenize(r#""\`""#).unwrap(),
-            vec![wq("`")]
+            vec![wqd("`")]
         );
     }
 
@@ -4433,7 +4491,7 @@ mod tests {
         assert_eq!(
             tokenize(r"echo \#hash").unwrap(),
             vec![w("echo"), Token::Word(Word(vec![
-                WordPart::Literal { text: "#".to_string(), quoted: true },
+                qbackslash("#"),
                 WordPart::Literal { text: "hash".to_string(), quoted: false },
             ]))]
         );
@@ -4451,13 +4509,13 @@ mod tests {
     fn tokenize_double_quotes() {
         assert_eq!(
             tokenize("echo \"hello world\"").unwrap(),
-            vec![w("echo"), wq("hello world")]
+            vec![w("echo"), wqd("hello world")]
         );
     }
 
     #[test]
     fn tokenize_double_quote_escape() {
-        assert_eq!(tokenize(r#"echo "a\"b""#).unwrap(), vec![w("echo"), wq("a\"b")]);
+        assert_eq!(tokenize(r#"echo "a\"b""#).unwrap(), vec![w("echo"), wqd("a\"b")]);
     }
 
     #[test]
@@ -4473,7 +4531,7 @@ mod tests {
                 w("echo"),
                 Token::Word(Word(vec![
                     WordPart::Literal { text: "a".to_string(), quoted: false },
-                    WordPart::Literal { text: " ".to_string(), quoted: true },
+                    qbackslash(" "),
                     WordPart::Literal { text: "b".to_string(), quoted: false },
                 ])),
             ]
@@ -4489,7 +4547,7 @@ mod tests {
     fn backslash_escaped_metachar_is_quoted_literal() {
         let tokens = tokenize("\\*").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        assert_eq!(parts, &[WordPart::Literal { text: "*".to_string(), quoted: true }]);
+        assert_eq!(parts, &[qbackslash("*")]);
     }
 
     #[test]
@@ -4499,7 +4557,7 @@ mod tests {
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts, &[
             WordPart::Literal { text: "foo".to_string(), quoted: false },
-            WordPart::Literal { text: "*".to_string(), quoted: true },
+            qbackslash("*"),
             WordPart::Literal { text: "bar".to_string(), quoted: false },
         ]);
     }
@@ -4512,7 +4570,7 @@ mod tests {
             tokenize(r#"foo"bar baz""#).unwrap(),
             vec![Token::Word(Word(vec![
                 WordPart::Literal { text: "foo".to_string(), quoted: false },
-                WordPart::Literal { text: "bar baz".to_string(), quoted: true },
+                qdouble(vec![WordPart::Literal { text: "bar baz".to_string(), quoted: true }]),
             ]))]
         );
     }
@@ -4641,7 +4699,7 @@ mod tests {
     fn tokenize_quoted_operators_stay_words() {
         assert_eq!(
             tokenize(r#"echo "|" ">""#).unwrap(),
-            vec![w("echo"), wq("|"), wq(">")]
+            vec![w("echo"), wqd("|"), wqd(">")]
         );
     }
 
@@ -4650,7 +4708,7 @@ mod tests {
         // Escaped operators become quoted single-char Literals (one Word each).
         assert_eq!(
             tokenize(r"echo \| \>").unwrap(),
-            vec![w("echo"), wq("|"), wq(">")]
+            vec![w("echo"), wqb("|"), wqb(">")]
         );
     }
 
@@ -4758,7 +4816,7 @@ mod tests {
     fn tokenize_quoted_sequencing_operators_stay_words() {
         assert_eq!(
             tokenize(r#"echo "&&" "||" ";""#).unwrap(),
-            vec![w("echo"), wq("&&"), wq("||"), wq(";")]
+            vec![w("echo"), wqd("&&"), wqd("||"), wqd(";")]
         );
     }
 
@@ -4767,14 +4825,11 @@ mod tests {
         // Each `\X` becomes its own quoted single-char Literal part. Adjacent
         // escapes within the same token concatenate into one Word with N parts.
         let two_quoted = |a: &str, b: &str| {
-            Token::Word(Word(vec![
-                WordPart::Literal { text: a.to_string(), quoted: true },
-                WordPart::Literal { text: b.to_string(), quoted: true },
-            ]))
+            Token::Word(Word(vec![qbackslash(a), qbackslash(b)]))
         };
         assert_eq!(
             tokenize(r"echo \&\& \|\| \;").unwrap(),
-            vec![w("echo"), two_quoted("&", "&"), two_quoted("|", "|"), wq(";")]
+            vec![w("echo"), two_quoted("&", "&"), two_quoted("|", "|"), wqb(";")]
         );
     }
 
@@ -4820,7 +4875,13 @@ mod tests {
 
     #[test]
     fn tokenize_dollar_var_in_double_quotes_is_quoted() {
-        assert_eq!(tokenize("\"$FOO\"").unwrap(), vec![vword_quoted("FOO")]);
+        assert_eq!(
+            tokenize("\"$FOO\"").unwrap(),
+            vec![Token::Word(Word(vec![qdouble(vec![WordPart::Var {
+                name: "FOO".to_string(),
+                quoted: true,
+            }])]))]
+        );
     }
 
     #[test]
@@ -4830,7 +4891,10 @@ mod tests {
         let toks = tokenize("\"$'\"").unwrap();
         assert_eq!(toks.len(), 1);
         let Token::Word(Word(parts)) = &toks[0] else { panic!("not a word: {toks:?}") };
-        let joined: String = parts.iter().map(|p| match p {
+        // The body is a single double-quote run wrapping literal parts.
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        let joined: String = inner.iter().map(|p| match p {
             WordPart::Literal { text, .. } => text.clone(),
             other => panic!("unexpected part {other:?}"),
         }).collect();
@@ -4841,14 +4905,14 @@ mod tests {
     fn tokenize_dollar_dquote_locale_drops_dollar() {
         // v181: `$"x"` is locale-translation quoting = identity; the `$` is
         // dropped and the body is a plain double-quoted literal `x`.
-        assert_eq!(tokenize("$\"x\"").unwrap(), vec![wq("x")]);
+        assert_eq!(tokenize("$\"x\"").unwrap(), vec![wqd("x")]);
     }
 
     #[test]
     fn tokenize_unquoted_ansi_c_still_decodes() {
         // v181 regression: unquoted `$'…'` ANSI-C escapes still decode (the
         // `!quoted` guard must not disturb the outside-double-quotes path).
-        assert_eq!(tokenize("$'a\\tb'").unwrap(), vec![wq("a\tb")]);
+        assert_eq!(tokenize("$'a\\tb'").unwrap(), vec![wqa("a\tb")]);
     }
 
     #[test]
@@ -4955,7 +5019,7 @@ mod tests {
 
     #[test]
     fn tokenize_tilde_in_quotes_is_literal() {
-        assert_eq!(tokenize("\"~\"").unwrap(), vec![wq("~")]);
+        assert_eq!(tokenize("\"~\"").unwrap(), vec![wqd("~")]);
     }
 
     #[test]
@@ -5000,7 +5064,7 @@ mod tests {
 
     #[test]
     fn tokenize_escaped_dollar_in_double_quotes_is_literal() {
-        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), vec![wq("$FOO")]);
+        assert_eq!(tokenize(r#""\$FOO""#).unwrap(), vec![wqd("$FOO")]);
     }
 
     #[test]
@@ -5054,10 +5118,10 @@ mod tests {
     fn tokenize_command_sub_quoted_in_double_quotes() {
         assert_eq!(
             tokenize("\"$(echo hi)\"").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
+            vec![sub_word(vec![qdouble(vec![WordPart::CommandSub {
                 sequence: echo_seq(&["hi"]),
                 quoted: true,
-            }])]
+            }])])]
         );
     }
 
@@ -5097,7 +5161,7 @@ mod tests {
                 commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
                     inline_assignments: Vec::new(),
                     program: Word(vec![WordPart::Literal { text: "echo".to_string(), quoted: false }]),
-                    args: vec![Word(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])],
+                    args: vec![Word(vec![qdouble(vec![WordPart::Literal { text: ")".to_string(), quoted: true }])])],
                     redirects: Vec::new(),
                     line: 0,
                 }))],
@@ -5267,10 +5331,10 @@ mod tests {
     fn tokenize_backtick_in_double_quotes_is_quoted() {
         assert_eq!(
             tokenize("\"`echo hi`\"").unwrap(),
-            vec![sub_word(vec![WordPart::CommandSub {
+            vec![sub_word(vec![qdouble(vec![WordPart::CommandSub {
                 sequence: echo_seq(&["hi"]),
                 quoted: true,
-            }])]
+            }])])]
         );
     }
 
@@ -5358,9 +5422,15 @@ mod tests {
                         crate::command::Command::Simple(crate::command::SimpleCommand::Exec(e)) => {
                             // Inner body `echo \n` — outer tokenizer's `\n` becomes `n`
                             assert_eq!(e.args.len(), 1);
+                            // `\n` → a backslash run wrapping literal `n`.
                             match &e.args[0].0[0] {
-                                WordPart::Literal { text, .. } => assert_eq!(text, "n"),
-                                other => panic!("expected Literal(n), got {other:?}"),
+                                WordPart::Quoted { style: QuoteStyle::Backslash, parts } => {
+                                    match &parts[0] {
+                                        WordPart::Literal { text, .. } => assert_eq!(text, "n"),
+                                        other => panic!("expected Literal(n), got {other:?}"),
+                                    }
+                                }
+                                other => panic!("expected backslash run, got {other:?}"),
                             }
                         }
                         other => panic!("expected Simple(Exec), got {other:?}"),
@@ -5498,7 +5568,7 @@ mod tests {
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         // Expect quoted "F", unquoted "OO=bar" — no assignment split.
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], WordPart::Literal { text: "F".to_string(), quoted: true });
+        assert_eq!(parts[0], qdouble(vec![WordPart::Literal { text: "F".to_string(), quoted: true }]));
         assert_eq!(parts[1], WordPart::Literal { text: "OO=bar".to_string(), quoted: false });
     }
 
@@ -5539,7 +5609,7 @@ mod tests {
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
-        assert_eq!(parts[1], WordPart::Literal { text: "bar".to_string(), quoted: true });
+        assert_eq!(parts[1], qdouble(vec![WordPart::Literal { text: "bar".to_string(), quoted: true }]));
         assert_eq!(parts[2], WordPart::Literal { text: "baz".to_string(), quoted: false });
     }
 
@@ -5626,11 +5696,13 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
         assert_eq!(parts.len(), 1);
-        let WordPart::Arith { quoted, .. } = &parts[0] else {
-            panic!("expected Arith part, got {:?}", parts[0])
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        let WordPart::Arith { quoted, .. } = &inner[0] else {
+            panic!("expected Arith part, got {:?}", inner[0])
         };
         assert!(*quoted);
-        assert_eq!(arith_body_lit(&parts[0]), "1+2");
+        assert_eq!(arith_body_lit(&inner[0]), "1+2");
     }
 
     #[test]
@@ -5653,7 +5725,9 @@ mod tests {
     fn tokenize_arith_inside_double_quotes_is_quoted() {
         let tokens = tokenize("\"$((1+2))\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        let WordPart::Arith { quoted, .. } = &parts[0] else { panic!() };
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        let WordPart::Arith { quoted, .. } = &inner[0] else { panic!() };
         assert!(*quoted);
     }
 
@@ -6412,7 +6486,9 @@ mod tests {
     fn tokenize_quoted_outer_param_expansion() {
         let tokens = tokenize("\"${X:-w}\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        let WordPart::ParamExpansion { quoted, .. } = &parts[0] else { panic!() };
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        let WordPart::ParamExpansion { quoted, .. } = &inner[0] else { panic!() };
         assert!(*quoted);
     }
 
@@ -6469,10 +6545,7 @@ mod tests {
         let tokens = tokenize("\"a\nb\"").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::Literal {
-                text: "a\nb".to_string(),
-                quoted: true,
-            }]))]
+            vec![wqd("a\nb")]
         );
     }
 
@@ -6481,10 +6554,7 @@ mod tests {
         let tokens = tokenize("'a\nb'").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::Literal {
-                text: "a\nb".to_string(),
-                quoted: true,
-            }]))]
+            vec![wq("a\nb")]
         );
     }
 
@@ -6621,9 +6691,9 @@ mod tests {
         let tokens = tokenize("\"$@\"").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::AllArgs {
+            vec![Token::Word(Word(vec![qdouble(vec![WordPart::AllArgs {
                 joined: false, quoted: true
-            }]))]
+            }])]))]
         );
     }
 
@@ -6953,14 +7023,18 @@ mod tests {
     fn lexer_dollar_dollar_inside_double_quotes() {
         let tokens = tokenize("\"$$\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        assert!(matches!(&parts[0], WordPart::Var { name, quoted: true } if name == "$"));
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "$"));
     }
 
     #[test]
     fn lexer_dollar_bang_inside_double_quotes() {
         let tokens = tokenize("\"$!\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
-        assert!(matches!(&parts[0], WordPart::Var { name, quoted: true } if name == "!"));
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "!"));
     }
 
     #[test]
@@ -6994,7 +7068,9 @@ mod tests {
     fn tokenize_here_string_with_quoted_word() {
         let tokens = tokenize("cat <<< \"hi there\"").unwrap();
         let Token::Word(Word(parts)) = &tokens[2] else { panic!("got {:?}", tokens[2]) };
-        assert!(matches!(&parts[0], WordPart::Literal { text, quoted: true } if text == "hi there"));
+        let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
+        else { panic!("expected one double-quote run: {parts:?}") };
+        assert!(matches!(&inner[0], WordPart::Literal { text, quoted: true } if text == "hi there"));
     }
 
     #[test]
@@ -7420,7 +7496,7 @@ mod tests {
         match &toks[0] {
             Token::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 1);
-                match &parts[0] {
+                match ansi_c_inner(&parts[0]) {
                     WordPart::Literal { text, quoted } => {
                         assert_eq!(text, "a\nb");
                         assert!(*quoted, "expected quoted Literal");
@@ -7437,7 +7513,7 @@ mod tests {
         let toks = tokenize("$'a\\tb'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "a\tb");
         assert!(*quoted);
     }
@@ -7448,7 +7524,7 @@ mod tests {
         let toks = tokenize("$'\\\\\\''").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\\'");
     }
 
@@ -7457,7 +7533,7 @@ mod tests {
         // \x48\x69 → "Hi"
         let toks = tokenize("$'\\x48\\x69'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "Hi");
     }
 
@@ -7466,7 +7542,7 @@ mod tests {
         // \110\151 → "Hi"  (0o110=72='H', 0o151=105='i')
         let toks = tokenize("$'\\110\\151'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "Hi");
     }
 
@@ -7475,7 +7551,7 @@ mod tests {
         // \18 → \1 followed by literal '8' → "\x01" + "8"
         let toks = tokenize("$'\\18'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\x018");
     }
 
@@ -7484,7 +7560,7 @@ mod tests {
         // é → é (U+00E9, "LATIN SMALL LETTER E WITH ACUTE")
         let toks = tokenize("$'\\u00e9'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "é");
     }
 
@@ -7493,7 +7569,7 @@ mod tests {
         // \U0001F600 → 😀 (grinning face)
         let toks = tokenize("$'\\U0001F600'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\u{1F600}");
     }
 
@@ -7502,7 +7578,7 @@ mod tests {
         // \cA → \x01, \cZ → \x1A
         let toks = tokenize("$'\\cA\\cZ'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\x01\x1a");
     }
 
@@ -7511,7 +7587,7 @@ mod tests {
         // \q → literal "\q" (two chars)
         let toks = tokenize("$'\\q'").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
-        let WordPart::Literal { text, .. } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\\q");
     }
 
@@ -7520,7 +7596,7 @@ mod tests {
         let toks = tokenize("$''").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
-        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal") };
+        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "");
         assert!(*quoted);
     }
@@ -7544,7 +7620,7 @@ mod tests {
         let toks = tokenize("$'a\\nb'foo").expect("lex");
         let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
         assert_eq!(parts.len(), 2);
-        let WordPart::Literal { text, quoted } = &parts[0] else { panic!("expected Literal at [0]") };
+        let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal at [0]") };
         assert_eq!(text, "a\nb");
         assert!(*quoted);
         let WordPart::Literal { text, quoted } = &parts[1] else { panic!("expected Literal at [1]") };
@@ -7820,7 +7896,13 @@ mod array_parse_tests {
         for cmd in &pipeline.commands {
             if let Command::Simple(SimpleCommand::Exec(e)) = cmd {
                 for w in std::iter::once(&e.program).chain(e.args.iter()) {
-                    for part in &w.0 {
+                    // Flatten one level of quoted runs so a `"${a[@]}"` expansion
+                    // (now nested inside a double-quote run) is still found.
+                    let flat = w.0.iter().flat_map(|p| match p {
+                        WordPart::Quoted { parts, .. } => parts.iter().collect::<Vec<_>>(),
+                        other => vec![other],
+                    });
+                    for part in flat {
                         if let WordPart::ParamExpansion { name: n, .. } = part
                             && n == name
                         {

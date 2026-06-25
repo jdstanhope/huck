@@ -1365,4 +1365,20 @@ mod tests {
             parts: vec![WordPart::Literal { text: "i\n".into(), quoted: true }] }]);
         assert_eq!(word_to_source(&w), "$'i\\n'");
     }
+
+    // ── Task 2 (v219): end-to-end byte-exact reconstruction of quoted words ──
+    fn declf_word(body_word_src: &str) -> String {
+        use crate::{command, lexer};
+        let src = format!("f(){{ echo {body_word_src}; }}");
+        let seq = command::parse(lexer::tokenize(&src).unwrap()).unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        function_to_source(&name, &body)
+    }
+
+    #[test] fn rt_quote_single()   { assert!(declf_word("'what a window'").contains("echo 'what a window'")); }
+    #[test] fn rt_quote_dq_span()  { assert!(declf_word("\"$a $b\"").contains("echo \"$a $b\"")); }
+    #[test] fn rt_quote_backslash(){ assert!(declf_word("\\$PWD").contains("echo \\$PWD")); }
+    #[test] fn rt_quote_adjacent() { assert!(declf_word("\"a b\"\"c d\"").contains("echo \"a b\"\"c d\"")); }
+    #[test] fn rt_quote_mixed()    { assert!(declf_word("ab'cd'ef").contains("echo ab'cd'ef")); }
+    #[test] fn rt_quote_specials() { assert!(declf_word("\\&\\|'()'").contains("echo \\&\\|'()'")); }
 }
