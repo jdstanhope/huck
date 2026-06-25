@@ -934,6 +934,15 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.scalar_view().to_string())
     }
 
+    /// Parse $FUNCNEST. Some(n) for a positive integer limit; None (unlimited)
+    /// for unset / 0 / negative / non-numeric — matching bash.
+    pub fn funcnest_limit(&self) -> Option<usize> {
+        self.lookup_var("FUNCNEST")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n as usize)
+    }
+
     /// Return the raw `Variable` (value + attribute flags) for `name`,
     /// following nameref chains. Used by `array_transforms` to read the
     /// var kind (`Scalar`/`Indexed`/`Associative`) and the per-var
@@ -2678,6 +2687,22 @@ mod tests {
         // `assign` path (used by `FOO=v`, inline, declare, read via try_set).
         let _ = sh.try_set("FUNCNAME", "9".to_string());
         assert_eq!(sh.lookup_var("FUNCNAME"), None, "assign must not write FUNCNAME");
+    }
+
+    #[test]
+    fn funcnest_limit_parses_positive_else_none() {
+        let mut sh = Shell::new();
+        assert_eq!(sh.funcnest_limit(), None);                 // unset
+        sh.set("FUNCNEST", "0".to_string());
+        assert_eq!(sh.funcnest_limit(), None);                 // 0 = unlimited
+        sh.set("FUNCNEST", "-3".to_string());
+        assert_eq!(sh.funcnest_limit(), None);                 // negative = unlimited
+        sh.set("FUNCNEST", "abc".to_string());
+        assert_eq!(sh.funcnest_limit(), None);                 // non-numeric = unlimited
+        sh.set("FUNCNEST", "5".to_string());
+        assert_eq!(sh.funcnest_limit(), Some(5));
+        sh.set("FUNCNEST", " 5 ".to_string());
+        assert_eq!(sh.funcnest_limit(), Some(5));              // trimmed
     }
 
     #[test]
