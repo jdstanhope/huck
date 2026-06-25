@@ -110,20 +110,27 @@ pub(crate) fn eval_subscript_key(
     crate::param_expansion::expand_word_to_string(subscript, shell)
 }
 
-/// Bash-faithful arithmetic evaluation of an arith body `Word`: expand all
-/// `$`-forms + quotes first (as `eval_subscript` does for subscripts), then
-/// parse and evaluate. Empty/all-whitespace expansion is `0` (bash: `$(())`==0).
+/// Returns the expanded arith source string and the eval result, so callers
+/// can render bash-compatible errors (which echo the source + error token).
+pub(crate) fn eval_arith_word_src(
+    body: &Word,
+    shell: &mut Shell,
+) -> (String, Result<i64, crate::arith::ArithError>) {
+    let s = crate::param_expansion::expand_word_to_string(body, shell);
+    if s.trim().is_empty() {
+        return (s, Ok(0));
+    }
+    let res = crate::arith::parse(&s).and_then(|e| crate::arith::eval(&e, shell));
+    (s, res)
+}
+
+/// Back-compat thin wrapper for callers that only need the value
+/// (arith-`for`, `${a[i]}` coercion, etc.).
 pub(crate) fn eval_arith_word(
     body: &Word,
     shell: &mut Shell,
 ) -> Result<i64, crate::arith::ArithError> {
-    let s = crate::param_expansion::expand_word_to_string(body, shell);
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(0);
-    }
-    let expr = crate::arith::parse(t)?;
-    crate::arith::eval(&expr, shell)
+    eval_arith_word_src(body, shell).1
 }
 
 /// Arith-evaluates an array subscript `Word` to a `usize`, honouring
@@ -1111,7 +1118,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                 emit_split_fields(&output, &ifs, &mut current, &mut result, &mut has_emitted);
             }
             WordPart::Arith { body, quoted: _ } => {
-                match eval_arith_word(body, shell) {
+                let (src, res) = eval_arith_word_src(body, shell);
+                match res {
                     Ok(n) => {
                         current.push_str(&n.to_string(), true);
                         has_emitted = true;
@@ -1122,7 +1130,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
                         // contribution here matches bash's empty $((..)) value
                         // on error. (-c mode divergence: L-55 in
                         // bash-divergences.md.)
-                        with_err(|err| e!(err, "huck: arithmetic: {}", e));
+                        let prefix = shell.error_prefix(None);
+                        with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
                         has_emitted = true;
                     }
                 }
@@ -1566,14 +1575,16 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 result.push_str(&run_substitution(sequence, shell));
             }
             WordPart::Arith { body, quoted: _ } => {
-                match eval_arith_word(body, shell) {
+                let (src, res) = eval_arith_word_src(body, shell);
+                match res {
                     Ok(n) => result.push_str(&n.to_string()),
                     Err(e) => {
                         // Print the error but DO NOT halt — bash script-file
                         // mode prints and continues. Empty contribution to
                         // the assignment value matches bash. (-c mode
                         // divergence: L-55.)
-                        with_err(|err| e!(err, "huck: arithmetic: {}", e));
+                        let prefix = shell.error_prefix(None);
+                        with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
                     }
                 }
             }

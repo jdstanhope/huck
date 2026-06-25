@@ -33,23 +33,17 @@ pub(crate) enum ArithToken {
 /// Parses hex digits 0-9, a-f, A-F after the `0x` / `0X` prefix has
 /// been consumed. Returns the i64 value. Errors on no digits, invalid
 /// digits, or out-of-range value.
-fn parse_hex_digits(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<i64, ArithError> {
+fn parse_hex_digits(bytes: &[u8], i: &mut usize) -> Result<i64, ArithError> {
     let mut s = String::new();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_hexdigit() {
-            s.push(c);
-            chars.next();
-        } else {
-            break;
-        }
+    while *i < bytes.len() && (bytes[*i] as char).is_ascii_hexdigit() {
+        s.push(bytes[*i] as char);
+        *i += 1;
     }
     if s.is_empty() {
-        return Err(ArithError::Parse("hex literal requires at least one digit".to_string()));
+        return Err(ArithError::parse("hex literal requires at least one digit"));
     }
     i64::from_str_radix(&s, 16).map_err(|_|
-        ArithError::Parse(format!("hex literal out of range: 0x{s}")))
+        ArithError::parse(format!("hex literal out of range: 0x{s}")))
 }
 
 /// Parses base-N digits after the `N#` prefix has been consumed. The
@@ -61,13 +55,16 @@ fn parse_hex_digits(
 ///   _   → 63
 /// For bases ≤ 36, a-z and A-Z are both valid as 10-35 (case-insensitive).
 /// For bases > 36, a-z (10-35) and A-Z (36-61) are distinct.
-fn parse_base_n_digits(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    base: u32,
-) -> Result<i64, ArithError> {
+///
+/// Returns bash-mapped error kinds for positioned errors (caller adds offset):
+///   digit >= base     → `ValueTooGreatForBase`
+///   no digits         → `InvalidIntegerConstant`
+///   overflow          → legacy `ArithError::parse(...)` (out-of-scope)
+fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, ArithError> {
     let mut value: i64 = 0;
     let mut any_digit = false;
-    while let Some(&c) = chars.peek() {
+    while *i < bytes.len() {
+        let c = bytes[*i] as char;
         let digit = match c {
             '0'..='9' => (c as u32) - ('0' as u32),
             'a'..='z' => (c as u32) - ('a' as u32) + 10,
@@ -85,251 +82,311 @@ fn parse_base_n_digits(
             _ => break,
         };
         if digit >= base {
-            return Err(ArithError::Parse(format!(
-                "invalid digit for base {base}: '{c}'"
-            )));
+            return Err(ArithError { kind: ArithErrorKind::ValueTooGreatForBase, offset: None, token_end: None });
         }
         value = value
             .checked_mul(base as i64)
             .and_then(|v| v.checked_add(digit as i64))
-            .ok_or_else(|| ArithError::Parse(format!(
+            .ok_or_else(|| ArithError::parse(format!(
                 "base-{base} literal out of range"
             )))?;
         any_digit = true;
-        chars.next();
+        *i += 1;
     }
     if !any_digit {
-        return Err(ArithError::Parse(format!(
-            "base-{base} literal requires at least one digit"
-        )));
+        return Err(ArithError { kind: ArithErrorKind::InvalidIntegerConstant, offset: None, token_end: None });
     }
     Ok(value)
 }
 
-pub(crate) fn tokenize(input: &str) -> Result<Vec<ArithToken>, ArithError> {
+/// Returns the exclusive end of the maximal number-token run starting at
+/// `start`: the run of bytes in `[A-Za-z0-9#@_]`. bash consumes the whole run
+/// before validating, so the error token covers the full run even when the
+/// fault (e.g. base > 64) is detected earlier.
+fn number_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut e = start;
+    while e < bytes.len() {
+        let b = bytes[e];
+        let is_run = b.is_ascii_alphanumeric() || b == b'#' || b == b'@' || b == b'_';
+        if !is_run { break; }
+        e += 1;
+    }
+    e
+}
+
+pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), ArithError> {
     let mut out = Vec::new();
-    let mut chars = input.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        match c {
-            ' ' | '\t' | '\n' | '\r' => { chars.next(); }
-            '0'..='9' => {
+    let mut offsets = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => { i += 1; }
+            b'0'..=b'9' => {
+                let num_start = i;
                 // Read greedy leading decimal digits.
                 let mut digits = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() { digits.push(d); chars.next(); } else { break; }
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    digits.push(bytes[i] as char);
+                    i += 1;
                 }
-                let n: i64 = if chars.peek() == Some(&'#') {
+                let n: i64 = if i < bytes.len() && bytes[i] == b'#' {
                     // Base-N literal: leading digits parsed as decimal base.
-                    chars.next();
-                    let base: u32 = digits.parse()
-                        .map_err(|_| ArithError::Parse(format!("invalid base: {digits}")))?;
-                    if !(2..=64).contains(&base) {
-                        return Err(ArithError::Parse(format!(
-                            "base must be 2-64, got {base}"
-                        )));
+                    // bash reports the FULL number run as the error token
+                    // (`[A-Za-z0-9#@_]*` from num_start), regardless of where in
+                    // the run the error was detected.
+                    i += 1;
+                    let base: u32 = digits.parse().map_err(|_| ArithError::at_span(
+                        ArithErrorKind::InvalidNumber, num_start, number_run_end(bytes, num_start),
+                    ))?;
+                    if base > 64 {
+                        return Err(ArithError::at_span(
+                            ArithErrorKind::InvalidBase, num_start, number_run_end(bytes, num_start),
+                        ));
                     }
-                    parse_base_n_digits(&mut chars, base)?
-                } else if digits == "0" && matches!(chars.peek(), Some('x') | Some('X')) {
+                    if base < 2 {
+                        return Err(ArithError::at_span(
+                            ArithErrorKind::InvalidNumber, num_start, number_run_end(bytes, num_start),
+                        ));
+                    }
+                    parse_base_n_digits(bytes, &mut i, base).map_err(|e| match e.kind {
+                        ArithErrorKind::InvalidIntegerConstant
+                        | ArithErrorKind::ValueTooGreatForBase => ArithError::at_span(
+                            e.kind, num_start, number_run_end(bytes, num_start),
+                        ),
+                        _ => e,
+                    })?
+                } else if digits == "0"
+                    && i < bytes.len()
+                    && (bytes[i] == b'x' || bytes[i] == b'X')
+                {
                     // Hex literal: 0x... / 0X...
-                    chars.next();
-                    parse_hex_digits(&mut chars)?
+                    i += 1;
+                    parse_hex_digits(bytes, &mut i)?
                 } else if digits.len() > 1 && digits.starts_with('0') {
                     // Octal literal: 010 → 8. All digits must be 0-7.
                     i64::from_str_radix(&digits, 8)
-                        .map_err(|_| ArithError::Parse(format!(
+                        .map_err(|_| ArithError::parse(format!(
                             "invalid octal literal: {digits}"
                         )))?
                 } else {
                     digits.parse()
-                        .map_err(|_| ArithError::Parse(format!(
+                        .map_err(|_| ArithError::parse(format!(
                             "integer literal out of range: {digits}"
                         )))?
                 };
+                offsets.push(num_start);
                 out.push(ArithToken::Number(n));
             }
             // Unreachable post-v93 for the three arith *contexts* (`(( ))`,
             // `$(( ))`, arith-`for`): those expand `$`-forms before calling
             // `arith::parse`. Kept defensive for any other `arith::parse`
             // caller (e.g. integer-coerce on a value still bearing a `$`).
-            '$' => {
-                chars.next();
+            b'$' => {
+                let start = i;
+                i += 1;
                 let mut s = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d == '_' || d.is_ascii_alphanumeric() {
-                        s.push(d); chars.next();
-                    } else { break; }
+                while i < bytes.len()
+                    && (bytes[i] == b'_' || (bytes[i] as char).is_ascii_alphanumeric())
+                {
+                    s.push(bytes[i] as char);
+                    i += 1;
                 }
                 if s.is_empty() {
-                    return Err(ArithError::Parse(
-                        "expected identifier after '$'".to_string()));
+                    return Err(ArithError::parse("expected identifier after '$'"));
                 }
+                offsets.push(start);
                 out.push(ArithToken::Ident(s));
             }
-            c if c == '_' || c.is_ascii_alphabetic() => {
+            b if b == b'_' || (b as char).is_ascii_alphabetic() => {
+                let start = i;
                 let mut s = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d == '_' || d.is_ascii_alphanumeric() {
-                        s.push(d); chars.next();
-                    } else { break; }
+                while i < bytes.len()
+                    && (bytes[i] == b'_' || (bytes[i] as char).is_ascii_alphanumeric())
+                {
+                    s.push(bytes[i] as char);
+                    i += 1;
                 }
+                offsets.push(start);
                 out.push(ArithToken::Ident(s));
             }
-            '(' => { chars.next(); out.push(ArithToken::LParen); }
-            ')' => { chars.next(); out.push(ArithToken::RParen); }
-            '[' => {
+            b'(' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::LParen);
+            }
+            b')' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::RParen);
+            }
+            b'[' => {
                 // Capture the RAW inner text up to the matching ']' (for the
                 // associative-key case), tracking bracket nesting so that
                 // e.g. `a[b[0]]` captures `b[0]`. The inner tokens are still
                 // produced by the main loop after this LBracket.
-                chars.next();
+                let start = i;
+                i += 1;
                 let mut raw = String::new();
                 let mut depth = 1i32;
-                let mut lookahead = chars.clone();
-                while let Some(&d) = lookahead.peek() {
-                    match d {
-                        '[' => depth += 1,
-                        ']' => {
-                            depth -= 1;
-                            if depth == 0 { break; }
-                        }
+                let mut j = i;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'[' => depth += 1,
+                        b']' => { depth -= 1; if depth == 0 { break; } }
                         _ => {}
                     }
-                    raw.push(d);
-                    lookahead.next();
+                    raw.push(bytes[j] as char);
+                    j += 1;
                 }
+                offsets.push(start);
                 out.push(ArithToken::LBracket(raw));
             }
-            ']' => { chars.next(); out.push(ArithToken::RBracket); }
-            ',' => { chars.next(); out.push(ArithToken::Comma); }
-            '+' => {
-                chars.next();
-                match chars.peek() {
-                    Some('+') => { chars.next(); out.push(ArithToken::PlusPlus); }
-                    Some('=') => { chars.next(); out.push(ArithToken::PlusEq); }
-                    _ => out.push(ArithToken::Plus),
-                }
+            b']' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::RBracket);
             }
-            '-' => {
-                chars.next();
-                match chars.peek() {
-                    Some('-') => { chars.next(); out.push(ArithToken::MinusMinus); }
-                    Some('=') => { chars.next(); out.push(ArithToken::MinusEq); }
-                    _ => out.push(ArithToken::Minus),
-                }
+            b',' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::Comma);
             }
-            '*' => {
-                chars.next();
-                match chars.peek() {
-                    Some('*') => { chars.next(); out.push(ArithToken::Power); }
-                    Some('=') => { chars.next(); out.push(ArithToken::StarEq); }
-                    _ => out.push(ArithToken::Star),
-                }
-            }
-            '/' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::SlashEq);
+            b'+' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'+' {
+                    i += 1; offsets.push(start); out.push(ArithToken::PlusPlus);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::PlusEq);
                 } else {
-                    out.push(ArithToken::Slash);
+                    offsets.push(start); out.push(ArithToken::Plus);
                 }
             }
-            '%' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::PercentEq);
+            b'-' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'-' {
+                    i += 1; offsets.push(start); out.push(ArithToken::MinusMinus);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::MinusEq);
                 } else {
-                    out.push(ArithToken::Percent);
+                    offsets.push(start); out.push(ArithToken::Minus);
                 }
             }
-            '?' => { chars.next(); out.push(ArithToken::Question); }
-            ':' => { chars.next(); out.push(ArithToken::Colon); }
-            '!' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Ne);
+            b'*' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'*' {
+                    i += 1; offsets.push(start); out.push(ArithToken::Power);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::StarEq);
                 } else {
-                    out.push(ArithToken::Bang);
+                    offsets.push(start); out.push(ArithToken::Star);
                 }
             }
-            '=' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::Eq);
+            b'/' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::SlashEq);
                 } else {
-                    out.push(ArithToken::Assign);
+                    offsets.push(start); out.push(ArithToken::Slash);
                 }
             }
-            '<' => {
-                chars.next();
-                match chars.peek() {
-                    Some('<') => {
-                        chars.next();
-                        if chars.peek() == Some(&'=') {
-                            chars.next();
-                            out.push(ArithToken::ShlEq);
-                        } else {
-                            out.push(ArithToken::Shl);
-                        }
+            b'%' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::PercentEq);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Percent);
+                }
+            }
+            b'?' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::Question);
+            }
+            b':' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::Colon);
+            }
+            b'!' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::Ne);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Bang);
+                }
+            }
+            b'=' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::Eq);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Assign);
+                }
+            }
+            b'<' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'<' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'=' {
+                        i += 1; offsets.push(start); out.push(ArithToken::ShlEq);
+                    } else {
+                        offsets.push(start); out.push(ArithToken::Shl);
                     }
-                    Some('=') => { chars.next(); out.push(ArithToken::Le); }
-                    _ => out.push(ArithToken::Lt),
-                }
-            }
-            '>' => {
-                chars.next();
-                match chars.peek() {
-                    Some('>') => {
-                        chars.next();
-                        if chars.peek() == Some(&'=') {
-                            chars.next();
-                            out.push(ArithToken::ShrEq);
-                        } else {
-                            out.push(ArithToken::Shr);
-                        }
-                    }
-                    Some('=') => { chars.next(); out.push(ArithToken::Ge); }
-                    _ => out.push(ArithToken::Gt),
-                }
-            }
-            '&' => {
-                chars.next();
-                match chars.peek() {
-                    Some('&') => { chars.next(); out.push(ArithToken::AndAnd); }
-                    Some('=') => { chars.next(); out.push(ArithToken::AmpEq); }
-                    _ => out.push(ArithToken::Amp),
-                }
-            }
-            '|' => {
-                chars.next();
-                match chars.peek() {
-                    Some('|') => { chars.next(); out.push(ArithToken::OrOr); }
-                    Some('=') => { chars.next(); out.push(ArithToken::PipeEq); }
-                    _ => out.push(ArithToken::Pipe),
-                }
-            }
-            '^' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    out.push(ArithToken::CaretEq);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::Le);
                 } else {
-                    out.push(ArithToken::Caret);
+                    offsets.push(start); out.push(ArithToken::Lt);
                 }
             }
-            '~' => {
-                chars.next();
-                out.push(ArithToken::Tilde);
+            b'>' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'>' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'=' {
+                        i += 1; offsets.push(start); out.push(ArithToken::ShrEq);
+                    } else {
+                        offsets.push(start); out.push(ArithToken::Shr);
+                    }
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::Ge);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Gt);
+                }
+            }
+            b'&' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'&' {
+                    i += 1; offsets.push(start); out.push(ArithToken::AndAnd);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::AmpEq);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Amp);
+                }
+            }
+            b'|' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'|' {
+                    i += 1; offsets.push(start); out.push(ArithToken::OrOr);
+                } else if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::PipeEq);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Pipe);
+                }
+            }
+            b'^' => {
+                let start = i; i += 1;
+                if i < bytes.len() && bytes[i] == b'=' {
+                    i += 1; offsets.push(start); out.push(ArithToken::CaretEq);
+                } else {
+                    offsets.push(start); out.push(ArithToken::Caret);
+                }
+            }
+            b'~' => {
+                let start = i; i += 1;
+                offsets.push(start); out.push(ArithToken::Tilde);
             }
             other => {
-                return Err(ArithError::Parse(format!("unexpected character: {other:?}")));
+                return Err(ArithError::parse(format!("unexpected character: {:?}", other as char)));
             }
         }
     }
-    Ok(out)
+    Ok((out, offsets))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,8 +427,8 @@ pub enum ArithExpr {
     Add(Box<ArithExpr>, Box<ArithExpr>),
     Sub(Box<ArithExpr>, Box<ArithExpr>),
     Mul(Box<ArithExpr>, Box<ArithExpr>),
-    Div(Box<ArithExpr>, Box<ArithExpr>),
-    Mod(Box<ArithExpr>, Box<ArithExpr>),
+    Div(Box<ArithExpr>, Box<ArithExpr>, usize), // usize = divisor token offset
+    Mod(Box<ArithExpr>, Box<ArithExpr>, usize),
     Eq(Box<ArithExpr>, Box<ArithExpr>),
     Ne(Box<ArithExpr>, Box<ArithExpr>),
     Lt(Box<ArithExpr>, Box<ArithExpr>),
@@ -403,8 +460,22 @@ pub enum ArithExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArithError {
+pub enum ArithErrorKind {
+    // Legacy free-form parse message (kept for sites not yet bash-mapped).
     Parse(String),
+    // Bash-mapped parse/lex errors (each renders a fixed bash string):
+    AssignToNonVar,          // "attempted assignment to non-variable"
+    InvalidBase,             // "invalid arithmetic base"
+    InvalidIntegerConstant,  // "invalid integer constant"
+    ValueTooGreatForBase,    // "value too great for base"
+    InvalidNumber,           // "invalid number"
+    MissingCloseParen,       // "missing `)'"
+    OperandExpected,         // "syntax error: operand expected"
+    ExpressionExpected,      // "expression expected"
+    ColonExpected,           // "`:' expected for conditional expression"
+    SyntaxErrorInExpression, // "syntax error in expression"
+    BadArraySubscript,       // "bad array subscript"
+    // Eval-time:
     DivisionByZero,
     ModuloByZero,
     NotAnInteger { var: String, value: String },
@@ -413,37 +484,114 @@ pub enum ArithError {
     ReadonlyVar(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithError {
+    pub kind: ArithErrorKind,
+    /// Byte offset into the parsed source of the error token (bash `lasttp`).
+    pub offset: Option<usize>,
+    /// Exclusive byte end of the error token. When `Some(e)`, the error token
+    /// is `src[offset..e]` (and bash's echo is truncated to `src[..e]`) — used
+    /// for tokenize-time NUMBER errors, where bash reports just the full number
+    /// run with no trailing content. When `None`, the token runs to end of
+    /// source (parse errors, eval errors).
+    pub token_end: Option<usize>,
+}
+
+impl ArithError {
+    /// Legacy free-form parse error, no position.
+    pub fn parse(msg: impl Into<String>) -> Self {
+        ArithError { kind: ArithErrorKind::Parse(msg.into()), offset: None, token_end: None }
+    }
+    /// A bash-mapped error with a token offset (token runs to end of source).
+    pub fn at(kind: ArithErrorKind, offset: usize) -> Self {
+        ArithError { kind, offset: Some(offset), token_end: None }
+    }
+    /// A bash-mapped error with an explicit token span `[start, end)`. Used by
+    /// tokenize-time NUMBER errors, where bash's error token is the full number
+    /// run and the echo is truncated to `src[..end]`.
+    pub fn at_span(kind: ArithErrorKind, start: usize, end: usize) -> Self {
+        ArithError { kind, offset: Some(start), token_end: Some(end) }
+    }
+    /// The text bash prints after the `<expr>: ` echo.
+    pub fn bash_message(&self) -> String {
+        use ArithErrorKind::*;
+        match &self.kind {
+            Parse(m) => m.clone(),
+            AssignToNonVar => "attempted assignment to non-variable".into(),
+            InvalidBase => "invalid arithmetic base".into(),
+            InvalidIntegerConstant => "invalid integer constant".into(),
+            ValueTooGreatForBase => "value too great for base".into(),
+            InvalidNumber => "invalid number".into(),
+            MissingCloseParen => "missing `)'".into(),
+            OperandExpected => "syntax error: operand expected".into(),
+            ExpressionExpected => "expression expected".into(),
+            ColonExpected => "`:' expected for conditional expression".into(),
+            SyntaxErrorInExpression => "syntax error in expression".into(),
+            BadArraySubscript => "bad array subscript".into(),
+            DivisionByZero | ModuloByZero => "division by 0".into(),
+            NotAnInteger { value, .. } => format!("{value}: syntax error: operand expected"),
+            NegativeExponent => "exponent less than 0".into(),
+            ShiftCountOutOfRange { .. } => "shift count out of range".into(),
+            ReadonlyVar(name) => format!("{name}: readonly variable"),
+        }
+    }
+}
+
 impl std::fmt::Display for ArithError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Parse(m) => write!(f, "{m}"),
-            Self::DivisionByZero => write!(f, "division by zero"),
-            Self::ModuloByZero => write!(f, "modulo by zero"),
-            Self::NotAnInteger { var, value } =>
+        // Legacy rendering kept so existing `{e}` callers compile unchanged
+        // until Task 5 swaps the emission sites to bash formatting.
+        use ArithErrorKind::*;
+        match &self.kind {
+            Parse(m) => write!(f, "{m}"),
+            DivisionByZero => write!(f, "division by zero"),
+            ModuloByZero => write!(f, "modulo by zero"),
+            NotAnInteger { var, value } =>
                 write!(f, "variable '{var}' is not an integer: '{value}'"),
-            Self::NegativeExponent => write!(f, "exponentiation with negative exponent"),
-            Self::ShiftCountOutOfRange { count } =>
-                write!(f, "shift count out of range: {count}"),
-            Self::ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
+            NegativeExponent => write!(f, "exponentiation with negative exponent"),
+            ShiftCountOutOfRange { count } => write!(f, "shift count out of range: {count}"),
+            ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
+            // Bash-mapped kinds render their bash text under Display too.
+            other => write!(f, "{}", ArithError { kind: other.clone(), offset: None, token_end: None }.bash_message()),
         }
     }
 }
 
 pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
-    let tokens = tokenize(input)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let (tokens, offsets) = tokenize(input)?;
+    let mut p = Parser { tokens, offsets, pos: 0, err_off: 0 };
     let expr = p.parse_comma_expr()?;
     if p.pos < p.tokens.len() {
-        return Err(ArithError::Parse(format!(
-            "unexpected token after expression: {:?}", p.tokens[p.pos]
-        )));
+        let off = p.offsets[p.pos];
+        return Err(ArithError::at(ArithErrorKind::SyntaxErrorInExpression, off));
     }
     Ok(expr)
 }
 
+/// Builds bash's post-prologue error body:
+/// `"<expr>: <msg> (error token is \"<tok>\")"`.
+///
+/// Normally `<expr>` is `src` leading-trimmed and `<tok>` is `src[offset..]`
+/// (token runs to end of source — parse and eval errors). When the error
+/// carries an explicit `token_end` (tokenize-time NUMBER errors), bash reports
+/// only the full number run: the echo is truncated to `src[..end]` and the
+/// token to `src[offset..end]` — no trailing content.
+pub fn render_error_body(src: &str, err: &ArithError) -> String {
+    let (expr, tok): (&str, &str) = match (err.offset, err.token_end) {
+        (Some(off), Some(end)) if end <= src.len() && off <= end => {
+            (src[..end].trim_start(), &src[off..end])
+        }
+        (Some(off), _) if off <= src.len() => (src.trim_start(), &src[off..]),
+        _ => (src.trim_start(), ""),
+    };
+    format!("{expr}: {} (error token is \"{tok}\")", err.bash_message())
+}
+
 struct Parser {
     tokens: Vec<ArithToken>,
+    offsets: Vec<usize>,
     pos: usize,
+    err_off: usize,
 }
 
 /// A row in the Pratt-parser operator table: left binding power, right
@@ -487,8 +635,15 @@ impl Parser {
 
     fn bump(&mut self) -> Option<ArithToken> {
         let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.err_off = self.offsets[self.pos];
+        }
         self.pos += 1;
         t
+    }
+
+    fn fail(&self, kind: ArithErrorKind) -> ArithError {
+        ArithError::at(kind, self.err_off)
     }
 
     /// Parse a comma-separated sequence of full expressions (each
@@ -516,8 +671,8 @@ impl Parser {
                 self.bump();
                 let target = match expr_to_lvalue(lhs) {
                     Some(t) => t,
-                    None => return Err(ArithError::Parse(
-                        "postfix ++/-- requires variable on LHS".to_string()
+                    None => return Err(ArithError::parse(
+                        "postfix ++/-- requires variable on LHS"
                     )),
                 };
                 lhs = match op {
@@ -534,9 +689,7 @@ impl Parser {
                 self.bump();
                 let target = match expr_to_lvalue(lhs) {
                     Some(t) => t,
-                    None => return Err(ArithError::Parse(
-                        "assignment requires variable on LHS".to_string()
-                    )),
+                    None => return Err(self.fail(ArithErrorKind::AssignToNonVar)),
                 };
                 let rhs = self.parse_expr(1)?;  // rbp = 1 allows cascading assigns
                 lhs = ArithExpr::Assign { target, op: assign_op, rhs: Box::new(rhs) };
@@ -549,9 +702,7 @@ impl Parser {
                 let then_branch = self.parse_expr(0)?;
                 match self.bump() {
                     Some(ArithToken::Colon) => {}
-                    other => return Err(ArithError::Parse(format!(
-                        "expected ':' in ternary, got {other:?}"
-                    ))),
+                    _ => return Err(self.fail(ArithErrorKind::ColonExpected)),
                 }
                 let else_branch = self.parse_expr(3)?;  // rbp = 3 for right-assoc
                 lhs = ArithExpr::Ternary(
@@ -565,6 +716,20 @@ impl Parser {
                 self.bump();
                 let rhs = self.parse_expr(24)?;
                 lhs = ArithExpr::Pow(Box::new(lhs), Box::new(rhs));
+                continue;
+            }
+
+            // 4b. Div/Mod (lbp = 22, rbp = 23 — left-associative, special-cased
+            //     to carry the divisor token's byte offset for by-zero error reporting).
+            if matches!(op, ArithToken::Slash | ArithToken::Percent) && 22 >= min_bp {
+                self.bump();
+                let rhs = self.parse_expr(23)?;
+                let off = self.err_off;
+                lhs = if op == ArithToken::Slash {
+                    ArithExpr::Div(Box::new(lhs), Box::new(rhs), off)
+                } else {
+                    ArithExpr::Mod(Box::new(lhs), Box::new(rhs), off)
+                };
                 continue;
             }
 
@@ -586,8 +751,6 @@ impl Parser {
                 ArithToken::Plus    => (20, 21, ArithExpr::Add),
                 ArithToken::Minus   => (20, 21, ArithExpr::Sub),
                 ArithToken::Star    => (22, 23, ArithExpr::Mul),
-                ArithToken::Slash   => (22, 23, ArithExpr::Div),
-                ArithToken::Percent => (22, 23, ArithExpr::Mod),
                 _ => break,
             };
             if lbp < min_bp { break; }
@@ -604,14 +767,14 @@ impl Parser {
     fn parse_subscript(&mut self) -> Result<(ArithExpr, String), ArithError> {
         let raw = match self.bump() {
             Some(ArithToken::LBracket(raw)) => raw,
-            other => return Err(ArithError::Parse(format!(
+            other => return Err(ArithError::parse(format!(
                 "expected '[', got {other:?}"
             ))),
         };
         let subscript = self.parse_comma_expr()?;
         match self.bump() {
             Some(ArithToken::RBracket) => {}
-            other => return Err(ArithError::Parse(format!(
+            other => return Err(ArithError::parse(format!(
                 "expected ']' after array subscript, got {other:?}"
             ))),
         }
@@ -650,8 +813,8 @@ impl Parser {
                 let inner = self.parse_prefix()?;
                 match expr_to_lvalue(inner) {
                     Some(target) => Ok(ArithExpr::PreInc(target)),
-                    None => Err(ArithError::Parse(
-                        "prefix ++ requires variable".to_string()
+                    None => Err(ArithError::parse(
+                        "prefix ++ requires variable"
                     )),
                 }
             }
@@ -660,8 +823,8 @@ impl Parser {
                 let inner = self.parse_prefix()?;
                 match expr_to_lvalue(inner) {
                     Some(target) => Ok(ArithExpr::PreDec(target)),
-                    None => Err(ArithError::Parse(
-                        "prefix -- requires variable".to_string()
+                    None => Err(ArithError::parse(
+                        "prefix -- requires variable"
                     )),
                 }
             }
@@ -669,15 +832,18 @@ impl Parser {
                 let inner = self.parse_comma_expr()?;
                 match self.bump() {
                     Some(ArithToken::RParen) => Ok(inner),
-                    other => Err(ArithError::Parse(format!(
-                        "expected ')', got {:?}", other
-                    ))),
+                    _ => Err(self.fail(ArithErrorKind::MissingCloseParen)),
                 }
             }
-            Some(t) => Err(ArithError::Parse(format!(
-                "expected expression, got {:?}", t
-            ))),
-            None => Err(ArithError::Parse("unexpected end of input".to_string())),
+            Some(t) => {
+                let kind = if matches!(t, ArithToken::Colon) {
+                    ArithErrorKind::ExpressionExpected
+                } else {
+                    ArithErrorKind::OperandExpected
+                };
+                Err(self.fail(kind))
+            }
+            None => Err(self.fail(ArithErrorKind::OperandExpected)),
         }
     }
 }
@@ -691,16 +857,16 @@ fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
     if raw.is_empty() {
         return Ok(0);
     }
-    raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+    raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw,
-    })
+    }, offset: None, token_end: None })
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
 fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithError> {
     shell.try_set(name, value.to_string())
-        .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+        .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
 }
 
 /// Arith-evaluates an element's raw string value to an i64, exactly like a
@@ -719,10 +885,10 @@ fn element_string_to_i64(
         return Ok(n);
     }
     // Non-numeric: arith-evaluate recursively (an element may hold "1+1").
-    let parsed = parse(&raw).map_err(|_| ArithError::NotAnInteger {
+    let parsed = parse(&raw).map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw.clone(),
-    })?;
+    }, offset: None, token_end: None })?;
     eval(&parsed, shell)
 }
 
@@ -752,12 +918,12 @@ fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<()
             if shell.get_associative(name).is_some() {
                 shell
                     .set_associative_element(name, subscript_raw.clone(), value.to_string())
-                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
             } else {
                 let idx = eval(subscript, shell)?;
                 shell
                     .set_indexed_element(name, idx as usize, value.to_string())
-                    .map_err(|_| ArithError::ReadonlyVar(name.to_string()))
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
             }
         }
     }
@@ -771,10 +937,10 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             if raw.is_empty() {
                 Ok(0)
             } else {
-                raw.parse::<i64>().map_err(|_| ArithError::NotAnInteger {
+                raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
                     var: name.clone(),
                     value: raw.to_string(),
-                })
+                }, offset: None, token_end: None })
             }
         }
         ArithExpr::Index { name, subscript, subscript_raw } => {
@@ -789,16 +955,16 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
         ArithExpr::Add(a, b) => Ok(eval(a, shell)?.wrapping_add(eval(b, shell)?)),
         ArithExpr::Sub(a, b) => Ok(eval(a, shell)?.wrapping_sub(eval(b, shell)?)),
         ArithExpr::Mul(a, b) => Ok(eval(a, shell)?.wrapping_mul(eval(b, shell)?)),
-        ArithExpr::Div(a, b) => {
+        ArithExpr::Div(a, b, off) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError::DivisionByZero); }
+            if rhs == 0 { return Err(ArithError::at(ArithErrorKind::DivisionByZero, *off)); }
             Ok(lhs.wrapping_div(rhs))
         }
-        ArithExpr::Mod(a, b) => {
+        ArithExpr::Mod(a, b, off) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError::ModuloByZero); }
+            if rhs == 0 { return Err(ArithError::at(ArithErrorKind::ModuloByZero, *off)); }
             Ok(lhs.wrapping_rem(rhs))
         }
         ArithExpr::Eq(a, b) => Ok(bool_to_i64(eval(a, shell)? == eval(b, shell)?)),
@@ -840,7 +1006,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
             }
             Ok(lhs.wrapping_shl(rhs as u32))
         }
@@ -848,7 +1014,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError::ShiftCountOutOfRange { count: rhs });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
             }
             Ok(lhs.wrapping_shr(rhs as u32))
         }
@@ -856,7 +1022,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let base = eval(a, shell)?;
             let exp = eval(b, shell)?;
             if exp < 0 {
-                return Err(ArithError::NegativeExponent);
+                return Err(ArithError { kind: ArithErrorKind::NegativeExponent, offset: None, token_end: None });
             }
             Ok(base.wrapping_pow(exp as u32))
         }
@@ -869,25 +1035,25 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 AssignOp::Mul    => read_lvalue_i64(shell, target)?.wrapping_mul(rhs_val),
                 AssignOp::Div => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError::DivisionByZero); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None, token_end: None }); }
                     lhs.wrapping_div(rhs_val)
                 }
                 AssignOp::Mod => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError::ModuloByZero); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None, token_end: None }); }
                     lhs.wrapping_rem(rhs_val)
                 }
                 AssignOp::Shl => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
                     }
                     lhs.wrapping_shl(rhs_val as u32)
                 }
                 AssignOp::Shr => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError::ShiftCountOutOfRange { count: rhs_val });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
                     }
                     lhs.wrapping_shr(rhs_val as u32)
                 }
@@ -931,67 +1097,63 @@ mod tests {
 
     #[test]
     fn display_division_by_zero() {
-        assert_eq!(ArithError::DivisionByZero.to_string(), "division by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None, token_end: None }.to_string(), "division by zero");
     }
 
     #[test]
     fn display_modulo_by_zero() {
-        assert_eq!(ArithError::ModuloByZero.to_string(), "modulo by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None, token_end: None }.to_string(), "modulo by zero");
     }
 
     #[test]
     fn display_parse_error_is_bare_message() {
-        let e = ArithError::Parse("unexpected end of input".to_string());
+        let e = ArithError::parse("unexpected end of input");
         assert_eq!(e.to_string(), "unexpected end of input");
     }
 
     #[test]
     fn display_not_an_integer_quotes_var_and_value() {
-        let e = ArithError::NotAnInteger {
+        let e = ArithError { kind: ArithErrorKind::NotAnInteger {
             var: "x".to_string(),
             value: "abc".to_string(),
-        };
+        }, offset: None, token_end: None };
         assert_eq!(e.to_string(), "variable 'x' is not an integer: 'abc'");
     }
 
     #[test]
     fn tokenize_single_number() {
-        assert_eq!(tokenize("42").unwrap(), vec![ArithToken::Number(42)]);
+        let (toks, _) = tokenize("42").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(42)]);
     }
 
     #[test]
     fn tokenize_zero() {
-        assert_eq!(tokenize("0").unwrap(), vec![ArithToken::Number(0)]);
+        let (toks, _) = tokenize("0").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(0)]);
     }
 
     #[test]
     fn tokenize_large_number() {
-        assert_eq!(
-            tokenize("9223372036854775807").unwrap(),
-            vec![ArithToken::Number(i64::MAX)]
-        );
+        let (toks, _) = tokenize("9223372036854775807").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(i64::MAX)]);
     }
 
     #[test]
     fn tokenize_number_overflow_is_parse_error() {
         let err = tokenize("99999999999999999999").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)), "got {:?}", err);
+        assert!(matches!(err.kind, ArithErrorKind::Parse(_)), "got {:?}", err);
     }
 
     #[test]
     fn tokenize_identifier() {
-        assert_eq!(
-            tokenize("foo").unwrap(),
-            vec![ArithToken::Ident("foo".to_string())]
-        );
+        let (toks, _) = tokenize("foo").unwrap();
+        assert_eq!(toks, vec![ArithToken::Ident("foo".to_string())]);
     }
 
     #[test]
     fn tokenize_identifier_with_dollar_prefix_strips_dollar() {
-        assert_eq!(
-            tokenize("$foo").unwrap(),
-            vec![ArithToken::Ident("foo".to_string())]
-        );
+        let (toks, _) = tokenize("$foo").unwrap();
+        assert_eq!(toks, vec![ArithToken::Ident("foo".to_string())]);
     }
 
     #[test]
@@ -1003,7 +1165,8 @@ mod tests {
             ArithToken::LParen, ArithToken::RParen,
             ArithToken::Bang, ArithToken::Question, ArithToken::Colon,
         ];
-        assert_eq!(tokenize(input).unwrap(), expected);
+        let (toks, _) = tokenize(input).unwrap();
+        assert_eq!(toks, expected);
     }
 
     #[test]
@@ -1014,27 +1177,27 @@ mod tests {
             ArithToken::AndAnd, ArithToken::OrOr,
             ArithToken::Lt, ArithToken::Gt,
         ];
-        assert_eq!(tokenize(input).unwrap(), expected);
+        let (toks, _) = tokenize(input).unwrap();
+        assert_eq!(toks, expected);
     }
 
     #[test]
     fn tokenize_skips_whitespace() {
-        assert_eq!(
-            tokenize("  1   +   2  ").unwrap(),
-            vec![ArithToken::Number(1), ArithToken::Plus, ArithToken::Number(2)]
-        );
+        let (toks, _) = tokenize("  1   +   2  ").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(1), ArithToken::Plus, ArithToken::Number(2)]);
     }
 
     #[test]
     fn tokenize_unknown_char_is_parse_error() {
         let err = tokenize("1 @ 2").unwrap_err();
-        assert!(matches!(err, ArithError::Parse(_)));
+        assert!(matches!(err.kind, ArithErrorKind::Parse(_)));
     }
 
     #[test]
     fn tokenize_single_amp_is_bitwise_and() {
         // v38: bare & is now bitwise AND (was: parse error).
-        assert_eq!(tokenize("1 & 2").unwrap(), vec![
+        let (toks, _) = tokenize("1 & 2").unwrap();
+        assert_eq!(toks, vec![
             ArithToken::Number(1), ArithToken::Amp, ArithToken::Number(2),
         ]);
     }
@@ -1042,24 +1205,28 @@ mod tests {
     #[test]
     fn tokenize_single_pipe_is_bitwise_or() {
         // v38: bare | is now bitwise OR (was: parse error).
-        assert_eq!(tokenize("1 | 2").unwrap(), vec![
+        let (toks, _) = tokenize("1 | 2").unwrap();
+        assert_eq!(toks, vec![
             ArithToken::Number(1), ArithToken::Pipe, ArithToken::Number(2),
         ]);
     }
 
     #[test]
     fn tokenize_hex_literal() {
-        assert_eq!(tokenize("0x10").unwrap(), vec![ArithToken::Number(16)]);
+        let (toks, _) = tokenize("0x10").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(16)]);
     }
 
     #[test]
     fn tokenize_hex_literal_uppercase() {
-        assert_eq!(tokenize("0X1F").unwrap(), vec![ArithToken::Number(31)]);
+        let (toks, _) = tokenize("0X1F").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(31)]);
     }
 
     #[test]
     fn tokenize_octal_literal() {
-        assert_eq!(tokenize("010").unwrap(), vec![ArithToken::Number(8)]);
+        let (toks, _) = tokenize("010").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(8)]);
     }
 
     #[test]
@@ -1070,12 +1237,14 @@ mod tests {
 
     #[test]
     fn tokenize_base_n_binary() {
-        assert_eq!(tokenize("2#1010").unwrap(), vec![ArithToken::Number(10)]);
+        let (toks, _) = tokenize("2#1010").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(10)]);
     }
 
     #[test]
     fn tokenize_base_n_hex_via_pound() {
-        assert_eq!(tokenize("16#FF").unwrap(), vec![ArithToken::Number(255)]);
+        let (toks, _) = tokenize("16#FF").unwrap();
+        assert_eq!(toks, vec![ArithToken::Number(255)]);
     }
 
     #[test]
@@ -1096,19 +1265,18 @@ mod tests {
 
     #[test]
     fn tokenize_bitwise_operators() {
-        assert_eq!(
-            tokenize("&|^~<<>>").unwrap(),
-            vec![
-                ArithToken::Amp, ArithToken::Pipe,
-                ArithToken::Caret, ArithToken::Tilde,
-                ArithToken::Shl, ArithToken::Shr,
-            ]
-        );
+        let (toks, _) = tokenize("&|^~<<>>").unwrap();
+        assert_eq!(toks, vec![
+            ArithToken::Amp, ArithToken::Pipe,
+            ArithToken::Caret, ArithToken::Tilde,
+            ArithToken::Shl, ArithToken::Shr,
+        ]);
     }
 
     #[test]
     fn tokenize_power_operator() {
-        assert_eq!(tokenize("2**3").unwrap(), vec![
+        let (toks, _) = tokenize("2**3").unwrap();
+        assert_eq!(toks, vec![
             ArithToken::Number(2), ArithToken::Power, ArithToken::Number(3),
         ]);
     }
@@ -1117,7 +1285,7 @@ mod tests {
     fn tokenize_compound_assignments() {
         // = += -= *= /= %= <<= >>= &= ^= |=
         let input = "= += -= *= /= %= <<= >>= &= ^= |=";
-        let tokens = tokenize(input).unwrap();
+        let (tokens, _) = tokenize(input).unwrap();
         assert_eq!(tokens, vec![
             ArithToken::Assign,
             ArithToken::PlusEq, ArithToken::MinusEq, ArithToken::StarEq,
@@ -1129,22 +1297,26 @@ mod tests {
 
     #[test]
     fn tokenize_inc_dec_operators() {
-        assert_eq!(tokenize("++ --").unwrap(), vec![
-            ArithToken::PlusPlus, ArithToken::MinusMinus,
-        ]);
+        let (toks, _) = tokenize("++ --").unwrap();
+        assert_eq!(toks, vec![ArithToken::PlusPlus, ArithToken::MinusMinus]);
     }
 
     #[test]
     fn tokenize_distinguishes_eq_from_assign() {
-        assert_eq!(tokenize("==").unwrap(), vec![ArithToken::Eq]);
-        assert_eq!(tokenize("=").unwrap(), vec![ArithToken::Assign]);
+        let (toks, _) = tokenize("==").unwrap();
+        assert_eq!(toks, vec![ArithToken::Eq]);
+        let (toks, _) = tokenize("=").unwrap();
+        assert_eq!(toks, vec![ArithToken::Assign]);
     }
 
     #[test]
     fn tokenize_distinguishes_lt_from_shl() {
-        assert_eq!(tokenize("<").unwrap(), vec![ArithToken::Lt]);
-        assert_eq!(tokenize("<<").unwrap(), vec![ArithToken::Shl]);
-        assert_eq!(tokenize("<<=").unwrap(), vec![ArithToken::ShlEq]);
+        let (toks, _) = tokenize("<").unwrap();
+        assert_eq!(toks, vec![ArithToken::Lt]);
+        let (toks, _) = tokenize("<<").unwrap();
+        assert_eq!(toks, vec![ArithToken::Shl]);
+        let (toks, _) = tokenize("<<=").unwrap();
+        assert_eq!(toks, vec![ArithToken::ShlEq]);
     }
 
     fn n(x: i64) -> Box<ArithExpr> { Box::new(ArithExpr::Num(x)) }
@@ -1198,7 +1370,7 @@ mod tests {
     fn parse_double_minus_with_number_is_prefix_dec_error() {
         // v38: -- is now MinusMinus (prefix decrement), which requires a
         // variable name after it. --5 → parse error.
-        assert!(matches!(parse("--5"), Err(ArithError::Parse(_))));
+        assert!(matches!(parse("--5"), Err(ref e) if matches!(e.kind, ArithErrorKind::Parse(_))));
     }
 
     #[test]
@@ -1243,22 +1415,26 @@ mod tests {
 
     #[test]
     fn parse_empty_is_error() {
-        assert!(matches!(parse("").unwrap_err(), ArithError::Parse(_)));
+        // Empty input → OperandExpected (bump returns None, err_off stays 0).
+        assert!(matches!(parse("").unwrap_err().kind, ArithErrorKind::OperandExpected));
     }
 
     #[test]
     fn parse_trailing_junk_is_error() {
-        assert!(matches!(parse("1+2 3").unwrap_err(), ArithError::Parse(_)));
+        // Trailing junk → SyntaxErrorInExpression at the junk token's offset.
+        assert!(matches!(parse("1+2 3").unwrap_err().kind, ArithErrorKind::SyntaxErrorInExpression));
     }
 
     #[test]
     fn parse_unbalanced_paren_is_error() {
-        assert!(matches!(parse("(1+2").unwrap_err(), ArithError::Parse(_)));
+        // Missing ')' → MissingCloseParen.
+        assert!(matches!(parse("(1+2").unwrap_err().kind, ArithErrorKind::MissingCloseParen));
     }
 
     #[test]
     fn parse_missing_rhs_is_error() {
-        assert!(matches!(parse("1+").unwrap_err(), ArithError::Parse(_)));
+        // Missing RHS operand → OperandExpected.
+        assert!(matches!(parse("1+").unwrap_err().kind, ArithErrorKind::OperandExpected));
     }
 
     #[test]
@@ -1314,14 +1490,14 @@ mod tests {
 
     #[test]
     fn parse_assignment_lhs_must_be_var() {
-        // (a + b) = 5 → parse error (LHS not a Var).
-        assert!(matches!(parse("(a + b) = 5"), Err(ArithError::Parse(_))));
+        // (a + b) = 5 → AssignToNonVar (LHS not a scalar var or array element).
+        assert!(matches!(parse("(a + b) = 5"), Err(ref e) if matches!(e.kind, ArithErrorKind::AssignToNonVar)));
     }
 
     #[test]
     fn parse_postfix_lhs_must_be_var() {
         // (a + b)++ → parse error.
-        assert!(matches!(parse("(a + b)++"), Err(ArithError::Parse(_))));
+        assert!(matches!(parse("(a + b)++"), Err(ref e) if matches!(e.kind, ArithErrorKind::Parse(_))));
     }
 
     #[test]
@@ -1473,13 +1649,24 @@ mod tests {
     #[test]
     fn eval_division_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError::DivisionByZero);
+        // offset 2 = byte offset of the `0` divisor token in "1/0"
+        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: Some(2), token_end: None });
     }
 
     #[test]
     fn eval_modulo_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError::ModuloByZero);
+        // offset 2 = byte offset of the `0` divisor token in "1%0"
+        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: Some(2), token_end: None });
+    }
+
+    #[test]
+    fn render_division_by_zero_token() {
+        let mut sh = Shell::new();
+        let expr = parse("44 / 0 ").unwrap();
+        let err = eval(&expr, &mut sh).unwrap_err();
+        assert_eq!(render_error_body("44 / 0 ", &err),
+            "44 / 0 : division by 0 (error token is \"0 \")");
     }
 
     #[test]
@@ -1573,10 +1760,10 @@ mod tests {
         let err = eval_str("HUCK_TEST_ARITH_BAD + 1", &mut s).unwrap_err();
         assert_eq!(
             err,
-            ArithError::NotAnInteger {
+            ArithError { kind: ArithErrorKind::NotAnInteger {
                 var: "HUCK_TEST_ARITH_BAD".to_string(),
                 value: "abc".to_string()
-            }
+            }, offset: None, token_end: None }
         );
     }
 
@@ -1626,7 +1813,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("1 << -1", &mut s),
-            Err(ArithError::ShiftCountOutOfRange { count: -1 })
+            Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: -1 }, .. })
         ));
     }
 
@@ -1635,7 +1822,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("1 << 64", &mut s),
-            Err(ArithError::ShiftCountOutOfRange { count: 64 })
+            Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: 64 }, .. })
         ));
     }
 
@@ -1657,7 +1844,7 @@ mod tests {
         let mut s = Shell::new();
         assert!(matches!(
             eval_str("2 ** -1", &mut s),
-            Err(ArithError::NegativeExponent)
+            Err(ArithError { kind: ArithErrorKind::NegativeExponent, .. })
         ));
     }
 
@@ -1680,7 +1867,7 @@ mod tests {
     fn eval_assign_div_by_zero_errors() {
         let mut s = Shell::new();
         s.set("a", "10".to_string());
-        assert!(matches!(eval_str("a /= 0", &mut s), Err(ArithError::DivisionByZero)));
+        assert!(matches!(eval_str("a /= 0", &mut s), Err(ArithError { kind: ArithErrorKind::DivisionByZero, .. })));
     }
 
     #[test]
@@ -1769,5 +1956,107 @@ mod tests {
         s.set("a", "5".to_string());
         assert_eq!(eval_str("a++", &mut s).unwrap(), 5);
         assert_eq!(s.lookup_var("a"), Some("6".to_string()));
+    }
+
+    #[test]
+    fn arith_error_bash_message_mapping() {
+        use ArithErrorKind::*;
+        let mk = |k| ArithError { kind: k, offset: None, token_end: None };
+        assert_eq!(mk(AssignToNonVar).bash_message(), "attempted assignment to non-variable");
+        assert_eq!(mk(DivisionByZero).bash_message(), "division by 0");
+        assert_eq!(mk(InvalidBase).bash_message(), "invalid arithmetic base");
+        assert_eq!(mk(InvalidIntegerConstant).bash_message(), "invalid integer constant");
+        assert_eq!(mk(ValueTooGreatForBase).bash_message(), "value too great for base");
+        assert_eq!(mk(MissingCloseParen).bash_message(), "missing `)'");
+        assert_eq!(mk(OperandExpected).bash_message(), "syntax error: operand expected");
+        assert_eq!(mk(ExpressionExpected).bash_message(), "expression expected");
+        assert_eq!(mk(ColonExpected).bash_message(), "`:' expected for conditional expression");
+        assert_eq!(mk(SyntaxErrorInExpression).bash_message(), "syntax error in expression");
+        assert_eq!(mk(InvalidNumber).bash_message(), "invalid number");
+    }
+
+    // ── Task 3: token offsets + render_error_body ──────────────────────────
+
+    #[test]
+    fn tokenize_reports_offsets() {
+        let (toks, offs) = tokenize("7 = 43 ").unwrap();
+        assert_eq!(toks.len(), offs.len());
+        // tokens: 7@0, =@2, 43@4
+        assert_eq!(offs, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn render_assign_to_nonvar() {
+        // `$(( 7 = 43 ))` inner text, untrimmed
+        let err = parse(" 7 = 43 ").unwrap_err();
+        assert_eq!(err.bash_message(), "attempted assignment to non-variable");
+        assert_eq!(render_error_body(" 7 = 43 ", &err),
+            "7 = 43 : attempted assignment to non-variable (error token is \"= 43 \")");
+    }
+
+    #[test]
+    fn render_operand_expected_at_eof() {
+        let err = parse(" 4 + ").unwrap_err();
+        assert_eq!(render_error_body(" 4 + ", &err),
+            "4 + : syntax error: operand expected (error token is \"+ \")");
+    }
+
+    #[test]
+    fn render_missing_close_paren() {
+        let err = parse("rv = 7 + (43 * 6").unwrap_err();
+        assert_eq!(render_error_body("rv = 7 + (43 * 6", &err),
+            "rv = 7 + (43 * 6: missing `)' (error token is \"6\")");
+    }
+
+    #[test]
+    fn render_trailing_junk() {
+        let err = parse("a b").unwrap_err();
+        assert_eq!(render_error_body("a b", &err),
+            "a b: syntax error in expression (error token is \"b\")");
+    }
+
+    #[test]
+    fn render_invalid_base_and_constants() {
+        assert_eq!(render_error_body("3425#56", &parse("3425#56").unwrap_err()),
+            "3425#56: invalid arithmetic base (error token is \"3425#56\")");
+        assert_eq!(render_error_body("2#", &parse("2#").unwrap_err()),
+            "2#: invalid integer constant (error token is \"2#\")");
+        assert_eq!(render_error_body("2#44", &parse("2#44").unwrap_err()),
+            "2#44: value too great for base (error token is \"2#44\")");
+    }
+
+    #[test]
+    fn render_number_error_token_truncated_at_run_end() {
+        // bash reports ONLY the full number run for tokenize-time number
+        // errors — no trailing content, even with surrounding whitespace.
+        assert_eq!(render_error_body(" 2#44 ", &parse(" 2#44 ").unwrap_err()),
+            "2#44: value too great for base (error token is \"2#44\")");
+        assert_eq!(render_error_body(" 3425#56 ", &parse(" 3425#56 ").unwrap_err()),
+            "3425#56: invalid arithmetic base (error token is \"3425#56\")");
+        assert_eq!(render_error_body(" 2# ", &parse(" 2# ").unwrap_err()),
+            "2#: invalid integer constant (error token is \"2#\")");
+    }
+
+    #[test]
+    fn render_number_error_token_truncated_with_trailing_expr() {
+        // Run end stops at the first non-run byte; the echo is truncated there.
+        assert_eq!(render_error_body("2#44 + 1", &parse("2#44 + 1").unwrap_err()),
+            "2#44: value too great for base (error token is \"2#44\")");
+        assert_eq!(render_error_body("1 + 2#44", &parse("1 + 2#44").unwrap_err()),
+            "1 + 2#44: value too great for base (error token is \"2#44\")");
+    }
+
+    #[test]
+    fn render_parse_error_token_still_runs_to_end_of_source() {
+        // Regression: parse errors (no token_end) keep trailing content,
+        // including the trailing space.
+        let body = render_error_body(" 7 = 43 ", &parse(" 7 = 43 ").unwrap_err());
+        assert!(body.ends_with("(error token is \"= 43 \")"), "got {body}");
+    }
+
+    #[test]
+    fn render_ternary_branches() {
+        assert_eq!(render_error_body("4 ? : 3 + 5", &parse("4 ? : 3 + 5").unwrap_err()),
+            "4 ? : 3 + 5: expression expected (error token is \": 3 + 5\")");
     }
 }

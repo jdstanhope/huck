@@ -1969,11 +1969,14 @@ fn run_arith(
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
-    match crate::expand::eval_arith_word(body, shell) {
+    let (src, res) = crate::expand::eval_arith_word_src(body, shell);
+    match res {
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: ((: {e}"); }
+            let prefix = shell.error_prefix(Some("(("));
+            { let mut err = err_writer(err_sink, sink);
+              e!(&mut *err, "{prefix}{}", crate::arith::render_error_body(&src, &e)); }
             ExecOutcome::Continue(1)
         }
     }

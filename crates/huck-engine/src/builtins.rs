@@ -5424,7 +5424,8 @@ fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecO
         match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
             Ok(v) => last = v,
             Err(e) => {
-                e!(err, "huck: let: {a}: {e}");
+                let prefix = shell.error_prefix(Some("let"));
+                e!(err, "{prefix}{}", crate::arith::render_error_body(a, &e));
                 return ExecOutcome::Continue(1);
             }
         }
