@@ -40,6 +40,7 @@ fragments=(
   'f(){ [[ -f x && $y == z ]]; }; declare -f f'
   'f(){ echo hi; }; declare -F f'
   'f(){ for ((i=0; i<3; i++)); do echo $i; done; }; type f'
+  'f(){ echo a; echo b; }; command -V f'
 )
 
 for frag in "${fragments[@]}"; do
