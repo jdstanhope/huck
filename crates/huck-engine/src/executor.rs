@@ -3657,6 +3657,28 @@ pub(crate) fn call_function(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    // FUNCNEST enforcement + recursion backstop. Refuse a call that would exceed
+    // the effective nesting limit BEFORE any frame/positional/local setup, so the
+    // caller's statement simply sees rc 1 (matching bash). The backstop
+    // (FUNCNEST_HARD_MAX) converts otherwise-unbounded recursion into a clean
+    // error instead of a Rust stack-overflow abort.
+    const FUNCNEST_HARD_MAX: usize = 2048;
+    let limit = shell
+        .funcnest_limit()
+        .map_or(FUNCNEST_HARD_MAX, |n| n.min(FUNCNEST_HARD_MAX));
+    let depth = shell
+        .call_stack
+        .iter()
+        .filter(|f| matches!(f.kind, crate::shell_state::FrameKind::Function))
+        .count();
+    if depth >= limit {
+        let prefix = shell.error_prefix(Some(name));
+        {
+            let mut err = err_writer(err_sink, sink);
+            e!(&mut *err, "{prefix}maximum function nesting level exceeded ({limit})");
+        }
+        return ExecOutcome::Continue(1);
+    }
     let saved = std::mem::take(&mut shell.positional_args);
     let saved_loop_depth = std::mem::replace(&mut shell.loop_depth, 0);
     // getopts' within-word cursor is per-call-context: save it and start the
@@ -8572,6 +8594,24 @@ mod tests {
         {
             let _ = execute(&seq, shell, &buf);
         }
+    }
+
+    #[test]
+    fn funcnest_limit_refuses_call_past_depth() {
+        let mut shell = Shell::new();
+        // FUNCNEST=3 allows depth 1,2,3; the 4th call is refused (rc 1).
+        exec_script("FUNCNEST=3\nn=0\nf(){ n=$((n+1)); f; }\nf\n", &mut shell);
+        assert_eq!(shell.get("n"), Some("3"), "should stop after depth 3");
+        assert_eq!(shell.last_status(), 1, "refused call propagates rc 1");
+    }
+
+    #[test]
+    fn funcnest_unlimited_allows_bounded_recursion() {
+        let mut shell = Shell::new();
+        // No FUNCNEST: a bounded 50-deep recursion completes without error.
+        exec_script("n=0\nf(){ n=$((n+1)); if (( n >= 50 )); then return 7; fi; f; }\nf\n", &mut shell);
+        assert_eq!(shell.get("n"), Some("50"));
+        assert_eq!(shell.last_status(), 7);
     }
 
     #[test]
