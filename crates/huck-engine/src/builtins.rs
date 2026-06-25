@@ -6597,6 +6597,7 @@ fn emit_type_entry(
     type_only: bool,
     path_only: bool,
     out: &mut dyn std::io::Write,
+    shell: &Shell,
 ) {
     if type_only {
         let word: &str = match res {
@@ -6622,6 +6623,9 @@ fn emit_type_entry(
         }
         CommandResolution::Function => {
             let _ = writeln!(out, "{name} is a function");
+            if let Some(body) = shell.functions.get(name) {
+                let _ = writeln!(out, "{}", crate::generate::function_to_source(name, body));
+            }
         }
         CommandResolution::Builtin => {
             let _ = writeln!(out, "{name} is a shell builtin");
@@ -6704,7 +6708,7 @@ fn builtin_type(
             continue;
         }
         for res in &resolutions {
-            emit_type_entry(name, res, type_only, path_only, out);
+            emit_type_entry(name, res, type_only, path_only, out, shell);
         }
     }
     ExecOutcome::Continue(exit)
@@ -6942,6 +6946,9 @@ fn builtin_command(
                     let _ = writeln!(out, "{name}");
                 } else {
                     let _ = writeln!(out, "{name} is a function");
+                    if let Some(body) = shell.functions.get(name) {
+                        let _ = writeln!(out, "{}", crate::generate::function_to_source(name, body));
+                    }
                 }
             }
             CommandResolution::Builtin => {
@@ -11080,13 +11087,35 @@ mod type_tests {
     #[test]
     fn type_default_function() {
         let mut shell = Shell::new();
-        let body = Box::new(crate::command::Command::Simple(
-            crate::command::SimpleCommand::Assign(vec![], 0),
-        ));
-        shell.define_function("myfn".to_string(), body);
+        let seq = crate::command::parse(
+            crate::lexer::tokenize("myfn(){ :; }").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let crate::command::Command::FunctionDef { name, body } = seq.first else {
+            panic!("expected function def")
+        };
+        shell.define_function(name, body);
         let (oc, out) = run(&["myfn"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
-        assert_eq!(out.trim_end(), "myfn is a function");
+        assert_eq!(out, "myfn is a function\nmyfn () \n{ \n    :\n}\n");
+    }
+
+    #[test]
+    fn type_prints_function_body() {
+        let mut shell = Shell::new();
+        let seq = crate::command::parse(
+            crate::lexer::tokenize("tf(){ echo a; }").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let crate::command::Command::FunctionDef { name, body } = seq.first else {
+            panic!("expected function def")
+        };
+        shell.define_function(name, body);
+        let (oc, out) = run(&["tf"], &mut shell);
+        assert!(matches!(oc, ExecOutcome::Continue(0)));
+        assert_eq!(out, "tf is a function\ntf () \n{ \n    echo a\n}\n");
     }
 
     #[test]
