@@ -96,23 +96,31 @@ fn inline_assignment_special_builtin_persists() {
 }
 
 // ---------------------------------------------------------------------------
-// Function calls: assignments persist (and mutations inside body persist)
+// Function calls: assignments do NOT persist (temporary scope, like bash 5.2)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn inline_assignment_function_call_persists() {
-    // Functions are persistent-scope targets per POSIX 2.9.1.
+fn inline_assignment_function_call_does_not_persist() {
+    // bash 5.2: a prefix assignment on a function call does NOT persist after
+    // the function returns — only POSIX special builtins persist. FOO was unset
+    // before the command, so `echo $FOO` prints an empty line afterward.
     // Body uses `true` (not `:` — huck has no `:` builtin yet).
-    let (out, _) = run("myfunc() { true; }\nFOO=val myfunc\necho $FOO\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "val"), "got: {out}");
+    let (out, _) = run("myfunc() { true; }\nFOO=val myfunc\necho \"[$FOO]\"\nexit\n");
+    assert!(out.lines().any(|l| l.trim() == "[]"), "got: {out}");
+    assert!(!out.lines().any(|l| l.trim() == "[val]"), "got: {out}");
 }
 
 #[test]
-fn inline_assignment_function_mutation_persists() {
-    // Mutations of the inline-assigned var inside the function body also persist.
+fn inline_assignment_function_mutation_clobbered_by_restore() {
+    // The function's own write to the prefixed var is clobbered back to the
+    // pre-command state (unset) by the snapshot/restore — bash-faithful.
     let (out, _) =
-        run("myfunc() { FOO=\"$FOO-modified\"; }\nFOO=initial myfunc\necho $FOO\nexit\n");
-    assert!(out.lines().any(|l| l.trim() == "initial-modified"), "got: {out}");
+        run("myfunc() { FOO=\"$FOO-modified\"; }\nFOO=initial myfunc\necho \"[$FOO]\"\nexit\n");
+    assert!(out.lines().any(|l| l.trim() == "[]"), "got: {out}");
+    assert!(
+        !out.lines().any(|l| l.trim() == "[initial-modified]"),
+        "got: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------
