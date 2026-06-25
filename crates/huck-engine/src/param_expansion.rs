@@ -385,8 +385,10 @@ pub(crate) fn ansi_c_quote(v: &str) -> String {
 }
 
 /// Expands `word` to a string (no field-splitting), parses it as
-/// arithmetic, evaluates it. On any error, prints `huck: arithmetic: <msg>`
-/// and sets `$? = 1`, returning `Err(())`.
+/// arithmetic, evaluates it. On any error, prints the bash-format
+/// diagnostic — `error_prefix(None)` prologue followed by
+/// `render_error_body` (`<expr>: <msg> (error token is "<tok>")`) — and
+/// sets `$? = 1`, returning `Err(())`.
 fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     let s = crate::expand::expand_assignment(word, shell);
     let expr = match crate::arith::parse(&s) {
