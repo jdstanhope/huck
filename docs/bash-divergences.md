@@ -30,7 +30,7 @@ stays in sync.
 | Bugs (Tier 1) | 0 | None open. |
 | Missing features (Tier 2) | 10 | Deferred bash-compat backlog, ranked by severity within each group. |
 | Intentional (Tier 3) | 10 | Deliberate divergences we're keeping. |
-| Low-impact (Tier 4) | 41 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
+| Low-impact (Tier 4) | 43 | Open edge cases / cosmetic divergences (`[low]`/`[intentional]`/`[deferred]`). |
 
 ---
 
@@ -355,3 +355,7 @@ v216 aligned arith error-message FORMAT with bash (`Shell::error_prefix` prologu
 (h) **Malformed second-`#` base-N number error kind** — `2#110#11` (a valid-prefix base-N literal with a spurious second `#`) maps to `invalid integer constant` in huck vs bash's `invalid number`; the fatal outcome is the same and only the wording differs. Low.
 
 Note: `Shell::error_prefix(cmd: Option<&str>) -> String` (v216) is the bash-compatible error-prologue foundation (`<name>: [line N: ][cmd: ]`). Arith is the first emission site converted; shell-wide adoption (builtins, parser, command-not-found, and the ~400 remaining `huck:`-prefixed error sites) is staged across future iterations.
+
+- **L-57: here-string / word quote provenance in reconstruction** — `[deferred]`, low (v218). huck's `Word` type normalizes quote style during lexing: the original spans of `"…"` / `'…'` / `$'…'` are not tracked, so `declare -f` / `type` reconstruction re-renders tokens in a normalized form rather than the source form. Observed divergences: adjacent double-quoted substrings (`"$a"" ""$b"`) collapse to a single double-quoted span (`"$a $b"`); a double-quoted literal that bash preserves as double-quoted may re-render as single-quoted or backslash-escaped (e.g. `"what a window"` → `'what a window'`). Matching bash's exact byte output requires the lexer to track original quote spans through the `Word` representation (same root cause as the xtrace quote-provenance residual in L-21(a)). Blocks the `herestr` bash test suite category; also responsible for the residual divergences in the `cprint` category (quote style in `echo` argument reconstruction). Fix would need a quote-span field on `Word` atoms preserved from lex time through generate/reconstruct.
+
+- **L-58: `time`-pipeline reconstruction** — `[deferred]`, low (v218). huck has no `time` / `CMD_TIME_PIPELINE` AST node (see M-96 for the related flat-`Sequence` model note). A `time` keyword prefixing a pipeline inside a function body cannot be preserved through `declare -f` / `type` reconstruction — the `time` keyword is silently dropped and the bare pipeline is printed. Severity low. Partially blocks the `cprint` bash test suite category (function bodies containing `time cmd` reconstruct without the `time` prefix). Fix would need a dedicated `Timed(Box<Sequence>)` AST variant in the `Command` or `Sequence` type, plus a corresponding `generate` path.
