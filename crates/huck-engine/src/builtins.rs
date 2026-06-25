@@ -1011,7 +1011,7 @@ fn declare_list_all_vars(
         let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
         fnames.sort();
         for n in &fnames {
-            emit_function(n, false, out, shell);
+            emit_function(n, false, false, out, shell);
         }
     }
     ExecOutcome::Continue(0)
@@ -1035,14 +1035,14 @@ fn declare_list_functions(
         let mut fnames: Vec<String> = shell.functions.keys().cloned().collect();
         fnames.sort();
         for n in &fnames {
-            emit_function(n, names_only, out, shell);
+            emit_function(n, names_only, false, out, shell); // listing: not explicit
         }
         return ExecOutcome::Continue(0);
     }
     let mut exit: i32 = 0;
     for name in names {
         if shell.functions.contains_key(name) {
-            emit_function(name, names_only, out, shell);
+            emit_function(name, names_only, true, out, shell); // explicit name
         } else {
             // bash: `declare -f`/`-F` on a missing function is silent (rc 1).
             exit = 1;
@@ -1053,14 +1053,26 @@ fn declare_list_functions(
 
 /// Emit a single existing function: the `-F` header for `names_only`,
 /// otherwise the full normalized body via `generate::function_to_source`.
+///
+/// `explicit` is true when the caller named this function explicitly
+/// (e.g. `declare -F foo`).  When `names_only && explicit`, bash prints
+/// just the bare name; when `names_only && !explicit` (listing all
+/// functions), bash prints the `declare -f NAME` header form.
 fn emit_function(
     name: &str,
     names_only: bool,
+    explicit: bool,
     out: &mut dyn std::io::Write,
     shell: &Shell,
 ) {
     if names_only {
-        let _ = writeln!(out, "declare -f {name}");
+        if explicit {
+            // bash `declare -F NAME` (specific name) → bare name.
+            let _ = writeln!(out, "{name}");
+        } else {
+            // bash `declare -F` (listing) → re-declarable header form.
+            let _ = writeln!(out, "declare -f {name}");
+        }
     } else if let Some(body) = shell.functions.get(name) {
         let _ = writeln!(out, "{}", crate::generate::function_to_source(name, body));
     }
@@ -11612,7 +11624,42 @@ mod declare_tests {
         shell.define_function("fn1".to_string(), body);
         let (oc, out) = run(&["-F", "fn1"], &mut shell);
         assert!(matches!(oc, ExecOutcome::Continue(0)));
-        assert_eq!(out, "declare -f fn1\n");
+        // bash `declare -F NAME` (explicit name) → bare name (not "declare -f NAME").
+        assert_eq!(out, "fn1\n");
+    }
+
+    #[cfg(test)]
+    fn define_fn(shell: &mut Shell, src: &str) {
+        let seq = crate::command::parse(crate::lexer::tokenize(src).unwrap())
+            .unwrap()
+            .unwrap();
+        let crate::command::Command::FunctionDef { name, body } = seq.first else {
+            panic!("expected function def")
+        };
+        shell.define_function(name, body);
+    }
+
+    #[test]
+    fn declare_dash_f_explicit_name_is_bare() {
+        let mut shell = Shell::new();
+        define_fn(&mut shell, "f(){ echo hi; }");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let args = vec!["-F".to_string(), "f".to_string()];
+        run_declaration_builtin_strs("declare", &args, &mut out, &mut err, &mut shell);
+        assert_eq!(String::from_utf8(out).unwrap(), "f\n");
+    }
+
+    #[test]
+    fn declare_dash_f_no_args_keeps_declare_prefix() {
+        let mut shell = Shell::new();
+        define_fn(&mut shell, "f(){ :; }");
+        define_fn(&mut shell, "g(){ :; }");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let args = vec!["-F".to_string()];
+        run_declaration_builtin_strs("declare", &args, &mut out, &mut err, &mut shell);
+        assert_eq!(String::from_utf8(out).unwrap(), "declare -f f\ndeclare -f g\n");
     }
 
     #[test]
