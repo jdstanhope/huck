@@ -869,6 +869,19 @@ fn quote_subscript_key(k: &str) -> String {
     }
 }
 
+/// Quote a value for `declare -p` display. bash double-quotes normally but
+/// switches the whole value to ANSI-C `$'…'` when it contains a control
+/// character (newline, tab, etc.) — the same `is_control()` trigger as
+/// `declare_scalar_quote`, so the `-p` and bare forms agree. Returns the full
+/// quoted token (`"…"` or `$'…'`), with no leading `=`.
+fn declare_p_value_quote(s: &str) -> String {
+    if s.chars().any(|c| c.is_control()) {
+        crate::param_expansion::ansi_c_quote(s)
+    } else {
+        format!("\"{}\"", crate::escape_double_quote_value(s))
+    }
+}
+
 /// Renders the `=<value>` suffix of a declare line: `="v"` for a scalar,
 /// `=([k]="v" …)` for arrays. Shared by `format_declare_line` (the `-p` form)
 /// and `format_declare_bare_line` (arrays only).
@@ -880,13 +893,13 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
             if var.nameref && s.is_empty() {
                 String::new()
             } else {
-                format!("=\"{}\"", crate::escape_double_quote_value(s))
+                format!("={}", declare_p_value_quote(s))
             }
         }
         VarValue::Indexed(m) => {
             let parts: Vec<String> = m
                 .iter()
-                .map(|(k, v)| format!("[{k}]=\"{}\"", crate::escape_double_quote_value(v)))
+                .map(|(k, v)| format!("[{k}]={}", declare_p_value_quote(v)))
                 .collect();
             format!("=({})", parts.join(" "))
         }
@@ -894,11 +907,7 @@ fn render_declare_value_part(var: &crate::shell_state::Variable) -> String {
             let parts: Vec<String> = pairs
                 .iter()
                 .map(|(k, v)| {
-                    format!(
-                        "[{}]=\"{}\"",
-                        quote_subscript_key(k),
-                        crate::escape_double_quote_value(v)
-                    )
+                    format!("[{}]={}", quote_subscript_key(k), declare_p_value_quote(v))
                 })
                 .collect();
             if parts.is_empty() {
@@ -7463,6 +7472,53 @@ mod tests {
         };
         let out = render_declare_value_part(&var);
         assert_eq!(out, r#"=([foo]="v" )"#);
+    }
+
+    #[test]
+    fn declare_p_scalar_control_uses_ansi_c() {
+        use crate::shell_state::Variable;
+        // value is `i` + a real newline; bash renders it as $'i\n'
+        let v = Variable::scalar("i\n".to_string());
+        assert_eq!(render_declare_value_part(&v), "=$'i\\n'");
+        let t = Variable::scalar("a\tb".to_string());
+        assert_eq!(render_declare_value_part(&t), "=$'a\\tb'");
+        // 0x01 SOH -> 3-digit octal
+        let c = Variable::scalar("a\u{01}b".to_string());
+        assert_eq!(render_declare_value_part(&c), "=$'a\\001b'");
+    }
+
+    #[test]
+    fn declare_p_scalar_plain_unchanged() {
+        use crate::shell_state::Variable;
+        assert_eq!(render_declare_value_part(&Variable::scalar("hello".to_string())), "=\"hello\"");
+        // `$` and `"` stay in the double-quoted form (no control char -> no $'…')
+        assert_eq!(
+            render_declare_value_part(&Variable::scalar("a$b\"c".to_string())),
+            "=\"a\\$b\\\"c\""
+        );
+    }
+
+    #[test]
+    fn declare_p_indexed_control_uses_ansi_c() {
+        use crate::shell_state::{VarValue, Variable};
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(0usize, "x".to_string());
+        m.insert(1usize, "i\n".to_string());
+        let a = Variable {
+            value: VarValue::Indexed(m),
+            exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
+        };
+        assert_eq!(render_declare_value_part(&a), "=([0]=\"x\" [1]=$'i\\n')");
+    }
+
+    #[test]
+    fn declare_p_assoc_control_uses_ansi_c() {
+        use crate::shell_state::{VarValue, Variable};
+        let var = Variable {
+            value: VarValue::Associative(vec![("k".into(), "a\tb".into())]),
+            exported: false, readonly: false, integer: false, case_fold: None, nameref: false,
+        };
+        assert_eq!(render_declare_value_part(&var), "=([k]=$'a\\tb' )");
     }
 
     #[test]
