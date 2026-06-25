@@ -32,6 +32,28 @@ The harness targets **bash 5.2.21** specifically — see the spec for
 why version pinning matters. Other versions may work but the baseline
 doc is keyed to 5.2.21.
 
+## Test helper binaries (recho / zecho / printenv)
+
+Many bash `.tests` invoke three helper programs — `recho`, `zecho`,
+`printenv` — that are NOT bash builtins but standalone C programs in bash's
+own test tooling (`support/recho.c`, `support/zecho.c`, `support/printenv.c`).
+The runner compiles them at runtime from `$BASH_SOURCE_DIR/support/*.c` into
+an ephemeral temp dir and adds that dir to `PATH` for the category runs.
+Nothing is vendored — they are built from the operator-supplied bash source,
+the same posture as the `.tests`/`.right` files.
+
+Requirements: a C compiler (`cc` by default; override with `$CC`) — the same
+toolchain already needed to build huck.
+
+Override: set `HUCK_BASH_TEST_HELPERS` to a directory containing pre-built
+`recho`/`zecho`/`printenv` executables and the runner will use those instead
+of compiling.
+
+If no compiler is available and no override is set, the runner prints a
+warning and continues; the ~21 categories that invoke these helpers will FAIL
+on `command not found` (as they did before this support existed), but the rest
+of the sweep is unaffected.
+
 ## Running the survey
 
 ```bash

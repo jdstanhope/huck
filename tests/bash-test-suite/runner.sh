@@ -52,6 +52,56 @@ if [ ! -x "$HUCK" ]; then
     exit 1
 fi
 
+# ---- Provision test helpers (recho / zecho / printenv) -------------
+# bash's .tests invoke these standalone helper programs (NOT builtins);
+# bash builds them from support/*.c. We compile them at runtime from the
+# operator-supplied $BASH_SOURCE_DIR (nothing vendored; GPL posture) into
+# an ephemeral dir and prepend it to PATH for the category runs. An
+# operator may instead point HUCK_BASH_TEST_HELPERS at a pre-built dir.
+# If no compiler is available, we warn and continue (categories that need
+# the helpers stay FAIL, exactly as before) — provisioning never aborts
+# the sweep.
+HELPER_DIR=""
+HELPERS="recho zecho printenv"
+
+if [ -n "${HUCK_BASH_TEST_HELPERS:-}" ]; then
+    # Override: use a pre-built dir if it has all three executables.
+    # (subshell so the `exit 1` aborts only the check, not the runner)
+    if ( for h in $HELPERS; do [ -x "$HUCK_BASH_TEST_HELPERS/$h" ] || exit 1; done ); then
+        HELPER_DIR="$HUCK_BASH_TEST_HELPERS"
+    else
+        echo "warning: HUCK_BASH_TEST_HELPERS=$HUCK_BASH_TEST_HELPERS is missing one of: $HELPERS; compiling from source instead." >&2
+    fi
+fi
+
+if [ -z "$HELPER_DIR" ]; then
+    CC="${CC:-cc}"
+    if ! command -v "$CC" >/dev/null 2>&1; then
+        echo "warning: no C compiler ('$CC') found; test helpers (recho/zecho/printenv) unavailable. Categories needing them will FAIL. Set HUCK_BASH_TEST_HELPERS to a pre-built dir or install a compiler." >&2
+    elif [ ! -f "$BASH_SOURCE_DIR/support/recho.c" ]; then
+        echo "warning: $BASH_SOURCE_DIR/support/recho.c not found; cannot build test helpers. Categories needing them will FAIL." >&2
+    else
+        built_dir=$(mktemp -d -t "huck-bash-helpers.XXXXXX")
+        inc="-I$BASH_SOURCE_DIR -I$BASH_SOURCE_DIR/include -I$BASH_SOURCE_DIR/builtins"
+        for h in $HELPERS; do
+            # -include string.h: printenv.c uses strlen without including it,
+            # which modern gcc treats as a hard error.
+            if ! "$CC" $inc -include string.h -o "$built_dir/$h" "$BASH_SOURCE_DIR/support/$h.c" 2>"$built_dir/$h.log"; then
+                echo "warning: failed to compile test helper '$h' (see $built_dir/$h.log); categories needing it will FAIL." >&2
+            fi
+        done
+        # Use the dir if anything compiled (a partial build still helps).
+        if [ -n "$(ls -A "$built_dir" 2>/dev/null | grep -vE '\.log$')" ]; then
+            HELPER_DIR="$built_dir"
+        fi
+    fi
+fi
+
+if [ -n "$HELPER_DIR" ]; then
+    PATH="$HELPER_DIR:$PATH"
+    export PATH
+fi
+
 # ---- Scratch dir ---------------------------------------------------
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
