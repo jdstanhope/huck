@@ -546,6 +546,55 @@ fn arith_body_to_source(w: &Word) -> String {
     out
 }
 
+/// Render one part inside a Single/Backslash/AnsiC quoted run: a `Literal`
+/// contributes its text verbatim (the run owns the quotes); an expansion renders
+/// via its normal source form WITHOUT re-quoting. (The `Double` style escapes
+/// literals itself, so it does not use this helper.)
+fn quoted_inner_to_source(part: &WordPart) -> String {
+    match part {
+        WordPart::Literal { text, .. } => text.clone(),
+        other => part_to_source(other),
+    }
+}
+
+/// Render a part that appears inside `"…"` — without the outer `"…"` wrapper
+/// that `quote_if(true, …)` would normally add; the caller provides the
+/// surrounding double-quotes. Literals are re-escaped for the double-quote
+/// context; expansions are rendered without re-wrapping.
+fn part_to_source_in_double(part: &WordPart) -> String {
+    match part {
+        WordPart::Literal { text, .. } => crate::escape_double_quote_value(text),
+        WordPart::Var { name, .. } => format!("${name}"),
+        WordPart::LastStatus { .. } => "$?".to_string(),
+        WordPart::AllArgs { joined, .. } => (if *joined { "$*" } else { "$@" }).to_string(),
+        WordPart::CommandSub { sequence, .. } =>
+            format!("$({})", sequence_to_source(sequence, 0).trim_end()),
+        WordPart::Arith { body, .. } =>
+            format!("$(({}))", arith_body_to_source(body)),
+        WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } =>
+            param_expansion_to_source(name, modifier, subscript.as_ref(), *indirect),
+        // Nested Quoted or anything else: delegate to the full renderer.
+        other => part_to_source(other),
+    }
+}
+
+/// ANSI-C re-escape for `$'…'`: turn control chars back into their escapes.
+fn ansi_c_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn part_to_source(part: &WordPart) -> String {
     match part {
         WordPart::Literal { text, quoted } => {
@@ -598,6 +647,27 @@ fn part_to_source(part: &WordPart) -> String {
                 crate::lexer::ProcDir::Out => ">(",
             };
             format!("{}{})", prefix, sequence_to_source(sequence, 0).trim_end())
+        }
+        WordPart::Quoted { style, parts } => {
+            use crate::lexer::QuoteStyle;
+            match style {
+                QuoteStyle::Double => {
+                    let inner: String = parts.iter().map(part_to_source_in_double).collect();
+                    format!("\"{inner}\"")
+                }
+                QuoteStyle::Single => {
+                    let inner: String = parts.iter().map(quoted_inner_to_source).collect();
+                    format!("'{inner}'")
+                }
+                QuoteStyle::Backslash => {
+                    let inner: String = parts.iter().map(quoted_inner_to_source).collect();
+                    format!("\\{inner}")
+                }
+                QuoteStyle::AnsiC => {
+                    let inner: String = parts.iter().map(quoted_inner_to_source).collect();
+                    format!("$'{}'", ansi_c_escape(&inner))
+                }
+            }
         }
     }
 }
@@ -1238,4 +1308,77 @@ mod tests {
         assert_eq!(declf("f() ( echo hi )"),
             "f () \n{ \n    ( echo hi )\n}");
     }
+
+    // ── Quoted variant rendering ──
+    #[test]
+    fn render_quoted_single() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let w = Word(vec![WordPart::Quoted {
+            style: QuoteStyle::Single,
+            parts: vec![WordPart::Literal { text: "what a window".into(), quoted: true }],
+        }]);
+        assert_eq!(word_to_source(&w), "'what a window'");
+    }
+    #[test]
+    fn render_quoted_double_span() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let w = Word(vec![WordPart::Quoted {
+            style: QuoteStyle::Double,
+            parts: vec![
+                WordPart::Var { name: "a".into(), quoted: true },
+                WordPart::Literal { text: " ".into(), quoted: true },
+                WordPart::Var { name: "b".into(), quoted: true },
+            ],
+        }]);
+        assert_eq!(word_to_source(&w), "\"$a $b\"");
+    }
+    #[test]
+    fn render_quoted_backslash() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let w = Word(vec![
+            WordPart::Quoted { style: QuoteStyle::Backslash,
+                parts: vec![WordPart::Literal { text: "$".into(), quoted: true }] },
+            WordPart::Literal { text: "PWD".into(), quoted: false },
+        ]);
+        assert_eq!(word_to_source(&w), "\\$PWD");
+    }
+    #[test]
+    fn render_quoted_adjacent_double() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let run = |t: &str| WordPart::Quoted { style: QuoteStyle::Double,
+            parts: vec![WordPart::Literal { text: t.into(), quoted: true }] };
+        let w = Word(vec![run("a b"), run("c d")]);
+        assert_eq!(word_to_source(&w), "\"a b\"\"c d\"");
+    }
+    #[test]
+    fn render_quoted_double_escapes_specials() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let w = Word(vec![WordPart::Quoted { style: QuoteStyle::Double,
+            parts: vec![WordPart::Literal { text: "a\"b$c".into(), quoted: true }] }]);
+        // inside "...", a literal " and $ must be backslash-escaped
+        assert_eq!(word_to_source(&w), "\"a\\\"b\\$c\"");
+    }
+    #[test]
+    fn render_quoted_ansic_newline() {
+        use crate::lexer::{QuoteStyle, Word, WordPart};
+        let w = Word(vec![WordPart::Quoted { style: QuoteStyle::AnsiC,
+            parts: vec![WordPart::Literal { text: "i\n".into(), quoted: true }] }]);
+        assert_eq!(word_to_source(&w), "$'i\\n'");
+    }
+
+    // ── Task 2 (v219): end-to-end byte-exact reconstruction of quoted words ──
+    fn declf_word(body_word_src: &str) -> String {
+        use crate::{command, lexer};
+        let src = format!("f(){{ echo {body_word_src}; }}");
+        let seq = command::parse(lexer::tokenize(&src).unwrap()).unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        function_to_source(&name, &body)
+    }
+
+    #[test] fn rt_quote_single()   { assert!(declf_word("'what a window'").contains("echo 'what a window'")); }
+    #[test] fn rt_quote_dq_span()  { assert!(declf_word("\"$a $b\"").contains("echo \"$a $b\"")); }
+    #[test] fn rt_quote_backslash(){ assert!(declf_word("\\$PWD").contains("echo \\$PWD")); }
+    #[test] fn rt_quote_adjacent() { assert!(declf_word("\"a b\"\"c d\"").contains("echo \"a b\"\"c d\"")); }
+    #[test] fn rt_quote_mixed()    { assert!(declf_word("ab'cd'ef").contains("echo ab'cd'ef")); }
+    #[test] fn rt_quote_specials() { assert!(declf_word("\\&\\|'()'").contains("echo \\&\\|'()'")); }
 }

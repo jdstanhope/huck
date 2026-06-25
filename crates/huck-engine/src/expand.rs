@@ -995,6 +995,268 @@ fn expand_array_param(
     }
 }
 
+/// Process a single `WordPart` in the context of `expand()`, mutating the
+/// in-progress `current` field, the accumulated `result` vector, and the
+/// `has_emitted` sentinel. Returns `ControlFlow::Break(())` when the callers
+/// should immediately return `result` (fatal parameter error / nounset).
+fn expand_part(
+    part: &WordPart,
+    current: &mut Field,
+    result: &mut Vec<Field>,
+    has_emitted: &mut bool,
+    shell: &mut Shell,
+    snapshot_status: i32,
+) -> std::ops::ControlFlow<()> {
+    use std::ops::ControlFlow;
+    match part {
+        WordPart::Literal { text, quoted } => {
+            current.push_str(text, *quoted);
+            *has_emitted = true;
+        }
+        WordPart::Tilde(spec) => {
+            // Tilde expansion result is always unquoted — pathname
+            // expansion treats the expanded path as if the user typed it.
+            let text = resolve_tilde(spec, shell)
+                .unwrap_or_else(|| render_tilde_literal(spec));
+            current.push_str(&text, false);
+            *has_emitted = true;
+        }
+        WordPart::Var { name, quoted: true } => {
+            match shell.lookup_var(name) {
+                Some(value) => current.push_str(&value, true),
+                None => {
+                    if shell.shell_options.nounset {
+                        with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                        shell.pending_fatal_pe_error = Some(1);
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            // Unset quoted var: relies on `has_emitted` so end-of-word
+            // still produces a (possibly empty) Field.
+            *has_emitted = true;
+        }
+        WordPart::LastStatus { quoted: true } => {
+            current.push_str(&snapshot_status.to_string(), true);
+            *has_emitted = true;
+        }
+        WordPart::Var { name, quoted: false } => {
+            let value = match shell.lookup_var(name) {
+                Some(v) => v,
+                None => {
+                    if shell.shell_options.nounset {
+                        with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                        shell.pending_fatal_pe_error = Some(1);
+                        return ControlFlow::Break(());
+                    }
+                    String::new()
+                }
+            };
+            let ifs = shell.ifs();
+            emit_split_fields(&value, &ifs, current, result, has_emitted);
+        }
+        WordPart::AllArgs { quoted: false, joined: _ } => {
+            // Unquoted $@ and $* are identical: each arg becomes its
+            // own field(s), IFS-split. Args are independent — the
+            // last IFS-fragment of arg N must NOT merge with the
+            // first of arg N+1, so we flush current between args.
+            let args = shell.positional_args.clone();
+            let ifs = shell.ifs();
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 && !current.is_empty() {
+                    result.push(std::mem::take(current));
+                }
+                emit_split_fields(arg, &ifs, current, result, has_emitted);
+            }
+        }
+        WordPart::AllArgs { quoted: true, joined: false } => {
+            // "$@" — each arg its own quoted field, no splitting.
+            // First arg merges into current; subsequent start new
+            // fields; last becomes the new current.
+            let args = shell.positional_args.clone();
+            if !args.is_empty() {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        // Start a new field for the next arg.
+                        result.push(std::mem::take(current));
+                    }
+                    current.push_str(arg, true);
+                    *has_emitted = true;
+                }
+            }
+            // Empty args: zero fields — do nothing.
+        }
+        WordPart::AllArgs { quoted: true, joined: true } => {
+            // "$*" — single field, args joined by the first IFS char.
+            // Empty IFS concatenates without a separator (POSIX § 2.5.2).
+            let sep = ifs_join_sep(&shell.ifs());
+            let joined = shell.positional_args.join(&sep);
+            current.push_str(&joined, true);
+            *has_emitted = true;
+        }
+        WordPart::LastStatus { quoted: false } => {
+            let value = snapshot_status.to_string();
+            let ifs = shell.ifs();
+            emit_split_fields(&value, &ifs, current, result, has_emitted);
+        }
+        WordPart::CommandSub { sequence, quoted: true } => {
+            let output = run_substitution(sequence, shell);
+            current.push_str(&output, true);
+            *has_emitted = true;
+        }
+        WordPart::CommandSub { sequence, quoted: false } => {
+            let output = run_substitution(sequence, shell);
+            let ifs = shell.ifs();
+            emit_split_fields(&output, &ifs, current, result, has_emitted);
+        }
+        WordPart::Arith { body, quoted: _ } => {
+            let (src, res) = eval_arith_word_src(body, shell);
+            match res {
+                Ok(n) => {
+                    current.push_str(&n.to_string(), true);
+                    *has_emitted = true;
+                }
+                Err(e) => {
+                    // Print the error but DO NOT set pending_fatal_pe_error —
+                    // bash script-file mode prints and continues. The empty
+                    // contribution here matches bash's empty $((..)) value
+                    // on error. (-c mode divergence: L-55 in
+                    // bash-divergences.md.)
+                    let prefix = shell.error_prefix(None);
+                    with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                    *has_emitted = true;
+                }
+            }
+        }
+        WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+            // Substring on `$@` / `$*` is array-shaped (closes v33's
+            // `${@:o:l}` deferral) — route through the shared
+            // word-list path even though there's no `subscript`.
+            let result_pe = if *indirect {
+                expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
+            } else if let Some(sub) = subscript {
+                expand_array_param(name, modifier, sub, *quoted, shell)
+            } else if matches!(
+                (name.as_str(), modifier),
+                ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
+            ) {
+                expand_positional_substring(name, modifier, *quoted, shell)
+            } else {
+                crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
+            };
+            match result_pe {
+                crate::param_expansion::ExpansionResult::Value(v) => {
+                    if *quoted {
+                        current.push_str(&v, true);
+                        *has_emitted = true;
+                    } else {
+                        let ifs = shell.ifs();
+                        emit_split_fields(&v, &ifs, current, result, has_emitted);
+                    }
+                }
+                crate::param_expansion::ExpansionResult::Empty => {
+                    // A QUOTED empty expansion (`"${u+x}"` when unset) still
+                    // contributes one empty field; an UNQUOTED one vanishes
+                    // (contributes no field), matching bash. Setting
+                    // has_emitted unconditionally injected a spurious empty
+                    // field for unquoted `${x+alt}` / `${arr[@]+…}` (M-105).
+                    if *quoted {
+                        *has_emitted = true;
+                    }
+                }
+                crate::param_expansion::ExpansionResult::WordList(words) => {
+                    if *quoted {
+                        // Quoted `@`-style: each element is its own
+                        // field, no IFS-splitting. Mirrors the
+                        // `"$@"` path above.
+                        if !words.is_empty() {
+                            for (i, w) in words.iter().enumerate() {
+                                if i > 0 {
+                                    result.push(std::mem::take(current));
+                                }
+                                current.push_str(w, true);
+                                *has_emitted = true;
+                            }
+                        }
+                    } else {
+                        // Unquoted: join with first IFS char then
+                        // let word-splitting do the rest.
+                        let ifs = shell.ifs();
+                        let sep = ifs_join_sep(&ifs);
+                        let joined = words.join(&sep);
+                        emit_split_fields(&joined, &ifs, current, result, has_emitted);
+                    }
+                }
+                crate::param_expansion::ExpansionResult::Fields(fields) => {
+                    // Substituted word of an UNQUOTED outer ${p+word} /
+                    // ${p-word} (M-110). Each Field came from expand(word),
+                    // so it already encodes per-char quoting; bash then
+                    // word-splits the result, protecting quoted regions.
+                    // Field boundaries from expand() (e.g. "${a[@]}"
+                    // elements) are word boundaries; within each field we
+                    // IFS-split only at UNQUOTED whitespace/IFS — so
+                    // quoted-empty fields survive and quoted-spaced fields
+                    // are not re-split.
+                    let ifs = shell.ifs();
+                    for (i, f) in fields.into_iter().enumerate() {
+                        if i > 0 {
+                            result.push(std::mem::take(current));
+                        }
+                        emit_split_field_quoted(
+                            &f, &ifs, current, result, has_emitted,
+                        );
+                    }
+                }
+                crate::param_expansion::ExpansionResult::Fatal { status } => {
+                    shell.pending_fatal_pe_error = Some(status);
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        WordPart::AssignPrefix { target, append } => {
+            let mut lhs = render_assign_target(target, shell);
+            lhs.push_str(if *append { "+=" } else { "=" });
+            current.push_str(&lhs, true);
+        }
+        WordPart::ArrayLiteral(elems) => {
+            let rendered = reconstruct_array_literal(elems, shell);
+            current.push_str(&rendered, true);
+        }
+        WordPart::ProcessSub { sequence, dir } => {
+            match crate::procsub::realize(sequence, dir.clone(), shell) {
+                Ok((path, ps)) => {
+                    shell.procsub_pending.push(ps);
+                    // The realized path (/dev/fd/N or a FIFO) is a single
+                    // non-splitting, non-glob field — mirror the
+                    // `CommandSub { quoted: true }` treatment.
+                    current.push_str(&path, true);
+                    *has_emitted = true;
+                }
+                Err(e) => {
+                    with_err(|err| e!(err, "huck: process substitution: {e}"));
+                    // Emit nothing; the field stays empty if no other parts.
+                }
+            }
+        }
+        WordPart::Quoted { parts, .. } => {
+            // Delegate to each inner part. Inner parts already carry their
+            // individual `quoted: true` flags so expansion semantics are
+            // unchanged; the wrapper exists only for source reconstruction.
+            for inner in parts {
+                if expand_part(inner, current, result, has_emitted, shell, snapshot_status).is_break() {
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        _ => {
+            // Forward-compatible catchall for future WordPart variants
+            // added by huck-syntax. Emit nothing — preserves the
+            // has_emitted state without producing spurious fields.
+        }
+    }
+    ControlFlow::Continue(())
+}
+
 /// Expands a `Word` against the current `Shell` state into 0 or more
 /// `Field`s. Quoted variable references append their value verbatim;
 /// unquoted references split on ASCII whitespace and can yield multiple
@@ -1016,241 +1278,8 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
     let mut result: Vec<Field> = Vec::new();
 
     for part in &word.0 {
-        match part {
-            WordPart::Literal { text, quoted } => {
-                current.push_str(text, *quoted);
-                has_emitted = true;
-            }
-            WordPart::Tilde(spec) => {
-                // Tilde expansion result is always unquoted — pathname
-                // expansion treats the expanded path as if the user typed it.
-                let text = resolve_tilde(spec, shell)
-                    .unwrap_or_else(|| render_tilde_literal(spec));
-                current.push_str(&text, false);
-                has_emitted = true;
-            }
-            WordPart::Var { name, quoted: true } => {
-                match shell.lookup_var(name) {
-                    Some(value) => current.push_str(&value, true),
-                    None => {
-                        if shell.shell_options.nounset {
-                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
-                            shell.pending_fatal_pe_error = Some(1);
-                            return result;
-                        }
-                    }
-                }
-                // Unset quoted var: relies on `has_emitted` so end-of-word
-                // still produces a (possibly empty) Field.
-                has_emitted = true;
-            }
-            WordPart::LastStatus { quoted: true } => {
-                current.push_str(&snapshot_status.to_string(), true);
-                has_emitted = true;
-            }
-            WordPart::Var { name, quoted: false } => {
-                let value = match shell.lookup_var(name) {
-                    Some(v) => v,
-                    None => {
-                        if shell.shell_options.nounset {
-                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
-                            shell.pending_fatal_pe_error = Some(1);
-                            return result;
-                        }
-                        String::new()
-                    }
-                };
-                let ifs = shell.ifs();
-                emit_split_fields(&value, &ifs, &mut current, &mut result, &mut has_emitted);
-            }
-            WordPart::AllArgs { quoted: false, joined: _ } => {
-                // Unquoted $@ and $* are identical: each arg becomes its
-                // own field(s), IFS-split. Args are independent — the
-                // last IFS-fragment of arg N must NOT merge with the
-                // first of arg N+1, so we flush current between args.
-                let args = shell.positional_args.clone();
-                let ifs = shell.ifs();
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 && !current.is_empty() {
-                        result.push(std::mem::take(&mut current));
-                    }
-                    emit_split_fields(arg, &ifs, &mut current, &mut result, &mut has_emitted);
-                }
-            }
-            WordPart::AllArgs { quoted: true, joined: false } => {
-                // "$@" — each arg its own quoted field, no splitting.
-                // First arg merges into current; subsequent start new
-                // fields; last becomes the new current.
-                let args = shell.positional_args.clone();
-                if !args.is_empty() {
-                    for (i, arg) in args.iter().enumerate() {
-                        if i > 0 {
-                            // Start a new field for the next arg.
-                            result.push(std::mem::take(&mut current));
-                        }
-                        current.push_str(arg, true);
-                        has_emitted = true;
-                    }
-                }
-                // Empty args: zero fields — do nothing.
-            }
-            WordPart::AllArgs { quoted: true, joined: true } => {
-                // "$*" — single field, args joined by the first IFS char.
-                // Empty IFS concatenates without a separator (POSIX § 2.5.2).
-                let sep = ifs_join_sep(&shell.ifs());
-                let joined = shell.positional_args.join(&sep);
-                current.push_str(&joined, true);
-                has_emitted = true;
-            }
-            WordPart::LastStatus { quoted: false } => {
-                let value = snapshot_status.to_string();
-                let ifs = shell.ifs();
-                emit_split_fields(&value, &ifs, &mut current, &mut result, &mut has_emitted);
-            }
-            WordPart::CommandSub { sequence, quoted: true } => {
-                let output = run_substitution(sequence, shell);
-                current.push_str(&output, true);
-                has_emitted = true;
-            }
-            WordPart::CommandSub { sequence, quoted: false } => {
-                let output = run_substitution(sequence, shell);
-                let ifs = shell.ifs();
-                emit_split_fields(&output, &ifs, &mut current, &mut result, &mut has_emitted);
-            }
-            WordPart::Arith { body, quoted: _ } => {
-                let (src, res) = eval_arith_word_src(body, shell);
-                match res {
-                    Ok(n) => {
-                        current.push_str(&n.to_string(), true);
-                        has_emitted = true;
-                    }
-                    Err(e) => {
-                        // Print the error but DO NOT set pending_fatal_pe_error —
-                        // bash script-file mode prints and continues. The empty
-                        // contribution here matches bash's empty $((..)) value
-                        // on error. (-c mode divergence: L-55 in
-                        // bash-divergences.md.)
-                        let prefix = shell.error_prefix(None);
-                        with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
-                        has_emitted = true;
-                    }
-                }
-            }
-            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
-                // Substring on `$@` / `$*` is array-shaped (closes v33's
-                // `${@:o:l}` deferral) — route through the shared
-                // word-list path even though there's no `subscript`.
-                let result_pe = if *indirect {
-                    expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
-                } else if let Some(sub) = subscript {
-                    expand_array_param(name, modifier, sub, *quoted, shell)
-                } else if matches!(
-                    (name.as_str(), modifier),
-                    ("@" | "*", crate::lexer::ParamModifier::Substring { .. })
-                ) {
-                    expand_positional_substring(name, modifier, *quoted, shell)
-                } else {
-                    crate::param_expansion::expand_modifier_quoted(name, modifier, *quoted, shell)
-                };
-                match result_pe {
-                    crate::param_expansion::ExpansionResult::Value(v) => {
-                        if *quoted {
-                            current.push_str(&v, true);
-                            has_emitted = true;
-                        } else {
-                            let ifs = shell.ifs();
-                            emit_split_fields(&v, &ifs, &mut current, &mut result, &mut has_emitted);
-                        }
-                    }
-                    crate::param_expansion::ExpansionResult::Empty => {
-                        // A QUOTED empty expansion (`"${u+x}"` when unset) still
-                        // contributes one empty field; an UNQUOTED one vanishes
-                        // (contributes no field), matching bash. Setting
-                        // has_emitted unconditionally injected a spurious empty
-                        // field for unquoted `${x+alt}` / `${arr[@]+…}` (M-105).
-                        if *quoted {
-                            has_emitted = true;
-                        }
-                    }
-                    crate::param_expansion::ExpansionResult::WordList(words) => {
-                        if *quoted {
-                            // Quoted `@`-style: each element is its own
-                            // field, no IFS-splitting. Mirrors the
-                            // `"$@"` path above.
-                            if !words.is_empty() {
-                                for (i, w) in words.iter().enumerate() {
-                                    if i > 0 {
-                                        result.push(std::mem::take(&mut current));
-                                    }
-                                    current.push_str(w, true);
-                                    has_emitted = true;
-                                }
-                            }
-                        } else {
-                            // Unquoted: join with first IFS char then
-                            // let word-splitting do the rest.
-                            let ifs = shell.ifs();
-                            let sep = ifs_join_sep(&ifs);
-                            let joined = words.join(&sep);
-                            emit_split_fields(&joined, &ifs, &mut current, &mut result, &mut has_emitted);
-                        }
-                    }
-                    crate::param_expansion::ExpansionResult::Fields(fields) => {
-                        // Substituted word of an UNQUOTED outer ${p+word} /
-                        // ${p-word} (M-110). Each Field came from expand(word),
-                        // so it already encodes per-char quoting; bash then
-                        // word-splits the result, protecting quoted regions.
-                        // Field boundaries from expand() (e.g. "${a[@]}"
-                        // elements) are word boundaries; within each field we
-                        // IFS-split only at UNQUOTED whitespace/IFS — so
-                        // quoted-empty fields survive and quoted-spaced fields
-                        // are not re-split.
-                        let ifs = shell.ifs();
-                        for (i, f) in fields.into_iter().enumerate() {
-                            if i > 0 {
-                                result.push(std::mem::take(&mut current));
-                            }
-                            emit_split_field_quoted(
-                                &f, &ifs, &mut current, &mut result, &mut has_emitted,
-                            );
-                        }
-                    }
-                    crate::param_expansion::ExpansionResult::Fatal { status } => {
-                        shell.pending_fatal_pe_error = Some(status);
-                        return result;
-                    }
-                }
-            }
-            WordPart::AssignPrefix { target, append } => {
-                let mut lhs = render_assign_target(target, shell);
-                lhs.push_str(if *append { "+=" } else { "=" });
-                current.push_str(&lhs, true);
-            }
-            WordPart::ArrayLiteral(elems) => {
-                let rendered = reconstruct_array_literal(elems, shell);
-                current.push_str(&rendered, true);
-            }
-            WordPart::ProcessSub { sequence, dir } => {
-                match crate::procsub::realize(sequence, dir.clone(), shell) {
-                    Ok((path, ps)) => {
-                        shell.procsub_pending.push(ps);
-                        // The realized path (/dev/fd/N or a FIFO) is a single
-                        // non-splitting, non-glob field — mirror the
-                        // `CommandSub { quoted: true }` treatment.
-                        current.push_str(&path, true);
-                        has_emitted = true;
-                    }
-                    Err(e) => {
-                        with_err(|err| e!(err, "huck: process substitution: {e}"));
-                        // Emit nothing; the field stays empty if no other parts.
-                    }
-                }
-            }
-            _ => {
-                // Forward-compatible catchall for future WordPart variants
-                // added by huck-syntax. Emit nothing — preserves the
-                // has_emitted state without producing spurious fields.
-            }
+        if expand_part(part, &mut current, &mut result, &mut has_emitted, shell, snapshot_status).is_break() {
+            return result;
         }
     }
 
@@ -1359,6 +1388,7 @@ fn part_is_quoted(part: &WordPart) -> bool {
             | P::Arith { quoted: true, .. }
             | P::ParamExpansion { quoted: true, .. }
             | P::AllArgs { quoted: true, .. }
+            | P::Quoted { .. }
     )
 }
 
@@ -1392,6 +1422,12 @@ fn reconstruct_part(part: &WordPart, out: &mut String) {
             reconstruct_param_expansion(name, modifier, subscript.as_ref(), *indirect, out);
         }
         P::AssignPrefix { .. } | P::ArrayLiteral(_) => {}
+        P::Quoted { parts, .. } => {
+            // Recurse so quoted content still appears in xtrace output.
+            for inner in parts {
+                reconstruct_part(inner, out);
+            }
+        }
         _ => {
             // Forward-compatible: unknown future WordPart renders as nothing.
         }
@@ -1646,6 +1682,17 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // it here (assignment context, no command to consume the fd)
                 // would leak an fd and a child process with no benefit. No-op.
             }
+            WordPart::Quoted { parts, .. } => {
+                // Delegate to each inner part. Inner parts carry their own
+                // `quoted` flags so expansion semantics are unchanged; the
+                // wrapper exists only for source reconstruction.
+                for inner in parts {
+                    result.push_str(&expand_assignment(&Word(vec![inner.clone()]), shell));
+                    if shell.pending_fatal_pe_error.is_some() {
+                        return result;
+                    }
+                }
+            }
             _ => {
                 // Forward-compatible: unknown future WordPart contributes nothing
                 // to the assignment value.
@@ -1671,6 +1718,8 @@ fn word_part_is_quoted(part: &WordPart) -> bool {
         // ProcessSub expands to a single /dev/fd/N path — treated as quoted
         // (no IFS-splitting, no glob expansion of the realized path).
         WordPart::ProcessSub { .. } => true,
+        // A Quoted wrapper always means the content was quoted at source.
+        WordPart::Quoted { .. } => true,
         // Forward-compatible: future WordPart variants default to unquoted.
         _ => false,
     }
