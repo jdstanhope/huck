@@ -402,8 +402,8 @@ pub enum ArithExpr {
     Add(Box<ArithExpr>, Box<ArithExpr>),
     Sub(Box<ArithExpr>, Box<ArithExpr>),
     Mul(Box<ArithExpr>, Box<ArithExpr>),
-    Div(Box<ArithExpr>, Box<ArithExpr>),
-    Mod(Box<ArithExpr>, Box<ArithExpr>),
+    Div(Box<ArithExpr>, Box<ArithExpr>, usize), // usize = divisor token offset
+    Mod(Box<ArithExpr>, Box<ArithExpr>, usize),
     Eq(Box<ArithExpr>, Box<ArithExpr>),
     Ne(Box<ArithExpr>, Box<ArithExpr>),
     Lt(Box<ArithExpr>, Box<ArithExpr>),
@@ -675,6 +675,20 @@ impl Parser {
                 continue;
             }
 
+            // 4b. Div/Mod (lbp = 22, rbp = 23 — left-associative, special-cased
+            //     to carry the divisor token's byte offset for by-zero error reporting).
+            if matches!(op, ArithToken::Slash | ArithToken::Percent) && 22 >= min_bp {
+                self.bump();
+                let rhs = self.parse_expr(23)?;
+                let off = self.err_off;
+                lhs = if op == ArithToken::Slash {
+                    ArithExpr::Div(Box::new(lhs), Box::new(rhs), off)
+                } else {
+                    ArithExpr::Mod(Box::new(lhs), Box::new(rhs), off)
+                };
+                continue;
+            }
+
             // 5. Standard left-associative binops via the precedence table.
             let (lbp, rbp, make): BinOpEntry = match op {
                 ArithToken::OrOr    => (4, 5, ArithExpr::Or),
@@ -693,8 +707,6 @@ impl Parser {
                 ArithToken::Plus    => (20, 21, ArithExpr::Add),
                 ArithToken::Minus   => (20, 21, ArithExpr::Sub),
                 ArithToken::Star    => (22, 23, ArithExpr::Mul),
-                ArithToken::Slash   => (22, 23, ArithExpr::Div),
-                ArithToken::Percent => (22, 23, ArithExpr::Mod),
                 _ => break,
             };
             if lbp < min_bp { break; }
@@ -899,16 +911,16 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
         ArithExpr::Add(a, b) => Ok(eval(a, shell)?.wrapping_add(eval(b, shell)?)),
         ArithExpr::Sub(a, b) => Ok(eval(a, shell)?.wrapping_sub(eval(b, shell)?)),
         ArithExpr::Mul(a, b) => Ok(eval(a, shell)?.wrapping_mul(eval(b, shell)?)),
-        ArithExpr::Div(a, b) => {
+        ArithExpr::Div(a, b, off) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }); }
+            if rhs == 0 { return Err(ArithError::at(ArithErrorKind::DivisionByZero, *off)); }
             Ok(lhs.wrapping_div(rhs))
         }
-        ArithExpr::Mod(a, b) => {
+        ArithExpr::Mod(a, b, off) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if rhs == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }); }
+            if rhs == 0 { return Err(ArithError::at(ArithErrorKind::ModuloByZero, *off)); }
             Ok(lhs.wrapping_rem(rhs))
         }
         ArithExpr::Eq(a, b) => Ok(bool_to_i64(eval(a, shell)? == eval(b, shell)?)),
@@ -1593,13 +1605,24 @@ mod tests {
     #[test]
     fn eval_division_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: None });
+        // offset 2 = byte offset of the `0` divisor token in "1/0"
+        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: Some(2) });
     }
 
     #[test]
     fn eval_modulo_by_zero() {
         let mut s = Shell::new();
-        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: None });
+        // offset 2 = byte offset of the `0` divisor token in "1%0"
+        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: Some(2) });
+    }
+
+    #[test]
+    fn render_division_by_zero_token() {
+        let mut sh = Shell::new();
+        let expr = parse("44 / 0 ").unwrap();
+        let err = eval(&expr, &mut sh).unwrap_err();
+        assert_eq!(render_error_body("44 / 0 ", &err),
+            "44 / 0 : division by 0 (error token is \"0 \")");
     }
 
     #[test]

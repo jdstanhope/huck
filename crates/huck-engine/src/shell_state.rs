@@ -1176,12 +1176,12 @@ impl Shell {
                 E::Add(a, b) => ev(a, sh)?.wrapping_add(ev(b, sh)?),
                 E::Sub(a, b) => ev(a, sh)?.wrapping_sub(ev(b, sh)?),
                 E::Mul(a, b) => ev(a, sh)?.wrapping_mul(ev(b, sh)?),
-                E::Div(a, b) => {
+                E::Div(a, b, _) => {
                     let r = ev(b, sh)?;
                     if r == 0 { return None; }
                     ev(a, sh)?.wrapping_div(r)
                 }
-                E::Mod(a, b) => {
+                E::Mod(a, b, _) => {
                     let r = ev(b, sh)?;
                     if r == 0 { return None; }
                     ev(a, sh)?.wrapping_rem(r)
