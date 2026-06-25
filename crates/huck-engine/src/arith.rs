@@ -82,7 +82,7 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
             _ => break,
         };
         if digit >= base {
-            return Err(ArithError { kind: ArithErrorKind::ValueTooGreatForBase, offset: None });
+            return Err(ArithError { kind: ArithErrorKind::ValueTooGreatForBase, offset: None, token_end: None });
         }
         value = value
             .checked_mul(base as i64)
@@ -94,9 +94,24 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
         *i += 1;
     }
     if !any_digit {
-        return Err(ArithError { kind: ArithErrorKind::InvalidIntegerConstant, offset: None });
+        return Err(ArithError { kind: ArithErrorKind::InvalidIntegerConstant, offset: None, token_end: None });
     }
     Ok(value)
+}
+
+/// Returns the exclusive end of the maximal number-token run starting at
+/// `start`: the run of bytes in `[A-Za-z0-9#@_]`. bash consumes the whole run
+/// before validating, so the error token covers the full run even when the
+/// fault (e.g. base > 64) is detected earlier.
+fn number_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut e = start;
+    while e < bytes.len() {
+        let b = bytes[e];
+        let is_run = b.is_ascii_alphanumeric() || b == b'#' || b == b'@' || b == b'_';
+        if !is_run { break; }
+        e += 1;
+    }
+    e
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), ArithError> {
@@ -118,18 +133,28 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                 }
                 let n: i64 = if i < bytes.len() && bytes[i] == b'#' {
                     // Base-N literal: leading digits parsed as decimal base.
+                    // bash reports the FULL number run as the error token
+                    // (`[A-Za-z0-9#@_]*` from num_start), regardless of where in
+                    // the run the error was detected.
                     i += 1;
-                    let base: u32 = digits.parse()
-                        .map_err(|_| ArithError::at(ArithErrorKind::InvalidNumber, num_start))?;
+                    let base: u32 = digits.parse().map_err(|_| ArithError::at_span(
+                        ArithErrorKind::InvalidNumber, num_start, number_run_end(bytes, num_start),
+                    ))?;
                     if base > 64 {
-                        return Err(ArithError::at(ArithErrorKind::InvalidBase, num_start));
+                        return Err(ArithError::at_span(
+                            ArithErrorKind::InvalidBase, num_start, number_run_end(bytes, num_start),
+                        ));
                     }
                     if base < 2 {
-                        return Err(ArithError::at(ArithErrorKind::InvalidNumber, num_start));
+                        return Err(ArithError::at_span(
+                            ArithErrorKind::InvalidNumber, num_start, number_run_end(bytes, num_start),
+                        ));
                     }
                     parse_base_n_digits(bytes, &mut i, base).map_err(|e| match e.kind {
                         ArithErrorKind::InvalidIntegerConstant
-                        | ArithErrorKind::ValueTooGreatForBase => ArithError::at(e.kind, num_start),
+                        | ArithErrorKind::ValueTooGreatForBase => ArithError::at_span(
+                            e.kind, num_start, number_run_end(bytes, num_start),
+                        ),
                         _ => e,
                     })?
                 } else if digits == "0"
@@ -464,16 +489,28 @@ pub struct ArithError {
     pub kind: ArithErrorKind,
     /// Byte offset into the parsed source of the error token (bash `lasttp`).
     pub offset: Option<usize>,
+    /// Exclusive byte end of the error token. When `Some(e)`, the error token
+    /// is `src[offset..e]` (and bash's echo is truncated to `src[..e]`) — used
+    /// for tokenize-time NUMBER errors, where bash reports just the full number
+    /// run with no trailing content. When `None`, the token runs to end of
+    /// source (parse errors, eval errors).
+    pub token_end: Option<usize>,
 }
 
 impl ArithError {
     /// Legacy free-form parse error, no position.
     pub fn parse(msg: impl Into<String>) -> Self {
-        ArithError { kind: ArithErrorKind::Parse(msg.into()), offset: None }
+        ArithError { kind: ArithErrorKind::Parse(msg.into()), offset: None, token_end: None }
     }
-    /// A bash-mapped error with a token offset.
+    /// A bash-mapped error with a token offset (token runs to end of source).
     pub fn at(kind: ArithErrorKind, offset: usize) -> Self {
-        ArithError { kind, offset: Some(offset) }
+        ArithError { kind, offset: Some(offset), token_end: None }
+    }
+    /// A bash-mapped error with an explicit token span `[start, end)`. Used by
+    /// tokenize-time NUMBER errors, where bash's error token is the full number
+    /// run and the echo is truncated to `src[..end]`.
+    pub fn at_span(kind: ArithErrorKind, start: usize, end: usize) -> Self {
+        ArithError { kind, offset: Some(start), token_end: Some(end) }
     }
     /// The text bash prints after the `<expr>: ` echo.
     pub fn bash_message(&self) -> String {
@@ -515,7 +552,7 @@ impl std::fmt::Display for ArithError {
             ShiftCountOutOfRange { count } => write!(f, "shift count out of range: {count}"),
             ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
             // Bash-mapped kinds render their bash text under Display too.
-            other => write!(f, "{}", ArithError { kind: other.clone(), offset: None }.bash_message()),
+            other => write!(f, "{}", ArithError { kind: other.clone(), offset: None, token_end: None }.bash_message()),
         }
     }
 }
@@ -532,13 +569,20 @@ pub fn parse(input: &str) -> Result<ArithExpr, ArithError> {
 }
 
 /// Builds bash's post-prologue error body:
-/// `"<expr>: <msg> (error token is \"<tok>\")"`, where `<expr>` is `src`
-/// with leading whitespace trimmed and `<tok>` is `src[offset..]`.
+/// `"<expr>: <msg> (error token is \"<tok>\")"`.
+///
+/// Normally `<expr>` is `src` leading-trimmed and `<tok>` is `src[offset..]`
+/// (token runs to end of source — parse and eval errors). When the error
+/// carries an explicit `token_end` (tokenize-time NUMBER errors), bash reports
+/// only the full number run: the echo is truncated to `src[..end]` and the
+/// token to `src[offset..end]` — no trailing content.
 pub fn render_error_body(src: &str, err: &ArithError) -> String {
-    let expr = src.trim_start();
-    let tok = match err.offset {
-        Some(off) if off <= src.len() => &src[off..],
-        _ => "",
+    let (expr, tok): (&str, &str) = match (err.offset, err.token_end) {
+        (Some(off), Some(end)) if end <= src.len() && off <= end => {
+            (src[..end].trim_start(), &src[off..end])
+        }
+        (Some(off), _) if off <= src.len() => (src.trim_start(), &src[off..]),
+        _ => (src.trim_start(), ""),
     };
     format!("{expr}: {} (error token is \"{tok}\")", err.bash_message())
 }
@@ -816,13 +860,13 @@ fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
     raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw,
-    }, offset: None })
+    }, offset: None, token_end: None })
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
 fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithError> {
     shell.try_set(name, value.to_string())
-        .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
+        .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
 }
 
 /// Arith-evaluates an element's raw string value to an i64, exactly like a
@@ -844,7 +888,7 @@ fn element_string_to_i64(
     let parsed = parse(&raw).map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw.clone(),
-    }, offset: None })?;
+    }, offset: None, token_end: None })?;
     eval(&parsed, shell)
 }
 
@@ -874,12 +918,12 @@ fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<()
             if shell.get_associative(name).is_some() {
                 shell
                     .set_associative_element(name, subscript_raw.clone(), value.to_string())
-                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
             } else {
                 let idx = eval(subscript, shell)?;
                 shell
                     .set_indexed_element(name, idx as usize, value.to_string())
-                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None })
+                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
             }
         }
     }
@@ -896,7 +940,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
                     var: name.clone(),
                     value: raw.to_string(),
-                }, offset: None })
+                }, offset: None, token_end: None })
             }
         }
         ArithExpr::Index { name, subscript, subscript_raw } => {
@@ -962,7 +1006,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
             }
             Ok(lhs.wrapping_shl(rhs as u32))
         }
@@ -970,7 +1014,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
             if !(0..64).contains(&rhs) {
-                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None });
+                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
             }
             Ok(lhs.wrapping_shr(rhs as u32))
         }
@@ -978,7 +1022,7 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             let base = eval(a, shell)?;
             let exp = eval(b, shell)?;
             if exp < 0 {
-                return Err(ArithError { kind: ArithErrorKind::NegativeExponent, offset: None });
+                return Err(ArithError { kind: ArithErrorKind::NegativeExponent, offset: None, token_end: None });
             }
             Ok(base.wrapping_pow(exp as u32))
         }
@@ -991,25 +1035,25 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 AssignOp::Mul    => read_lvalue_i64(shell, target)?.wrapping_mul(rhs_val),
                 AssignOp::Div => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None, token_end: None }); }
                     lhs.wrapping_div(rhs_val)
                 }
                 AssignOp::Mod => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }); }
+                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None, token_end: None }); }
                     lhs.wrapping_rem(rhs_val)
                 }
                 AssignOp::Shl => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
                     }
                     lhs.wrapping_shl(rhs_val as u32)
                 }
                 AssignOp::Shr => {
                     let lhs = read_lvalue_i64(shell, target)?;
                     if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None });
+                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
                     }
                     lhs.wrapping_shr(rhs_val as u32)
                 }
@@ -1053,12 +1097,12 @@ mod tests {
 
     #[test]
     fn display_division_by_zero() {
-        assert_eq!(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None }.to_string(), "division by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None, token_end: None }.to_string(), "division by zero");
     }
 
     #[test]
     fn display_modulo_by_zero() {
-        assert_eq!(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None }.to_string(), "modulo by zero");
+        assert_eq!(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None, token_end: None }.to_string(), "modulo by zero");
     }
 
     #[test]
@@ -1072,7 +1116,7 @@ mod tests {
         let e = ArithError { kind: ArithErrorKind::NotAnInteger {
             var: "x".to_string(),
             value: "abc".to_string(),
-        }, offset: None };
+        }, offset: None, token_end: None };
         assert_eq!(e.to_string(), "variable 'x' is not an integer: 'abc'");
     }
 
@@ -1606,14 +1650,14 @@ mod tests {
     fn eval_division_by_zero() {
         let mut s = Shell::new();
         // offset 2 = byte offset of the `0` divisor token in "1/0"
-        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: Some(2) });
+        assert_eq!(eval_str("1/0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::DivisionByZero, offset: Some(2), token_end: None });
     }
 
     #[test]
     fn eval_modulo_by_zero() {
         let mut s = Shell::new();
         // offset 2 = byte offset of the `0` divisor token in "1%0"
-        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: Some(2) });
+        assert_eq!(eval_str("1%0", &mut s).unwrap_err(), ArithError { kind: ArithErrorKind::ModuloByZero, offset: Some(2), token_end: None });
     }
 
     #[test]
@@ -1719,7 +1763,7 @@ mod tests {
             ArithError { kind: ArithErrorKind::NotAnInteger {
                 var: "HUCK_TEST_ARITH_BAD".to_string(),
                 value: "abc".to_string()
-            }, offset: None }
+            }, offset: None, token_end: None }
         );
     }
 
@@ -1917,7 +1961,7 @@ mod tests {
     #[test]
     fn arith_error_bash_message_mapping() {
         use ArithErrorKind::*;
-        let mk = |k| ArithError { kind: k, offset: None };
+        let mk = |k| ArithError { kind: k, offset: None, token_end: None };
         assert_eq!(mk(AssignToNonVar).bash_message(), "attempted assignment to non-variable");
         assert_eq!(mk(DivisionByZero).bash_message(), "division by 0");
         assert_eq!(mk(InvalidBase).bash_message(), "invalid arithmetic base");
@@ -1979,6 +2023,35 @@ mod tests {
             "2#: invalid integer constant (error token is \"2#\")");
         assert_eq!(render_error_body("2#44", &parse("2#44").unwrap_err()),
             "2#44: value too great for base (error token is \"2#44\")");
+    }
+
+    #[test]
+    fn render_number_error_token_truncated_at_run_end() {
+        // bash reports ONLY the full number run for tokenize-time number
+        // errors — no trailing content, even with surrounding whitespace.
+        assert_eq!(render_error_body(" 2#44 ", &parse(" 2#44 ").unwrap_err()),
+            "2#44: value too great for base (error token is \"2#44\")");
+        assert_eq!(render_error_body(" 3425#56 ", &parse(" 3425#56 ").unwrap_err()),
+            "3425#56: invalid arithmetic base (error token is \"3425#56\")");
+        assert_eq!(render_error_body(" 2# ", &parse(" 2# ").unwrap_err()),
+            "2#: invalid integer constant (error token is \"2#\")");
+    }
+
+    #[test]
+    fn render_number_error_token_truncated_with_trailing_expr() {
+        // Run end stops at the first non-run byte; the echo is truncated there.
+        assert_eq!(render_error_body("2#44 + 1", &parse("2#44 + 1").unwrap_err()),
+            "2#44: value too great for base (error token is \"2#44\")");
+        assert_eq!(render_error_body("1 + 2#44", &parse("1 + 2#44").unwrap_err()),
+            "1 + 2#44: value too great for base (error token is \"2#44\")");
+    }
+
+    #[test]
+    fn render_parse_error_token_still_runs_to_end_of_source() {
+        // Regression: parse errors (no token_end) keep trailing content,
+        // including the trailing space.
+        let body = render_error_body(" 7 = 43 ", &parse(" 7 = 43 ").unwrap_err());
+        assert!(body.ends_with("(error token is \"= 43 \")"), "got {body}");
     }
 
     #[test]
