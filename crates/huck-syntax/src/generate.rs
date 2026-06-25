@@ -44,7 +44,7 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             body_block(body, indent + 1),
             pad(indent)
         ),
-        Command::Arith(word) => format!("(({}))", word_to_source(word)),
+        Command::Arith(word) => format!("(({}))", arith_body_to_source(word)),
         Command::DoubleBracket {
             expr,
             inline_assignments,
@@ -472,6 +472,40 @@ fn heredoc_body_to_source(w: &Word) -> String {
     out
 }
 
+/// Render an arithmetic body Word as raw expression text. The lexer marks
+/// arith literal/expansion parts `quoted: true` (so expansion-time quote
+/// removal applies), but bash's `print_cmd.c` prints the expression WITHOUT
+/// those quotes (`(( i < 3 ))`, not `((" i < 3 "))`). Emit each part bare:
+/// Literal text verbatim, expansions via their `$…` source form.
+fn arith_body_to_source(w: &Word) -> String {
+    let mut out = String::new();
+    for part in &w.0 {
+        match part {
+            WordPart::Literal { text, .. } => out.push_str(text),
+            WordPart::Var { name, .. } => out.push_str(&format!("${name}")),
+            WordPart::LastStatus { .. } => out.push_str("$?"),
+            WordPart::AllArgs { joined, .. } => {
+                out.push_str(if *joined { "$*" } else { "$@" })
+            }
+            WordPart::CommandSub { sequence, .. } => {
+                out.push_str(&format!("$({})", sequence_to_source(sequence, 0).trim_end()))
+            }
+            WordPart::Arith { body, .. } => {
+                out.push_str(&format!("$(({}))", arith_body_to_source(body)))
+            }
+            WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } => out
+                .push_str(&param_expansion_to_source(
+                    name,
+                    modifier,
+                    subscript.as_ref(),
+                    *indirect,
+                )),
+            other => out.push_str(&part_to_source(other)),
+        }
+    }
+    out
+}
+
 fn part_to_source(part: &WordPart) -> String {
     match part {
         WordPart::Literal { text, quoted } => {
@@ -494,7 +528,7 @@ fn part_to_source(part: &WordPart) -> String {
             quote_if(*quoted, format!("$({})", sequence_to_source(sequence, 0).trim_end()))
         }
         WordPart::Arith { body, quoted } => {
-            quote_if(*quoted, format!("$(({}))", word_to_source(body)))
+            quote_if(*quoted, format!("$(({}))", arith_body_to_source(body)))
         }
         WordPart::Tilde(t) => match t {
             TildeSpec::Home => "~".to_string(),
@@ -1030,5 +1064,37 @@ mod tests {
         };
         let rendered_out = function_to_source("g", &body_out);
         assert!(rendered_out.contains(">(cat)"), "got: {rendered_out}");
+    }
+
+    #[test]
+    fn arith_command_renders_unquoted() {
+        use crate::{command, lexer};
+        let seq = command::parse(lexer::tokenize("f(){ (( i < 3 )); }").unwrap())
+            .unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let s = function_to_source(&name, &body);
+        assert!(s.contains("(( i < 3 ))"), "got: {s:?}");
+        assert!(!s.contains("((\""), "spurious quote in: {s:?}");
+    }
+
+    #[test]
+    fn arith_expansion_renders_unquoted() {
+        use crate::{command, lexer};
+        let seq = command::parse(lexer::tokenize("f(){ i=$(( i + 1 )); }").unwrap())
+            .unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let s = function_to_source(&name, &body);
+        assert!(s.contains("$(( i + 1 ))"), "got: {s:?}");
+        assert!(!s.contains("$((\""), "spurious quote in: {s:?}");
+    }
+
+    #[test]
+    fn arith_with_var_renders_unquoted() {
+        use crate::{command, lexer};
+        let seq = command::parse(lexer::tokenize("f(){ (( x + $y )); }").unwrap())
+            .unwrap().unwrap();
+        let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
+        let s = function_to_source(&name, &body);
+        assert!(s.contains("(( x + $y ))"), "got: {s:?}");
     }
 }
