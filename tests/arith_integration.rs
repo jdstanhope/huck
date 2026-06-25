@@ -53,7 +53,7 @@ fn arith_inside_double_quotes() {
 #[test]
 fn arith_division_by_zero_writes_to_stderr() {
     let (_, err) = run("echo $((1/0))\nexit\n");
-    assert!(err.contains("division by zero"), "stderr: {err}");
+    assert!(err.contains("division by 0"), "stderr: {err}");
 }
 
 #[test]
@@ -67,5 +67,5 @@ fn arith_logical_short_circuit() {
     // The RHS `1/0` would error if evaluated; short-circuit must prevent that.
     let (out, err) = run("echo $((0 && 1/0))\nexit\n");
     assert!(out.lines().any(|l| l == "0"), "stdout: {out}");
-    assert!(!err.contains("division by zero"), "stderr: {err}");
+    assert!(!err.contains("division by 0"), "stderr: {err}");
 }

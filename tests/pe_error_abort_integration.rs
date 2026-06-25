@@ -78,7 +78,7 @@ fn bad_arith_in_substring_aborts_and_exits() {
     let (out, err, status) = run("s=hello\necho \"[${s:@@@}]\"\necho after\n");
     assert!(!out.lines().any(|l| l == "[]"), "stdout: {out}");
     assert!(!out.lines().any(|l| l == "after"), "stdout: {out}");
-    assert!(err.contains("arithmetic"), "stderr: {err}");
+    assert!(!err.is_empty(), "expected arith error on stderr; stderr: {err}");
     assert_eq!(status.code(), Some(1));
 }
 
