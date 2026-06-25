@@ -16,7 +16,46 @@ use crate::lexer::{
 
 /// Render a function definition for `declare -f`: `NAME ()\n<body>`.
 pub fn function_to_source(name: &str, body: &Command) -> String {
-    command_to_source(&Command::FunctionDef { name: name.to_string(), body: Box::new(body.clone()) }, 0)
+    render_function_def(name, body, 0, false)
+}
+
+/// Render the trailing redirects of a hoisted brace-group body, reusing the
+/// 0/1/2 slot fast-path (mirrors the `Command::Redirected` arm). Each slot is
+/// prefixed with a space, e.g. ` 1>&2`.
+fn render_hoisted_redirects(redirects: &[crate::command::Redirection]) -> String {
+    let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
+    let mut s = String::new();
+    if let Some(r) = &stdin { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdin)); }
+    if let Some(r) = &stdout { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdout)); }
+    if let Some(r) = &stderr { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stderr)); }
+    s
+}
+
+/// Render a function definition. `with_keyword` adds the leading `function `
+/// that bash emits for NESTED defs; the outer named function (declare -f / type
+/// entry point) passes `false`. A brace-group body — bare or carrying a redirect
+/// — becomes the function's own braces, with any redirect hoisted to the close
+/// brace (`} 1>&2`). Any other body is wrapped in fresh `{ }`.
+fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: bool) -> String {
+    let kw = if with_keyword { "function " } else { "" };
+    let (group_seq, hoisted): (Sequence, String) = match body {
+        Command::BraceGroup(seq) => ((**seq).clone(), String::new()),
+        Command::Redirected { inner, redirects }
+            if matches!(inner.as_ref(), Command::BraceGroup(_)) =>
+        {
+            let Command::BraceGroup(seq) = inner.as_ref() else { unreachable!() };
+            ((**seq).clone(), render_hoisted_redirects(redirects))
+        }
+        other => (
+            Sequence { first: other.clone(), rest: Vec::new(), background: false },
+            String::new(),
+        ),
+    };
+    format!(
+        "{kw}{name} () \n{p}{{ \n{}{p}}}{hoisted}",
+        group_body(&group_seq, indent + 1),
+        p = pad(indent),
+    )
 }
 
 /// The BASH_FUNC env-var VALUE form: `() {\n    <body>\n}` (no name prefix).
@@ -56,23 +95,7 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             s.push_str(&format!("[[ {} ]]", testexpr_to_source(expr)));
             s
         }
-        Command::FunctionDef { name, body } => {
-            // bash always wraps the body in `{ }`; a brace-group body is
-            // unwrapped (its inner sequence printed) to avoid double-bracing.
-            let inner = match body.as_ref() {
-                Command::BraceGroup(seq) => *seq.clone(),
-                other => Sequence {
-                    first: other.clone(),
-                    rest: Vec::new(),
-                    background: false,
-                },
-            };
-            format!(
-                "{name} () \n{p}{{ \n{}{p}}}",
-                group_body(&inner, indent + 1),
-                p = pad(indent)
-            )
-        }
+        Command::FunctionDef { name, body } => render_function_def(name, body, indent, true),
         Command::Coproc { name, body } => {
             let body_src = command_to_source(body, indent);
             if name == "COPROC" {
@@ -1307,6 +1330,47 @@ mod tests {
     fn declf_subshell_body_wrapped() {
         assert_eq!(declf("f() ( echo hi )"),
             "f () \n{ \n    ( echo hi )\n}");
+    }
+
+    // ── v222: outer-vs-nested keyword split + redirect hoist ──
+    #[test]
+    fn declf_outer_no_function_keyword_all_forms() {
+        for src in ["f(){ echo a; }", "function f { echo a; }", "function f() { echo a; }"] {
+            let s = declf(src);
+            assert!(s.starts_with("f () \n"), "outer must omit keyword: {s:?}");
+            assert!(!s.starts_with("function "), "outer must not start with `function `: {s:?}");
+        }
+    }
+
+    #[test]
+    fn declf_nested_def_gets_function_keyword_all_forms() {
+        // All three nested forms render identically as `function f3 () `.
+        for inner in ["function f3() { echo b; }", "function f3 { echo b; }", "f3() { echo b; }"] {
+            let s = declf(&format!("outer(){{ echo a; {inner}; }}"));
+            assert!(s.contains("function f3 () \n"), "nested def needs keyword (inner={inner:?}): {s:?}");
+            assert!(s.starts_with("outer () \n"), "outer still keyword-free: {s:?}");
+        }
+    }
+
+    #[test]
+    fn declf_outer_redirected_brace_body_hoists() {
+        // `{ …; } 1>&2` body → unwrapped, redirect on the function close brace.
+        assert_eq!(declf("f(){ echo a; echo b; } 1>&2"),
+            "f () \n{ \n    echo a;\n    echo b\n} 1>&2");
+    }
+
+    #[test]
+    fn declf_nested_redirected_brace_body_hoists() {
+        let s = declf("outer(){ f3() { echo b; } 1>&2; }");
+        assert!(s.contains("function f3 () \n    { \n        echo b\n    } 1>&2"),
+            "nested redirected brace body must hoist: {s:?}");
+    }
+
+    #[test]
+    fn declf_subshell_body_with_redirect_not_hoisted() {
+        // A subshell body keeps its redirect INSIDE the function braces.
+        assert_eq!(declf("funcc() ( echo c ) 2>&1"),
+            "funcc () \n{ \n    ( echo c ) 2>&1\n}");
     }
 
     // ── Quoted variant rendering ──
