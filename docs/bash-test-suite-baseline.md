@@ -1,14 +1,14 @@
 # bash 5.2.21 test-suite baseline
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
-huck commit: f488b94 (v218 task 4: declare -F NAME prints the bare function name).
-Sweep date: 2026-06-25 UTC (full sweep with recho/zecho/printenv helpers provisioned; cprint/func/arith-for/herestr re-triaged after v218 reconstruction fix).
+huck commit: 8a9494f (v219 task 2 cleanup: lexer wraps quoted runs in WordPart::Quoted).
+Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers provisioned; v219 targeted re-run of cprint+herestr after the WordPart::Quoted quote-provenance fix — cprint flips to PASS, herestr re-triaged; all other categories carried over from the v218 full sweep).
 
 ## Summary
 
 - Categories run: 82
-- PASS: 6
-- FAIL: 71
+- PASS: 7
+- FAIL: 70
 - TIMEOUT: 5
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
@@ -35,7 +35,7 @@ Sweep date: 2026-06-25 UTC (full sweep with recho/zecho/printenv helpers provisi
 | comsub-posix | FAIL | Unterminated heredoc inside a command substitution causes a hard error in huck, losing many expected output lines across multiple sub-tests. Additionally, huck rejects several command-substitution forms where POSIX allows a bare `)` to end the substitution (e.g., heredoc-terminated-by-parenthesis patterns and substitutions containing `if/then` fragments without a closing `fi`). |
 | cond | FAIL | M-94 (`${!@}` / `${!*}` as indirect expansion of the positional list) causes a parse error, aborting the test early. Additional `[[ ]]` compound-test edge case with an incomplete expression. |
 | coproc | FAIL | Coproc pipe file-descriptor numbers diverge — huck allocates low-numbered fds while bash allocates high-numbered fds. Also `<&N-` / `>&N-` dup-and-close fd redirect operator not supported (same root cause as the redir TIMEOUT). M-126 and a new dup-close gap. |
-| cprint | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences are all quote-provenance in reconstruction (L-57): `"\$"PWD` reconstructs as `\$PWD`; adjacent double-quoted substrings (`"&""|""()"`) reconstruct as backslash/single-quoted forms (`\&\|'()'`). Five-line diff; gated on L-57 (huck's Word loses original quote spans). |
+| cprint | PASS | v218 resolved the `declare -f` trailing-space format; v219's `WordPart::Quoted` quote-provenance fix (L-57) resolves the remaining reconstruction divergences — `echo`-argument quoting and adjacent-double-quoted-substring reconstruction now match bash byte-for-byte. 0-diff PASS (verified via the runner 2026-06-25). |
 | dbg-support | FAIL | `set -o functrace` (DEBUG/RETURN/ERR trap inheritance through function calls) not yet supported. Entire debug-trap test suite fails from the first rejected option. |
 | dbg-support2 | FAIL | `LINENO` inside functions reports the logical-command start line (often line 1) rather than the actual in-function source line. New bug: LINENO tracking accuracy inside function bodies. |
 | dirstack | FAIL | `pushd -m` / `popd -m` / `dirs -m` argument is treated as an invalid option rather than a numeric argument (huck and bash differ on which flags these commands accept). Error-message prefix and format differences throughout. |
@@ -53,7 +53,7 @@ Sweep date: 2026-06-25 UTC (full sweep with recho/zecho/printenv helpers provisi
 | glob-test | FAIL | A missing locale warning appears in huck's output but not bash's (locale check position differs). Multibyte character handling diverges: a Unicode character is rendered differently (huck produces different byte sequences vs bash). Globbing correctness diverges for some patterns — cases that should fail to match succeed in huck, and vice versa. Backslash-escaped glob metacharacters passed as arguments are handled differently. Glob results omit the `./` prefix that bash includes when the pattern starts with `./`. L-04/L-11 (character vs byte in multibyte globbing) class divergence remains. |
 | globstar | FAIL | Test environment mismatch — `globstar.tests` expects to run from the bash build directory (where compiled object files are present to glob over); huck runs it from the tests directory, where those files do not exist. Also M-53 (bare `**` globstar matches directories only, not files). |
 | heredoc | FAIL | Several heredoc edge cases: a `$PS4` literal appears in huck's heredoc output where bash expects an expanded (or empty) value; fd-based heredoc reads via an `exec`-opened descriptor generate bad-fd errors; and an unterminated heredoc inside a complex script aborts where bash would continue. |
-| herestr | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences are gated on L-57 (quote provenance): adjacent double-quoted spans in here-string operands collapse (`"$a"" ""$b"` → `"$a $b"`); double-quoted literals reconstruct as single-quoted (`"what a fabulous window treatment"` → `'what a fabulous window treatment'`). Also: an array element containing a literal embedded newline reconstructs as `$'i\n'` escape notation in huck vs bash's inline literal-newline form. |
+| herestr | FAIL | v219's `WordPart::Quoted` quote-provenance fix removes the reconstruction hunks (adjacent double-quoted here-string operands and double-quoted-vs-single-quoted function-body lines now match bash). Sole remaining runner residual (L-57 successor): a `declare -p` of an indexed array whose element holds an embedded newline renders the value in double quotes with a literal newline rather than bash's ANSI-C `$'i\n'` escape. A separate empty-leading-word `command not found:` bug (an empty-expanded command name, e.g. `${THIS_SH} ./herestr1.sub` with `THIS_SH` unset) surfaces only on a direct invocation and is masked under the runner, which exports `THIS_SH=$HUCK`. |
 | histexpand | FAIL | `set: history: not yet supported`, and history-expansion flags (`-p`, `-a`, `-s`, `-w`) not implemented (M-46). Entire test suite fails from the first rejected option. |
 | history | FAIL | M-46 (`history -d/-w/-r/-a` not supported), M-47 (`history N` numeric argument not supported), `fc` not found as a command, `set: history: not yet supported`. Multiple history-command gaps. |
 | ifs | FAIL | One remaining divergence after the helper unblock: when `IFS` is set to a non-whitespace character (e.g., `:`), joining array elements via `${a[*]}` or `$*` uses a space separator instead of the first IFS character. |
