@@ -241,6 +241,16 @@ pub enum ProcDir {
     Out,
 }
 
+/// The original source quoting style of a `WordPart::Quoted` run, preserved
+/// so `declare -f` / `type` reconstruction reproduces bash's exact bytes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum QuoteStyle {
+    Single,    // '…'
+    Double,    // "…"
+    AnsiC,     // $'…'
+    Backslash, // \c
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum WordPart {
@@ -285,6 +295,11 @@ pub enum WordPart {
     /// as the sole trailing `WordPart` in a `Word` used as the RHS of
     /// an array-assignment in `SimpleCommand::Assign` / inline prefix.
     ArrayLiteral(Vec<ArrayLiteralElement>),
+    /// One contiguous quoted run, preserving source `style` and span. Inner
+    /// `parts` keep their own `quoted: true` flag so the expansion path is
+    /// unchanged; the wrapper exists for reconstruction in `declare -f` /
+    /// `type`.
+    Quoted { style: QuoteStyle, parts: Vec<WordPart> },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

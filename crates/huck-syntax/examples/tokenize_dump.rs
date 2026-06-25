@@ -116,6 +116,9 @@ fn part_label(p: &WordPart) -> String {
         WordPart::ArrayLiteral(elems) => {
             format!("ArrayLiteral({} elements)", elems.len())
         }
+        WordPart::Quoted { style, parts } => {
+            format!("Quoted({style:?},{} inner)", parts.len())
+        }
         _ => "WordPart(<unknown>)".to_string(),
     }
 }
