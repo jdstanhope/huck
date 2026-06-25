@@ -4211,13 +4211,10 @@ fn run_exec_single(
     }
 
     // Determine whether the assignments should persist after the command.
-    // Control builtins and special builtins: persistent.
-    // User functions: persistent.
-    // Regular builtins and external commands: temporary (restore after).
-    // Note: is_control_builtin's set {break,continue,exit,return} is a strict
-    // subset of is_special_builtin's set, so only the latter term is needed.
-    let persistent = builtins::is_special_builtin(&resolved.program)
-        || (!bypass_functions && shell.functions.contains_key(&resolved.program));
+    // POSIX special builtins persist their prefix assignments. User functions
+    // and regular builtins/externals do NOT — they snapshot/restore (temporary
+    // scope), matching bash in both default and posix mode.
+    let persistent = builtins::is_special_builtin(&resolved.program);
 
     // `exec`: a special builtin that does NOT fork. With a command operand it
     // replaces the shell process image; with only redirections it applies them
@@ -8130,7 +8127,7 @@ mod tests {
     }
 
     #[test]
-    fn run_exec_single_function_call_inline_assignment_persists() {
+    fn run_exec_single_function_call_inline_assignment_does_not_persist() {
         let mut shell = Shell::new();
         // Define a no-op function via the parser.
         if let Some(tokens) = crate::lexer::tokenize("myfunc() { echo ok; }").ok()
@@ -8148,7 +8145,38 @@ mod tests {
         let pipeline = Pipeline { negate: false, commands: vec![Command::Simple(cmd)] };
         let seq = Sequence { first: Command::Pipeline(pipeline), rest: vec![], background: false };
         let _ = execute(&seq, &mut shell, "FOO=val myfunc");
-        assert_eq!(shell.get("FOO"), Some("val"));
+        // bash: a prefix assignment does NOT persist across a function call.
+        assert_eq!(shell.get("FOO"), None);
+    }
+
+    #[test]
+    fn prefix_assign_restores_prior_value_over_function_global_mutation() {
+        // Function's own global write to the same var is clobbered by the restore.
+        let mut shell = Shell::new();
+        exec_script("v=1\nf(){ v=99; }\nv=5 f\n", &mut shell);
+        assert_eq!(shell.get("v"), Some("1"));
+    }
+
+    #[test]
+    fn prefix_assign_restores_prior_value_over_function_local() {
+        let mut shell = Shell::new();
+        exec_script("v=1\nf(){ local v=99; }\nv=5 f\n", &mut shell);
+        assert_eq!(shell.get("v"), Some("1"));
+    }
+
+    #[test]
+    fn prefix_assign_restores_unset_over_function_unset() {
+        // Function unsets the var; restore reinstates the prior value.
+        let mut shell = Shell::new();
+        exec_script("v=1\nf(){ unset v; }\nv=5 f\n", &mut shell);
+        assert_eq!(shell.get("v"), Some("1"));
+    }
+
+    #[test]
+    fn prefix_assign_with_no_prior_var_is_unset_after_function() {
+        let mut shell = Shell::new();
+        exec_script("f(){ :; }\nv=5 f\n", &mut shell);
+        assert_eq!(shell.get("v"), None);
     }
 
     #[test]
