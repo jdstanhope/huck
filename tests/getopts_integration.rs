@@ -126,3 +126,32 @@ fn nested_getopts_does_not_corrupt_mid_cluster_caller() {
     assert_eq!(out, "caller:a\n  nested:x\n  nested:y\ncaller:b\ncaller:c\n", "out: {out}");
     assert_eq!(c, 0, "should not panic/abort");
 }
+
+#[test]
+fn usage_error_drops_huck_prefix_and_fixes_arg_ellipsis() {
+    // Too few operands → builtin usage error, no shell prologue, rc 2.
+    let (_o, e, c) = run("getopts\n");
+    assert_eq!(e, "getopts: usage: getopts optstring name [arg ...]\n", "stderr: {e:?}");
+    assert_eq!(c, 2);
+}
+
+#[test]
+fn invalid_option_to_getopts_itself_is_rejected() {
+    // getopts has no options of its own; `-a` is invalid → error + usage, rc 2.
+    // `echo "rc=$?"` captures getopts' status into stdout; the script's own
+    // exit (c) is the echo's success (0).
+    let (o, e, c) = run("getopts -a opts name\necho \"rc=$?\"\n");
+    assert!(e.contains("-a: invalid option"), "stderr: {e:?}");
+    assert!(e.contains("getopts: usage: getopts optstring name [arg ...]"), "stderr: {e:?}");
+    assert_eq!(o, "rc=2\n", "stdout: {o:?}");
+    assert_eq!(c, 0, "script's own exit is the echo's success");
+}
+
+#[test]
+fn invalid_name_still_binds_optind() {
+    // bash binds OPTIND from the parsed option BEFORE validating the name var,
+    // so an invalid name still advances OPTIND (here: parsed `-a` → OPTIND 2).
+    let (o, e, _c) = run("set -- -a\ngetopts ab bad-name\necho \"oi=$OPTIND\"\n");
+    assert_eq!(o, "oi=2\n", "stdout: {o:?}");
+    assert!(e.contains("`bad-name': not a valid identifier"), "stderr: {e:?}");
+}
