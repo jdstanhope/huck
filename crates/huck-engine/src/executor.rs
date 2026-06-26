@@ -4172,11 +4172,6 @@ fn run_exec_single(
         }
     };
 
-    // Section 3: track this command's snapshotted names on a shell-managed stack
-    // so a nested posix special-builtin persist can delete them from enclosing
-    // scopes. finalize_inline_scope (every exit path below) pops exactly this.
-    shell.inline_scopes.push(snap.iter().map(|(n, _)| n.clone()).collect());
-
     // xtrace (`set -x`): print the expanded command to stderr, prefixed by
     // `$PS4` (default `+ `), BEFORE dispatch so a hanging command is traced
     // first. Use the already-expanded `resolved.program`/`resolved.args` (do
@@ -4268,6 +4263,11 @@ fn run_exec_single(
         drain_procsubs(shell, procsub_base);
         return outcome;
     }
+
+    // Section 3: track this command's snapshotted names on a shell-managed stack
+    // so a nested posix special-builtin persist can delete them from enclosing
+    // scopes. finalize_inline_scope (every exit path below) pops exactly this.
+    shell.inline_scopes.push(snap.iter().map(|(n, _)| n.clone()).collect());
 
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
@@ -8239,6 +8239,15 @@ mod tests {
         );
         assert_eq!(shell.get("var"), Some("20"));
         assert!(shell.inline_scopes.is_empty(), "scope stack balanced");
+    }
+
+    #[test]
+    fn exec_with_redirect_does_not_leak_inline_scope() {
+        // exec returns via its own early path; the scope-stack push must sit
+        // below the exec block so exec never pushes (else it leaks an entry).
+        let mut shell = Shell::new();
+        exec_script("FOO=bar exec 3>&1\n", &mut shell);
+        assert!(shell.inline_scopes.is_empty(), "exec must not leak an inline scope");
     }
 
     #[test]
