@@ -6,6 +6,7 @@
 
 #[macro_use]
 mod macros;
+pub(crate) use macros::bash_io_error;
 
 pub mod alias_expand;
 pub mod arith;
