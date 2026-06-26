@@ -8864,6 +8864,17 @@ mod tests {
         assert_eq!(posix_run("exec -z"), Some(2), "exec bad option");
     }
     #[test]
+    fn posix_set_unimplemented_option_does_not_exit() {
+        // Valid-in-bash options huck hasn't implemented must NOT exit a posix shell.
+        assert_eq!(posix_run("set -o emacs"), None, "set -o emacs");
+        assert_eq!(posix_run("set -o vi"), None, "set -o vi");
+        assert_eq!(posix_run("set -h"), None, "set -h single-char");
+    }
+    #[test]
+    fn posix_set_invalid_option_name_exits() {
+        assert_eq!(posix_run("set -o nosuchopt"), Some(2), "genuinely invalid -o name");
+    }
+    #[test]
     fn posix_special_builtin_runtime_errors_do_not_exit() {
         assert_eq!(posix_run("shift 99"), None, "shift out of range");
         assert_eq!(posix_run("shift -z"), None, "shift bad option");

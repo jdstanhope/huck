@@ -5100,16 +5100,13 @@ fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
-    let outcome = builtin_set_inner(args, out, err, shell);
-    // POSIX case #1: every `Continue(2)` from `set` is an invalid-option /
-    // bad-flag / invalid `-o` name usage error (set has no runtime 2-return).
-    // Flag it so a bare `set` in a non-interactive posix shell exits; the
-    // executor strips it for `command set`/`builtin set` wrappers. The +r
-    // restricted refusal returns Continue(1), so it is untouched.
-    if matches!(outcome, ExecOutcome::Continue(2)) {
-        shell.builtin_usage_error = Some(2);
-    }
-    outcome
+    // POSIX case #1: a `set` option error exits a non-interactive posix shell
+    // ONLY when an `-o`/`+o` option NAME is genuinely invalid
+    // (`OptSetErr::Unknown`). Unimplemented-but-valid-in-bash options
+    // (`set -o emacs`) and unknown single-char flags (`set -h`) are accepted
+    // by bash and must NOT exit, so `builtin_set_inner` flags only the four
+    // `OptSetErr::Unknown` arms via `shell.builtin_usage_error`.
+    builtin_set_inner(args, out, err, shell)
 }
 
 fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
@@ -5157,6 +5154,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                 }
                 Err(OptSetErr::Unknown) => {
                     e!(err, "huck: set: -o: invalid option name: {}", args[i]);
+                    shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5176,6 +5174,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                 }
                 Err(OptSetErr::Unknown) => {
                     e!(err, "huck: set: +o: invalid option name: {}", args[i]);
+                    shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5214,6 +5213,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                                     "huck: set: -o: invalid option name: {}",
                                     args[i]
                                 );
+                                shell.builtin_usage_error = Some(2);
                                 return ExecOutcome::Continue(2);
                             }
                         }
@@ -5259,6 +5259,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                                     "huck: set: +o: invalid option name: {}",
                                     args[i]
                                 );
+                                shell.builtin_usage_error = Some(2);
                                 return ExecOutcome::Continue(2);
                             }
                         }
