@@ -75,6 +75,18 @@ pub fn run(args: &[String], version: &str) -> i32 {
     // false for Command/File modes (an interactive REPL keeps executing).
     shell_cell.borrow_mut().shell_options.noexec = opts.noexec;
 
+    // POSIX mode: --posix, invocation as `sh`, or POSIXLY_CORRECT. Applied before
+    // any program/interactive dispatch so it governs the whole session.
+    {
+        let argv0 = std::env::args().next().unwrap_or_default();
+        let posix = huck_engine::shell::startup_posix(
+            opts.posix,
+            &argv0,
+            std::env::var_os("POSIXLY_CORRECT").is_some(),
+        );
+        shell_cell.borrow_mut().shell_options.posix = posix;
+    }
+
     // Non-interactive program modes bypass the REPL entirely.
     match opts.mode {
         RunMode::Command { command, argv0, args } => {

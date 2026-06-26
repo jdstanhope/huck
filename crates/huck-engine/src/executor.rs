@@ -4236,7 +4236,13 @@ fn run_exec_single(
     // POSIX special builtins persist their prefix assignments. User functions
     // and regular builtins/externals do NOT — they snapshot/restore (temporary
     // scope), matching bash in both default and posix mode.
-    let persistent = builtins::is_special_builtin(&resolved.program);
+    // `export`/`readonly` absorb their named variable in BOTH modes (bash
+    // assignment-builtin semantics). Every other special builtin persists its
+    // prefix only under `set -o posix`; default mode restores it (POSIX 2.14 is
+    // posix-mode-only in bash). `declare`/`typeset`/`local` are not special, so
+    // they already restore correctly.
+    let persistent = matches!(resolved.program.as_str(), "export" | "readonly")
+        || (builtins::is_special_builtin(&resolved.program) && shell.shell_options.posix);
 
     // `exec`: a special builtin that does NOT fork. With a command operand it
     // replaces the shell process image; with only redirections it applies them
@@ -4258,13 +4264,16 @@ fn run_exec_single(
         return outcome;
     }
 
+    // Section 3: track this command's snapshotted names on a shell-managed stack
+    // so a nested posix special-builtin persist can delete them from enclosing
+    // scopes. finalize_inline_scope (every exit path below) pops exactly this.
+    shell.inline_scopes.push(snap.iter().map(|(n, _)| n.clone()).collect());
+
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
     {
         { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
-        if !persistent {
-            restore_inline_assignments(snap, shell);
-        }
+        finalize_inline_scope(snap, persistent, shell);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -4329,18 +4338,14 @@ fn run_exec_single(
         match build_child_redir_plan(&cmd.redirects, shell, sink, err_sink) {
             Ok(plan) => run_subprocess(&resolved, plan, shell, sink, err_sink),
             Err(code) => {
-                if !persistent {
-                    restore_inline_assignments(snap, shell);
-                }
+                finalize_inline_scope(snap, persistent, shell);
                 drain_procsubs(shell, procsub_base);
                 return ExecOutcome::Continue(code);
             }
         }
     };
 
-    if !persistent {
-        restore_inline_assignments(snap, shell);
-    }
+    finalize_inline_scope(snap, persistent, shell);
     // Apply `$_` AFTER dispatch so a function/eval/source body's nested
     // commands don't leave a stale value (see `next_last_arg` above).
     shell.last_arg = next_last_arg;
@@ -6458,6 +6463,34 @@ fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
     }
 }
 
+/// Pops the top `inline_scopes` entry pushed by `run_exec_single` and finalizes
+/// this command's inline assignments. NON-persistent: restore LIFO, but skip any
+/// name a nested posix special-builtin persist deleted from this scope.
+/// PERSISTENT (posix special builtin / export / readonly): keep the live values
+/// and delete these names from every enclosing scope so their restores skip them.
+fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut Shell) {
+    let kept = shell.inline_scopes.pop().unwrap_or_default();
+    if persistent {
+        // Only POSIX mode propagates a persist THROUGH an enclosing
+        // temp-assignment scope. In default mode export/readonly keep their
+        // value at their own level (snap not restored here) but must NOT
+        // survive an enclosing same-name restore — so skip the deletion.
+        if shell.shell_options.posix {
+            for (name, _) in &snap {
+                for scope in shell.inline_scopes.iter_mut() {
+                    scope.remove(name);
+                }
+            }
+        }
+    } else {
+        for (name, prior) in snap.into_iter().rev() {
+            if kept.contains(&name) {
+                shell.restore_var(&name, prior);
+            }
+        }
+    }
+}
+
 /// Returns the static text of `word` iff it is a single unquoted `Literal`
 /// part (e.g. a statically-written `command`/`declare`/`-p`). Returns `None`
 /// for dynamic words (`$x`, quoted, multi-part). Mirrors
@@ -8202,6 +8235,75 @@ mod tests {
     }
 
     #[test]
+    fn posix_special_persist_survives_enclosing_prefix() {
+        // func3.sub line 155: outer prefix restore must NOT clobber the inner
+        // posix special-builtin persist.
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\nvar=0\nf(){ var=20 return 5; }\nvar=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("var"), Some("20"));
+        assert!(shell.inline_scopes.is_empty(), "scope stack balanced");
+    }
+
+    #[test]
+    fn export_under_enclosing_prefix_does_not_survive_restore_in_default_mode() {
+        // export is persistent (absorbs its named var), but in DEFAULT mode that
+        // persist must NOT propagate through an enclosing same-name prefix-restore.
+        // bash 5.2.21: FOO=30 f restores FOO to 0 even though f did `FOO=20 export FOO`.
+        let mut shell = Shell::new();
+        exec_script(
+            "FOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("FOO"), Some("0"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
+    fn export_under_enclosing_prefix_survives_in_posix_mode() {
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\nFOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("FOO"), Some("20"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
+    fn exec_with_redirect_does_not_leak_inline_scope() {
+        // exec returns via its own early path; the scope-stack push must sit
+        // below the exec block so exec never pushes (else it leaks an entry).
+        let mut shell = Shell::new();
+        exec_script("FOO=bar exec 3>&1\n", &mut shell);
+        assert!(shell.inline_scopes.is_empty(), "exec must not leak an inline scope");
+    }
+
+    #[test]
+    fn default_special_persist_does_not_survive_enclosing_prefix() {
+        let mut shell = Shell::new();
+        exec_script(
+            "var=0\nf(){ var=20 return 5; }\nvar=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("var"), Some("0"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
+    fn posix_special_persist_survives_multi_level_enclosing() {
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\na=0\nm(){ a=3 return; }\no(){ a=2 m; }\na=1 o\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("a"), Some("3"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
     fn run_exec_single_special_builtin_inline_assignment_persists() {
         let mut shell = Shell::new();
         let cmd = SimpleCommand::Exec(ExecCommand {
@@ -8216,6 +8318,30 @@ mod tests {
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
         assert!(shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn special_builtin_prefix_does_not_persist_in_default_mode() {
+        // `:` is a special builtin; in DEFAULT mode the prefix is temporary.
+        let mut shell = Shell::new();
+        exec_script("var=0\nvar=20 :\n", &mut shell);
+        assert_eq!(shell.get("var"), Some("0"), "default mode restores the prefix");
+    }
+
+    #[test]
+    fn special_builtin_prefix_persists_in_posix_mode() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nvar=0\nvar=20 :\n", &mut shell);
+        assert_eq!(shell.get("var"), Some("20"), "posix mode persists the prefix");
+    }
+
+    #[test]
+    fn export_prefix_persists_in_default_mode() {
+        // export/readonly absorb their named var even in default mode (regression
+        // guard alongside run_exec_single_special_builtin_inline_assignment_persists).
+        let mut shell = Shell::new();
+        exec_script("FOO=val export FOO\n", &mut shell);
+        assert_eq!(shell.get("FOO"), Some("val"), "export keeps its named var");
     }
 
     /// Canonical "fork_and_run_in_subshell works" test.
@@ -8594,6 +8720,16 @@ mod tests {
         {
             let _ = execute(&seq, shell, &buf);
         }
+    }
+
+    #[test]
+    fn set_o_posix_toggles_shell_option() {
+        let mut shell = Shell::new();
+        assert!(!shell.shell_options.posix, "posix defaults off");
+        exec_script("set -o posix\n", &mut shell);
+        assert!(shell.shell_options.posix, "set -o posix turns it on");
+        exec_script("set +o posix\n", &mut shell);
+        assert!(!shell.shell_options.posix, "set +o posix turns it off");
     }
 
     #[test]
