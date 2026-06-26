@@ -94,3 +94,35 @@ fn readonly_with_single_quote_listing_escapes() {
         "stdout: {out:?}",
     );
 }
+
+/// Run huck with a script FILE (not stdin) so non-interactive prologue
+/// (`<path>: line N:`) is produced. Returns (stdout, stderr).
+fn run_file(script: &str) -> (String, String) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("huck-ro-{}.sh", std::process::id()));
+    std::fs::write(&path, script).unwrap();
+    let out = std::process::Command::new(huck_binary())
+        .arg(&path)
+        .output()
+        .expect("run huck file");
+    let _ = std::fs::remove_file(&path);
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn readonly_assignment_error_uses_prologue_in_file_mode() {
+    // Line 1 = `readonly r=1`, line 2 = `r=2` (the readonly error).
+    let (_o, e) = run_file("readonly r=1\nr=2\n");
+    assert!(
+        e.contains(": line 2: r: readonly variable"),
+        "expected bash-style prologue with line number, got: {e:?}"
+    );
+    // File-mode prologue is the script path, never the literal `huck:`.
+    assert!(
+        !e.starts_with("huck:"),
+        "should not use the interactive `huck:` prologue in file mode: {e:?}"
+    );
+}

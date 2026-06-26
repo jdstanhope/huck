@@ -1645,7 +1645,11 @@ impl Shell {
         // The single readonly check, before any store (no partial array
         // writes); the storage primitives do not re-check.
         if self.is_readonly(&name) {
-            with_err(|err| e!(err, "huck: {name}: readonly variable"));
+            // bash prefixes the readonly-assignment error with the
+            // non-interactive prologue (`<src>: line N:`); interactive keeps
+            // `huck:` (error_prefix handles the mode split).
+            let prefix = self.error_prefix(None);
+            with_err(|err| e!(err, "{prefix}{name}: readonly variable"));
             return Err(AssignErr::Readonly);
         }
 
