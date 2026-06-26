@@ -931,7 +931,8 @@ impl RedirectScope {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                            let prefix = shell.error_prefix(None);
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
                             return Err(ExecOutcome::Continue(1));
                         }
                     },
@@ -948,7 +949,8 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); }
+                                let prefix = shell.error_prefix(None);
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{}: {}", resolved_path(&resolved), crate::bash_io_error(&e)); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -959,7 +961,8 @@ impl RedirectScope {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                let prefix = shell.error_prefix(None);
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -4904,7 +4907,11 @@ fn build_child_redir_plan(
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                        Err(e) => {
+                            let prefix = shell.error_prefix(None);
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                            return Err(1);
+                        }
                     },
                     FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                         let resolved = match mode {
@@ -4917,13 +4924,21 @@ fn build_child_redir_plan(
                         };
                         match open_resolved(&resolved) {
                             Ok(f) => f,
-                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
+                            Err(e) => {
+                                let prefix = shell.error_prefix(None);
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{}: {}", resolved_path(&resolved), crate::bash_io_error(&e)); }
+                                return Err(1);
+                            }
                         }
                     }
                     FileMode::ReadWrite => {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f,
-                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                            Err(e) => {
+                                let prefix = shell.error_prefix(None);
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                                return Err(1);
+                            }
                         }
                     }
                 };

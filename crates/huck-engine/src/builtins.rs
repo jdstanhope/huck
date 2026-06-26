@@ -402,7 +402,8 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
-            e!(err, "huck: cd: {target}: {e}");
+            let prefix = shell.error_prefix(Some("cd"));
+            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
@@ -425,7 +426,8 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
         };
         let normalized = normalize_logical(&curpath);
         if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            e!(err, "huck: cd: {target}: {e}");
+            let prefix = shell.error_prefix(Some("cd"));
+            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         normalized
@@ -441,7 +443,8 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     if print_new_pwd
         && let Err(e) = writeln!(out, "{new_pwd}")
     {
-        e!(err, "huck: cd: {e}");
+        let prefix = shell.error_prefix(Some("cd"));
+        e!(err, "{prefix}{}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
