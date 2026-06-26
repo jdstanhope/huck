@@ -122,6 +122,25 @@ pub(crate) fn err_writer<'a>(
     }
 }
 
+/// Emit a path-bearing redirect-open failure in bash's format:
+/// `<error_prefix>{path}: {strerror}` — the non-interactive prologue
+/// (`<src>: line N: `) or interactive `huck: ` from `error_prefix(None)`, the
+/// offending path, and `bash_io_error` (strerror with no Rust `(os error N)`
+/// suffix). Single home for every `File::open`/`open_resolved`/`OpenOptions`
+/// redirect-open error so the format stays identical across execution contexts.
+/// Compute is done before taking the writer so the `&shell` borrow ends first.
+pub(crate) fn redir_open_error(
+    shell: &Shell,
+    err_sink: &mut StderrSink,
+    out_sink: &mut StdoutSink,
+    path: &str,
+    e: &std::io::Error,
+) {
+    let prefix = shell.error_prefix(None);
+    let mut err = err_writer(err_sink, out_sink);
+    e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(e));
+}
+
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
 /// partial line is held back) before handing fd 1 to another process. A fork
 /// child would otherwise inherit — and possibly duplicate — the pending bytes,
@@ -931,8 +950,7 @@ impl RedirectScope {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            let prefix = shell.error_prefix(None);
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                            redir_open_error(shell, err_sink, sink, &path, &e);
                             return Err(ExecOutcome::Continue(1));
                         }
                     },
@@ -949,8 +967,7 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                let prefix = shell.error_prefix(None);
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{}: {}", resolved_path(&resolved), crate::bash_io_error(&e)); }
+                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -961,8 +978,7 @@ impl RedirectScope {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                let prefix = shell.error_prefix(None);
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -1105,7 +1121,7 @@ impl RedirectScope {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                            redir_open_error(shell, err_sink, sink, &path, &e);
                             return Err(ExecOutcome::Continue(1));
                         }
                     },
@@ -1121,7 +1137,7 @@ impl RedirectScope {
                         match open_resolved(&resolved) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); }
+                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -1130,7 +1146,7 @@ impl RedirectScope {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f.into_raw_fd(),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 return Err(ExecOutcome::Continue(1));
                             }
                         }
@@ -2902,7 +2918,7 @@ fn run_background_sequence(
                     match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                            redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2986,7 +3002,7 @@ fn run_background_sequence(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -3012,7 +3028,7 @@ fn run_background_sequence(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -3051,7 +3067,7 @@ fn run_background_sequence(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -3079,7 +3095,7 @@ fn run_background_sequence(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -4057,7 +4073,7 @@ fn run_exec_single_inner(
                         ExecOutcome::Continue(0)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                        redir_open_error(shell, err_sink, sink, &path, &e);
                         ExecOutcome::Continue(1)
                     }
                 };
@@ -4815,7 +4831,7 @@ fn build_child_redir_plan(
                     let file: File = match mode {
                         FileMode::ReadOnly => match File::open(&path) {
                             Ok(f) => f,
-                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                            Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
                         },
                         FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                             let resolved = match mode {
@@ -4828,13 +4844,13 @@ fn build_child_redir_plan(
                             };
                             match open_resolved(&resolved) {
                                 Ok(f) => f,
-                                Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
+                                Err(e) => { redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e); return Err(1); }
                             }
                         }
                         FileMode::ReadWrite => {
                             match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                                 Ok(f) => f,
-                                Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                                Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
                             }
                         }
                     };
@@ -4908,8 +4924,7 @@ fn build_child_redir_plan(
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
                         Err(e) => {
-                            let prefix = shell.error_prefix(None);
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                            redir_open_error(shell, err_sink, sink, &path, &e);
                             return Err(1);
                         }
                     },
@@ -4925,8 +4940,7 @@ fn build_child_redir_plan(
                         match open_resolved(&resolved) {
                             Ok(f) => f,
                             Err(e) => {
-                                let prefix = shell.error_prefix(None);
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{}: {}", resolved_path(&resolved), crate::bash_io_error(&e)); }
+                                redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e);
                                 return Err(1);
                             }
                         }
@@ -4935,8 +4949,7 @@ fn build_child_redir_plan(
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f,
                             Err(e) => {
-                                let prefix = shell.error_prefix(None);
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(&e)); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 return Err(1);
                             }
                         }
@@ -5036,7 +5049,7 @@ fn build_child_extra_ops(
                 let file: File = match mode {
                     FileMode::ReadOnly => match File::open(&path) {
                         Ok(f) => f,
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                        Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
                     },
                     FileMode::Truncate | FileMode::Append | FileMode::Clobber => {
                         let resolved = match mode {
@@ -5047,13 +5060,13 @@ fn build_child_extra_ops(
                         };
                         match open_resolved(&resolved) {
                             Ok(f) => f,
-                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", resolved_path(&resolved)); } return Err(1); }
+                            Err(e) => { redir_open_error(shell, err_sink, sink, &resolved_path(&resolved), &e); return Err(1); }
                         }
                     }
                     FileMode::ReadWrite => {
                         match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
                             Ok(f) => f,
-                            Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); } return Err(1); }
+                            Err(e) => { redir_open_error(shell, err_sink, sink, &path, &e); return Err(1); }
                         }
                     }
                 };
@@ -5740,7 +5753,7 @@ fn run_multi_stage(
                     match File::open(&path) {
                         Ok(f) => f.into_raw_fd(),
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                            redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -5838,7 +5851,7 @@ fn run_multi_stage(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -5862,7 +5875,7 @@ fn run_multi_stage(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -5899,7 +5912,7 @@ fn run_multi_stage(
                         match open_writable(&path, guard) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
@@ -5925,7 +5938,7 @@ fn run_multi_stage(
                         match OpenOptions::new().create(true).append(true).open(&path) {
                             Ok(f) => Some(f.into_raw_fd()),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {path}: {e}"); }
+                                redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
