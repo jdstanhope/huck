@@ -45,10 +45,22 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "help",
     "complete", "compgen", "compopt",
     "bind",
+    "umask",
+    "ulimit",
+    "times",
+    "enable",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
+}
+
+/// True if `name` is a known builtin that is currently ENABLED (not turned off
+/// via `enable -n`). Command dispatch and `type`/`command -v` use this so a
+/// disabled builtin falls through to the external command. `enable`'s validity
+/// check and the `builtin` forcing builtin use `is_builtin` (name known) instead.
+pub fn builtin_active(name: &str, shell: &Shell) -> bool {
+    is_builtin(name) && !shell.disabled_builtins.contains(name)
 }
 
 /// True for "declaration commands" (bash terminology). Their
@@ -69,7 +81,7 @@ pub fn is_declaration_command(name: &str) -> bool {
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
         ":" | "." | "break" | "continue" | "eval" | "exec" | "exit" | "export" | "readonly" | "return"
-        | "set" | "shift" | "source" | "trap" | "unset"
+        | "set" | "shift" | "source" | "times" | "trap" | "unset"
     )
 }
 
@@ -172,6 +184,10 @@ pub fn run_builtin(
             builtin_return(args, shell)
         }
         "bind" => builtin_bind(args, out, err, shell),
+        "umask" => builtin_umask(args, out, err, shell),
+        "ulimit" => builtin_ulimit(args, out, err, shell),
+        "times" => builtin_times(args, out, err, shell),
+        "enable" => builtin_enable(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -6649,7 +6665,7 @@ fn resolve_command_name(name: &str, shell: &Shell) -> CommandResolution {
     if shell.functions.contains_key(name) {
         return CommandResolution::Function;
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         return CommandResolution::Builtin;
     }
     if is_shell_keyword(name) {
@@ -6698,7 +6714,7 @@ fn resolve_command_name_with(
     if !skip_func && shell.functions.contains_key(name) {
         return CommandResolution::Function;
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         return CommandResolution::Builtin;
     }
     if is_shell_keyword(name) {
@@ -6725,7 +6741,7 @@ fn resolve_command_name_all(
     if !skip_func && shell.functions.contains_key(name) {
         out.push(CommandResolution::Function);
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         out.push(CommandResolution::Builtin);
     }
     if is_shell_keyword(name) {
@@ -7741,6 +7757,16 @@ mod tests {
     #[test]
     fn help_topic_names_nonempty() {
         assert!(help_topic_names().count() >= 40);
+    }
+
+    #[test]
+    fn builtin_active_reflects_disabled_set() {
+        let mut sh = crate::shell_state::Shell::new();
+        assert!(super::builtin_active("test", &sh));      // enabled by default
+        sh.disabled_builtins.insert("test".to_string());
+        assert!(!super::builtin_active("test", &sh));     // now disabled
+        assert!(super::is_builtin("test"));               // still a KNOWN builtin
+        assert!(!super::builtin_active("not_a_builtin", &sh));
     }
 
     #[test]
@@ -9723,7 +9749,7 @@ mod special_builtin_tests {
 
     #[test]
     fn is_special_builtin_recognises_posix_specials() {
-        for name in ["break", "continue", "exit", "export", "return", "unset"] {
+        for name in ["break", "continue", "exit", "export", "return", "unset", "times"] {
             assert!(is_special_builtin(name), "expected {name} to be special");
         }
     }
@@ -13066,6 +13092,436 @@ mod getopts_step_tests {
         assert_eq!(s.name, ":");
         assert_eq!(s.optarg.as_deref(), Some("b"));
         assert!(s.error.is_none());
+    }
+}
+
+// ── umask ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SymErr { Char(char), Operator(char) }
+
+/// Parse an octal umask literal (digits 0-7 only). Err on any non-octal digit.
+pub(crate) fn parse_octal_umask(s: &str) -> Result<u32, ()> {
+    let mut val: u32 = 0;
+    for ch in s.chars() {
+        let d = ch.to_digit(8).ok_or(())?; // rejects 8,9 and non-digits
+        val = val.checked_mul(8).and_then(|v| v.checked_add(d)).ok_or(())?;
+    }
+    if s.is_empty() { return Err(()); }
+    Ok(val & 0o777)
+}
+
+/// Parse a symbolic umask string against the current mask. mask bit set = deny.
+pub(crate) fn parse_symbolic_umask(s: &str, cur: u32) -> Result<u32, SymErr> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut mask = cur & 0o777;
+    loop {
+        // who
+        let mut shifts: Vec<u32> = Vec::new();
+        while i < chars.len() && matches!(chars[i], 'u' | 'g' | 'o' | 'a') {
+            match chars[i] {
+                'u' => shifts.push(6),
+                'g' => shifts.push(3),
+                'o' => shifts.push(0),
+                'a' => { shifts.extend([6, 3, 0]); }
+                _ => unreachable!(),
+            }
+            i += 1;
+        }
+        if shifts.is_empty() { shifts = vec![6, 3, 0]; }
+        // operator
+        if i >= chars.len() { return Err(SymErr::Operator('\0')); }
+        let op = chars[i];
+        if !matches!(op, '=' | '+' | '-') { return Err(SymErr::Operator(op)); }
+        i += 1;
+        // perms
+        let mut perm: u32 = 0;
+        while i < chars.len() && matches!(chars[i], 'r' | 'w' | 'x') {
+            perm |= match chars[i] { 'r' => 4, 'w' => 2, 'x' => 1, _ => 0 };
+            i += 1;
+        }
+        for sh in &shifts {
+            match op {
+                '=' => { mask &= !(0o7 << sh); mask |= (!perm & 0o7) << sh; }
+                '+' => { mask &= !(perm << sh); }
+                '-' => { mask |= perm << sh; }
+                _ => unreachable!(),
+            }
+        }
+        // clause boundary
+        if i >= chars.len() { break; }
+        if chars[i] == ',' { i += 1; continue; }
+        return Err(SymErr::Char(chars[i]));
+    }
+    Ok(mask & 0o777)
+}
+
+/// Symbolic rendering of the ALLOWED perms (complement of mask) as `u=rwx,g=rx,o=rx`.
+pub(crate) fn format_symbolic_umask(mask: u32) -> String {
+    let mut parts = Vec::new();
+    for (cls, sh) in [('u', 6u32), ('g', 3), ('o', 0)] {
+        let allowed = (!mask >> sh) & 0o7;
+        let mut p = String::new();
+        if allowed & 4 != 0 { p.push('r'); }
+        if allowed & 2 != 0 { p.push('w'); }
+        if allowed & 1 != 0 { p.push('x'); }
+        parts.push(format!("{cls}={p}"));
+    }
+    parts.join(",")
+}
+
+fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let mut symbolic = false;
+    let mut posix = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'S' => symbolic = true,
+                    'p' => posix = true,
+                    other => {
+                        let prefix = shell.error_prefix(Some("umask"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "umask: usage: umask [-p] [-S] [mode]");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    // read current mask without disturbing it
+    let cur = (unsafe { let m = libc::umask(0); libc::umask(m); m } as u32) & 0o777;
+
+    if idx < args.len() {
+        let mode = &args[idx];
+        let first_digit = mode.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let new_mask = if first_digit {
+            match parse_octal_umask(mode) {
+                Ok(m) => m,
+                Err(()) => {
+                    let prefix = shell.error_prefix(Some("umask"));
+                    e!(err, "{prefix}{mode}: octal number out of range");
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        } else {
+            match parse_symbolic_umask(mode, cur) {
+                Ok(m) => m,
+                Err(se) => {
+                    let prefix = shell.error_prefix(Some("umask"));
+                    match se {
+                        SymErr::Char(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode character"),
+                        SymErr::Operator(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode operator"),
+                    }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        };
+        unsafe { libc::umask(new_mask as libc::mode_t); }
+        // bash prints the symbolic mask when -S is given alongside a mode arg
+        if symbolic {
+            let body = format_symbolic_umask(new_mask);
+            let _ = writeln!(out, "{body}");
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let body = if symbolic { format_symbolic_umask(cur) } else { format!("{cur:04o}") };
+    let line = match (posix, symbolic) {
+        (true, true) => format!("umask -S {body}"),
+        (true, false) => format!("umask {body}"),
+        (false, _) => body,
+    };
+    let _ = writeln!(out, "{line}");
+    ExecOutcome::Continue(0)
+}
+
+#[cfg(test)]
+mod umask_tests {
+    #[test]
+    fn umask_octal_rejects_nonoctal() {
+        assert!(super::parse_octal_umask("09").is_err());
+        assert_eq!(super::parse_octal_umask("022").unwrap(), 0o22);
+    }
+    #[test]
+    fn umask_symbolic_roundtrip() {
+        assert_eq!(super::format_symbolic_umask(0o022), "u=rwx,g=rx,o=rx");
+        // set o to deny write from a clear mask
+        assert_eq!(super::parse_symbolic_umask("u=rwx,g=rwx,o=rx", 0).unwrap(), 0o002);
+    }
+    #[test]
+    fn umask_symbolic_errors() {
+        assert!(matches!(super::parse_symbolic_umask("g=u", 0), Err(super::SymErr::Char('u'))));
+        assert!(matches!(super::parse_symbolic_umask("u:rwx", 0), Err(super::SymErr::Operator(':'))));
+        assert!(matches!(super::parse_symbolic_umask("u=rwx:g=rwx", 0), Err(super::SymErr::Char(':'))));
+    }
+}
+
+// ─── ulimit ──────────────────────────────────────────────────────────────────
+
+struct UlimitRes {
+    letter: char,
+    resource: libc::__rlimit_resource_t,
+    mult: u64,           // value units per limit byte/raw; 1 = unscaled
+    label: &'static str, // for `-a`
+}
+
+const ULIMIT_TABLE: &[UlimitRes] = &[
+    UlimitRes { letter: 'c', resource: libc::RLIMIT_CORE,        mult: 1024, label: "core file size          (blocks, -c)" },
+    UlimitRes { letter: 'd', resource: libc::RLIMIT_DATA,        mult: 1024, label: "data seg size           (kbytes, -d)" },
+    UlimitRes { letter: 'e', resource: libc::RLIMIT_NICE,        mult: 1,    label: "scheduling priority             (-e)" },
+    UlimitRes { letter: 'f', resource: libc::RLIMIT_FSIZE,       mult: 1024, label: "file size               (blocks, -f)" },
+    UlimitRes { letter: 'i', resource: libc::RLIMIT_SIGPENDING,  mult: 1,    label: "pending signals                 (-i)" },
+    UlimitRes { letter: 'l', resource: libc::RLIMIT_MEMLOCK,     mult: 1024, label: "max locked memory       (kbytes, -l)" },
+    UlimitRes { letter: 'm', resource: libc::RLIMIT_RSS,         mult: 1024, label: "max memory size         (kbytes, -m)" },
+    UlimitRes { letter: 'n', resource: libc::RLIMIT_NOFILE,      mult: 1,    label: "open files                      (-n)" },
+    UlimitRes { letter: 'q', resource: libc::RLIMIT_MSGQUEUE,    mult: 1,    label: "POSIX message queues     (bytes, -q)" },
+    UlimitRes { letter: 'r', resource: libc::RLIMIT_RTPRIO,      mult: 1,    label: "real-time priority              (-r)" },
+    UlimitRes { letter: 's', resource: libc::RLIMIT_STACK,       mult: 1024, label: "stack size              (kbytes, -s)" },
+    UlimitRes { letter: 't', resource: libc::RLIMIT_CPU,         mult: 1,    label: "cpu time               (seconds, -t)" },
+    UlimitRes { letter: 'u', resource: libc::RLIMIT_NPROC,       mult: 1,    label: "max user processes              (-u)" },
+    UlimitRes { letter: 'v', resource: libc::RLIMIT_AS,          mult: 1024, label: "virtual memory          (kbytes, -v)" },
+    UlimitRes { letter: 'x', resource: libc::RLIMIT_LOCKS,       mult: 1,    label: "file locks                      (-x)" },
+];
+
+fn ulimit_lookup(letter: char) -> Option<&'static UlimitRes> {
+    ULIMIT_TABLE.iter().find(|r| r.letter == letter)
+}
+
+fn ulimit_get(res: &UlimitRes, hard: bool) -> Option<u64> {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(res.resource, &mut rl) } != 0 { return None; }
+    let v = if hard { rl.rlim_max } else { rl.rlim_cur };
+    if v == libc::RLIM_INFINITY { return Some(u64::MAX); } // sentinel for "unlimited"
+    Some((v as u64) / res.mult)
+}
+
+/// Returns Err(io::Error) if setrlimit fails.
+fn ulimit_set(res: &UlimitRes, raw: u64, set_soft: bool, set_hard: bool) -> std::io::Result<()> {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(res.resource, &mut rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let scaled: libc::rlim_t = if raw == u64::MAX {
+        libc::RLIM_INFINITY
+    } else {
+        raw.saturating_mul(res.mult) as libc::rlim_t
+    };
+    if set_soft { rl.rlim_cur = scaled; }
+    if set_hard { rl.rlim_max = scaled; }
+    if unsafe { libc::setrlimit(res.resource, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    const USAGE: &str = "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]";
+    let mut want_soft = false;
+    let mut want_hard = false;
+    let mut show_all = false;
+    let mut letters: Vec<char> = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'S' => want_soft = true,
+                    'H' => want_hard = true,
+                    'a' => show_all = true,
+                    'p' => letters.push('p'),
+                    other if ulimit_lookup(other).is_some() => letters.push(other),
+                    other => {
+                        let prefix = shell.error_prefix(Some("ulimit"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "{USAGE}");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    let value_arg: Option<&String> = args.get(idx);
+
+    if show_all {
+        let hard = want_hard && !want_soft;
+        for res in ULIMIT_TABLE {
+            let v = ulimit_get(res, hard);
+            let disp = match v {
+                Some(u64::MAX) => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+                None => "?".to_string(),
+            };
+            let _ = writeln!(out, "{} {}", res.label, disp);
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if letters.is_empty() { letters.push('f'); } // bash default resource
+
+    // `-p` pipe pseudo-resource: bash reports 8 (512-byte blocks), set is a no-op.
+    let do_hard = want_hard;
+    let do_soft = want_soft || !want_hard; // query: soft by default; set: both unless one chosen
+    let mut status = 0;
+
+    if let Some(val) = value_arg {
+        // SET
+        let set_soft = want_soft || (!want_soft && !want_hard);
+        let set_hard = want_hard || (!want_soft && !want_hard);
+        for &lt in &letters {
+            if lt == 'p' { continue; } // no-op success
+            let res = ulimit_lookup(lt).unwrap();
+            let raw = match val.as_str() {
+                "unlimited" => u64::MAX,
+                s => match s.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let prefix = shell.error_prefix(Some("ulimit"));
+                        e!(err, "{prefix}{val}: invalid number");
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+            if let Err(e) = ulimit_set(res, raw, set_soft, set_hard) {
+                let prefix = shell.error_prefix(Some("ulimit"));
+                e!(err, "{prefix}{val}: cannot modify limit: {}", crate::bash_io_error(&e));
+                status = 1;
+            }
+        }
+    } else {
+        // QUERY
+        let hard = do_hard && !do_soft;
+        let single = letters.len() == 1;
+        for &lt in &letters {
+            if lt == 'p' {
+                if single {
+                    let _ = writeln!(out, "8");
+                } else {
+                    let _ = writeln!(out, "pipe size            (512 bytes, -p) 8");
+                }
+                continue;
+            }
+            let res = ulimit_lookup(lt).unwrap();
+            let disp = match ulimit_get(res, hard) {
+                Some(u64::MAX) => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+                None => { status = 1; continue; }
+            };
+            if single {
+                let _ = writeln!(out, "{disp}");
+            } else {
+                let _ = writeln!(out, "{} {}", res.label, disp);
+            }
+        }
+    }
+    ExecOutcome::Continue(status)
+}
+
+fn builtin_times(_args: &[String], out: &mut dyn Write, _err: &mut dyn Write, _shell: &mut Shell) -> ExecOutcome {
+    let mut t: libc::tms = unsafe { std::mem::zeroed() };
+    unsafe { libc::times(&mut t); }
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as f64 } else { 100.0 };
+    let fmt = |ticks: libc::clock_t| -> String {
+        let secs = ticks as f64 / hz;
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64) * 60.0;
+        format!("{m}m{s:.3}s")
+    };
+    let _ = writeln!(out, "{} {}", fmt(t.tms_utime), fmt(t.tms_stime));
+    let _ = writeln!(out, "{} {}", fmt(t.tms_cutime), fmt(t.tms_cstime));
+    ExecOutcome::Continue(0)
+}
+
+fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    const USAGE: &str = "enable: usage: enable [-a] [-dnps] [-f filename] [name ...]";
+    let mut disable = false; // -n
+    let mut all = false;     // -a
+    let mut special = false; // -s
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'n' => disable = true,
+                    'a' => all = true,
+                    's' => special = true,
+                    'p' => {} // print format — the listing default
+                    other => {
+                        let prefix = shell.error_prefix(Some("enable"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "{USAGE}");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    let names = &args[idx..];
+
+    if names.is_empty() {
+        let mut cands: Vec<&str> = BUILTIN_NAMES.iter().copied()
+            .filter(|n| !special || is_special_builtin(n))
+            .collect();
+        cands.sort_unstable();
+        for n in cands {
+            let is_off = shell.disabled_builtins.contains(n);
+            let show = if disable { is_off } else if all { true } else { !is_off };
+            if !show { continue; }
+            if is_off { let _ = writeln!(out, "enable -n {n}"); }
+            else { let _ = writeln!(out, "enable {n}"); }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut status = 0;
+    for name in names {
+        if !is_builtin(name) {
+            let prefix = shell.error_prefix(Some("enable"));
+            e!(err, "{prefix}{name}: not a shell builtin");
+            status = 1;
+            continue;
+        }
+        if disable { shell.disabled_builtins.insert(name.clone()); }
+        else { shell.disabled_builtins.remove(name); }
+    }
+    ExecOutcome::Continue(status)
+}
+
+#[cfg(test)]
+mod ulimit_tests {
+    #[test]
+    fn ulimit_table_lookup_and_scale() {
+        let c = super::ulimit_lookup('c').unwrap();
+        assert_eq!(c.mult, 1024);
+        let n = super::ulimit_lookup('n').unwrap();
+        assert_eq!(n.mult, 1);
+        assert!(super::ulimit_lookup('Z').is_none());
+    }
+}
+
+#[cfg(test)]
+mod enable_tests {
+    #[test]
+    fn enable_toggle_updates_set() {
+        let mut sh = crate::shell_state::Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        super::builtin_enable(&["-n".into(), "test".into()], &mut out, &mut err, &mut sh);
+        assert!(sh.disabled_builtins.contains("test"));
+        super::builtin_enable(&["test".into()], &mut out, &mut err, &mut sh);
+        assert!(!sh.disabled_builtins.contains("test"));
     }
 }
 

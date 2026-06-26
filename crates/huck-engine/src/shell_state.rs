@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::rc::Rc;
@@ -611,6 +612,13 @@ pub struct Shell {
     /// readline-style settings populated by the `bind` builtin; applied to
     /// the rustyline editor by the run loop. See `ReadlineSettings`.
     pub readline_settings: ReadlineSettings,
+
+    /// Set of builtin names disabled via `enable -n`. Command dispatch and
+    /// `type`/`command -v` skip a disabled builtin and fall through to the
+    /// external command. `enable`'s validity check and the `builtin` forcing
+    /// builtin use `is_builtin` (name known) instead. Empty until `enable -n`
+    /// populates it (Task 5).
+    pub disabled_builtins: BTreeSet<String>,
 }
 
 // ---- Static builtin variable helpers (platform strings, libc wrappers) ----
@@ -799,6 +807,7 @@ impl Shell {
             seconds_base: std::time::Instant::now(),
             coprocs: Vec::new(),
             readline_settings: ReadlineSettings::default(),
+            disabled_builtins: BTreeSet::new(),
         };
         // Make the trap_pending Arc visible to async-signal-safe
         // signal handlers installed by the traps module.

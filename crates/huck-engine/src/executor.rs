@@ -4386,7 +4386,7 @@ fn run_exec_single_inner(
         } else {
             builtins::source_in_sink(&args, shell, sink, err_sink)
         }
-    } else if builtins::is_builtin(&resolved.program) {
+    } else if builtins::builtin_active(&resolved.program, shell) {
         // v156 task 7: ALL redirects flow through one ordered RedirectScope (via
         // run_builtin_with_redirects) applied to the real fds in source order, so
         // `echo x 2>&1 >file`, `>file 3>&1`, `read < file`, `cmd <<<here` etc. all
@@ -7108,7 +7108,7 @@ pub fn fork_and_run_in_subshell(
 ///   - `cmd` is `Command::Simple(SimpleCommand::Exec(exec))`,
 ///   - AND `exec.program_static_text()` returns `Some(name)` (single unquoted Literal),
 ///   - AND `name` is NOT in `shell.functions`,
-///   - AND NOT in `builtins::is_builtin`.
+///   - AND NOT an active builtin (`builtins::builtin_active`).
 ///
 /// Everything else (compounds, function calls, builtins, dynamic program words,
 /// assignment-only stages) → `InProcess`.
@@ -7125,7 +7125,7 @@ fn classify_stage<'a>(cmd: &'a Command, shell: &Shell) -> StageKind<'a> {
         && let SimpleCommand::Exec(exec) = simple
         && let Some(prog) = exec.program_static_text()
         && !shell.functions.contains_key(&prog)
-        && !builtins::is_builtin(&prog)
+        && !builtins::builtin_active(&prog, shell)
     {
         return StageKind::External(simple);
     }
