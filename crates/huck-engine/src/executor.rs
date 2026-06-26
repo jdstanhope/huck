@@ -595,7 +595,7 @@ fn run_command(
                 StdoutSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -612,7 +612,7 @@ fn run_command(
                 StderrSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
                         if stdout_fd != libc::STDOUT_FILENO { unsafe { libc::close(stdout_fd); } }
                         return ExecOutcome::Continue(1);
@@ -633,7 +633,7 @@ fn run_command(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
                     if let Some(r) = capture_read_fd {
                         unsafe { libc::close(r); }
                     }
@@ -1012,7 +1012,7 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
@@ -1047,7 +1047,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1066,7 +1066,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1158,7 +1158,7 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
@@ -1176,7 +1176,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1190,7 +1190,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1206,7 +1206,7 @@ impl RedirectScope {
                 if owns_src {
                     unsafe { libc::close(src) };
                 }
-                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {e}"); }
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {}", crate::bash_io_error(&e)); }
                 return Err(ExecOutcome::Continue(1));
             }
         };
@@ -2752,7 +2752,7 @@ fn run_background_subshell(
             ExecOutcome::Continue(0)
         }
         Err(e) => {
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
             ExecOutcome::Continue(1)
         }
     }
@@ -2790,7 +2790,7 @@ fn run_background_sequence(
         match File::open("/dev/null") {
             Ok(f) => f.into_raw_fd(),
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: /dev/null: {e}"); }
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: /dev/null: {}", crate::bash_io_error(&e)); }
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2830,7 +2830,7 @@ fn run_background_sequence(
                         w
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         drain_procsubs(shell, procsub_base);
                         cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -2864,7 +2864,7 @@ fn run_background_sequence(
                     spawned_pids.push(pid);
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
                     drain_procsubs(shell, procsub_base);
                     cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2940,7 +2940,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -2961,7 +2961,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
@@ -3124,7 +3124,7 @@ fn run_background_sequence(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
@@ -3146,7 +3146,7 @@ fn run_background_sequence(
                     w
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -3181,7 +3181,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -3198,7 +3198,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 drain_procsubs(shell, procsub_base);
@@ -3232,7 +3232,7 @@ fn run_background_sequence(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                 if !went_external {
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
@@ -4859,7 +4859,7 @@ fn build_child_redir_plan(
                 RedirOp::Dup { source, .. } => {
                     let src = match resolve_fd_target(source, shell) {
                         Ok(fd) => fd,
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); } return Err(1); }
                     };
                     (src, false)
                 }
@@ -4867,7 +4867,7 @@ fn build_child_redir_plan(
                     let bytes = expand_assignment(body, shell).into_bytes();
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                     }
                 }
                 RedirOp::HereString(w) => {
@@ -4875,7 +4875,7 @@ fn build_child_redir_plan(
                     bytes.push(b'\n');
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                     }
                 }
                 RedirOp::Close => unreachable!("Close handled above"),
@@ -4884,7 +4884,7 @@ fn build_child_redir_plan(
                 Ok(h) => h,
                 Err(e) => {
                     if owns_src { unsafe { libc::close(src) }; }
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: {}", crate::bash_io_error(&e)); }
                     return Err(1);
                 }
             };
@@ -4968,7 +4968,7 @@ fn build_child_redir_plan(
                 // number is valid in the child after fork.
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); } return Err(1); }
                 };
                 plan.ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -4985,7 +4985,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                 }
             }
             RedirOp::HereString(w) => {
@@ -4999,7 +4999,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); } return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                 }
             }
         }
@@ -5077,7 +5077,7 @@ fn build_child_extra_ops(
             RedirOp::Dup { source, .. } => {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); } return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); } return Err(1); }
                 };
                 ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -5333,7 +5333,7 @@ fn run_subprocess(
                         ExecOutcome::Continue(code)
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {}", cmd.program, crate::bash_io_error(&e)); }
                         ExecOutcome::Continue(1)
                     }
                 }
@@ -5366,7 +5366,7 @@ fn run_subprocess(
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {e}", cmd.program); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: {}", cmd.program, crate::bash_io_error(&e)); }
             ExecOutcome::Continue(1)
         }
     }
@@ -5404,7 +5404,7 @@ fn run_coproc(
     let (in_r, in_w) = match make_pipe() {
         Ok(p) => p,
         Err(e) => {
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5415,7 +5415,7 @@ fn run_coproc(
                 libc::close(in_r);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5441,7 +5441,7 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(out_w);
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5463,7 +5463,7 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5480,7 +5480,7 @@ fn run_coproc(
                 libc::close(read_fd);
                 libc::close(in_w);
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {e}"); }
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5597,7 +5597,7 @@ fn run_multi_stage(
                     (Some(w), Some(r))
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -5647,7 +5647,7 @@ fn run_multi_stage(
                         w
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         // Clean up all held fds.
                         drain_procsubs(shell, procsub_base);
                         for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -5664,7 +5664,7 @@ fn run_multi_stage(
                                 w
                             }
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                                 drain_procsubs(shell, procsub_base);
                                 for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                                 return ExecOutcome::Continue(1);
@@ -5693,7 +5693,7 @@ fn run_multi_stage(
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
                     drain_procsubs(shell, procsub_base);
                     for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
                     return ExecOutcome::Continue(1);
@@ -5781,7 +5781,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -5806,7 +5806,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {e}"); }
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             drain_procsubs(shell, procsub_base);
                             for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
@@ -5967,7 +5967,7 @@ fn run_multi_stage(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
@@ -5990,7 +5990,7 @@ fn run_multi_stage(
                     w
                 }
                 Err(e) => {
-                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                    { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -6009,7 +6009,7 @@ fn run_multi_stage(
                             w
                         }
                         Err(e) => {
-                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {e}"); }
+                            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -6091,7 +6091,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -6111,7 +6111,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -6176,7 +6176,7 @@ fn run_multi_stage(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {e}"); }
+                { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                 // For InProcess (fork failed), close the fds we were going to
                 // pass. For External, they were already consumed by OwnedFd.
                 if !went_external {

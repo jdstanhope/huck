@@ -409,7 +409,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
         match env::current_dir() {
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(e) => {
-                e!(err, "huck: cd: warning: could not read current dir: {e}");
+                e!(err, "huck: cd: warning: could not read current dir: {}", crate::bash_io_error(&e));
                 prev_pwd.clone().unwrap_or_default()
             }
         }
@@ -502,7 +502,7 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
     };
 
     if let Err(e) = writeln!(out, "{path}") {
-        e!(err, "huck: pwd: {e}");
+        e!(err, "huck: pwd: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -522,13 +522,13 @@ fn builtin_echo(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Ex
     };
 
     if let Err(e) = out.write_all(&bytes) {
-        e!(err, "huck: echo: {e}");
+        e!(err, "huck: echo: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     if !suppress_newline
         && let Err(e) = out.write_all(b"\n")
     {
-        e!(err, "huck: echo: {e}");
+        e!(err, "huck: echo: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -979,7 +979,7 @@ fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> Exe
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
-            e!(err, "huck: export: {e}");
+            e!(err, "huck: export: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
     }
@@ -1621,7 +1621,7 @@ fn builtin_readonly_decl(
                 }
             };
             if let Err(e) = writeln!(out, "{line}") {
-                e!(err, "huck: readonly: {e}");
+                e!(err, "huck: readonly: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2523,7 +2523,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
-                e!(err, "huck: mapfile: {e}");
+                e!(err, "huck: mapfile: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2544,7 +2544,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             }
             Ok(None) => break,
             Err(e) => {
-                e!(err, "huck: mapfile: {e}");
+                e!(err, "huck: mapfile: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2703,7 +2703,7 @@ fn builtin_read(
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
-            e!(err, "huck: read: {e}");
+            e!(err, "huck: read: {}", crate::bash_io_error(&e));
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
@@ -3675,7 +3675,7 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             writeln!(out, "{}", crate::jobs::notification_line(job, flag))
         };
         if let Err(e) = write_result {
-            e!(err, "huck: jobs: {e}");
+            e!(err, "huck: jobs: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         printed_ids.push(job.id);
@@ -6175,18 +6175,20 @@ pub(crate) fn source_in_sink(
         Ok(s) => s,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::InvalidData {
-                // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`.
+                // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`
+                // and exits with status 126.
                 let prefix = shell.error_prefix(Some("."));
                 let mut errw = crate::executor::err_writer(err_sink, sink);
                 e!(&mut *errw, "{prefix}{}: cannot execute binary file", path.display());
+                return ExecOutcome::Continue(126);
             } else {
                 // Open/read io error (permission, …): bash reports `<path>: <strerror>`
                 // (redirect-style, no `.:`).
                 let prefix = shell.error_prefix(None);
                 let mut errw = crate::executor::err_writer(err_sink, sink);
                 e!(&mut *errw, "{prefix}{}: {}", path.display(), crate::bash_io_error(&e));
+                return ExecOutcome::Continue(1);
             }
-            return ExecOutcome::Continue(1);
         }
     };
     let extra: Vec<String> = args[1..].to_vec();
