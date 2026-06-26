@@ -32,6 +32,9 @@ pub struct CliOptions {
     /// `-n`: read and parse commands without executing them (noexec / syntax
     /// check). Applied to `shell_options.noexec`; honored only non-interactively.
     pub noexec: bool,
+    /// `--posix` CLI flag — start in POSIX mode (also set later for invocation
+    /// as `sh` or with `POSIXLY_CORRECT`; see `startup_posix`).
+    pub posix: bool,
     pub mode: RunMode,
 }
 
@@ -41,6 +44,7 @@ impl Default for CliOptions {
             rcfile_path: None,
             norc: false,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         }
     }
@@ -50,6 +54,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
     let mut rcfile_path: Option<PathBuf> = None;
     let mut norc = false;
     let mut noexec = false;
+    let mut posix = false;
     let mut command: Option<String> = None;
     let mut i = 0;
 
@@ -62,6 +67,10 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
             }
             "-n" => {
                 noexec = true;
+                i += 1;
+            }
+            "--posix" => {
+                posix = true;
                 i += 1;
             }
             "--rcfile" => {
@@ -94,6 +103,7 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
                     rcfile_path: None,
                     norc: false,
                     noexec: false,
+                    posix: false,
                     mode: RunMode::PrintVersion,
                 });
             }
@@ -120,7 +130,18 @@ pub fn parse_cli(args: &[String]) -> Result<CliOptions, String> {
         RunMode::Interactive
     };
 
-    Ok(CliOptions { rcfile_path, norc, noexec, mode })
+    Ok(CliOptions { rcfile_path, norc, noexec, posix, mode })
+}
+
+/// POSIX mode is enabled at startup when `--posix` was passed, the shell was
+/// invoked as `sh` (argv[0] basename), or `POSIXLY_CORRECT` is in the
+/// environment. Mirrors bash's startup posix-mode triggers.
+pub fn startup_posix(cli_posix: bool, argv0: &str, posixly_correct: bool) -> bool {
+    cli_posix
+        || posixly_correct
+        || std::path::Path::new(argv0)
+            .file_name()
+            .is_some_and(|n| n == "sh")
 }
 
 fn default_rc_path(shell: &Shell) -> Option<std::path::PathBuf> {
@@ -583,6 +604,29 @@ mod rc_tests {
     }
 
     #[test]
+    fn parse_cli_posix_flag() {
+        let o = parse_cli(&["--posix".into(), "script.sh".into()]).unwrap();
+        assert!(o.posix);
+        assert_eq!(o.mode, RunMode::File { path: PathBuf::from("script.sh"), args: vec![] });
+    }
+
+    #[test]
+    fn parse_cli_posix_default_off() {
+        let o = parse_cli(&["script.sh".into()]).unwrap();
+        assert!(!o.posix);
+    }
+
+    #[test]
+    fn startup_posix_sources() {
+        assert!(startup_posix(true, "/usr/bin/huck", false), "--posix");
+        assert!(startup_posix(false, "/bin/sh", false), "invoked as sh");
+        assert!(startup_posix(false, "sh", false), "argv0 bare sh");
+        assert!(startup_posix(false, "/usr/bin/huck", true), "POSIXLY_CORRECT");
+        assert!(!startup_posix(false, "/usr/bin/huck", false), "none → off");
+        assert!(!startup_posix(false, "/usr/bin/bash", false), "bash basename → off");
+    }
+
+    #[test]
     fn parse_cli_rcfile_separate() {
         let opts = parse_cli(&[
             "--rcfile".to_string(),
@@ -716,6 +760,7 @@ mod rc_tests {
             rcfile_path: Some(p.clone()),
             norc: true,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -732,6 +777,7 @@ mod rc_tests {
             rcfile_path: Some(p.clone()),
             norc: false,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -748,6 +794,7 @@ mod rc_tests {
             rcfile_path: Some(p.clone()),
             norc: false,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), None);
@@ -768,6 +815,7 @@ mod rc_tests {
             )),
             norc: false,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(1));
@@ -782,6 +830,7 @@ mod rc_tests {
             rcfile_path: Some(p.clone()),
             norc: false,
             noexec: false,
+            posix: false,
             mode: RunMode::Interactive,
         };
         assert_eq!(maybe_source_rc_file(&mut shell, &opts), Some(42));
