@@ -463,6 +463,11 @@ pub struct Shell {
     /// `kind == FrameKind::Function`. Replaces the old `function_arg0: Vec<String>`.
     /// (`$0` is NOT taken from here — bash keeps `shell_argv0` inside functions.)
     pub call_stack: Vec<Frame>,
+    /// Stack of name-sets for the currently-active inline-assignment scopes in
+    /// `run_exec_single` (innermost last). A posix special-builtin persist
+    /// deletes its names from all enclosing scopes so the live value survives
+    /// their restores. Empty between top-level commands.
+    pub inline_scopes: Vec<std::collections::HashSet<String>>,
     /// Map of function-name → defining source file path. Populated when a
     /// function is defined. Used to fill `Frame.source` and ultimately
     /// `BASH_SOURCE`.
@@ -755,6 +760,7 @@ impl Shell {
             last_arg: shell_argv0.clone(),
             shell_argv0,
             call_stack: Vec::new(),
+            inline_scopes: Vec::new(),
             function_source: std::collections::HashMap::new(),
             pending_fatal_pe_error: None,
             is_interactive: std::io::stdin().is_terminal(),

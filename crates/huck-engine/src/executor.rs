@@ -4172,6 +4172,11 @@ fn run_exec_single(
         }
     };
 
+    // Section 3: track this command's snapshotted names on a shell-managed stack
+    // so a nested posix special-builtin persist can delete them from enclosing
+    // scopes. finalize_inline_scope (every exit path below) pops exactly this.
+    shell.inline_scopes.push(snap.iter().map(|(n, _)| n.clone()).collect());
+
     // xtrace (`set -x`): print the expanded command to stderr, prefixed by
     // `$PS4` (default `+ `), BEFORE dispatch so a hanging command is traced
     // first. Use the already-expanded `resolved.program`/`resolved.args` (do
@@ -4268,9 +4273,7 @@ fn run_exec_single(
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
     {
         { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
-        if !persistent {
-            restore_inline_assignments(snap, shell);
-        }
+        finalize_inline_scope(snap, persistent, shell);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -4335,18 +4338,14 @@ fn run_exec_single(
         match build_child_redir_plan(&cmd.redirects, shell, sink, err_sink) {
             Ok(plan) => run_subprocess(&resolved, plan, shell, sink, err_sink),
             Err(code) => {
-                if !persistent {
-                    restore_inline_assignments(snap, shell);
-                }
+                finalize_inline_scope(snap, persistent, shell);
                 drain_procsubs(shell, procsub_base);
                 return ExecOutcome::Continue(code);
             }
         }
     };
 
-    if !persistent {
-        restore_inline_assignments(snap, shell);
-    }
+    finalize_inline_scope(snap, persistent, shell);
     // Apply `$_` AFTER dispatch so a function/eval/source body's nested
     // commands don't leave a stale value (see `next_last_arg` above).
     shell.last_arg = next_last_arg;
@@ -6464,6 +6463,28 @@ fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
     }
 }
 
+/// Pops the top `inline_scopes` entry pushed by `run_exec_single` and finalizes
+/// this command's inline assignments. NON-persistent: restore LIFO, but skip any
+/// name a nested posix special-builtin persist deleted from this scope.
+/// PERSISTENT (posix special builtin / export / readonly): keep the live values
+/// and delete these names from every enclosing scope so their restores skip them.
+fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut Shell) {
+    let kept = shell.inline_scopes.pop().unwrap_or_default();
+    if persistent {
+        for (name, _) in &snap {
+            for scope in shell.inline_scopes.iter_mut() {
+                scope.remove(name);
+            }
+        }
+    } else {
+        for (name, prior) in snap.into_iter().rev() {
+            if kept.contains(&name) {
+                shell.restore_var(&name, prior);
+            }
+        }
+    }
+}
+
 /// Returns the static text of `word` iff it is a single unquoted `Literal`
 /// part (e.g. a statically-written `command`/`declare`/`-p`). Returns `None`
 /// for dynamic words (`$x`, quoted, multi-part). Mirrors
@@ -8205,6 +8226,41 @@ mod tests {
         let mut shell = Shell::new();
         exec_script("f(){ :; }\nv=5 f\n", &mut shell);
         assert_eq!(shell.get("v"), None);
+    }
+
+    #[test]
+    fn posix_special_persist_survives_enclosing_prefix() {
+        // func3.sub line 155: outer prefix restore must NOT clobber the inner
+        // posix special-builtin persist.
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\nvar=0\nf(){ var=20 return 5; }\nvar=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("var"), Some("20"));
+        assert!(shell.inline_scopes.is_empty(), "scope stack balanced");
+    }
+
+    #[test]
+    fn default_special_persist_does_not_survive_enclosing_prefix() {
+        let mut shell = Shell::new();
+        exec_script(
+            "var=0\nf(){ var=20 return 5; }\nvar=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("var"), Some("0"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
+    fn posix_special_persist_survives_multi_level_enclosing() {
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\na=0\nm(){ a=3 return; }\no(){ a=2 m; }\na=1 o\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("a"), Some("3"));
+        assert!(shell.inline_scopes.is_empty());
     }
 
     #[test]
