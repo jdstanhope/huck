@@ -3894,10 +3894,12 @@ fn run_assignment_list(
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: readonly variable"); }
+            shell.posix_fatal(127);
             st = 1;
             break;
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
+            shell.posix_fatal(127);
             st = 1;
             break;
         }
@@ -4176,6 +4178,9 @@ fn run_exec_single(
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
+            if builtins::is_special_builtin(&resolved.program) {
+                shell.posix_fatal(127);
+            }
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
@@ -8767,6 +8772,31 @@ mod tests {
     fn default_readonly_for_var_is_not_fatal() {
         let mut shell = Shell::new();
         exec_script("readonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn posix_assignment_no_command_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn posix_assignment_before_special_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2 export y\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn posix_assignment_before_regular_is_not_fatal() {
+        // before a REGULAR command → abort-continue (deferred), NOT a shell exit.
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn default_assignment_no_command_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script("readonly x=1\nx=2\n", &mut shell);
         assert_eq!(shell.pending_fatal_status, None);
     }
 
