@@ -13119,7 +13119,7 @@ pub(crate) fn parse_symbolic_umask(s: &str, cur: u32) -> Result<u32, SymErr> {
         }
         for sh in &shifts {
             match op {
-                '=' => { mask &= !(0o7 << sh); mask |= ((!perm & 0o7) << sh); }
+                '=' => { mask &= !(0o7 << sh); mask |= (!perm & 0o7) << sh; }
                 '+' => { mask &= !(perm << sh); }
                 '-' => { mask |= perm << sh; }
                 _ => unreachable!(),
