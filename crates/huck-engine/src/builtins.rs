@@ -47,6 +47,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "bind",
     "umask",
     "ulimit",
+    "times",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -79,7 +80,7 @@ pub fn is_declaration_command(name: &str) -> bool {
 pub fn is_special_builtin(name: &str) -> bool {
     matches!(name,
         ":" | "." | "break" | "continue" | "eval" | "exec" | "exit" | "export" | "readonly" | "return"
-        | "set" | "shift" | "source" | "trap" | "unset"
+        | "set" | "shift" | "source" | "times" | "trap" | "unset"
     )
 }
 
@@ -184,6 +185,7 @@ pub fn run_builtin(
         "bind" => builtin_bind(args, out, err, shell),
         "umask" => builtin_umask(args, out, err, shell),
         "ulimit" => builtin_ulimit(args, out, err, shell),
+        "times" => builtin_times(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -9745,7 +9747,7 @@ mod special_builtin_tests {
 
     #[test]
     fn is_special_builtin_recognises_posix_specials() {
-        for name in ["break", "continue", "exit", "export", "return", "unset"] {
+        for name in ["break", "continue", "exit", "export", "return", "unset", "times"] {
             assert!(is_special_builtin(name), "expected {name} to be special");
         }
     }
@@ -13419,6 +13421,22 @@ fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
         }
     }
     ExecOutcome::Continue(status)
+}
+
+fn builtin_times(_args: &[String], out: &mut dyn Write, _err: &mut dyn Write, _shell: &mut Shell) -> ExecOutcome {
+    let mut t: libc::tms = unsafe { std::mem::zeroed() };
+    unsafe { libc::times(&mut t); }
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = if hz > 0 { hz as f64 } else { 100.0 };
+    let fmt = |ticks: libc::clock_t| -> String {
+        let secs = ticks as f64 / hz;
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64) * 60.0;
+        format!("{m}m{s:.3}s")
+    };
+    let _ = writeln!(out, "{} {}", fmt(t.tms_utime), fmt(t.tms_stime));
+    let _ = writeln!(out, "{} {}", fmt(t.tms_cutime), fmt(t.tms_cstime));
+    ExecOutcome::Continue(0)
 }
 
 #[cfg(test)]
