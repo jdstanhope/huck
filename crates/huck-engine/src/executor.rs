@@ -4236,7 +4236,13 @@ fn run_exec_single(
     // POSIX special builtins persist their prefix assignments. User functions
     // and regular builtins/externals do NOT — they snapshot/restore (temporary
     // scope), matching bash in both default and posix mode.
-    let persistent = builtins::is_special_builtin(&resolved.program);
+    // `export`/`readonly` absorb their named variable in BOTH modes (bash
+    // assignment-builtin semantics). Every other special builtin persists its
+    // prefix only under `set -o posix`; default mode restores it (POSIX 2.14 is
+    // posix-mode-only in bash). `declare`/`typeset`/`local` are not special, so
+    // they already restore correctly.
+    let persistent = matches!(resolved.program.as_str(), "export" | "readonly")
+        || (builtins::is_special_builtin(&resolved.program) && shell.shell_options.posix);
 
     // `exec`: a special builtin that does NOT fork. With a command operand it
     // replaces the shell process image; with only redirections it applies them
@@ -8216,6 +8222,30 @@ mod tests {
         let _ = execute(&seq, &mut shell, "FOO=val export FOO");
         assert_eq!(shell.get("FOO"), Some("val"));
         assert!(shell.is_exported("FOO"));
+    }
+
+    #[test]
+    fn special_builtin_prefix_does_not_persist_in_default_mode() {
+        // `:` is a special builtin; in DEFAULT mode the prefix is temporary.
+        let mut shell = Shell::new();
+        exec_script("var=0\nvar=20 :\n", &mut shell);
+        assert_eq!(shell.get("var"), Some("0"), "default mode restores the prefix");
+    }
+
+    #[test]
+    fn special_builtin_prefix_persists_in_posix_mode() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nvar=0\nvar=20 :\n", &mut shell);
+        assert_eq!(shell.get("var"), Some("20"), "posix mode persists the prefix");
+    }
+
+    #[test]
+    fn export_prefix_persists_in_default_mode() {
+        // export/readonly absorb their named var even in default mode (regression
+        // guard alongside run_exec_single_special_builtin_inline_assignment_persists).
+        let mut shell = Shell::new();
+        exec_script("FOO=val export FOO\n", &mut shell);
+        assert_eq!(shell.get("FOO"), Some("val"), "export keeps its named var");
     }
 
     /// Canonical "fork_and_run_in_subshell works" test.
