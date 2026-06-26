@@ -46,6 +46,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "complete", "compgen", "compopt",
     "bind",
     "umask",
+    "ulimit",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -174,6 +175,7 @@ pub fn run_builtin(
         }
         "bind" => builtin_bind(args, out, err, shell),
         "umask" => builtin_umask(args, out, err, shell),
+        "ulimit" => builtin_ulimit(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -13235,6 +13237,181 @@ mod umask_tests {
         assert!(matches!(super::parse_symbolic_umask("g=u", 0), Err(super::SymErr::Char('u'))));
         assert!(matches!(super::parse_symbolic_umask("u:rwx", 0), Err(super::SymErr::Operator(':'))));
         assert!(matches!(super::parse_symbolic_umask("u=rwx:g=rwx", 0), Err(super::SymErr::Char(':'))));
+    }
+}
+
+// ─── ulimit ──────────────────────────────────────────────────────────────────
+
+struct UlimitRes {
+    letter: char,
+    resource: libc::__rlimit_resource_t,
+    mult: u64,           // value units per limit byte/raw; 1 = unscaled
+    label: &'static str, // for `-a`
+}
+
+const ULIMIT_TABLE: &[UlimitRes] = &[
+    UlimitRes { letter: 'c', resource: libc::RLIMIT_CORE,        mult: 1024, label: "core file size          (blocks, -c)" },
+    UlimitRes { letter: 'd', resource: libc::RLIMIT_DATA,        mult: 1024, label: "data seg size           (kbytes, -d)" },
+    UlimitRes { letter: 'e', resource: libc::RLIMIT_NICE,        mult: 1,    label: "scheduling priority             (-e)" },
+    UlimitRes { letter: 'f', resource: libc::RLIMIT_FSIZE,       mult: 1024, label: "file size               (blocks, -f)" },
+    UlimitRes { letter: 'i', resource: libc::RLIMIT_SIGPENDING,  mult: 1,    label: "pending signals                 (-i)" },
+    UlimitRes { letter: 'l', resource: libc::RLIMIT_MEMLOCK,     mult: 1024, label: "max locked memory       (kbytes, -l)" },
+    UlimitRes { letter: 'm', resource: libc::RLIMIT_RSS,         mult: 1024, label: "max memory size         (kbytes, -m)" },
+    UlimitRes { letter: 'n', resource: libc::RLIMIT_NOFILE,      mult: 1,    label: "open files                      (-n)" },
+    UlimitRes { letter: 'q', resource: libc::RLIMIT_MSGQUEUE,    mult: 1024, label: "POSIX message queues     (bytes, -q)" },
+    UlimitRes { letter: 'r', resource: libc::RLIMIT_RTPRIO,      mult: 1,    label: "real-time priority              (-r)" },
+    UlimitRes { letter: 's', resource: libc::RLIMIT_STACK,       mult: 1024, label: "stack size              (kbytes, -s)" },
+    UlimitRes { letter: 't', resource: libc::RLIMIT_CPU,         mult: 1,    label: "cpu time               (seconds, -t)" },
+    UlimitRes { letter: 'u', resource: libc::RLIMIT_NPROC,       mult: 1,    label: "max user processes              (-u)" },
+    UlimitRes { letter: 'v', resource: libc::RLIMIT_AS,          mult: 1024, label: "virtual memory          (kbytes, -v)" },
+    UlimitRes { letter: 'x', resource: libc::RLIMIT_LOCKS,       mult: 1,    label: "file locks                      (-x)" },
+];
+
+fn ulimit_lookup(letter: char) -> Option<&'static UlimitRes> {
+    ULIMIT_TABLE.iter().find(|r| r.letter == letter)
+}
+
+fn ulimit_get(res: &UlimitRes, hard: bool) -> Option<u64> {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(res.resource, &mut rl) } != 0 { return None; }
+    let v = if hard { rl.rlim_max } else { rl.rlim_cur };
+    if v == libc::RLIM_INFINITY { return Some(u64::MAX); } // sentinel for "unlimited"
+    Some((v as u64) / res.mult)
+}
+
+/// Returns Err(io::Error) if setrlimit fails.
+fn ulimit_set(res: &UlimitRes, raw: u64, set_soft: bool, set_hard: bool) -> std::io::Result<()> {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(res.resource, &mut rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let scaled: libc::rlim_t = if raw == u64::MAX {
+        libc::RLIM_INFINITY
+    } else {
+        raw.saturating_mul(res.mult) as libc::rlim_t
+    };
+    if set_soft { rl.rlim_cur = scaled; }
+    if set_hard { rl.rlim_max = scaled; }
+    if unsafe { libc::setrlimit(res.resource, &rl) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    const USAGE: &str = "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]";
+    let mut want_soft = false;
+    let mut want_hard = false;
+    let mut show_all = false;
+    let mut letters: Vec<char> = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'S' => want_soft = true,
+                    'H' => want_hard = true,
+                    'a' => show_all = true,
+                    'p' => letters.push('p'),
+                    other if ulimit_lookup(other).is_some() => letters.push(other),
+                    other => {
+                        let prefix = shell.error_prefix(Some("ulimit"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "{USAGE}");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    let value_arg: Option<&String> = args.get(idx);
+
+    if show_all {
+        let hard = want_hard && !want_soft;
+        for res in ULIMIT_TABLE {
+            let v = ulimit_get(res, hard);
+            let disp = match v {
+                Some(u64::MAX) => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+                None => "?".to_string(),
+            };
+            let _ = writeln!(out, "{} {}", res.label, disp);
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    if letters.is_empty() { letters.push('f'); } // bash default resource
+
+    // `-p` pipe pseudo-resource: bash reports 8 (512-byte blocks), set is a no-op.
+    let do_hard = want_hard;
+    let do_soft = want_soft || !want_hard; // query: soft by default; set: both unless one chosen
+    let mut status = 0;
+
+    if let Some(val) = value_arg {
+        // SET
+        let set_soft = want_soft || (!want_soft && !want_hard);
+        let set_hard = want_hard || (!want_soft && !want_hard);
+        for &lt in &letters {
+            if lt == 'p' { continue; } // no-op success
+            let res = ulimit_lookup(lt).unwrap();
+            let raw = match val.as_str() {
+                "unlimited" => u64::MAX,
+                s => match s.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let prefix = shell.error_prefix(Some("ulimit"));
+                        e!(err, "{prefix}{val}: invalid number");
+                        return ExecOutcome::Continue(1);
+                    }
+                },
+            };
+            if let Err(e) = ulimit_set(res, raw, set_soft, set_hard) {
+                let prefix = shell.error_prefix(Some("ulimit"));
+                e!(err, "{prefix}{val}: cannot modify limit: {}", crate::bash_io_error(&e));
+                status = 1;
+            }
+        }
+    } else {
+        // QUERY
+        let hard = do_hard && !do_soft;
+        let single = letters.len() == 1;
+        for &lt in &letters {
+            if lt == 'p' {
+                if single {
+                    let _ = writeln!(out, "8");
+                } else {
+                    let _ = writeln!(out, "pipe size            (512 bytes, -p) 8");
+                }
+                continue;
+            }
+            let res = ulimit_lookup(lt).unwrap();
+            let disp = match ulimit_get(res, hard) {
+                Some(u64::MAX) => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+                None => { status = 1; continue; }
+            };
+            if single {
+                let _ = writeln!(out, "{disp}");
+            } else {
+                let _ = writeln!(out, "{} {}", res.label, disp);
+            }
+        }
+    }
+    ExecOutcome::Continue(status)
+}
+
+#[cfg(test)]
+mod ulimit_tests {
+    #[test]
+    fn ulimit_table_lookup_and_scale() {
+        let c = super::ulimit_lookup('c').unwrap();
+        assert_eq!(c.mult, 1024);
+        let n = super::ulimit_lookup('n').unwrap();
+        assert_eq!(n.mult, 1);
+        assert!(super::ulimit_lookup('Z').is_none());
     }
 }
 
