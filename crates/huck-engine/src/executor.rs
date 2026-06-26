@@ -3893,7 +3893,8 @@ fn run_assignment_list(
         // For namerefs, skip the early readonly check and let assign() check the
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: readonly variable"); }
+            let prefix = shell.error_prefix(None);
+            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{name}: readonly variable"); }
             shell.posix_fatal(127);
             st = 1;
             break;

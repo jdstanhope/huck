@@ -4894,16 +4894,32 @@ fn optstring_takes_arg(optstring: &str, c: char) -> bool {
 /// writes OPTIND/OPTARG/OPTERR + the matched-letter `name`, holding the
 /// within-word cursor in Shell. Delegates the state machine to `getopts_step`.
 fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    const USAGE: &str = "getopts: usage: getopts optstring name [arg ...]";
+
+    // getopts accepts no options of its own. A leading operand starting with
+    // '-' (other than "-" or "--") is an invalid option, reported with the
+    // builtin-error prologue plus a usage line (bash: internal_getopt("")).
+    // A leading "--" is consumed as the option terminator.
+    let mut args = args;
+    if let Some(first) = args.first() {
+        if first.starts_with('-') && first != "-" && first != "--" {
+            let c = first.chars().nth(1).unwrap();
+            e!(err, "{}-{c}: invalid option", shell.error_prefix(Some("getopts")));
+            e!(err, "{USAGE}");
+            return ExecOutcome::Continue(2);
+        }
+        if first == "--" {
+            args = &args[1..];
+        }
+    }
+
     if args.len() < 2 {
-        e!(err, "huck: getopts: usage: getopts optstring name [arg]");
+        e!(err, "{USAGE}");
         return ExecOutcome::Continue(2);
     }
     let optstring = args[0].clone();
     let name = args[1].clone();
-    if !is_valid_name(&name) {
-        e!(err, "huck: getopts: `{name}': not a valid identifier");
-        return ExecOutcome::Continue(2);
-    }
+
     // Parse explicit args if given, else the current positional parameters.
     let parse_args: Vec<String> = if args.len() > 2 {
         args[2..].to_vec()
@@ -4921,22 +4937,41 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
 
     let step = getopts_step(&optstring, &parse_args, optind, sp);
 
-    // Write back OPTIND + cursor cache.
+    // Bind OPTIND + cursor cache UNCONDITIONALLY, before the name/OPTARG
+    // checks — bash's dogetopts binds OPTIND from the post-parse value
+    // regardless of whether the name is a valid identifier, so an invalid
+    // name (or readonly OPTARG) still advances OPTIND.
     shell.set("OPTIND", step.optind.to_string());
     shell.getopts_optind_cache = step.optind;
     shell.getopts_sp = step.sp;
-    // Assign the matched letter (or '?' / ':').
-    let _ = shell.try_set(&name, step.name.clone());
-    // OPTARG: set or unset.
+
+    // OPTARG is bound before the name check (bash binds OPTARG in dogetopts
+    // before getopts_bind_variable runs the identifier check). A readonly
+    // OPTARG prints the prologue-prefixed readonly error (Task 1).
     match step.optarg {
         Some(v) => { let _ = shell.try_set("OPTARG", v); }
         None => shell.unset("OPTARG"),
     }
-    // Verbose error message (suppressed by OPTERR=0).
+
+    // Validate the name AFTER OPTIND/OPTARG are bound. Invalid identifier is a
+    // hard error (bash EXECUTION_FAILURE = 1) with the full builtin prologue.
+    // This returns before the $0-prefixed option-diagnostic block below, so an
+    // invalid optstring option AND an invalid name var together print only the
+    // identifier error (bash prints both — an untested edge, accepted by spec).
+    if !is_valid_name(&name) {
+        e!(err, "{}`{name}': not a valid identifier", shell.error_prefix(Some("getopts")));
+        return ExecOutcome::Continue(1);
+    }
+
+    // Assign the matched letter (or '?' / ':').
+    let _ = shell.try_set(&name, step.name.clone());
+
+    // Verbose getopts-internal option diagnostic (suppressed by OPTERR=0),
+    // prefixed with $0 (bash sets argv[0] = dollar_vars[0] for sh_getopt).
     if let Some(body) = step.error
         && shell.lookup_var("OPTERR").as_deref() != Some("0")
     {
-        e!(err, "huck: {body}");
+        e!(err, "{}: {body}", shell.shell_argv0);
     }
     ExecOutcome::Continue(if step.done { 1 } else { 0 })
 }
