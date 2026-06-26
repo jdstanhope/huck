@@ -37,41 +37,52 @@ umask/ulimit/enable, `set -o` gaps), so **no category flips**. The value is the
 breadth (a recurring, correct-to-fix divergence) and the unblocking, consistent
 with the "valuable across multiple issues" half of the project's bar.
 
-## The two emission sites
+## The emission site
 
-Both in `crates/huck-engine/src/executor.rs`:
+In `crates/huck-engine/src/executor.rs`:
 
-1. **Site 5327** — the spawn-`NotFound` branch (the normal path a bare missing
-   command takes):
-   ```rust
-   { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: command not found: {}", cmd.program); }
-   ExecOutcome::Continue(127)
-   ```
-2. **Site 3443** — `resolve`, reached when the command word expands to nothing
-   (`prog_fields.is_empty()`), e.g. a quoted-empty `''` command:
-   ```rust
-   e!(err, "huck: command not found:");
-   return Err(127);
-   ```
+**Site 5327** (in `run_subprocess`, `cmd: &ResolvedCommand`, `shell: &mut Shell`
+in scope) — the spawn-`NotFound` branch, the path EVERY missing command takes
+once it resolves to an external program and the spawn fails. This is the ONLY
+site this iteration converts.
+```rust
+{ let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: command not found: {}", cmd.program); }
+ExecOutcome::Continue(127)
+```
+This fires for a normal missing command (`nosuch`) AND for a quoted-empty `''`
+command — `''` expands to one empty FIELD, so `cmd.program` is `""` and the spawn
+of `""` fails `NotFound`, landing here with an empty program name.
+
+**Site 3443 is NOT converted** (measurement correction — see below). It is the
+`resolve` branch reached when the command word expands to ZERO fields
+(`prog_fields.is_empty()`), e.g. unquoted `$empty`. bash never emits
+`: command not found` from a zero-field word — it either no-ops (rc 0) or
+promotes a surviving field — so converting its message would be wrong. It is left
+as-is and folded into the deferred empty-command-word divergence (non-goals).
 
 ## Fix design
 
-Route both messages through `error_prefix(None)` and put the name before the
-phrase. `error_prefix(None)` yields `<BASH_SOURCE[0] or $0>: line N: `
+Route the site-5327 message through `error_prefix(None)` and put the name before
+the phrase. `error_prefix(None)` yields `<BASH_SOURCE[0] or $0>: line N: `
 non-interactively and `huck: ` interactively (it handles the mode split).
 
-- **Site 5327** → `{error_prefix(None)}{program}: command not found`, e.g.
-  `./s.sh: line 1: foo: command not found` (file mode). Keep `ExecOutcome::Continue(127)`.
-  Note the `err_writer`/`with_err` borrow shape: compute the prefix from `shell`
-  BEFORE acquiring the `err` writer (mirroring v227's `assign()` fix), so the
-  `&shell` borrow ends first.
-- **Site 3443** → `{error_prefix(None)}: command not found` (empty name), e.g.
-  `./s.sh: line 1: : command not found`. Keep `return Err(127)`. `error_prefix`
-  borrows `&self` (`shell`) and `err` is a separate `&mut dyn Write` parameter,
-  so compute the prefix into a local first.
+Site 5327 → `{error_prefix(None)}{program}: command not found`. Compute the
+prefix from `shell` BEFORE acquiring the `err` writer (the `err_writer` borrow
+shape; mirrors v227's `assign()` fix) so the `&shell` borrow ends first:
+```rust
+{
+    let prefix = shell.error_prefix(None);
+    let mut err = err_writer(err_sink, sink);
+    e!(&mut *err, "{prefix}{}: command not found", cmd.program);
+}
+ExecOutcome::Continue(127)
+```
 
-Resulting parity:
-- file mode: byte-identical to bash (the bash-test categories run in file mode).
+Resulting parity (site 5327):
+- normal missing command, file mode: `./s.sh: line 1: foo: command not found`
+  — byte-identical to bash (the bash-test categories run in file mode).
+- quoted-empty `''`, file mode: `./s.sh: line 1: : command not found` (empty
+  program) — byte-identical to bash.
 - `-c` / interactive: word order matches; the prologue NAME differs (`huck`/argv0
   vs `bash`) — the universal argv0 divergence, unchanged and out of scope.
 
@@ -79,14 +90,18 @@ Exit code (127) is already correct and unchanged.
 
 ## Non-goals
 
-- **Field-promotion bug** (deferred, recorded as a new divergence): when the
-  command word expands to nothing but later fields survive (`$empty arg`), bash
-  promotes the first surviving field as the command name
-  (`./s.sh: line N: arg: command not found`); huck instead reaches site 3443 and
-  reports an empty name. This is an expansion/field-handling bug, not a
-  message-format issue, and the bash-test categories exercise the normal
-  not-found path (site 5327), not this. Site 3443's format fix still makes the
-  truly-empty `''` case bash-correct.
+- **Empty-command-word divergence** (deferred, recorded as a new divergence —
+  generalizes the field-promotion bug): when a command word expands to ZERO
+  fields (site 3443), huck always errors `huck: command not found:` rc 127, but
+  bash's behavior depends on what remains: `$empty` alone → no-op rc 0 (no
+  command); `$empty >redir` → redirection-only, rc 0; `$empty arg` → promotes
+  `arg` as the command (`./s.sh: line N: arg: command not found`). None of these
+  is a `: command not found` from a zero-field word, so site 3443's message is
+  never bash-correct and is left untouched here. This is an expansion/field +
+  empty-simple-command-semantics bug, distinct from message word order, and the
+  bash-test categories exercise the normal external-not-found path (site 5327),
+  not this. (The quoted-empty `''` REAL-field case is handled — it goes through
+  site 5327, not 3443.)
 - **Builtin-specific `not found` messages** (`declare`/`type`/`hash`/`alias`/
   `unalias`/`command`/`.`): these are `huck: <builtin>: <name>: not found` with
   the builtin name and a different body; they are separate per-builtin prologue
@@ -105,7 +120,8 @@ the prologue path matches, assert byte-identical stdout+stderr+rc):
   prologue's `line N:` tracks position).
 - a missing command whose error is the second statement on a line / mid-script,
   confirming the word order and 127.
-- truly-empty command (`''`) → `<path>: line N: : command not found`, rc 127.
+- quoted-empty `''` command (a real empty field → site 5327, empty program) →
+  `<path>: line N: : command not found`, rc 127.
 
 **Regression:** the existing `command_bare_form_diff_check.sh` and
 `assign_redirect_diff_check.sh` mention the not-found message but deliberately do
@@ -123,5 +139,5 @@ out of each diff and no category may regress (FAIL→TIMEOUT/ERROR).
   that substring-checks `command not found` regresses on word order alone —
   but the word order DOES change, so any test asserting the exact old string
   `command not found: NAME` would need updating; the workspace sweep catches it.
-- Borrow shape at both sites: compute the `error_prefix(None)` prefix into a
+- Borrow shape at site 5327: compute the `error_prefix(None)` prefix into a
   local before taking the `err` writer (same pattern v227 used in `assign()`).
