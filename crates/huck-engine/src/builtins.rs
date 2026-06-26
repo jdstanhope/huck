@@ -45,6 +45,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "help",
     "complete", "compgen", "compopt",
     "bind",
+    "umask",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -172,6 +173,7 @@ pub fn run_builtin(
             builtin_return(args, shell)
         }
         "bind" => builtin_bind(args, out, err, shell),
+        "umask" => builtin_umask(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -13066,6 +13068,173 @@ mod getopts_step_tests {
         assert_eq!(s.name, ":");
         assert_eq!(s.optarg.as_deref(), Some("b"));
         assert!(s.error.is_none());
+    }
+}
+
+// ── umask ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SymErr { Char(char), Operator(char) }
+
+/// Parse an octal umask literal (digits 0-7 only). Err on any non-octal digit.
+pub(crate) fn parse_octal_umask(s: &str) -> Result<u32, ()> {
+    let mut val: u32 = 0;
+    for ch in s.chars() {
+        let d = ch.to_digit(8).ok_or(())?; // rejects 8,9 and non-digits
+        val = val.checked_mul(8).and_then(|v| v.checked_add(d)).ok_or(())?;
+    }
+    if s.is_empty() { return Err(()); }
+    Ok(val & 0o777)
+}
+
+/// Parse a symbolic umask string against the current mask. mask bit set = deny.
+pub(crate) fn parse_symbolic_umask(s: &str, cur: u32) -> Result<u32, SymErr> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut mask = cur & 0o777;
+    loop {
+        // who
+        let mut shifts: Vec<u32> = Vec::new();
+        while i < chars.len() && matches!(chars[i], 'u' | 'g' | 'o' | 'a') {
+            match chars[i] {
+                'u' => shifts.push(6),
+                'g' => shifts.push(3),
+                'o' => shifts.push(0),
+                'a' => { shifts.extend([6, 3, 0]); }
+                _ => unreachable!(),
+            }
+            i += 1;
+        }
+        if shifts.is_empty() { shifts = vec![6, 3, 0]; }
+        // operator
+        if i >= chars.len() { return Err(SymErr::Operator('\0')); }
+        let op = chars[i];
+        if !matches!(op, '=' | '+' | '-') { return Err(SymErr::Operator(op)); }
+        i += 1;
+        // perms
+        let mut perm: u32 = 0;
+        while i < chars.len() && matches!(chars[i], 'r' | 'w' | 'x') {
+            perm |= match chars[i] { 'r' => 4, 'w' => 2, 'x' => 1, _ => 0 };
+            i += 1;
+        }
+        for sh in &shifts {
+            match op {
+                '=' => { mask &= !(0o7 << sh); mask |= ((!perm & 0o7) << sh); }
+                '+' => { mask &= !(perm << sh); }
+                '-' => { mask |= perm << sh; }
+                _ => unreachable!(),
+            }
+        }
+        // clause boundary
+        if i >= chars.len() { break; }
+        if chars[i] == ',' { i += 1; continue; }
+        return Err(SymErr::Char(chars[i]));
+    }
+    Ok(mask & 0o777)
+}
+
+/// Symbolic rendering of the ALLOWED perms (complement of mask) as `u=rwx,g=rx,o=rx`.
+pub(crate) fn format_symbolic_umask(mask: u32) -> String {
+    let mut parts = Vec::new();
+    for (cls, sh) in [('u', 6u32), ('g', 3), ('o', 0)] {
+        let allowed = (!mask >> sh) & 0o7;
+        let mut p = String::new();
+        if allowed & 4 != 0 { p.push('r'); }
+        if allowed & 2 != 0 { p.push('w'); }
+        if allowed & 1 != 0 { p.push('x'); }
+        parts.push(format!("{cls}={p}"));
+    }
+    parts.join(",")
+}
+
+fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    let mut symbolic = false;
+    let mut posix = false;
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'S' => symbolic = true,
+                    'p' => posix = true,
+                    other => {
+                        let prefix = shell.error_prefix(Some("umask"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "umask: usage: umask [-p] [-S] [mode]");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    // read current mask without disturbing it
+    let cur = (unsafe { let m = libc::umask(0); libc::umask(m); m } as u32) & 0o777;
+
+    if idx < args.len() {
+        let mode = &args[idx];
+        let first_digit = mode.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let new_mask = if first_digit {
+            match parse_octal_umask(mode) {
+                Ok(m) => m,
+                Err(()) => {
+                    let prefix = shell.error_prefix(Some("umask"));
+                    e!(err, "{prefix}{mode}: octal number out of range");
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        } else {
+            match parse_symbolic_umask(mode, cur) {
+                Ok(m) => m,
+                Err(se) => {
+                    let prefix = shell.error_prefix(Some("umask"));
+                    match se {
+                        SymErr::Char(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode character"),
+                        SymErr::Operator(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode operator"),
+                    }
+                    return ExecOutcome::Continue(1);
+                }
+            }
+        };
+        unsafe { libc::umask(new_mask as libc::mode_t); }
+        // bash prints the symbolic mask when -S is given alongside a mode arg
+        if symbolic {
+            let body = format_symbolic_umask(new_mask);
+            let _ = writeln!(out, "{body}");
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let body = if symbolic { format_symbolic_umask(cur) } else { format!("{cur:04o}") };
+    let line = match (posix, symbolic) {
+        (true, true) => format!("umask -S {body}"),
+        (true, false) => format!("umask {body}"),
+        (false, _) => body,
+    };
+    let _ = writeln!(out, "{line}");
+    ExecOutcome::Continue(0)
+}
+
+#[cfg(test)]
+mod umask_tests {
+    #[test]
+    fn umask_octal_rejects_nonoctal() {
+        assert!(super::parse_octal_umask("09").is_err());
+        assert_eq!(super::parse_octal_umask("022").unwrap(), 0o22);
+    }
+    #[test]
+    fn umask_symbolic_roundtrip() {
+        assert_eq!(super::format_symbolic_umask(0o022), "u=rwx,g=rx,o=rx");
+        // set o to deny write from a clear mask
+        assert_eq!(super::parse_symbolic_umask("u=rwx,g=rwx,o=rx", 0).unwrap(), 0o002);
+    }
+    #[test]
+    fn umask_symbolic_errors() {
+        assert!(matches!(super::parse_symbolic_umask("g=u", 0), Err(super::SymErr::Char('u'))));
+        assert!(matches!(super::parse_symbolic_umask("u:rwx", 0), Err(super::SymErr::Operator(':'))));
+        assert!(matches!(super::parse_symbolic_umask("u=rwx:g=rwx", 0), Err(super::SymErr::Char(':'))));
     }
 }
 
