@@ -179,13 +179,20 @@ diff harness.
 ### Section 4 — testing & verification
 
 - **Diff harness** `tests/scripts/posix_exit_on_error_diff_check.sh` (runner-
-  style, byte-identical to bash 5.2.21): each of the seven triggers run twice —
-  under `set -o posix` (exits with bash's status, no trailing `echo AFTER`) and
-  in default mode (continues, prints `AFTER`). Plus an EXIT-trap-fires fragment, a
-  subshell-isolation fragment (`( trigger ); echo AFTER`), and — for case #1 — the
-  boundary cases that MUST still continue: `shift 99` (runtime error), `eval
-  false`, a legitimate `f(){ return 2; }; f`, and the `command`/`builtin`-wrapped
-  forms (`command set -o bad`, `builtin set -o bad`, `command export AA[4]=1`).
+  style). **It compares STDOUT + exit code only, NOT stderr** — huck's error
+  messages carry the `huck:` prologue (and some differ in wording) vs bash's
+  `bash: line N: …`; that prologue/wording gap is a separate, deferred broad fix,
+  and the Cluster A behavior under test (exit vs continue) is fully observable as
+  "did `echo AFTER` reach stdout" + the exit status. So each fragment ends in
+  `echo AFTER`, and the harness asserts huck's `(stdout, exit-code)` equals bash's
+  for that fragment (stderr discarded). Each of the seven triggers runs twice —
+  under `set -o posix` (no `AFTER`, bash's exit status) and in default mode
+  (`AFTER` printed, exit status matches bash). Plus an EXIT-trap-fires fragment
+  (the trap's `echo` reaches stdout before exit), a subshell-isolation fragment
+  (`( trigger ); echo AFTER` → `AFTER` prints), and — for case #1 — the boundary
+  cases that MUST still continue: `shift 99` (runtime error), `eval false`, a
+  legitimate `f(){ return 2; }; f`, and the `command`/`builtin`-wrapped forms
+  (`command set -o bad`, `builtin set -o bad`, `command export AA[4]=1`).
 - **Unit tests** (`shell_state.rs` / `executor.rs`): `posix_fatal` sets the flag
   only when `posix && !interactive` (four-quadrant); a couple of triggers drain
   to the right status via the `exec_script` harness with `set -o posix`.
