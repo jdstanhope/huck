@@ -4955,6 +4955,9 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
 
     // Validate the name AFTER OPTIND/OPTARG are bound. Invalid identifier is a
     // hard error (bash EXECUTION_FAILURE = 1) with the full builtin prologue.
+    // This returns before the $0-prefixed option-diagnostic block below, so an
+    // invalid optstring option AND an invalid name var together print only the
+    // identifier error (bash prints both — an untested edge, accepted by spec).
     if !is_valid_name(&name) {
         e!(err, "{}`{name}': not a valid identifier", shell.error_prefix(Some("getopts")));
         return ExecOutcome::Continue(1);
