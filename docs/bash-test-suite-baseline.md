@@ -2,13 +2,13 @@
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
 huck commit: 670581b (v220 task 1: declare -p ANSI-C value quoting for control chars).
-Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers provisioned; v219 targeted re-run of cprint+herestr after the WordPart::Quoted quote-provenance fix — cprint flips to PASS; v220 targeted re-run of herestr after the declare -p ANSI-C control-char value-quoting fix — herestr flips to PASS; all other categories carried over from the v218 full sweep).
+Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers provisioned; v219 targeted re-run of cprint+herestr after the WordPart::Quoted quote-provenance fix — cprint flips to PASS; v220 targeted re-run of herestr after the declare -p ANSI-C control-char value-quoting fix — herestr flips to PASS; v225 targeted re-run of func after the posix-gated special-builtin persistence fix — func flips to PASS; all other categories carried over from the v218 full sweep).
 
 ## Summary
 
 - Categories run: 82
-- PASS: 8
-- FAIL: 69
+- PASS: 9
+- FAIL: 68
 - TIMEOUT: 5
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
@@ -48,7 +48,7 @@ Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers pr
 | extglob | FAIL | A subset of extglob patterns involving backslash-escaped metacharacters inside extglob brackets diverge from bash (e.g., some `!([*)*`-class patterns are not correctly rejected). A temp-directory permission or working-directory issue also causes certain filesystem-based extglob tests to produce wrong results. Core extglob matching is mostly correct; edge cases remain. |
 | extglob2 | PASS | |
 | extglob3 | PASS | |
-| func | FAIL | The `declare -f` trailing-space format divergence is resolved by v218. Remaining divergences: (1) a brace group carrying a redirect (`{ …; } 1>&2`) inside a function body is reconstructed without the enclosing `{ }` wrapper — the redirect moves to the outer function close brace; (2) `function name ()` defined with the `function` keyword reconstructs as `function name ()` in huck while bash always drops the keyword to `name ()`; (3) `FUNCNAME` array reports as empty at top level where bash counts nested calls; (4) `FUNCNEST` default recursion limit is 100 in huck vs 200 in bash. |
+| func | PASS | All blockers cleared across v221–v225: v221 prefix-assignment leak; v222 redirected-brace-body + nested-`function`-keyword reconstruction; v223 `declare -xF` export filter/format + FUNCNAME write protection; v224 FUNCNEST enforcement + recursion backstop (func4.sub byte-identical); v225 posix-gated special-builtin prefix-assignment persistence + the inline_scopes enclosing-restore-survival fix (func3.sub line 155). 0-diff PASS (verified via the runner 2026-06-26). |
 | getopts | FAIL | Usage-message format divergence — huck omits the trailing ellipsis from the optional-argument notation and uses its own name as message prefix. Pre-existing L-26 class divergence. |
 | glob-test | FAIL | A missing locale warning appears in huck's output but not bash's (locale check position differs). Multibyte character handling diverges: a Unicode character is rendered differently (huck produces different byte sequences vs bash). Globbing correctness diverges for some patterns — cases that should fail to match succeed in huck, and vice versa. Backslash-escaped glob metacharacters passed as arguments are handled differently. Glob results omit the `./` prefix that bash includes when the pattern starts with `./`. L-04/L-11 (character vs byte in multibyte globbing) class divergence remains. |
 | globstar | FAIL | Test environment mismatch — `globstar.tests` expects to run from the bash build directory (where compiled object files are present to glob over); huck runs it from the tests directory, where those files do not exist. Also M-53 (bare `**` globstar matches directories only, not files). |
