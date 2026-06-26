@@ -322,15 +322,6 @@ than silently producing invalid UTF-8.
 - **Why intentional**: both are negligible and only affect the already-divergent-from-bash verbose / error edges; unit boundaries are intentionally `&&`/`||`/`;`-on-a-line / top-level-newline so the one-command-at-a-time linear reader (M-99) stays O(n). Normal execution output is identical.
 - **Workaround**: none needed; put `set -v` / `set +v` on its own line (no trailing `;`/`&`) for an exact bash-matching echo boundary.
 
-### L-26: `getopts` verbose error messages use huck's program-name prefix
-
-- **Status**: `[intentional]`, low (noted v111)
-- **Severity**: low
-- **huck**: `getopts` verbose error messages match bash's body (`illegal option -- c` / `option requires an argument -- c`) but use huck's `huck:` prefix instead of bash's `$0`/script-name prefix — stderr text only. The `name`/`OPTARG`/`OPTIND`/rc are byte-identical to bash.
-- **bash**: prefixes the same message body with `$0` (or the script name).
-- **Why intentional**: the same program-name-prefix class as L-13/L-15/L-16 (`huck:` vs `bash:`); rc and the `name`/`OPTARG`/`OPTIND` outputs that scripts key off match bash exactly.
-- **Workaround**: none needed for rc/variable-driven scripts; use the silent error mode (leading `:` in the optstring) to suppress the message entirely.
-
 ### L-56: Remaining arithmetic behavioral divergences (post-v216)
 
 - **Status**: `[deferred]`
@@ -354,7 +345,15 @@ v216 aligned arith error-message FORMAT with bash (`Shell::error_prefix` prologu
 
 (h) **Malformed second-`#` base-N number error kind** — `2#110#11` (a valid-prefix base-N literal with a spurious second `#`) maps to `invalid integer constant` in huck vs bash's `invalid number`; the fatal outcome is the same and only the wording differs. Low.
 
-Note: `Shell::error_prefix(cmd: Option<&str>) -> String` (v216) is the bash-compatible error-prologue foundation (`<name>: [line N: ][cmd: ]`). Arith is the first emission site converted; shell-wide adoption (builtins, parser, command-not-found, and the ~400 remaining `huck:`-prefixed error sites) is staged across future iterations.
+Note: `Shell::error_prefix(cmd: Option<&str>) -> String` (v216) is the bash-compatible error-prologue foundation (`<name>: [line N: ][cmd: ]`). Converted so far: arith (v216, first site); the **getopts** error sites and the **generic readonly-assignment error** (v227 — `assign()` + the `run_assignment_list` early check, which together flipped the `getopts` bash-test category). The remaining ~400 `huck:`-prefixed sites (other builtins' usage/readonly errors, parser, command-not-found, redirections) are still staged across future iterations. **v227 measured all 11 prologue-touched categories first and confirmed the prologue flips ZERO categories alone — each has independent residual blockers (command-not-found word order, Rust `io::Error` text leakage, unimplemented builtins, `set -o` gaps).** So the prologue is converted per-category, where it is a category's LAST blocker (getopts was the smallest such residual), not in one shell-wide sweep.
+
+### L-66: getopts prints only the identifier error when both the option and the name are invalid
+
+- **Status**: `[deferred]`, low (v227)
+- **Severity**: low
+- **huck**: when a single `getopts` call hits BOTH an invalid optstring option (non-silent mode) AND an invalid name-variable identifier, huck prints only the `` getopts: `name': not a valid identifier `` error — the invalid-name check returns before the `$0`-prefixed option diagnostic is emitted.
+- **bash**: prints both the option diagnostic and the identifier error.
+- **Why deferred**: not exercised by any bash-test category (the `getopts` category's invalid-name case uses a SILENT optstring, so there is no option diagnostic to suppress); emitting both would require reordering the diagnostic ahead of the name check. The code comment at the early return documents the choice. Independent of the v227 getopts flip.
 
 - **L-57: `herestr` harness-masked empty-command-name runtime bug** — `[deferred]`, low (re-scoped v220). The `herestr` bash-test-suite category PASSes (0 diff) as of v220: the v219 `WordPart::Quoted` quote-provenance fix removed the reconstruction hunks, and v220 task 1 resolved the last runner residual — `declare -p` of an indexed-array element whose value holds a non-printable byte now ANSI-C `$'…'`-quotes it (`[3]=$'i\n'`) to match bash 5.2.21. One genuine general divergence remains but is masked under the runner: a command whose LEADING word expands to empty (`$Z echo hi` with `Z` unset, or the test's `${THIS_SH} ./herestr1.sub` when `THIS_SH` is unset) should drop the empty word via word-splitting and run the remainder; huck instead treats the empty expansion as an empty command NAME and prints `huck: command not found:` (rc 127). This surfaces only on a DIRECT `huck herestr.tests` invocation; the runner exports `THIS_SH=$HUCK`, so it does NOT gate the category (the sub-script runs and its `foo`/`qux` output matches). Worth fixing on its own.
 
