@@ -6156,7 +6156,17 @@ pub(crate) fn source_in_sink(
     let path = match resolve_source_path(filename, shell) {
         Some(p) => p,
         None => {
-            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: .: {filename}: file not found"); }
+            // bash distinguishes a directory (opened, unusable → `.:` prefix) from a
+            // genuinely-missing file (open fails → no `.:`, redirect-style).
+            if std::path::Path::new(filename).is_dir() {
+                let prefix = shell.error_prefix(Some("."));
+                let mut err = crate::executor::err_writer(err_sink, sink);
+                e!(&mut *err, "{prefix}{filename}: is a directory");
+            } else {
+                let prefix = shell.error_prefix(None);
+                let mut err = crate::executor::err_writer(err_sink, sink);
+                e!(&mut *err, "{prefix}{filename}: No such file or directory");
+            }
             shell.posix_fatal(1);
             return ExecOutcome::Continue(1);
         }
@@ -6164,7 +6174,18 @@ pub(crate) fn source_in_sink(
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            { let mut errw = crate::executor::err_writer(err_sink, sink); e!(&mut *errw, "huck: .: {}: {e}", path.display()); }
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`.
+                let prefix = shell.error_prefix(Some("."));
+                let mut errw = crate::executor::err_writer(err_sink, sink);
+                e!(&mut *errw, "{prefix}{}: cannot execute binary file", path.display());
+            } else {
+                // Open/read io error (permission, …): bash reports `<path>: <strerror>`
+                // (redirect-style, no `.:`).
+                let prefix = shell.error_prefix(None);
+                let mut errw = crate::executor::err_writer(err_sink, sink);
+                e!(&mut *errw, "{prefix}{}: {}", path.display(), crate::bash_io_error(&e));
+            }
             return ExecOutcome::Continue(1);
         }
     };

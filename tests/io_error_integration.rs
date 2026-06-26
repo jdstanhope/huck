@@ -47,3 +47,27 @@ fn redirect_write_to_directory_is_a_directory() {
     assert!(e.contains(": line 1: /etc: Is a directory\n"), "stderr: {e:?}");
     assert!(!e.contains("os error"), "leaked Rust suffix: {e:?}");
 }
+
+#[test]
+fn source_not_found_matches_bash() {
+    let (_o, e, _c) = run_file(". /no/such_xyz\n");
+    // bash: `<src>: line 1: /no/such_xyz: No such file or directory` (no `.:`).
+    assert!(e.contains(": line 1: /no/such_xyz: No such file or directory\n"), "stderr: {e:?}");
+    assert!(!e.contains(".: /no/such_xyz"), "should not use the `.:` prefix for not-found: {e:?}");
+}
+
+#[test]
+fn source_a_directory_is_a_directory() {
+    let (_o, e, _c) = run_file(". /etc\n");
+    // bash: `<src>: line 1: .: /etc: is a directory` (WITH `.:`).
+    assert!(e.contains(": line 1: .: /etc: is a directory\n"), "stderr: {e:?}");
+    assert!(!e.contains("file not found"), "old wrong message: {e:?}");
+}
+
+#[test]
+fn source_a_binary_cannot_execute() {
+    let (_o, e, _c) = run_file(". /bin/true\n");
+    // bash: `<src>: line 1: .: /bin/true: cannot execute binary file` (WITH `.:`).
+    assert!(e.contains(": line 1: .: /bin/true: cannot execute binary file\n"), "stderr: {e:?}");
+    assert!(!e.contains("valid UTF-8"), "leaked Rust UTF-8 error: {e:?}");
+}
