@@ -6048,7 +6048,7 @@ fn run_multi_stage(
                     let fd = unsafe { libc::dup(shared) };
                     if fd < 0 {
                         let e = io::Error::last_os_error();
-                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: dup: {e}"); }
+                        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: dup: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if stdout_fd > 2 {

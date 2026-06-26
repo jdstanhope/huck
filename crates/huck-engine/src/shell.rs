@@ -316,7 +316,7 @@ pub fn run_program_in_sink(
 /// builtin can poll it to break out of its loop when Ctrl-C is pressed.
 pub fn install_sigint_handler(flag: Arc<AtomicBool>) {
     if let Err(e) = signal_hook::flag::register(SIGINT, flag) {
-        eprintln!("huck: warning: could not install SIGINT handler: {e}");
+        eprintln!("huck: warning: could not install SIGINT handler: {}", crate::bash_io_error(&e));
     }
 }
 
@@ -324,7 +324,7 @@ pub fn install_sigint_handler(flag: Arc<AtomicBool>) {
 /// at startup; the flag lives on the `Shell` so the reap path can poll it.
 pub fn install_sigchld_handler(flag: Arc<AtomicBool>) {
     if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
-        eprintln!("huck: warning: could not install SIGCHLD handler: {e}");
+        eprintln!("huck: warning: could not install SIGCHLD handler: {}", crate::bash_io_error(&e));
     }
 }
 
