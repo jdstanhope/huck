@@ -7108,7 +7108,7 @@ pub fn fork_and_run_in_subshell(
 ///   - `cmd` is `Command::Simple(SimpleCommand::Exec(exec))`,
 ///   - AND `exec.program_static_text()` returns `Some(name)` (single unquoted Literal),
 ///   - AND `name` is NOT in `shell.functions`,
-///   - AND NOT in `builtins::is_builtin`.
+///   - AND NOT an active builtin (`builtins::builtin_active`).
 ///
 /// Everything else (compounds, function calls, builtins, dynamic program words,
 /// assignment-only stages) → `InProcess`.
