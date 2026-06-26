@@ -214,6 +214,10 @@ pub struct ShellOptions {
     /// (use the physical directory structure). When off (default), the logical
     /// PWD is maintained (symlinks preserved in `$PWD`). Mirrors bash `-P`.
     pub physical: bool,
+    /// `set -o posix` / `--posix` / invoked-as-`sh` / `POSIXLY_CORRECT`: enable
+    /// strict POSIX semantics. Currently gates special-builtin prefix-assignment
+    /// persistence (executor.rs); more posix-mode behaviors hang off this later.
+    pub posix: bool,
 }
 
 /// One row of the bash `shopt` option table.

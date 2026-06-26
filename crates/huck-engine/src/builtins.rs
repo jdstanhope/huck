@@ -5015,6 +5015,7 @@ pub(crate) fn option_get(shell: &Shell, name: &str) -> Option<bool> {
         "noclobber" => Some(shell.shell_options.noclobber),
         "noexec" => Some(shell.shell_options.noexec),
         "physical" => Some(shell.shell_options.physical),
+        "posix" => Some(shell.shell_options.posix),
         other => SETO_TABLE.iter().find(|o| o.name == other).map(|o| o.default),
     }
 }
@@ -5032,16 +5033,7 @@ fn option_set(shell: &mut Shell, name: &str, value: bool) -> Result<(), OptSetEr
         "noclobber" => { shell.shell_options.noclobber = value; Ok(()) }
         "noexec" => { shell.shell_options.noexec = value; Ok(()) }
         "physical" => { shell.shell_options.physical = value; Ok(()) }
-        "posix" => {
-            // Accept as a silent no-op. huck is POSIX-respecting by default;
-            // `set +o posix` is a no-op against that default, and `set -o
-            // posix` does not unlock additional strict-POSIX semantics.
-            // Scripts that toggle the option for bash compatibility pass
-            // through cleanly. The "huck doesn't implement strict POSIX
-            // mode" gap is a known minor divergence.
-            let _ = value;
-            Ok(())
-        }
+        "posix" => { shell.shell_options.posix = value; Ok(()) }
         other => {
             if SETO_TABLE.iter().any(|o| o.name == other) {
                 Err(OptSetErr::Unimplemented)

@@ -8597,6 +8597,16 @@ mod tests {
     }
 
     #[test]
+    fn set_o_posix_toggles_shell_option() {
+        let mut shell = Shell::new();
+        assert!(!shell.shell_options.posix, "posix defaults off");
+        exec_script("set -o posix\n", &mut shell);
+        assert!(shell.shell_options.posix, "set -o posix turns it on");
+        exec_script("set +o posix\n", &mut shell);
+        assert!(!shell.shell_options.posix, "set +o posix turns it off");
+    }
+
+    #[test]
     fn funcnest_limit_refuses_call_past_depth() {
         let mut shell = Shell::new();
         // FUNCNEST=3 allows depth 1,2,3; the 4th call is refused (rc 1).
