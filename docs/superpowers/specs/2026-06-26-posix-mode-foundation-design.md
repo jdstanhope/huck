@@ -80,70 +80,138 @@ in posix — this is func's sole remaining hunk, func3.sub line 155, `5 0` vs `5
 
 ### Section 2 — gate special-builtin persistence
 
-In `executor.rs` (~4219, the v221 site):
+**Measured bash truth (5.2.21).** Two distinct persistence mechanisms hide
+behind huck's current "all special builtins always persist":
+
+1. **Assignment-builtin absorption — `export`/`readonly` only, NOT posix-gated.**
+   `FOO=val export FOO` keeps `FOO=val` in BOTH default and posix mode (the
+   builtin absorbs its named variable). `declare`/`typeset`/`local` do NOT
+   absorb the prefix (`FOO=val declare FOO` → unset) — and they aren't special
+   builtins anyway, so huck already restores them correctly.
+2. **Generic special-builtin persistence — posix-gated.** `var=20 return`,
+   `var=20 :`, `var=20 eval …`, `var=20 set --`, etc. persist ONLY in posix
+   mode; default mode restores them.
+
+huck today wrongly persists category 2 in default mode (`var=20 return` → `20`,
+should be `0`). The fix gates category 2 on posix while leaving `export`/
+`readonly` (category 1) persistent in both modes. In `executor.rs` (~4239, the
+v221 site):
 
 ```rust
-let persistent = builtins::is_special_builtin(&resolved.program)
-    && shell.shell_options.posix;
+let persistent = matches!(resolved.program.as_str(), "export" | "readonly")
+    || (builtins::is_special_builtin(&resolved.program) && shell.shell_options.posix);
 ```
 
-Default mode → `persistent` false for special builtins → their prefix
-assignments restore (no persist), matching default bash (`var=20 return` →
-unchanged). Posix mode → persist, as today.
+- Default mode: `export`/`readonly` persist their prefix (existing test
+  `run_exec_single_special_builtin_inline_assignment_persists` stays green);
+  every other special builtin restores (fixes `var=20 return` → `0`).
+- Posix mode: all special builtins persist, as huck does today.
+
+`exec` is handled by its own early return (~4248) before this value is used, so
+it is unaffected. `export`/`readonly` keep huck's pre-existing whole-prefix
+persistence (e.g. `FOO=val export BAR` also persists `FOO`, a per-variable
+divergence from bash that predates this work and is left as-is — see
+bash-divergences follow-on).
 
 ### Section 3 — posix persist survives an enclosing prefix-restore
 
-Promote the inline-assignment snapshot from a Rust-stack-local
-`AssignmentSnapshot` to a **shell-managed stack** `shell.inline_scopes:
-Vec<AssignmentSnapshot>` so an inner persist can reach enclosing scopes:
+**Why only one executor path needs to change.** `apply_inline_assignments` /
+`restore_inline_assignments` (executor.rs ~6396/6455) are called from four
+functions: `run_exec_single` (foreground simple command), `run_double_bracket`,
+`run_background_sequence`, and `run_multi_stage`. Only `run_exec_single` can be a
+foreground *enclosing* scope whose restore an inner persist must suppress:
+`[[ … ]]` cannot nest a function call, and the background/pipeline paths run the
+inner command in a subshell, so a persist there never propagates back to the
+parent's variable state. Both halves of the func3.sub case — the enclosing
+`var=30 f` and the inner `var=20 return` inside f's body — flow through
+`run_exec_single` (nested on the Rust call stack, sharing one `&mut Shell`).
+**So the scope stack is wired into `run_exec_single` only; the other three
+apply/restore sites are left exactly as they are.**
 
-- `apply_inline_assignments` pushes its snapshot onto `shell.inline_scopes`
-  (only when there are assignments); the command's exit paths pop it.
-- On a NON-persistent command: pop the top scope and restore its (remaining)
-  entries — current behavior, just sourced from the stack.
-- On a PERSISTENT command (posix special builtin): pop the top scope, do NOT
-  restore it, and for each variable name it held, **remove that name from every
-  remaining (enclosing) scope** on `inline_scopes`. This makes the live persisted
-  value survive all enclosing restores.
+Add a **names-only** shell-managed stack — values stay in the existing local
+`snap`, only the snapshotted names go on the shell stack:
+
+```rust
+// Shell:
+pub inline_scopes: Vec<std::collections::HashSet<String>>,  // default empty
+```
+
+In `run_exec_single`:
+- After `apply_inline_assignments` succeeds, push the snap's names:
+  `shell.inline_scopes.push(snap.iter().map(|(n,_)| n.clone()).collect());`
+  (The apply-*error* path runs BEFORE this push and keeps its plain
+  `restore_inline_assignments(s, shell)` — no pop.)
+- Replace the three post-push exit points — currently
+  `if !persistent { restore_inline_assignments(snap, shell) }` at the
+  restricted-name return, the child-redir-plan-error return, and the main
+  post-dispatch return — with one helper `finalize_inline_scope(snap,
+  persistent, shell)` that ALWAYS pops, so push/pop stay balanced on every path:
+
+```rust
+fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut Shell) {
+    let kept = shell.inline_scopes.pop().unwrap_or_default();
+    if persistent {
+        // posix special builtin keeps its prefix: make it survive every
+        // enclosing restore by deleting these names from all enclosing scopes.
+        for (name, _) in &snap {
+            for scope in shell.inline_scopes.iter_mut() { scope.remove(name); }
+        }
+    } else {
+        // temporary scope: restore LIFO, but skip any name an inner persist
+        // removed from this scope (it must keep the persisted live value).
+        for (name, prior) in snap.into_iter().rev() {
+            if kept.contains(&name) { shell.restore_var(&name, prior); }
+        }
+    }
+}
+```
 
 Trace (posix, `var=0; f(){ var=20 return 5; }; var=30 f`):
-1. outer `var=30 f`: push `[(var,Some(0))]`; set var=30.
-2. inner `var=20 return`: push `[(var,Some(30))]`; set var=20; persistent → pop
-   without restore, remove `var` from the outer scope → outer becomes `[]`.
-3. f returns; outer pop restores `[]` → var stays **20**. ✓
+1. outer `var=30 f`: snap `[(var,Some(0))]`, set var=30, push `{var}` →
+   `inline_scopes=[{var}]`.
+2. inner `var=20 return`: snap `[(var,Some(30))]`, set var=20, push `{var}` →
+   `[{var},{var}]`; persistent → pop top, remove `var` from the remaining
+   (outer) scope → `[{}]`; do not restore. var stays 20.
+3. f returns; outer finalize (function → not persistent): pop `{}`, `kept` lacks
+   `var` → skip restore. var stays **20**. ✓
 
-The same trace in default mode: inner is non-persistent → restores var to 30; f
-returns; outer restores var to 0 → **0**. ✓ The no-enclosing cases fall out
-identically. Multi-level nesting (`a=1 o; o→a=2 m; m→a=3 return`) works because
-the persist removes `a` from BOTH enclosing scopes — a correctness requirement
-that rules out a simpler "skip-list set" (which can only consume one level).
+Default mode: inner not persistent → restores var=30; outer restores var=0 →
+**0**. ✓ No-enclosing cases (no outer prefix → no outer push) fall out
+identically. Multi-level (`a=1 o; o→a=2 m; m→a=3 return`, posix) → **3**, because
+the persist deletes `a` from BOTH enclosing scopes — a correctness requirement
+that rules out a simpler one-shot "skip set."
 
-Invariant: every push has exactly one matching pop on every exit path of the
-simple-command executor; `inline_scopes` is empty between top-level commands
-(assert in tests).
+Invariant: in `run_exec_single`, every push has exactly one matching pop on every
+exit path; `inline_scopes` is empty between top-level commands (assert in a test).
 
 ## Testing / Verification
 
 - **Unit tests** (shell_state.rs): the flag round-trips via `option_set`/
   `option_get`; default is false.
-- **Unit/behavior tests** (executor.rs, via `exec_script`): all four persistence
-  cases (posix/default × enclosing/no-enclosing) yield bash's values; a
-  multi-level (`a=1/a=2/a=3 return`) posix case yields `a=3`; `inline_scopes` is
-  empty after each top-level command.
+- **Unit/behavior tests** (executor.rs, via `exec_script`): the four generic
+  persistence cases (posix/default × enclosing/no-enclosing, using `return`)
+  yield bash's values; the multi-level (`a=1/a=2/a=3 return`) posix case yields
+  `a=3`; `export`/`readonly` named-var persist in DEFAULT mode (regression
+  guard); `inline_scopes` is empty after each top-level command.
 - **Diff harness** `posix_mode_diff_check.sh` vs live bash 5.2.21: run each
-  persistence fragment under BOTH `bash`/`huck` (default) and `bash --posix`/
-  `huck --posix` (or `set -o posix` prefix), byte-identical. Include a couple of
-  flag-plumbing fragments (`set -o posix; set -o | grep posix`).
+  fragment under BOTH `bash`/`huck` (default) and `bash --posix`/`huck --posix`,
+  byte-identical. Fragments cover: `var=20 return`/`:` (gated), `FOO=val export
+  FOO` (default-persist), the enclosing `var=30 f` case, and flag-plumbing
+  (`set -o posix; set -o | grep posix`).
 - `cargo test --workspace` green (~3698).
 - **func category PASS** (headline criterion); cprint + herestr stay PASS.
 
 ## Risks
 
-- **Scope-stack push/pop balance.** The simple-command executor has many
-  early-return paths that currently call `restore_inline_assignments`; each must
-  become a stack pop. A missed pop leaks a scope (caught by the
-  `inline_scopes`-empty assertion + the full suite). Mitigation: route all
-  pop/restore through one helper; add the emptiness assertion.
+- **Scope-stack push/pop balance.** Only `run_exec_single` participates, and it
+  has exactly three post-push exit points (restricted-name return,
+  child-redir-error return, main post-dispatch return); all three route through
+  `finalize_inline_scope`, which always pops. The pre-push apply-error path keeps
+  plain `restore_inline_assignments` (no pop). A missed pop leaks a scope — caught
+  by the `inline_scopes`-empty assertion + the full suite. The other three
+  apply/restore call sites (`run_double_bracket`, `run_background_sequence`,
+  `run_multi_stage`) are deliberately NOT touched and must keep using the plain
+  `restore_inline_assignments` (they never push, so they must never pop).
 - **Behavior change in default mode is intended** (`var=20 return` no longer
   persists). Any existing huck test asserting the old unconditional persist
   encoded the bug and must be updated to the bash-default value — verify against
@@ -158,3 +226,6 @@ simple-command executor; `inline_scopes` is empty between top-level commands
   references). Add a `[deferred]` entry listing the remaining POSIX-mode clusters
   (A/B + the unconditional-behavior gating) as the roadmap.
 - `docs/bash-test-suite-baseline.md` (func → PASS; Summary 8→9) + memory.
+- Add a `[deferred]` (low) entry for the pre-existing `export`/`readonly`
+  whole-prefix over-persistence (`FOO=val export BAR` persists `FOO`; bash
+  restores it — bash absorbs only the *named* variable). Out of scope here.
