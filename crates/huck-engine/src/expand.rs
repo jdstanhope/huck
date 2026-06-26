@@ -1234,7 +1234,7 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: process substitution: {e}"));
+                    with_err(|err| e!(err, "huck: process substitution: {}", crate::bash_io_error(&e)));
                     // Emit nothing; the field stays empty if no other parts.
                 }
             }

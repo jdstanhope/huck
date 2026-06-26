@@ -141,7 +141,7 @@ impl History {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                with_err(|err| e!(err, "huck: warning: could not read history file: {e}"));
+                with_err(|err| e!(err, "huck: warning: could not read history file: {}", crate::bash_io_error(&e)));
             }
         }
     }
@@ -163,7 +163,7 @@ impl History {
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
-            with_err(|err| e!(err, "huck: warning: could not write history file: {e}"));
+            with_err(|err| e!(err, "huck: warning: could not write history file: {}", crate::bash_io_error(&e)));
         }
     }
 

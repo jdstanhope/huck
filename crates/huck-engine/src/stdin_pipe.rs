@@ -23,7 +23,7 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
         Ok(pair) => pair,
         Err(e) => {
             // Hard-fail before any state change.
-            eprintln!("huck: pipe: {e}");
+            eprintln!("huck: pipe: {}", crate::bash_io_error(&e));
             return f(); // run anyway with caller's fd 0; matches "best effort"
         }
     };
@@ -31,7 +31,7 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
     let saved = unsafe { libc::dup(0) };
     if saved < 0 {
         let e = io::Error::last_os_error();
-        eprintln!("huck: dup: {e}");
+        eprintln!("huck: dup: {}", crate::bash_io_error(&e));
         unsafe {
             libc::close(r);
             libc::close(w);
@@ -41,7 +41,7 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
 
     if unsafe { libc::dup2(r, 0) } < 0 {
         let e = io::Error::last_os_error();
-        eprintln!("huck: dup2: {e}");
+        eprintln!("huck: dup2: {}", crate::bash_io_error(&e));
         unsafe {
             libc::close(r);
             libc::close(w);
