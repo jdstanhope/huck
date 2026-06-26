@@ -53,6 +53,14 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+/// True if `name` is a known builtin that is currently ENABLED (not turned off
+/// via `enable -n`). Command dispatch and `type`/`command -v` use this so a
+/// disabled builtin falls through to the external command. `enable`'s validity
+/// check and the `builtin` forcing builtin use `is_builtin` (name known) instead.
+pub fn builtin_active(name: &str, shell: &Shell) -> bool {
+    is_builtin(name) && !shell.disabled_builtins.contains(name)
+}
+
 /// True for "declaration commands" (bash terminology). Their
 /// assignment-shaped args (`a=(x y)`, `a[i]+=v`) are parsed as
 /// `Assignment`s and routed through `apply_one_assignment`, NOT
@@ -6653,7 +6661,7 @@ fn resolve_command_name(name: &str, shell: &Shell) -> CommandResolution {
     if shell.functions.contains_key(name) {
         return CommandResolution::Function;
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         return CommandResolution::Builtin;
     }
     if is_shell_keyword(name) {
@@ -6702,7 +6710,7 @@ fn resolve_command_name_with(
     if !skip_func && shell.functions.contains_key(name) {
         return CommandResolution::Function;
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         return CommandResolution::Builtin;
     }
     if is_shell_keyword(name) {
@@ -6729,7 +6737,7 @@ fn resolve_command_name_all(
     if !skip_func && shell.functions.contains_key(name) {
         out.push(CommandResolution::Function);
     }
-    if is_builtin(name) {
+    if builtin_active(name, shell) {
         out.push(CommandResolution::Builtin);
     }
     if is_shell_keyword(name) {
@@ -7745,6 +7753,16 @@ mod tests {
     #[test]
     fn help_topic_names_nonempty() {
         assert!(help_topic_names().count() >= 40);
+    }
+
+    #[test]
+    fn builtin_active_reflects_disabled_set() {
+        let mut sh = crate::shell_state::Shell::new();
+        assert!(super::builtin_active("test", &sh));      // enabled by default
+        sh.disabled_builtins.insert("test".to_string());
+        assert!(!super::builtin_active("test", &sh));     // now disabled
+        assert!(super::is_builtin("test"));               // still a KNOWN builtin
+        assert!(!super::builtin_active("not_a_builtin", &sh));
     }
 
     #[test]
