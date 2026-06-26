@@ -1117,13 +1117,14 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    // Print the error but DO NOT set pending_fatal_status —
-                    // bash script-file mode prints and continues. The empty
-                    // contribution here matches bash's empty $((..)) value
-                    // on error. (-c mode divergence: L-55 in
-                    // bash-divergences.md.)
+                    // Print the error. Default mode: NON-fatal (v215) — prints
+                    // and continues; the empty contribution matches bash's empty
+                    // $((..)) value on error. (-c mode divergence: L-55 in
+                    // bash-divergences.md.) POSIX non-interactive: the shell
+                    // exits (127) via posix_fatal (a no-op in default mode).
                     let prefix = shell.error_prefix(None);
                     with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                    shell.posix_fatal(127);
                     *has_emitted = true;
                 }
             }
@@ -2991,6 +2992,16 @@ mod tests {
         let word = Word(vec![arith_part("1 / 0")]);
         let _ = expand(&word, &mut shell);
         assert_eq!(shell.pending_fatal_status, None);
+    }
+
+    #[test]
+    fn expand_arith_error_is_posix_fatal() {
+        let mut shell = Shell::new();
+        shell.shell_options.posix = true;
+        shell.is_interactive = false;
+        let word = Word(vec![arith_part("1 + ")]);
+        let _ = expand(&word, &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
     }
 
     #[test]
