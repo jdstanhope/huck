@@ -6471,9 +6471,15 @@ fn restore_inline_assignments(snap: AssignmentSnapshot, shell: &mut Shell) {
 fn finalize_inline_scope(snap: AssignmentSnapshot, persistent: bool, shell: &mut Shell) {
     let kept = shell.inline_scopes.pop().unwrap_or_default();
     if persistent {
-        for (name, _) in &snap {
-            for scope in shell.inline_scopes.iter_mut() {
-                scope.remove(name);
+        // Only POSIX mode propagates a persist THROUGH an enclosing
+        // temp-assignment scope. In default mode export/readonly keep their
+        // value at their own level (snap not restored here) but must NOT
+        // survive an enclosing same-name restore — so skip the deletion.
+        if shell.shell_options.posix {
+            for (name, _) in &snap {
+                for scope in shell.inline_scopes.iter_mut() {
+                    scope.remove(name);
+                }
             }
         }
     } else {
@@ -8239,6 +8245,31 @@ mod tests {
         );
         assert_eq!(shell.get("var"), Some("20"));
         assert!(shell.inline_scopes.is_empty(), "scope stack balanced");
+    }
+
+    #[test]
+    fn export_under_enclosing_prefix_does_not_survive_restore_in_default_mode() {
+        // export is persistent (absorbs its named var), but in DEFAULT mode that
+        // persist must NOT propagate through an enclosing same-name prefix-restore.
+        // bash 5.2.21: FOO=30 f restores FOO to 0 even though f did `FOO=20 export FOO`.
+        let mut shell = Shell::new();
+        exec_script(
+            "FOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("FOO"), Some("0"));
+        assert!(shell.inline_scopes.is_empty());
+    }
+
+    #[test]
+    fn export_under_enclosing_prefix_survives_in_posix_mode() {
+        let mut shell = Shell::new();
+        exec_script(
+            "set -o posix\nFOO=0\nf(){ FOO=20 export FOO; }\nFOO=30 f\n",
+            &mut shell,
+        );
+        assert_eq!(shell.get("FOO"), Some("20"));
+        assert!(shell.inline_scopes.is_empty());
     }
 
     #[test]

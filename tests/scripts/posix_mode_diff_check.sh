@@ -31,6 +31,8 @@ check "enclosing posix"      'set -o posix; var=0; f(){ var=20 return 5; }; var=
 check "multilevel posix"     'set -o posix; a=0; m(){ a=3 return; }; o(){ a=2 m; }; a=1 o; echo "$a"'
 # Assignment-builtin absorption: persists in default mode too.
 check "export named default"  'FOO=val export FOO; echo "[${FOO-U}]"'
+check "export nested default" 'FOO=0; f(){ FOO=20 export FOO; }; FOO=30 f; echo "[$FOO]"'
+check "export nested posix"   'set -o posix; FOO=0; f(){ FOO=20 export FOO; }; FOO=30 f; echo "[$FOO]"'
 check "readonly named default" 'BAR=ro readonly BAR; echo "[${BAR-U}]"'
 # Flag plumbing.
 check "set -o posix listing"  'set -o posix; set -o | grep posix'
