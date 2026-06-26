@@ -13258,7 +13258,7 @@ const ULIMIT_TABLE: &[UlimitRes] = &[
     UlimitRes { letter: 'l', resource: libc::RLIMIT_MEMLOCK,     mult: 1024, label: "max locked memory       (kbytes, -l)" },
     UlimitRes { letter: 'm', resource: libc::RLIMIT_RSS,         mult: 1024, label: "max memory size         (kbytes, -m)" },
     UlimitRes { letter: 'n', resource: libc::RLIMIT_NOFILE,      mult: 1,    label: "open files                      (-n)" },
-    UlimitRes { letter: 'q', resource: libc::RLIMIT_MSGQUEUE,    mult: 1024, label: "POSIX message queues     (bytes, -q)" },
+    UlimitRes { letter: 'q', resource: libc::RLIMIT_MSGQUEUE,    mult: 1,    label: "POSIX message queues     (bytes, -q)" },
     UlimitRes { letter: 'r', resource: libc::RLIMIT_RTPRIO,      mult: 1,    label: "real-time priority              (-r)" },
     UlimitRes { letter: 's', resource: libc::RLIMIT_STACK,       mult: 1024, label: "stack size              (kbytes, -s)" },
     UlimitRes { letter: 't', resource: libc::RLIMIT_CPU,         mult: 1,    label: "cpu time               (seconds, -t)" },
