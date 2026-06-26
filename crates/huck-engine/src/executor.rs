@@ -5324,7 +5324,13 @@ fn run_subprocess(
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: command not found: {}", cmd.program); }
+            // bash format: `<src>: line N: <name>: command not found` (the name
+            // precedes the phrase; error_prefix supplies the prologue + mode split).
+            {
+                let prefix = shell.error_prefix(None);
+                let mut err = err_writer(err_sink, sink);
+                e!(&mut *err, "{prefix}{}: command not found", cmd.program);
+            }
             ExecOutcome::Continue(127)
         }
         Err(e) => {
