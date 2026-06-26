@@ -1,12 +1,17 @@
 //! v228: command-not-found error format (word order + non-interactive prologue).
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn huck_bin() -> &'static str { env!("CARGO_BIN_EXE_huck") }
 
 /// Run huck with a script FILE (not stdin) so the non-interactive prologue
 /// (`<path>: line N:`) is produced. Returns (stdout, stderr, exit_code).
 fn run_file(script: &str) -> (String, String, i32) {
-    let path = std::env::temp_dir().join(format!("huck-cnf-{}.sh", std::process::id()));
+    // Unique path per call: these #[test]s run in parallel threads sharing one
+    // PID, so a PID-only name would race (one test's script overwriting another).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("huck-cnf-{}-{n}.sh", std::process::id()));
     std::fs::write(&path, script).unwrap();
     let out = Command::new(huck_bin()).arg(&path).output().expect("run huck file");
     let _ = std::fs::remove_file(&path);
