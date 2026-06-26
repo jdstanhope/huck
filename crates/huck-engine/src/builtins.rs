@@ -6064,6 +6064,7 @@ pub(crate) fn source_in_sink(
         Some(p) => p,
         None => {
             { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: .: {filename}: file not found"); }
+            shell.posix_fatal(1);
             return ExecOutcome::Continue(1);
         }
     };

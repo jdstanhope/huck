@@ -810,6 +810,14 @@ fn run_command(
             }
         }
         Command::FunctionDef { name, body } => {
+            // POSIX: a function may not be named after a special builtin; a
+            // non-interactive posix shell errors and exits (default mode allows it).
+            if shell.shell_options.posix && builtins::is_special_builtin(name) {
+                { let mut err = err_writer(err_sink, sink);
+                  e!(&mut *err, "{}{name}: is a special builtin", shell.error_prefix(None)); }
+                shell.posix_fatal(2);
+                return ExecOutcome::Continue(2);
+            }
             shell.define_function(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
@@ -1842,6 +1850,7 @@ fn run_for_inner(
         }
         if shell.try_set(&clause.var, value).is_err() {
             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: readonly variable", clause.var); }
+            shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
         match execute_sequence_body(&clause.body, shell, sink, err_sink) {
@@ -8720,6 +8729,45 @@ mod tests {
         {
             let _ = execute(&seq, shell, &buf);
         }
+    }
+
+    #[test]
+    fn posix_source_not_found_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\n. /no/such/huck_file_xyz\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(1));
+    }
+    #[test]
+    fn default_source_not_found_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script(". /no/such/huck_file_xyz\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn posix_function_named_special_builtin_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\neval() { :; }\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(2));
+        assert!(!shell.functions.contains_key("eval"), "function not defined");
+    }
+    #[test]
+    fn default_function_named_special_builtin_is_allowed() {
+        let mut shell = Shell::new();
+        exec_script("eval() { :; }\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+        assert!(shell.functions.contains_key("eval"));
+    }
+    #[test]
+    fn posix_readonly_for_var_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn default_readonly_for_var_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script("readonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
     }
 
     #[test]
