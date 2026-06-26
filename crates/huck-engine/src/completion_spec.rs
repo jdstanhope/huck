@@ -330,7 +330,7 @@ fn call_completion_function(
 
     // 9. Drain any pending fatal PE error from inside the function so
     //    the next prompt is clean.
-    let _ = shell.take_pending_fatal_pe_error();
+    let _ = shell.take_pending_fatal_status();
 
     reply_values
 }

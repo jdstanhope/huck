@@ -384,7 +384,7 @@ fn run_andor_group(
     // would see a stale value.
     if let ExecOutcome::Continue(c) = status {
         shell.set_last_status(c);
-        if shell.pending_fatal_pe_error.is_some() {
+        if shell.pending_fatal_status.is_some() {
             return ExecOutcome::Continue(c);
         }
         crate::traps::dispatch_pending_traps(shell);
@@ -424,7 +424,7 @@ fn run_andor_group(
             }
             if let ExecOutcome::Continue(c) = status {
                 shell.set_last_status(c);
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return ExecOutcome::Continue(c);
                 }
                 crate::traps::dispatch_pending_traps(shell);
@@ -810,6 +810,14 @@ fn run_command(
             }
         }
         Command::FunctionDef { name, body } => {
+            // POSIX: a function may not be named after a special builtin; a
+            // non-interactive posix shell errors and exits (default mode allows it).
+            if shell.shell_options.posix && builtins::is_special_builtin(name) {
+                { let mut err = err_writer(err_sink, sink);
+                  e!(&mut *err, "{}{name}: is a special builtin", shell.error_prefix(None)); }
+                shell.posix_fatal(2);
+                return ExecOutcome::Continue(2);
+            }
             shell.define_function(name.clone(), body.clone());
             ExecOutcome::Continue(0)
         }
@@ -1842,6 +1850,7 @@ fn run_for_inner(
         }
         if shell.try_set(&clause.var, value).is_err() {
             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}: readonly variable", clause.var); }
+            shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
         match execute_sequence_body(&clause.body, shell, sink, err_sink) {
@@ -2301,7 +2310,7 @@ fn run_case(
     while i < clause.items.len() {
         let item = &clause.items[i];
         let run_this = fall_through || case_item_matches(item, &subject, shell);
-        if let Some(status) = shell.pending_fatal_pe_error {
+        if let Some(status) = shell.pending_fatal_status {
             return ExecOutcome::Continue(status);
         }
         if !run_this {
@@ -3427,7 +3436,7 @@ fn resolve(
         Ok(v) => v,
         Err(()) => return Err(1),
     };
-    if let Some(status) = shell.pending_fatal_pe_error {
+    if let Some(status) = shell.pending_fatal_status {
         return Err(status);
     }
     if prog_fields.is_empty() {
@@ -3472,7 +3481,7 @@ fn resolve(
             Ok(v) => v,
             Err(()) => return Err(1),
         };
-        if let Some(status) = shell.pending_fatal_pe_error {
+        if let Some(status) = shell.pending_fatal_status {
             return Err(status);
         }
         if let Some(da) = decl_args.as_mut() {
@@ -3885,10 +3894,12 @@ fn run_assignment_list(
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {name}: readonly variable"); }
+            shell.posix_fatal(127);
             st = 1;
             break;
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
+            shell.posix_fatal(127);
             st = 1;
             break;
         }
@@ -3913,6 +3924,26 @@ fn run_exec_single(
     sink: &mut StdoutSink,
     err_sink: &mut StderrSink,
 ) -> ExecOutcome {
+    run_exec_single_inner(cmd, shell, sink, err_sink, false)
+}
+
+/// `wrapped` is true when this invocation was reached via the pre-resolve
+/// `command <decl>` / `builtin <decl>` rewrite (the inner program is therefore
+/// command/builtin-wrapped even though `command_prefix`/`require_builtin` were
+/// reset on recursion). It suppresses the bare-special-builtin posix-fatal
+/// consume so `command export AA[4]=1` / `builtin export AA[4]=1` strip the
+/// usage/assignment fatal, matching bash.
+fn run_exec_single_inner(
+    cmd: &ExecCommand,
+    shell: &mut Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    wrapped: bool,
+) -> ExecOutcome {
+    // POSIX case #1: clear any usage-error signal a prior command may have left
+    // un-consumed (e.g. a `command`-wrapped special builtin). Each special
+    // builtin re-sets it at its own usage/assignment error site during dispatch.
+    shell.builtin_usage_error = None;
     // Stamp $LINENO from the parse-time source line before any expansion.
     // The guard prevents synthesized line-0 commands (rewrites, builtins-via-command)
     // from clobbering a real current line.
@@ -3948,8 +3979,9 @@ fn run_exec_single(
             line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
+        // `wrapped`: the inner decl builtin is `command`-wrapped → strip its usage fatal.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single(&inner, shell, sink, err_sink);
+        return run_exec_single_inner(&inner, shell, sink, err_sink, true);
     }
 
     // `builtin <decl-builtin> …` (v142): a declaration builtin reached via `builtin`
@@ -3975,8 +4007,9 @@ fn run_exec_single(
             line: 0,
         };
         // Pre-resolve recursion: no expansion yet, drain is a no-op but kept for uniformity.
+        // `wrapped`: the inner decl builtin is `builtin`-wrapped → strip its usage fatal.
         drain_procsubs(shell, procsub_base);
-        return run_exec_single(&inner, shell, sink, err_sink);
+        return run_exec_single_inner(&inner, shell, sink, err_sink, true);
     }
 
     // Assignment/redirect-only command: no program word, just inline assignments
@@ -4167,6 +4200,9 @@ fn run_exec_single(
         Ok(s) => s,
         Err(s) => {
             restore_inline_assignments(s, shell);
+            if builtins::is_special_builtin(&resolved.program) {
+                shell.posix_fatal(127);
+            }
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
@@ -4260,6 +4296,15 @@ fn run_exec_single(
             return ExecOutcome::Continue(1);
         }
         let outcome = run_exec_builtin(&resolved, cmd, shell, sink, err_sink);
+        // POSIX case #1: `exec -z` (bad option) exits a non-interactive posix
+        // shell. A `command exec`/`builtin exec` wrapper strips it (matches bash).
+        // exec returns early here (it never reaches the post-dispatch consume), so
+        // mirror that consume on this path, gated identically on a BARE invocation.
+        if !wrapped && command_prefix.is_empty() && !require_builtin
+            && let Some(st) = shell.builtin_usage_error.take()
+        {
+            shell.posix_fatal(st);
+        }
         drain_procsubs(shell, procsub_base);
         return outcome;
     }
@@ -4344,6 +4389,19 @@ fn run_exec_single(
             }
         }
     };
+
+    // POSIX case #1: a BARE special builtin that hit a usage / bad-option /
+    // bad-assignment error exits a non-interactive posix shell (bash EX_USAGE).
+    // `command`/`builtin` wrappers (command_prefix non-empty, require_builtin, or
+    // reached via the pre-resolve decl-rewrite — `wrapped`) do NOT exit; they
+    // leave the signal for the next command's top-of-fn clear. Runtime errors
+    // never set the signal, so they fall through here untouched.
+    if !wrapped && command_prefix.is_empty() && !require_builtin
+        && builtins::is_special_builtin(&resolved.program)
+        && let Some(st) = shell.builtin_usage_error.take()
+    {
+        shell.posix_fatal(st);
+    }
 
     finalize_inline_scope(snap, persistent, shell);
     // Apply `$_` AFTER dispatch so a function/eval/source body's nested
@@ -4532,6 +4590,9 @@ fn run_exec_builtin(
         Ok(f) => f,
         Err(msg) => {
             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {msg}"); }
+            // POSIX case #1: bad option is a usage error (the exec interception
+            // consumes this for a bare invocation).
+            shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
     };
@@ -6799,7 +6860,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, expand_assignment(&elem.value, shell));
                 implicit = idx + 1;
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return Err(());
                 }
             }
@@ -6808,7 +6869,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return Err(());
                 }
             }
@@ -8720,6 +8781,115 @@ mod tests {
         {
             let _ = execute(&seq, shell, &buf);
         }
+    }
+
+    #[test]
+    fn posix_source_not_found_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\n. /no/such/huck_file_xyz\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(1));
+    }
+    #[test]
+    fn default_source_not_found_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script(". /no/such/huck_file_xyz\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn posix_function_named_special_builtin_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\neval() { :; }\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(2));
+        assert!(!shell.functions.contains_key("eval"), "function not defined");
+    }
+    #[test]
+    fn default_function_named_special_builtin_is_allowed() {
+        let mut shell = Shell::new();
+        exec_script("eval() { :; }\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+        assert!(shell.functions.contains_key("eval"));
+    }
+    #[test]
+    fn posix_readonly_for_var_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn default_readonly_for_var_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script("readonly i=1\nfor i in a b; do :; done\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn posix_assignment_no_command_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn posix_assignment_before_special_is_fatal() {
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2 export y\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
+    }
+    #[test]
+    fn posix_assignment_before_regular_is_not_fatal() {
+        // before a REGULAR command → abort-continue (deferred), NOT a shell exit.
+        let mut shell = Shell::new();
+        exec_script("set -o posix\nreadonly x=1\nx=2 true\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+    #[test]
+    fn default_assignment_no_command_is_not_fatal() {
+        let mut shell = Shell::new();
+        exec_script("readonly x=1\nx=2\n", &mut shell);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+
+    // ----- Case #1: special-builtin usage / assignment errors are posix-fatal --
+    fn posix_run(src: &str) -> Option<i32> {
+        let mut shell = Shell::new();
+        exec_script(&format!("set -o posix\n{src}\n"), &mut shell);
+        shell.pending_fatal_status
+    }
+    #[test]
+    fn posix_special_builtin_usage_errors_exit() {
+        assert_eq!(posix_run("set -o nosuchopt"), Some(2), "set bad option");
+        assert_eq!(posix_run("unset -z"), Some(2), "unset bad option");
+        assert_eq!(posix_run("export -z"), Some(2), "export bad option");
+        assert_eq!(posix_run("export AA[4]=1"), Some(1), "export bad assignment");
+        assert_eq!(posix_run("readonly AA[4]=1"), Some(1), "readonly bad assignment");
+        assert_eq!(posix_run("return 2"), Some(2), "return outside function");
+        assert_eq!(posix_run("exec -z"), Some(2), "exec bad option");
+    }
+    #[test]
+    fn posix_set_unimplemented_option_does_not_exit() {
+        // Valid-in-bash options huck hasn't implemented must NOT exit a posix shell.
+        assert_eq!(posix_run("set -o emacs"), None, "set -o emacs");
+        assert_eq!(posix_run("set -o vi"), None, "set -o vi");
+        assert_eq!(posix_run("set -h"), None, "set -h single-char");
+    }
+    #[test]
+    fn posix_set_invalid_option_name_exits() {
+        assert_eq!(posix_run("set -o nosuchopt"), Some(2), "genuinely invalid -o name");
+    }
+    #[test]
+    fn posix_special_builtin_runtime_errors_do_not_exit() {
+        assert_eq!(posix_run("shift 99"), None, "shift out of range");
+        assert_eq!(posix_run("shift -z"), None, "shift bad option");
+        assert_eq!(posix_run("break"), None, "break outside loop");
+        assert_eq!(posix_run("unset RO; readonly RO=1; unset RO"), None, "unset readonly var");
+        assert_eq!(posix_run("eval false"), None, "eval propagates child status");
+        assert_eq!(posix_run("f(){ return 2; }; f"), None, "legit return 2");
+        assert_eq!(posix_run("trap x NOSUCHSIG"), None, "trap bad signal");
+        assert_eq!(posix_run("export \"AA[4]\""), None, "export bad name no =");
+    }
+    #[test]
+    fn posix_command_builtin_wrappers_strip_fatal() {
+        assert_eq!(posix_run("command set -o bad"), None, "command strips");
+        assert_eq!(posix_run("builtin set -o bad"), None, "builtin strips");
+        assert_eq!(posix_run("command export AA[4]=1"), None, "command strips assignment");
     }
 
     #[test]

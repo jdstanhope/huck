@@ -98,7 +98,15 @@ pub fn run_builtin(
         "cd" => builtin_cd(args, out, err, shell),
         "pwd" => builtin_pwd(args, out, err, shell),
         "echo" => builtin_echo(args, out, err),
-        "exit" => builtin_exit(args, err, shell),
+        "exit" => {
+            let outcome = builtin_exit(args, err, shell);
+            // POSIX case #1: `exit <non-numeric>` is a usage error (the only
+            // Continue(2) exit produces; a valid `exit N` is ExecOutcome::Exit).
+            if matches!(outcome, ExecOutcome::Continue(2)) {
+                shell.builtin_usage_error = Some(2);
+            }
+            outcome
+        }
         "unset" => builtin_unset(args, err, shell),
         "jobs" => builtin_jobs(args, out, err, shell),
         "wait" => builtin_wait(args, out, err, shell),
@@ -147,7 +155,22 @@ pub fn run_builtin(
         "test" | "[" => builtin_test(name, args, err, shell),
         "break" => builtin_break(args, err, shell),
         "continue" => builtin_continue(args, err, shell),
-        "return" => builtin_return(args, shell),
+        "return" => {
+            // POSIX case #1: `return` outside a function or sourced script is a
+            // usage error (bash: "can only `return' from a function or sourced
+            // script"). A legitimate `return N` (inside a Function/Source frame)
+            // leaves the signal unset. Detected here (builtin_return takes &Shell).
+            let in_fn_or_source = shell.call_stack.iter().any(|f| {
+                matches!(
+                    f.kind,
+                    crate::shell_state::FrameKind::Function | crate::shell_state::FrameKind::Source
+                )
+            });
+            if !in_fn_or_source {
+                shell.builtin_usage_error = Some(2);
+            }
+            builtin_return(args, shell)
+        }
         "bind" => builtin_bind(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
@@ -639,6 +662,9 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
             }
             s if s.len() > 1 && s.starts_with('-') => {
                 e!(err, "huck: unset: {s}: invalid option");
+                // POSIX case #1: bad option is a usage error (the "cannot unset
+                // readonly" path below is runtime and stays unmarked).
+                shell.builtin_usage_error = Some(2);
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -1154,6 +1180,8 @@ fn builtin_export_decl(
                                 e!(err,
                                     "export: usage: export [-fn] [name[=value] ...] or export -p"
                                 );
+                                // POSIX case #1: bad option is a usage error.
+                                shell.builtin_usage_error = Some(2);
                                 return ExecOutcome::Continue(2);
                             }
                         }
@@ -1247,6 +1275,10 @@ fn builtin_export_decl(
                 if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
                     let name = a.target.name();
                     e!(err, "huck: export: `{name}': not a valid identifier");
+                    // POSIX case #1: an invalid-identifier ASSIGNMENT (`AA[4]=1`)
+                    // is a bad-assignment usage error → exit status 1. A bad name
+                    // WITHOUT `=` (the Plain branches above) stays unmarked.
+                    shell.builtin_usage_error = Some(1);
                     any_error = true;
                     continue;
                 }
@@ -1562,6 +1594,8 @@ fn builtin_readonly_decl(
             }
             o if o.starts_with('-') && o.len() > 1 => {
                 e!(err, "huck: readonly: {o}: invalid option");
+                // POSIX case #1: bad option is a usage error.
+                shell.builtin_usage_error = Some(2);
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -1651,6 +1685,10 @@ fn builtin_readonly_decl(
                     e!(err,
                         "huck: readonly: `{name}': cannot make subscripted-assignment target readonly"
                     );
+                    // POSIX case #1: invalid-identifier ASSIGNMENT (`AA[4]=1`) →
+                    // bad-assignment usage error, exit status 1. A bad name without
+                    // `=` (the Plain branch above) stays unmarked.
+                    shell.builtin_usage_error = Some(1);
                     exit = 1;
                 }
             },
@@ -5062,6 +5100,16 @@ fn print_options_reinput(out: &mut dyn Write, shell: &Shell) -> ExecOutcome {
 }
 
 fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    // POSIX case #1: a `set` option error exits a non-interactive posix shell
+    // ONLY when an `-o`/`+o` option NAME is genuinely invalid
+    // (`OptSetErr::Unknown`). Unimplemented-but-valid-in-bash options
+    // (`set -o emacs`) and unknown single-char flags (`set -h`) are accepted
+    // by bash and must NOT exit, so `builtin_set_inner` flags only the four
+    // `OptSetErr::Unknown` arms via `shell.builtin_usage_error`.
+    builtin_set_inner(args, out, err, shell)
+}
+
+fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if crate::restricted::is_restricted(shell)
         && args.iter().any(|a| a == "+r")
         && let Err(msg) = crate::restricted::check_set_plus_r()
@@ -5106,6 +5154,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
                 }
                 Err(OptSetErr::Unknown) => {
                     e!(err, "huck: set: -o: invalid option name: {}", args[i]);
+                    shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5125,6 +5174,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
                 }
                 Err(OptSetErr::Unknown) => {
                     e!(err, "huck: set: +o: invalid option name: {}", args[i]);
+                    shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -5163,6 +5213,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
                                     "huck: set: -o: invalid option name: {}",
                                     args[i]
                                 );
+                                shell.builtin_usage_error = Some(2);
                                 return ExecOutcome::Continue(2);
                             }
                         }
@@ -5208,6 +5259,7 @@ fn builtin_set(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
                                     "huck: set: +o: invalid option name: {}",
                                     args[i]
                                 );
+                                shell.builtin_usage_error = Some(2);
                                 return ExecOutcome::Continue(2);
                             }
                         }
@@ -6052,6 +6104,9 @@ pub(crate) fn source_in_sink(
         let mut err = crate::executor::err_writer(err_sink, sink);
         if args.is_empty() {
             e!(&mut *err, "huck: .: usage: . filename [arguments]");
+            // POSIX case #1: missing-filename usage error (the not-found case at
+            // resolve_source_path below was Task 2 and stays posix_fatal(1)).
+            shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
         if shell.source_depth >= 64 {
@@ -6064,6 +6119,7 @@ pub(crate) fn source_in_sink(
         Some(p) => p,
         None => {
             { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: .: {filename}: file not found"); }
+            shell.posix_fatal(1);
             return ExecOutcome::Continue(1);
         }
     };
@@ -6287,7 +6343,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             // !is_interactive so interactive source/. and the rc
                             // path keep continuing past the error.
                             if !shell.is_interactive
-                                && let Some(st) = shell.take_pending_fatal_pe_error()
+                                && let Some(st) = shell.take_pending_fatal_status()
                             {
                                 return ExecOutcome::Exit(st);
                             }

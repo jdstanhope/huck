@@ -138,7 +138,7 @@ pub(crate) fn eval_arith_word(
 /// `${a[-1]}` is the highest-subscript element. Returns `Err(msg)` if
 /// the subscript fails to parse/eval, or if the wrap-around still
 /// yields a negative index. The caller decides whether to print the
-/// diagnostic and set `pending_fatal_pe_error`.
+/// diagnostic and set `pending_fatal_status`.
 pub(crate) fn eval_subscript(
     subscript: &Word,
     shell: &mut Shell,
@@ -387,7 +387,7 @@ fn expand_assoc_param(
             let val = shell.lookup_associative_element(name, &key);
             if val.is_none() && shell.shell_options.nounset {
                 with_err(|err| e!(err, "huck: {name}[{key}]: unbound variable"));
-                shell.pending_fatal_pe_error = Some(1);
+                shell.pending_fatal_status = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -428,7 +428,7 @@ fn expand_assoc_param(
                 Ok(v) => v,
                 Err(e) => {
                     with_err(|err| e!(err, "huck: {name}: {e}"));
-                    shell.pending_fatal_pe_error = Some(1);
+                    shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -724,7 +724,7 @@ fn expand_array_param(
     use crate::param_expansion::ExpansionResult;
     use crate::shell_state::ResolvedName;
 
-    if shell.pending_fatal_pe_error.is_some() {
+    if shell.pending_fatal_status.is_some() {
         return ExpansionResult::Empty;
     }
 
@@ -792,14 +792,14 @@ fn expand_array_param(
                 Ok(i) => i,
                 Err(e) => {
                     with_err(|err| e!(err, "huck: {e}"));
-                    shell.pending_fatal_pe_error = Some(1);
+                    shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
             let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
                 with_err(|err| e!(err, "huck: {name}[{idx}]: unbound variable"));
-                shell.pending_fatal_pe_error = Some(1);
+                shell.pending_fatal_status = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
             ExpansionResult::Value(val.unwrap_or_default())
@@ -814,7 +814,7 @@ fn expand_array_param(
                 Ok(i) => i,
                 Err(e) => {
                     with_err(|err| e!(err, "huck: {e}"));
-                    shell.pending_fatal_pe_error = Some(1);
+                    shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -845,7 +845,7 @@ fn expand_array_param(
                 Ok(v) => v,
                 Err(e) => {
                     with_err(|err| e!(err, "huck: {name}: {e}"));
-                    shell.pending_fatal_pe_error = Some(1);
+                    shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -1027,7 +1027,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         with_err(|err| e!(err, "huck: {name}: unbound variable"));
-                        shell.pending_fatal_pe_error = Some(1);
+                        shell.pending_fatal_status = Some(1);
                         return ControlFlow::Break(());
                     }
                 }
@@ -1046,7 +1046,7 @@ fn expand_part(
                 None => {
                     if shell.shell_options.nounset {
                         with_err(|err| e!(err, "huck: {name}: unbound variable"));
-                        shell.pending_fatal_pe_error = Some(1);
+                        shell.pending_fatal_status = Some(1);
                         return ControlFlow::Break(());
                     }
                     String::new()
@@ -1117,13 +1117,14 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    // Print the error but DO NOT set pending_fatal_pe_error —
-                    // bash script-file mode prints and continues. The empty
-                    // contribution here matches bash's empty $((..)) value
-                    // on error. (-c mode divergence: L-55 in
-                    // bash-divergences.md.)
+                    // Print the error. Default mode: NON-fatal (v215) — prints
+                    // and continues; the empty contribution matches bash's empty
+                    // $((..)) value on error. (-c mode divergence: L-55 in
+                    // bash-divergences.md.) POSIX non-interactive: the shell
+                    // exits (127) via posix_fatal (a no-op in default mode).
                     let prefix = shell.error_prefix(None);
                     with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                    shell.posix_fatal(127);
                     *has_emitted = true;
                 }
             }
@@ -1208,7 +1209,7 @@ fn expand_part(
                     }
                 }
                 crate::param_expansion::ExpansionResult::Fatal { status } => {
-                    shell.pending_fatal_pe_error = Some(status);
+                    shell.pending_fatal_status = Some(status);
                     return ControlFlow::Break(());
                 }
             }
@@ -1598,7 +1599,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     None => {
                         if shell.shell_options.nounset {
                             with_err(|err| e!(err, "huck: {name}: unbound variable"));
-                            shell.pending_fatal_pe_error = Some(1);
+                            shell.pending_fatal_status = Some(1);
                             return result;
                         }
                     }
@@ -1659,7 +1660,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         result.push_str(&joined);
                     }
                     crate::param_expansion::ExpansionResult::Fatal { status } => {
-                        shell.pending_fatal_pe_error = Some(status);
+                        shell.pending_fatal_status = Some(status);
                         return result;
                     }
                 }
@@ -1688,7 +1689,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 // wrapper exists only for source reconstruction.
                 for inner in parts {
                     result.push_str(&expand_assignment(&Word(vec![inner.clone()]), shell));
-                    if shell.pending_fatal_pe_error.is_some() {
+                    if shell.pending_fatal_status.is_some() {
                         return result;
                     }
                 }
@@ -1756,7 +1757,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
         } else {
             expand_assignment(&Word(vec![part.clone()]), shell)
         };
-        if shell.pending_fatal_pe_error.is_some() {
+        if shell.pending_fatal_status.is_some() {
             return result;
         }
         if word_part_is_quoted(part) {
@@ -1784,7 +1785,7 @@ pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
         } else {
             expand_assignment(&Word(vec![part.clone()]), shell)
         };
-        if shell.pending_fatal_pe_error.is_some() {
+        if shell.pending_fatal_status.is_some() {
             return result;
         }
         if word_part_is_quoted(part) {
@@ -2985,23 +2986,33 @@ mod tests {
         // An arith eval error (e.g. division by zero) in $((…)) is NO LONGER
         // a fatal expansion error — bash script-file mode prints the error
         // and continues. The error still surfaces via stderr;
-        // pending_fatal_pe_error stays None so the surrounding command list
+        // pending_fatal_status stays None so the surrounding command list
         // runs to completion. The `-c` mode divergence is tracked as L-55.
         let mut shell = Shell::new();
         let word = Word(vec![arith_part("1 / 0")]);
         let _ = expand(&word, &mut shell);
-        assert_eq!(shell.pending_fatal_pe_error, None);
+        assert_eq!(shell.pending_fatal_status, None);
+    }
+
+    #[test]
+    fn expand_arith_error_is_posix_fatal() {
+        let mut shell = Shell::new();
+        shell.shell_options.posix = true;
+        shell.is_interactive = false;
+        let word = Word(vec![arith_part("1 + ")]);
+        let _ = expand(&word, &mut shell);
+        assert_eq!(shell.pending_fatal_status, Some(127));
     }
 
     #[test]
     fn expand_arith_part_invalid_lhs_assignment_is_nonfatal() {
         // A parse-time arith error (e.g. assignment to a non-lvalue) is also
-        // non-fatal. The expansion contributes empty; pending_fatal_pe_error
+        // non-fatal. The expansion contributes empty; pending_fatal_status
         // stays None.
         let mut shell = Shell::new();
         let word = Word(vec![arith_part("1 + 2 = 3")]);
         let _ = expand(&word, &mut shell);
-        assert_eq!(shell.pending_fatal_pe_error, None);
+        assert_eq!(shell.pending_fatal_status, None);
     }
 
     #[test]
@@ -3104,10 +3115,10 @@ mod tests {
         }]);
         let fields = expand(&word, &mut shell);
         // v34 (Task 4): expand() now bails early on Fatal, stashing status on
-        // pending_fatal_pe_error and returning the partial (empty) result
+        // pending_fatal_status and returning the partial (empty) result
         // without the end-of-word push, so fields is empty.
         assert_eq!(fields.len(), 0);
-        assert_eq!(shell.pending_fatal_pe_error, Some(1));
+        assert_eq!(shell.pending_fatal_status, Some(1));
     }
 
     #[test]
@@ -3690,7 +3701,7 @@ mod array_expansion_tests {
         let mut s = shell_with_a();
         s.shell_options.nounset = true;
         let _ = expand_for_test(&mut s, "${a[99]}");
-        assert!(s.pending_fatal_pe_error.is_some());
+        assert!(s.pending_fatal_status.is_some());
     }
 
     #[test]
@@ -3709,7 +3720,7 @@ mod array_expansion_tests {
         // rather than silently using idx 0.
         let mut s = Shell::new();
         let _ = expand_for_test(&mut s, "${#nonexistent[-1]}");
-        assert!(s.pending_fatal_pe_error.is_some());
+        assert!(s.pending_fatal_status.is_some());
     }
 
     // v73 regression: ${a[i]:-default} on a missing index must substitute
@@ -3738,7 +3749,7 @@ mod array_expansion_tests {
     fn error_if_unset_on_missing_index_fires() {
         let mut s = shell_with_a();
         let _ = expand_for_test(&mut s, "${a[99]:?missing}");
-        assert!(s.pending_fatal_pe_error.is_some());
+        assert!(s.pending_fatal_status.is_some());
     }
 
     // v73 regression: ${a[i]:+alt} on a missing index returns empty (the
@@ -3972,7 +3983,7 @@ mod assoc_expansion_tests {
         let mut s = shell_with_m();
         s.shell_options.nounset = true;
         let _ = expand_for_test(&mut s, "${m[nope]}");
-        assert!(s.pending_fatal_pe_error.is_some());
+        assert!(s.pending_fatal_status.is_some());
     }
 
     #[test]
@@ -3999,7 +4010,7 @@ mod assoc_expansion_tests {
     fn error_if_unset_on_missing_associative_key_fires() {
         let mut s = shell_with_m();
         let _ = expand_for_test(&mut s, "${m[nope]:?missing}");
-        assert!(s.pending_fatal_pe_error.is_some());
+        assert!(s.pending_fatal_status.is_some());
     }
 
     // v73 regression: ${m[k]:+alt} on a missing key returns empty (the
