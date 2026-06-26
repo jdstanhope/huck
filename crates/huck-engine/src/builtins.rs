@@ -48,6 +48,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "umask",
     "ulimit",
     "times",
+    "enable",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -186,6 +187,7 @@ pub fn run_builtin(
         "umask" => builtin_umask(args, out, err, shell),
         "ulimit" => builtin_ulimit(args, out, err, shell),
         "times" => builtin_times(args, out, err, shell),
+        "enable" => builtin_enable(args, out, err, shell),
         _ => unreachable!("run_builtin called with non-builtin: {name}"),
     }
 }
@@ -13439,6 +13441,64 @@ fn builtin_times(_args: &[String], out: &mut dyn Write, _err: &mut dyn Write, _s
     ExecOutcome::Continue(0)
 }
 
+fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    const USAGE: &str = "enable: usage: enable [-a] [-dnps] [-f filename] [name ...]";
+    let mut disable = false; // -n
+    let mut all = false;     // -a
+    let mut special = false; // -s
+    let mut idx = 0;
+    while idx < args.len() {
+        let a = &args[idx];
+        if a == "--" { idx += 1; break; }
+        if a.len() > 1 && a.starts_with('-') {
+            for c in a[1..].chars() {
+                match c {
+                    'n' => disable = true,
+                    'a' => all = true,
+                    's' => special = true,
+                    'p' => {} // print format — the listing default
+                    other => {
+                        let prefix = shell.error_prefix(Some("enable"));
+                        e!(err, "{prefix}-{other}: invalid option");
+                        e!(err, "{USAGE}");
+                        return ExecOutcome::Continue(2);
+                    }
+                }
+            }
+            idx += 1;
+        } else { break; }
+    }
+    let names = &args[idx..];
+
+    if names.is_empty() {
+        let mut cands: Vec<&str> = BUILTIN_NAMES.iter().copied()
+            .filter(|n| !special || is_special_builtin(n))
+            .collect();
+        cands.sort_unstable();
+        for n in cands {
+            let is_off = shell.disabled_builtins.contains(n);
+            let show = if disable { is_off } else if all { true } else { !is_off };
+            if !show { continue; }
+            if is_off { let _ = writeln!(out, "enable -n {n}"); }
+            else { let _ = writeln!(out, "enable {n}"); }
+        }
+        return ExecOutcome::Continue(0);
+    }
+
+    let mut status = 0;
+    for name in names {
+        if !is_builtin(name) {
+            let prefix = shell.error_prefix(Some("enable"));
+            e!(err, "{prefix}{name}: not a shell builtin");
+            status = 1;
+            continue;
+        }
+        if disable { shell.disabled_builtins.insert(name.clone()); }
+        else { shell.disabled_builtins.remove(name); }
+    }
+    ExecOutcome::Continue(status)
+}
+
 #[cfg(test)]
 mod ulimit_tests {
     #[test]
@@ -13448,6 +13508,20 @@ mod ulimit_tests {
         let n = super::ulimit_lookup('n').unwrap();
         assert_eq!(n.mult, 1);
         assert!(super::ulimit_lookup('Z').is_none());
+    }
+}
+
+#[cfg(test)]
+mod enable_tests {
+    #[test]
+    fn enable_toggle_updates_set() {
+        let mut sh = crate::shell_state::Shell::new();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        super::builtin_enable(&["-n".into(), "test".into()], &mut out, &mut err, &mut sh);
+        assert!(sh.disabled_builtins.contains("test"));
+        super::builtin_enable(&["test".into()], &mut out, &mut err, &mut sh);
+        assert!(!sh.disabled_builtins.contains("test"));
     }
 }
 
