@@ -204,7 +204,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                         // (stdin not a TTY), exit immediately with the fatal
                         // status. Interactive: $? already set; fall through
                         // to the next prompt iteration.
-                        if let Some(fatal_status) = shell.take_pending_fatal_pe_error()
+                        if let Some(fatal_status) = shell.take_pending_fatal_status()
                             && !shell.is_interactive
                         {
                             huck_engine::traps::fire_exit_trap(&mut shell);

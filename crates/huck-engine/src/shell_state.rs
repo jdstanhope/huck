@@ -475,9 +475,13 @@ pub struct Shell {
     /// `Some(status)` after a fatal parameter-expansion error fires
     /// inside an `expand_*` call. The executor peeks this to bail the
     /// current simple command; the REPL loop drains it via
-    /// `take_pending_fatal_pe_error` to decide whether to exit (in
+    /// `take_pending_fatal_status` to decide whether to exit (in
     /// non-interactive mode) or return to prompt (interactive).
-    pub pending_fatal_pe_error: Option<i32>,
+    pub pending_fatal_status: Option<i32>,
+    /// Set by a POSIX special builtin when it hits a usage / bad-option /
+    /// bad-assignment error (NOT a runtime error). Consumed by the executor's
+    /// bare special-builtin dispatch to fire `posix_fatal`. Cleared per command.
+    pub builtin_usage_error: Option<i32>,
     /// True if stdin was a TTY at startup. Determines whether fatal PE
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
@@ -762,7 +766,8 @@ impl Shell {
             call_stack: Vec::new(),
             inline_scopes: Vec::new(),
             function_source: std::collections::HashMap::new(),
-            pending_fatal_pe_error: None,
+            pending_fatal_status: None,
+            builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
             in_subshell: false,
             in_completion: false,
@@ -2430,8 +2435,16 @@ impl Shell {
     }
 
     /// Returns and clears the pending fatal-PE-error flag.
-    pub fn take_pending_fatal_pe_error(&mut self) -> Option<i32> {
-        self.pending_fatal_pe_error.take()
+    pub fn take_pending_fatal_status(&mut self) -> Option<i32> {
+        self.pending_fatal_status.take()
+    }
+
+    /// Mark a POSIX-mode fatal error: a non-interactive posix shell exits with
+    /// `status`. No-op in default mode or interactively (matches bash).
+    pub fn posix_fatal(&mut self, status: i32) {
+        if self.shell_options.posix && !self.is_interactive {
+            self.pending_fatal_status = Some(status);
+        }
     }
 
     /// Iterates only the exported variables, suitable for passing to a child
@@ -2687,6 +2700,24 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_fatal_is_gated_on_posix_and_noninteractive() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        // default mode → no-op
+        sh.posix_fatal(127);
+        assert_eq!(sh.pending_fatal_status, None);
+        // posix + non-interactive → sets
+        sh.shell_options.posix = true;
+        sh.posix_fatal(127);
+        assert_eq!(sh.pending_fatal_status, Some(127));
+        // posix + interactive → no-op (clear first)
+        sh.pending_fatal_status = None;
+        sh.is_interactive = true;
+        sh.posix_fatal(2);
+        assert_eq!(sh.pending_fatal_status, None);
+    }
 
     #[test]
     fn funcname_assignment_is_silently_discarded() {

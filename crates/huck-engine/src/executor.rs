@@ -384,7 +384,7 @@ fn run_andor_group(
     // would see a stale value.
     if let ExecOutcome::Continue(c) = status {
         shell.set_last_status(c);
-        if shell.pending_fatal_pe_error.is_some() {
+        if shell.pending_fatal_status.is_some() {
             return ExecOutcome::Continue(c);
         }
         crate::traps::dispatch_pending_traps(shell);
@@ -424,7 +424,7 @@ fn run_andor_group(
             }
             if let ExecOutcome::Continue(c) = status {
                 shell.set_last_status(c);
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return ExecOutcome::Continue(c);
                 }
                 crate::traps::dispatch_pending_traps(shell);
@@ -2301,7 +2301,7 @@ fn run_case(
     while i < clause.items.len() {
         let item = &clause.items[i];
         let run_this = fall_through || case_item_matches(item, &subject, shell);
-        if let Some(status) = shell.pending_fatal_pe_error {
+        if let Some(status) = shell.pending_fatal_status {
             return ExecOutcome::Continue(status);
         }
         if !run_this {
@@ -3427,7 +3427,7 @@ fn resolve(
         Ok(v) => v,
         Err(()) => return Err(1),
     };
-    if let Some(status) = shell.pending_fatal_pe_error {
+    if let Some(status) = shell.pending_fatal_status {
         return Err(status);
     }
     if prog_fields.is_empty() {
@@ -3472,7 +3472,7 @@ fn resolve(
             Ok(v) => v,
             Err(()) => return Err(1),
         };
-        if let Some(status) = shell.pending_fatal_pe_error {
+        if let Some(status) = shell.pending_fatal_status {
             return Err(status);
         }
         if let Some(da) = decl_args.as_mut() {
@@ -6799,7 +6799,7 @@ fn expand_array_elements(
                 };
                 map.insert(idx, expand_assignment(&elem.value, shell));
                 implicit = idx + 1;
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return Err(());
                 }
             }
@@ -6808,7 +6808,7 @@ fn expand_array_elements(
                     map.insert(implicit, field);
                     implicit += 1;
                 }
-                if shell.pending_fatal_pe_error.is_some() {
+                if shell.pending_fatal_status.is_some() {
                     return Err(());
                 }
             }

@@ -6287,7 +6287,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             // !is_interactive so interactive source/. and the rc
                             // path keep continuing past the error.
                             if !shell.is_interactive
-                                && let Some(st) = shell.take_pending_fatal_pe_error()
+                                && let Some(st) = shell.take_pending_fatal_status()
                             {
                                 return ExecOutcome::Exit(st);
                             }
