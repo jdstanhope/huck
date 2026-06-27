@@ -6246,22 +6246,39 @@ fn resolve_source_path(
     filename: &str,
     shell: &crate::shell_state::Shell,
 ) -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    // Accept any existing path that is NOT a directory: regular file, char/block
+    // device, fifo, or a symlink to one (bash sources /dev/null, /dev/stdin,
+    // fifos, and procsub /dev/fd/N). A directory is rejected here and reported as
+    // "is a directory" by the caller's None branch.
+    let usable = |p: &Path| -> bool {
+        match std::fs::metadata(p) {
+            // follows symlinks
+            Ok(m) => !m.is_dir(),
+            Err(_) => false,
+        }
+    };
     if filename.contains('/') {
         let p = PathBuf::from(filename);
-        return if p.is_file() { Some(p) } else { None };
+        return usable(&p).then_some(p);
     }
-    let path_var = shell.lookup_var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = PathBuf::from(dir).join(filename);
-        if candidate.is_file() {
-            return Some(candidate);
+    // No slash: PATH search is gated on `shopt sourcepath` (default on); when off,
+    // or when the file is not found in PATH, fall back to the current directory.
+    let sourcepath = shell.shopt_options.get("sourcepath").unwrap_or(true);
+    if sourcepath {
+        let path_var = shell.lookup_var("PATH").unwrap_or_default();
+        for dir in path_var.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(dir).join(filename);
+            if usable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
-    None
+    let cwd_candidate = PathBuf::from(filename); // ./filename
+    usable(&cwd_candidate).then_some(cwd_candidate)
 }
 
 /// A parse error that only signals "the input ended mid-compound". When the
@@ -6352,6 +6369,37 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // lex_lines.len() == total + 1 (includes sentinel); slice to total.
         let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
         let token_lines: Vec<u32> = lex_lines[..total].iter().map(|&l| l + base_line).collect();
+        // v231: honor `shopt expand_aliases` (and interactive) in the file/source/-c
+        // path. Expand aliases on the chunk tokens, remapping offsets/lines back to
+        // the ORIGINAL source tokens via a provenance map so byte-offset bookkeeping
+        // (`unit_end_abs`, `set -v`) stays anchored to the raw source bytes.
+        let expand = shell.is_interactive
+            || shell.shopt_options.get("expand_aliases").unwrap_or(false);
+        let alias_gen = shell.alias_generation;
+        let (tokens, token_lines, offsets, total) = if expand && !shell.aliases.is_empty() {
+            match crate::alias_expand::expand_aliases_in_tokens_mapped(tokens, &shell.aliases) {
+                Ok((exp, map)) => {
+                    let e = exp.len();
+                    let offsets2: Vec<usize> = (0..e)
+                        .map(|j| offsets[map[j]])
+                        .chain(std::iter::once(offsets[total]))
+                        .collect();
+                    let lines2: Vec<u32> = (0..e).map(|j| token_lines[map[j]]).collect();
+                    (exp, lines2, offsets2, e)
+                }
+                Err(le) => {
+                    {
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        e!(&mut *err, "huck: {}: line {}: syntax error{}",
+                            path.display(), line_of(start), crate::lex_error_message(&le));
+                    }
+                    last_status = 2;
+                    break 'outer;
+                }
+            }
+        } else {
+            (tokens, token_lines, offsets, total)
+        };
         let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {
@@ -6435,10 +6483,18 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                     }
 
-                    // A command may have flipped `shopt extglob`, which changes
-                    // how the remainder must be lexed. Re-lex from here.
+                    // A command may have flipped `shopt extglob` or the alias
+                    // table changed, both of which require re-lexing the remainder.
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-                    if new_extglob != extglob {
+                    let new_expand = shell.is_interactive
+                        || shell.shopt_options.get("expand_aliases").unwrap_or(false);
+                    // Note: when alias expansion ran, `total` was re-bound to the
+                    // EXPANDED token count, so `unit_end_idx == total` below still
+                    // means "consumed every token" in the expanded stream.
+                    if new_extglob != extglob
+                        || new_expand != expand
+                        || (new_expand && shell.alias_generation != alias_gen)
+                    {
                         // If this flipping unit was the last complete token before
                         // a lex truncation, the un-lexed tail begins at the start
                         // of the failing line — `offsets[total]` is the
@@ -6561,6 +6617,7 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                 continue;
             }
             shell.aliases.insert(name.to_string(), value.to_string());
+            shell.alias_generation += 1;
         } else {
             match shell.aliases.get(arg) {
                 Some(v) => {
@@ -6583,6 +6640,7 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     }
     if args[0] == "-a" {
         shell.aliases.clear();
+        shell.alias_generation += 1;
         return ExecOutcome::Continue(0);
     }
     let mut any_failed = false;
@@ -6590,6 +6648,8 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         if shell.aliases.remove(name).is_none() {
             e!(err, "huck: unalias: {name}: not found");
             any_failed = true;
+        } else {
+            shell.alias_generation += 1;
         }
     }
     ExecOutcome::Continue(if any_failed { 1 } else { 0 })
@@ -13539,5 +13599,21 @@ mod normalize_logical_tests {
         assert_eq!(normalize_logical("/a/../.."), "/");
         assert_eq!(normalize_logical("/"), "/");
         assert_eq!(normalize_logical("/tmp/m/link/.."), "/tmp/m");
+    }
+}
+
+#[cfg(test)]
+mod alias_generation_tests {
+    #[test]
+    fn alias_generation_bumps_on_define_and_unalias() {
+        let mut sh = crate::shell_state::Shell::new();
+        let g0 = sh.alias_generation;
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        super::builtin_alias(&["foo=bar".into()], &mut out, &mut err, &mut sh);
+        assert!(sh.alias_generation > g0, "define must bump");
+        let g1 = sh.alias_generation;
+        super::builtin_unalias(&["foo".into()], &mut err, &mut sh);
+        assert!(sh.alias_generation > g1, "unalias must bump");
     }
 }
