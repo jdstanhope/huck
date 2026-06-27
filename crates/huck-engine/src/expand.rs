@@ -1443,6 +1443,12 @@ fn reconstruct_param_expansion(
     out: &mut String,
 ) {
     use crate::lexer::{ParamModifier as M, SubstAnchor, CaseDirection, SubscriptKind as S, TransformOp};
+    // A bad substitution carries its full `${…}` source verbatim; emit it as-is
+    // so `set -x` traces reproduce the original (matches generate.rs).
+    if let M::BadSubst { raw } = modifier {
+        out.push_str(raw);
+        return;
+    }
     out.push_str("${");
     if indirect || matches!(modifier, M::IndirectKeys) {
         out.push('!');
