@@ -32,12 +32,13 @@ fn error_line_is_command_start_not_line_one() {
 
 #[test]
 fn lex_error_reports_line() {
-    // `${}` (parameter expansion with an empty name) is a lex error on line 2.
-    // (An unterminated quote is treated as an open continuation in huck, so it
-    // never reaches the lexer; an empty-name `${}` is a complete-line lex error.)
+    // `${}` (parameter expansion with an empty name) parses fine and defers to
+    // a RUNTIME "bad substitution" on line 2 (v233: lexable-but-invalid `${…}`
+    // matches bash instead of aborting the parse). The physical-line guarantee
+    // this file exists to verify still holds: the error reports `line 2:`.
     let (_o, se, _c) = run_script("echo ok\necho ${}\n");
     assert!(se.contains("line 2:"), "expected 'line 2:', got: {se:?}");
-    assert!(se.contains("syntax error"), "stderr: {se:?}");
+    assert!(se.contains("bad substitution"), "stderr: {se:?}");
 }
 
 #[test]
