@@ -6246,22 +6246,39 @@ fn resolve_source_path(
     filename: &str,
     shell: &crate::shell_state::Shell,
 ) -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    // Accept any existing path that is NOT a directory: regular file, char/block
+    // device, fifo, or a symlink to one (bash sources /dev/null, /dev/stdin,
+    // fifos, and procsub /dev/fd/N). A directory is rejected here and reported as
+    // "is a directory" by the caller's None branch.
+    let usable = |p: &Path| -> bool {
+        match std::fs::metadata(p) {
+            // follows symlinks
+            Ok(m) => !m.is_dir(),
+            Err(_) => false,
+        }
+    };
     if filename.contains('/') {
         let p = PathBuf::from(filename);
-        return if p.is_file() { Some(p) } else { None };
+        return usable(&p).then_some(p);
     }
-    let path_var = shell.lookup_var("PATH").unwrap_or_default();
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = PathBuf::from(dir).join(filename);
-        if candidate.is_file() {
-            return Some(candidate);
+    // No slash: PATH search is gated on `shopt sourcepath` (default on); when off,
+    // or when the file is not found in PATH, fall back to the current directory.
+    let sourcepath = shell.shopt_options.get("sourcepath").unwrap_or(true);
+    if sourcepath {
+        let path_var = shell.lookup_var("PATH").unwrap_or_default();
+        for dir in path_var.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(dir).join(filename);
+            if usable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
-    None
+    let cwd_candidate = PathBuf::from(filename); // ./filename
+    usable(&cwd_candidate).then_some(cwd_candidate)
 }
 
 /// A parse error that only signals "the input ended mid-compound". When the
