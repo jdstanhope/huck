@@ -780,6 +780,14 @@ fn param_expansion_to_source(
         // emitted regardless of `indirect` (the AST keeps indirect=false but
         // the construct is written with a leading `!`).
         ParamModifier::IndirectKeys => format!("${{!{name}{sub}}}"),
+        // `${!prefix*}` / `${!prefix@}` — prefix-name expansion (the `!` is a
+        // prefix and `*`/`@` a suffix, so it doesn't fit the generic shape).
+        ParamModifier::PrefixNames { at } => {
+            format!("${{!{name}{}}}", if *at { "@" } else { "*" })
+        }
+        // `${…}` bad substitution: `raw` is the full `${…}` text already;
+        // reproduce it verbatim so `declare -f` / `type` round-trips cleanly.
+        ParamModifier::BadSubst { raw } => raw.clone(),
         _ => {
             let suffix = modifier_suffix(modifier);
             format!("${{{bang}{name}{sub}{suffix}}}")
@@ -794,6 +802,14 @@ fn modifier_suffix(modifier: &ParamModifier) -> String {
         ParamModifier::None => String::new(),
         ParamModifier::Length | ParamModifier::IndirectKeys => {
             unreachable!("Length/IndirectKeys handled by param_expansion_to_source")
+        }
+        ParamModifier::PrefixNames { .. } => {
+            unreachable!("PrefixNames handled by param_expansion_to_source")
+        }
+        ParamModifier::BadSubst { raw } => {
+            // Handled by param_expansion_to_source before reaching here;
+            // this arm exists only for exhaustiveness.
+            raw.clone()
         }
         ParamModifier::UseDefault { word, colon } => {
             format!("{}-{}", if *colon { ":" } else { "" }, word_to_source(word))

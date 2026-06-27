@@ -65,22 +65,21 @@ group.
   decisive completion source; deferred to avoid new filesystem/libc lookups.
 - **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
 - **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-92: prefix-name `${!prefix@}` / `${!prefix*}`** — `[deferred]` low.
-  The variable-NAME-listing forms of `${!…}` (expand to the names of all
-  set variables whose name begins with `prefix`) are not implemented —
-  the lexer's `${!` branch handles only the scalar-indirect form (M-91).
-  Not used by the bashrc / bash-completion; deferred. M-91 follow-on.
-- **M-94: indirect through `@` / `*` — `${!@}` / `${!*}`** — `[deferred]` low
-  (found during v195). bash treats `${!@}` / `${!*}` as indirect expansion
-  whose source parameter is the positional list: with no args it yields empty
-  (rc 0), and with args it uses the joined value as a name (`set -- a b;
-  ${!@}` → "a b: invalid variable name"). huck rejects both at PARSE
-  (`syntax error: parameter expansion with empty name`) because the lexer's
-  `${!` branch does not accept `@`/`*` as the indirect parameter. Distinct from
-  M-92 (which is the `${!prefix@}` name-LISTING form); this is the bare
-  `@`/`*`-as-indirect-source case. The scalar / positional-digit indirect forms
-  all work (v195 `indirect_unset_positional_diff_check.sh`); only the
-  `@`/`*`-source variant is unparsed. Rare; M-91 follow-on.
+- **M-148: `${!name[@]<op>}` indirect-keys with a trailing operation** — `[deferred]`
+  low (v233 follow-on). v233 closed the `${!prefix*}`/`${!prefix@}` name-listing
+  forms (old M-92), `${!@}`/`${!*}`/`${!#}` special-param indirection (old M-94),
+  and the defer-to-runtime model for bad substitutions (old I-17). Two `${…}` parse
+  residuals remain, both still a `syntax error: unterminated '${...}'` at parse where
+  bash parses and evaluates: (a) indirect array KEYS followed by a non-`@` operation,
+  e.g. `${!arr[@]%b}` / `${!arr[@]#x}` (bash: `v=arr; arr=(a b); echo ${!v[@]%b}` →
+  `a`) — needs real indirect-keys-with-operation evaluation, not a parse-defer (bash
+  does NOT error, so routing to a runtime bad-subst would be wrong); (b) a nested
+  `${…}` whose inner operand is an ANSI-C `$'…'` used as a name, e.g.
+  `${x#${$'x1'%$'t'}}` (bash runs it → `tOK`). Both are rare; the M1–M4 target forms
+  all parse. RELATED text divergence: the in-scope M3 combo `${!arr[@]@OP}` defers to
+  a runtime `bad substitution` in huck, where bash variously evaluates it (assoc
+  arrays) or says `invalid variable name` (indexed) — huck's defer is a safe superset
+  but the message/rc can differ.
 
 ### Globbing
 
@@ -151,13 +150,6 @@ Things huck deliberately does differently from bash. Document and keep.
 - **huck**: the lexer accepts an array literal `name=(…)` as a command ARGUMENT and `expand()` reconstructs the argument to its `name=(…)` text — so `echo x=(a b)` prints `x=(a b)`.
 - **bash**: a parse-time syntax error (`echo x=(a b)` → `syntax error near unexpected token '('`).
 - **Why**: replicating bash's parse-time gating would need command-context-aware lexing; the reconstruction is harmless and is what makes `eval x=(a b)` / `declare`-style array-literal args work (v136 resolved the prior panic via this reconstruction).
-
-### I-17: malformed `${…}` rejected at parse, not runtime
-- **Status**: `[intentional]`
-- **Severity**: low (v192)
-- **huck**: rejects a malformed parameter expansion (`${}`, `${=1}`, `${ x}`, `${@x}`, `${1abc}`, `${-x}`, `${.}`) at PARSE time (`syntax error: parameter expansion with empty name` / `invalid parameter-expansion modifier`).
-- **bash**: parses these (`bash -n` rc 0) and emits the identical `bad substitution` error only at RUNTIME.
-- **Why**: the constructs are invalid in bash either way; huck's earlier error is by design (matching `bash -n`'s leniency would require a deferred-runtime-error path to accept syntax that is broken regardless). This is the parse sweep's remaining `${=1}` ×2 entries (`perf-completion.sh`, a zsh-only word-split form).
 
 ---
 
