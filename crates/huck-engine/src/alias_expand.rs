@@ -15,18 +15,35 @@ pub fn expand_aliases_in_tokens(
     tokens: Vec<Token>,
     aliases: &HashMap<String, String>,
 ) -> Result<Vec<Token>, LexError> {
-    let mut out: Vec<Token> = Vec::new();
-    let mut next_eligible = true;
-    let mut active: HashSet<String> = HashSet::new();
-    for token in tokens {
-        next_eligible = process_token(token, &mut out, next_eligible, aliases, &mut active)?;
-    }
-    Ok(out)
+    expand_aliases_in_tokens_mapped(tokens, aliases).map(|(t, _)| t)
 }
 
-fn process_token(
+/// Like `expand_aliases_in_tokens` but also returns, per output token, the index
+/// of the SOURCE token it originated from. Alias-body tokens inherit the index of
+/// the alias-name token they replaced; untouched tokens map to themselves. Used by
+/// the non-interactive source loop to remap byte-offsets/lines back to the raw
+/// source after expansion rewrites the token stream.
+pub fn expand_aliases_in_tokens_mapped(
+    tokens: Vec<Token>,
+    aliases: &HashMap<String, String>,
+) -> Result<(Vec<Token>, Vec<usize>), LexError> {
+    let mut out: Vec<Token> = Vec::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut next_eligible = true;
+    let mut active: HashSet<String> = HashSet::new();
+    for (src_idx, token) in tokens.into_iter().enumerate() {
+        next_eligible = process_token_mapped(
+            token, src_idx, &mut out, &mut map, next_eligible, aliases, &mut active,
+        )?;
+    }
+    Ok((out, map))
+}
+
+fn process_token_mapped(
     token: Token,
+    src_idx: usize,
     out: &mut Vec<Token>,
+    map: &mut Vec<usize>,
     eligible: bool,
     aliases: &HashMap<String, String>,
     active: &mut HashSet<String>,
@@ -42,22 +59,17 @@ fn process_token(
                 let inner_tokens = crate::lexer::tokenize(&body)?;
                 let mut inner_eligible = true;
                 for inner in inner_tokens {
-                    inner_eligible = process_token(
-                        inner,
-                        out,
-                        inner_eligible,
-                        aliases,
-                        active,
+                    // Body tokens inherit the alias-name token's source index.
+                    inner_eligible = process_token_mapped(
+                        inner, src_idx, out, map, inner_eligible, aliases, active,
                     )?;
                 }
                 active.remove(&name);
-                let trailing = body
-                    .chars()
-                    .last()
-                    .is_some_and(|c| c.is_whitespace());
+                let trailing = body.chars().last().is_some_and(|c| c.is_whitespace());
                 return Ok(trailing);
             }
             out.push(token);
+            map.push(src_idx);
             Ok(false)
         }
         Token::Op(op) => {
@@ -71,14 +83,17 @@ fn process_token(
                     | Operator::LParen
             );
             out.push(token);
+            map.push(src_idx);
             Ok(separator)
         }
         Token::Newline => {
             out.push(token);
+            map.push(src_idx);
             Ok(true)
         }
         _ => {
             out.push(token);
+            map.push(src_idx);
             Ok(eligible)
         }
     }
@@ -88,7 +103,7 @@ fn process_token(
 /// an unquoted Literal. Returns None for any quoted, Var, Arith,
 /// CommandSub, or Tilde part — aliases only expand from plain
 /// unquoted identifiers.
-fn simple_word_text(w: &Word) -> Option<String> {
+pub(crate) fn simple_word_text(w: &Word) -> Option<String> {
     let mut text = String::new();
     for part in &w.0 {
         match part {
@@ -186,5 +201,27 @@ mod tests {
         // `'ll'` is a quoted Literal — `simple_word_text` returns None
         // because `quoted: true`. So no expansion fires.
         assert_eq!(out, tokenize("'ll'").unwrap());
+    }
+
+    #[test]
+    fn mapped_expansion_tracks_source_indices() {
+        // alias ll='ls -l'; tokens: [ll, /usr] → [ls, -l, /usr] with map [0,0,1].
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = crate::lexer::tokenize("ll /usr").unwrap();
+        let (out, map) = super::expand_aliases_in_tokens_mapped(toks, &aliases).unwrap();
+        let words: Vec<String> = out.iter().filter_map(|t| match t {
+            crate::lexer::Token::Word(w) => super::simple_word_text(w), _ => None }).collect();
+        assert_eq!(words, vec!["ls", "-l", "/usr"]);
+        assert_eq!(map, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn mapped_noop_is_identity() {
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = crate::lexer::tokenize("echo hi").unwrap(); // no alias at cmd pos
+        let n = toks.len();
+        let (out, map) = super::expand_aliases_in_tokens_mapped(toks, &aliases).unwrap();
+        assert_eq!(out.len(), n);
+        assert_eq!(map, (0..n).collect::<Vec<_>>());
     }
 }
