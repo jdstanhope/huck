@@ -6488,6 +6488,9 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
                     let new_expand = shell.is_interactive
                         || shell.shopt_options.get("expand_aliases").unwrap_or(false);
+                    // Note: when alias expansion ran, `total` was re-bound to the
+                    // EXPANDED token count, so `unit_end_idx == total` below still
+                    // means "consumed every token" in the expanded stream.
                     if new_extglob != extglob
                         || new_expand != expand
                         || (new_expand && shell.alias_generation != alias_gen)
