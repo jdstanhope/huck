@@ -1449,6 +1449,15 @@ fn reconstruct_param_expansion(
         out.push_str(raw);
         return;
     }
+    // `${!prefix*}` / `${!prefix@}` — the `!` is a prefix and `*`/`@` a
+    // suffix, so it doesn't fit the generic `${[!][#]name[sub]MOD}` shape.
+    if let M::PrefixNames { at } = modifier {
+        out.push_str("${!");
+        out.push_str(name);
+        out.push(if *at { '@' } else { '*' });
+        out.push('}');
+        return;
+    }
     out.push_str("${");
     if indirect || matches!(modifier, M::IndirectKeys) {
         out.push('!');

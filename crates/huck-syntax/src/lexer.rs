@@ -190,6 +190,11 @@ pub enum ParamModifier {
     /// the bare indirect form `${!name}` is not yet supported; the
     /// lexer only emits this on a subscripted reference.
     IndirectKeys,
+    /// `${!prefix*}` / `${!prefix@}` — expand to the sorted NAMES of set
+    /// shell variables whose name starts with `prefix`. `at=false` (`*`)
+    /// joins like `$*`; `at=true` (`@`) yields separate words like `$@`.
+    /// The `name` field holds the prefix.
+    PrefixNames { at: bool },
     UseDefault    { word: Word, colon: bool },
     AssignDefault { word: Word, colon: bool },
     ErrorIfUnset  { word: Word, colon: bool },
@@ -3016,6 +3021,29 @@ fn scan_braced_param_expansion(
         if name.is_empty() {
             // e.g. `${!+foo}` or `${!-default}` — bad substitution at runtime.
             return recover_bad_subst(chars, parts, quoted, dollar_start);
+        }
+        // `${!prefix*}` / `${!prefix@}` — prefix-name expansion. Distinguish
+        // `*}`/`@}` (prefix form) from `@OP}` (a transform on an indirect
+        // ref): only a `*`/`@` IMMEDIATELY followed by `}` is the prefix form.
+        // Clone the cursor for a one-char lookahead past the `*`/`@`.
+        match chars.peek().copied() {
+            Some(c @ ('*' | '@')) => {
+                let mut look = chars.clone();
+                look.next(); // skip the `*`/`@`
+                if look.peek() == Some(&'}') {
+                    chars.next(); // consume `*`/`@`
+                    chars.next(); // consume `}`
+                    parts.push(WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::PrefixNames { at: c == '@' },
+                        quoted,
+                        subscript: None,
+                        indirect: false,
+                    });
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
         let subscript = scan_param_subscript(chars, opts)?;
         match subscript {
@@ -6335,6 +6363,45 @@ mod tests {
         assert_eq!(name, "a");
         assert!(!(*indirect));
         assert!(matches!(modifier, ParamModifier::IndirectKeys));
+    }
+
+    #[test]
+    fn tokenize_prefix_names_star() {
+        // `${!pfx*}` — prefix-name expansion, `*` form (at=false).
+        let tokens = tokenize("${!_Q*}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "_Q");
+        assert!(!(*indirect));
+        assert!(subscript.is_none());
+        assert!(matches!(modifier, ParamModifier::PrefixNames { at: false }));
+    }
+
+    #[test]
+    fn tokenize_prefix_names_at() {
+        // `${!pfx@}` — prefix-name expansion, `@` form (at=true).
+        let tokens = tokenize("${!_Q@}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "_Q");
+        assert!(!(*indirect));
+        assert!(subscript.is_none());
+        assert!(matches!(modifier, ParamModifier::PrefixNames { at: true }));
+    }
+
+    #[test]
+    fn tokenize_indirect_transform_not_prefix_names() {
+        // Regression: `${!ref@Q}` is a transform on an indirect ref, NOT the
+        // prefix-name form — the `@` is not immediately followed by `}`.
+        let tokens = tokenize("${!ref@Q}").unwrap();
+        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert_eq!(name, "ref");
+        assert!(*indirect);
+        assert!(matches!(modifier, ParamModifier::Transform { .. }));
     }
 
     #[test]

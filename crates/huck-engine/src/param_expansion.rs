@@ -301,6 +301,27 @@ pub fn expand_modifier_with_value(
             };
             ExpansionResult::Value(out)
         }
+        ParamModifier::PrefixNames { at } => {
+            // `${!prefix*}` / `${!prefix@}` — sorted (byte/C order) NAMES of
+            // SET shell variables whose name starts with `name`. Unset/special
+            // dynamic params are not included (only the vars table). No match
+            // yields empty, rc 0.
+            let mut names: Vec<String> = shell
+                .var_names()
+                .filter(|n| n.starts_with(name))
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            if *at && quoted {
+                // Quoted `@`: each name is its own field, like `"$@"`.
+                ExpansionResult::WordList(names)
+            } else {
+                // Unquoted `@`/`*` and quoted `*`: join with the first IFS
+                // char (default space). Unquoted results then word-split.
+                let sep = crate::expand::ifs_join_sep(&shell.ifs());
+                ExpansionResult::Value(names.join(&sep))
+            }
+        }
         ParamModifier::BadSubst { raw } => {
             // Lexable-but-invalid `${…}`: emit a runtime "bad substitution"
             // error matching bash. Evaluated lazily — only errors when this
