@@ -1,16 +1,28 @@
 //! Alias expansion. Runs after tokenize, before parse. Substitutes
 //! aliases at command position with cycle protection and the bash
-//! trailing-space rule.
+//! trailing-space rule. Command position is tracked with reserved-word
+//! recognition and compound-command context (`case` / `for` / `[[ ]]`),
+//! so words that are not the first word of a simple command (case
+//! patterns, for-lists, `[[ ]]` interiors, reserved words themselves)
+//! are never alias-expanded.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::lexer::{LexError, Operator, Token, Word, WordPart};
 
-/// Walks `tokens`, substituting alias definitions at command
-/// position. Recursive substitution is cycle-protected via a
-/// per-input `active` set. The trailing-space rule applies: if an
-/// alias body ends with whitespace, the token immediately following
-/// the expansion is itself alias-eligible.
+/// Compound-command context. The stack handles nesting (e.g. a `case`
+/// inside a `case` body).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ctx {
+    CaseSubject,   // after `case`, before `in`
+    CasePattern,   // pattern list: after `in`, or after ;;/;&/;;&
+    CaseBody,      // clause body — normal command position resumes
+    ForName,       // after `for`/`select`, before `in`
+    ForList,       // after for/select `in`, until separator or `do`
+    DoubleBracket, // inside [[ ... ]]
+}
+
+/// Walks a token stream substituting aliases at command position.
 pub fn expand_aliases_in_tokens(
     tokens: Vec<Token>,
     aliases: &HashMap<String, String>,
@@ -27,74 +39,255 @@ pub fn expand_aliases_in_tokens_mapped(
     tokens: Vec<Token>,
     aliases: &HashMap<String, String>,
 ) -> Result<(Vec<Token>, Vec<usize>), LexError> {
-    let mut out: Vec<Token> = Vec::new();
-    let mut map: Vec<usize> = Vec::new();
-    let mut next_eligible = true;
-    let mut active: HashSet<String> = HashSet::new();
+    let mut ex = Expander::new(aliases);
     for (src_idx, token) in tokens.into_iter().enumerate() {
-        next_eligible = process_token_mapped(
-            token, src_idx, &mut out, &mut map, next_eligible, aliases, &mut active,
-        )?;
+        ex.feed(token, src_idx)?;
     }
-    Ok((out, map))
+    Ok((ex.out, ex.map))
 }
 
-fn process_token_mapped(
-    token: Token,
-    src_idx: usize,
-    out: &mut Vec<Token>,
-    map: &mut Vec<usize>,
+struct Expander<'a> {
+    out: Vec<Token>,
+    map: Vec<usize>,
+    active: HashSet<String>,
     eligible: bool,
-    aliases: &HashMap<String, String>,
-    active: &mut HashSet<String>,
-) -> Result<bool, LexError> {
-    match &token {
-        Token::Word(w) => {
-            if eligible
-                && let Some(name) = simple_word_text(w)
-                && !active.contains(&name)
-                && let Some(body) = aliases.get(&name).cloned()
-            {
-                active.insert(name.clone());
-                let inner_tokens = crate::lexer::tokenize(&body)?;
-                let mut inner_eligible = true;
-                for inner in inner_tokens {
-                    // Body tokens inherit the alias-name token's source index.
-                    inner_eligible = process_token_mapped(
-                        inner, src_idx, out, map, inner_eligible, aliases, active,
-                    )?;
-                }
-                active.remove(&name);
-                let trailing = body.chars().last().is_some_and(|c| c.is_whitespace());
-                return Ok(trailing);
+    ctx: Vec<Ctx>,
+    aliases: &'a HashMap<String, String>,
+}
+
+impl<'a> Expander<'a> {
+    fn new(aliases: &'a HashMap<String, String>) -> Self {
+        Expander {
+            out: Vec::new(),
+            map: Vec::new(),
+            active: HashSet::new(),
+            eligible: true,
+            ctx: Vec::new(),
+            aliases,
+        }
+    }
+
+    fn top(&self) -> Option<Ctx> {
+        self.ctx.last().copied()
+    }
+
+    fn push(&mut self, token: Token, src_idx: usize) {
+        self.out.push(token);
+        self.map.push(src_idx);
+    }
+
+    /// Feed one source token, updating output, map, eligibility, and context.
+    fn feed(&mut self, token: Token, src_idx: usize) -> Result<(), LexError> {
+        match token {
+            Token::Word(w) => self.feed_word(w, src_idx),
+            Token::Op(op) => {
+                self.feed_op(op, src_idx);
+                Ok(())
             }
-            out.push(token);
-            map.push(src_idx);
-            Ok(false)
+            Token::Newline => {
+                self.feed_newline(src_idx);
+                Ok(())
+            }
+            // Heredoc / ArithBlock / RedirFd: not command-position changing.
+            other => {
+                self.push(other, src_idx);
+                Ok(())
+            }
         }
-        Token::Op(op) => {
-            let separator = matches!(
-                op,
-                Operator::Pipe
-                    | Operator::And
-                    | Operator::Or
-                    | Operator::Semi
-                    | Operator::Background
-                    | Operator::LParen
-            );
-            out.push(token);
-            map.push(src_idx);
-            Ok(separator)
+    }
+
+    fn feed_word(&mut self, w: Word, src_idx: usize) -> Result<(), LexError> {
+        let text = simple_word_text(&w);
+
+        // Context-driven handling first: words inside subject/pattern/for/[[
+        // positions are never alias-expanded; some drive transitions.
+        match self.top() {
+            Some(Ctx::CaseSubject) => {
+                if text.as_deref() == Some("in") {
+                    *self.ctx.last_mut().unwrap() = Ctx::CasePattern;
+                }
+                self.push(Token::Word(w), src_idx);
+                self.eligible = false;
+                return Ok(());
+            }
+            Some(Ctx::CasePattern) => {
+                if text.as_deref() == Some("esac") {
+                    self.ctx.pop();
+                }
+                self.push(Token::Word(w), src_idx);
+                self.eligible = false;
+                return Ok(());
+            }
+            Some(Ctx::ForName) => {
+                if text.as_deref() == Some("in") {
+                    *self.ctx.last_mut().unwrap() = Ctx::ForList;
+                }
+                self.push(Token::Word(w), src_idx);
+                self.eligible = false;
+                return Ok(());
+            }
+            Some(Ctx::ForList) => {
+                self.push(Token::Word(w), src_idx);
+                self.eligible = false;
+                return Ok(());
+            }
+            Some(Ctx::DoubleBracket) => {
+                if text.as_deref() == Some("]]") {
+                    self.ctx.pop();
+                }
+                self.push(Token::Word(w), src_idx);
+                self.eligible = false;
+                return Ok(());
+            }
+            Some(Ctx::CaseBody) | None => {}
         }
-        Token::Newline => {
-            out.push(token);
-            map.push(src_idx);
-            Ok(true)
+
+        // Normal command-position handling (CaseBody or empty stack).
+        if self.eligible {
+            if let Some(t) = text.as_deref() {
+                if let Some(next_elig) = self.handle_reserved(t) {
+                    self.push(Token::Word(w), src_idx);
+                    self.eligible = next_elig;
+                    return Ok(());
+                }
+                if !self.active.contains(t)
+                    && let Some(body) = self.aliases.get(t).cloned()
+                {
+                    return self.expand_alias(t.to_string(), body, src_idx);
+                }
+            }
+            // Ordinary command word (no alias): consumes command position.
+            self.push(Token::Word(w), src_idx);
+            self.eligible = false;
+            return Ok(());
         }
-        _ => {
-            out.push(token);
-            map.push(src_idx);
-            Ok(eligible)
+
+        // Argument word.
+        self.push(Token::Word(w), src_idx);
+        self.eligible = false;
+        Ok(())
+    }
+
+    /// If `t` is a reserved word recognized at command position, update
+    /// context and return `Some(next_eligible)`. Returns `None` if `t` is
+    /// not a reserved word (caller then tries alias expansion).
+    fn handle_reserved(&mut self, t: &str) -> Option<bool> {
+        match t {
+            "case" => {
+                self.ctx.push(Ctx::CaseSubject);
+                Some(false)
+            }
+            "for" | "select" => {
+                self.ctx.push(Ctx::ForName);
+                Some(false)
+            }
+            "[[" => {
+                self.ctx.push(Ctx::DoubleBracket);
+                Some(false)
+            }
+            "function" => Some(false),
+            "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "{" | "!" | "time" => {
+                Some(true)
+            }
+            "fi" | "done" | "}" => Some(false),
+            "esac" => {
+                if self.top() == Some(Ctx::CaseBody) {
+                    self.ctx.pop();
+                }
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    fn expand_alias(
+        &mut self,
+        name: String,
+        body: String,
+        src_idx: usize,
+    ) -> Result<(), LexError> {
+        self.active.insert(name.clone());
+        let inner_tokens = crate::lexer::tokenize(&body)?;
+        // The alias body begins at command position.
+        self.eligible = true;
+        for inner in inner_tokens {
+            // Body tokens inherit the alias-name token's source index.
+            self.feed(inner, src_idx)?;
+        }
+        self.active.remove(&name);
+        // Trailing-blank rule: a body ending in whitespace makes the next
+        // source token alias-eligible.
+        self.eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
+        Ok(())
+    }
+
+    fn feed_op(&mut self, op: Operator, src_idx: usize) {
+        match self.top() {
+            Some(Ctx::CasePattern) => {
+                self.push(Token::Op(op), src_idx);
+                if matches!(op, Operator::RParen) {
+                    *self.ctx.last_mut().unwrap() = Ctx::CaseBody;
+                    self.eligible = true;
+                } else {
+                    // `|` (pattern alternative), leading `(`, or any other op:
+                    // stay in pattern position.
+                    self.eligible = false;
+                }
+            }
+            Some(Ctx::CaseBody)
+                if matches!(
+                    op,
+                    Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp
+                ) =>
+            {
+                self.push(Token::Op(op), src_idx);
+                *self.ctx.last_mut().unwrap() = Ctx::CasePattern;
+                self.eligible = false;
+            }
+            Some(Ctx::ForName) | Some(Ctx::ForList) if matches!(op, Operator::Semi) => {
+                self.push(Token::Op(op), src_idx);
+                self.ctx.pop();
+                self.eligible = true;
+            }
+            Some(Ctx::CaseSubject)
+            | Some(Ctx::DoubleBracket)
+            | Some(Ctx::ForName)
+            | Some(Ctx::ForList) => {
+                self.push(Token::Op(op), src_idx);
+                self.eligible = false;
+            }
+            _ => {
+                // CaseBody (non-;;) or empty stack: normal separator logic.
+                self.push(Token::Op(op), src_idx);
+                self.eligible = matches!(
+                    op,
+                    Operator::Pipe
+                        | Operator::And
+                        | Operator::Or
+                        | Operator::Semi
+                        | Operator::Background
+                        | Operator::LParen
+                );
+            }
+        }
+    }
+
+    fn feed_newline(&mut self, src_idx: usize) {
+        match self.top() {
+            Some(Ctx::ForName) | Some(Ctx::ForList) => {
+                self.ctx.pop();
+                self.push(Token::Newline, src_idx);
+                self.eligible = true;
+            }
+            Some(Ctx::CaseSubject) | Some(Ctx::CasePattern) | Some(Ctx::DoubleBracket) => {
+                self.push(Token::Newline, src_idx);
+                self.eligible = false;
+            }
+            _ => {
+                // CaseBody or empty stack: newline is a command separator.
+                self.push(Token::Newline, src_idx);
+                self.eligible = true;
+            }
         }
     }
 }
@@ -221,6 +414,93 @@ mod tests {
         let toks = crate::lexer::tokenize("echo hi").unwrap(); // no alias at cmd pos
         let n = toks.len();
         let (out, map) = super::expand_aliases_in_tokens_mapped(toks, &aliases).unwrap();
+        assert_eq!(out.len(), n);
+        assert_eq!(map, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn case_pattern_word_not_expanded() {
+        // The v231 regression: `ls` after `|` is a case pattern, not a command.
+        let aliases = make_aliases(&[("ls", "ls --color")]);
+        let toks = tokenize("case $x in use | ls | list) echo hi ;; *) echo no ;; esac").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "case $x in use | ls | list) echo hi ;; *) echo no ;; esac");
+    }
+
+    #[test]
+    fn case_subject_word_not_expanded() {
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("case ll in a) echo x ;; esac").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "case ll in a) echo x ;; esac");
+    }
+
+    #[test]
+    fn case_body_command_is_expanded() {
+        // Inside a clause body we ARE at command position.
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("case $x in a) ll ;; esac").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "case $x in a) ls -l ;; esac");
+    }
+
+    #[test]
+    fn nested_case_patterns_not_expanded() {
+        let aliases = make_aliases(&[("ls", "ls --color")]);
+        let toks =
+            tokenize("case $x in a) case $y in ls) echo z ;; esac ;; esac").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "case $x in a) case $y in ls) echo z ;; esac ;; esac");
+    }
+
+    #[test]
+    fn expand_after_then_and_do() {
+        // The opposite latent bug: reserved words introduce command position.
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("if true; then ll; fi").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "if true; then ls -l; fi");
+
+        let toks = tokenize("while true; do ll; done").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "while true; do ls -l; done");
+    }
+
+    #[test]
+    fn reserved_word_not_expanded() {
+        // An alias whose name is a reserved word is not expanded in that slot.
+        let aliases = make_aliases(&[("then", "echo BAD")]);
+        let toks = tokenize("if true; then echo ok; fi").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "if true; then echo ok; fi");
+    }
+
+    #[test]
+    fn for_list_words_not_expanded_body_is() {
+        let aliases = make_aliases(&[("ls", "ls --color"), ("ll", "ls -l")]);
+        let toks = tokenize("for x in ls ll; do ll; done").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        // `ls` and `ll` in the for-list stay literal; `ll` in the body expands
+        // recursively: ll → ls -l → ls --color -l (same as recursive_expansion test).
+        assert_tokens_eq(&out, "for x in ls ll; do ls --color -l; done");
+    }
+
+    #[test]
+    fn double_bracket_interior_not_expanded() {
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("[[ ll == x ]]").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "[[ ll == x ]]");
+    }
+
+    #[test]
+    fn mapped_indices_preserved_through_case() {
+        // Offsets must still anchor to raw source token indices.
+        let aliases = make_aliases(&[("ls", "ls --color")]);
+        let toks = tokenize("case $x in ls) echo z ;; esac").unwrap();
+        let n = toks.len();
+        let (out, map) = expand_aliases_in_tokens_mapped(toks, &aliases).unwrap();
+        // No expansion happened, so output is identity-mapped.
         assert_eq!(out.len(), n);
         assert_eq!(map, (0..n).collect::<Vec<_>>());
     }
