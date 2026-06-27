@@ -2575,11 +2575,9 @@ fn scan_braced_operand(
                 consume_backtick_verbatim(chars, &mut body)?;
             }
             Some('$') => {
-                // `${` (dollar-brace) nests the operand and needs a matching `}`.
-                // A BARE `{` (e.g. in a `%%`/`##` glob pattern like `${x%%[<{(]*}`)
-                // is literal and must NOT raise depth. `$(` opens a command
-                // substitution whose body — including any `}` — is consumed
-                // verbatim so it cannot close the operand (L-52).
+                // `${` nests; `$(` is a cmdsub consumed verbatim; `$'…'` /
+                // `$"…"` are ANSI-C / locale quoted spans whose internal `'`/`"`
+                // (and `\'` escapes) must not be mistaken for plain quoting.
                 body.push('$');
                 match chars.peek() {
                     Some(&'{') => {
@@ -2591,6 +2589,40 @@ fn scan_braced_operand(
                         chars.next();
                         body.push('(');
                         consume_paren_cmdsub_verbatim(chars, &mut body)?;
+                    }
+                    Some(&'\'') => {
+                        chars.next();
+                        body.push('\'');
+                        // ANSI-C span: `\` escapes the next char (incl. `\'`),
+                        // closing on the first UNescaped `'`.
+                        loop {
+                            match chars.next() {
+                                None => return Err(LexError::UnterminatedBrace),
+                                Some('\\') => {
+                                    body.push('\\');
+                                    if let Some(c) = chars.next() { body.push(c); }
+                                }
+                                Some('\'') => { body.push('\''); break; }
+                                Some(c) => body.push(c),
+                            }
+                        }
+                    }
+                    Some(&'"') => {
+                        chars.next();
+                        body.push('"');
+                        // Locale `$"…"`: same scan as a normal double-quote span
+                        // (handled by the outer `Some('"')` loop shape).
+                        loop {
+                            match chars.next() {
+                                None => return Err(LexError::UnterminatedBrace),
+                                Some('"') => { body.push('"'); break; }
+                                Some('\\') => {
+                                    body.push('\\');
+                                    if let Some(c) = chars.next() { body.push(c); }
+                                }
+                                Some(c) => body.push(c),
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -4114,6 +4146,22 @@ mod tests {
         assert!(tokenize("${x%%{*}").is_ok());
         // nested ${...} still depth-tracks:
         assert!(tokenize("${x:-${y}}").is_ok());
+    }
+
+    #[test]
+    fn braced_operand_ansi_c_quote_with_escaped_quote() {
+        // `$'a\t\'\tb'` inside the body: the escaped `\'` must NOT terminate
+        // the scan, and the trailing `'` is the ANSI-C close, not a new span.
+        let toks = tokenize(r#"${x#$'a\t\'\tb'}"#).unwrap();
+        // It must tokenize (not error). Exactly one Word token with a single
+        // ParamExpansion part (RemovePrefix).
+        assert_eq!(toks.len(), 1);
+    }
+
+    #[test]
+    fn braced_operand_ansi_c_quote_simple() {
+        let toks = tokenize(r#"${x#$'f'}"#).unwrap();
+        assert_eq!(toks.len(), 1);
     }
 
     #[test]
