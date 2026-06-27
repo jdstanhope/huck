@@ -53,6 +53,12 @@ struct Expander<'a> {
     eligible: bool,
     ctx: Vec<Ctx>,
     aliases: &'a HashMap<String, String>,
+    /// True iff the most recent token processed (in the `_` arm of `feed_op`)
+    /// was `LParen` with no intervening word tokens. Used to detect the
+    /// function-definition `name()` pattern: when `RParen` immediately follows
+    /// `LParen` the `)` closes the function header, so the next word (the
+    /// compound-command body) is at command position.
+    last_was_open_paren: bool,
 }
 
 impl<'a> Expander<'a> {
@@ -64,6 +70,7 @@ impl<'a> Expander<'a> {
             eligible: true,
             ctx: Vec::new(),
             aliases,
+            last_was_open_paren: false,
         }
     }
 
@@ -97,6 +104,8 @@ impl<'a> Expander<'a> {
     }
 
     fn feed_word(&mut self, w: Word, src_idx: usize) -> Result<(), LexError> {
+        // Any word token breaks the "just saw LParen" chain.
+        self.last_was_open_paren = false;
         let text = simple_word_text(&w);
 
         // Context-driven handling first: words inside subject/pattern/for/[[
@@ -224,6 +233,7 @@ impl<'a> Expander<'a> {
     fn feed_op(&mut self, op: Operator, src_idx: usize) {
         match self.top() {
             Some(Ctx::CasePattern) => {
+                self.last_was_open_paren = false;
                 self.push(Token::Op(op), src_idx);
                 if matches!(op, Operator::RParen) {
                     *self.ctx.last_mut().unwrap() = Ctx::CaseBody;
@@ -240,11 +250,13 @@ impl<'a> Expander<'a> {
                     Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp
                 ) =>
             {
+                self.last_was_open_paren = false;
                 self.push(Token::Op(op), src_idx);
                 *self.ctx.last_mut().unwrap() = Ctx::CasePattern;
                 self.eligible = false;
             }
             Some(Ctx::ForName) | Some(Ctx::ForList) if matches!(op, Operator::Semi) => {
+                self.last_was_open_paren = false;
                 self.push(Token::Op(op), src_idx);
                 self.ctx.pop();
                 self.eligible = true;
@@ -253,26 +265,39 @@ impl<'a> Expander<'a> {
             | Some(Ctx::DoubleBracket)
             | Some(Ctx::ForName)
             | Some(Ctx::ForList) => {
+                self.last_was_open_paren = false;
                 self.push(Token::Op(op), src_idx);
                 self.eligible = false;
             }
             _ => {
                 // CaseBody (non-;;) or empty stack: normal separator logic.
+                //
+                // Function-definition detection: `name ( )` — when `RParen`
+                // immediately follows `LParen` (no word between them) the `)` closes
+                // the function header, not a subshell. The next word (the function
+                // body compound-command) is at command position.
+                let func_def_close =
+                    matches!(op, Operator::RParen) && self.last_was_open_paren;
+                self.last_was_open_paren = matches!(op, Operator::LParen);
                 self.push(Token::Op(op), src_idx);
-                self.eligible = matches!(
-                    op,
-                    Operator::Pipe
-                        | Operator::And
-                        | Operator::Or
-                        | Operator::Semi
-                        | Operator::Background
-                        | Operator::LParen
-                );
+                self.eligible = func_def_close
+                    || matches!(
+                        op,
+                        Operator::Pipe
+                            | Operator::And
+                            | Operator::Or
+                            | Operator::Semi
+                            | Operator::Background
+                            | Operator::LParen
+                    );
             }
         }
     }
 
     fn feed_newline(&mut self, src_idx: usize) {
+        // A newline between `(` and `)` in `f(\n)` is unusual; reset the flag
+        // conservatively so we don't misfire on multi-line constructs.
+        self.last_was_open_paren = false;
         match self.top() {
             Some(Ctx::ForName) | Some(Ctx::ForList) => {
                 self.ctx.pop();
@@ -503,5 +528,31 @@ mod tests {
         // No expansion happened, so output is identity-mapped.
         assert_eq!(out.len(), n);
         assert_eq!(map, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn function_def_body_case_pattern_not_expanded() {
+        // v232 regression: case pattern inside a function body must not be
+        // alias-expanded. `name()` closes the header; `{` is at command position;
+        // `case` pushes CaseSubject; `ls` in the pattern list is suppressed.
+        let aliases = make_aliases(&[("ls", "ls --color")]);
+        let toks = tokenize(
+            "f() { case \"$1\" in use | ls | list) echo HIT ;; *) echo MISS ;; esac; }",
+        )
+        .unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(
+            &out,
+            "f() { case \"$1\" in use | ls | list) echo HIT ;; *) echo MISS ;; esac; }",
+        );
+    }
+
+    #[test]
+    fn function_def_body_command_expanded() {
+        // The body of a function def IS at command position after `{`.
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("f() { ll; }").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "f() { ls -l; }");
     }
 }
