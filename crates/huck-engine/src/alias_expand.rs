@@ -96,7 +96,11 @@ impl<'a> Expander<'a> {
                 Ok(())
             }
             // Heredoc / ArithBlock / RedirFd: not command-position changing.
+            // Still breaks the "just saw LParen" chain, so a token between
+            // `(` and `)` (e.g. `( (( expr )) )`) doesn't leave it stale and
+            // misfire function-definition detection on the closing `)`.
             other => {
+                self.last_was_open_paren = false;
                 self.push(other, src_idx);
                 Ok(())
             }
@@ -554,5 +558,17 @@ mod tests {
         let toks = tokenize("f() { ll; }").unwrap();
         let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
         assert_tokens_eq(&out, "f() { ls -l; }");
+    }
+
+    #[test]
+    fn arith_block_between_parens_does_not_misfire_func_def() {
+        // `( (( x )) )` tokenizes as LParen, ArithBlock, RParen. The ArithBlock
+        // must reset the "just saw LParen" flag so the closing `)` is not
+        // mistaken for a function-definition header close — otherwise a word
+        // after it would be wrongly treated as command position and expanded.
+        let aliases = make_aliases(&[("ll", "ls -l")]);
+        let toks = tokenize("( (( x )) ) ll").unwrap();
+        let out = expand_aliases_in_tokens(toks, &aliases).unwrap();
+        assert_tokens_eq(&out, "( (( x )) ) ll");
     }
 }
