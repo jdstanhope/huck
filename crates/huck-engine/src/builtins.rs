@@ -6369,6 +6369,37 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // lex_lines.len() == total + 1 (includes sentinel); slice to total.
         let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
         let token_lines: Vec<u32> = lex_lines[..total].iter().map(|&l| l + base_line).collect();
+        // v231: honor `shopt expand_aliases` (and interactive) in the file/source/-c
+        // path. Expand aliases on the chunk tokens, remapping offsets/lines back to
+        // the ORIGINAL source tokens via a provenance map so byte-offset bookkeeping
+        // (`unit_end_abs`, `set -v`) stays anchored to the raw source bytes.
+        let expand = shell.is_interactive
+            || shell.shopt_options.get("expand_aliases").unwrap_or(false);
+        let alias_gen = shell.alias_generation;
+        let (tokens, token_lines, offsets, total) = if expand && !shell.aliases.is_empty() {
+            match crate::alias_expand::expand_aliases_in_tokens_mapped(tokens, &shell.aliases) {
+                Ok((exp, map)) => {
+                    let e = exp.len();
+                    let offsets2: Vec<usize> = (0..e)
+                        .map(|j| offsets[map[j]])
+                        .chain(std::iter::once(offsets[total]))
+                        .collect();
+                    let lines2: Vec<u32> = (0..e).map(|j| token_lines[map[j]]).collect();
+                    (exp, lines2, offsets2, e)
+                }
+                Err(le) => {
+                    {
+                        let mut err = crate::executor::err_writer(err_sink, sink);
+                        e!(&mut *err, "huck: {}: line {}: syntax error{}",
+                            path.display(), line_of(start), crate::lex_error_message(&le));
+                    }
+                    last_status = 2;
+                    break 'outer;
+                }
+            }
+        } else {
+            (tokens, token_lines, offsets, total)
+        };
         let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
 
         loop {
@@ -6452,10 +6483,15 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         ExecOutcome::Interrupted(r) => return ExecOutcome::Interrupted(r),
                     }
 
-                    // A command may have flipped `shopt extglob`, which changes
-                    // how the remainder must be lexed. Re-lex from here.
+                    // A command may have flipped `shopt extglob` or the alias
+                    // table changed, both of which require re-lexing the remainder.
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-                    if new_extglob != extglob {
+                    let new_expand = shell.is_interactive
+                        || shell.shopt_options.get("expand_aliases").unwrap_or(false);
+                    if new_extglob != extglob
+                        || new_expand != expand
+                        || (new_expand && shell.alias_generation != alias_gen)
+                    {
                         // If this flipping unit was the last complete token before
                         // a lex truncation, the un-lexed tail begins at the start
                         // of the failing line — `offsets[total]` is the
