@@ -591,6 +591,27 @@ fn expand_indirect(
             shell.nameref_raw_target(name).unwrap_or_default(),
         );
     }
+    // `${!*}` / `${!@}` (v233 M2): indirect through `$*` / `$@`. bash uses
+    // the IFS-joined positional params as the effective NAME: no positionals
+    // -> empty, rc 0; a single valid name (or positional digit) -> resolve it;
+    // a multi-word / IFS-joined value (e.g. "foo bar", "a,b") is an invalid
+    // variable name -> fatal rc 1. (The positionals are NOT reachable via
+    // `lookup_var("*")`, so handle them before the generic through-value path.)
+    if subscript.is_none() && (name == "*" || name == "@") {
+        let through = shell
+            .positional_args
+            .join(&ifs_join_sep(&shell.ifs()));
+        if through.is_empty() {
+            return ExpansionResult::Value(String::new());
+        }
+        let valid = crate::builtins::is_valid_name(&through)
+            || through.bytes().all(|b| b.is_ascii_digit());
+        if !valid {
+            with_err(|err| e!(err, "huck: {through}: invalid variable name"));
+            return ExpansionResult::Fatal { status: 1 };
+        }
+        return crate::param_expansion::expand_modifier_quoted(&through, modifier, quoted, shell);
+    }
     // Step 1: through-value = scalar value of (name, subscript).
     let through = match subscript {
         None => shell.lookup_var(name).unwrap_or_default(),

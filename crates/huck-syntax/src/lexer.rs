@@ -2943,10 +2943,15 @@ fn scan_braced_param_expansion(
             }
             Some('@') => { chars.next(); "@".to_string() }
             Some('*') => { chars.next(); "*".to_string() }
+            // Length of a special parameter's value: `${##}` = len of `$#`,
+            // `${#?}` = len of `$?`, `${#-}` = len of `$-`, `${#$}` = len of
+            // `$$`, `${#!}` = len of `$!` (bash semantics). `@`/`*` are caught
+            // above (arg count), so this only matches `# $ ! ? -`.
+            Some(c) if special_param_char(c) => { chars.next(); c.to_string() }
             _ => scan_braced_name(chars)?,
         };
         if name.is_empty() {
-            // e.g. `${#!}` or `${##}` — bad substitution at runtime.
+            // e.g. `${#+}` — bad substitution at runtime.
             return recover_bad_subst(chars, parts, quoted, dollar_start);
         }
         // Optional subscript for the Length form: `${#a[i]}`, `${#a[@]}`.
@@ -3016,6 +3021,28 @@ fn scan_braced_param_expansion(
                 }
             }
             return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts, dollar_start);
+        }
+        // `${!X}` where X is a special parameter immediately followed by `}`:
+        // special-parameter indirect. `${!#}` = indirect of `$#`, `${!*}` /
+        // `${!@}` = indirect of `$*` / `$@`, `${!?}` = indirect of `$?`. This
+        // MUST run before the empty-name guard and the M1 prefix lookahead
+        // below, so `${!*}` / `${!@}` route to indirect (bash: empty when
+        // unset, "invalid variable name" when set) rather than a bad-subst or
+        // a prefix-name expansion.
+        //
+        // The valid set is exactly `# @ * ?` (verified against bash 5.x).
+        // `$` and `!` are bad-substs (`${!$}` / `${!!}`); `-` and `+` are
+        // operator introducers (`${!-}` / `${!-x}` / `${!+x}` parse `-`/`+`
+        // as use-default/use-alternate on an empty indirect ref, NOT as the
+        // special param `$-`), so all four fall through to the empty-name
+        // guard / operator paths below.
+        if matches!(chars.peek().copied(), Some('#' | '@' | '*' | '?')) {
+            let mut look = chars.clone();
+            let c = look.next().unwrap();
+            if look.peek() == Some(&'}') {
+                chars.next(); // consume the special-parameter char
+                return dispatch_braced_modifier(c.to_string(), quoted, None, chars, parts, /* indirect */ true, opts, dollar_start);
+            }
         }
         let name = scan_braced_name(chars)?;
         if name.is_empty() {
@@ -3429,6 +3456,16 @@ fn scan_array_element_word(
 
 /// Reads identifier chars (the parameter name) inside a `${...}` until it
 /// hits a non-identifier char. Does NOT consume the terminator.
+/// The special single-char parameter names that may appear as the operand
+/// of the length (`${#X}`) form. (`@`/`*` are handled separately in the
+/// Length path because they mean "arg count", not "length of the special
+/// param's value".) For the indirect (`${!X}`) form a narrower set is used
+/// inline — see `scan_braced_param_expansion` — because bash bad-substs
+/// `${!$}` and `${!!}`.
+fn special_param_char(c: char) -> bool {
+    matches!(c, '#' | '@' | '*' | '$' | '!' | '?' | '-')
+}
+
 fn scan_braced_name(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
@@ -6402,6 +6439,65 @@ mod tests {
         assert_eq!(name, "ref");
         assert!(*indirect);
         assert!(matches!(modifier, ParamModifier::Transform { .. }));
+    }
+
+    #[test]
+    fn length_of_special_param_hash() {
+        // v233 M2: `${##}` = `${#<#>}` = length of `$#`.
+        let mut toks = tokenize("${##}").unwrap();
+        let part = single_param_expansion(&mut toks);
+        assert!(matches!(part,
+            WordPart::ParamExpansion { ref name, modifier: ParamModifier::Length, indirect: false, .. } if name == "#"),
+            "got {part:?}");
+    }
+
+    #[test]
+    fn length_of_special_param_others() {
+        // v233 M2: `${#?}`, `${#-}`, `${#$}`, `${#!}` = length of the special
+        // param. `@`/`*` stay arg-count (not exercised here).
+        for (src, want) in [("${#?}", "?"), ("${#-}", "-"), ("${#$}", "$"), ("${#!}", "!")] {
+            let mut toks = tokenize(src).unwrap();
+            let part = single_param_expansion(&mut toks);
+            assert!(matches!(part,
+                WordPart::ParamExpansion { ref name, modifier: ParamModifier::Length, indirect: false, .. } if name == want),
+                "{src} -> got {part:?}");
+        }
+    }
+
+    #[test]
+    fn indirect_of_special_param_hash() {
+        // v233 M2: `${!#}` = indirect through `$#`.
+        let mut toks = tokenize("${!#}").unwrap();
+        let part = single_param_expansion(&mut toks);
+        assert!(matches!(part,
+            WordPart::ParamExpansion { ref name, indirect: true, .. } if name == "#"),
+            "got {part:?}");
+    }
+
+    #[test]
+    fn indirect_of_special_param_star_at() {
+        // v233 M2: `${!*}` / `${!@}` / `${!?}` route to special-param indirect
+        // (NOT PrefixNames, NOT BadSubst). Distinct from `${!pfx*}` prefix form.
+        for (src, want) in [("${!*}", "*"), ("${!@}", "@"), ("${!?}", "?")] {
+            let mut toks = tokenize(src).unwrap();
+            let part = single_param_expansion(&mut toks);
+            assert!(matches!(part,
+                WordPart::ParamExpansion { ref name, indirect: true, modifier: ParamModifier::None, .. } if name == want),
+                "{src} -> got {part:?}");
+        }
+    }
+
+    #[test]
+    fn indirect_special_dollar_bang_stay_badsubst() {
+        // v233 M2: `${!$}` / `${!!}` are bad substitutions in bash — they must
+        // NOT route to special-param indirect. They scan to `}` and defer.
+        for src in ["${!$}", "${!!}"] {
+            let mut toks = tokenize(src).unwrap();
+            let part = single_param_expansion(&mut toks);
+            // recover_bad_subst emits a ParamExpansion carrying a BadSubst marker.
+            assert!(matches!(part, WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }),
+                "{src} -> expected BadSubst, got {part:?}");
+        }
     }
 
     #[test]
