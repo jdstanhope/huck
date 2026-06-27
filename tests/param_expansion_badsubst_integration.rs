@@ -49,3 +49,12 @@ fn bad_subst_message_whole_word_quoted() {
     let (_o, e, _c) = run_file("echo \"[${-3}]\"\n");
     assert!(e.contains("[${-3}]: bad substitution"), "stderr: {e}");
 }
+
+#[test]
+fn bad_subst_whole_word_in_assignment_rhs() {
+    // The whole-word message also applies off the command-argument path:
+    // an assignment RHS reports the full word `a${-3}b`, not just the token.
+    let (_o, e, _c) = run_file("x=a${-3}b\n");
+    assert!(e.contains("a${-3}b: bad substitution"), "stderr: {e}");
+    assert!(!e.contains(" ${-3}: bad"), "should report whole word, got: {e}");
+}

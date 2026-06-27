@@ -1153,16 +1153,8 @@ fn expand_part(
         }
         WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
             // A lexable-but-invalid `${…}` (BadSubst) errors at runtime with
-            // bash's message, which reports the ENTIRE enclosing word's source
-            // (e.g. `[${-3}]`, `a${-3}b${V@}c`), not just the offending token.
-            // Reconstruct it here where the whole `word` is in scope; the
-            // token-only fallback in `param_expansion.rs` covers callers that
-            // bypass this path (assignment RHS / patterns / regex operands).
-            if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
-                let prefix = shell.error_prefix(None);
-                let src = reconstruct_word_source_inner(word);
-                with_err(|err| e!(err, "{prefix}{src}: bad substitution"));
-                shell.pending_fatal_status = Some(1);
+            // bash's whole-word "bad substitution" message (see emit_bad_subst).
+            if emit_bad_subst(modifier, word, shell) {
                 return ControlFlow::Break(());
             }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
@@ -1411,6 +1403,26 @@ pub(crate) fn reconstruct_word_source_inner(word: &Word) -> String {
         reconstruct_part(part, &mut out);
     }
     out
+}
+
+/// If `modifier` is a lexable-but-invalid `${…}` (`BadSubst`), emit bash's
+/// runtime "bad substitution" error and stash fatal status 1, then return
+/// `true` so the caller bails. bash reports the ENTIRE enclosing word's source
+/// (e.g. `a${-3}b`, `[${-3}]`), not just the offending `${…}` token — so every
+/// word-expansion path (`expand`, `expand_assignment`, `expand_pattern`,
+/// `expand_regex_operand`) routes through here with the whole `word` in scope.
+/// (The token-only fallback in `param_expansion.rs` remains for any caller that
+/// expands a modifier without a surrounding word, e.g. arithmetic operands.)
+fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &mut Shell) -> bool {
+    if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
+        let prefix = shell.error_prefix(None);
+        let src = reconstruct_word_source_inner(word);
+        with_err(|err| e!(err, "{prefix}{src}: bad substitution"));
+        shell.pending_fatal_status = Some(1);
+        true
+    } else {
+        false
+    }
 }
 
 fn part_is_quoted(part: &WordPart) -> bool {
@@ -1676,6 +1688,9 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                 }
             }
             WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+                if emit_bad_subst(modifier, word, shell) {
+                    return result;
+                }
                 let result_pe = if *indirect {
                     expand_indirect(name, subscript.as_ref(), modifier, *quoted, shell)
                 } else if let Some(sub) = subscript {
@@ -1802,6 +1817,14 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
     let snapshot_status = shell.last_status();
     let mut result = String::new();
     for part in &word.0 {
+        // A BadSubst part errors with bash's whole-word message; intercept here
+        // (with the outer `word`) before delegating per-part to expand_assignment,
+        // which would otherwise only see the single-part sub-word.
+        if let WordPart::ParamExpansion { modifier, .. } = part {
+            if emit_bad_subst(modifier, word, shell) {
+                return result;
+            }
+        }
         let text = if matches!(part, WordPart::LastStatus { .. }) {
             snapshot_status.to_string()
         } else {
@@ -1830,6 +1853,14 @@ pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
     let snapshot_status = shell.last_status();
     let mut result = String::new();
     for part in &word.0 {
+        // A BadSubst part errors with bash's whole-word message; intercept here
+        // (with the outer `word`) before delegating per-part to expand_assignment,
+        // which would otherwise only see the single-part sub-word.
+        if let WordPart::ParamExpansion { modifier, .. } = part {
+            if emit_bad_subst(modifier, word, shell) {
+                return result;
+            }
+        }
         let text = if matches!(part, WordPart::LastStatus { .. }) {
             snapshot_status.to_string()
         } else {
