@@ -301,6 +301,15 @@ pub fn expand_modifier_with_value(
             };
             ExpansionResult::Value(out)
         }
+        ParamModifier::BadSubst { raw } => {
+            // Lexable-but-invalid `${…}`: emit a runtime "bad substitution"
+            // error matching bash. Evaluated lazily — only errors when this
+            // node is actually expanded (e.g. short-circuited `||` never
+            // reaches here).
+            let prefix = shell.error_prefix(None);
+            with_err(|err| e!(err, "{}{}: bad substitution", prefix, raw));
+            ExpansionResult::Fatal { status: 1 }
+        }
         _ => {
             // Forward-compatible: unknown ParamModifier yields empty.
             ExpansionResult::Empty

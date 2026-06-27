@@ -81,6 +81,12 @@ impl<'a> CharCursor<'a> {
     pub fn line(&self) -> u32 {
         self.line
     }
+
+    /// Byte slice of the source from `start` to the current offset. Used to
+    /// reconstruct the raw `${…}` text for a deferred bad-substitution.
+    pub fn slice_from(&self, start: usize) -> &str {
+        &self.s[start..self.pos]
+    }
 }
 
 impl Iterator for CharCursor<'_> {
@@ -207,6 +213,12 @@ pub enum ParamModifier {
     },
     /// `${var@OP}` scalar transform (`@P`/`@Q`/`@U`/`@L`/`@u`/`@E`).
     Transform { op: TransformOp },
+    /// A `${…}` whose content is lexable (matching `}` found) but
+    /// semantically invalid (bad modifier, special char as name, etc.).
+    /// Parses successfully and defers to a RUNTIME "bad substitution"
+    /// error, matching bash. `raw` is the literal `${…}` source for the
+    /// message. Evaluated lazily — only errors when actually expanded.
+    BadSubst { raw: String },
 }
 
 /// Subscript form attached to `${a[…]}` / `${a[@]}` / `${a[*]}`.
@@ -1833,8 +1845,12 @@ fn scan_dollar_expansion(
             }
         }
         Some('{') => {
-            chars.next();
-            scan_braced_param_expansion(chars, parts, quoted, opts)?;
+            // Capture the `$` offset before consuming `{`. The `$` was already
+            // consumed by the outer loop; chars.offset() is the position of `{`,
+            // so `$` is exactly 1 byte before it.
+            let dollar_start = chars.offset() - 1;
+            chars.next(); // consume `{`
+            scan_braced_param_expansion(chars, parts, quoted, opts, dollar_start)?;
         }
         Some('[') => {
             chars.next(); // consume '['
@@ -2526,6 +2542,32 @@ fn unescape_backtick(raw: &str) -> String {
     out
 }
 
+/// Recovery for a lexable-but-invalid `${…}`: consume the rest of the brace
+/// body through the matching `}`, then build a `BadSubst` ParamExpansion whose
+/// `raw` is the literal `${…}` source (for the runtime message). `dollar_start`
+/// is the offset of the leading `$`. Used so bad substitutions defer to runtime
+/// instead of aborting the parse (matching bash).
+fn recover_bad_subst(
+    chars: &mut CharCursor<'_>,
+    parts: &mut Vec<WordPart>,
+    quoted: bool,
+    dollar_start: usize,
+) -> Result<(), LexError> {
+    // `scan_braced_operand` consumes through the matching `}` (depth + quote +
+    // $'…' aware after Task 1). It returns the inner body; we don't need it —
+    // we slice the raw source instead, which includes `${` … `}`.
+    let _ = scan_braced_operand(chars)?; // may still error on genuinely unterminated
+    let raw = chars.slice_from(dollar_start).to_string();
+    parts.push(WordPart::ParamExpansion {
+        name: String::new(),
+        modifier: ParamModifier::BadSubst { raw },
+        quoted,
+        subscript: None,
+        indirect: false,
+    });
+    Ok(())
+}
+
 fn scan_braced_operand(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
@@ -2818,12 +2860,14 @@ fn scan_var_name(chars: &mut CharCursor<'_>) -> String {
 
 /// Reads a `${...}` parameter expansion. The opening `$` and `{` have
 /// already been consumed. Pushes either a `WordPart::Var` (plain `${name}`)
-/// or a `WordPart::ParamExpansion` (any modifier).
+/// or a `WordPart::ParamExpansion` (any modifier). `dollar_start` is the byte
+/// offset of the leading `$` in the source (for `recover_bad_subst`).
 fn scan_braced_param_expansion(
     chars: &mut CharCursor<'_>,
     parts: &mut Vec<WordPart>,
     quoted: bool,
     opts: LexerOptions,
+    dollar_start: usize,
 ) -> Result<(), LexError> {
     // Special single-char forms: ${@}, ${*}, ${#} (arg count).
     // These must be checked before the Length form (${#name}) disambiguation.
@@ -2840,7 +2884,7 @@ fn scan_braced_param_expansion(
             }
             // `${@<mod>...}` — fall through to the modifier dispatcher
             // with name="@" and no subscript.
-            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false, opts);
+            return dispatch_braced_modifier("@".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         Some('*') => {
             chars.next();
@@ -2849,22 +2893,22 @@ fn scan_braced_param_expansion(
                 parts.push(WordPart::AllArgs { joined: true, quoted });
                 return Ok(());
             }
-            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false, opts);
+            return dispatch_braced_modifier("*".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         // Scalar special params: ${-} (option flags), ${?} (exit status),
         // ${$} (shell pid). Route bare `}` and modifiers through the
         // dispatcher (e.g. `${-#*e}` from nvm). Resolved by `lookup_var`.
         Some('-') => {
             chars.next();
-            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false, opts);
+            return dispatch_braced_modifier("-".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         Some('?') => {
             chars.next();
-            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false, opts);
+            return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         Some('$') => {
             chars.next();
-            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts);
+            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         _ => {}
     }
@@ -2897,7 +2941,8 @@ fn scan_braced_param_expansion(
             _ => scan_braced_name(chars)?,
         };
         if name.is_empty() {
-            return Err(LexError::EmptyParamName);
+            // e.g. `${#!}` or `${##}` — bad substitution at runtime.
+            return recover_bad_subst(chars, parts, quoted, dollar_start);
         }
         // Optional subscript for the Length form: `${#a[i]}`, `${#a[@]}`.
         // The named regular-identifier path is the only one that takes
@@ -2935,7 +2980,7 @@ fn scan_braced_param_expansion(
             }
         }
         // Positional parameters cannot be subscripted.
-        return dispatch_braced_modifier(name, quoted, None, chars, parts, false, opts);
+        return dispatch_braced_modifier(name, quoted, None, chars, parts, false, opts, dollar_start);
     }
 
     // `${!NAME[@]}` / `${!NAME[*]}` — array-keys form (v71). The bare
@@ -2965,44 +3010,57 @@ fn scan_braced_param_expansion(
                     break;
                 }
             }
-            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts);
+            return dispatch_braced_modifier(name, quoted, None, chars, parts, /* indirect */ true, opts, dollar_start);
         }
         let name = scan_braced_name(chars)?;
         if name.is_empty() {
-            return Err(LexError::EmptyParamName);
+            // e.g. `${!+foo}` or `${!-default}` — bad substitution at runtime.
+            return recover_bad_subst(chars, parts, quoted, dollar_start);
         }
         let subscript = scan_param_subscript(chars, opts)?;
         match subscript {
             Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
-                if chars.next() != Some('}') {
-                    return Err(LexError::UnterminatedBrace);
+                // `${!arr[@]}` / `${!arr[*]}` — array-keys form. The next
+                // char must be `}`. If it's `@` (a trailing transform like
+                // `${!arr[@]@Q}` — which bash rejects at runtime), defer to
+                // a bad-substitution. Any other non-`}` is unterminated.
+                match chars.peek().copied() {
+                    Some('}') => {
+                        chars.next(); // consume `}`
+                        parts.push(WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::IndirectKeys,
+                            quoted,
+                            subscript,
+                            indirect: false,
+                        });
+                        return Ok(());
+                    }
+                    Some('@') => {
+                        // Trailing @OP on indirect-keys form — bad substitution at runtime.
+                        return recover_bad_subst(chars, parts, quoted, dollar_start);
+                    }
+                    _ => return Err(LexError::UnterminatedBrace),
                 }
-                parts.push(WordPart::ParamExpansion {
-                    name,
-                    modifier: ParamModifier::IndirectKeys,
-                    quoted,
-                    subscript,
-                    indirect: false,
-                });
-                return Ok(());
             }
             _ => {
                 // `${!NAME}` / `${!NAME-word}` / `${!NAME[i]}` — indirect
                 // scalar expansion (v95): resolve NAME's value to a name,
                 // then expand that (with any trailing modifier). The name +
                 // (non-`[@]`/`[*]`) subscript are already read/scanned here.
-                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts);
+                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts, dollar_start);
             }
         }
     }
 
     let name = scan_braced_name(chars)?;
     if name.is_empty() {
-        return Err(LexError::EmptyParamName);
+        // `${}` (truly empty) or `${+foo}` etc. — bad substitution at runtime.
+        return recover_bad_subst(chars, parts, quoted, dollar_start);
     }
     // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
     let subscript = scan_param_subscript(chars, opts)?;
-    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts)
+    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts, dollar_start)
 }
 
 /// Scans an optional `[…]` subscript immediately after the parameter name
@@ -3365,7 +3423,8 @@ fn scan_braced_name(
 /// next char to read from `chars` is whatever follows the name (typically
 /// `}`, `:`, `-`, `=`, `?`, `+`, `#`, `%`, or `/`). `subscript` is
 /// `Some(...)` when the name was followed by `[...]` (already scanned).
-/// Pushes a single `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
+/// `dollar_start` is the byte offset of the leading `$` (for bad-subst
+/// recovery). Pushes a single `WordPart` (`Var` or `ParamExpansion`) onto `parts`.
 fn dispatch_braced_modifier(
     name: String,
     quoted: bool,
@@ -3374,6 +3433,7 @@ fn dispatch_braced_modifier(
     parts: &mut Vec<WordPart>,
     indirect: bool,
     opts: LexerOptions,
+    dollar_start: usize,
 ) -> Result<(), LexError> {
     match chars.next() {
         Some('}') => {
@@ -3436,7 +3496,7 @@ fn dispatch_braced_modifier(
                     parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
                     Ok(())
                 }
-                Some('}') => Err(LexError::InvalidBraceModifier(":".to_string())),
+                Some('}') => recover_bad_subst(chars, parts, quoted, dollar_start),
                 Some(_) => {
                     let (offset, length) = scan_substring_operands(chars, opts)?;
                     parts.push(WordPart::ParamExpansion {
@@ -3530,6 +3590,10 @@ fn dispatch_braced_modifier(
             Ok(())
         }
         Some('@') => {
+            // `${V@}` with no op letter — bad substitution at runtime.
+            if chars.peek() == Some(&'}') {
+                return recover_bad_subst(chars, parts, quoted, dollar_start);
+            }
             let op = match chars.next() {
                 Some('P') => TransformOp::PromptExpand,
                 Some('Q') => TransformOp::Quote,
@@ -3541,12 +3605,11 @@ fn dispatch_braced_modifier(
                 Some('K') => TransformOp::KvString,
                 Some('k') => TransformOp::KvWords,
                 Some('a') => TransformOp::AttrFlags,
-                other => {
-                    // Unknown letter — bad substitution.
-                    return Err(LexError::InvalidBraceModifier(format!(
-                        "@{}",
-                        other.map(|c| c.to_string()).unwrap_or_default()
-                    )));
+                _other => {
+                    // Unknown or missing op letter — bad substitution at runtime.
+                    // One char has already been consumed; scan_braced_operand will
+                    // continue from here to the matching `}`.
+                    return recover_bad_subst(chars, parts, quoted, dollar_start);
                 }
             };
             // After the operator letter, the next char must close the brace.
@@ -3564,7 +3627,13 @@ fn dispatch_braced_modifier(
                 _ => Err(LexError::UnterminatedBrace),
             }
         }
-        Some(c) => Err(LexError::InvalidBraceModifier(c.to_string())),
+        Some(c) => {
+            // Unknown modifier character — bad substitution at runtime.
+            // `c` was already consumed by `chars.next()` at the top of this match;
+            // `recover_bad_subst` will scan from here to the matching `}`.
+            let _ = c;
+            recover_bad_subst(chars, parts, quoted, dollar_start)
+        }
         None => Err(LexError::UnterminatedBrace),
     }
 }
@@ -5065,15 +5134,26 @@ mod tests {
 
     #[test]
     fn tokenize_braced_var_invalid_name() {
-        // ${1foo}: digits are consumed as a positional name, then `f` is
-        // found which is not a valid modifier → InvalidBraceModifier (v33:
-        // digit branch now routes through dispatch_braced_modifier).
-        assert!(matches!(tokenize("${1foo}").unwrap_err(), LexError::InvalidBraceModifier(_)));
+        // ${1foo}: digits consumed as positional name "1", then `f` is not a
+        // valid modifier. v233: deferred to runtime BadSubst (matching bash)
+        // instead of a parse error.
+        let toks = tokenize("${1foo}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(&parts[0],
+            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
+            if raw == "${1foo}"
+        ), "expected BadSubst, got {:?}", parts[0]);
     }
 
     #[test]
     fn tokenize_braced_var_empty_name() {
-        assert_eq!(tokenize("${}").unwrap_err(), LexError::EmptyParamName);
+        // v233: `${}` is lexable-but-invalid → BadSubst at runtime, not a parse error.
+        let toks = tokenize("${}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(&parts[0],
+            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
+            if raw == "${}"
+        ), "expected BadSubst, got {:?}", parts[0]);
     }
 
     #[test]
@@ -5289,16 +5369,11 @@ mod tests {
 
     #[test]
     fn tokenize_command_sub_inner_lex_error() {
-        // `${1foo}` inside a substitution → InvalidBraceModifier (v33:
-        // digit branch routes through dispatch_braced_modifier; `f` is not
-        // a valid modifier), wrapped in Substitution.
-        let err = tokenize("$(echo ${1foo})").unwrap_err();
-        match err {
-            LexError::Substitution(inner) => {
-                assert!(matches!(*inner, LexError::InvalidBraceModifier(_)));
-            }
-            other => panic!("expected Substitution, got {other:?}"),
-        }
+        // v233: `${1foo}` inside a substitution is now a runtime BadSubst,
+        // not a parse error. The command sub parses successfully.
+        let toks = tokenize("$(echo ${1foo})").unwrap();
+        // The outer token is a Word containing a CommandSub.
+        assert!(matches!(&toks[0], Token::Word(Word(p)) if matches!(&p[0], WordPart::CommandSub { .. })));
     }
 
     #[test]
@@ -6548,8 +6623,13 @@ mod tests {
 
     #[test]
     fn tokenize_empty_param_name_errors() {
-        let err = tokenize("${:-foo}").unwrap_err();
-        assert_eq!(err, LexError::EmptyParamName);
+        // v233: `${:-foo}` has an empty param name before `:` — now a runtime
+        // BadSubst (matching bash) rather than a parse error.
+        let toks = tokenize("${:-foo}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(&parts[0],
+            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
+        ), "expected BadSubst, got {:?}", parts[0]);
     }
 
     #[test]
@@ -7382,13 +7462,14 @@ mod tests {
 
     #[test]
     fn brace_substring_empty_operand_is_lex_error() {
-        // `${var:}` — colon followed immediately by close brace has no
-        // semantic meaning; reject at lex time rather than letting a
-        // confusing arithmetic error fire later.
-        assert!(matches!(
-            tokenize_words("${name:}"),
-            Err(LexError::InvalidBraceModifier(s)) if s == ":"
-        ));
+        // v233: `${var:}` — colon followed immediately by close brace — is
+        // now a runtime BadSubst (matching bash) rather than a parse error.
+        let toks = tokenize_words("${name:}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(&parts[0],
+            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
+            if raw == "${name:}"
+        ), "expected BadSubst, got {:?}", parts[0]);
     }
 
     #[test]
@@ -8240,8 +8321,13 @@ mod array_parse_tests {
             };
             assert_eq!(*op, want);
         }
-        // `@Z` and other unknown letters are bad subst.
-        assert!(tokenize("${v@Z}").is_err());
+        // v233: `@Z` and other unknown letters are runtime BadSubst, not parse errors.
+        let toks = tokenize("${v@Z}").unwrap();
+        assert!(matches!(&toks[0],
+            Token::Word(Word(p)) if matches!(&p[0],
+                WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
+            )
+        ), "expected BadSubst for @Z");
     }
 
     fn array_lit(w: &Word) -> &[ArrayLiteralElement] {
@@ -8420,6 +8506,56 @@ mod array_parse_tests {
         }).expect("a trailing word");
         assert!(matches!(last_word.0.first(), Some(WordPart::ProcessSub { dir: ProcDir::In, .. })),
             "the `<(printf hi)` is a process-sub word");
+    }
+
+    // --- bad-substitution lexer tests (v233) ---
+
+    /// Extract the first WordPart from a single-word tokenization result.
+    fn first_word_part(input: &str) -> WordPart {
+        let mut toks = crate::lexer::tokenize(input).expect("lex");
+        let word = match toks.remove(0) {
+            Token::Word(w) => w,
+            other => panic!("expected Word, got {other:?}"),
+        };
+        word.0.into_iter().next().expect("non-empty word")
+    }
+
+    #[test]
+    fn bad_subst_dollar_name_defers() {
+        // `${$x}` has a `$` as name — lexable but invalid. Must parse OK and
+        // produce a BadSubst node with the raw `${$x}` text.
+        let part = first_word_part("${$x}");
+        assert!(matches!(&part,
+            WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
+            if raw == "${$x}"
+        ), "got {:?}", part);
+    }
+
+    #[test]
+    fn bad_subst_empty_transform_op_defers() {
+        // `${V@}` — `@` with no op letter — bad substitution but must parse.
+        assert!(crate::lexer::tokenize("${V@}").is_ok(), "should lex without error");
+    }
+
+    #[test]
+    fn bad_subst_dash_digit_defers() {
+        // `${-3}` and `${-3:-x}` — digit after special name `-` — must parse.
+        assert!(crate::lexer::tokenize("${-3}").is_ok(), "should lex ${{-3}}");
+        assert!(crate::lexer::tokenize("${-3:-x}").is_ok(), "should lex ${{-3:-x}}");
+    }
+
+    #[test]
+    fn bad_subst_star_modifier_defers() {
+        // `${H*}` — `*` is not a valid modifier char — must parse.
+        assert!(crate::lexer::tokenize("${H*}").is_ok(), "should lex ${{H*}}");
+    }
+
+    #[test]
+    fn unterminated_brace_still_errors() {
+        assert_eq!(
+            crate::lexer::tokenize("${x").unwrap_err(),
+            LexError::UnterminatedBrace
+        );
     }
 }
 
