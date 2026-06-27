@@ -1027,6 +1027,7 @@ fn expand_part(
     has_emitted: &mut bool,
     shell: &mut Shell,
     snapshot_status: i32,
+    word: &Word,
 ) -> std::ops::ControlFlow<()> {
     use std::ops::ControlFlow;
     match part {
@@ -1151,6 +1152,19 @@ fn expand_part(
             }
         }
         WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect } => {
+            // A lexable-but-invalid `${…}` (BadSubst) errors at runtime with
+            // bash's message, which reports the ENTIRE enclosing word's source
+            // (e.g. `[${-3}]`, `a${-3}b${V@}c`), not just the offending token.
+            // Reconstruct it here where the whole `word` is in scope; the
+            // token-only fallback in `param_expansion.rs` covers callers that
+            // bypass this path (assignment RHS / patterns / regex operands).
+            if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
+                let prefix = shell.error_prefix(None);
+                let src = reconstruct_word_source_inner(word);
+                with_err(|err| e!(err, "{prefix}{src}: bad substitution"));
+                shell.pending_fatal_status = Some(1);
+                return ControlFlow::Break(());
+            }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
             // `${@:o:l}` deferral) — route through the shared
             // word-list path even though there's no `subscript`.
@@ -1265,7 +1279,7 @@ fn expand_part(
             // individual `quoted: true` flags so expansion semantics are
             // unchanged; the wrapper exists only for source reconstruction.
             for inner in parts {
-                if expand_part(inner, current, result, has_emitted, shell, snapshot_status).is_break() {
+                if expand_part(inner, current, result, has_emitted, shell, snapshot_status, word).is_break() {
                     return ControlFlow::Break(());
                 }
             }
@@ -1300,7 +1314,7 @@ pub fn expand(word: &Word, shell: &mut Shell) -> Vec<Field> {
     let mut result: Vec<Field> = Vec::new();
 
     for part in &word.0 {
-        if expand_part(part, &mut current, &mut result, &mut has_emitted, shell, snapshot_status).is_break() {
+        if expand_part(part, &mut current, &mut result, &mut has_emitted, shell, snapshot_status, word).is_break() {
             return result;
         }
     }

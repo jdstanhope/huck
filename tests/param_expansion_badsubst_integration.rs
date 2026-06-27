@@ -32,3 +32,20 @@ fn bad_subst_short_circuited_does_not_error() {
     assert!(!e.contains("bad substitution"), "should not error: {e}");
     assert_eq!(c, 0);
 }
+
+#[test]
+fn bad_subst_message_reports_whole_word() {
+    // bash reports the ENTIRE enclosing word's source in the error, not just
+    // the offending `${…}` token: `echo a${-3}b` -> `a${-3}b: bad substitution`.
+    let (_o, e, _c) = run_file("echo a${-3}b\n");
+    assert!(e.contains("a${-3}b: bad substitution"), "stderr: {e}");
+    assert!(!e.contains(" ${-3}: bad"), "should report whole word, got: {e}");
+}
+
+#[test]
+fn bad_subst_message_whole_word_quoted() {
+    // Quoted word: quotes are stripped but the `${…}` stays raw: `"[${-3}]"`
+    // -> `[${-3}]: bad substitution`.
+    let (_o, e, _c) = run_file("echo \"[${-3}]\"\n");
+    assert!(e.contains("[${-3}]: bad substitution"), "stderr: {e}");
+}
