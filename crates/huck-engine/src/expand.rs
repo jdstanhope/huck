@@ -644,9 +644,15 @@ fn expand_indirect(
     // A non-empty through-value that is not a valid name (e.g. the space-joined
     // values of a real `${!arr[@]<op>}`) is rejected by bash as an invalid
     // variable name, before any modifier is applied.
+    // Exception: `name[sub]` element-references (e.g. `arr[0]`, `m[k]`) are
+    // valid indirect targets and are handled by the `split_name_subscript`
+    // path below — exclude them from this guard.
+    let is_element_ref = split_name_subscript(n)
+        .is_some_and(|(base, _)| crate::builtins::is_valid_name(&base));
     if !through.is_empty()
         && !crate::builtins::is_valid_name(n)
         && !n.bytes().all(|b| b.is_ascii_digit())
+        && !is_element_ref
     {
         with_err(|err| e!(err, "{}{}: invalid variable name", shell.error_prefix(None), n));
         return ExpansionResult::Fatal { status: 1 };

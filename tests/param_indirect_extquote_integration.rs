@@ -83,3 +83,25 @@ fn extquote_name_honors_nounset() {
     assert_eq!(c, 0, "expected rc=0 for set var, got {c}");
     assert_eq!(o, "set\n", "expected 'set', got {o:?}");
 }
+
+// === Final-review regression tests (v234 findings) ===
+
+#[test]
+fn indirect_through_array_element_ref() {
+    // bash: ${!v} where v="arr[0]" resolves to arr[0] value ("aa").
+    // huck PREVIOUSLY fired "invalid variable name" because brackets
+    // made is_valid_name return false before split_name_subscript ran.
+    let (o, e, c) = run_file("arr=(aa bb); v=\"arr[0]\"; echo \"${!v}\"\n");
+    assert_eq!(c, 0, "expected rc=0 for arr[0] indirect; rc={c}; stderr={e}");
+    assert_eq!(o, "aa\n", "expected 'aa', got {o:?}");
+
+    // Index 1
+    let (o, e, c) = run_file("arr=(aa bb); v=\"arr[1]\"; echo \"${!v:-d}\"\n");
+    assert_eq!(c, 0, "expected rc=0 for arr[1] indirect; rc={c}; stderr={e}");
+    assert_eq!(o, "bb\n", "expected 'bb', got {o:?}");
+
+    // Associative array element
+    let (o, e, c) = run_file("declare -A m=([k]=v); v=\"m[k]\"; echo \"${!v}\"\n");
+    assert_eq!(c, 0, "expected rc=0 for m[k] indirect; rc={c}; stderr={e}");
+    assert_eq!(o, "v\n", "expected 'v', got {o:?}");
+}
