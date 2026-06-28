@@ -166,13 +166,13 @@ fn apply_unary(
         // libc mode constants are `mode_t`, which is `u32` on Linux but `u16`
         // on macOS/BSD. `file_mode()` already returns `u32`; cast the constants
         // for cross-platform builds (a no-op on Linux).
-        "-p" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFIFO as u32).unwrap_or(false)),
-        "-S" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFSOCK as u32).unwrap_or(false)),
-        "-b" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFBLK as u32).unwrap_or(false)),
-        "-c" => Ok(file_mode(operand).map(|m| m & libc::S_IFMT as u32 == libc::S_IFCHR as u32).unwrap_or(false)),
-        "-k" => Ok(file_mode(operand).map(|m| m & libc::S_ISVTX as u32 != 0).unwrap_or(false)),
-        "-u" => Ok(file_mode(operand).map(|m| m & libc::S_ISUID as u32 != 0).unwrap_or(false)),
-        "-g" => Ok(file_mode(operand).map(|m| m & libc::S_ISGID as u32 != 0).unwrap_or(false)),
+        "-p" => Ok(file_type_is(operand, libc::S_IFIFO as u32)),
+        "-S" => Ok(file_type_is(operand, libc::S_IFSOCK as u32)),
+        "-b" => Ok(file_type_is(operand, libc::S_IFBLK as u32)),
+        "-c" => Ok(file_type_is(operand, libc::S_IFCHR as u32)),
+        "-k" => Ok(mode_bit_set(operand, libc::S_ISVTX as u32)),
+        "-u" => Ok(mode_bit_set(operand, libc::S_ISUID as u32)),
+        "-g" => Ok(mode_bit_set(operand, libc::S_ISGID as u32)),
         "-O" => Ok(std::fs::metadata(operand).map(|m| m.uid() == unsafe { libc::geteuid() }).unwrap_or(false)),
         "-G" => Ok(std::fs::metadata(operand).map(|m| m.gid() == unsafe { libc::getegid() }).unwrap_or(false)),
         "-N" => Ok(std::fs::metadata(operand)
@@ -192,6 +192,18 @@ fn apply_unary(
 /// mode bits of `path` (follows symlinks), or None if it can't be stat'd.
 fn file_mode(path: &str) -> Option<u32> {
     std::fs::metadata(path).ok().map(|m| m.mode())
+}
+
+/// True if `operand`'s file type equals `ftype` (an `S_IF*` constant).
+/// `S_IFMT as u32` cast is a no-op on Linux but required on macOS/BSD.
+#[allow(clippy::unnecessary_cast)]
+fn file_type_is(operand: &str, ftype: u32) -> bool {
+    file_mode(operand).map(|m| m & libc::S_IFMT as u32 == ftype).unwrap_or(false)
+}
+
+/// True if `operand`'s mode has `bit` set (an `S_IS*` constant).
+fn mode_bit_set(operand: &str, bit: u32) -> bool {
+    file_mode(operand).map(|m| m & bit != 0).unwrap_or(false)
 }
 
 /// True if the calling process can access `path` with `mode`

@@ -1203,6 +1203,54 @@ fn single_unquoted_literal(parts: &[WordPart]) -> Option<&str> {
     }
 }
 
+/// Collects a single-quoted `'…'` span body (opening `'` already consumed).
+/// Returns the content as a `String`, NOT including the closing `'`.
+/// Errors with `UnterminatedQuote` if the input ends before the closing `'`.
+fn scan_squote_content(chars: &mut CharCursor<'_>) -> Result<String, LexError> {
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            Some('\'') => return Ok(out),
+            Some(ch) => out.push(ch),
+            None => return Err(LexError::UnterminatedQuote),
+        }
+    }
+}
+
+/// Scans a `"…"` span body (opening `"` already consumed): expands `$`/`` ` ``/`\`,
+/// pushes resulting `WordPart`s into `parts`. Consumes through the closing `"`.
+fn scan_dquote_expansion_body(
+    chars: &mut CharCursor<'_>,
+    parts: &mut Vec<WordPart>,
+    opts: LexerOptions,
+) -> Result<(), LexError> {
+    let mut q = String::new();
+    loop {
+        match chars.next() {
+            Some('"') => break,
+            Some('\\') => match chars.next() {
+                Some(esc @ ('"' | '\\' | '$' | '`')) => q.push(esc),
+                Some('\n') => {}
+                Some(other) => { q.push('\\'); q.push(other); }
+                None => return Err(LexError::UnterminatedQuote),
+            },
+            Some('$') => {
+                flush_literal(parts, &mut q, true);
+                scan_dollar_expansion(chars, parts, true, opts)?;
+            }
+            Some('`') => {
+                flush_literal(parts, &mut q, true);
+                let sequence = scan_backtick_substitution(chars, opts)?;
+                parts.push(WordPart::CommandSub { sequence, quoted: true });
+            }
+            Some(ch) => q.push(ch),
+            None => return Err(LexError::UnterminatedQuote),
+        }
+    }
+    flush_literal(parts, &mut q, true);
+    Ok(())
+}
+
 /// Scan the RHS operand of `=~` inside `[[ … ]]` as one regex word. `(`/`)`/`|`/`((`
 /// are literal; paren depth keeps unquoted whitespace part of the operand while >0.
 /// `$…`/`` `…` ``/quotes/`\` behave as in a normal word. No brace expansion, no
@@ -1248,45 +1296,12 @@ fn scan_regex_operand(chars: &mut CharCursor<'_>, opts: LexerOptions) -> Result<
             }
             '\'' => {
                 flush(&mut lit, &mut parts);
-                let mut inner = String::new();
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => inner.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
+                let inner = scan_squote_content(chars)?;
                 parts.push(WordPart::Literal { text: inner, quoted: true });
             }
             '"' => {
                 flush(&mut lit, &mut parts);
-                let mut q = String::new();
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(esc @ ('"' | '\\' | '$' | '`')) => q.push(esc),
-                            Some('\n') => {}
-                            Some(other) => {
-                                q.push('\\');
-                                q.push(other);
-                            }
-                            None => return Err(LexError::UnterminatedQuote),
-                        },
-                        Some('$') => {
-                            flush_literal(&mut parts, &mut q, true);
-                            scan_dollar_expansion(chars, &mut parts, true, opts)?;
-                        }
-                        Some('`') => {
-                            flush_literal(&mut parts, &mut q, true);
-                            let sequence = scan_backtick_substitution(chars, opts)?;
-                            parts.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        Some(ch) => q.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                flush_literal(&mut parts, &mut q, true);
+                scan_dquote_expansion_body(chars, &mut parts, opts)?;
             }
             '\\' => match chars.next() {
                 Some('\n') => {} // line continuation
@@ -1342,46 +1357,13 @@ fn scan_extglob_group(
             '\'' => {
                 // Single quote: literal, no expansion.
                 flush(&mut lit, &mut group_parts);
-                let mut inner = String::new();
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => inner.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
+                let inner = scan_squote_content(chars)?;
                 group_parts.push(WordPart::Literal { text: inner, quoted: true });
             }
             '"' => {
                 // Double quote: mirror the main loop's `"` arm.
                 flush(&mut lit, &mut group_parts);
-                let mut quoted_current = String::new();
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(esc @ ('"' | '\\' | '$' | '`')) => quoted_current.push(esc),
-                            Some('\n') => {}
-                            Some(other) => {
-                                quoted_current.push('\\');
-                                quoted_current.push(other);
-                            }
-                            None => return Err(LexError::UnterminatedQuote),
-                        },
-                        Some('$') => {
-                            flush_literal(&mut group_parts, &mut quoted_current, true);
-                            scan_dollar_expansion(chars, &mut group_parts, true, opts)?;
-                        }
-                        Some('`') => {
-                            flush_literal(&mut group_parts, &mut quoted_current, true);
-                            let sequence = scan_backtick_substitution(chars, opts)?;
-                            group_parts.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        Some(ch) => quoted_current.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                flush_literal(&mut group_parts, &mut quoted_current, true);
+                scan_dquote_expansion_body(chars, &mut group_parts, opts)?;
             }
             '\\' => {
                 // Literal escape: keep both chars.
@@ -1710,36 +1692,27 @@ fn scan_expanding_body_line(
                     Some('$') | Some('`') | Some('\\') => {
                         let next = chars.next().unwrap();
                         // Flush current as unquoted, then push escaped char as quoted Literal.
-                        flush_body_literal(parts, &mut current, false);
+                        flush_literal(parts, &mut current, false);
                         parts.push(WordPart::Literal { text: next.to_string(), quoted: true });
                     }
                     _ => current.push('\\'),
                 }
             }
             '$' => {
-                flush_body_literal(parts, &mut current, false);
+                flush_literal(parts, &mut current, false);
                 // Heredoc bodies are quoted-context (no word-splitting).
                 scan_dollar_expansion(&mut chars, parts, true, opts)?;
             }
             '`' => {
-                flush_body_literal(parts, &mut current, false);
+                flush_literal(parts, &mut current, false);
                 let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: true });
             }
             other => current.push(other),
         }
     }
-    flush_body_literal(parts, &mut current, false);
+    flush_literal(parts, &mut current, false);
     Ok(())
-}
-
-fn flush_body_literal(parts: &mut Vec<WordPart>, current: &mut String, quoted: bool) {
-    if !current.is_empty() {
-        parts.push(WordPart::Literal {
-            text: std::mem::take(current),
-            quoted,
-        });
-    }
 }
 
 /// Reads what follows a `$`. Pushes the resulting WordPart onto `parts` or
@@ -2405,16 +2378,7 @@ fn scan_cmdsub_body(
             Some('\'') => {
                 word_bare = false;
                 out.push('\'');
-                loop {
-                    match chars.next() {
-                        Some('\'') => {
-                            out.push('\'');
-                            break;
-                        }
-                        Some(c) => out.push(c),
-                        None => return Err(unterminated),
-                    }
-                }
+                push_quoted_span(chars, '\'', out, unterminated.clone())?;
                 at_boundary = false;
             }
             Some('"') => {
@@ -2585,6 +2549,27 @@ fn recover_bad_subst(
     Ok(())
 }
 
+/// Collects a raw ANSI-C `$'…'` body (both `$` and opening `'` already consumed).
+/// Appends chars to `out` with `\`-escape pairs verbatim; does NOT push the
+/// closing `'`. Returns `Ok(())` on the first unescaped `'`; `Err(err)` on EOF.
+fn scan_raw_ansi_c_body(
+    chars: &mut CharCursor<'_>,
+    out: &mut String,
+    err: LexError,
+) -> Result<(), LexError> {
+    loop {
+        match chars.next() {
+            None => return Err(err),
+            Some('\\') => {
+                out.push('\\');
+                if let Some(c) = chars.next() { out.push(c); }
+            }
+            Some('\'') => return Ok(()),
+            Some(c) => out.push(c),
+        }
+    }
+}
+
 fn scan_braced_operand(
     chars: &mut CharCursor<'_>,
 ) -> Result<String, LexError> {
@@ -2618,13 +2603,7 @@ fn scan_braced_operand(
             }
             Some('\'') => {
                 body.push('\'');
-                loop {
-                    match chars.next() {
-                        None => return Err(LexError::UnterminatedBrace),
-                        Some('\'') => { body.push('\''); break; }
-                        Some(c) => body.push(c),
-                    }
-                }
+                push_quoted_span(chars, '\'', &mut body, LexError::UnterminatedBrace)?;
             }
             Some('`') => {
                 // Backtick command substitution: consume verbatim through the
@@ -2654,17 +2633,8 @@ fn scan_braced_operand(
                         body.push('\'');
                         // ANSI-C span: `\` escapes the next char (incl. `\'`),
                         // closing on the first UNescaped `'`.
-                        loop {
-                            match chars.next() {
-                                None => return Err(LexError::UnterminatedBrace),
-                                Some('\\') => {
-                                    body.push('\\');
-                                    if let Some(c) = chars.next() { body.push(c); }
-                                }
-                                Some('\'') => { body.push('\''); break; }
-                                Some(c) => body.push(c),
-                            }
-                        }
+                        scan_raw_ansi_c_body(chars, &mut body, LexError::UnterminatedBrace)?;
+                        body.push('\'');
                     }
                     Some(&'"') => {
                         chars.next();
@@ -2730,7 +2700,7 @@ fn parse_braced_operand_opts(
             '\\' if enclosing_dquote => match chars.peek().copied() {
                 Some(e @ ('$' | '`' | '"' | '\\')) => {
                     chars.next();
-                    flush_body_literal(&mut parts, &mut cur, true);
+                    flush_literal(&mut parts, &mut cur, true);
                     parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
                 }
                 _ => cur.push('\\'),
@@ -2740,16 +2710,16 @@ fn parse_braced_operand_opts(
                 // (glob-safe, consistent with the main tokenizer). `\` at end of
                 // body silently vanishes.
                 if let Some(n) = chars.next() {
-                    flush_body_literal(&mut parts, &mut cur, false);
+                    flush_literal(&mut parts, &mut cur, false);
                     parts.push(WordPart::Literal { text: n.to_string(), quoted: true });
                 }
             }
             '$' => {
-                flush_body_literal(&mut parts, &mut cur, q);
+                flush_literal(&mut parts, &mut cur, q);
                 scan_dollar_expansion(&mut chars, &mut parts, q, opts)?;
             }
             '`' => {
-                flush_body_literal(&mut parts, &mut cur, q);
+                flush_literal(&mut parts, &mut cur, q);
                 let sequence = scan_backtick_substitution(&mut chars, opts)?;
                 parts.push(WordPart::CommandSub { sequence, quoted: q });
             }
@@ -2757,7 +2727,7 @@ fn parse_braced_operand_opts(
             '\'' if enclosing_dquote => cur.push('\''),
             '\'' => {
                 // Single-quoted span: everything literal until the next `'`.
-                flush_body_literal(&mut parts, &mut cur, false);
+                flush_literal(&mut parts, &mut cur, false);
                 let mut s = String::new();
                 loop {
                     match chars.next() {
@@ -2770,7 +2740,7 @@ fn parse_braced_operand_opts(
             }
             '"' => {
                 // Double-quoted span: $/`/\ active; everything else literal (quoted).
-                flush_body_literal(&mut parts, &mut cur, q);
+                flush_literal(&mut parts, &mut cur, q);
                 loop {
                     match chars.next() {
                         None => return Err(LexError::UnterminatedQuote),
@@ -2778,29 +2748,29 @@ fn parse_braced_operand_opts(
                         Some('\\') => match chars.peek().copied() {
                             Some(e @ ('$' | '`' | '"' | '\\')) => {
                                 chars.next();
-                                flush_body_literal(&mut parts, &mut cur, true);
+                                flush_literal(&mut parts, &mut cur, true);
                                 parts.push(WordPart::Literal { text: e.to_string(), quoted: true });
                             }
                             _ => cur.push('\\'),
                         },
                         Some('$') => {
-                            flush_body_literal(&mut parts, &mut cur, true);
+                            flush_literal(&mut parts, &mut cur, true);
                             scan_dollar_expansion(&mut chars, &mut parts, true, opts)?;
                         }
                         Some('`') => {
-                            flush_body_literal(&mut parts, &mut cur, true);
+                            flush_literal(&mut parts, &mut cur, true);
                             let sequence = scan_backtick_substitution(&mut chars, opts)?;
                             parts.push(WordPart::CommandSub { sequence, quoted: true });
                         }
                         Some(ch) => cur.push(ch),
                     }
                 }
-                flush_body_literal(&mut parts, &mut cur, true);
+                flush_literal(&mut parts, &mut cur, true);
             }
             other => cur.push(other),
         }
     }
-    flush_body_literal(&mut parts, &mut cur, q);
+    flush_literal(&mut parts, &mut cur, q);
     Ok(Word(parts))
 }
 
@@ -3390,16 +3360,7 @@ fn scan_array_element_word(
             '\'' => {
                 buf.push(c);
                 chars.next();
-                loop {
-                    match chars.next() {
-                        Some('\'') => {
-                            buf.push('\'');
-                            break;
-                        }
-                        Some(ch) => buf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
+                push_quoted_span(chars, '\'', &mut buf, LexError::UnterminatedQuote)?;
             }
             '"' => {
                 buf.push(c);
@@ -3558,17 +3519,7 @@ fn scan_braced_name_ext(chars: &mut CharCursor<'_>) -> Result<NameScan, LexError
                         // ANSI-C span: `\` escapes the next char; closes on the
                         // first UNescaped `'`. Reuses the M4 span shape.
                         let mut body = String::new();
-                        loop {
-                            match chars.next() {
-                                None => return Err(LexError::UnterminatedBrace),
-                                Some('\\') => {
-                                    body.push('\\');
-                                    if let Some(c) = chars.next() { body.push(c); }
-                                }
-                                Some('\'') => break,
-                                Some(c) => body.push(c),
-                            }
-                        }
+                        scan_raw_ansi_c_body(chars, &mut body, LexError::UnterminatedBrace)?;
                         name.push_str(&decode_ansi_c_escapes(&body));
                         decoded = true;
                     }

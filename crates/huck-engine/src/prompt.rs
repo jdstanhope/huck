@@ -72,8 +72,7 @@ pub fn expand_prompt(template: &str, shell: &mut Shell) -> String {
                 b'\\' => out.push('\\'),
                 b'?' => out.push_str(&shell.last_status().to_string()),
                 b'j' => out.push_str(&shell.jobs.iter().count().to_string()),
-                b'!' => out.push_str(&next_history_number(shell).to_string()),
-                b'#' => out.push_str(&next_history_number(shell).to_string()),
+                b'!' | b'#' => out.push_str(&next_history_number(shell).to_string()),
                 b'e' => out.push('\x1B'),
                 b'a' => out.push('\x07'),
                 b'[' => out.push('\x01'),
@@ -358,7 +357,10 @@ fn host_short() -> String {
     }
 }
 
-fn cwd_tilde(shell: &Shell) -> String {
+/// Returns `(cwd, home)` by checking the shell's `PWD`/`HOME` variables,
+/// falling back to the OS environment. Both values default to an empty string
+/// if unset.
+fn resolve_cwd_home(shell: &Shell) -> (String, String) {
     let cwd = shell
         .lookup_var("PWD")
         .or_else(|| {
@@ -371,6 +373,11 @@ fn cwd_tilde(shell: &Shell) -> String {
         .lookup_var("HOME")
         .or_else(|| std::env::var("HOME").ok())
         .unwrap_or_default();
+    (cwd, home)
+}
+
+fn cwd_tilde(shell: &Shell) -> String {
+    let (cwd, home) = resolve_cwd_home(shell);
     if !home.is_empty() && cwd == home {
         return "~".to_string();
     }
@@ -384,18 +391,7 @@ fn cwd_tilde(shell: &Shell) -> String {
 }
 
 fn cwd_basename(shell: &Shell) -> String {
-    let cwd = shell
-        .lookup_var("PWD")
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string())
-        })
-        .unwrap_or_default();
-    let home = shell
-        .lookup_var("HOME")
-        .or_else(|| std::env::var("HOME").ok())
-        .unwrap_or_default();
+    let (cwd, home) = resolve_cwd_home(shell);
     if !home.is_empty() && cwd == home {
         return "~".to_string();
     }

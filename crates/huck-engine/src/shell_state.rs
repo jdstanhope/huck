@@ -881,6 +881,11 @@ impl Shell {
         self.shopt_options.get("nocasematch").unwrap_or(false)
     }
 
+    /// True when `shopt -s extglob` is in effect (drives `LexerOptions.extglob`).
+    pub fn extglob(&self) -> bool {
+        self.shopt_options.get("extglob").unwrap_or(false)
+    }
+
     /// Bash-compatible error prologue: `<name>: [line N: ][cmd: ]`.
     /// Mirrors bash `get_name_for_error` + `error_prolog`/`builtin_error_prolog`.
     /// `cmd` is the command context (`let`, `((`) or `None` for `$(( ))`.
