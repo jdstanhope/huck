@@ -3075,28 +3075,23 @@ fn scan_braced_param_expansion(
         let subscript = scan_param_subscript(chars, opts)?;
         match subscript {
             Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
-                // `${!arr[@]}` / `${!arr[*]}` — array-keys form. The next
-                // char must be `}`. If it's `@` (a trailing transform like
-                // `${!arr[@]@Q}` — which bash rejects at runtime), defer to
-                // a bad-substitution. Any other non-`}` is unterminated.
-                match chars.peek().copied() {
-                    Some('}') => {
-                        chars.next(); // consume `}`
-                        parts.push(WordPart::ParamExpansion {
-                            name,
-                            modifier: ParamModifier::IndirectKeys,
-                            quoted,
-                            subscript,
-                            indirect: false,
-                        });
-                        return Ok(());
-                    }
-                    Some('@') => {
-                        // Trailing @OP on indirect-keys form — bad substitution at runtime.
-                        return recover_bad_subst(chars, parts, quoted, dollar_start);
-                    }
-                    _ => return Err(LexError::UnterminatedBrace),
+                // `${!arr[@]}` / `${!arr[*]}` with NOTHING after `]` is the
+                // array-KEYS operator. With a trailing operator it is instead
+                // INDIRECT expansion through `${arr[@]}`'s value, then the
+                // operator (bash) — route that through dispatch_braced_modifier
+                // exactly like the scalar-subscript `_` arm below.
+                if chars.peek() == Some(&'}') {
+                    chars.next(); // consume `}`
+                    parts.push(WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::IndirectKeys,
+                        quoted,
+                        subscript,
+                        indirect: false,
+                    });
+                    return Ok(());
                 }
+                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts, dollar_start);
             }
             _ => {
                 // `${!NAME}` / `${!NAME-word}` / `${!NAME[i]}` — indirect
@@ -6399,6 +6394,40 @@ mod tests {
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "a");
         assert!(!(*indirect));
+        assert!(matches!(modifier, ParamModifier::IndirectKeys));
+    }
+
+    #[test]
+    fn indirect_keys_with_suffix_op_is_indirect_not_keys() {
+        // `${!v[@]%b}` — trailing `%b` makes it indirect-through-${v[@]} + RemoveSuffix,
+        // NOT the array-keys operator.
+        let toks = tokenize("${!v[@]%b}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert!(*indirect);
+        assert!(matches!(subscript, Some(SubscriptKind::All)));
+        assert!(matches!(modifier, ParamModifier::RemoveSuffix { .. }));
+    }
+
+    #[test]
+    fn indirect_keys_with_transform_op_is_indirect() {
+        // `${!v[@]@Q}` — was wrongly BadSubst in v233; now indirect + transform.
+        let toks = tokenize("${!v[@]@Q}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert!(*indirect);
+        assert!(matches!(subscript, Some(SubscriptKind::All)));
+        assert!(matches!(modifier, ParamModifier::Transform { .. }));
+    }
+
+    #[test]
+    fn indirect_keys_bare_still_keys() {
+        // Regression: `${!v[@]}` with NOTHING after `]` stays the keys operator.
+        let toks = tokenize("${!v[@]}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::IndirectKeys));
     }
 
