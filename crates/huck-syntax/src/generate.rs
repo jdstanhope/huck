@@ -19,16 +19,15 @@ pub fn function_to_source(name: &str, body: &Command) -> String {
     render_function_def(name, body, 0, false)
 }
 
-/// Render the trailing redirects of a hoisted brace-group body, reusing the
-/// 0/1/2 slot fast-path (mirrors the `Command::Redirected` arm). Each slot is
-/// prefixed with a space, e.g. ` 1>&2`.
-fn render_hoisted_redirects(redirects: &[crate::command::Redirection]) -> String {
+/// Append the 0/1/2 slot redirects to `s`, each prefixed with a space
+/// (e.g. ` 1>&2`). Shared by the hoisted-brace-group path, the
+/// `Command::Redirected` arm, and `exec_to_source` — all three emit
+/// identical spacing/ordering (stdin → stdout → stderr, empty slots skipped).
+fn append_slot_redirects(s: &mut String, redirects: &[crate::command::Redirection]) {
     let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
-    let mut s = String::new();
     if let Some(r) = &stdin { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdin)); }
     if let Some(r) = &stdout { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stdout)); }
     if let Some(r) = &stderr { s.push(' '); s.push_str(&redirect_to_source(r, RedirDefault::Stderr)); }
-    s
 }
 
 /// Render a function definition. `with_keyword` adds the leading `function `
@@ -44,7 +43,9 @@ fn render_function_def(name: &str, body: &Command, indent: usize, with_keyword: 
             if matches!(inner.as_ref(), Command::BraceGroup(_)) =>
         {
             let Command::BraceGroup(seq) = inner.as_ref() else { unreachable!() };
-            ((**seq).clone(), render_hoisted_redirects(redirects))
+            let mut hoisted = String::new();
+            append_slot_redirects(&mut hoisted, redirects);
+            ((**seq).clone(), hoisted)
         }
         other => (
             Sequence { first: other.clone(), rest: Vec::new(), background: false },
@@ -108,20 +109,8 @@ pub fn command_to_source(cmd: &Command, indent: usize) -> String {
             // Source regeneration uses the 0/1/2 slot fast-path (v156).
             // Regeneration of fd>2 / `<&` / `{var}` redirects is best-effort
             // (slot-collapsed).
-            let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(redirects);
             let mut s = command_to_source(inner, indent);
-            if let Some(r) = &stdin {
-                s.push(' ');
-                s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
-            }
-            if let Some(r) = &stdout {
-                s.push(' ');
-                s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
-            }
-            if let Some(r) = &stderr {
-                s.push(' ');
-                s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
-            }
+            append_slot_redirects(&mut s, redirects);
             s
         }
     }
@@ -422,19 +411,7 @@ fn exec_to_source(e: &ExecCommand) -> String {
     }
     let mut s = parts.join(" ");
     // 0/1/2 slot fast-path for source regeneration (v156, best-effort).
-    let (stdin, stdout, stderr) = crate::command::slots_for_simple_path(&e.redirects);
-    if let Some(r) = &stdin {
-        s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stdin));
-    }
-    if let Some(r) = &stdout {
-        s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stdout));
-    }
-    if let Some(r) = &stderr {
-        s.push(' ');
-        s.push_str(&redirect_to_source(r, RedirDefault::Stderr));
-    }
+    append_slot_redirects(&mut s, &e.redirects);
     s
 }
 

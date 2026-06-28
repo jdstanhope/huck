@@ -2439,6 +2439,31 @@ impl std::io::Read for RawStdinReader {
     }
 }
 
+/// Extract an option's value from the rest of a flag cluster (`-dVALUE`) or
+/// consume the next argument (`-d VALUE`). Advances `*i` only in the
+/// separate-arg case. Returns `Err(2)` (the exit code) if there is no next
+/// arg, after printing the standard diagnostic.
+fn take_opt_value(
+    args: &[String],
+    i: &mut usize,
+    bytes: &[u8],
+    j: usize,
+    cmd: &str,
+    opt: char,
+    err: &mut dyn Write,
+) -> Result<String, i32> {
+    if j + 1 < bytes.len() {
+        Ok(String::from_utf8_lossy(&bytes[j + 1..]).into_owned())
+    } else {
+        *i += 1;
+        if *i >= args.len() {
+            e!(err, "huck: {cmd}: -{opt}: option requires an argument");
+            return Err(2);
+        }
+        Ok(args[*i].clone())
+    }
+}
+
 /// `mapfile [-d DELIM] [-n COUNT] [-O ORIGIN] [-s SKIP] [-t] [ARRAY]`
 /// (alias `readarray`). Reads delimiter-separated records from stdin into the
 /// indexed array ARRAY (default MAPFILE). Core option set (v140); `-u`/`-C`/`-c`
@@ -2488,15 +2513,9 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             match bytes[j] {
                 b't' => strip_t = true,
                 b'd' => {
-                    let s = if j + 1 < bytes.len() {
-                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
-                    } else {
-                        i += 1;
-                        if i >= args.len() {
-                            e!(err, "huck: mapfile: -d: option requires an argument");
-                            return ExecOutcome::Continue(2);
-                        }
-                        args[i].clone()
+                    let s = match take_opt_value(args, &mut i, bytes, j, "mapfile", 'd', err) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
                     };
                     delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
                     consumed_rest = true;
@@ -2638,30 +2657,18 @@ fn builtin_read(
                     break;
                 }
                 b'd' => {
-                    let d_val: String = if j + 1 < bytes.len() {
-                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
-                    } else {
-                        i += 1;
-                        if i >= args.len() {
-                            e!(err, "huck: read: -d: option requires an argument");
-                            return ExecOutcome::Continue(2);
-                        }
-                        args[i].clone()
+                    let d_val = match take_opt_value(args, &mut i, bytes, j, "read", 'd', err) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
                     };
                     // Empty DELIM means NUL byte.
                     delim = d_val.bytes().next().unwrap_or(0u8);
                     break;
                 }
                 b'a' => {
-                    let v: String = if j + 1 < bytes.len() {
-                        String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
-                    } else {
-                        i += 1;
-                        if i >= args.len() {
-                            e!(err, "huck: read: -a: option requires an argument");
-                            return ExecOutcome::Continue(2);
-                        }
-                        args[i].clone()
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'a', err) {
+                        Ok(v) => v,
+                        Err(rc) => return ExecOutcome::Continue(rc),
                     };
                     array_name = Some(v);
                     break;

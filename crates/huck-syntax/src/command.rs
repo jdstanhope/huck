@@ -1204,6 +1204,22 @@ fn is_function_body_shape(body: &Command) -> bool {
     )
 }
 
+/// After the function name and optional `()` have been consumed, skips
+/// newlines, guards against end-of-input, parses the body command,
+/// validates its shape, and returns the complete `FunctionDef` command.
+/// Shared by `parse_function_def` and `parse_function_keyword_def`.
+fn finish_function_body(name: String, iter: &mut TokenCursor) -> Result<Command, ParseError> {
+    skip_newlines(iter);
+    if iter.peek().is_none() {
+        return Err(ParseError::UnterminatedFunction);
+    }
+    let body = parse_command(iter)?;
+    if !is_function_body_shape(&body) {
+        return Err(ParseError::FunctionBody);
+    }
+    Ok(Command::FunctionDef { name, body: Box::new(body) })
+}
+
 /// Parses `name() compound-command`. The caller has consumed the name
 /// (`name_word`) and verified the next token is `(`.
 fn parse_function_def(
@@ -1218,15 +1234,7 @@ fn parse_function_def(
         Some(Token::Op(Operator::RParen)) => {}
         _ => return Err(ParseError::FunctionBody),
     }
-    skip_newlines(iter);
-    if iter.peek().is_none() {
-        return Err(ParseError::UnterminatedFunction);
-    }
-    let body = parse_command(iter)?;
-    if !is_function_body_shape(&body) {
-        return Err(ParseError::FunctionBody);
-    }
-    Ok(Command::FunctionDef { name, body: Box::new(body) })
+    finish_function_body(name, iter)
 }
 
 /// Parses `function NAME [()] compound-command`. The caller has
@@ -1257,16 +1265,7 @@ fn parse_function_keyword_def(
     }
 
     // Allow newlines between name (or `()`) and the body.
-    skip_newlines(iter);
-    if iter.peek().is_none() {
-        return Err(ParseError::UnterminatedFunction);
-    }
-
-    let body = parse_command(iter)?;
-    if !is_function_body_shape(&body) {
-        return Err(ParseError::FunctionBody);
-    }
-    Ok(Command::FunctionDef { name, body: Box::new(body) })
+    finish_function_body(name, iter)
 }
 
 /// Consumes a run of `Newline` tokens. Newlines are soft separators —
@@ -1551,6 +1550,22 @@ fn parse_for_command(
     Ok(Command::For(Box::new(parse_for_after_keyword(iter)?)))
 }
 
+/// Skips `;`/newline separators before `do`, then consumes `do`, the
+/// loop body, and `done`. Returns the parsed body `Sequence`. Shared
+/// by `parse_for_after_keyword` and `parse_select_command`.
+fn parse_do_body_done(iter: &mut TokenCursor) -> Result<Sequence, ParseError> {
+    while matches!(
+        iter.peek(),
+        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+    ) {
+        iter.next();
+    }
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    Ok(body)
+}
+
 /// Parses `for NAME [in WORD...] sep do LIST done` AFTER the `for`
 /// keyword has already been consumed by the caller.
 fn parse_for_after_keyword(
@@ -1591,17 +1606,7 @@ fn parse_for_after_keyword(
         false
     };
 
-    // Skip `;`/newline separators, then `do`.
-    while matches!(
-        iter.peek(),
-        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
-    ) {
-        iter.next();
-    }
-    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
-
-    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
-    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    let body = parse_do_body_done(iter)?;
     Ok(ForClause { var, words, has_in, body })
 }
 
@@ -1645,17 +1650,7 @@ fn parse_select_command(
         None
     };
 
-    // Skip `;`/newline separators, then `do`.
-    while matches!(
-        iter.peek(),
-        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
-    ) {
-        iter.next();
-    }
-    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
-
-    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
-    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    let body = parse_do_body_done(iter)?;
     Ok(Command::Select(Box::new(SelectClause { var, words, body })))
 }
 
