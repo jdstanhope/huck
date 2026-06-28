@@ -47,7 +47,7 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     if ends_with_continuation_backslash(buffer) {
         return Completeness::Incomplete(ContinuationReason::Backslash);
     }
-    let tokens = match lexer::tokenize_with_opts(buffer, lexer::LexerOptions { extglob }) {
+    let tokens = match lexer::tokenize_with_opts(buffer, lexer::LexerOptions { extglob, ..Default::default() }) {
         Ok(tokens) => tokens,
         Err(LexError::UnterminatedHeredoc) => {
             return Completeness::Incomplete(ContinuationReason::Heredoc);

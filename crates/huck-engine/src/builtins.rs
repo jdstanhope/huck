@@ -6342,7 +6342,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // truncated trailing unit is re-lexed with the now-current extglob.
         let (tokens, offsets, lex_lines, terr) = crate::lexer::tokenize_partial(
             &contents[start..],
-            crate::lexer::LexerOptions { extglob },
+            crate::lexer::LexerOptions { extglob, ..Default::default() },
         );
         let total = tokens.len();
         if total == 0 {

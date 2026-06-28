@@ -105,3 +105,35 @@ fn indirect_through_array_element_ref() {
     assert_eq!(c, 0, "expected rc=0 for m[k] indirect; rc={c}; stderr={e}");
     assert_eq!(o, "v\n", "expected 'v', got {o:?}");
 }
+
+// === v235: extquote gate (M-156) — in_dquote context ===
+
+#[test]
+fn extquote_pattern_quoted_decodes() {
+    // Quoted outer -> the nested ${$'x1'%$'t'} in the # pattern decodes.
+    let (o, _e, c) = run_file("x=notOK; x1=not; echo \"${x#${$'x1'%$'t'}}\"\n");
+    assert_eq!(c, 0);
+    assert_eq!(o, "tOK\n");
+}
+
+#[test]
+fn extquote_pattern_unquoted_is_bad_subst() {
+    // Unquoted outer -> the nested extquote name is a runtime bad substitution.
+    let (_o, e, c) = run_file("x=notOK; x1=not; echo ${x#${$'x1'%$'t'}}\n");
+    assert_eq!(c, 1);
+    assert!(e.contains("bad substitution"), "stderr: {e}");
+}
+
+#[test]
+fn extquote_default_unquoted_is_bad_subst() {
+    let (_o, e, c) = run_file("x1=hi; unset z; echo ${z:-${$'x1'}}\n");
+    assert_eq!(c, 1);
+    assert!(e.contains("bad substitution"), "stderr: {e}");
+}
+
+#[test]
+fn extquote_default_quoted_decodes() {
+    let (o, _e, c) = run_file("x1=hi; unset z; echo \"${z:-${$'x1'}}\"\n");
+    assert_eq!(c, 0);
+    assert_eq!(o, "hi\n");
+}

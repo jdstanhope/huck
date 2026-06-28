@@ -359,6 +359,18 @@ struct PendingHeredoc {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LexerOptions {
     pub extglob: bool,
+    /// True when the `${…}` currently being scanned is inside double quotes.
+    /// Read ONLY by the extquote `$'…'`-name gate (M-156); it does NOT affect
+    /// glob-literalness, word-splitting, or quoting of operands.
+    pub in_dquote: bool,
+}
+
+impl LexerOptions {
+    /// Returns a copy with `in_dquote` set — used to seed the extquote
+    /// double-quote context for a pattern-operand re-parse.
+    fn with_in_dquote(self, b: bool) -> Self {
+        LexerOptions { in_dquote: b, ..self }
+    }
 }
 
 /// Raw output of the partial tokenizer: `tokens`, parallel byte `offsets` and
@@ -3115,9 +3127,14 @@ fn scan_braced_param_expansion(
     let (name, name_decoded) = match scan_braced_name_ext(chars)? {
         NameScan::BadSubst => return recover_bad_subst(chars, parts, quoted, dollar_start),
         NameScan::Name { name, decoded } => {
+            // extquote: a `$'…'`-decoded name is only valid in double-quote
+            // context (bash). `quoted` covers top-level + default operands;
+            // `opts.in_dquote` covers pattern operands. Unquoted -> bad subst.
+            if decoded && !(quoted || opts.in_dquote) {
+                return recover_bad_subst(chars, parts, quoted, dollar_start);
+            }
             // A decoded name must be a valid identifier (e.g. `${$'x\ty'}` is
-            // invalid -> bad subst). A non-decoded name keeps the prior
-            // behavior exactly (empty -> bad subst below).
+            // invalid -> bad subst). A non-decoded name keeps prior behavior.
             if decoded && !is_valid_param_name(&name) {
                 return recover_bad_subst(chars, parts, quoted, dollar_start);
             }
@@ -3698,14 +3715,14 @@ fn dispatch_braced_modifier(
         Some('#') => {
             let longest = chars.peek() == Some(&'#');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, false, opts.with_in_dquote(quoted || opts.in_dquote), |w| ParamModifier::RemovePrefix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
         Some('%') => {
             let longest = chars.peek() == Some(&'%');
             if longest { chars.next(); }
-            let modifier = modifier_with_operand(chars, false, opts, |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
+            let modifier = modifier_with_operand(chars, false, opts.with_in_dquote(quoted || opts.in_dquote), |w| ParamModifier::RemoveSuffix { pattern: w, longest })?;
             parts.push(WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect });
             Ok(())
         }
@@ -3717,7 +3734,7 @@ fn dispatch_braced_modifier(
                 Some('%') if !all => { chars.next(); SubstAnchor::Suffix }
                 _ => SubstAnchor::None,
             };
-            let (pattern, replacement) = scan_substitution_operand(chars, opts)?;
+            let (pattern, replacement) = scan_substitution_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
@@ -3730,7 +3747,7 @@ fn dispatch_braced_modifier(
         Some('^') => {
             let all = chars.peek() == Some(&'^');
             if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars, opts)?;
+            let pattern = scan_optional_braced_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Upper, all, pattern },
@@ -3743,7 +3760,7 @@ fn dispatch_braced_modifier(
         Some(',') => {
             let all = chars.peek() == Some(&',');
             if all { chars.next(); }
-            let pattern = scan_optional_braced_operand(chars, opts)?;
+            let pattern = scan_optional_braced_operand(chars, opts.with_in_dquote(quoted || opts.in_dquote))?;
             parts.push(WordPart::ParamExpansion {
                 name,
                 modifier: ParamModifier::Case { direction: CaseDirection::Lower, all, pattern },
@@ -4293,7 +4310,7 @@ mod tests {
 
     #[test]
     fn extglob_inside_command_sub_lexes() {
-        let opts = LexerOptions { extglob: true };
+        let opts = LexerOptions { extglob: true, ..Default::default() };
         let toks = tokenize_with_opts("echo $(echo !(x))", opts).unwrap();
         assert!(toks.iter().any(|t| matches!(
             t, Token::Word(Word(parts)) if parts.iter().any(|p| matches!(p, WordPart::CommandSub { .. }))
@@ -4302,26 +4319,26 @@ mod tests {
 
     #[test]
     fn extglob_inside_backtick_sub_lexes() {
-        let opts = LexerOptions { extglob: true };
+        let opts = LexerOptions { extglob: true, ..Default::default() };
         tokenize_with_opts("echo `echo !(x)`", opts).unwrap();
     }
 
     #[test]
     fn extglob_inside_array_literal_command_sub_lexes() {
-        let opts = LexerOptions { extglob: true };
+        let opts = LexerOptions { extglob: true, ..Default::default() };
         tokenize_with_opts("a=($(printf '%s\\n' /tmp/!(x)))", opts).unwrap();
     }
 
     #[test]
     fn command_sub_without_extglob_still_errors_on_bare_extglob() {
-        let opts = LexerOptions { extglob: false };
+        let opts = LexerOptions { extglob: false, ..Default::default() };
         assert!(tokenize_with_opts("echo $(echo !(x))", opts).is_err());
     }
 
     #[test]
     fn plain_command_sub_unchanged() {
         for eg in [false, true] {
-            let opts = LexerOptions { extglob: eg };
+            let opts = LexerOptions { extglob: eg, ..Default::default() };
             tokenize_with_opts("echo $(echo hi) $((1+1))", opts).unwrap();
         }
     }
@@ -4514,7 +4531,7 @@ mod tests {
 
     #[test]
     fn extglob_word_recognized_when_enabled() {
-        let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true }).unwrap();
+        let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
         assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
         assert!(matches!(&toks[0], Token::Word(_)));
     }
@@ -4529,7 +4546,7 @@ mod tests {
     #[test]
     fn extglob_all_prefixes_and_nesting() {
         for p in ["?(a)", "*(a)", "@(a|b)", "!(a)", "a+(b|c)d", "@(a*(b)c)"] {
-            let toks = tokenize_with_opts(p, LexerOptions { extglob: true }).unwrap();
+            let toks = tokenize_with_opts(p, LexerOptions { extglob: true, ..Default::default() }).unwrap();
             assert_eq!(toks.len(), 1, "{p} should be one word, got {toks:?}");
         }
     }
@@ -4538,7 +4555,7 @@ mod tests {
     fn extglob_group_preserves_inner_expansion() {
         // `+($x)` must NOT collapse to a single flat literal — the `$x`
         // inside the group has to survive as a Param part so it expands.
-        let toks = tokenize_with_opts("+($x)", LexerOptions { extglob: true }).unwrap();
+        let toks = tokenize_with_opts("+($x)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
         assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
         let Token::Word(Word(parts)) = &toks[0] else {
             panic!("expected a Word token, got {:?}", toks[0]);
@@ -5990,8 +6007,8 @@ mod tests {
         // A command substitution inside arithmetic whose body uses an extglob
         // pattern lexes only when extglob is enabled (L-24).
         let body = "$( [[ foo == @(foo|bar) ]] && echo 1 )";
-        assert!(arith_string_to_word(body, LexerOptions { extglob: true }).is_ok());
-        assert!(arith_string_to_word(body, LexerOptions { extglob: false }).is_err());
+        assert!(arith_string_to_word(body, LexerOptions { extglob: true, ..Default::default() }).is_ok());
+        assert!(arith_string_to_word(body, LexerOptions { extglob: false, ..Default::default() }).is_err());
     }
 
     #[test]
@@ -8856,21 +8873,30 @@ mod array_parse_tests {
 
     #[test]
     fn extquote_name_decodes_to_identifier() {
-        // `${$'x1'}` -> name "x1".
-        let toks = tokenize(r#"${$'x1'}"#).unwrap();
+        // `"${$'x1'}"` (double-quoted) -> name "x1"; unquoted is now bad subst (M-156).
+        let toks = tokenize(r#""${$'x1'}""#).unwrap();
         let Token::Word(Word(parts)) = &toks[0] else { panic!() };
-        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = &parts[0]
-        else { panic!("expected name-bearing part, got {:?}", parts[0]) };
+        // Unwrap a possible outer Quoted wrapper.
+        let inner = match &parts[0] {
+            WordPart::Quoted { parts, .. } => &parts[0],
+            other => other,
+        };
+        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = inner
+        else { panic!("expected name-bearing part, got {:?}", inner) };
         assert_eq!(name, "x1");
     }
 
     #[test]
     fn extquote_name_concatenates() {
-        // `${a$'b'}` -> name "ab".
-        let toks = tokenize(r#"${a$'b'}"#).unwrap();
+        // `"${a$'b'}"` (double-quoted) -> name "ab"; unquoted is now bad subst (M-156).
+        let toks = tokenize(r#""${a$'b'}""#).unwrap();
         let Token::Word(Word(parts)) = &toks[0] else { panic!() };
-        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = &parts[0]
-        else { panic!("got {:?}", parts[0]) };
+        let inner = match &parts[0] {
+            WordPart::Quoted { parts, .. } => &parts[0],
+            other => other,
+        };
+        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = inner
+        else { panic!("got {:?}", inner) };
         assert_eq!(name, "ab");
     }
 
@@ -8884,10 +8910,59 @@ mod array_parse_tests {
 
     #[test]
     fn extquote_decoded_invalid_name_is_bad_subst() {
-        // `${$'x\ty'}` decodes to "x<TAB>y" — invalid name -> bad substitution.
+        // `${$'x\ty'}` is UNQUOTED: fires at the quote-context gate (not the
+        // invalid-name gate) — unquoted extquote name -> bad substitution.
         let toks = tokenize("${$'x\\ty'}").unwrap();
         let Token::Word(Word(parts)) = &toks[0] else { panic!() };
         assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
+    }
+
+    #[test]
+    fn extquote_decoded_invalid_name_quoted_is_bad_subst() {
+        // Inside `"…"` the quote-context gate PASSES (extquote allowed), but the
+        // decoded name "x<TAB>y" is not a valid identifier -> bad substitution.
+        // This exercises the invalid-name gate (the path `!is_valid_param_name`).
+        let toks = tokenize(r#""${$'x\ty'}""#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let inner = match &parts[0] {
+            WordPart::Quoted { parts, .. } => &parts[0],
+            other => other,
+        };
+        assert!(
+            matches!(inner, WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }),
+            "expected BadSubst for invalid decoded name, got {inner:?}"
+        );
+    }
+
+    #[test]
+    fn extquote_name_unquoted_defers() {
+        // Top-level unquoted `${$'x1'}` -> BadSubst (the default tokenize path
+        // is unquoted).
+        let toks = tokenize(r#"${$'x1'}"#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
+    }
+
+    #[test]
+    fn extquote_name_double_quoted_decodes() {
+        // Inside `"…"` the name decodes (no BadSubst).
+        let toks = tokenize(r#""${$'x1'}""#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        // The single part is the decoded name `x1` (Var or ParamExpansion),
+        // NOT a BadSubst.
+        let inner = match &parts[0] {
+            WordPart::Quoted { parts, .. } => &parts[0],
+            other => other,
+        };
+        let name = match inner {
+            WordPart::ParamExpansion { name, modifier, .. } => {
+                assert!(!matches!(modifier, ParamModifier::BadSubst { .. }), "should not be BadSubst");
+                name
+            }
+            WordPart::Var { name, .. } => name,
+            other => panic!("expected name-bearing part, got {other:?}"),
+        };
+        assert_eq!(name, "x1");
     }
 }
 

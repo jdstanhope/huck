@@ -64,5 +64,14 @@ checkf_badsubst "extquote locale bad"   "echo \"\${\$\"x1\"}\"; echo after"
 # (anticipated residual per v234 spec)
 checkf_badsubst "extquote invalid name" "echo \"\${\$'x\\ty'}\"; echo after"
 
+# v235 M-156: extquote name gated on double-quote context
+checkf          "extquote quoted top"    'x1=V; echo "${$'"'"'x1'"'"'}"'
+checkf_badsubst "extquote unquoted top"  'x1=V; echo ${$'"'"'x1'"'"'}; echo after'
+checkf          "extquote quoted pat"    'x=notOK; x1=not; echo "${x#${$'"'"'x1'"'"'%$'"'"'t'"'"'}}"'
+checkf_badsubst "extquote unquoted pat"  'x=notOK; x1=not; echo ${x#${$'"'"'x1'"'"'%$'"'"'t'"'"'}}; echo after'
+checkf          "extquote quoted def"    'x1=hi; unset z; echo "${z:-${$'"'"'x1'"'"'}}"'
+checkf_badsubst "extquote unquoted def"  'x1=hi; unset z; echo ${z:-${$'"'"'x1'"'"'}}; echo after'
+checkf          "glob-in-pat unchanged"  'x="aXb"; p="a?"; echo "${x#$p}"'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
