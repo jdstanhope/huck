@@ -65,21 +65,25 @@ group.
   decisive completion source; deferred to avoid new filesystem/libc lookups.
 - **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
 - **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-148: `${!name[@]<op>}` indirect-keys with a trailing operation** — `[deferred]`
-  low (v233 follow-on). v233 closed the `${!prefix*}`/`${!prefix@}` name-listing
-  forms (old M-92), `${!@}`/`${!*}`/`${!#}` special-param indirection (old M-94),
-  and the defer-to-runtime model for bad substitutions (old I-17). Two `${…}` parse
-  residuals remain, both still a `syntax error: unterminated '${...}'` at parse where
-  bash parses and evaluates: (a) indirect array KEYS followed by a non-`@` operation,
-  e.g. `${!arr[@]%b}` / `${!arr[@]#x}` (bash: `v=arr; arr=(a b); echo ${!v[@]%b}` →
-  `a`) — needs real indirect-keys-with-operation evaluation, not a parse-defer (bash
-  does NOT error, so routing to a runtime bad-subst would be wrong); (b) a nested
-  `${…}` whose inner operand is an ANSI-C `$'…'` used as a name, e.g.
-  `${x#${$'x1'%$'t'}}` (bash runs it → `tOK`). Both are rare; the M1–M4 target forms
-  all parse. RELATED text divergence: the in-scope M3 combo `${!arr[@]@OP}` defers to
-  a runtime `bad substitution` in huck, where bash variously evaluates it (assoc
-  arrays) or says `invalid variable name` (indexed) — huck's defer is a safe superset
-  but the message/rc can differ.
+- **M-156: `$'…'`-in-`${…}`-name decodes regardless of quoting context** —
+  `[deferred]` low (v234 follow-on). v234 closed M-148 (both parts): `${!name[@]<op>}`
+  indirect-with-subscript-modifier (incl. the M3 combo `${!arr[@]@OP}`, which now
+  evaluates as indirect+transform rather than deferring to bad-subst) and `$'…'`
+  decoded as the parameter name inside `${…}` (extquote). RESIDUAL: bash decodes
+  `$'…'`-in-name ONLY when the `${…}` is within DOUBLE QUOTES (the documented
+  `extquote` behavior); huck decodes unconditionally at lex time. So an UNQUOTED
+  top-level `${$'x1'}` (or `y=${$'x1'}`, `echo ${x1}${$'x1'}`) expands in huck but is
+  a `bad substitution` (rc 1) in bash. huck is the more-permissive side (a script that
+  runs under bash still runs under huck), so harm is low. A faithful fix needs huck's
+  lexer `quoted` flag to propagate into modifier-pattern sub-words (it currently does
+  NOT — the inner `${$'x1'%…}` of `${x#${$'x1'%$'t'}}` sees `quoted=false` even inside
+  outer `"…"`, so naively gating the decode on `quoted` breaks that legitimate nested
+  case); deferred until that propagation exists. The common QUOTED forms (`"${$'x1'}"`,
+  nested-in-`"…"`) are byte-identical to bash. MINOR display residuals (error-message
+  name-form only; the `bad substitution` tail, rc, and continuation all match bash):
+  an invalid decoded name `${$'x\ty'}` shows the raw source in huck vs bash's decoded
+  `${x\ty}`; `${$"x1"}` (locale form, bad-subst in both) shows `${$"x1"}` in huck vs
+  bash's `${"x1"}`.
 
 ### Globbing
 
