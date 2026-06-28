@@ -144,10 +144,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
     {
         let mut shell = shell_cell.borrow_mut();
         if let Some(exit_code) = maybe_source_rc_file(&mut shell, &opts) {
-            huck_engine::traps::fire_exit_trap(&mut shell);
-            shell.hangup_jobs();
-            shell.save_history();
-            return exit_code;
+            return shell_exit(&mut shell, exit_code);
         }
         // v139: re-apply the in-memory cap now that ~/.huckrc may have set HISTSIZE
         // (history was loaded before rc). Nets out to bash's rc-then-history effect.
@@ -165,10 +162,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
         {
             let mut shell = shell_cell.borrow_mut();
             if let Some(exit_code) = fire_prompt_command(&mut shell) {
-                huck_engine::traps::fire_exit_trap(&mut shell);
-                shell.hangup_jobs();
-                shell.save_history();
-                return exit_code;
+                return shell_exit(&mut shell, exit_code);
             }
         }
         match read_logical_command(&mut editor, &shell_cell) {
@@ -192,10 +186,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 match outcome {
                     ExecOutcome::Exit(code) => {
                         let mut shell = shell_cell.borrow_mut();
-                        huck_engine::traps::fire_exit_trap(&mut shell);
-                        shell.hangup_jobs();
-                        shell.save_history();
-                        return code;
+                        return shell_exit(&mut shell, code);
                     }
                     ExecOutcome::Continue(status) => {
                         let mut shell = shell_cell.borrow_mut();
@@ -207,10 +198,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                         if let Some(fatal_status) = shell.take_pending_fatal_status()
                             && !shell.is_interactive
                         {
-                            huck_engine::traps::fire_exit_trap(&mut shell);
-                            shell.hangup_jobs();
-                            shell.save_history();
-                            return fatal_status;
+                            return shell_exit(&mut shell, fatal_status);
                         }
                     }
                     ExecOutcome::LoopBreak(_, _) | ExecOutcome::LoopContinue(_)
@@ -228,28 +216,32 @@ pub fn run(args: &[String], version: &str) -> i32 {
             ReadResult::Interrupted => continue,
             ReadResult::Eof => {
                 let mut shell = shell_cell.borrow_mut();
-                huck_engine::traps::fire_exit_trap(&mut shell);
-                shell.hangup_jobs();
-                shell.save_history();
-                return shell.last_status();
+                let code = shell.last_status();
+                return shell_exit(&mut shell, code);
             }
             ReadResult::EofMidCommand => {
                 eprintln!("huck: syntax error: unexpected end of input");
                 let mut shell = shell_cell.borrow_mut();
-                huck_engine::traps::fire_exit_trap(&mut shell);
-                shell.hangup_jobs();
-                shell.save_history();
-                return 2;
+                return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
                 eprintln!("huck: input error: {msg}");
                 let mut shell = shell_cell.borrow_mut();
-                huck_engine::traps::fire_exit_trap(&mut shell);
-                shell.hangup_jobs();
-                return 1;
+                return shell_exit(&mut shell, 1);
             }
         }
     }
+}
+
+/// Runs the shell's exit sequence — fire the EXIT trap, SIGHUP any queued
+/// jobs, and persist history — then returns `code`. Centralizes the teardown so
+/// every REPL exit path stays consistent (the `ReadError` path previously
+/// skipped `save_history`).
+fn shell_exit(shell: &mut Shell, code: i32) -> i32 {
+    huck_engine::traps::fire_exit_trap(shell);
+    shell.hangup_jobs();
+    shell.save_history();
+    code
 }
 
 /// Applies any pending `bind` settings (editor-mapped vars + key (un)binds)
@@ -397,7 +389,7 @@ fn read_logical_command(
                     }
                 }
 
-                match classify(&buffer, cell.borrow().shopt_options.get("extglob").unwrap_or(false)) {
+                match classify(&buffer, cell.borrow().extglob()) {
                     Completeness::Complete | Completeness::Error => {
                         return ReadResult::Ready { buffer, history };
                     }

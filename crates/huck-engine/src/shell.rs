@@ -286,31 +286,6 @@ pub fn run_program(
     run_program_in_sinks(contents, argv0, args, label, push_main_frame, &mut sink, &mut err_sink, shell_cell)
 }
 
-/// Backward-compat wrapper kept for v204 callers that pre-date the `_in_sinks`
-/// rename. Forwards to [`run_program_in_sinks`] with `StderrSink::Terminal`.
-#[allow(clippy::too_many_arguments)]
-pub fn run_program_in_sink(
-    contents: &str,
-    argv0: Option<String>,
-    args: Vec<String>,
-    label: &str,
-    push_main_frame: bool,
-    sink: &mut crate::executor::StdoutSink,
-    shell_cell: &Rc<RefCell<Shell>>,
-) -> i32 {
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    run_program_in_sinks(
-        contents,
-        argv0,
-        args,
-        label,
-        push_main_frame,
-        sink,
-        &mut err_sink,
-        shell_cell,
-    )
-}
-
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
 /// startup after `Shell::new()`; the flag lives on the `Shell` so the wait
 /// builtin can poll it to break out of its loop when Ctrl-C is pressed.
@@ -400,7 +375,7 @@ pub fn process_line_in_sinks(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false), ..Default::default() };
+    let opts = lexer::LexerOptions { extglob: shell.extglob(), ..Default::default() };
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
@@ -444,18 +419,6 @@ pub fn process_line(line: &str, shell: &mut Shell, expand_aliases: bool) -> Exec
     let mut sink = crate::executor::StdoutSink::Terminal;
     let mut err_sink = crate::executor::StderrSink::Terminal;
     process_line_in_sinks(line, shell, expand_aliases, &mut sink, &mut err_sink)
-}
-
-/// Backward-compat wrapper kept for v204 callers that pre-date the `_in_sinks`
-/// rename. Forwards to [`process_line_in_sinks`] with `StderrSink::Terminal`.
-pub fn process_line_in_sink(
-    line: &str,
-    shell: &mut Shell,
-    expand_aliases: bool,
-    sink: &mut crate::executor::StdoutSink,
-) -> ExecOutcome {
-    let mut err_sink = crate::executor::StderrSink::Terminal;
-    process_line_in_sinks(line, shell, expand_aliases, sink, &mut err_sink)
 }
 
 #[cfg(test)]
