@@ -83,9 +83,33 @@ group.
   extquote-name doesn't apply" is factually slightly off — bash DOES decode there.) MINOR
   display residuals (error-message name-form only; `bad substitution` tail, rc, continuation
   all match bash): invalid decoded name `${$'x\ty'}` shows raw source vs bash's `${x\ty}`;
-  `${$"x1"}` (locale form) shows `${$"x1"}` vs bash's `${"x1"}`. Also pre-existing (not
-  v235): the `${#$'x1'}` length form gives huck "unterminated `${...}`" (rc 2) vs bash
-  bad-subst (rc 1) — the `${#…}` path predates extquote awareness.
+  `${$"x1"}` (locale form) shows `${$"x1"}` vs bash's `${"x1"}`. (The `${#$'x1'}` length-form
+  rc divergence previously noted here is now tracked separately as M-161.)
+- **M-161: malformed `${…}` gives a syntax error (rc 2) where bash defers a runtime
+  `bad substitution` (rc 1)** — `[deferred]` low (found in the 2026-06-28 param-expansion
+  architectural review). v233 began migrating malformed-but-lexable `${…}` from parse-time
+  reject (`LexError` — rc 2 "syntax error"/"unterminated") toward bash's
+  scan-to-`}`-then-runtime-`bad substitution` (rc 1) model, routed via `recover_bad_subst` /
+  `ParamModifier::BadSubst`. That migration is ~50% done — three confirmed forms still return
+  a lex error where bash bad-substs:
+  (a) `${#$'x1'}` (and other malformed length forms, e.g. `${#1foo}`, `${#foo bar}`) — the
+  length-`}` check at lexer.rs:2990 returns `Err`; `special_param_char` includes `$`, so
+  `$'x1'` is greedily consumed as the length "name". CLEAN one-line fix (route the `Err` to
+  `recover_bad_subst`).
+  (b) `${x@QQ}` / `${x@Q@Q}` — the `@`-transform tail at lexer.rs:3808. MEASURE-FIRST: bash's
+  transform-edge result is variable-state dependent — bad-subst rc 1 when the var is SET, but
+  rc 0 / empty when unset (`${x@Q}` itself is valid; only the doubled/garbage tail bad-substs).
+  CLEAN one-line fix once measured.
+  (c) `${x[i}` — the subscript scan at lexer.rs:3187/3234. NOT a clean fix: `scan_subscript`
+  is quote-naive, so telling the brace-closer `}` apart from a `}` inside a nested `${y}` or a
+  quoted `'}'` needs a quote-aware subscript scanner; belongs with a scanner rewrite, not a
+  one-liner. (A minimal brace-depth hack here would regress `${x['}']}`.)
+  All three are exotic (malformed `${…}` no real script writes) and huck is the stricter side
+  (rejects rather than misbehaves). The broader consolidation of this subsystem (the duplicated
+  scanners, the three overlapping dquote flags, and this error-model seam) was reviewed
+  2026-06-28 and consciously deferred — a pure refactor is incompatible with the drifted
+  duplicates, and a behavior-changing rewrite was judged not worth the hot-path risk. (a) and
+  (b) can be picked off individually as small bash-alignment fixes if desired.
 
 ### Globbing
 
