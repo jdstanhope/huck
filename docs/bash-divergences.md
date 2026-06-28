@@ -65,25 +65,27 @@ group.
   decisive completion source; deferred to avoid new filesystem/libc lookups.
 - **M-46: `history -d`/`-w`/`-r`/`-a` flags** — `[deferred]` low. huck: only `-c`. bash: full set.
 - **M-47: `history N`** — `[deferred]` low. huck: rejects numeric arg. bash: prints last N entries.
-- **M-156: `$'…'`-in-`${…}`-name decodes regardless of quoting context** —
-  `[deferred]` low (v234 follow-on). v234 closed M-148 (both parts): `${!name[@]<op>}`
-  indirect-with-subscript-modifier (incl. the M3 combo `${!arr[@]@OP}`, which now
-  evaluates as indirect+transform rather than deferring to bad-subst) and `$'…'`
-  decoded as the parameter name inside `${…}` (extquote). RESIDUAL: bash decodes
-  `$'…'`-in-name ONLY when the `${…}` is within DOUBLE QUOTES (the documented
-  `extquote` behavior); huck decodes unconditionally at lex time. So an UNQUOTED
-  top-level `${$'x1'}` (or `y=${$'x1'}`, `echo ${x1}${$'x1'}`) expands in huck but is
-  a `bad substitution` (rc 1) in bash. huck is the more-permissive side (a script that
-  runs under bash still runs under huck), so harm is low. A faithful fix needs huck's
-  lexer `quoted` flag to propagate into modifier-pattern sub-words (it currently does
-  NOT — the inner `${$'x1'%…}` of `${x#${$'x1'%$'t'}}` sees `quoted=false` even inside
-  outer `"…"`, so naively gating the decode on `quoted` breaks that legitimate nested
-  case); deferred until that propagation exists. The common QUOTED forms (`"${$'x1'}"`,
-  nested-in-`"…"`) are byte-identical to bash. MINOR display residuals (error-message
-  name-form only; the `bad substitution` tail, rc, and continuation all match bash):
-  an invalid decoded name `${$'x\ty'}` shows the raw source in huck vs bash's decoded
-  `${x\ty}`; `${$"x1"}` (locale form, bad-subst in both) shows `${$"x1"}` in huck vs
-  bash's `${"x1"}`.
+- **M-160: extquote `$'…'`-name not decoded in 3 less-common double-quote contexts** —
+  `[deferred]` low (v235 follow-on). v235 closed M-156: the `$'…'`-as-name decode inside
+  `${…}` is now gated on double-quote context (bash `extquote`) for top-level, `:-`/`:=`/`:+`
+  defaults, and `#`/`%`/`/`/`^`/`,` pattern operands incl. nesting — unquoted `${$'x1'}` is
+  now `bad substitution` (rc 1) like bash, quoted `"${$'x1'}"`/`"${x#${$'x1'%$'t'}}"` decode.
+  RESIDUAL: three OTHER operand-scanning paths do not seed the lexer's `in_dquote` flag, so
+  a `$'…'`-name nested inside them still `bad-subst`s in DOUBLE-QUOTE context where bash
+  decodes: (a) substring offset `"${x:${$'1'}}"` (bash `abcdef`; huck bad-subst + a spurious
+  second "operand expected"), (b) array subscript `"${arr[${$'i'}]}"`, (c) command-sub
+  directly inside `"…"` `"$(echo ${$'a'})"` (huck re-lexes the cmdsub body with a fresh
+  `quoted=false`/no `in_dquote`). All exotic (a `$'…'` literal used AS a parameter name in
+  these positions); huck is the stricter side here, so a bash-valid script bad-substs rather
+  than misbehaving. Fix: seed `opts.with_in_dquote(quoted || opts.in_dquote)` at the
+  substring-offset/length operand and `scan_param_subscript`, and propagate dquote context
+  into the cmdsub re-tokenize. (Note: the v235 spec's claim that substring is "out of scope,
+  extquote-name doesn't apply" is factually slightly off — bash DOES decode there.) MINOR
+  display residuals (error-message name-form only; `bad substitution` tail, rc, continuation
+  all match bash): invalid decoded name `${$'x\ty'}` shows raw source vs bash's `${x\ty}`;
+  `${$"x1"}` (locale form) shows `${$"x1"}` vs bash's `${"x1"}`. Also pre-existing (not
+  v235): the `${#$'x1'}` length form gives huck "unterminated `${...}`" (rc 2) vs bash
+  bad-subst (rc 1) — the `${#…}` path predates extquote awareness.
 
 ### Globbing
 
