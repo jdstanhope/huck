@@ -21,7 +21,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let opts = LexerOptions { extglob: true };
+    let opts = LexerOptions { extglob: true, ..Default::default() };
 
     match tokenize_with_opts(&input, opts) {
         Ok(tokens) => print_tokens(&tokens),

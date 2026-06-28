@@ -400,7 +400,7 @@ pub fn process_line_in_sinks(
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
-    let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false) };
+    let opts = lexer::LexerOptions { extglob: shell.shopt_options.get("extglob").unwrap_or(false), ..Default::default() };
     let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
         Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
         Err((e, _off)) => {
