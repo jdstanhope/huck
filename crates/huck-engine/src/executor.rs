@@ -719,15 +719,7 @@ fn run_command(
                 // (fork_and_run_in_subshell already race-closes setpgid in the
                 // parent; this is belt-and-suspenders to guarantee the pgrp
                 // exists before give_terminal_to, mirroring the pipeline path.)
-                unsafe {
-                    if libc::setpgid(pid, pid) != 0 {
-                        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        debug_assert!(
-                            errno == libc::ESRCH || errno == libc::EACCES,
-                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
-                        );
-                    }
-                }
+                setpgid_self(pid);
                 give_terminal_to(pid);
                 let outcome = match wait_with_untraced(pid) {
                     Ok((raw_status, true)) => {
@@ -748,19 +740,7 @@ fn run_command(
                         128 + sig
                     }
                     Ok((raw_status, false)) => {
-                        if libc::WIFEXITED(raw_status) {
-                            libc::WEXITSTATUS(raw_status)
-                        } else if libc::WIFSIGNALED(raw_status) {
-                            let sig = libc::WTERMSIG(raw_status);
-                            if sig == libc::SIGINT {
-                                shell
-                                    .sigint_flag
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            128 + sig
-                        } else {
-                            1
-                        }
+                        raw_status_to_exit_code(raw_status, shell)
                     }
                     Err(()) => 1,
                 };
@@ -811,19 +791,7 @@ fn run_command(
                 if let StderrSink::Capture(buf) = err_sink {
                     buf.extend_from_slice(&stderr_capture);
                 }
-                let code = if libc::WIFEXITED(raw_status) {
-                    libc::WEXITSTATUS(raw_status)
-                } else if libc::WIFSIGNALED(raw_status) {
-                    let sig = libc::WTERMSIG(raw_status);
-                    if sig == libc::SIGINT {
-                        shell
-                            .sigint_flag
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    128 + sig
-                } else {
-                    1
-                };
+                let code = raw_status_to_exit_code(raw_status, shell);
                 shell.set_pipestatus(&[code]);
                 ExecOutcome::Continue(code)
             }
@@ -2831,10 +2799,7 @@ fn run_background_sequence(
                     }
                     Err(e) => {
                         { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
-                        drain_procsubs(shell, procsub_base);
-                        cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                        for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                        return ExecOutcome::Continue(1);
+                        return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                     }
                 }
             } else {
@@ -2866,10 +2831,7 @@ fn run_background_sequence(
                 Err(e) => {
                     { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
-                    drain_procsubs(shell, procsub_base);
-                    cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                    return ExecOutcome::Continue(1);
+                    return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                 }
             }
             continue;
@@ -2886,10 +2848,7 @@ fn run_background_sequence(
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
-                drain_procsubs(shell, procsub_base);
-                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                return ExecOutcome::Continue(1);
+                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
             }
         };
 
@@ -2908,10 +2867,7 @@ fn run_background_sequence(
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
                     };
                     use std::os::unix::io::IntoRawFd;
@@ -2920,10 +2876,7 @@ fn run_background_sequence(
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
                     }
                 }
@@ -2942,10 +2895,7 @@ fn run_background_sequence(
                         Err(e) => {
                             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
                     }
                 }
@@ -2963,10 +2913,7 @@ fn run_background_sequence(
                         Err(e) => {
                             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
                     }
                 }
@@ -2990,10 +2937,7 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -3005,10 +2949,7 @@ fn run_background_sequence(
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3018,10 +2959,7 @@ fn run_background_sequence(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -3031,10 +2969,7 @@ fn run_background_sequence(
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3055,10 +2990,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -3071,10 +3003,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3085,10 +3014,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -3099,10 +3025,7 @@ fn run_background_sequence(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3150,10 +3073,7 @@ fn run_background_sequence(
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
-                    drain_procsubs(shell, procsub_base);
-                    cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                    return ExecOutcome::Continue(1);
+                    return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                 }
             }
         } else {
@@ -3184,10 +3104,7 @@ fn run_background_sequence(
                                 { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3201,10 +3118,7 @@ fn run_background_sequence(
                                 { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: {}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                             }
                         }
                     }
@@ -3241,10 +3155,7 @@ fn run_background_sequence(
                 for fd in [stdout_fd, stdin_fd, stderr_fd] {
                     if fd > 2 { parent_held.retain(|&x| x != fd); }
                 }
-                drain_procsubs(shell, procsub_base);
-                cleanup_partial_pipeline_raw(first_pid, &spawned_pids);
-                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                return ExecOutcome::Continue(1);
+                return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
             }
         };
 
@@ -3316,6 +3227,74 @@ fn run_background_sequence(
     // synchronous. Any child not yet exited is left to SIGCHLD/exit cleanup.
     drain_procsubs_nonblocking(shell, procsub_base);
     ExecOutcome::Continue(0)
+}
+
+/// Pipeline-spawn error teardown for `run_background_sequence`: reap process
+/// substitutions started this pipeline, kill+reap already-spawned stages, close
+/// every parent-held pipe fd, and return failure. Extracted from the ~19
+/// byte-identical bail sites in that function.
+fn bail_teardown_bg(
+    shell: &mut Shell,
+    procsub_base: usize,
+    first_pid: Option<i32>,
+    spawned_pids: &[i32],
+    parent_held: &mut Vec<RawFd>,
+) -> ExecOutcome {
+    drain_procsubs(shell, procsub_base);
+    cleanup_partial_pipeline_raw(first_pid, spawned_pids);
+    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+    ExecOutcome::Continue(1)
+}
+
+/// Pipeline-spawn error teardown for `run_multi_stage`: reap process
+/// substitutions and close every parent-held pipe fd, then return failure. The
+/// foreground path tracks live pids separately (`live_pids_arc`/`pipeline_stages`),
+/// so there is no `cleanup_partial_pipeline_raw` here — that is the only
+/// difference from `bail_teardown_bg`. Extracted from the ~21 byte-identical sites.
+fn bail_teardown_stage(
+    shell: &mut Shell,
+    procsub_base: usize,
+    parent_held: &mut Vec<RawFd>,
+) -> ExecOutcome {
+    drain_procsubs(shell, procsub_base);
+    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
+    ExecOutcome::Continue(1)
+}
+
+/// Best-effort `setpgid(pid, pid)` to guarantee the child's process group
+/// exists before `give_terminal_to`/`tcsetpgrp` (a race-close mirror of what
+/// `fork_and_run_in_subshell` already does in the parent). A failure here is
+/// expected only as ESRCH/EACCES (the child already exec'd or changed its pgrp).
+fn setpgid_self(pid: i32) {
+    unsafe {
+        if libc::setpgid(pid, pid) != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            debug_assert!(
+                errno == libc::ESRCH || errno == libc::EACCES,
+                "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
+            );
+        }
+    }
+}
+
+/// Decodes a raw `waitpid` status into a shell exit code: `WEXITSTATUS` for a
+/// normal exit, `128 + signal` for a signal death (recording a pending SIGINT
+/// so the interactive loop can react), and `1` otherwise. Extracted from the
+/// four byte-identical decode sites.
+fn raw_status_to_exit_code(raw_status: libc::c_int, shell: &Shell) -> i32 {
+    if libc::WIFEXITED(raw_status) {
+        libc::WEXITSTATUS(raw_status)
+    } else if libc::WIFSIGNALED(raw_status) {
+        let sig = libc::WTERMSIG(raw_status);
+        if sig == libc::SIGINT {
+            shell
+                .sigint_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        128 + sig
+    } else {
+        1
+    }
 }
 
 /// Cleans up stages spawned during a background pipeline that failed to start
@@ -5193,15 +5172,7 @@ fn run_subprocess(
             let outcome = if interactive {
                 // Race-close: also setpgid in the parent so the child's pgrp
                 // is guaranteed to exist before we call tcsetpgrp.
-                unsafe {
-                    if libc::setpgid(pid, pid) != 0 {
-                        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        debug_assert!(
-                            errno == libc::ESRCH || errno == libc::EACCES,
-                            "setpgid({pid}, {pid}) failed with unexpected errno {errno}"
-                        );
-                    }
-                }
+                setpgid_self(pid);
                 give_terminal_to(pid);
 
                 // wait_with_untraced already waitpid'd the child, so each arm
@@ -5234,19 +5205,7 @@ fn run_subprocess(
                     }
                     Ok((raw_status, false)) => {
                         // Child exited or was killed by a signal.
-                        let code = if libc::WIFEXITED(raw_status) {
-                            libc::WEXITSTATUS(raw_status)
-                        } else if libc::WIFSIGNALED(raw_status) {
-                            let sig = libc::WTERMSIG(raw_status);
-                            if sig == libc::SIGINT {
-                                shell
-                                    .sigint_flag
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            128 + sig
-                        } else {
-                            1
-                        };
+                        let code = raw_status_to_exit_code(raw_status, shell);
                         std::mem::forget(child);
                         give_terminal_to(shell.shell_pgid);
                         ExecOutcome::Continue(code)
@@ -5317,19 +5276,7 @@ fn run_subprocess(
                         {
                             buf.extend_from_slice(&stderr_capture);
                         }
-                        let code = if libc::WIFEXITED(raw_status) {
-                            libc::WEXITSTATUS(raw_status)
-                        } else if libc::WIFSIGNALED(raw_status) {
-                            let sig = libc::WTERMSIG(raw_status);
-                            if sig == libc::SIGINT {
-                                shell
-                                    .sigint_flag
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            128 + sig
-                        } else {
-                            1
-                        };
+                        let code = raw_status_to_exit_code(raw_status, shell);
                         ExecOutcome::Continue(code)
                     }
                     Err(e) => {
@@ -5649,9 +5596,7 @@ fn run_multi_stage(
                     Err(e) => {
                         { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
                         // Clean up all held fds.
-                        drain_procsubs(shell, procsub_base);
-                        for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                        return ExecOutcome::Continue(1);
+                        return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
                 }
             } else {
@@ -5665,9 +5610,7 @@ fn run_multi_stage(
                             }
                             Err(e) => {
                                 { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: pipe: {}", crate::bash_io_error(&e)); }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -5694,9 +5637,7 @@ fn run_multi_stage(
                 }
                 Err(e) => {
                     { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: fork: {}", crate::bash_io_error(&e)); }
-                    drain_procsubs(shell, procsub_base);
-                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                    return ExecOutcome::Continue(1);
+                    return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
             continue;
@@ -5713,9 +5654,7 @@ fn run_multi_stage(
             Ok(s) => s,
             Err(s) => {
                 restore_inline_assignments(s, shell);
-                drain_procsubs(shell, procsub_base);
-                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                return ExecOutcome::Continue(1);
+                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
             }
         };
 
@@ -5744,9 +5683,7 @@ fn run_multi_stage(
                         Ok(p) => p,
                         Err(()) => {
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     };
                     use std::os::unix::io::IntoRawFd;
@@ -5755,9 +5692,7 @@ fn run_multi_stage(
                         Err(e) => {
                             redir_open_error(shell, err_sink, sink, &path, &e);
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
                 }
@@ -5783,9 +5718,7 @@ fn run_multi_stage(
                         Err(e) => {
                             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
                 }
@@ -5808,9 +5741,7 @@ fn run_multi_stage(
                         Err(e) => {
                             { let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
-                            drain_procsubs(shell, procsub_base);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
                 }
@@ -5840,9 +5771,7 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -5854,9 +5783,7 @@ fn run_multi_stage(
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -5866,9 +5793,7 @@ fn run_multi_stage(
                             Err(()) => {
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -5878,9 +5803,7 @@ fn run_multi_stage(
                                 redir_open_error(shell, err_sink, sink, &path, &e);
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -5901,9 +5824,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -5916,9 +5837,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -5929,9 +5848,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         };
                         use std::os::unix::io::IntoRawFd;
@@ -5942,9 +5859,7 @@ fn run_multi_stage(
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(fd) = explicit_stdout_fd { unsafe { libc::close(fd); } }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -5994,9 +5909,7 @@ fn run_multi_stage(
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
-                    drain_procsubs(shell, procsub_base);
-                    for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                    return ExecOutcome::Continue(1);
+                    return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
         } else {
@@ -6013,9 +5926,7 @@ fn run_multi_stage(
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
-                            drain_procsubs(shell, procsub_base);
-                            for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                            return ExecOutcome::Continue(1);
+                            return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
                     }
                 }
@@ -6059,9 +5970,7 @@ fn run_multi_stage(
                             parent_held.retain(|&x| x != r);
                             unsafe { libc::close(r); }
                         }
-                        drain_procsubs(shell, procsub_base);
-                        for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                        return ExecOutcome::Continue(1);
+                        return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
                     fd
                 }
@@ -6098,9 +6007,7 @@ fn run_multi_stage(
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
                                 }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
@@ -6118,9 +6025,7 @@ fn run_multi_stage(
                                     parent_held.retain(|&fd| fd != r);
                                     unsafe { libc::close(r); }
                                 }
-                                drain_procsubs(shell, procsub_base);
-                                for fd in parent_held.drain(..) { unsafe { libc::close(fd); } }
-                                return ExecOutcome::Continue(1);
+                                return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
                     }
