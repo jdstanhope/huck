@@ -1179,6 +1179,19 @@ fn expand_part(
             if emit_bad_subst(modifier, word, shell) {
                 return ControlFlow::Break(());
             }
+            // Task 2 (v234) promotes ${$'name'} to ParamExpansion{None}
+            // instead of Var. Honor set -u for this exact shape so nounset
+            // semantics are not silently dropped (regression fix F2).
+            if matches!(modifier, crate::lexer::ParamModifier::None)
+                && subscript.is_none()
+                && !*indirect
+            {
+                if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
+                    with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                    shell.pending_fatal_status = Some(1);
+                    return ControlFlow::Break(());
+                }
+            }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
             // `${@:o:l}` deferral) — route through the shared
             // word-list path even though there's no `subscript`.

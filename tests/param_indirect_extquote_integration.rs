@@ -69,3 +69,17 @@ fn extquote_declare_f_reconstructs_decoded() {
     let (o, _e, _c) = run_file("f() { x1=not; echo \"${$'x1'}\"; }\ndeclare -f f\n");
     assert!(o.contains("${x1}"), "stdout: {o}");
 }
+
+#[test]
+fn extquote_name_honors_nounset() {
+    // Regression F2: promoted ParamExpansion{None} node must honor set -u.
+    // Unset var with nounset should fail (rc 1, "unbound variable" on stderr).
+    let (_o, e, c) = run_file("set -u; echo \"${$'unsetvar'}\"\n");
+    assert_eq!(c, 1, "expected rc=1 (nounset), got {c}; stderr: {e}");
+    assert!(e.contains("unbound variable"), "expected 'unbound variable' in stderr: {e}");
+
+    // Set var with nounset should succeed.
+    let (o, _e, c) = run_file("set -u; x1=set; echo \"${$'x1'}\"\n");
+    assert_eq!(c, 0, "expected rc=0 for set var, got {c}");
+    assert_eq!(o, "set\n", "expected 'set', got {o:?}");
+}
