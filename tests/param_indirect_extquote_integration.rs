@@ -47,3 +47,25 @@ fn indirect_keys_bare_still_works() {
     assert_eq!(c, 0);
     assert_eq!(o, "0 1 2\n");
 }
+
+#[test]
+fn extquote_name_resolves_value() {
+    let (o, _e, c) = run_file("x1=not; echo \"${$'x1'}\"\n");
+    assert_eq!(c, 0);
+    assert_eq!(o, "not\n");
+}
+
+#[test]
+fn extquote_nested_pattern_operand() {
+    // ${x#${$'x1'%$'t'}} -> ${x1%t}="no" -> strip prefix "no" from "notOK" -> "tOK".
+    let (o, _e, c) = run_file("x=notOK; x1=not; echo \"${x#${$'x1'%$'t'}}\"\n");
+    assert_eq!(c, 0);
+    assert_eq!(o, "tOK\n");
+}
+
+#[test]
+fn extquote_declare_f_reconstructs_decoded() {
+    // declare -f normalizes ${$'x1'} to ${x1} (bash behavior, free via decoded name).
+    let (o, _e, _c) = run_file("f() { x1=not; echo \"${$'x1'}\"; }\ndeclare -f f\n");
+    assert!(o.contains("${x1}"), "stdout: {o}");
+}
