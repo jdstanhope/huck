@@ -8910,10 +8910,28 @@ mod array_parse_tests {
 
     #[test]
     fn extquote_decoded_invalid_name_is_bad_subst() {
-        // `${$'x\ty'}` decodes to "x<TAB>y" — invalid name -> bad substitution.
+        // `${$'x\ty'}` is UNQUOTED: fires at the quote-context gate (not the
+        // invalid-name gate) — unquoted extquote name -> bad substitution.
         let toks = tokenize("${$'x\\ty'}").unwrap();
         let Token::Word(Word(parts)) = &toks[0] else { panic!() };
         assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
+    }
+
+    #[test]
+    fn extquote_decoded_invalid_name_quoted_is_bad_subst() {
+        // Inside `"…"` the quote-context gate PASSES (extquote allowed), but the
+        // decoded name "x<TAB>y" is not a valid identifier -> bad substitution.
+        // This exercises the invalid-name gate (the path `!is_valid_param_name`).
+        let toks = tokenize(r#""${$'x\ty'}""#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let inner = match &parts[0] {
+            WordPart::Quoted { parts, .. } => &parts[0],
+            other => other,
+        };
+        assert!(
+            matches!(inner, WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }),
+            "expected BadSubst for invalid decoded name, got {inner:?}"
+        );
     }
 
     #[test]
