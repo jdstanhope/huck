@@ -2912,8 +2912,17 @@ fn scan_braced_param_expansion(
             return dispatch_braced_modifier("?".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
         }
         Some('$') => {
-            chars.next();
-            return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
+            // `${$'…'}` (extquote name) / `${$"…"}` (bad-subst) must NOT be
+            // parsed as the `$` shell-pid special param. If `$` is followed by
+            // a quote, fall through to the extquote-aware regular-name path.
+            let mut look = chars.clone();
+            look.next();
+            if matches!(look.peek().copied(), Some('\'') | Some('"')) {
+                // fall through (do not consume, do not return)
+            } else {
+                chars.next();
+                return dispatch_braced_modifier("$".to_string(), quoted, None, chars, parts, false, opts, dollar_start);
+            }
         }
         _ => {}
     }
@@ -3075,28 +3084,23 @@ fn scan_braced_param_expansion(
         let subscript = scan_param_subscript(chars, opts)?;
         match subscript {
             Some(SubscriptKind::All) | Some(SubscriptKind::Star) => {
-                // `${!arr[@]}` / `${!arr[*]}` — array-keys form. The next
-                // char must be `}`. If it's `@` (a trailing transform like
-                // `${!arr[@]@Q}` — which bash rejects at runtime), defer to
-                // a bad-substitution. Any other non-`}` is unterminated.
-                match chars.peek().copied() {
-                    Some('}') => {
-                        chars.next(); // consume `}`
-                        parts.push(WordPart::ParamExpansion {
-                            name,
-                            modifier: ParamModifier::IndirectKeys,
-                            quoted,
-                            subscript,
-                            indirect: false,
-                        });
-                        return Ok(());
-                    }
-                    Some('@') => {
-                        // Trailing @OP on indirect-keys form — bad substitution at runtime.
-                        return recover_bad_subst(chars, parts, quoted, dollar_start);
-                    }
-                    _ => return Err(LexError::UnterminatedBrace),
+                // `${!arr[@]}` / `${!arr[*]}` with NOTHING after `]` is the
+                // array-KEYS operator. With a trailing operator it is instead
+                // INDIRECT expansion through `${arr[@]}`'s value, then the
+                // operator (bash) — route that through dispatch_braced_modifier
+                // exactly like the scalar-subscript `_` arm below.
+                if chars.peek() == Some(&'}') {
+                    chars.next(); // consume `}`
+                    parts.push(WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::IndirectKeys,
+                        quoted,
+                        subscript,
+                        indirect: false,
+                    });
+                    return Ok(());
                 }
+                return dispatch_braced_modifier(name, quoted, subscript, chars, parts, /* indirect */ true, opts, dollar_start);
             }
             _ => {
                 // `${!NAME}` / `${!NAME-word}` / `${!NAME[i]}` — indirect
@@ -3108,14 +3112,42 @@ fn scan_braced_param_expansion(
         }
     }
 
-    let name = scan_braced_name(chars)?;
+    let (name, name_decoded) = match scan_braced_name_ext(chars)? {
+        NameScan::BadSubst => return recover_bad_subst(chars, parts, quoted, dollar_start),
+        NameScan::Name { name, decoded } => {
+            // A decoded name must be a valid identifier (e.g. `${$'x\ty'}` is
+            // invalid -> bad subst). A non-decoded name keeps the prior
+            // behavior exactly (empty -> bad subst below).
+            if decoded && !is_valid_param_name(&name) {
+                return recover_bad_subst(chars, parts, quoted, dollar_start);
+            }
+            (name, decoded)
+        }
+    };
     if name.is_empty() {
         // `${}` (truly empty) or `${+foo}` etc. — bad substitution at runtime.
         return recover_bad_subst(chars, parts, quoted, dollar_start);
     }
     // Optional subscript: `${a[…]}`, `${a[@]}`, `${a[*]}`.
     let subscript = scan_param_subscript(chars, opts)?;
-    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts, dollar_start)
+    let pre_len = parts.len();
+    dispatch_braced_modifier(name, quoted, subscript, chars, parts, false, opts, dollar_start)?;
+    // When the name was decoded from `$'…'`, the dispatcher emits a bare `Var`
+    // for `${$'x1'}` — which `declare -f` would reconstruct as `$x1`.  Promote
+    // it to a `ParamExpansion` with `ParamModifier::None` so reconstruction
+    // yields the normalised `${x1}` form (matches bash `declare -f` output).
+    if name_decoded && parts.len() > pre_len {
+        if let Some(WordPart::Var { name: vn, quoted: vq }) = parts.last().cloned() {
+            *parts.last_mut().unwrap() = WordPart::ParamExpansion {
+                name: vn,
+                modifier: ParamModifier::None,
+                quoted: vq,
+                subscript: None,
+                indirect: false,
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Scans an optional `[…]` subscript immediately after the parameter name
@@ -3464,6 +3496,73 @@ fn scan_array_element_word(
 /// `${!$}` and `${!!}`.
 fn special_param_char(c: char) -> bool {
     matches!(c, '#' | '@' | '*' | '$' | '!' | '?' | '-')
+}
+
+/// A valid POSIX parameter name: `[A-Za-z_][A-Za-z0-9_]*`, non-empty.
+fn is_valid_param_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    cs.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Result of scanning a braced parameter NAME with `extquote` support.
+enum NameScan {
+    /// The assembled name. `decoded` is true if any `$'…'` run contributed
+    /// (so the caller validates it as an identifier).
+    Name { name: String, decoded: bool },
+    /// A `$"…"` in name position — bash bad-substs it; the caller recovers.
+    BadSubst,
+}
+
+/// Scans a braced parameter name, decoding any `$'…'` (ANSI-C) runs into the
+/// name (bash `extquote`). `${a$'b'}` -> "ab". Stops at the first non-name,
+/// non-`$'…'` char (leaving the cursor there for subscript/modifier scanning).
+/// A `$"…"` (locale) run in name position returns `NameScan::BadSubst`.
+fn scan_braced_name_ext(chars: &mut CharCursor<'_>) -> Result<NameScan, LexError> {
+    let mut name = String::new();
+    let mut decoded = false;
+    loop {
+        match chars.peek().copied() {
+            Some(c) if c == '_' || c.is_ascii_alphanumeric() => {
+                name.push(c);
+                chars.next();
+            }
+            Some('$') => {
+                // Look past `$` for `'` (ANSI-C, decode) / `"` (locale, bad-subst).
+                let mut look = chars.clone();
+                look.next();
+                match look.peek().copied() {
+                    Some('\'') => {
+                        chars.next(); // `$`
+                        chars.next(); // `'`
+                        // ANSI-C span: `\` escapes the next char; closes on the
+                        // first UNescaped `'`. Reuses the M4 span shape.
+                        let mut body = String::new();
+                        loop {
+                            match chars.next() {
+                                None => return Err(LexError::UnterminatedBrace),
+                                Some('\\') => {
+                                    body.push('\\');
+                                    if let Some(c) = chars.next() { body.push(c); }
+                                }
+                                Some('\'') => break,
+                                Some(c) => body.push(c),
+                            }
+                        }
+                        name.push_str(&decode_ansi_c_escapes(&body));
+                        decoded = true;
+                    }
+                    Some('"') => return Ok(NameScan::BadSubst),
+                    _ => break, // a `$` not starting a quote ends the name run
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(NameScan::Name { name, decoded })
 }
 
 fn scan_braced_name(
@@ -6403,6 +6502,40 @@ mod tests {
     }
 
     #[test]
+    fn indirect_keys_with_suffix_op_is_indirect_not_keys() {
+        // `${!v[@]%b}` — trailing `%b` makes it indirect-through-${v[@]} + RemoveSuffix,
+        // NOT the array-keys operator.
+        let toks = tokenize("${!v[@]%b}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert!(*indirect);
+        assert!(matches!(subscript, Some(SubscriptKind::All)));
+        assert!(matches!(modifier, ParamModifier::RemoveSuffix { .. }));
+    }
+
+    #[test]
+    fn indirect_keys_with_transform_op_is_indirect() {
+        // `${!v[@]@Q}` — was wrongly BadSubst in v233; now indirect + transform.
+        let toks = tokenize("${!v[@]@Q}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
+        else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
+        assert!(*indirect);
+        assert!(matches!(subscript, Some(SubscriptKind::All)));
+        assert!(matches!(modifier, ParamModifier::Transform { .. }));
+    }
+
+    #[test]
+    fn indirect_keys_bare_still_keys() {
+        // Regression: `${!v[@]}` with NOTHING after `]` stays the keys operator.
+        let toks = tokenize("${!v[@]}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
+        assert!(matches!(modifier, ParamModifier::IndirectKeys));
+    }
+
+    #[test]
     fn tokenize_prefix_names_star() {
         // `${!pfx*}` — prefix-name expansion, `*` form (at=false).
         let tokens = tokenize("${!_Q*}").unwrap();
@@ -8719,6 +8852,42 @@ mod array_parse_tests {
             crate::lexer::tokenize("${x").unwrap_err(),
             LexError::UnterminatedBrace
         );
+    }
+
+    #[test]
+    fn extquote_name_decodes_to_identifier() {
+        // `${$'x1'}` -> name "x1".
+        let toks = tokenize(r#"${$'x1'}"#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = &parts[0]
+        else { panic!("expected name-bearing part, got {:?}", parts[0]) };
+        assert_eq!(name, "x1");
+    }
+
+    #[test]
+    fn extquote_name_concatenates() {
+        // `${a$'b'}` -> name "ab".
+        let toks = tokenize(r#"${a$'b'}"#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let (WordPart::ParamExpansion { name, .. } | WordPart::Var { name, .. }) = &parts[0]
+        else { panic!("got {:?}", parts[0]) };
+        assert_eq!(name, "ab");
+    }
+
+    #[test]
+    fn extquote_locale_name_is_bad_subst() {
+        // `${$"x1"}` -> bash bad substitution.
+        let toks = tokenize(r#"${$"x1"}"#).unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
+    }
+
+    #[test]
+    fn extquote_decoded_invalid_name_is_bad_subst() {
+        // `${$'x\ty'}` decodes to "x<TAB>y" — invalid name -> bad substitution.
+        let toks = tokenize("${$'x\\ty'}").unwrap();
+        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
     }
 }
 

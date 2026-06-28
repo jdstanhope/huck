@@ -63,9 +63,13 @@ fn array_keys_still_work() {
 
 #[test]
 fn indirect_spaced_source_value_is_not_trimmed() {
-    // bash: a through-value with surrounding spaces is an invalid name -> empty,
-    // NOT resolved to the trimmed name. (Verbatim, no trim.)
-    assert_eq!(run("x=hi\nref=\" x \"\necho \"[${!ref}]\"\n").0, "[]\n");
+    // bash 5.2.21: a through-value with surrounding spaces is NOT trimmed to the
+    // inner name — bash rejects " x " as an invalid variable name (fatal, exit 1,
+    // no stdout).  v234 F1 (is_valid_name gate) made huck match this exactly.
+    // The old expectation ("[]\n") was wrong for bash; updated to reflect truth.
+    let (out, code) = run("x=hi\nref=\" x \"\necho \"[${!ref}]\"\n");
+    assert_eq!(out, "");
+    assert_eq!(code, 1);
 }
 
 #[test]

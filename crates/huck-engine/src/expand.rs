@@ -616,11 +616,23 @@ fn expand_indirect(
     let through = match subscript {
         None => shell.lookup_var(name).unwrap_or_default(),
         Some(sub) => {
-            // Indirect through an array element: read its scalar value;
-            // empty if absent.
-            match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, quoted, shell) {
-                ExpansionResult::Value(v) => v,
-                _ => String::new(),
+            // Indirect through a subscripted source. For `[@]`/`[*]` bash uses
+            // the IFS-JOINED array values as the effective name (a single
+            // element -> that value; multiple -> a space-joined string that is
+            // an invalid name -> the `invalid variable name` fatal below). For
+            // a single-index `[i]` read that element's scalar value.
+            match sub {
+                crate::lexer::SubscriptKind::All | crate::lexer::SubscriptKind::Star => {
+                    match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, /* quoted */ true, shell) {
+                        ExpansionResult::WordList(ws) => ws.join(&ifs_join_sep(&shell.ifs())),
+                        ExpansionResult::Value(v) => v,
+                        _ => String::new(),
+                    }
+                }
+                _ => match expand_array_param(name, &crate::lexer::ParamModifier::None, sub, quoted, shell) {
+                    ExpansionResult::Value(v) => v,
+                    _ => String::new(),
+                },
             }
         }
     };
@@ -629,6 +641,22 @@ fn expand_indirect(
     // value is a non-empty (invalid) name that falls through to the normal
     // lookup path and yields empty, matching bash's observable result.
     let n: &str = &through;
+    // A non-empty through-value that is not a valid name (e.g. the space-joined
+    // values of a real `${!arr[@]<op>}`) is rejected by bash as an invalid
+    // variable name, before any modifier is applied.
+    // Exception: `name[sub]` element-references (e.g. `arr[0]`, `m[k]`) are
+    // valid indirect targets and are handled by the `split_name_subscript`
+    // path below — exclude them from this guard.
+    let is_element_ref = split_name_subscript(n)
+        .is_some_and(|(base, _)| crate::builtins::is_valid_name(&base));
+    if !through.is_empty()
+        && !crate::builtins::is_valid_name(n)
+        && !n.bytes().all(|b| b.is_ascii_digit())
+        && !is_element_ref
+    {
+        with_err(|err| e!(err, "{}{}: invalid variable name", shell.error_prefix(None), n));
+        return ExpansionResult::Fatal { status: 1 };
+    }
     if through.is_empty() {
         // Empty through-value: bash distinguishes three cases (verified
         // against bash 5.x). All route through the fatal-PE mechanism so a
@@ -1156,6 +1184,19 @@ fn expand_part(
             // bash's whole-word "bad substitution" message (see emit_bad_subst).
             if emit_bad_subst(modifier, word, shell) {
                 return ControlFlow::Break(());
+            }
+            // Task 2 (v234) promotes ${$'name'} to ParamExpansion{None}
+            // instead of Var. Honor set -u for this exact shape so nounset
+            // semantics are not silently dropped (regression fix F2).
+            if matches!(modifier, crate::lexer::ParamModifier::None)
+                && subscript.is_none()
+                && !*indirect
+            {
+                if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
+                    with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                    shell.pending_fatal_status = Some(1);
+                    return ControlFlow::Break(());
+                }
             }
             // Substring on `$@` / `$*` is array-shaped (closes v33's
             // `${@:o:l}` deferral) — route through the shared
