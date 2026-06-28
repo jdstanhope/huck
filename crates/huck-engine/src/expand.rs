@@ -1847,11 +1847,10 @@ fn escape_pattern_literal(text: &str) -> String {
         .replace(')', "[)]")
 }
 
-/// Expands `word` into a glob-pattern string for `case` matching.
-/// Like `expand_assignment` (no field splitting), but text contributed
-/// by a quoted part is escaped via `escape_pattern_literal`, so a quoted
-/// `*`/`?`/`[`/`|`/`(`/`)` matches literally while an unquoted one is special.
-pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
+/// Shared body for `expand_pattern` and `expand_regex_operand`: expands `word`
+/// with no field splitting, calling `escape` on text contributed by quoted
+/// parts so that quoted metacharacters match literally.
+fn expand_word_with_quote_escape(word: &Word, shell: &mut Shell, escape: fn(&str) -> String) -> String {
     // Snapshot `$?` so `LastStatus` parts read the value at the start of
     // the expansion, not whatever a preceding `$(cmd)` mutated it to.
     // Matches the contract in `expand()` (used for command arguments).
@@ -1875,12 +1874,20 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
             return result;
         }
         if word_part_is_quoted(part) {
-            result.push_str(&escape_pattern_literal(&text));
+            result.push_str(&escape(&text));
         } else {
             result.push_str(&text);
         }
     }
     result
+}
+
+/// Expands `word` into a glob-pattern string for `case` matching.
+/// Like `expand_assignment` (no field splitting), but text contributed
+/// by a quoted part is escaped via `escape_pattern_literal`, so a quoted
+/// `*`/`?`/`[`/`|`/`(`/`)` matches literally while an unquoted one is special.
+pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
+    expand_word_with_quote_escape(word, shell, escape_pattern_literal)
 }
 
 /// Expands `word` into a regex string for `[[ … =~ … ]]` matching. Like
@@ -1889,34 +1896,7 @@ pub fn expand_pattern(word: &Word, shell: &mut Shell) -> String {
 /// while an unquoted one stays an active regex metacharacter (bash 3.2+). An
 /// unquoted `$var` expands to an active regex; a quoted `"$var"` is literal.
 pub fn expand_regex_operand(word: &Word, shell: &mut Shell) -> String {
-    // Snapshot `$?` so `LastStatus` parts read the value at the start of the
-    // expansion (same contract as `expand_pattern`).
-    let snapshot_status = shell.last_status();
-    let mut result = String::new();
-    for part in &word.0 {
-        // A BadSubst part errors with bash's whole-word message; intercept here
-        // (with the outer `word`) before delegating per-part to expand_assignment,
-        // which would otherwise only see the single-part sub-word.
-        if let WordPart::ParamExpansion { modifier, .. } = part {
-            if emit_bad_subst(modifier, word, shell) {
-                return result;
-            }
-        }
-        let text = if matches!(part, WordPart::LastStatus { .. }) {
-            snapshot_status.to_string()
-        } else {
-            expand_assignment(&Word(vec![part.clone()]), shell)
-        };
-        if shell.pending_fatal_status.is_some() {
-            return result;
-        }
-        if word_part_is_quoted(part) {
-            result.push_str(&regex::escape(&text));
-        } else {
-            result.push_str(&text);
-        }
-    }
-    result
+    expand_word_with_quote_escape(word, shell, regex::escape)
 }
 
 /// Runs a sub-sequence as a substituted command: clones the parent `Shell`

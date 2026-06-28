@@ -86,19 +86,24 @@ fn expand_into(input: &str, out: &mut Vec<String>) -> Result<(), BraceError> {
     Ok(())
 }
 
+/// Consume the remainder of a `\u{E000}…\u{E001}` sentinel span from
+/// `iter`, which has already yielded the opening `\u{E000}` character.
+/// Returns `true` if the closing `\u{E001}` was found, `false` if the
+/// iterator was exhausted before seeing it.
+fn skip_sentinel<I: Iterator<Item = (usize, char)>>(iter: &mut I) -> bool {
+    for (_, nc) in iter.by_ref() {
+        if nc == '\u{E001}' {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_top_level_lbrace(s: &str) -> Option<usize> {
     let mut iter = s.char_indices();
     while let Some((i, c)) = iter.next() {
         if c == '\u{E000}' {
-            // Skip sentinel block: \u{E000} <digits> \u{E001}
-            let mut closed = false;
-            for (_, nc) in iter.by_ref() {
-                if nc == '\u{E001}' {
-                    closed = true;
-                    break;
-                }
-            }
-            if !closed {
+            if !skip_sentinel(&mut iter) {
                 return None;
             }
             continue;
@@ -116,14 +121,7 @@ fn find_matching_rbrace(s: &str, lbrace: usize) -> Option<usize> {
     while let Some((rel_i, c)) = iter.next() {
         let i = lbrace + 1 + rel_i;
         if c == '\u{E000}' {
-            let mut closed = false;
-            for (_, nc) in iter.by_ref() {
-                if nc == '\u{E001}' {
-                    closed = true;
-                    break;
-                }
-            }
-            if !closed {
+            if !skip_sentinel(&mut iter) {
                 return None;
             }
             continue;
@@ -161,14 +159,7 @@ fn split_top_level_commas(body: &str) -> Option<Vec<String>> {
     let mut iter = body.char_indices();
     while let Some((i, c)) = iter.next() {
         if c == '\u{E000}' {
-            let mut closed = false;
-            for (_, nc) in iter.by_ref() {
-                if nc == '\u{E001}' {
-                    closed = true;
-                    break;
-                }
-            }
-            if !closed {
+            if !skip_sentinel(&mut iter) {
                 return None;
             }
             continue;

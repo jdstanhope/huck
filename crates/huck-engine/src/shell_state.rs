@@ -1803,25 +1803,25 @@ impl Shell {
         Ok(())
     }
 
+    /// Mutates an attribute on `name` by applying `f` to its `Variable`.
+    /// If `name` is unset, creates a default empty scalar `Variable` first,
+    /// applies `f`, then inserts it — matching the bash behavior of
+    /// `readonly`/`declare -i`/etc. on unset names.
+    fn mutate_or_create<F: FnOnce(&mut Variable)>(&mut self, name: &str, f: F) {
+        if let Some(v) = self.vars.get_mut(name) {
+            f(v);
+        } else {
+            let mut v = Variable::scalar(String::new());
+            f(&mut v);
+            self.vars.insert(name.to_string(), v);
+        }
+    }
+
     /// Marks `name` readonly. If `name` is unset, creates it with an
     /// empty value (matching bash's behavior for `readonly NAME`
     /// against an unset name).
     pub fn mark_readonly(&mut self, name: &str) {
-        if let Some(v) = self.vars.get_mut(name) {
-            v.readonly = true;
-        } else {
-            self.vars.insert(
-                name.to_string(),
-                Variable {
-                    value: VarValue::Scalar(String::new()),
-                    exported: false,
-                    readonly: true,
-                    integer: false,
-                    case_fold: None,
-                    nameref: false,
-                },
-            );
-        }
+        self.mutate_or_create(name, |v| v.readonly = true);
     }
 
     /// True if `name` is set and marked integer (v65). Unset names are
@@ -1833,21 +1833,7 @@ impl Shell {
     /// Marks `name` integer. If `name` is unset, creates it with an
     /// empty value (mirrors `mark_readonly`). Used by `declare -i`.
     pub fn mark_integer(&mut self, name: &str) {
-        if let Some(v) = self.vars.get_mut(name) {
-            v.integer = true;
-        } else {
-            self.vars.insert(
-                name.to_string(),
-                Variable {
-                    value: VarValue::Scalar(String::new()),
-                    exported: false,
-                    readonly: false,
-                    integer: true,
-                    case_fold: None,
-                    nameref: false,
-                },
-            );
-        }
+        self.mutate_or_create(name, |v| v.integer = true);
     }
 
     /// Flips the `integer` flag off on an existing variable. No-op
@@ -1867,21 +1853,7 @@ impl Shell {
     /// Creates an empty scalar if the variable is unset, mirroring
     /// `mark_integer` (so `declare -l NAME` with no value declares it).
     pub fn set_case_fold(&mut self, name: &str, fold: Option<CaseFold>) {
-        if let Some(v) = self.vars.get_mut(name) {
-            v.case_fold = fold;
-        } else {
-            self.vars.insert(
-                name.to_string(),
-                Variable {
-                    value: VarValue::Scalar(String::new()),
-                    exported: false,
-                    readonly: false,
-                    integer: false,
-                    case_fold: fold,
-                    nameref: false,
-                },
-            );
-        }
+        self.mutate_or_create(name, |v| v.case_fold = fold);
     }
 
     /// Reader for the nameref attribute.
@@ -1893,15 +1865,7 @@ impl Shell {
     /// (mirrors `set_case_fold`). The target name (if any) is stored as the
     /// scalar value separately, via the normal store path.
     pub fn set_nameref(&mut self, name: &str, on: bool) {
-        if let Some(v) = self.vars.get_mut(name) {
-            v.nameref = on;
-        } else {
-            self.vars.insert(name.to_string(), Variable {
-                value: VarValue::Scalar(String::new()),
-                exported: false, readonly: false, integer: false,
-                case_fold: None, nameref: on,
-            });
-        }
+        self.mutate_or_create(name, |v| v.nameref = on);
     }
 
     /// Follows the nameref chain starting at `name` to its effective storage
