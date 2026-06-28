@@ -82,7 +82,7 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
             _ => break,
         };
         if digit >= base {
-            return Err(ArithError { kind: ArithErrorKind::ValueTooGreatForBase, offset: None, token_end: None });
+            return Err(ArithError::plain(ArithErrorKind::ValueTooGreatForBase));
         }
         value = value
             .checked_mul(base as i64)
@@ -94,7 +94,7 @@ fn parse_base_n_digits(bytes: &[u8], i: &mut usize, base: u32) -> Result<i64, Ar
         *i += 1;
     }
     if !any_digit {
-        return Err(ArithError { kind: ArithErrorKind::InvalidIntegerConstant, offset: None, token_end: None });
+        return Err(ArithError::plain(ArithErrorKind::InvalidIntegerConstant));
     }
     Ok(value)
 }
@@ -112,6 +112,17 @@ fn number_run_end(bytes: &[u8], start: usize) -> usize {
         e += 1;
     }
     e
+}
+
+/// Consumes the longest run of identifier characters (`[_A-Za-z0-9]`) from
+/// `bytes` starting at `*i`, appending each to `s` and advancing `*i`.
+fn read_ident_chars(bytes: &[u8], i: &mut usize, s: &mut String) {
+    while *i < bytes.len()
+        && (bytes[*i] == b'_' || (bytes[*i] as char).is_ascii_alphanumeric())
+    {
+        s.push(bytes[*i] as char);
+        *i += 1;
+    }
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), ArithError> {
@@ -187,12 +198,7 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
                 let start = i;
                 i += 1;
                 let mut s = String::new();
-                while i < bytes.len()
-                    && (bytes[i] == b'_' || (bytes[i] as char).is_ascii_alphanumeric())
-                {
-                    s.push(bytes[i] as char);
-                    i += 1;
-                }
+                read_ident_chars(bytes, &mut i, &mut s);
                 if s.is_empty() {
                     return Err(ArithError::parse("expected identifier after '$'"));
                 }
@@ -202,12 +208,7 @@ pub(crate) fn tokenize(input: &str) -> Result<(Vec<ArithToken>, Vec<usize>), Ari
             b if b == b'_' || (b as char).is_ascii_alphabetic() => {
                 let start = i;
                 let mut s = String::new();
-                while i < bytes.len()
-                    && (bytes[i] == b'_' || (bytes[i] as char).is_ascii_alphanumeric())
-                {
-                    s.push(bytes[i] as char);
-                    i += 1;
-                }
+                read_ident_chars(bytes, &mut i, &mut s);
                 offsets.push(start);
                 out.push(ArithToken::Ident(s));
             }
@@ -512,6 +513,10 @@ impl ArithError {
     pub fn at_span(kind: ArithErrorKind, start: usize, end: usize) -> Self {
         ArithError { kind, offset: Some(start), token_end: Some(end) }
     }
+    /// A plain error with no position info (offset and token_end are None).
+    pub fn plain(kind: ArithErrorKind) -> Self {
+        ArithError { kind, offset: None, token_end: None }
+    }
     /// The text bash prints after the `<expr>: ` echo.
     pub fn bash_message(&self) -> String {
         use ArithErrorKind::*;
@@ -552,7 +557,7 @@ impl std::fmt::Display for ArithError {
             ShiftCountOutOfRange { count } => write!(f, "shift count out of range: {count}"),
             ReadonlyVar(name) => write!(f, "{name}: readonly variable"),
             // Bash-mapped kinds render their bash text under Display too.
-            other => write!(f, "{}", ArithError { kind: other.clone(), offset: None, token_end: None }.bash_message()),
+            other => write!(f, "{}", ArithError::plain(other.clone()).bash_message()),
         }
     }
 }
@@ -857,16 +862,16 @@ fn read_var_i64(shell: &Shell, name: &str) -> Result<i64, ArithError> {
     if raw.is_empty() {
         return Ok(0);
     }
-    raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
+    raw.parse::<i64>().map_err(|_| ArithError::plain(ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw,
-    }, offset: None, token_end: None })
+    }))
 }
 
 /// Writes an i64 back to a shell variable as a decimal string.
 fn write_var_i64(shell: &mut Shell, name: &str, value: i64) -> Result<(), ArithError> {
     shell.try_set(name, value.to_string())
-        .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
+        .map_err(|_| ArithError::plain(ArithErrorKind::ReadonlyVar(name.to_string())))
 }
 
 /// Arith-evaluates an element's raw string value to an i64, exactly like a
@@ -885,10 +890,10 @@ fn element_string_to_i64(
         return Ok(n);
     }
     // Non-numeric: arith-evaluate recursively (an element may hold "1+1").
-    let parsed = parse(&raw).map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
+    let parsed = parse(&raw).map_err(|_| ArithError::plain(ArithErrorKind::NotAnInteger {
         var: name.to_string(),
         value: raw.clone(),
-    }, offset: None, token_end: None })?;
+    }))?;
     eval(&parsed, shell)
 }
 
@@ -918,15 +923,24 @@ fn write_lvalue_i64(shell: &mut Shell, target: &LValue, value: i64) -> Result<()
             if shell.get_associative(name).is_some() {
                 shell
                     .set_associative_element(name, subscript_raw.clone(), value.to_string())
-                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
+                    .map_err(|_| ArithError::plain(ArithErrorKind::ReadonlyVar(name.to_string())))
             } else {
                 let idx = eval(subscript, shell)?;
                 shell
                     .set_indexed_element(name, idx as usize, value.to_string())
-                    .map_err(|_| ArithError { kind: ArithErrorKind::ReadonlyVar(name.to_string()), offset: None, token_end: None })
+                    .map_err(|_| ArithError::plain(ArithErrorKind::ReadonlyVar(name.to_string())))
             }
         }
     }
+}
+
+/// Validates that `count` is in `[0, 64)` (the legal shift range) and returns
+/// it as `u32`. Returns `ShiftCountOutOfRange` on failure.
+fn check_shift_count(count: i64) -> Result<u32, ArithError> {
+    if !(0..64).contains(&count) {
+        return Err(ArithError::plain(ArithErrorKind::ShiftCountOutOfRange { count }));
+    }
+    Ok(count as u32)
 }
 
 pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
@@ -937,10 +951,10 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             if raw.is_empty() {
                 Ok(0)
             } else {
-                raw.parse::<i64>().map_err(|_| ArithError { kind: ArithErrorKind::NotAnInteger {
+                raw.parse::<i64>().map_err(|_| ArithError::plain(ArithErrorKind::NotAnInteger {
                     var: name.clone(),
                     value: raw.to_string(),
-                }, offset: None, token_end: None })
+                }))
             }
         }
         ArithExpr::Index { name, subscript, subscript_raw } => {
@@ -1005,24 +1019,18 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
         ArithExpr::Shl(a, b) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if !(0..64).contains(&rhs) {
-                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
-            }
-            Ok(lhs.wrapping_shl(rhs as u32))
+            Ok(lhs.wrapping_shl(check_shift_count(rhs)?))
         }
         ArithExpr::Shr(a, b) => {
             let lhs = eval(a, shell)?;
             let rhs = eval(b, shell)?;
-            if !(0..64).contains(&rhs) {
-                return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs }, offset: None, token_end: None });
-            }
-            Ok(lhs.wrapping_shr(rhs as u32))
+            Ok(lhs.wrapping_shr(check_shift_count(rhs)?))
         }
         ArithExpr::Pow(a, b) => {
             let base = eval(a, shell)?;
             let exp = eval(b, shell)?;
             if exp < 0 {
-                return Err(ArithError { kind: ArithErrorKind::NegativeExponent, offset: None, token_end: None });
+                return Err(ArithError::plain(ArithErrorKind::NegativeExponent));
             }
             Ok(base.wrapping_pow(exp as u32))
         }
@@ -1035,27 +1043,21 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
                 AssignOp::Mul    => read_lvalue_i64(shell, target)?.wrapping_mul(rhs_val),
                 AssignOp::Div => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::DivisionByZero, offset: None, token_end: None }); }
+                    if rhs_val == 0 { return Err(ArithError::plain(ArithErrorKind::DivisionByZero)); }
                     lhs.wrapping_div(rhs_val)
                 }
                 AssignOp::Mod => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if rhs_val == 0 { return Err(ArithError { kind: ArithErrorKind::ModuloByZero, offset: None, token_end: None }); }
+                    if rhs_val == 0 { return Err(ArithError::plain(ArithErrorKind::ModuloByZero)); }
                     lhs.wrapping_rem(rhs_val)
                 }
                 AssignOp::Shl => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
-                    }
-                    lhs.wrapping_shl(rhs_val as u32)
+                    lhs.wrapping_shl(check_shift_count(rhs_val)?)
                 }
                 AssignOp::Shr => {
                     let lhs = read_lvalue_i64(shell, target)?;
-                    if !(0..64).contains(&rhs_val) {
-                        return Err(ArithError { kind: ArithErrorKind::ShiftCountOutOfRange { count: rhs_val }, offset: None, token_end: None });
-                    }
-                    lhs.wrapping_shr(rhs_val as u32)
+                    lhs.wrapping_shr(check_shift_count(rhs_val)?)
                 }
                 AssignOp::BitAnd => read_lvalue_i64(shell, target)? & rhs_val,
                 AssignOp::BitXor => read_lvalue_i64(shell, target)? ^ rhs_val,
@@ -1064,27 +1066,25 @@ pub fn eval(expr: &ArithExpr, shell: &mut Shell) -> Result<i64, ArithError> {
             write_lvalue_i64(shell, target, new_val)?;
             Ok(new_val)
         }
-        ArithExpr::PreInc(target) => {
-            let new_val = read_lvalue_i64(shell, target)?.wrapping_add(1);
-            write_lvalue_i64(shell, target, new_val)?;
-            Ok(new_val)
-        }
-        ArithExpr::PreDec(target) => {
-            let new_val = read_lvalue_i64(shell, target)?.wrapping_sub(1);
-            write_lvalue_i64(shell, target, new_val)?;
-            Ok(new_val)
-        }
-        ArithExpr::PostInc(target) => {
-            let old_val = read_lvalue_i64(shell, target)?;
-            write_lvalue_i64(shell, target, old_val.wrapping_add(1))?;
-            Ok(old_val)
-        }
-        ArithExpr::PostDec(target) => {
-            let old_val = read_lvalue_i64(shell, target)?;
-            write_lvalue_i64(shell, target, old_val.wrapping_sub(1))?;
-            Ok(old_val)
-        }
+        ArithExpr::PreInc(target)  => do_pre_incdec(shell, target,  1),
+        ArithExpr::PreDec(target)  => do_pre_incdec(shell, target, -1),
+        ArithExpr::PostInc(target) => do_post_incdec(shell, target,  1),
+        ArithExpr::PostDec(target) => do_post_incdec(shell, target, -1),
     }
+}
+
+/// Pre-increment/decrement: read→apply delta→write→return new value.
+fn do_pre_incdec(shell: &mut Shell, target: &LValue, delta: i64) -> Result<i64, ArithError> {
+    let new_val = read_lvalue_i64(shell, target)?.wrapping_add(delta);
+    write_lvalue_i64(shell, target, new_val)?;
+    Ok(new_val)
+}
+
+/// Post-increment/decrement: read old value→write (old+delta)→return old value.
+fn do_post_incdec(shell: &mut Shell, target: &LValue, delta: i64) -> Result<i64, ArithError> {
+    let old_val = read_lvalue_i64(shell, target)?;
+    write_lvalue_i64(shell, target, old_val.wrapping_add(delta))?;
+    Ok(old_val)
 }
 
 fn bool_to_i64(b: bool) -> i64 {

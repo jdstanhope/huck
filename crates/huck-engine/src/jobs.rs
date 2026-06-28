@@ -90,10 +90,7 @@ impl JobTable {
             marked_for_nohup: false,
             own_pgroup,
         };
-        self.next_created_at += 1;
-        self.jobs.push(job);
-        self.jobs.sort_by_key(|j| j.id);
-        id
+        self.insert_job(job)
     }
 
     /// Inserts a synthetic already-Done job — used for pure-builtin
@@ -115,10 +112,7 @@ impl JobTable {
             marked_for_nohup: false,
             own_pgroup: true,
         };
-        self.next_created_at += 1;
-        self.jobs.push(job);
-        self.jobs.sort_by_key(|j| j.id);
-        id
+        self.insert_job(job)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
@@ -244,32 +238,8 @@ impl JobTable {
                 let (_, prev) = self.current_and_previous();
                 prev.ok_or(JobSpecResolveError::NotFound)
             }
-            JobSpec::Prefix(p) => {
-                let matches: Vec<u32> = self
-                    .jobs
-                    .iter()
-                    .filter(|j| j.command.starts_with(p.as_str()))
-                    .map(|j| j.id)
-                    .collect();
-                match matches.len() {
-                    0 => Err(JobSpecResolveError::NotFound),
-                    1 => Ok(matches[0]),
-                    _ => Err(JobSpecResolveError::Ambiguous),
-                }
-            }
-            JobSpec::Substring(p) => {
-                let matches: Vec<u32> = self
-                    .jobs
-                    .iter()
-                    .filter(|j| j.command.contains(p.as_str()))
-                    .map(|j| j.id)
-                    .collect();
-                match matches.len() {
-                    0 => Err(JobSpecResolveError::NotFound),
-                    1 => Ok(matches[0]),
-                    _ => Err(JobSpecResolveError::Ambiguous),
-                }
-            }
+            JobSpec::Prefix(p) => self.resolve_by_command(|cmd| cmd.starts_with(p.as_str())),
+            JobSpec::Substring(p) => self.resolve_by_command(|cmd| cmd.contains(p.as_str())),
         }
     }
 
@@ -302,6 +272,28 @@ impl JobTable {
                 return id;
             }
             id += 1;
+        }
+    }
+
+    fn insert_job(&mut self, job: Job) -> u32 {
+        let id = job.id;
+        self.next_created_at += 1;
+        self.jobs.push(job);
+        self.jobs.sort_by_key(|j| j.id);
+        id
+    }
+
+    fn resolve_by_command<F: Fn(&str) -> bool>(&self, pred: F) -> Result<u32, JobSpecResolveError> {
+        let matches: Vec<u32> = self
+            .jobs
+            .iter()
+            .filter(|j| pred(j.command.as_str()))
+            .map(|j| j.id)
+            .collect();
+        match matches.len() {
+            0 => Err(JobSpecResolveError::NotFound),
+            1 => Ok(matches[0]),
+            _ => Err(JobSpecResolveError::Ambiguous),
         }
     }
 }
@@ -368,16 +360,21 @@ pub fn render_state(state: &JobState) -> String {
     }
 }
 
-/// Renders one notification/listing line for a job. The trailing `&` is
-/// included for Running and Done/Signaled jobs — Stopped jobs are not
-/// "running in the background" so the suffix would be misleading. Column
-/// width is 24 to fit `Stopped (tty output)`.
-pub fn notification_line(job: &Job, flag: char) -> String {
+fn job_state_and_suffix(job: &Job) -> (String, &'static str) {
     let state = render_state(&job.state);
     let suffix = match job.state {
         JobState::Stopped(_) => "",
         _ => " &",
     };
+    (state, suffix)
+}
+
+/// Renders one notification/listing line for a job. The trailing `&` is
+/// included for Running and Done/Signaled jobs — Stopped jobs are not
+/// "running in the background" so the suffix would be misleading. Column
+/// width is 24 to fit `Stopped (tty output)`.
+pub fn notification_line(job: &Job, flag: char) -> String {
+    let (state, suffix) = job_state_and_suffix(job);
     format!("[{}]{} {:<24} {}{}", job.id, flag, state, job.command, suffix)
 }
 
@@ -386,11 +383,7 @@ pub fn notification_line(job: &Job, flag: char) -> String {
 /// prefix, state, command, and trailing `&`. Subsequent stages are
 /// indented 5 spaces and carry only the PID.
 pub fn notification_line_long(job: &Job, flag: char) -> Vec<String> {
-    let state = render_state(&job.state);
-    let suffix = match job.state {
-        JobState::Stopped(_) => "",
-        _ => " &",
-    };
+    let (state, suffix) = job_state_and_suffix(job);
     let mut lines = Vec::with_capacity(job.pids.len().max(1));
     let first_pid = job.pids.first().copied().unwrap_or(job.pgid);
     lines.push(format!(
