@@ -476,670 +476,704 @@ fn fd_prefix_of(token: Option<&TokenKind>) -> Option<crate::command::RedirFd> {
     }
 }
 
+/// Incremental tokenizer state (v238 Phase A). Holds what were
+/// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
+/// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
+/// intact (batch internally); T2 splits it into a pull `next_token`.
+struct Lexer<'a> {
+    cursor: CharCursor<'a>,
+    opts: LexerOptions,
+    brace_expand: bool,
+    /// Tokens produced so far (was the local `tokens` vec).
+    history: Vec<Token>,
+    parts: Vec<WordPart>,
+    current: String,
+    has_token: bool,
+    token_start: usize,
+    token_start_line: u32,
+    token_start_col: u32,
+    in_assignment_value: bool,
+    dbracket_depth: u32,
+    expect_regex: bool,
+    pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(input: &'a str, opts: LexerOptions, brace_expand: bool) -> Self {
+        Lexer {
+            cursor: CharCursor::new(input),
+            opts,
+            brace_expand,
+            history: Vec::new(),
+            parts: Vec::new(),
+            current: String::new(),
+            has_token: false,
+            token_start: 0,
+            token_start_line: 1,
+            token_start_col: 1,
+            in_assignment_value: false,
+            dbracket_depth: 0,
+            expect_regex: false,
+            pending_heredocs: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Run the scan loop to completion, filling `self.history`. (T2 will split
+    /// this into one-iteration `scan_step` + a pull `next_token`.)
+    fn fill_all(&mut self) -> Result<(), LexError> {
+        // When `$glued` (no whitespace between the just-flushed Word and the
+        // redirect operator about to be pushed), and that trailing Word is a pure
+        // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
+        // same span. Must be
+        // invoked AFTER the preceding word has been flushed and BEFORE the operator
+        // token is pushed.
+        macro_rules! take_fd_prefix {
+            ($glued:expr) => {{
+                if $glued {
+                    if let Some(fd) = fd_prefix_of(self.history.last().map(|t| &t.kind)) {
+                        // Replace the digit/`{n}` word with a RedirFd at the SAME span.
+                        let span = self.history.pop().expect("fd-prefix word present").span;
+                        self.history.push(Token::new(TokenKind::RedirFd(fd), span));
+                    }
+                }
+            }};
+        }
+        loop {
+            // `=~` regex operand inside `[[ … ]]`: once `self.expect_regex` is armed and
+            // the next char is the operand's first (non-whitespace) char, scan the
+            // whole operand as one literal regex Word. Whitespace between `=~` and
+            // the operand falls through to the normal loop (which skips it and keeps
+            // `self.expect_regex` set). Branching before `self.cursor.next()` keeps the emitted
+            // offset exactly at the operand's first byte.
+            if self.expect_regex {
+                if let Some(&ch) = self.cursor.peek() {
+                    if ch.is_whitespace() {
+                        // skip leading whitespace via the normal path below
+                    } else {
+                        self.expect_regex = false;
+                        // The operand's first byte. Push the Word directly (NOT via
+                        // emit_word_with_braces) so no brace expansion applies.
+                        let operand_start = self.cursor.offset();
+                        let operand_line = self.cursor.line();
+                        let operand_col = self.cursor.column();
+                        let operand_parts = scan_regex_operand(&mut self.cursor, self.opts)?;
+                        self.history.push(Token::new(TokenKind::Word(Word(operand_parts)), Span::new(operand_start, operand_line, operand_col)));
+                        self.has_token = false;
+                        continue;
+                    }
+                } else {
+                    break;
+                }
+            }
+            let c_off = self.cursor.offset();
+            let c_line = self.cursor.line();
+            let c_col = self.cursor.column();
+            let c = match self.cursor.next() {
+                Some(c) => c,
+                None => break,
+            };
+            if c.is_whitespace() {
+                if self.has_token {
+                    flush_literal(&mut self.parts, &mut self.current, false);
+                    debug_assert!(
+                        !self.parts.is_empty(),
+                        "lexer invariant: self.has_token was true but no self.parts were emitted"
+                    );
+                    let kw = single_unquoted_literal(&self.parts).map(str::to_owned);
+                    emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                    match kw.as_deref() {
+                        Some("[[") => self.dbracket_depth += 1,
+                        Some("]]") => self.dbracket_depth = self.dbracket_depth.saturating_sub(1),
+                        Some("=~") if self.dbracket_depth > 0 => self.expect_regex = true,
+                        _ => {}
+                    }
+                    self.has_token = false;
+                    self.in_assignment_value = false;
+                }
+                if c == '\n' {
+                    // If there are pending heredocs, collect their bodies now
+                    // before emitting the Newline token.
+                    if !self.pending_heredocs.is_empty() {
+                        collect_heredoc_bodies(&mut self.cursor, &mut self.pending_heredocs, &mut self.history, self.opts)?;
+                    }
+                    self.history.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
+                }
+                continue;
+            }
+
+            // Record the start byte offset of a word as soon as its first char is
+            // seen. When `self.has_token` is false at the top of an iteration, this char
+            // is a candidate first char; operator arms (which leave `self.has_token`
+            // false) simply overwrite `self.token_start` on the next iteration, while
+            // word arms read the value captured at the word's true first char.
+            if !self.has_token {
+                self.token_start = c_off;
+                self.token_start_line = c_line;
+                self.token_start_col = c_col;
+            }
+
+            // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
+            // by `(` introduces a balanced parenthesised group (`+(a|b)`), lexed
+            // as a single literal word part. Checked before the normal
+            // `?`/`*`/`(` handling so the group is recognized first. With extglob
+            // off, this branch never fires and lexing is byte-identical.
+            if self.opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && self.cursor.peek() == Some(&'(') {
+                self.has_token = true;
+                flush_literal(&mut self.parts, &mut self.current, false);
+                let group_parts = scan_extglob_group(c, &mut self.cursor, self.opts)?;
+                self.parts.extend(group_parts);
+                continue;
+            }
+
+            match c {
+                '\'' => {
+                    self.has_token = true;
+                    flush_literal(&mut self.parts, &mut self.current, false);
+                    let mut run: Vec<WordPart> = Vec::new();
+                    let mut buf = String::new();
+                    loop {
+                        match self.cursor.next() {
+                            Some('\'') => break,
+                            Some(ch) => buf.push(ch),
+                            None => return Err(LexError::UnterminatedQuote),
+                        }
+                    }
+                    // empty '' still yields one empty quoted Literal (empty-token contract)
+                    run.push(WordPart::Literal { text: buf, quoted: true });
+                    self.parts.push(WordPart::Quoted { style: QuoteStyle::Single, parts: run });
+                }
+                '"' => {
+                    self.has_token = true;
+                    flush_literal(&mut self.parts, &mut self.current, false);
+                    let mut run: Vec<WordPart> = Vec::new();
+                    let mut qbuf = String::new();
+                    loop {
+                        match self.cursor.next() {
+                            Some('"') => break,
+                            Some('\\') => match self.cursor.next() {
+                                // POSIX: inside `"..."`, backslash is special only
+                                // before `$`, `, `"`, `\`, and newline. For other
+                                // characters, the backslash is retained literally.
+                                Some(esc @ ('"' | '\\' | '$' | '`')) => qbuf.push(esc),
+                                // POSIX 2.2.3: `\<NL>` inside double quotes is also
+                                // line continuation — both characters deleted.
+                                Some('\n') => {}
+                                Some(other) => {
+                                    qbuf.push('\\');
+                                    qbuf.push(other);
+                                }
+                                None => return Err(LexError::UnterminatedQuote),
+                            },
+                            Some('$') => {
+                                // Expansion inside double quotes (quoted: true).
+                                flush_literal(&mut run, &mut qbuf, true);
+                                scan_dollar_expansion(&mut self.cursor, &mut run, true, self.opts)?;
+                            }
+                            Some('`') => {
+                                // Backtick substitution inside double quotes (quoted: true).
+                                flush_literal(&mut run, &mut qbuf, true);
+                                let sequence = scan_backtick_substitution(&mut self.cursor, self.opts)?;
+                                run.push(WordPart::CommandSub { sequence, quoted: true });
+                            }
+                            Some(ch) => qbuf.push(ch),
+                            None => return Err(LexError::UnterminatedQuote),
+                        }
+                    }
+                    flush_literal(&mut run, &mut qbuf, true);
+                    if run.is_empty() {
+                        // Empty `""` — preserve the empty-token contract by
+                        // emitting an empty quoted Literal.
+                        run.push(WordPart::Literal { text: String::new(), quoted: true });
+                    }
+                    self.parts.push(WordPart::Quoted { style: QuoteStyle::Double, parts: run });
+                }
+                '\\' => match self.cursor.next() {
+                    Some('\n') => {
+                        // POSIX 2.2.1: `\<NL>` is line continuation — both self.cursor
+                        // are deleted. `self.has_token` stays at its self.current value, so
+                        // `echo\<NL>foo` becomes the single word "echofoo" while
+                        // `echo \<NL>foo` keeps the space-driven separation.
+                    }
+                    Some(ch) => {
+                        // Flush any accumulated unquoted text, then push the
+                        // escaped char as a one-char quoted Literal wrapped in a
+                        // Backslash run. This is what makes `\*` survive pathname
+                        // expansion as a literal `*` (the `quoted` flag inhibits
+                        // globbing) while recording the backslash quote style for
+                        // byte-exact reconstruction.
+                        self.has_token = true;
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        self.parts.push(WordPart::Quoted {
+                            style: QuoteStyle::Backslash,
+                            parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
+                        });
+                    }
+                    None => {
+                        self.has_token = true;
+                        self.current.push('\\');
+                    }
+                },
+                '$' => {
+                    // Expansion outside any quotes (quoted: false).
+                    self.has_token = true;
+                    flush_literal(&mut self.parts, &mut self.current, false);
+                    scan_dollar_expansion(&mut self.cursor, &mut self.parts, false, self.opts)?;
+                }
+                '#' if !self.has_token => {
+                    // POSIX: an unquoted `#` that begins a word starts a comment to
+                    // end-of-line. `#` mid-word (self.has_token) falls through as literal.
+                    skip_line_comment(&mut self.cursor);
+                }
+                '~' if !self.has_token || tilde_eligible_in_assignment(self.in_assignment_value, &self.current) => {
+                    if let Some(spec) = try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        self.has_token = true;
+                        self.parts.push(WordPart::Tilde(spec));
+                    } else {
+                        // Fall through: treat '~' as literal.
+                        self.current.push('~');
+                        self.has_token = true;
+                    }
+                }
+                '`' => {
+                    self.has_token = true;
+                    flush_literal(&mut self.parts, &mut self.current, false);
+                    let sequence = scan_backtick_substitution(&mut self.cursor, self.opts)?;
+                    self.parts.push(WordPart::CommandSub { sequence, quoted: false });
+                }
+                '|' => {
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    if self.cursor.peek() == Some(&'|') {
+                        self.cursor.next();
+                        self.history.push(Token::new(TokenKind::Op(Operator::Or), Span::new(c_off, c_line, c_col)));
+                    } else if self.cursor.peek() == Some(&'&') {
+                        // `|&` is bash shorthand for `2>&1 |`: merge the left command's
+                        // stderr into the pipe, then pipe. Desugar at the token level so
+                        // the existing pipeline/redirect machinery (incl. v176
+                        // compound-stage redirects) handles it unchanged.
+                        self.cursor.next(); // consume the '&' of `|&`
+                        self.history.push(Token::new(TokenKind::RedirFd(crate::command::RedirFd::Number(2)), Span::new(c_off, c_line, c_col)));
+                        self.history.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
+                        self.history.push(Token::new(TokenKind::Word(Word(vec![WordPart::Literal {
+                            text: "1".to_string(),
+                            quoted: false,
+                        }])), Span::new(c_off, c_line, c_col)));
+                        self.history.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
+                    } else {
+                        self.history.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
+                    }
+                    self.in_assignment_value = false;
+                }
+                '&' => {
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::And)));
+                    } else if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        if self.cursor.peek() == Some(&'>') {
+                            self.cursor.next();
+                            self.history.push(Token::from(TokenKind::Op(Operator::AndRedirAppend)));
+                        } else {
+                            self.history.push(Token::from(TokenKind::Op(Operator::AndRedirOut)));
+                        }
+                    } else {
+                        self.history.push(Token::from(TokenKind::Op(Operator::Background)));
+                    }
+                    if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
+                    self.in_assignment_value = false;
+                }
+                ';' => {
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    let op = if self.cursor.peek() == Some(&';') {
+                        self.cursor.next();
+                        if self.cursor.peek() == Some(&'&') {
+                            self.cursor.next();
+                            Operator::DoubleSemiAmp
+                        } else {
+                            Operator::DoubleSemi
+                        }
+                    } else if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        Operator::SemiAmp
+                    } else {
+                        Operator::Semi
+                    };
+                    self.history.push(Token::new(TokenKind::Op(op), Span::new(c_off, c_line, c_col)));
+                    self.in_assignment_value = false;
+                }
+                '(' => {
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    // Detect `((` (contiguous, no whitespace). The peek/next
+                    // sequence below consumes the second `(` only when present.
+                    // Whitespace between the two `(` is already consumed by the
+                    // outer loop's whitespace handling — so by the time we get
+                    // here, a second `(` means they were truly adjacent.
+                    if self.cursor.peek() == Some(&'(') {
+                        // `((` is an arithmetic command ONLY if a matching `))` is
+                        // found; otherwise bash treats it as nested subshells `( (`.
+                        // Save the cursor at the second `(`, try the arith block, and
+                        // on failure rewind + emit a single LParen (the first `(`); the
+                        // second `(` then re-lexes as another LParen. A `((` that DOES
+                        // close as `))` but isn't valid arithmetic stays an ArithBlock
+                        // → arith error at parse/eval, matching bash. Mirrors the v177
+                        // `$((` disambiguation.
+                        let saved = self.cursor.clone();
+                        self.cursor.next(); // consume the second `(`
+                        match scan_arith_block(&mut self.cursor) {
+                            Ok(body) => self.history.push(Token::from(TokenKind::ArithBlock(body, self.opts))),
+                            Err(_) => {
+                                self.cursor = saved;
+                                self.history.push(Token::from(TokenKind::Op(Operator::LParen)));
+                            }
+                        }
+                    } else {
+                        self.history.push(Token::from(TokenKind::Op(Operator::LParen)));
+                    }
+                    if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
+                    self.in_assignment_value = false;
+                }
+                ')' => {
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    self.history.push(Token::new(TokenKind::Op(Operator::RParen), Span::new(c_off, c_line, c_col)));
+                    self.in_assignment_value = false;
+                }
+                '<' => {
+                    // `glued` = a Word was being accumulated with no intervening
+                    // whitespace before this operator. Captured before the flush.
+                    let glued = self.has_token;
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    if self.cursor.peek() == Some(&'<') {
+                        self.cursor.next(); // consume second '<'
+                        if self.cursor.peek() == Some(&'<') {
+                            self.cursor.next(); // consume third '<' — here-string
+                            take_fd_prefix!(glued);
+                            self.history.push(Token::from(TokenKind::Op(Operator::HereString)));
+                        } else {
+                            let strip_tabs = if self.cursor.peek() == Some(&'-') {
+                                self.cursor.next(); // consume '-'
+                                true
+                            } else {
+                                false
+                            };
+                            // Parse the delimiter word and detect literal vs expanding mode.
+                            let (delim, expand) = parse_heredoc_delim(&mut self.cursor)?;
+                            // A glued fd-prefix (`3<<EOF`) becomes a RedirFd token
+                            // before the heredoc placeholder.
+                            take_fd_prefix!(glued);
+                            // Push a placeholder TokenKind::Heredoc with empty body.
+                            // The body is back-patched after the line's \n.
+                            let placeholder_idx = self.history.len();
+                            self.history.push(Token::from(TokenKind::Heredoc {
+                                body: Word(Vec::new()),
+                                expand,
+                                strip_tabs,
+                            }));
+                            self.pending_heredocs.push_back(PendingHeredoc {
+                                delim,
+                                expand,
+                                strip_tabs,
+                                token_idx: placeholder_idx,
+                            });
+                        }
+                        if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'(') {
+                        // `<(cmd)` — process substitution. Consume the `(` and scan the
+                        // inner command body exactly like `$(…)`. The result is a word
+                        // part on the CURRENT word (not a standalone redirect operator).
+                        self.cursor.next(); // consume '('
+                        let sequence = scan_paren_substitution(&mut self.cursor, self.opts)?;
+                        if !self.has_token {
+                            self.token_start = c_off;
+                            self.token_start_line = c_line;
+                        }
+                        self.has_token = true;
+                        self.parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::DupIn), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::RedirReadWrite), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    } else {
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::RedirIn), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    }
+                }
+                '>' => {
+                    let glued = self.has_token;
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+                        self.has_token = false;
+                    }
+                    if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::RedirAppend), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'|') {
+                        self.cursor.next();
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::RedirClobber), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    } else if self.cursor.peek() == Some(&'(') {
+                        // `>(cmd)` — process substitution. Consume the `(` and scan the
+                        // inner command body exactly like `$(…)`. The result is a word
+                        // part on the CURRENT word (not a standalone redirect operator).
+                        self.cursor.next(); // consume '('
+                        let sequence = scan_paren_substitution(&mut self.cursor, self.opts)?;
+                        if !self.has_token {
+                            self.token_start = c_off;
+                            self.token_start_line = c_line;
+                        }
+                        self.has_token = true;
+                        self.parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
+                        self.in_assignment_value = false;
+                    } else {
+                        take_fd_prefix!(glued);
+                        self.history.push(Token::new(TokenKind::Op(Operator::RedirOut), Span::new(c_off, c_line, c_col)));
+                        self.in_assignment_value = false;
+                    }
+                }
+                '1' if !self.has_token && self.cursor.peek() == Some(&'>') => {
+                    self.cursor.next();
+                    if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirAppend)));
+                    } else if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::DupOut)));
+                    } else if self.cursor.peek() == Some(&'|') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirClobber)));
+                    } else {
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirOut)));
+                    }
+                    if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
+                    self.in_assignment_value = false;
+                }
+                '2' if !self.has_token && self.cursor.peek() == Some(&'>') => {
+                    self.cursor.next();
+                    if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirErrAppend)));
+                    } else if self.cursor.peek() == Some(&'&') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::DupErr)));
+                    } else if self.cursor.peek() == Some(&'|') {
+                        self.cursor.next();
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirErrClobber)));
+                    } else {
+                        self.history.push(Token::from(TokenKind::Op(Operator::RedirErr)));
+                    }
+                    if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
+                    self.in_assignment_value = false;
+                }
+                '=' if !self.in_assignment_value && word_is_identifier_so_far(&self.current, &self.parts) => {
+                    self.in_assignment_value = true;
+                    self.has_token = true;
+                    self.current.push('=');
+                    // Compound RHS: `name=(...)`. Scan the array literal as
+                    // a single WordPart that becomes the value.
+                    // A `\<NL>` line continuation may sit between `=` and the array
+                    // `(` (`arr=\<NL>(…)`); bash deletes it pre-tokenization.
+                    skip_line_continuations(&mut self.cursor);
+                    if self.cursor.peek() == Some(&'(') {
+                        self.cursor.next(); // consume '('
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        let elements = scan_array_literal(&mut self.cursor, self.opts)?;
+                        self.parts.push(WordPart::ArrayLiteral(elements));
+                    }
+                }
+                // `+=`: scalar-or-array append assignment when the prefix is
+                // identifier-shaped. Emits an AssignPrefix(Bare, append=true)
+                // prefix Word.
+                '+' if !self.in_assignment_value
+                    && self.cursor.peek() == Some(&'=')
+                    && word_is_identifier_so_far(&self.current, &self.parts) =>
+                {
+                    self.cursor.next(); // consume '='
+                    self.in_assignment_value = true;
+                    self.has_token = true;
+                    // Bake the accumulated identifier text into the target.
+                    let name = std::mem::take(&mut self.current);
+                    debug_assert!(
+                        self.parts.is_empty(),
+                        "word_is_identifier_so_far guarantees no prior self.parts"
+                    );
+                    self.parts.push(WordPart::AssignPrefix {
+                        target: crate::command::AssignTarget::Bare(name),
+                        append: true,
+                    });
+                    // Compound RHS: `name+=(...)`.
+                    skip_line_continuations(&mut self.cursor);
+                    if self.cursor.peek() == Some(&'(') {
+                        self.cursor.next();
+                        let elements = scan_array_literal(&mut self.cursor, self.opts)?;
+                        self.parts.push(WordPart::ArrayLiteral(elements));
+                    }
+                }
+                // Subscripted lvalue: `name[expr]=…` or `name[expr]+=…`.
+                // Only fires before the assignment value has started AND
+                // when the accumulated text is identifier-shaped. We
+                // speculatively scan the `[…]` and the optional `+`; if
+                // an `=` follows, this is an indexed assignment. Otherwise
+                // (e.g. `cmd[[foo]]`, glob-style `[abc]*`), we fall back
+                // to treating the `[` and everything we scanned as literal
+                // text so existing word semantics are preserved.
+                '[' if !self.in_assignment_value && word_is_identifier_so_far(&self.current, &self.parts) => {
+                    let mut raw_subscript = String::new();
+                    let mut depth: usize = 1;
+                    let mut closed_subscript = false;
+                    while let Some(&c) = self.cursor.peek() {
+                        if c == '[' {
+                            depth += 1;
+                            raw_subscript.push(c);
+                            self.cursor.next();
+                        } else if c == ']' {
+                            self.cursor.next();
+                            depth -= 1;
+                            if depth == 0 {
+                                closed_subscript = true;
+                                break;
+                            }
+                            raw_subscript.push(c);
+                        } else {
+                            raw_subscript.push(c);
+                            self.cursor.next();
+                        }
+                    }
+                    // Decide: is this an assignment? Peek for `=` or `+=`.
+                    let assign_op: Option<bool> = if closed_subscript {
+                        match self.cursor.peek().copied() {
+                            Some('=') => {
+                                self.cursor.next();
+                                Some(false)
+                            }
+                            Some('+') => {
+                                // Need to peek two self.cursor; clone iter for lookahead.
+                                let mut peeker = self.cursor.clone();
+                                peeker.next();
+                                if peeker.peek() == Some(&'=') {
+                                    self.cursor.next(); // consume '+'
+                                    self.cursor.next(); // consume '='
+                                    Some(true)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    match assign_op {
+                        Some(append) => {
+                            let name = std::mem::take(&mut self.current);
+                            debug_assert!(
+                                self.parts.is_empty(),
+                                "word_is_identifier_so_far guarantees no prior self.parts"
+                            );
+                            let subscript = parse_subscript_body(&raw_subscript, self.opts)?;
+                            self.in_assignment_value = true;
+                            self.has_token = true;
+                            self.parts.push(WordPart::AssignPrefix {
+                                target: crate::command::AssignTarget::Indexed { name, subscript },
+                                append,
+                            });
+                            // Compound RHS: `name[i]=(...)`.
+                            if self.cursor.peek() == Some(&'(') {
+                                self.cursor.next();
+                                let elements = scan_array_literal(&mut self.cursor, self.opts)?;
+                                self.parts.push(WordPart::ArrayLiteral(elements));
+                            }
+                        }
+                        None => {
+                            // Not an indexed assignment. Fall back: append
+                            // the `[`, the scanned subscript text, and the
+                            // closing `]` (if any) back into the self.current
+                            // literal so the word behaves the same as
+                            // before this arm existed.
+                            self.has_token = true;
+                            self.current.push('[');
+                            self.current.push_str(&raw_subscript);
+                            if closed_subscript {
+                                self.current.push(']');
+                            }
+                        }
+                    }
+                }
+                other => {
+                    self.has_token = true;
+                    self.current.push(other);
+                }
+            }
+        }
+
+        if self.has_token {
+            flush_literal(&mut self.parts, &mut self.current, false);
+            emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
+        }
+        // If there are unresolved pending heredocs after end-of-input, it's an error.
+        if !self.pending_heredocs.is_empty() {
+            return Err(LexError::UnterminatedHeredoc);
+        }
+        Ok(())
+    }
+}
+
 fn tokenize_partial_inner(
     input: &str,
     opts: LexerOptions,
     brace_expand: bool,
 ) -> PartialTokens {
-    let mut tokens: Vec<Token> = Vec::new();
-    // When `$glued` (no whitespace between the just-flushed Word and the
-    // redirect operator about to be pushed), and that trailing Word is a pure
-    // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
-    // same span. Must be
-    // invoked AFTER the preceding word has been flushed and BEFORE the operator
-    // token is pushed.
-    macro_rules! take_fd_prefix {
-        ($glued:expr) => {{
-            if $glued {
-                if let Some(fd) = fd_prefix_of(tokens.last().map(|t| &t.kind)) {
-                    // Replace the digit/`{n}` word with a RedirFd at the SAME span.
-                    let span = tokens.pop().expect("fd-prefix word present").span;
-                    tokens.push(Token::new(TokenKind::RedirFd(fd), span));
-                }
-            }
-        }};
-    }
-    let mut parts: Vec<WordPart> = Vec::new();
-    let mut current = String::new();
-    let mut has_token = false;
-    let mut token_start: usize = 0;
-    let mut token_start_line: u32 = 1;
-    let mut token_start_col: u32 = 1;
-    let mut in_assignment_value = false;
-    // `[[ … ]]` context tracking for the `=~` regex operand. `dbracket_depth`
-    // counts open `[[`; `expect_regex` is armed right after an `=~` keyword
-    // inside `[[ ]]` so the NEXT word is scanned as one literal regex Word.
-    let mut dbracket_depth: u32 = 0;
-    let mut expect_regex = false;
-    let mut chars = CharCursor::new(input);
-    let mut pending_heredocs: std::collections::VecDeque<PendingHeredoc> = std::collections::VecDeque::new();
-
-    let result: Result<(), LexError> = (|| {
-    loop {
-        // `=~` regex operand inside `[[ … ]]`: once `expect_regex` is armed and
-        // the next char is the operand's first (non-whitespace) char, scan the
-        // whole operand as one literal regex Word. Whitespace between `=~` and
-        // the operand falls through to the normal loop (which skips it and keeps
-        // `expect_regex` set). Branching before `chars.next()` keeps the emitted
-        // offset exactly at the operand's first byte.
-        if expect_regex {
-            if let Some(&ch) = chars.peek() {
-                if ch.is_whitespace() {
-                    // skip leading whitespace via the normal path below
-                } else {
-                    expect_regex = false;
-                    // The operand's first byte. Push the Word directly (NOT via
-                    // emit_word_with_braces) so no brace expansion applies.
-                    let operand_start = chars.offset();
-                    let operand_line = chars.line();
-                    let operand_col = chars.column();
-                    let parts = scan_regex_operand(&mut chars, opts)?;
-                    tokens.push(Token::new(TokenKind::Word(Word(parts)), Span::new(operand_start, operand_line, operand_col)));
-                    has_token = false;
-                    continue;
-                }
-            } else {
-                break;
-            }
-        }
-        let c_off = chars.offset();
-        let c_line = chars.line();
-        let c_col = chars.column();
-        let c = match chars.next() {
-            Some(c) => c,
-            None => break,
-        };
-        if c.is_whitespace() {
-            if has_token {
-                flush_literal(&mut parts, &mut current, false);
-                debug_assert!(
-                    !parts.is_empty(),
-                    "lexer invariant: has_token was true but no parts were emitted"
-                );
-                let kw = single_unquoted_literal(&parts).map(str::to_owned);
-                emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                match kw.as_deref() {
-                    Some("[[") => dbracket_depth += 1,
-                    Some("]]") => dbracket_depth = dbracket_depth.saturating_sub(1),
-                    Some("=~") if dbracket_depth > 0 => expect_regex = true,
-                    _ => {}
-                }
-                has_token = false;
-                in_assignment_value = false;
-            }
-            if c == '\n' {
-                // If there are pending heredocs, collect their bodies now
-                // before emitting the Newline token.
-                if !pending_heredocs.is_empty() {
-                    collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens, opts)?;
-                }
-                tokens.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
-            }
-            continue;
-        }
-
-        // Record the start byte offset of a word as soon as its first char is
-        // seen. When `has_token` is false at the top of an iteration, this char
-        // is a candidate first char; operator arms (which leave `has_token`
-        // false) simply overwrite `token_start` on the next iteration, while
-        // word arms read the value captured at the word's true first char.
-        if !has_token {
-            token_start = c_off;
-            token_start_line = c_line;
-            token_start_col = c_col;
-        }
-
-        // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
-        // by `(` introduces a balanced parenthesised group (`+(a|b)`), lexed
-        // as a single literal word part. Checked before the normal
-        // `?`/`*`/`(` handling so the group is recognized first. With extglob
-        // off, this branch never fires and lexing is byte-identical.
-        if opts.extglob && matches!(c, '?' | '*' | '+' | '@' | '!') && chars.peek() == Some(&'(') {
-            has_token = true;
-            flush_literal(&mut parts, &mut current, false);
-            let group_parts = scan_extglob_group(c, &mut chars, opts)?;
-            parts.extend(group_parts);
-            continue;
-        }
-
-        match c {
-            '\'' => {
-                has_token = true;
-                flush_literal(&mut parts, &mut current, false);
-                let mut run: Vec<WordPart> = Vec::new();
-                let mut buf = String::new();
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(ch) => buf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                // empty '' still yields one empty quoted Literal (empty-token contract)
-                run.push(WordPart::Literal { text: buf, quoted: true });
-                parts.push(WordPart::Quoted { style: QuoteStyle::Single, parts: run });
-            }
-            '"' => {
-                has_token = true;
-                flush_literal(&mut parts, &mut current, false);
-                let mut run: Vec<WordPart> = Vec::new();
-                let mut qbuf = String::new();
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            // POSIX: inside `"..."`, backslash is special only
-                            // before `$`, `, `"`, `\`, and newline. For other
-                            // characters, the backslash is retained literally.
-                            Some(esc @ ('"' | '\\' | '$' | '`')) => qbuf.push(esc),
-                            // POSIX 2.2.3: `\<NL>` inside double quotes is also
-                            // line continuation — both characters deleted.
-                            Some('\n') => {}
-                            Some(other) => {
-                                qbuf.push('\\');
-                                qbuf.push(other);
-                            }
-                            None => return Err(LexError::UnterminatedQuote),
-                        },
-                        Some('$') => {
-                            // Expansion inside double quotes (quoted: true).
-                            flush_literal(&mut run, &mut qbuf, true);
-                            scan_dollar_expansion(&mut chars, &mut run, true, opts)?;
-                        }
-                        Some('`') => {
-                            // Backtick substitution inside double quotes (quoted: true).
-                            flush_literal(&mut run, &mut qbuf, true);
-                            let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                            run.push(WordPart::CommandSub { sequence, quoted: true });
-                        }
-                        Some(ch) => qbuf.push(ch),
-                        None => return Err(LexError::UnterminatedQuote),
-                    }
-                }
-                flush_literal(&mut run, &mut qbuf, true);
-                if run.is_empty() {
-                    // Empty `""` — preserve the empty-token contract by
-                    // emitting an empty quoted Literal.
-                    run.push(WordPart::Literal { text: String::new(), quoted: true });
-                }
-                parts.push(WordPart::Quoted { style: QuoteStyle::Double, parts: run });
-            }
-            '\\' => match chars.next() {
-                Some('\n') => {
-                    // POSIX 2.2.1: `\<NL>` is line continuation — both chars
-                    // are deleted. `has_token` stays at its current value, so
-                    // `echo\<NL>foo` becomes the single word "echofoo" while
-                    // `echo \<NL>foo` keeps the space-driven separation.
-                }
-                Some(ch) => {
-                    // Flush any accumulated unquoted text, then push the
-                    // escaped char as a one-char quoted Literal wrapped in a
-                    // Backslash run. This is what makes `\*` survive pathname
-                    // expansion as a literal `*` (the `quoted` flag inhibits
-                    // globbing) while recording the backslash quote style for
-                    // byte-exact reconstruction.
-                    has_token = true;
-                    flush_literal(&mut parts, &mut current, false);
-                    parts.push(WordPart::Quoted {
-                        style: QuoteStyle::Backslash,
-                        parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
-                    });
-                }
-                None => {
-                    has_token = true;
-                    current.push('\\');
-                }
-            },
-            '$' => {
-                // Expansion outside any quotes (quoted: false).
-                has_token = true;
-                flush_literal(&mut parts, &mut current, false);
-                scan_dollar_expansion(&mut chars, &mut parts, false, opts)?;
-            }
-            '#' if !has_token => {
-                // POSIX: an unquoted `#` that begins a word starts a comment to
-                // end-of-line. `#` mid-word (has_token) falls through as literal.
-                skip_line_comment(&mut chars);
-            }
-            '~' if !has_token || tilde_eligible_in_assignment(in_assignment_value, &current) => {
-                if let Some(spec) = try_parse_tilde(&mut chars, in_assignment_value) {
-                    flush_literal(&mut parts, &mut current, false);
-                    has_token = true;
-                    parts.push(WordPart::Tilde(spec));
-                } else {
-                    // Fall through: treat '~' as literal.
-                    current.push('~');
-                    has_token = true;
-                }
-            }
-            '`' => {
-                has_token = true;
-                flush_literal(&mut parts, &mut current, false);
-                let sequence = scan_backtick_substitution(&mut chars, opts)?;
-                parts.push(WordPart::CommandSub { sequence, quoted: false });
-            }
-            '|' => {
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(Token::new(TokenKind::Op(Operator::Or), Span::new(c_off, c_line, c_col)));
-                } else if chars.peek() == Some(&'&') {
-                    // `|&` is bash shorthand for `2>&1 |`: merge the left command's
-                    // stderr into the pipe, then pipe. Desugar at the token level so
-                    // the existing pipeline/redirect machinery (incl. v176
-                    // compound-stage redirects) handles it unchanged.
-                    chars.next(); // consume the '&' of `|&`
-                    tokens.push(Token::new(TokenKind::RedirFd(crate::command::RedirFd::Number(2)), Span::new(c_off, c_line, c_col)));
-                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
-                    tokens.push(Token::new(TokenKind::Word(Word(vec![WordPart::Literal {
-                        text: "1".to_string(),
-                        quoted: false,
-                    }])), Span::new(c_off, c_line, c_col)));
-                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
-                } else {
-                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
-                }
-                in_assignment_value = false;
-            }
-            '&' => {
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::And)));
-                } else if chars.peek() == Some(&'>') {
-                    chars.next();
-                    if chars.peek() == Some(&'>') {
-                        chars.next();
-                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirAppend)));
-                    } else {
-                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirOut)));
-                    }
-                } else {
-                    tokens.push(Token::from(TokenKind::Op(Operator::Background)));
-                }
-                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                in_assignment_value = false;
-            }
-            ';' => {
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                let op = if chars.peek() == Some(&';') {
-                    chars.next();
-                    if chars.peek() == Some(&'&') {
-                        chars.next();
-                        Operator::DoubleSemiAmp
-                    } else {
-                        Operator::DoubleSemi
-                    }
-                } else if chars.peek() == Some(&'&') {
-                    chars.next();
-                    Operator::SemiAmp
-                } else {
-                    Operator::Semi
-                };
-                tokens.push(Token::new(TokenKind::Op(op), Span::new(c_off, c_line, c_col)));
-                in_assignment_value = false;
-            }
-            '(' => {
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                // Detect `((` (contiguous, no whitespace). The peek/next
-                // sequence below consumes the second `(` only when present.
-                // Whitespace between the two `(` is already consumed by the
-                // outer loop's whitespace handling — so by the time we get
-                // here, a second `(` means they were truly adjacent.
-                if chars.peek() == Some(&'(') {
-                    // `((` is an arithmetic command ONLY if a matching `))` is
-                    // found; otherwise bash treats it as nested subshells `( (`.
-                    // Save the cursor at the second `(`, try the arith block, and
-                    // on failure rewind + emit a single LParen (the first `(`); the
-                    // second `(` then re-lexes as another LParen. A `((` that DOES
-                    // close as `))` but isn't valid arithmetic stays an ArithBlock
-                    // → arith error at parse/eval, matching bash. Mirrors the v177
-                    // `$((` disambiguation.
-                    let saved = chars.clone();
-                    chars.next(); // consume the second `(`
-                    match scan_arith_block(&mut chars) {
-                        Ok(body) => tokens.push(Token::from(TokenKind::ArithBlock(body, opts))),
-                        Err(_) => {
-                            chars = saved;
-                            tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
-                        }
-                    }
-                } else {
-                    tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
-                }
-                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                in_assignment_value = false;
-            }
-            ')' => {
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                tokens.push(Token::new(TokenKind::Op(Operator::RParen), Span::new(c_off, c_line, c_col)));
-                in_assignment_value = false;
-            }
-            '<' => {
-                // `glued` = a Word was being accumulated with no intervening
-                // whitespace before this operator. Captured before the flush.
-                let glued = has_token;
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                if chars.peek() == Some(&'<') {
-                    chars.next(); // consume second '<'
-                    if chars.peek() == Some(&'<') {
-                        chars.next(); // consume third '<' — here-string
-                        take_fd_prefix!(glued);
-                        tokens.push(Token::from(TokenKind::Op(Operator::HereString)));
-                    } else {
-                        let strip_tabs = if chars.peek() == Some(&'-') {
-                            chars.next(); // consume '-'
-                            true
-                        } else {
-                            false
-                        };
-                        // Parse the delimiter word and detect literal vs expanding mode.
-                        let (delim, expand) = parse_heredoc_delim(&mut chars)?;
-                        // A glued fd-prefix (`3<<EOF`) becomes a RedirFd token
-                        // before the heredoc placeholder.
-                        take_fd_prefix!(glued);
-                        // Push a placeholder TokenKind::Heredoc with empty body.
-                        // The body is back-patched after the line's \n.
-                        let placeholder_idx = tokens.len();
-                        tokens.push(Token::from(TokenKind::Heredoc {
-                            body: Word(Vec::new()),
-                            expand,
-                            strip_tabs,
-                        }));
-                        pending_heredocs.push_back(PendingHeredoc {
-                            delim,
-                            expand,
-                            strip_tabs,
-                            token_idx: placeholder_idx,
-                        });
-                    }
-                    if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'(') {
-                    // `<(cmd)` — process substitution. Consume the `(` and scan the
-                    // inner command body exactly like `$(…)`. The result is a word
-                    // part on the CURRENT word (not a standalone redirect operator).
-                    chars.next(); // consume '('
-                    let sequence = scan_paren_substitution(&mut chars, opts)?;
-                    if !has_token {
-                        token_start = c_off;
-                        token_start_line = c_line;
-                    }
-                    has_token = true;
-                    parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::In });
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'&') {
-                    chars.next();
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::DupIn), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'>') {
-                    chars.next();
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::RedirReadWrite), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                } else {
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::RedirIn), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                }
-            }
-            '>' => {
-                let glued = has_token;
-                if has_token {
-                    flush_literal(&mut parts, &mut current, false);
-                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-                    has_token = false;
-                }
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::RedirAppend), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'&') {
-                    chars.next();
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'|') {
-                    chars.next();
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::RedirClobber), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                } else if chars.peek() == Some(&'(') {
-                    // `>(cmd)` — process substitution. Consume the `(` and scan the
-                    // inner command body exactly like `$(…)`. The result is a word
-                    // part on the CURRENT word (not a standalone redirect operator).
-                    chars.next(); // consume '('
-                    let sequence = scan_paren_substitution(&mut chars, opts)?;
-                    if !has_token {
-                        token_start = c_off;
-                        token_start_line = c_line;
-                    }
-                    has_token = true;
-                    parts.push(WordPart::ProcessSub { sequence, dir: ProcDir::Out });
-                    in_assignment_value = false;
-                } else {
-                    take_fd_prefix!(glued);
-                    tokens.push(Token::new(TokenKind::Op(Operator::RedirOut), Span::new(c_off, c_line, c_col)));
-                    in_assignment_value = false;
-                }
-            }
-            '1' if !has_token && chars.peek() == Some(&'>') => {
-                chars.next();
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirAppend)));
-                } else if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::DupOut)));
-                } else if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirClobber)));
-                } else {
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirOut)));
-                }
-                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                in_assignment_value = false;
-            }
-            '2' if !has_token && chars.peek() == Some(&'>') => {
-                chars.next();
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrAppend)));
-                } else if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::DupErr)));
-                } else if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrClobber)));
-                } else {
-                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErr)));
-                }
-                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
-                in_assignment_value = false;
-            }
-            '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
-                in_assignment_value = true;
-                has_token = true;
-                current.push('=');
-                // Compound RHS: `name=(...)`. Scan the array literal as
-                // a single WordPart that becomes the value.
-                // A `\<NL>` line continuation may sit between `=` and the array
-                // `(` (`arr=\<NL>(…)`); bash deletes it pre-tokenization.
-                skip_line_continuations(&mut chars);
-                if chars.peek() == Some(&'(') {
-                    chars.next(); // consume '('
-                    flush_literal(&mut parts, &mut current, false);
-                    let elements = scan_array_literal(&mut chars, opts)?;
-                    parts.push(WordPart::ArrayLiteral(elements));
-                }
-            }
-            // `+=`: scalar-or-array append assignment when the prefix is
-            // identifier-shaped. Emits an AssignPrefix(Bare, append=true)
-            // prefix Word.
-            '+' if !in_assignment_value
-                && chars.peek() == Some(&'=')
-                && word_is_identifier_so_far(&current, &parts) =>
-            {
-                chars.next(); // consume '='
-                in_assignment_value = true;
-                has_token = true;
-                // Bake the accumulated identifier text into the target.
-                let name = std::mem::take(&mut current);
-                debug_assert!(
-                    parts.is_empty(),
-                    "word_is_identifier_so_far guarantees no prior parts"
-                );
-                parts.push(WordPart::AssignPrefix {
-                    target: crate::command::AssignTarget::Bare(name),
-                    append: true,
-                });
-                // Compound RHS: `name+=(...)`.
-                skip_line_continuations(&mut chars);
-                if chars.peek() == Some(&'(') {
-                    chars.next();
-                    let elements = scan_array_literal(&mut chars, opts)?;
-                    parts.push(WordPart::ArrayLiteral(elements));
-                }
-            }
-            // Subscripted lvalue: `name[expr]=…` or `name[expr]+=…`.
-            // Only fires before the assignment value has started AND
-            // when the accumulated text is identifier-shaped. We
-            // speculatively scan the `[…]` and the optional `+`; if
-            // an `=` follows, this is an indexed assignment. Otherwise
-            // (e.g. `cmd[[foo]]`, glob-style `[abc]*`), we fall back
-            // to treating the `[` and everything we scanned as literal
-            // text so existing word semantics are preserved.
-            '[' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
-                let mut raw_subscript = String::new();
-                let mut depth: usize = 1;
-                let mut closed_subscript = false;
-                while let Some(&c) = chars.peek() {
-                    if c == '[' {
-                        depth += 1;
-                        raw_subscript.push(c);
-                        chars.next();
-                    } else if c == ']' {
-                        chars.next();
-                        depth -= 1;
-                        if depth == 0 {
-                            closed_subscript = true;
-                            break;
-                        }
-                        raw_subscript.push(c);
-                    } else {
-                        raw_subscript.push(c);
-                        chars.next();
-                    }
-                }
-                // Decide: is this an assignment? Peek for `=` or `+=`.
-                let assign_op: Option<bool> = if closed_subscript {
-                    match chars.peek().copied() {
-                        Some('=') => {
-                            chars.next();
-                            Some(false)
-                        }
-                        Some('+') => {
-                            // Need to peek two chars; clone iter for lookahead.
-                            let mut peeker = chars.clone();
-                            peeker.next();
-                            if peeker.peek() == Some(&'=') {
-                                chars.next(); // consume '+'
-                                chars.next(); // consume '='
-                                Some(true)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                match assign_op {
-                    Some(append) => {
-                        let name = std::mem::take(&mut current);
-                        debug_assert!(
-                            parts.is_empty(),
-                            "word_is_identifier_so_far guarantees no prior parts"
-                        );
-                        let subscript = parse_subscript_body(&raw_subscript, opts)?;
-                        in_assignment_value = true;
-                        has_token = true;
-                        parts.push(WordPart::AssignPrefix {
-                            target: crate::command::AssignTarget::Indexed { name, subscript },
-                            append,
-                        });
-                        // Compound RHS: `name[i]=(...)`.
-                        if chars.peek() == Some(&'(') {
-                            chars.next();
-                            let elements = scan_array_literal(&mut chars, opts)?;
-                            parts.push(WordPart::ArrayLiteral(elements));
-                        }
-                    }
-                    None => {
-                        // Not an indexed assignment. Fall back: append
-                        // the `[`, the scanned subscript text, and the
-                        // closing `]` (if any) back into the current
-                        // literal so the word behaves the same as
-                        // before this arm existed.
-                        has_token = true;
-                        current.push('[');
-                        current.push_str(&raw_subscript);
-                        if closed_subscript {
-                            current.push(']');
-                        }
-                    }
-                }
-            }
-            other => {
-                has_token = true;
-                current.push(other);
-            }
-        }
-    }
-
-    if has_token {
-        flush_literal(&mut parts, &mut current, false);
-        emit_word_with_braces(&mut tokens, parts, brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
-    }
-    // If there are unresolved pending heredocs after end-of-input, it's an error.
-    if !pending_heredocs.is_empty() {
-        return Err(LexError::UnterminatedHeredoc);
-    }
-    Ok(())
-    })();
-
+    let mut lx = Lexer::new(input, opts, brace_expand);
+    let result = lx.fill_all();
     match result {
-        Ok(()) => (tokens, None),
+        Ok(()) => (lx.history, None),
         // Partial: keep the tokens produced before the error; the error byte
         // offset is returned separately (no longer a trailing sentinel).
-        Err(e) => (tokens, Some((e, chars.offset()))),
+        Err(e) => {
+            let off = lx.cursor.offset();
+            (lx.history, Some((e, off)))
+        }
     }
 }
 
