@@ -1439,12 +1439,10 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     out
 }
 
-/// Emits a Word into `tokens`. If the parts contain an unquoted
-/// `{`, runs brace expansion and emits one Word per expansion.
 /// Emits the word for `parts` into `tokens`, expanding any unquoted braces.
-/// Returns the number of tokens pushed (1 normally, or one per brace-expansion
-/// product). Callers that track byte offsets push the word's start offset this
-/// many times to keep the offset sidecar in lockstep with the token stream.
+/// Every emitted Word (1 normally, or one per brace-expansion product) is built
+/// with `span` — the source span of the word's first character — so each token
+/// carries its own location. Returns the number of tokens pushed.
 fn emit_word_with_braces(
     tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,

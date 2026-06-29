@@ -765,10 +765,11 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// A token stream the parser consumes, carrying each token's 1-based source
-/// line in parallel. Replaces `Peekable<vec::IntoIter<Token>>`: same
-/// `peek`/`next`/`len`, plus `current_line()` (the line of the NEXT
-/// token to be returned). Lines are `0` ("unknown") unless built with real lines.
+/// A token stream the parser consumes. Each token carries its own `Span`, so
+/// location travels with the token (no parallel line/offset array). Replaces
+/// `Peekable<vec::IntoIter<Token>>`: same `peek`/`next`/`len`, plus
+/// `current_line()` / `peek_span()` reading the NEXT token's span. `current_line`
+/// is `0` ("unknown") when a token's span line is unset.
 pub struct TokenCursor {
     tokens: Vec<Option<Token>>,
     pos: usize,
