@@ -72,13 +72,13 @@ pub mod util;
 // `huck_syntax::brace_expand::expand(...)` explicitly.
 pub use brace_expand::BraceError;
 pub use command::{
-    parse, parse_with_lines, try_split_assignment, try_split_assignment_ref, AssignTarget,
+    parse, try_split_assignment, try_split_assignment_ref, AssignTarget,
     Assignment, Command, ExecCommand, ParseError, Pipeline, Sequence, SimpleCommand,
 };
 pub use errors::{lex_error_message, parse_error_message};
 pub use generate::{command_to_source, function_to_source};
 pub use lexer::{
-    tokenize, tokenize_with_opts, LexError, LexerOptions, ParamModifier, SubscriptKind, Token,
-    TransformOp, Word, WordPart,
+    tokenize, tokenize_with_opts, LexError, LexerOptions, ParamModifier, Span, SubscriptKind,
+    Token, TokenKind, TransformOp, Word, WordPart,
 };
 pub use util::escape_double_quote_value;

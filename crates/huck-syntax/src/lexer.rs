@@ -50,13 +50,14 @@ pub struct CharCursor<'a> {
     s: &'a str,
     pos: usize,
     line: u32,
+    column: u32,            // NEW: 1-based character column
     peeked: Option<char>,
     peeked_len: usize,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, peeked: None, peeked_len: 0 }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0 }
     }
 
     /// Peek the next char without consuming it.
@@ -82,6 +83,9 @@ impl<'a> CharCursor<'a> {
         self.line
     }
 
+    /// 1-based character column of the next char to be produced.
+    pub fn column(&self) -> u32 { self.column }
+
     /// Byte slice of the source from `start` to the current offset. Used to
     /// reconstruct the raw `${…}` text for a deferred bad-substitution.
     pub fn slice_from(&self, start: usize) -> &str {
@@ -95,11 +99,11 @@ impl Iterator for CharCursor<'_> {
         if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
-            if c == '\n' { self.line += 1; }
+            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
             Some(c)
         } else if let Some(c) = self.s[self.pos..].chars().next() {
             self.pos += c.len_utf8();
-            if c == '\n' { self.line += 1; }
+            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
             Some(c)
         } else {
             None
@@ -322,16 +326,34 @@ pub enum WordPart {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
 
+/// A token's source location. `column` is a 1-based character column
+/// (Unicode scalars from the line start; a tab is one column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub offset: usize,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Span {
+    /// A span at byte `offset`, 1-based source `line`, and 1-based character
+    /// `column`. Built at lex time from the `CharCursor` position of a token's
+    /// first character, so location travels with the token (no sidecar arrays).
+    pub fn new(offset: usize, line: u32, column: u32) -> Span { Span { offset, line, column } }
+    /// Placeholder span for synthesized tokens / test fixtures (line 0 = unknown).
+    pub fn unknown() -> Span { Span { offset: 0, line: 0, column: 0 } }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
-pub enum Token {
+pub enum TokenKind {
     Word(Word),
     Op(Operator),
     Newline,
     /// A complete here-doc with its body already collected. The lexer
     /// builds this in two phases: the `<<DELIM` opener is seen on one
     /// line, the body lines are consumed after the line's `\n`. The
-    /// resulting Token::Heredoc occupies the position where `<<DELIM`
+    /// resulting TokenKind::Heredoc occupies the position where `<<DELIM`
     /// appeared (the delim word itself is not emitted).
     Heredoc { body: Word, expand: bool, strip_tabs: bool },
     /// Raw text inside a `(( ... ))` block (the outer `((` and `))`
@@ -346,12 +368,47 @@ pub enum Token {
     RedirFd(crate::command::RedirFd),
 }
 
+/// A token paired with its source location. Equality and hashing are by `kind`
+/// only — `span` is positional metadata, NOT part of token identity. This keeps
+/// equality-based lexer tests valid (they ignore position) and is the deliberate
+/// design choice for v237.
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: Span,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, span: Span) -> Token { Token { kind, span } }
+    pub fn kind(&self) -> &TokenKind { &self.kind }
+}
+
+impl From<TokenKind> for Token {
+    /// Wrap a kind with a placeholder span (line 0 = unknown). Used by test
+    /// fixtures and synthesized tokens; real lexer output carries true spans.
+    fn from(kind: TokenKind) -> Token { Token { kind, span: Span::unknown() } }
+}
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool { self.kind == other.kind }
+}
+impl Eq for Token {}
+
+#[cfg(test)]
+impl PartialEq<TokenKind> for Token {
+    fn eq(&self, other: &TokenKind) -> bool { &self.kind == other }
+}
+#[cfg(test)]
+impl PartialEq<Token> for TokenKind {
+    fn eq(&self, other: &Token) -> bool { self == &other.kind }
+}
+
 /// State for a heredoc whose body hasn't been collected yet.
 struct PendingHeredoc {
     delim: String,
     expand: bool,
     strip_tabs: bool,
-    /// Index into `tokens` of the `Token::Heredoc` placeholder to patch.
+    /// Index into `tokens` of the `TokenKind::Heredoc` placeholder to patch.
     token_idx: usize,
 }
 
@@ -373,50 +430,23 @@ impl LexerOptions {
     }
 }
 
-/// Raw output of the partial tokenizer: `tokens`, parallel byte `offsets` and
-/// 1-based `lines` (with a trailing sentinel), and an optional trailing lex
-/// error + the byte offset where lexing failed.
-type PartialTokens = (Vec<Token>, Vec<usize>, Vec<u32>, Option<(LexError, usize)>);
-/// Successful tokenization with positions: `tokens` plus parallel `offsets` and
-/// `lines`. See [`tokenize_with_offsets`].
-type TokensWithPos = (Vec<Token>, Vec<usize>, Vec<u32>);
+/// Raw output of the partial tokenizer: the spanned `tokens` (each carrying its
+/// own start `Span`) and an optional trailing lex error + the byte offset where
+/// lexing failed.
+type PartialTokens = (Vec<Token>, Option<(LexError, usize)>);
 
 /// Back-compat entry: lexes with all options off (current behavior).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     tokenize_with_opts(input, LexerOptions::default())
 }
 
-/// Tokenize, returning each token's start byte offset (and a trailing sentinel
-/// `offsets[tokens.len()] == input.len()`), and the per-token 1-based source
-/// line numbers (same length as `offsets`). On error, returns the LexError and
-/// the byte offset where lexing failed.
-// Retained as a thin `Result`-returning wrapper over `tokenize_partial` and
-// exercised by the offset unit tests; the source reader now calls
-// `tokenize_partial` directly, so it is otherwise unused in non-test builds.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn tokenize_with_offsets(
-    input: &str,
-    opts: LexerOptions,
-) -> Result<TokensWithPos, (LexError, usize)> {
-    match tokenize_partial(input, opts) {
-        (tokens, offsets, lines, None) => Ok((tokens, offsets, lines)),
-        (_, _, _, Some((e, off))) => Err((e, off)),
-    }
-}
-
 pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
     match tokenize_partial(input, opts) {
-        (tokens, _offsets, _lines, None) => Ok(tokens),
-        (_, _, _, Some((e, _off))) => Err(e),
+        (tokens, None) => Ok(tokens),
+        (_, Some((e, _off))) => Err(e),
     }
 }
 
-/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
-/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
-/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
-/// trailing offset is `input.len()` on success, or the error byte offset on
-/// failure. This lets the source reader execute the complete units that lexed
-/// before the failure and re-lex the truncated trailing unit.
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
 /// expanded into multiple Words (`true` for normal command words) or left as
 /// literal text in a single Word (`false` for array-literal elements, which are
@@ -427,8 +457,8 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
 /// fd-prefix glued to a following redirect operator. Returns `None` for any
 /// other shape (e.g. `file2`, `{}`, `{1bad}`), leaving the Word intact as a
 /// normal argument.
-fn fd_prefix_of(token: Option<&Token>) -> Option<crate::command::RedirFd> {
-    let Some(Token::Word(w)) = token else { return None };
+fn fd_prefix_of(token: Option<&TokenKind>) -> Option<crate::command::RedirFd> {
+    let Some(TokenKind::Word(w)) = token else { return None };
     let text = crate::command::word_literal_text(w)?;
     if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
         text.parse::<u16>().ok().map(crate::command::RedirFd::Number)
@@ -452,27 +482,19 @@ fn tokenize_partial_inner(
     brace_expand: bool,
 ) -> PartialTokens {
     let mut tokens: Vec<Token> = Vec::new();
-    let mut offsets: Vec<usize> = Vec::new();
-    let mut lines: Vec<u32> = Vec::new();
-    // Lockstep push: always push offset and line together so they can never diverge.
-    macro_rules! push_pos {
-        ($off:expr, $ln:expr) => {{ offsets.push($off); lines.push($ln); }};
-    }
     // When `$glued` (no whitespace between the just-flushed Word and the
     // redirect operator about to be pushed), and that trailing Word is a pure
-    // digit-run or `{ident}`, replace it with a `Token::RedirFd` occupying the
-    // same offset/line. Keeps `offsets`/`lines` parallel to `tokens`. Must be
+    // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
+    // same span. Must be
     // invoked AFTER the preceding word has been flushed and BEFORE the operator
     // token is pushed.
     macro_rules! take_fd_prefix {
         ($glued:expr) => {{
             if $glued {
-                if let Some(fd) = fd_prefix_of(tokens.last()) {
-                    tokens.pop();
-                    let off = offsets.pop().expect("offset parallel to token");
-                    let ln = lines.pop().expect("line parallel to token");
-                    tokens.push(Token::RedirFd(fd));
-                    push_pos!(off, ln);
+                if let Some(fd) = fd_prefix_of(tokens.last().map(|t| &t.kind)) {
+                    // Replace the digit/`{n}` word with a RedirFd at the SAME span.
+                    let span = tokens.pop().expect("fd-prefix word present").span;
+                    tokens.push(Token::new(TokenKind::RedirFd(fd), span));
                 }
             }
         }};
@@ -482,6 +504,7 @@ fn tokenize_partial_inner(
     let mut has_token = false;
     let mut token_start: usize = 0;
     let mut token_start_line: u32 = 1;
+    let mut token_start_col: u32 = 1;
     let mut in_assignment_value = false;
     // `[[ … ]]` context tracking for the `=~` regex operand. `dbracket_depth`
     // counts open `[[`; `expect_regex` is armed right after an `=~` keyword
@@ -509,9 +532,9 @@ fn tokenize_partial_inner(
                     // emit_word_with_braces) so no brace expansion applies.
                     let operand_start = chars.offset();
                     let operand_line = chars.line();
+                    let operand_col = chars.column();
                     let parts = scan_regex_operand(&mut chars, opts)?;
-                    tokens.push(Token::Word(Word(parts)));
-                    push_pos!(operand_start, operand_line);
+                    tokens.push(Token::new(TokenKind::Word(Word(parts)), Span::new(operand_start, operand_line, operand_col)));
                     has_token = false;
                     continue;
                 }
@@ -521,6 +544,7 @@ fn tokenize_partial_inner(
         }
         let c_off = chars.offset();
         let c_line = chars.line();
+        let c_col = chars.column();
         let c = match chars.next() {
             Some(c) => c,
             None => break,
@@ -533,8 +557,7 @@ fn tokenize_partial_inner(
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
                 let kw = single_unquoted_literal(&parts).map(str::to_owned);
-                let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                for _ in 0..n { push_pos!(token_start, token_start_line); }
+                emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                 match kw.as_deref() {
                     Some("[[") => dbracket_depth += 1,
                     Some("]]") => dbracket_depth = dbracket_depth.saturating_sub(1),
@@ -550,8 +573,7 @@ fn tokenize_partial_inner(
                 if !pending_heredocs.is_empty() {
                     collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens, opts)?;
                 }
-                tokens.push(Token::Newline);
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
             }
             continue;
         }
@@ -564,6 +586,7 @@ fn tokenize_partial_inner(
         if !has_token {
             token_start = c_off;
             token_start_line = c_line;
+            token_start_col = c_col;
         }
 
         // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
@@ -698,66 +721,57 @@ fn tokenize_partial_inner(
             '|' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::Or));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::Or), Span::new(c_off, c_line, c_col)));
                 } else if chars.peek() == Some(&'&') {
                     // `|&` is bash shorthand for `2>&1 |`: merge the left command's
                     // stderr into the pipe, then pipe. Desugar at the token level so
                     // the existing pipeline/redirect machinery (incl. v176
                     // compound-stage redirects) handles it unchanged.
                     chars.next(); // consume the '&' of `|&`
-                    tokens.push(Token::RedirFd(crate::command::RedirFd::Number(2)));
-                    push_pos!(c_off, c_line);
-                    tokens.push(Token::Op(Operator::DupOut));
-                    push_pos!(c_off, c_line);
-                    tokens.push(Token::Word(Word(vec![WordPart::Literal {
+                    tokens.push(Token::new(TokenKind::RedirFd(crate::command::RedirFd::Number(2)), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Word(Word(vec![WordPart::Literal {
                         text: "1".to_string(),
                         quoted: false,
-                    }])));
-                    push_pos!(c_off, c_line);
-                    tokens.push(Token::Op(Operator::Pipe));
-                    push_pos!(c_off, c_line);
+                    }])), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
                 } else {
-                    tokens.push(Token::Op(Operator::Pipe));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
                 }
                 in_assignment_value = false;
             }
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::And));
+                    tokens.push(Token::from(TokenKind::Op(Operator::And)));
                 } else if chars.peek() == Some(&'>') {
                     chars.next();
                     if chars.peek() == Some(&'>') {
                         chars.next();
-                        tokens.push(Token::Op(Operator::AndRedirAppend));
+                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirAppend)));
                     } else {
-                        tokens.push(Token::Op(Operator::AndRedirOut));
+                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirOut)));
                     }
                 } else {
-                    tokens.push(Token::Op(Operator::Background));
+                    tokens.push(Token::from(TokenKind::Op(Operator::Background)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 let op = if chars.peek() == Some(&';') {
@@ -774,15 +788,13 @@ fn tokenize_partial_inner(
                 } else {
                     Operator::Semi
                 };
-                tokens.push(Token::Op(op));
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Op(op), Span::new(c_off, c_line, c_col)));
                 in_assignment_value = false;
             }
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 // Detect `((` (contiguous, no whitespace). The peek/next
@@ -802,27 +814,25 @@ fn tokenize_partial_inner(
                     let saved = chars.clone();
                     chars.next(); // consume the second `(`
                     match scan_arith_block(&mut chars) {
-                        Ok(body) => tokens.push(Token::ArithBlock(body, opts)),
+                        Ok(body) => tokens.push(Token::from(TokenKind::ArithBlock(body, opts))),
                         Err(_) => {
                             chars = saved;
-                            tokens.push(Token::Op(Operator::LParen));
+                            tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
                         }
                     }
                 } else {
-                    tokens.push(Token::Op(Operator::LParen));
+                    tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
-                tokens.push(Token::Op(Operator::RParen));
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Op(Operator::RParen), Span::new(c_off, c_line, c_col)));
                 in_assignment_value = false;
             }
             '<' => {
@@ -831,8 +841,7 @@ fn tokenize_partial_inner(
                 let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'<') {
@@ -840,7 +849,7 @@ fn tokenize_partial_inner(
                     if chars.peek() == Some(&'<') {
                         chars.next(); // consume third '<' — here-string
                         take_fd_prefix!(glued);
-                        tokens.push(Token::Op(Operator::HereString));
+                        tokens.push(Token::from(TokenKind::Op(Operator::HereString)));
                     } else {
                         let strip_tabs = if chars.peek() == Some(&'-') {
                             chars.next(); // consume '-'
@@ -853,14 +862,14 @@ fn tokenize_partial_inner(
                         // A glued fd-prefix (`3<<EOF`) becomes a RedirFd token
                         // before the heredoc placeholder.
                         take_fd_prefix!(glued);
-                        // Push a placeholder Token::Heredoc with empty body.
+                        // Push a placeholder TokenKind::Heredoc with empty body.
                         // The body is back-patched after the line's \n.
                         let placeholder_idx = tokens.len();
-                        tokens.push(Token::Heredoc {
+                        tokens.push(Token::from(TokenKind::Heredoc {
                             body: Word(Vec::new()),
                             expand,
                             strip_tabs,
-                        });
+                        }));
                         pending_heredocs.push_back(PendingHeredoc {
                             delim,
                             expand,
@@ -868,7 +877,7 @@ fn tokenize_partial_inner(
                             token_idx: placeholder_idx,
                         });
                     }
-                    push_pos!(c_off, c_line);
+                    if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `<(cmd)` — process substitution. Consume the `(` and scan the
@@ -886,19 +895,16 @@ fn tokenize_partial_inner(
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::DupIn));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupIn), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'>') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::RedirReadWrite));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirReadWrite), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else {
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::RedirIn));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirIn), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 }
             }
@@ -906,27 +912,23 @@ fn tokenize_partial_inner(
                 let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::RedirAppend));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirAppend), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::DupOut));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::RedirClobber));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirClobber), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `>(cmd)` — process substitution. Consume the `(` and scan the
@@ -943,8 +945,7 @@ fn tokenize_partial_inner(
                     in_assignment_value = false;
                 } else {
                     take_fd_prefix!(glued);
-                    tokens.push(Token::Op(Operator::RedirOut));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirOut), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 }
             }
@@ -952,34 +953,34 @@ fn tokenize_partial_inner(
                 chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::RedirAppend));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirAppend)));
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::DupOut));
+                    tokens.push(Token::from(TokenKind::Op(Operator::DupOut)));
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::RedirClobber));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirClobber)));
                 } else {
-                    tokens.push(Token::Op(Operator::RedirOut));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirOut)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             '2' if !has_token && chars.peek() == Some(&'>') => {
                 chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::RedirErrAppend));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrAppend)));
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::DupErr));
+                    tokens.push(Token::from(TokenKind::Op(Operator::DupErr)));
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(Token::Op(Operator::RedirErrClobber));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrClobber)));
                 } else {
-                    tokens.push(Token::Op(Operator::RedirErr));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErr)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
@@ -1125,8 +1126,7 @@ fn tokenize_partial_inner(
 
     if has_token {
         flush_literal(&mut parts, &mut current, false);
-        let n = emit_word_with_braces(&mut tokens, parts, brace_expand)?;
-        for _ in 0..n { push_pos!(token_start, token_start_line); }
+        emit_word_with_braces(&mut tokens, parts, brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
     if !pending_heredocs.is_empty() {
@@ -1136,39 +1136,19 @@ fn tokenize_partial_inner(
     })();
 
     match result {
-        Ok(()) => {
-            push_pos!(input.len(), chars.line()); // sentinel, ONLY on success
-            debug_assert_eq!(
-                offsets.len(),
-                tokens.len() + 1,
-                "offset sidecar must have one entry per token plus a sentinel"
-            );
-            debug_assert_eq!(offsets.len(), lines.len(), "offsets/lines out of lockstep");
-            (tokens, offsets, lines, None)
-        }
-        Err(e) => {
-            // Partial: keep the tokens produced before the error and push the
-            // error byte offset as the trailing sentinel, preserving the
-            // `offsets.len() == tokens.len() + 1` invariant.
-            let off = chars.offset();
-            push_pos!(off, chars.line());
-            debug_assert_eq!(
-                offsets.len(),
-                tokens.len() + 1,
-                "offset sidecar must have one entry per token plus a sentinel"
-            );
-            debug_assert_eq!(offsets.len(), lines.len(), "offsets/lines out of lockstep");
-            (tokens, offsets, lines, Some((e, off)))
-        }
+        Ok(()) => (tokens, None),
+        // Partial: keep the tokens produced before the error; the error byte
+        // offset is returned separately (no longer a trailing sentinel).
+        Err(e) => (tokens, Some((e, chars.offset()))),
     }
 }
 
-/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
-/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
-/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
-/// trailing offset is `input.len()` on success, or the error byte offset on
-/// failure. This lets the source reader execute the complete units that lexed
-/// before the failure and re-lex the truncated trailing unit.
+/// Tokenizes `input`, returning `(tokens, error)`. On a lex error the tokens
+/// produced BEFORE the error are returned alongside `Some((error, byte_offset))`;
+/// on success the second element is `None`. Each token carries its own span, so
+/// there is no separate offsets sidecar — the byte offset of the truncation is
+/// the `byte_offset` in the error tuple. This lets the source reader execute the
+/// complete units that lexed before the failure and re-lex the truncated unit.
 pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
@@ -1181,8 +1161,8 @@ pub fn tokenize_partial(
 /// are preserved as real WordParts).
 fn tokenize_no_brace(input: &str, opts: LexerOptions) -> Result<Vec<Token>, LexError> {
     match tokenize_partial_inner(input, opts, false) {
-        (tokens, _, _, None) => Ok(tokens),
-        (_, _, _, Some((e, _))) => Err(e),
+        (tokens, None) => Ok(tokens),
+        (_, Some((e, _))) => Err(e),
     }
 }
 
@@ -1459,25 +1439,25 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
     out
 }
 
-/// Emits a Word into `tokens`. If the parts contain an unquoted
-/// `{`, runs brace expansion and emits one Word per expansion.
 /// Emits the word for `parts` into `tokens`, expanding any unquoted braces.
-/// Returns the number of tokens pushed (1 normally, or one per brace-expansion
-/// product). Callers that track byte offsets push the word's start offset this
-/// many times to keep the offset sidecar in lockstep with the token stream.
+/// Every emitted Word (1 normally, or one per brace-expansion product) is built
+/// with `span` — the source span of the word's first character — so each token
+/// carries its own location. Returns the number of tokens pushed.
 fn emit_word_with_braces(
     tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,
     brace_expand: bool,
+    span: Span,
 ) -> Result<usize, LexError> {
     if !brace_expand {
-        tokens.push(Token::Word(Word(parts)));
+        tokens.push(Token::new(TokenKind::Word(Word(parts)), span));
         return Ok(1);
     }
     let products = brace_expand_parts(parts)?;
     let count = products.len();
     for p in products {
-        tokens.push(Token::Word(Word(p)));
+        // Every brace-expansion product shares the source word's start span.
+        tokens.push(Token::new(TokenKind::Word(Word(p)), span));
     }
     Ok(count)
 }
@@ -1566,7 +1546,7 @@ fn parse_heredoc_delim(
 
 /// Collects bodies for all pending heredocs in queue order.
 /// After each heredoc's body is collected, it is patched back into the
-/// placeholder `Token::Heredoc` at `token_idx`.
+/// placeholder `TokenKind::Heredoc` at `token_idx`.
 fn collect_heredoc_bodies(
     chars: &mut CharCursor<'_>,
     pending: &mut std::collections::VecDeque<PendingHeredoc>,
@@ -1575,12 +1555,14 @@ fn collect_heredoc_bodies(
 ) -> Result<(), LexError> {
     while let Some(ph) = pending.pop_front() {
         let body = collect_one_heredoc_body(chars, &ph, opts)?;
-        if let Some(Token::Heredoc { body: slot, expand, strip_tabs }) = tokens.get_mut(ph.token_idx) {
+        if let Some(TokenKind::Heredoc { body: slot, expand, strip_tabs }) =
+            tokens.get_mut(ph.token_idx).map(|t| &mut t.kind)
+        {
             *slot = body;
             *expand = ph.expand;
             *strip_tabs = ph.strip_tabs;
         } else {
-            unreachable!("placeholder token at index was not Token::Heredoc");
+            unreachable!("placeholder token at index was not TokenKind::Heredoc");
         }
     }
     Ok(())
@@ -2800,7 +2782,12 @@ fn scan_paren_substitution(
 /// substitution-context `LexError` variants. Empty bodies (whitespace only)
 /// produce an empty `Sequence`.
 fn parse_substitution_body(body: &str, opts: LexerOptions) -> Result<crate::command::Sequence, LexError> {
-    let tokens = tokenize_with_opts(body, opts).map_err(|e| LexError::Substitution(Box::new(e)))?;
+    let mut tokens = tokenize_with_opts(body, opts).map_err(|e| LexError::Substitution(Box::new(e)))?;
+    // A command-substitution body is parsed in isolation; its token lines are
+    // body-relative, not script-relative. Keep inner commands' `line` at 0
+    // ("unknown"), matching pre-span behavior (script-relative $LINENO inside
+    // `$( )` would need offset propagation, out of scope here).
+    for t in &mut tokens { t.span.line = 0; }
     let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
 }
@@ -3212,7 +3199,7 @@ fn parse_subscript_body(src: &str, opts: LexerOptions) -> Result<Word, LexError>
     let toks = tokenize_with_opts(src, opts)?;
     let mut words: Vec<Word> = Vec::new();
     for t in toks {
-        if let Token::Word(w) = t {
+        if let TokenKind::Word(w) = t.kind {
             words.push(w);
         }
     }
@@ -3443,7 +3430,7 @@ fn scan_array_element_word(
     let toks = tokenize_no_brace(&buf, opts)?;
     let mut words: Vec<Word> = Vec::new();
     for t in toks {
-        if let Token::Word(w) = t {
+        if let TokenKind::Word(w) = t.kind {
             words.push(w);
         }
     }
@@ -4091,6 +4078,25 @@ mod tests {
     use crate::command::RedirFd;
 
     #[test]
+    fn char_cursor_tracks_offset_line_column() {
+        let mut c = CharCursor::new("ab\ncé\td");
+        // before consuming: at 'a'
+        assert_eq!((c.offset(), c.line(), c.column()), (0, 1, 1));
+        c.next();                       // consume 'a'
+        assert_eq!((c.offset(), c.line(), c.column()), (1, 1, 2)); // at 'b'
+        c.next();                       // consume 'b'
+        assert_eq!((c.offset(), c.line(), c.column()), (2, 1, 3)); // at '\n'
+        c.next();                       // consume '\n' -> next line, col resets
+        assert_eq!((c.offset(), c.line(), c.column()), (3, 2, 1)); // at 'c'
+        c.next();                       // consume 'c'
+        assert_eq!((c.offset(), c.line(), c.column()), (4, 2, 2)); // at 'é' (2 bytes)
+        c.next();                       // consume 'é' -> offset +2, column +1
+        assert_eq!((c.offset(), c.line(), c.column()), (6, 2, 3)); // at '\t'
+        c.next();                       // consume tab -> one column
+        assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
+    }
+
+    #[test]
     fn split_modifier_operand_basic_split() {
         assert_eq!(split_modifier_operand("a/b", '/'), ("a".into(), Some("b".into())));
         assert_eq!(split_modifier_operand("a", '/'), ("a".into(), None));
@@ -4156,9 +4162,9 @@ mod tests {
         assert_eq!(split_modifier_operand("${x:-y}", ':'), ("${x:-y}".into(), None));
     }
 
-    /// True iff `tokens` contains at least one `Token::RedirFd`.
+    /// True iff `tokens` contains at least one `TokenKind::RedirFd`.
     fn has_redir_fd(tokens: &[Token]) -> bool {
-        tokens.iter().any(|t| matches!(t, Token::RedirFd(_)))
+        tokens.iter().any(|t| matches!(t.kind, TokenKind::RedirFd(_)))
     }
 
     #[test]
@@ -4169,13 +4175,13 @@ mod tests {
         // Use an fd with no dedicated scanner (`3>`) to exercise take_fd_prefix.
         let toks = tokenize("echo 3>file").unwrap();
         assert!(
-            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(3)))),
+            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(3)))),
             "expected RedirFd(Number(3)) in {toks:?}"
         );
         // And `echo 12>file` → fd 12.
         let toks = tokenize("echo 12>file").unwrap();
         assert!(
-            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(12)))),
+            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(12)))),
             "expected RedirFd(Number(12)) in {toks:?}"
         );
     }
@@ -4188,7 +4194,7 @@ mod tests {
         assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
         // The `3` survives as a Word arg.
         assert!(
-            toks.iter().any(|t| matches!(t, Token::Word(w) if crate::command::word_literal_text(w) == Some("3"))),
+            toks.iter().any(|t| matches!(&t.kind, TokenKind::Word(w) if crate::command::word_literal_text(w) == Some("3"))),
             "expected Word(\"3\") arg in {toks:?}"
         );
     }
@@ -4199,7 +4205,7 @@ mod tests {
         let toks = tokenize("file2>x").unwrap();
         assert!(!has_redir_fd(&toks), "unexpected RedirFd in {toks:?}");
         assert!(
-            toks.iter().any(|t| matches!(t, Token::Word(w) if crate::command::word_literal_text(w) == Some("file2"))),
+            toks.iter().any(|t| matches!(&t.kind, TokenKind::Word(w) if crate::command::word_literal_text(w) == Some("file2"))),
             "expected Word(\"file2\") in {toks:?}"
         );
     }
@@ -4209,7 +4215,7 @@ mod tests {
         // `exec {fd}>log`: `{fd}` glued to `>` → RedirFd::Var("fd").
         let toks = tokenize("exec {fd}>log").unwrap();
         assert!(
-            toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Var(name)) if name == "fd")),
+            toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Var(name)) if name == "fd")),
             "expected RedirFd(Var(\"fd\")) in {toks:?}"
         );
     }
@@ -4217,10 +4223,10 @@ mod tests {
     #[test]
     fn lexer_readwrite_and_dupin_operators() {
         let toks = tokenize("cmd <>f").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirReadWrite))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirReadWrite))));
         let toks = tokenize("cmd 3<&0").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::RedirFd(RedirFd::Number(3)))));
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::DupIn))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::RedirFd(RedirFd::Number(3)))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::DupIn))));
     }
 
     #[test]
@@ -4246,11 +4252,11 @@ mod tests {
 
     /// Builds a Token that holds a single-Literal Word.
     fn w(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+        TokenKind::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])).into()
     }
 
     fn word_text(t: &Token) -> Option<String> {
-        if let Token::Word(Word(parts)) = t
+        if let TokenKind::Word(Word(parts)) = &t.kind
             && parts.len() == 1
             && let WordPart::Literal { text, quoted: false } = &parts[0]
         {
@@ -4264,7 +4270,7 @@ mod tests {
         let opts = LexerOptions { extglob: true, ..Default::default() };
         let toks = tokenize_with_opts("echo $(echo !(x))", opts).unwrap();
         assert!(toks.iter().any(|t| matches!(
-            t, Token::Word(Word(parts)) if parts.iter().any(|p| matches!(p, WordPart::CommandSub { .. }))
+            &t.kind, TokenKind::Word(Word(parts)) if parts.iter().any(|p| matches!(p, WordPart::CommandSub { .. }))
         )));
     }
 
@@ -4299,7 +4305,7 @@ mod tests {
         let toks = tokenize("[[ x =~ (a) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "x", "=~", "(a)", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen) | Token::ArithBlock(..))));
+        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen) | TokenKind::ArithBlock(..))));
     }
 
     #[test]
@@ -4307,7 +4313,7 @@ mod tests {
         let toks = tokenize("[[ ab =~ ((a)) ]]").unwrap();
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert_eq!(texts, vec!["[[", "ab", "=~", "((a))", "]]"]);
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
+        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
     }
 
     #[test]
@@ -4316,7 +4322,7 @@ mod tests {
         let texts: Vec<_> = toks.iter().filter_map(word_text).collect();
         assert!(texts.iter().any(|t| t.starts_with("(\\[")));
         assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
+        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
     }
 
     #[test]
@@ -4335,7 +4341,7 @@ mod tests {
         // the regex operand is the single word `(a|b)c`, then `]]`.
         assert!(texts.contains(&"(a|b)c".to_string()), "texts: {texts:?}");
         assert!(texts.contains(&"]]".to_string()));
-        assert!(!toks.iter().any(|t| matches!(t, Token::ArithBlock(..) | Token::Op(Operator::LParen))));
+        assert!(!toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..) | TokenKind::Op(Operator::LParen))));
     }
 
     #[test]
@@ -4368,14 +4374,14 @@ mod tests {
     #[test]
     fn grouping_paren_outside_regex_still_op() {
         let toks = tokenize("[[ ( -n a ) ]]").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::LParen))));
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RParen))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RParen))));
     }
 
     #[test]
     fn arith_block_outside_dbracket_unchanged() {
         let toks = tokenize("(( 1 + 1 ))").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::ArithBlock(..))));
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))));
     }
 
     #[test]
@@ -4402,71 +4408,58 @@ mod tests {
     }
 
     #[test]
-    fn offsets_align_with_token_starts() {
-        // "echo hi\nls" -> Word(echo)@0 Word(hi)@5 Newline@7 Word(ls)@8, sentinel@10
-        let (toks, offs, _lns) = tokenize_with_offsets("echo hi\nls", LexerOptions::default()).unwrap();
-        assert_eq!(offs.len(), toks.len() + 1);
-        assert_eq!(offs[toks.len()], 10); // sentinel = input.len()
-        assert_eq!(offs[0], 0);
-        let nl = toks.iter().position(|t| matches!(t, Token::Newline)).unwrap();
-        assert_eq!(offs[nl], 7);
-        assert_eq!(offs[nl + 1], 8);
+    fn span_offsets_align_with_token_starts() {
+        // "echo hi\nls" -> Word(echo)@0 Word(hi)@5 Newline@7 Word(ls)@8
+        let toks = tokenize("echo hi\nls").unwrap();
+        assert_eq!(toks[0].span.offset, 0);
+        let nl = toks.iter().position(|t| matches!(&t.kind, TokenKind::Newline)).unwrap();
+        assert_eq!(toks[nl].span.offset, 7);
+        assert_eq!(toks[nl + 1].span.offset, 8);
     }
 
-    /// Each token's recorded offset must point at the byte where that token's
-    /// source actually begins (verified by re-deriving the offset from a
-    /// distinctive first character). Guards offset *correctness*, not just the
-    /// lockstep length invariant.
+    /// Each token's recorded span offset must point at the byte where that
+    /// token's source actually begins (verified by re-deriving from a
+    /// distinctive first character).
     #[test]
-    fn offsets_point_at_real_token_starts() {
+    fn span_offsets_point_at_real_token_starts() {
         // Leading whitespace before the first word; operators; a quoted word.
         //          0123456789012345678901
         let src = "  echo a && ls 'x y'\n";
-        let (toks, offs, _lns) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
-        assert_eq!(offs.len(), toks.len() + 1);
+        let toks = tokenize_with_opts(src, LexerOptions::default()).unwrap();
         // First word "echo" starts at byte 2 (after two spaces).
-        assert_eq!(offs[0], 2);
+        assert_eq!(toks[0].span.offset, 2);
         // The `&&` operator starts at byte 9.
-        let and = toks.iter().position(|t| matches!(t, Token::Op(Operator::And))).unwrap();
-        assert_eq!(offs[and], 9);
-        assert_eq!(&src[offs[and]..offs[and] + 2], "&&");
-        // The quoted word 'x y' starts at byte 15 (the opening quote).
-        assert_eq!(&src[offs[toks.len() - 2]..offs[toks.len() - 2] + 1], "'");
-        // Trailing Newline at byte 20; sentinel at 21.
-        assert_eq!(offs[toks.len() - 1], 20);
-        assert_eq!(offs[toks.len()], 21);
+        let and = toks.iter().position(|t| matches!(&t.kind, TokenKind::Op(Operator::And))).unwrap();
+        assert_eq!(toks[and].span.offset, 9);
+        assert_eq!(&src[toks[and].span.offset..toks[and].span.offset + 2], "&&");
+        // The quoted word 'x y' is the second-to-last token (before trailing Newline).
+        let q = toks.len() - 2;
+        assert_eq!(&src[toks[q].span.offset..toks[q].span.offset + 1], "'");
+        // Trailing Newline at byte 20.
+        assert_eq!(toks.last().unwrap().span.offset, 20);
         // Offsets are non-decreasing and in range.
-        for w in offs.windows(2) {
-            assert!(w[0] <= w[1]);
+        for w in toks.windows(2) {
+            assert!(w[0].span.offset <= w[1].span.offset);
         }
-        assert!(offs.iter().all(|&o| o <= src.len()));
+        assert!(toks.iter().all(|t| t.span.offset <= src.len()));
     }
 
-    /// Offsets across multiple physical lines map to the right line when the
-    /// reader counts newlines up to an offset (the v94 line-number mechanism).
+    /// A token's span carries its 1-based source line directly (the line-lookup
+    /// the reader used to compute by counting newlines up to an offset).
     #[test]
-    fn offsets_support_line_lookup() {
+    fn span_carries_source_line() {
         let src = "echo a\necho b\nbad)\n";
-        let (toks, offs, _lns) = tokenize_with_offsets(src, LexerOptions::default()).unwrap();
-        // The `)` operator is on line 3; line = 1 + newlines before its offset.
-        let rp = toks.iter().position(|t| matches!(t, Token::Op(Operator::RParen))).unwrap();
-        let line = 1 + src.as_bytes()[..offs[rp]].iter().filter(|&&b| b == b'\n').count();
-        assert_eq!(line, 3);
+        let toks = tokenize(src).unwrap();
+        // The `)` operator is on line 3.
+        let rp = toks.iter().position(|t| matches!(&t.kind, TokenKind::Op(Operator::RParen))).unwrap();
+        assert_eq!(toks[rp].span.line, 3);
     }
 
     #[test]
-    fn offsets_error_returns_failure_position() {
-        let err = tokenize_with_offsets("echo 'oops", LexerOptions::default());
-        assert!(err.is_err());
-        let (_e, off) = err.unwrap_err();
+    fn partial_error_returns_failure_position() {
+        let (_toks, err) = tokenize_partial("echo 'oops", LexerOptions::default());
+        let (_e, off) = err.expect("unterminated quote should error");
         assert!(off >= 5, "failure offset {off} should be at/after the open quote");
-    }
-
-    #[test]
-    fn tokenize_with_opts_output_unchanged() {
-        let a = tokenize_with_opts("if true; then echo hi; fi", LexerOptions::default()).unwrap();
-        let (b, _o, _l) = tokenize_with_offsets("if true; then echo hi; fi", LexerOptions::default()).unwrap();
-        assert_eq!(a, b);
     }
 
     #[test]
@@ -4484,7 +4477,29 @@ mod tests {
     fn extglob_word_recognized_when_enabled() {
         let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
         assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
-        assert!(matches!(&toks[0], Token::Word(_)));
+        assert!(matches!(&toks[0].kind, TokenKind::Word(_)));
+    }
+
+    #[test]
+    fn span_columns_are_1based_char_columns_reset_per_line() {
+        // 1-based CHARACTER columns (Unicode scalars; tab counts as 1) captured at
+        // each token's first char, reset to 1 after a newline. Built at lex time
+        // from the CharCursor — no offsets/lines sidecar, no zip pass.
+        //          col: 1234567 8 12345
+        let src = "echo  hi\nαβ x";
+        let toks = tokenize(src).unwrap();
+        // "echo" starts at column 1.
+        assert_eq!(toks[0].span.column, 1);
+        // "hi" follows two spaces after "echo " -> column 7.
+        assert_eq!(toks[1].span.column, 7);
+        // Newline itself sits at column 9 (after "echo  hi").
+        let nl = toks.iter().position(|t| matches!(&t.kind, TokenKind::Newline)).unwrap();
+        assert_eq!(toks[nl].span.column, 9);
+        // After the newline, "αβ" starts at column 1 (two scalars, not bytes).
+        assert_eq!(toks[nl + 1].span.column, 1);
+        // "x" is one scalar ('α','β') + one space past column 1 -> column 4.
+        assert_eq!(toks[nl + 2].span.column, 4);
+        assert_eq!(toks[nl + 2].span.line, 2);
     }
 
     #[test]
@@ -4508,7 +4523,7 @@ mod tests {
         // inside the group has to survive as a Param part so it expands.
         let toks = tokenize_with_opts("+($x)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
         assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
-        let Token::Word(Word(parts)) = &toks[0] else {
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else {
             panic!("expected a Word token, got {:?}", toks[0]);
         };
         assert!(parts.len() > 1, "group should not be one flat literal: {parts:?}");
@@ -4521,25 +4536,25 @@ mod tests {
     /// Builds a Token that holds a single quoted-Literal Word.
     /// A single-quoted word: `'s'` → `Quoted{Single, [Literal{s, true}]}`.
     fn wq(s: &str) -> Token {
-        Token::Word(Word(vec![qsingle(s)]))
+        TokenKind::Word(Word(vec![qsingle(s)])).into()
     }
     /// A double-quoted word with a single literal body: `"s"`.
     fn wqd(s: &str) -> Token {
-        Token::Word(Word(vec![qdouble(vec![WordPart::Literal {
+        TokenKind::Word(Word(vec![qdouble(vec![WordPart::Literal {
             text: s.to_string(),
             quoted: true,
-        }])]))
+        }])])).into()
     }
     /// A backslash-escaped single char as a word: `\s`.
     fn wqb(s: &str) -> Token {
-        Token::Word(Word(vec![qbackslash(s)]))
+        TokenKind::Word(Word(vec![qbackslash(s)])).into()
     }
     /// An ANSI-C quoted word: `$'s'` (s already decoded).
     fn wqa(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Quoted {
+        TokenKind::Word(Word(vec![WordPart::Quoted {
             style: QuoteStyle::AnsiC,
             parts: vec![WordPart::Literal { text: s.to_string(), quoted: true }],
-        }]))
+        }])).into()
     }
     /// A single-quote run as a `WordPart`.
     fn qsingle(s: &str) -> WordPart {
@@ -4579,8 +4594,8 @@ mod tests {
     /// Pops the first token from `tokens`, asserts it's a single-part Word,
     /// and returns that `WordPart`.
     fn single_param_expansion(tokens: &mut Vec<Token>) -> WordPart {
-        let word = match tokens.remove(0) {
-            Token::Word(w) => w,
+        let word = match tokens.remove(0).kind {
+            TokenKind::Word(w) => w,
             other => panic!("expected Word, got {:?}", other),
         };
         let part = word.0.into_iter().next().expect("non-empty word");
@@ -4630,7 +4645,7 @@ mod tests {
     fn tokenize_comment_to_newline() {
         assert_eq!(
             tokenize("# comment\necho hi").unwrap(),
-            vec![Token::Newline, w("echo"), w("hi")]
+            vec![TokenKind::Newline.into(), w("echo"), w("hi")]
         );
     }
 
@@ -4646,7 +4661,7 @@ mod tests {
     fn tokenize_trailing_comment_then_next_line() {
         assert_eq!(
             tokenize("echo a # comment\necho b").unwrap(),
-            vec![w("echo"), w("a"), Token::Newline, w("echo"), w("b")]
+            vec![w("echo"), w("a"), TokenKind::Newline.into(), w("echo"), w("b")]
         );
     }
 
@@ -4663,7 +4678,7 @@ mod tests {
     fn tokenize_hash_after_semicolon_is_comment() {
         assert_eq!(
             tokenize("echo a; # comment").unwrap(),
-            vec![w("echo"), w("a"), Token::Op(Operator::Semi)]
+            vec![w("echo"), w("a"), TokenKind::Op(Operator::Semi).into()]
         );
     }
 
@@ -4739,10 +4754,10 @@ mod tests {
         // `\#` at word start: backslash escape, # is literal
         assert_eq!(
             tokenize(r"echo \#hash").unwrap(),
-            vec![w("echo"), Token::Word(Word(vec![
+            vec![w("echo"), TokenKind::Word(Word(vec![
                 qbackslash("#"),
                 WordPart::Literal { text: "hash".to_string(), quoted: false },
-            ]))]
+            ])).into()]
         );
     }
 
@@ -4778,11 +4793,11 @@ mod tests {
             tokenize(r"echo a\ b").unwrap(),
             vec![
                 w("echo"),
-                Token::Word(Word(vec![
+                TokenKind::Word(Word(vec![
                     WordPart::Literal { text: "a".to_string(), quoted: false },
                     qbackslash(" "),
                     WordPart::Literal { text: "b".to_string(), quoted: false },
-                ])),
+                ])).into(),
             ]
         );
     }
@@ -4795,7 +4810,7 @@ mod tests {
     #[test]
     fn backslash_escaped_metachar_is_quoted_literal() {
         let tokens = tokenize("\\*").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts, &[qbackslash("*")]);
     }
 
@@ -4803,7 +4818,7 @@ mod tests {
     fn backslash_in_middle_of_word_flushes_and_quotes() {
         // `foo\*bar` → unquoted "foo", quoted "*", unquoted "bar"
         let tokens = tokenize("foo\\*bar").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts, &[
             WordPart::Literal { text: "foo".to_string(), quoted: false },
             qbackslash("*"),
@@ -4817,7 +4832,7 @@ mod tests {
         // parts, the unquoted `foo` and the quoted `bar baz`.
         assert_eq!(
             tokenize(r#"foo"bar baz""#).unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "foo".to_string(), quoted: false },
                 qdouble(vec![WordPart::Literal { text: "bar baz".to_string(), quoted: true }]),
             ]))]
@@ -4854,7 +4869,7 @@ mod tests {
     fn tokenize_pipe_with_spaces() {
         assert_eq!(
             tokenize("a | b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Pipe), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Pipe).into(), w("b")]
         );
     }
 
@@ -4862,7 +4877,7 @@ mod tests {
     fn tokenize_pipe_without_spaces() {
         assert_eq!(
             tokenize("a|b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Pipe), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Pipe).into(), w("b")]
         );
     }
 
@@ -4874,10 +4889,10 @@ mod tests {
             toks,
             vec![
                 w("a"),
-                Token::RedirFd(crate::command::RedirFd::Number(2)),
-                Token::Op(Operator::DupOut),
+                TokenKind::RedirFd(crate::command::RedirFd::Number(2)).into(),
+                TokenKind::Op(Operator::DupOut).into(),
                 w("1"),
-                Token::Op(Operator::Pipe),
+                TokenKind::Op(Operator::Pipe).into(),
                 w("b"),
             ]
         );
@@ -4887,7 +4902,7 @@ mod tests {
     fn tokenize_redirect_out() {
         assert_eq!(
             tokenize("ls > f").unwrap(),
-            vec![w("ls"), Token::Op(Operator::RedirOut), w("f")]
+            vec![w("ls"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
         );
     }
 
@@ -4895,7 +4910,7 @@ mod tests {
     fn tokenize_redirect_out_without_spaces() {
         assert_eq!(
             tokenize("ls>f").unwrap(),
-            vec![w("ls"), Token::Op(Operator::RedirOut), w("f")]
+            vec![w("ls"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
         );
     }
 
@@ -4903,7 +4918,7 @@ mod tests {
     fn tokenize_redirect_append() {
         assert_eq!(
             tokenize("ls >> f").unwrap(),
-            vec![w("ls"), Token::Op(Operator::RedirAppend), w("f")]
+            vec![w("ls"), TokenKind::Op(Operator::RedirAppend).into(), w("f")]
         );
     }
 
@@ -4911,7 +4926,7 @@ mod tests {
     fn tokenize_redirect_in() {
         assert_eq!(
             tokenize("cat < f").unwrap(),
-            vec![w("cat"), Token::Op(Operator::RedirIn), w("f")]
+            vec![w("cat"), TokenKind::Op(Operator::RedirIn).into(), w("f")]
         );
     }
 
@@ -4919,7 +4934,7 @@ mod tests {
     fn tokenize_redirect_stderr() {
         assert_eq!(
             tokenize("cmd 2> f").unwrap(),
-            vec![w("cmd"), Token::Op(Operator::RedirErr), w("f")]
+            vec![w("cmd"), TokenKind::Op(Operator::RedirErr).into(), w("f")]
         );
     }
 
@@ -4927,7 +4942,7 @@ mod tests {
     fn tokenize_redirect_stderr_append() {
         assert_eq!(
             tokenize("cmd 2>> f").unwrap(),
-            vec![w("cmd"), Token::Op(Operator::RedirErrAppend), w("f")]
+            vec![w("cmd"), TokenKind::Op(Operator::RedirErrAppend).into(), w("f")]
         );
     }
 
@@ -4935,7 +4950,7 @@ mod tests {
     fn tokenize_two_in_word_is_not_stderr_operator() {
         assert_eq!(
             tokenize("x2>f").unwrap(),
-            vec![w("x2"), Token::Op(Operator::RedirOut), w("f")]
+            vec![w("x2"), TokenKind::Op(Operator::RedirOut).into(), w("f")]
         );
     }
 
@@ -4967,11 +4982,11 @@ mod tests {
             tokenize("a < in | b > out").unwrap(),
             vec![
                 w("a"),
-                Token::Op(Operator::RedirIn),
+                TokenKind::Op(Operator::RedirIn).into(),
                 w("in"),
-                Token::Op(Operator::Pipe),
+                TokenKind::Op(Operator::Pipe).into(),
                 w("b"),
-                Token::Op(Operator::RedirOut),
+                TokenKind::Op(Operator::RedirOut).into(),
                 w("out"),
             ]
         );
@@ -4981,7 +4996,7 @@ mod tests {
     fn tokenize_or_with_spaces() {
         assert_eq!(
             tokenize("a || b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Or), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Or).into(), w("b")]
         );
     }
 
@@ -4989,7 +5004,7 @@ mod tests {
     fn tokenize_or_without_spaces() {
         assert_eq!(
             tokenize("a||b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Or), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Or).into(), w("b")]
         );
     }
 
@@ -4997,7 +5012,7 @@ mod tests {
     fn tokenize_and_with_spaces() {
         assert_eq!(
             tokenize("a && b").unwrap(),
-            vec![w("a"), Token::Op(Operator::And), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
         );
     }
 
@@ -5005,7 +5020,7 @@ mod tests {
     fn tokenize_and_without_spaces() {
         assert_eq!(
             tokenize("a&&b").unwrap(),
-            vec![w("a"), Token::Op(Operator::And), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
         );
     }
 
@@ -5013,7 +5028,7 @@ mod tests {
     fn tokenize_bare_ampersand_is_background_op() {
         assert_eq!(
             tokenize("a & b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Background), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Background).into(), w("b")]
         );
     }
 
@@ -5021,7 +5036,7 @@ mod tests {
     fn tokenize_bare_ampersand_at_end_is_background_op() {
         assert_eq!(
             tokenize("a &").unwrap(),
-            vec![w("a"), Token::Op(Operator::Background)]
+            vec![w("a"), TokenKind::Op(Operator::Background).into()]
         );
     }
 
@@ -5029,7 +5044,7 @@ mod tests {
     fn tokenize_double_ampersand_still_and_op() {
         assert_eq!(
             tokenize("a && b").unwrap(),
-            vec![w("a"), Token::Op(Operator::And), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::And).into(), w("b")]
         );
     }
 
@@ -5039,8 +5054,8 @@ mod tests {
             tokenize("a & &").unwrap(),
             vec![
                 w("a"),
-                Token::Op(Operator::Background),
-                Token::Op(Operator::Background),
+                TokenKind::Op(Operator::Background).into(),
+                TokenKind::Op(Operator::Background).into(),
             ]
         );
     }
@@ -5049,7 +5064,7 @@ mod tests {
     fn tokenize_semicolon_with_spaces() {
         assert_eq!(
             tokenize("a ; b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Semi), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
         );
     }
 
@@ -5057,7 +5072,7 @@ mod tests {
     fn tokenize_semicolon_without_spaces() {
         assert_eq!(
             tokenize("a;b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Semi), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
         );
     }
 
@@ -5074,7 +5089,7 @@ mod tests {
         // Each `\X` becomes its own quoted single-char Literal part. Adjacent
         // escapes within the same token concatenate into one Word with N parts.
         let two_quoted = |a: &str, b: &str| {
-            Token::Word(Word(vec![qbackslash(a), qbackslash(b)]))
+            TokenKind::Word(Word(vec![qbackslash(a), qbackslash(b)])).into()
         };
         assert_eq!(
             tokenize(r"echo \&\& \|\| \;").unwrap(),
@@ -5088,21 +5103,21 @@ mod tests {
             tokenize("a && b || c ; d").unwrap(),
             vec![
                 w("a"),
-                Token::Op(Operator::And),
+                TokenKind::Op(Operator::And).into(),
                 w("b"),
-                Token::Op(Operator::Or),
+                TokenKind::Op(Operator::Or).into(),
                 w("c"),
-                Token::Op(Operator::Semi),
+                TokenKind::Op(Operator::Semi).into(),
                 w("d"),
             ]
         );
     }
 
     fn vword_unquoted(name: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Var {
+        TokenKind::Word(Word(vec![WordPart::Var {
             name: name.to_string(),
             quoted: false,
-        }]))
+        }])).into()
     }
 
     #[test]
@@ -5119,7 +5134,7 @@ mod tests {
     fn tokenize_dollar_var_in_double_quotes_is_quoted() {
         assert_eq!(
             tokenize("\"$FOO\"").unwrap(),
-            vec![Token::Word(Word(vec![qdouble(vec![WordPart::Var {
+            vec![TokenKind::Word(Word(vec![qdouble(vec![WordPart::Var {
                 name: "FOO".to_string(),
                 quoted: true,
             }])]))]
@@ -5132,7 +5147,7 @@ mod tests {
         // quoting; it must tokenize (pre-fix this was Err(UnterminatedQuote)).
         let toks = tokenize("\"$'\"").unwrap();
         assert_eq!(toks.len(), 1);
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("not a word: {toks:?}") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("not a word: {toks:?}") };
         // The body is a single double-quote run wrapping literal parts.
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
@@ -5166,7 +5181,7 @@ mod tests {
     fn tokenize_last_status() {
         assert_eq!(
             tokenize("$?").unwrap(),
-            vec![Token::Word(Word(vec![WordPart::LastStatus {
+            vec![TokenKind::Word(Word(vec![WordPart::LastStatus {
                 quoted: false
             }]))]
         );
@@ -5177,7 +5192,7 @@ mod tests {
         // Since v22 Task 4: $<digit> is a positional parameter, not a literal $.
         assert_eq!(
             tokenize("$5").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Var { name: "5".to_string(), quoted: false },
             ]))]
         );
@@ -5188,7 +5203,7 @@ mod tests {
         // v26: $$ is the shell PID special parameter, not two literal dollars.
         assert_eq!(
             tokenize("$$").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Var { name: "$".to_string(), quoted: false },
             ]))]
         );
@@ -5198,7 +5213,7 @@ mod tests {
     fn tokenize_tilde_alone() {
         assert_eq!(
             tokenize("~").unwrap(),
-            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::Home)]))]
+            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::Home)]))]
         );
     }
 
@@ -5206,7 +5221,7 @@ mod tests {
     fn tokenize_tilde_slash_path() {
         assert_eq!(
             tokenize("~/foo").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::Home),
                 WordPart::Literal { text: "/foo".to_string(), quoted: false },
             ]))]
@@ -5222,7 +5237,7 @@ mod tests {
     fn tokenize_tilde_followed_by_name_is_user_form() {
         assert_eq!(
             tokenize("~foo").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::User("foo".to_string())),
             ]))]
         );
@@ -5232,7 +5247,7 @@ mod tests {
     fn tokenize_tilde_user_alone() {
         assert_eq!(
             tokenize("~alice").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::User("alice".to_string())),
             ]))]
         );
@@ -5242,7 +5257,7 @@ mod tests {
     fn tokenize_tilde_user_slash_path() {
         assert_eq!(
             tokenize("~alice/bin").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::User("alice".to_string())),
                 WordPart::Literal { text: "/bin".to_string(), quoted: false },
             ]))]
@@ -5253,7 +5268,7 @@ mod tests {
     fn tokenize_tilde_user_with_underscore_and_digits() {
         assert_eq!(
             tokenize("~alice_123").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::User("alice_123".to_string())),
             ]))]
         );
@@ -5270,7 +5285,7 @@ mod tests {
         // valid modifier. v233: deferred to runtime BadSubst (matching bash)
         // instead of a parse error.
         let toks = tokenize("${1foo}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(&parts[0],
             WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
             if raw == "${1foo}"
@@ -5281,7 +5296,7 @@ mod tests {
     fn tokenize_braced_var_empty_name() {
         // v233: `${}` is lexable-but-invalid → BadSubst at runtime, not a parse error.
         let toks = tokenize("${}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(&parts[0],
             WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
             if raw == "${}"
@@ -5297,7 +5312,7 @@ mod tests {
     fn tokenize_var_concatenates_with_literal() {
         assert_eq!(
             tokenize("a$FOOb").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "a".to_string(), quoted: false },
                 WordPart::Var { name: "FOOb".to_string(), quoted: false },
             ]))]
@@ -5308,7 +5323,7 @@ mod tests {
     fn tokenize_braced_var_separates_from_following_word() {
         assert_eq!(
             tokenize("${FOO}bar").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Var { name: "FOO".to_string(), quoted: false },
                 WordPart::Literal { text: "bar".to_string(), quoted: false },
             ]))]
@@ -5324,7 +5339,7 @@ mod tests {
     fn tokenize_two_adjacent_vars() {
         assert_eq!(
             tokenize("$FOO$BAR").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Var { name: "FOO".to_string(), quoted: false },
                 WordPart::Var { name: "BAR".to_string(), quoted: false },
             ]))]
@@ -5332,7 +5347,7 @@ mod tests {
     }
 
     fn sub_word(parts: Vec<WordPart>) -> Token {
-        Token::Word(Word(parts))
+        TokenKind::Word(Word(parts)).into()
     }
 
     fn echo_seq(args: &[&str]) -> crate::command::Sequence {
@@ -5472,8 +5487,8 @@ mod tests {
         // error with UnterminatedSubstitution (the bare-`(` arm didn't count).
         let tokens = tokenize("$( (echo a) )").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::Word(Word(parts)) => {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 1);
                 match &parts[0] {
                     WordPart::CommandSub { sequence, .. } => {
@@ -5505,7 +5520,7 @@ mod tests {
         // not a parse error. The command sub parses successfully.
         let toks = tokenize("$(echo ${1foo})").unwrap();
         // The outer token is a Word containing a CommandSub.
-        assert!(matches!(&toks[0], Token::Word(Word(p)) if matches!(&p[0], WordPart::CommandSub { .. })));
+        assert!(matches!(&toks[0].kind, TokenKind::Word(Word(p)) if matches!(&p[0], WordPart::CommandSub { .. })));
     }
 
     #[test]
@@ -5525,8 +5540,8 @@ mod tests {
         // `$(echo ls) -la` — the program word is itself a CommandSub.
         let tokens = tokenize("$(echo ls) -la").unwrap();
         assert_eq!(tokens.len(), 2);
-        match &tokens[0] {
-            Token::Word(Word(parts)) => {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
             }
             other => panic!("expected Word, got {other:?}"),
@@ -5539,8 +5554,8 @@ mod tests {
         // `pre$(echo x)post` → one Word with three parts: Literal, CommandSub, Literal
         let tokens = tokenize("pre$(echo x)post").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::Word(Word(parts)) => {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 3);
                 assert!(matches!(parts[0], WordPart::Literal { ref text, .. } if text == "pre"));
                 assert!(matches!(parts[1], WordPart::CommandSub { .. }));
@@ -5555,9 +5570,9 @@ mod tests {
         let tokens = tokenize("cat > $(echo /tmp/f)").unwrap();
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0], w("cat"));
-        assert_eq!(tokens[1], Token::Op(Operator::RedirOut));
-        match &tokens[2] {
-            Token::Word(Word(parts)) => {
+        assert_eq!(tokens[1], TokenKind::Op(Operator::RedirOut));
+        match &tokens[2].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
             }
             other => panic!("expected Word, got {other:?}"),
@@ -5593,8 +5608,8 @@ mod tests {
         // single command whose first arg expands $FOO.
         let tokens = tokenize("`echo \\$FOO`").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::Word(Word(parts)) => {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 1);
                 match &parts[0] {
                     WordPart::CommandSub { sequence, quoted: false } => {
@@ -5629,8 +5644,8 @@ mod tests {
         // `\\` inside backticks → inner body is `\`. Inner tokenize sees
         // a trailing backslash; treats it as a literal.
         let tokens = tokenize("`echo \\\\`").unwrap();
-        match &tokens[0] {
-            Token::Word(Word(parts)) => match &parts[0] {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => match &parts[0] {
                 WordPart::CommandSub { sequence, .. } => {
                     let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
                     else {
@@ -5659,8 +5674,8 @@ mod tests {
         // `\n` inside backticks → body has `\n` (backslash + n), which the
         // inner tokenize treats as an escape (literal `n`).
         let tokens = tokenize("`echo \\n`").unwrap();
-        match &tokens[0] {
-            Token::Word(Word(parts)) => match &parts[0] {
+        match &tokens[0].kind {
+            TokenKind::Word(Word(parts)) => match &parts[0] {
                 WordPart::CommandSub { sequence, .. } => {
                     let crate::command::Command::Pipeline(inner_pipeline) = &sequence.first
                     else {
@@ -5710,7 +5725,7 @@ mod tests {
     fn tokenize_tilde_plus_alone() {
         assert_eq!(
             tokenize("~+").unwrap(),
-            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::Pwd)]))]
+            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::Pwd)]))]
         );
     }
 
@@ -5718,7 +5733,7 @@ mod tests {
     fn tokenize_tilde_minus_alone() {
         assert_eq!(
             tokenize("~-").unwrap(),
-            vec![Token::Word(Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]))]
+            vec![TokenKind::Word(Word(vec![WordPart::Tilde(TildeSpec::OldPwd)]))]
         );
     }
 
@@ -5726,7 +5741,7 @@ mod tests {
     fn tokenize_tilde_plus_slash_path() {
         assert_eq!(
             tokenize("~+/x").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::Pwd),
                 WordPart::Literal { text: "/x".to_string(), quoted: false },
             ]))]
@@ -5737,7 +5752,7 @@ mod tests {
     fn tokenize_tilde_minus_slash_path() {
         assert_eq!(
             tokenize("~-/x").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Tilde(TildeSpec::OldPwd),
                 WordPart::Literal { text: "/x".to_string(), quoted: false },
             ]))]
@@ -5756,7 +5771,7 @@ mod tests {
         // of try_parse_tilde inside assignment context.
         assert_eq!(
             tokenize("X=~").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "X=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
             ]))]
@@ -5767,7 +5782,7 @@ mod tests {
     fn tokenize_assignment_value_expands_first_tilde_after_equals() {
         assert_eq!(
             tokenize("PATH=~/bin").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "PATH=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
                 WordPart::Literal { text: "/bin".to_string(), quoted: false },
@@ -5779,7 +5794,7 @@ mod tests {
     fn tokenize_assignment_value_expands_each_tilde_after_colon() {
         assert_eq!(
             tokenize("PATH=~/bin:~/lib").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "PATH=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::Home),
                 WordPart::Literal { text: "/bin:".to_string(), quoted: false },
@@ -5813,7 +5828,7 @@ mod tests {
         // identifier prefix contains quoted text.
         let tokens = tokenize("\"F\"OO=bar").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         // Expect quoted "F", unquoted "OO=bar" — no assignment split.
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], qdouble(vec![WordPart::Literal { text: "F".to_string(), quoted: true }]));
@@ -5824,7 +5839,7 @@ mod tests {
     fn tokenize_assignment_value_tilde_user() {
         assert_eq!(
             tokenize("HOMES=~alice:~bob").unwrap(),
-            vec![Token::Word(Word(vec![
+            vec![TokenKind::Word(Word(vec![
                 WordPart::Literal { text: "HOMES=".to_string(), quoted: false },
                 WordPart::Tilde(TildeSpec::User("alice".to_string())),
                 WordPart::Literal { text: ":".to_string(), quoted: false },
@@ -5854,7 +5869,7 @@ mod tests {
     fn tokenize_mixed_quoted_unquoted_flushes_at_boundaries() {
         let tokens = tokenize("foo\"bar\"baz").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], WordPart::Literal { text: "foo".to_string(), quoted: false });
         assert_eq!(parts[1], qdouble(vec![WordPart::Literal { text: "bar".to_string(), quoted: true }]));
@@ -5879,7 +5894,7 @@ mod tests {
         // a single literal `1+2` (parsed at eval time, not lex time).
         let tokens = tokenize("$((1+2))").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         let WordPart::Arith { quoted, .. } = &parts[0] else {
             panic!("expected Arith part, got {:?}", parts[0])
@@ -5892,7 +5907,7 @@ mod tests {
     fn tokenize_legacy_arith_basic() {
         let tokens = tokenize("$[2**(3*2)]").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         let WordPart::Arith { quoted, .. } = &parts[0] else {
             panic!("expected Arith part, got {:?}", parts[0])
@@ -5905,7 +5920,7 @@ mod tests {
     fn tokenize_legacy_arith_array_subscript() {
         let tokens = tokenize("$[a[1]+1]").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         assert_eq!(arith_body_lit(&parts[0]), "a[1]+1");
     }
@@ -5915,7 +5930,7 @@ mod tests {
         for src in ["$[ $(echo ']')+1 ]", "$[ \"x]\" + 1 ]"] {
             let tokens = tokenize(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
             assert_eq!(tokens.len(), 1, "{src} closed early: {tokens:?}");
-            let Token::Word(Word(parts)) = &tokens[0] else { panic!("{src}") };
+            let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!("{src}") };
             assert_eq!(parts.len(), 1, "{src}: {parts:?}");
             assert!(matches!(parts[0], WordPart::Arith { .. }), "{src}: {:?}", parts[0]);
         }
@@ -5932,7 +5947,7 @@ mod tests {
         // scan_braced_skip, which the other tests don't reach).
         let tokens = tokenize("$[${x}+1]").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         assert!(matches!(parts[0], WordPart::Arith { .. }), "got {:?}", parts[0]);
     }
@@ -5942,7 +5957,7 @@ mod tests {
         // `"$[1+2]"` — the $[ arm must carry quoted: true through to WordPart::Arith.
         let tokens = tokenize("\"$[1+2]\"").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
@@ -5965,14 +5980,14 @@ mod tests {
     #[test]
     fn tokenize_arith_with_nested_parens() {
         let tokens = tokenize("$(( (1+2) * 3 ))").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(arith_body_lit(&parts[0]), " (1+2) * 3 ");
     }
 
     #[test]
     fn tokenize_arith_inside_double_quotes_is_quoted() {
         let tokens = tokenize("\"$((1+2))\"").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
         let WordPart::Arith { quoted, .. } = &inner[0] else { panic!() };
@@ -5993,7 +6008,7 @@ mod tests {
         // Post-v93: arithmetic is parsed at eval time, so a body that would
         // fail to parse (`1+`) still lexes successfully into an Arith part.
         let tokens = tokenize("$((1+))").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert!(matches!(parts[0], WordPart::Arith { .. }));
         assert_eq!(arith_body_lit(&parts[0]), "1+");
     }
@@ -6001,9 +6016,9 @@ mod tests {
     #[test]
     fn tokenize_arith_and_command_sub_both_recognized() {
         let tokens = tokenize("$((1)) $(echo x)").unwrap();
-        let Token::Word(Word(parts1)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts1)) = &tokens[0].kind else { panic!() };
         assert!(matches!(parts1[0], WordPart::Arith { .. }));
-        let Token::Word(Word(parts2)) = &tokens[1] else { panic!() };
+        let TokenKind::Word(Word(parts2)) = &tokens[1].kind else { panic!() };
         assert!(matches!(parts2[0], WordPart::CommandSub { .. }));
     }
 
@@ -6012,7 +6027,7 @@ mod tests {
         // Post-v93: `$x` inside `$(())` is now an expandable Var body part
         // (expanded before arith parse), not a pre-parsed ArithExpr::Var.
         let tokens = tokenize("$(($x))").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::Arith { body: Word(bparts), .. } = &parts[0] else { panic!() };
         assert_eq!(bparts.len(), 1);
         assert_eq!(bparts[0], WordPart::Var { name: "x".to_string(), quoted: true });
@@ -6022,7 +6037,7 @@ mod tests {
     fn tokenize_arith_back_to_back_in_same_word() {
         let tokens = tokenize("$((1+2))$((3+4))").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 2);
         assert_eq!(arith_body_lit(&parts[0]), "1+2");
         assert_eq!(arith_body_lit(&parts[1]), "3+4");
@@ -6035,7 +6050,7 @@ mod tests {
         // substitution whose body starts with a subshell — `$( (echo hi) 2>&1 )`
         // written glued — NOT arithmetic. (Pre-v177 this returned UnterminatedArith.)
         let tokens = tokenize("$((echo hi) 2>&1)").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert!(matches!(parts[0], WordPart::CommandSub { .. }));
     }
 
@@ -6380,7 +6395,7 @@ mod tests {
     #[test]
     fn tokenize_brace_var_no_modifier_still_emits_var() {
         let tokens = tokenize("${foo}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], WordPart::Var { name: "foo".to_string(), quoted: false });
     }
@@ -6388,7 +6403,7 @@ mod tests {
     #[test]
     fn tokenize_length_modifier() {
         let tokens = tokenize("${#foo}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 1);
         let WordPart::ParamExpansion { name, modifier, quoted, .. } = &parts[0] else {
             panic!("expected ParamExpansion, got {:?}", parts[0]);
@@ -6411,7 +6426,7 @@ mod tests {
     #[test]
     fn tokenize_use_default_colon_dash() {
         let tokens = tokenize("${X:-w}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, .. } = &parts[0] else { panic!() };
         assert_eq!(name, "X");
         match modifier {
@@ -6426,7 +6441,7 @@ mod tests {
     #[test]
     fn tokenize_use_default_no_colon() {
         let tokens = tokenize("${X-w}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::UseDefault { colon: false, .. }));
     }
@@ -6435,7 +6450,7 @@ mod tests {
     fn tokenize_indirect_bare() {
         // `${!ref}` — v95 indirect scalar expansion, no modifier.
         let tokens = tokenize("${!ref}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, subscript, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "ref");
@@ -6448,7 +6463,7 @@ mod tests {
     fn tokenize_indirect_with_default_modifier() {
         // `${!ref-w}` — v95 indirect + trailing UseDefault modifier.
         let tokens = tokenize("${!ref-w}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "ref");
@@ -6461,7 +6476,7 @@ mod tests {
         // Regression: `${!a[@]}` is array-keys (IndirectKeys), NOT the
         // scalar indirect path — it must keep `indirect: false`.
         let tokens = tokenize("${!a[@]}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "a");
@@ -6474,7 +6489,7 @@ mod tests {
         // `${!v[@]%b}` — trailing `%b` makes it indirect-through-${v[@]} + RemoveSuffix,
         // NOT the array-keys operator.
         let toks = tokenize("${!v[@]%b}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert!(*indirect);
@@ -6486,7 +6501,7 @@ mod tests {
     fn indirect_keys_with_transform_op_is_indirect() {
         // `${!v[@]@Q}` — was wrongly BadSubst in v233; now indirect + transform.
         let toks = tokenize("${!v[@]@Q}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         let WordPart::ParamExpansion { indirect, subscript, modifier, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert!(*indirect);
@@ -6498,7 +6513,7 @@ mod tests {
     fn indirect_keys_bare_still_keys() {
         // Regression: `${!v[@]}` with NOTHING after `]` stays the keys operator.
         let toks = tokenize("${!v[@]}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::IndirectKeys));
     }
@@ -6507,7 +6522,7 @@ mod tests {
     fn tokenize_prefix_names_star() {
         // `${!pfx*}` — prefix-name expansion, `*` form (at=false).
         let tokens = tokenize("${!_Q*}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "_Q");
@@ -6520,7 +6535,7 @@ mod tests {
     fn tokenize_prefix_names_at() {
         // `${!pfx@}` — prefix-name expansion, `@` form (at=true).
         let tokens = tokenize("${!_Q@}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, subscript, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "_Q");
@@ -6534,7 +6549,7 @@ mod tests {
         // Regression: `${!ref@Q}` is a transform on an indirect ref, NOT the
         // prefix-name form — the `@` is not immediately followed by `}`.
         let tokens = tokenize("${!ref@Q}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "ref");
@@ -6606,7 +6621,7 @@ mod tests {
         // v102: `${-}` — option-flags special param, no modifier. Like
         // `${a}`, the bare form is emitted as a plain Var, not ParamExpansion.
         let tokens = tokenize("${-}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::Var { name, .. } = &parts[0]
         else { panic!("expected Var, got {:?}", parts[0]) };
         assert_eq!(name, "-");
@@ -6616,7 +6631,7 @@ mod tests {
     fn tokenize_braced_dash_remove_prefix() {
         // v102: `${-#*e}` — nvm's errexit driver, RemovePrefix modifier.
         let tokens = tokenize("${-#*e}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, modifier, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "-");
@@ -6628,7 +6643,7 @@ mod tests {
     fn tokenize_braced_status_bare() {
         // v102: `${?}` — exit-status special param, bare form is a Var.
         let tokens = tokenize("${?}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::Var { name, .. } = &parts[0]
         else { panic!("expected Var, got {:?}", parts[0]) };
         assert_eq!(name, "?");
@@ -6638,7 +6653,7 @@ mod tests {
     fn tokenize_braced_pid_bare() {
         // v102: `${$}` — shell-pid special param, bare form is a Var.
         let tokens = tokenize("${$}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::Var { name, .. } = &parts[0]
         else { panic!("expected Var, got {:?}", parts[0]) };
         assert_eq!(name, "$");
@@ -6649,7 +6664,7 @@ mod tests {
         // v102: bare `${!}` is the `$!` last-bg-pid special param,
         // emitted as a plain Var, NOT the v95 indirect path.
         let tokens = tokenize("${!}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::Var { name, .. } = &parts[0]
         else { panic!("expected Var, got {:?}", parts[0]) };
         assert_eq!(name, "!");
@@ -6659,7 +6674,7 @@ mod tests {
     fn tokenize_braced_indirect_still_indirect() {
         // Regression: `${!var}` (non-`}` after `!`) stays the v95 indirect path.
         let tokens = tokenize("${!var}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { name, indirect, .. } = &parts[0]
         else { panic!("expected ParamExpansion, got {:?}", parts[0]) };
         assert_eq!(name, "var");
@@ -6669,7 +6684,7 @@ mod tests {
     #[test]
     fn tokenize_assign_default_colon_equals() {
         let tokens = tokenize("${X:=w}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::AssignDefault { colon: true, .. }));
     }
@@ -6677,7 +6692,7 @@ mod tests {
     #[test]
     fn tokenize_error_if_unset_colon_question() {
         let tokens = tokenize("${X:?msg}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::ErrorIfUnset { colon: true, .. }));
     }
@@ -6685,7 +6700,7 @@ mod tests {
     #[test]
     fn tokenize_use_alternate_colon_plus() {
         let tokens = tokenize("${X:+w}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::UseAlternate { colon: true, .. }));
     }
@@ -6693,7 +6708,7 @@ mod tests {
     #[test]
     fn tokenize_remove_prefix_short() {
         let tokens = tokenize("${X#pat}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: false, .. }));
     }
@@ -6701,7 +6716,7 @@ mod tests {
     #[test]
     fn tokenize_remove_prefix_long() {
         let tokens = tokenize("${X##pat}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::RemovePrefix { longest: true, .. }));
     }
@@ -6709,7 +6724,7 @@ mod tests {
     #[test]
     fn tokenize_remove_suffix_short() {
         let tokens = tokenize("${X%pat}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: false, .. }));
     }
@@ -6717,7 +6732,7 @@ mod tests {
     #[test]
     fn tokenize_remove_suffix_long() {
         let tokens = tokenize("${X%%pat}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         assert!(matches!(modifier, ParamModifier::RemoveSuffix { longest: true, .. }));
     }
@@ -6839,7 +6854,7 @@ mod tests {
     #[test]
     fn tokenize_nested_param_expansion_in_operand() {
         let tokens = tokenize("${X:-${Y}}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         if let ParamModifier::UseDefault { word, .. } = modifier {
             assert_eq!(word.0.len(), 1);
@@ -6852,7 +6867,7 @@ mod tests {
     #[test]
     fn tokenize_quoted_operand_preserves_spaces() {
         let tokens = tokenize("${X:-\"a b\"}").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let WordPart::ParamExpansion { modifier, .. } = &parts[0] else { panic!() };
         if let ParamModifier::UseDefault { word, .. } = modifier {
             assert_eq!(word.0.len(), 1);
@@ -6865,7 +6880,7 @@ mod tests {
     #[test]
     fn tokenize_quoted_outer_param_expansion() {
         let tokens = tokenize("\"${X:-w}\"").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
         let WordPart::ParamExpansion { quoted, .. } = &inner[0] else { panic!() };
@@ -6890,7 +6905,7 @@ mod tests {
         // v233: `${:-foo}` has an empty param name before `:` — now a runtime
         // BadSubst (matching bash) rather than a parse error.
         let toks = tokenize("${:-foo}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(&parts[0],
             WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
         ), "expected BadSubst, got {:?}", parts[0]);
@@ -6907,7 +6922,7 @@ mod tests {
         // After v84: pipe in operand is literal — ${X:-foo | bar} parses successfully.
         let tokens = tokenize("${X:-foo | bar}").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         // Should be a ParamExpansion with UseDefault modifier.
         assert!(matches!(parts[0], WordPart::ParamExpansion { .. }));
     }
@@ -6918,9 +6933,9 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                Token::Newline,
-                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                TokenKind::Newline.into(),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
             ]
         );
     }
@@ -6949,10 +6964,10 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                Token::Newline,
-                Token::Newline,
-                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                TokenKind::Newline.into(),
+                TokenKind::Newline.into(),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
             ]
         );
     }
@@ -6964,42 +6979,42 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                Token::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
-                Token::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "a".to_string(), quoted: false }])),
+                TokenKind::Word(Word(vec![WordPart::Literal { text: "b".to_string(), quoted: false }])),
             ]
         );
     }
 
     #[test]
     fn tokenize_open_paren() {
-        assert_eq!(tokenize("(").unwrap(), vec![Token::Op(Operator::LParen)]);
+        assert_eq!(tokenize("(").unwrap(), vec![TokenKind::Op(Operator::LParen)]);
     }
 
     #[test]
     fn tokenize_close_paren() {
-        assert_eq!(tokenize(")").unwrap(), vec![Token::Op(Operator::RParen)]);
+        assert_eq!(tokenize(")").unwrap(), vec![TokenKind::Op(Operator::RParen)]);
     }
 
     #[test]
     fn tokenize_double_semi() {
-        assert_eq!(tokenize(";;").unwrap(), vec![Token::Op(Operator::DoubleSemi)]);
+        assert_eq!(tokenize(";;").unwrap(), vec![TokenKind::Op(Operator::DoubleSemi)]);
     }
 
     #[test]
     fn tokenize_semi_amp() {
-        assert_eq!(tokenize(";&").unwrap(), vec![Token::Op(Operator::SemiAmp)]);
+        assert_eq!(tokenize(";&").unwrap(), vec![TokenKind::Op(Operator::SemiAmp)]);
     }
 
     #[test]
     fn tokenize_double_semi_amp() {
-        assert_eq!(tokenize(";;&").unwrap(), vec![Token::Op(Operator::DoubleSemiAmp)]);
+        assert_eq!(tokenize(";;&").unwrap(), vec![TokenKind::Op(Operator::DoubleSemiAmp)]);
     }
 
     #[test]
     fn tokenize_double_semi_space_amp_is_two_tokens() {
         assert_eq!(
             tokenize(";; &").unwrap(),
-            vec![Token::Op(Operator::DoubleSemi), Token::Op(Operator::Background)]
+            vec![TokenKind::Op(Operator::DoubleSemi), TokenKind::Op(Operator::Background)]
         );
     }
 
@@ -7007,7 +7022,7 @@ mod tests {
     fn tokenize_lone_semi_still_semi() {
         assert_eq!(
             tokenize("a;b").unwrap(),
-            vec![w("a"), Token::Op(Operator::Semi), w("b")]
+            vec![w("a"), TokenKind::Op(Operator::Semi).into(), w("b")]
         );
     }
 
@@ -7015,7 +7030,7 @@ mod tests {
     fn tokenize_paren_splits_adjacent_word() {
         assert_eq!(
             tokenize("a)").unwrap(),
-            vec![w("a"), Token::Op(Operator::RParen)]
+            vec![w("a"), TokenKind::Op(Operator::RParen).into()]
         );
     }
 
@@ -7032,7 +7047,7 @@ mod tests {
         let tokens = tokenize("$1").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::Var {
+            vec![TokenKind::Word(Word(vec![WordPart::Var {
                 name: "1".to_string(), quoted: false
             }]))]
         );
@@ -7043,7 +7058,7 @@ mod tests {
         let tokens = tokenize("$#").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::Var {
+            vec![TokenKind::Word(Word(vec![WordPart::Var {
                 name: "#".to_string(), quoted: false
             }]))]
         );
@@ -7054,7 +7069,7 @@ mod tests {
         let tokens = tokenize("$@").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::AllArgs {
+            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
                 joined: false, quoted: false
             }]))]
         );
@@ -7065,7 +7080,7 @@ mod tests {
         let tokens = tokenize("$*").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::AllArgs {
+            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
                 joined: true, quoted: false
             }]))]
         );
@@ -7076,7 +7091,7 @@ mod tests {
         let tokens = tokenize("\"$@\"").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![qdouble(vec![WordPart::AllArgs {
+            vec![TokenKind::Word(Word(vec![qdouble(vec![WordPart::AllArgs {
                 joined: false, quoted: true
             }])]))]
         );
@@ -7087,7 +7102,7 @@ mod tests {
         let tokens = tokenize("${10}").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::Var {
+            vec![TokenKind::Word(Word(vec![WordPart::Var {
                 name: "10".to_string(), quoted: false
             }]))]
         );
@@ -7098,7 +7113,7 @@ mod tests {
         let tokens = tokenize("${@}").unwrap();
         assert_eq!(
             tokens,
-            vec![Token::Word(Word(vec![WordPart::AllArgs {
+            vec![TokenKind::Word(Word(vec![WordPart::AllArgs {
                 joined: false, quoted: false
             }]))]
         );
@@ -7106,14 +7121,14 @@ mod tests {
 
     // --- Here-document tests (v24) ---
 
-    /// Helper: extract the body Word from the first Token::Heredoc in tokens.
+    /// Helper: extract the body Word from the first TokenKind::Heredoc in tokens.
     fn heredoc_body(tokens: &[Token]) -> &Word {
         for tok in tokens {
-            if let Token::Heredoc { body, .. } = tok {
+            if let TokenKind::Heredoc { body, .. } = &tok.kind {
                 return body;
             }
         }
-        panic!("no Token::Heredoc found in tokens: {tokens:?}");
+        panic!("no TokenKind::Heredoc found in tokens: {tokens:?}");
     }
 
     /// Helper: assert a Literal part matches expected text and quoted flag.
@@ -7129,18 +7144,18 @@ mod tests {
 
     #[test]
     fn tokenize_heredoc_op_recognized() {
-        // Verify <<EOF lexes and produces a Token::Heredoc with body.
+        // Verify <<EOF lexes and produces a TokenKind::Heredoc with body.
         let result = tokenize("cat <<EOF\nhello\nEOF\n");
         let tokens = result.expect("parse ok");
         assert_eq!(tokens.len(), 3, "got: {tokens:?}"); // Word("cat"), Heredoc{...}, Newline
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[1], Token::Heredoc { .. }));
-        assert!(matches!(tokens[2], Token::Newline));
+        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
+        assert!(matches!(tokens[1].kind, TokenKind::Heredoc { .. }));
+        assert!(matches!(tokens[2].kind, TokenKind::Newline));
     }
 
     #[test]
     fn tokenize_heredoc_simple_expand() {
-        // cat <<EOF\nhello\nEOF → Token::Heredoc{body=Word[Literal{"hello"}, Literal{"\n"}],
+        // cat <<EOF\nhello\nEOF → TokenKind::Heredoc{body=Word[Literal{"hello"}, Literal{"\n"}],
         //                                         expand:true, strip_tabs:false}
         let tokens = tokenize("cat <<EOF\nhello\nEOF\n").unwrap();
         let body = heredoc_body(&tokens);
@@ -7148,7 +7163,7 @@ mod tests {
         assert_eq!(body.0.len(), 2);
         assert_literal(&body.0[0], "hello", false);
         assert_literal(&body.0[1], "\n", true);
-        if let Token::Heredoc { expand, strip_tabs, .. } = &tokens[1] {
+        if let TokenKind::Heredoc { expand, strip_tabs, .. } = &tokens[1].kind {
             assert!(expand, "should be expanding");
             assert!(!strip_tabs, "should not strip tabs");
         }
@@ -7158,7 +7173,7 @@ mod tests {
     fn tokenize_heredoc_literal_no_expand() {
         // cat <<'EOF'\n$HOME\nEOF → body is one Literal{quoted:true, text:"$HOME\n"}
         let tokens = tokenize("cat <<'EOF'\n$HOME\nEOF\n").unwrap();
-        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[1] {
+        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[1].kind {
             assert!(!expand, "quoted delim → literal mode (no expand)");
             assert!(!strip_tabs);
             // Literal mode: entire body as one quoted Literal per line, plus newline parts.
@@ -7166,7 +7181,7 @@ mod tests {
             assert_literal(&body.0[0], "$HOME", true);
             assert_literal(&body.0[1], "\n", true);
         } else {
-            panic!("expected Token::Heredoc, got {:?}", tokens[1]);
+            panic!("expected TokenKind::Heredoc, got {:?}", tokens[1]);
         }
     }
 
@@ -7174,7 +7189,7 @@ mod tests {
     fn tokenize_heredoc_strip_tabs_dash() {
         // <<-EOF\n\t\thello\n\tEOF → body "hello\n" (tabs stripped from body AND close line)
         let tokens = tokenize("<<-EOF\n\t\thello\n\tEOF\n").unwrap();
-        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[0] {
+        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[0].kind {
             assert!(strip_tabs, "<<- should strip tabs");
             assert!(expand);
             // After tab stripping, body line is "hello"
@@ -7182,7 +7197,7 @@ mod tests {
             assert_literal(&body.0[0], "hello", false);
             assert_literal(&body.0[1], "\n", true);
         } else {
-            panic!("expected Token::Heredoc");
+            panic!("expected TokenKind::Heredoc");
         }
     }
 
@@ -7190,14 +7205,14 @@ mod tests {
     fn tokenize_heredoc_strip_tabs_with_literal_delim() {
         // <<-'EOF' composes strip + no-expansion
         let tokens = tokenize("cat <<-'EOF'\n\thello\n\tEOF\n").unwrap();
-        if let Token::Heredoc { body, expand, strip_tabs } = &tokens[1] {
+        if let TokenKind::Heredoc { body, expand, strip_tabs } = &tokens[1].kind {
             assert!(strip_tabs, "<<- should strip tabs");
             assert!(!expand, "quoted delim → literal mode");
             assert_eq!(body.0.len(), 2);
             assert_literal(&body.0[0], "hello", true);
             assert_literal(&body.0[1], "\n", true);
         } else {
-            panic!("expected Token::Heredoc");
+            panic!("expected TokenKind::Heredoc");
         }
     }
 
@@ -7228,21 +7243,21 @@ mod tests {
         let tokens = tokenize("cmd <<A <<B\nbody_a\nA\nbody_b\nB\n").unwrap();
         // tokens: Word("cmd"), Heredoc{A's body}, Heredoc{B's body}, Newline
         assert_eq!(tokens.len(), 4, "got: {tokens:?}");
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[3], Token::Newline));
-        if let Token::Heredoc { body: body_a, .. } = &tokens[1] {
+        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
+        assert!(matches!(tokens[3].kind, TokenKind::Newline));
+        if let TokenKind::Heredoc { body: body_a, .. } = &tokens[1].kind {
             assert_eq!(body_a.0.len(), 2);
             assert_literal(&body_a.0[0], "body_a", false);
             assert_literal(&body_a.0[1], "\n", true);
         } else {
-            panic!("tokens[1] should be Token::Heredoc for A");
+            panic!("tokens[1] should be TokenKind::Heredoc for A");
         }
-        if let Token::Heredoc { body: body_b, .. } = &tokens[2] {
+        if let TokenKind::Heredoc { body: body_b, .. } = &tokens[2].kind {
             assert_eq!(body_b.0.len(), 2);
             assert_literal(&body_b.0[0], "body_b", false);
             assert_literal(&body_b.0[1], "\n", true);
         } else {
-            panic!("tokens[2] should be Token::Heredoc for B");
+            panic!("tokens[2] should be TokenKind::Heredoc for B");
         }
     }
 
@@ -7314,14 +7329,14 @@ mod tests {
     fn tokenize_heredoc_delim_partially_quoted_is_literal_mode() {
         // cat <<E"O"F\n$X\nEOF → expand:false, delim:"EOF"
         let tokens = tokenize("cat <<E\"O\"F\n$X\nEOF\n").unwrap();
-        if let Token::Heredoc { body, expand, .. } = &tokens[1] {
+        if let TokenKind::Heredoc { body, expand, .. } = &tokens[1].kind {
             assert!(!expand, "partial quoting triggers literal mode");
             // Literal body: "$X" as-is
             assert_eq!(body.0.len(), 2);
             assert_literal(&body.0[0], "$X", true);
             assert_literal(&body.0[1], "\n", true);
         } else {
-            panic!("expected Token::Heredoc");
+            panic!("expected TokenKind::Heredoc");
         }
     }
 
@@ -7329,13 +7344,13 @@ mod tests {
     fn tokenize_heredoc_delim_backslash_escaped_is_literal_mode() {
         // cat <<\EOF\n$X\nEOF → expand:false (backslash-escaped delim = literal mode)
         let tokens = tokenize("cat <<\\EOF\n$X\nEOF\n").unwrap();
-        if let Token::Heredoc { body, expand, .. } = &tokens[1] {
+        if let TokenKind::Heredoc { body, expand, .. } = &tokens[1].kind {
             assert!(!expand, "backslash-escaped delim triggers literal mode");
             assert_eq!(body.0.len(), 2);
             assert_literal(&body.0[0], "$X", true);
             assert_literal(&body.0[1], "\n", true);
         } else {
-            panic!("expected Token::Heredoc");
+            panic!("expected TokenKind::Heredoc");
         }
     }
 
@@ -7344,8 +7359,8 @@ mod tests {
         // POSIX 2.7.4: \<NL> inside expanding heredoc is line continuation.
         let tokens = tokenize("cat <<EOF\nhello \\\nworld\nEOF\n").unwrap();
         // Find the Heredoc token and verify body literal is "hello world\n".
-        let body_text: String = match &tokens[1] {
-            Token::Heredoc { body, .. } => body.0.iter()
+        let body_text: String = match &tokens[1].kind {
+            TokenKind::Heredoc { body, .. } => body.0.iter()
                 .filter_map(|p| match p {
                     WordPart::Literal { text, .. } => Some(text.as_str()),
                     _ => None,
@@ -7360,8 +7375,8 @@ mod tests {
     fn tokenize_heredoc_literal_backslash_newline_is_literal() {
         // Inside literal heredoc, \<NL> is two literal chars (POSIX 2.2.2 / 2.7.4).
         let tokens = tokenize("cat <<'EOF'\nhello \\\nworld\nEOF\n").unwrap();
-        let body_text: String = match &tokens[1] {
-            Token::Heredoc { body, .. } => body.0.iter()
+        let body_text: String = match &tokens[1].kind {
+            TokenKind::Heredoc { body, .. } => body.0.iter()
                 .filter_map(|p| match p {
                     WordPart::Literal { text, .. } => Some(text.clone()),
                     _ => None,
@@ -7377,7 +7392,7 @@ mod tests {
     fn lexer_dollar_dollar_emits_var_name_dollar() {
         let tokens = tokenize("$$").unwrap();
         assert_eq!(tokens.len(), 1);
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!("expected Word, got {:?}", tokens[0]) };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!("expected Word, got {:?}", tokens[0]) };
         assert_eq!(parts.len(), 1);
         assert!(
             matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "$"),
@@ -7388,7 +7403,7 @@ mod tests {
     #[test]
     fn lexer_dollar_bang_emits_var_name_bang() {
         let tokens = tokenize("$!").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert!(
             matches!(&parts[0], WordPart::Var { name, quoted: false } if name == "!"),
             "got {:?}", parts[0]
@@ -7400,14 +7415,14 @@ mod tests {
         // Regression test: $0 was lexed by the existing digit path pre-v26;
         // confirm it still produces Var { name: "0" }.
         let tokens = tokenize("$0").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "0"));
     }
 
     #[test]
     fn lexer_dollar_dollar_inside_double_quotes() {
         let tokens = tokenize("\"$$\"").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
         assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "$"));
@@ -7416,7 +7431,7 @@ mod tests {
     #[test]
     fn lexer_dollar_bang_inside_double_quotes() {
         let tokens = tokenize("\"$!\"").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
         assert!(matches!(&inner[0], WordPart::Var { name, quoted: true } if name == "!"));
@@ -7425,7 +7440,7 @@ mod tests {
     #[test]
     fn lexer_dollar_dollar_concatenates_with_literal() {
         let tokens = tokenize("pre-$$-post").unwrap();
-        let Token::Word(Word(parts)) = &tokens[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[0].kind else { panic!() };
         assert_eq!(parts.len(), 3);
         assert!(matches!(&parts[0], WordPart::Literal { text, .. } if text == "pre-"));
         assert!(matches!(&parts[1], WordPart::Var { name, .. } if name == "$"));
@@ -7437,22 +7452,22 @@ mod tests {
     #[test]
     fn tokenize_here_string_op_alone() {
         let tokens = tokenize("<<<").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::HereString)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::HereString)]);
     }
 
     #[test]
     fn tokenize_here_string_with_unquoted_word() {
         let tokens = tokenize("cat <<< hello").unwrap();
         assert_eq!(tokens.len(), 3);
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[1], Token::Op(Operator::HereString)));
-        assert!(matches!(tokens[2], Token::Word(_)));
+        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
+        assert!(matches!(tokens[1].kind, TokenKind::Op(Operator::HereString)));
+        assert!(matches!(tokens[2].kind, TokenKind::Word(_)));
     }
 
     #[test]
     fn tokenize_here_string_with_quoted_word() {
         let tokens = tokenize("cat <<< \"hi there\"").unwrap();
-        let Token::Word(Word(parts)) = &tokens[2] else { panic!("got {:?}", tokens[2]) };
+        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!("got {:?}", tokens[2]) };
         let [WordPart::Quoted { style: QuoteStyle::Double, parts: inner }] = &parts[..]
         else { panic!("expected one double-quote run: {parts:?}") };
         assert!(matches!(&inner[0], WordPart::Literal { text, quoted: true } if text == "hi there"));
@@ -7461,14 +7476,14 @@ mod tests {
     #[test]
     fn tokenize_here_string_with_var_in_body() {
         let tokens = tokenize("cat <<< $FOO").unwrap();
-        let Token::Word(Word(parts)) = &tokens[2] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!() };
         assert!(matches!(&parts[0], WordPart::Var { name, .. } if name == "FOO"));
     }
 
     #[test]
     fn tokenize_here_string_with_command_sub_in_body() {
         let tokens = tokenize("cat <<< $(echo hi)").unwrap();
-        let Token::Word(Word(parts)) = &tokens[2] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &tokens[2].kind else { panic!() };
         assert!(matches!(&parts[0], WordPart::CommandSub { .. }));
     }
 
@@ -7476,72 +7491,72 @@ mod tests {
     fn tokenize_double_less_still_heredoc() {
         // Regression: `<<EOF` must still lex as Heredoc, not split into `<<` + `<EOF`.
         let tokens = tokenize("cat <<EOF\nbody\nEOF\n").unwrap();
-        assert!(tokens.iter().any(|t| matches!(t, Token::Heredoc { .. })),
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Heredoc { .. })),
             "expected Heredoc token, got {:?}", tokens);
     }
 
     #[test]
     fn tokenize_dup_out_basic() {
         let tokens = tokenize(">&").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::DupOut)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupOut)]);
     }
 
     #[test]
     fn tokenize_dup_err_basic() {
         let tokens = tokenize("2>&").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::DupErr)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupErr)]);
     }
 
     #[test]
     fn tokenize_and_redir_out() {
         let tokens = tokenize("&>").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::AndRedirOut)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::AndRedirOut)]);
     }
 
     #[test]
     fn tokenize_and_redir_append() {
         let tokens = tokenize("&>>").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::AndRedirAppend)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::AndRedirAppend)]);
     }
 
     #[test]
     fn tokenize_dup_in_context() {
         let tokens = tokenize("cmd 2>&1").unwrap();
         assert_eq!(tokens.len(), 3);
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[1], Token::Op(Operator::DupErr)));
-        assert!(matches!(tokens[2], Token::Word(_)));
+        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
+        assert!(matches!(tokens[1].kind, TokenKind::Op(Operator::DupErr)));
+        assert!(matches!(tokens[2].kind, TokenKind::Word(_)));
     }
 
     #[test]
     fn tokenize_redir_out_regression() {
-        assert_eq!(tokenize(">").unwrap(), vec![Token::Op(Operator::RedirOut)]);
-        assert_eq!(tokenize(">>").unwrap(), vec![Token::Op(Operator::RedirAppend)]);
+        assert_eq!(tokenize(">").unwrap(), vec![TokenKind::Op(Operator::RedirOut)]);
+        assert_eq!(tokenize(">>").unwrap(), vec![TokenKind::Op(Operator::RedirAppend)]);
     }
 
     #[test]
     fn tokenize_redir_err_regression() {
-        assert_eq!(tokenize("2>").unwrap(), vec![Token::Op(Operator::RedirErr)]);
-        assert_eq!(tokenize("2>>").unwrap(), vec![Token::Op(Operator::RedirErrAppend)]);
+        assert_eq!(tokenize("2>").unwrap(), vec![TokenKind::Op(Operator::RedirErr)]);
+        assert_eq!(tokenize("2>>").unwrap(), vec![TokenKind::Op(Operator::RedirErrAppend)]);
     }
 
     #[test]
     fn tokenize_explicit_fd1_redir_out() {
         // `1>` lexes as RedirOut (same as `>`).
         let tokens = tokenize("1>").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::RedirOut)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::RedirOut)]);
     }
 
     #[test]
     fn tokenize_explicit_fd1_redir_append() {
         let tokens = tokenize("1>>").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::RedirAppend)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::RedirAppend)]);
     }
 
     #[test]
     fn tokenize_explicit_fd1_dup() {
         let tokens = tokenize("1>&").unwrap();
-        assert_eq!(tokens, vec![Token::Op(Operator::DupOut)]);
+        assert_eq!(tokens, vec![TokenKind::Op(Operator::DupOut)]);
     }
 
     #[test]
@@ -7549,14 +7564,14 @@ mod tests {
         // `cmd 1` where 1 is an argument — should NOT trigger the new arm.
         let tokens = tokenize("cmd 1").unwrap();
         assert_eq!(tokens.len(), 2);
-        assert!(matches!(tokens[0], Token::Word(_)));
-        assert!(matches!(tokens[1], Token::Word(_)));
+        assert!(matches!(tokens[0].kind, TokenKind::Word(_)));
+        assert!(matches!(tokens[1].kind, TokenKind::Word(_)));
     }
 
     #[test]
     fn tokenize_background_regression() {
-        assert_eq!(tokenize("&").unwrap(), vec![Token::Op(Operator::Background)]);
-        assert_eq!(tokenize("&&").unwrap(), vec![Token::Op(Operator::And)]);
+        assert_eq!(tokenize("&").unwrap(), vec![TokenKind::Op(Operator::Background)]);
+        assert_eq!(tokenize("&&").unwrap(), vec![TokenKind::Op(Operator::And)]);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -7565,20 +7580,20 @@ mod tests {
 
     #[test]
     fn lex_clobber_stdout() {
-        assert_eq!(tokenize(">|").unwrap(), vec![Token::Op(Operator::RedirClobber)]);
-        assert_eq!(tokenize("1>|").unwrap(), vec![Token::Op(Operator::RedirClobber)]);
+        assert_eq!(tokenize(">|").unwrap(), vec![TokenKind::Op(Operator::RedirClobber)]);
+        assert_eq!(tokenize("1>|").unwrap(), vec![TokenKind::Op(Operator::RedirClobber)]);
     }
 
     #[test]
     fn lex_clobber_stderr() {
-        assert_eq!(tokenize("2>|").unwrap(), vec![Token::Op(Operator::RedirErrClobber)]);
+        assert_eq!(tokenize("2>|").unwrap(), vec![TokenKind::Op(Operator::RedirErrClobber)]);
     }
 
     #[test]
     fn lex_clobber_with_target() {
         assert_eq!(
             tokenize("cmd >|f").unwrap(),
-            vec![w("cmd"), Token::Op(Operator::RedirClobber), w("f")]
+            vec![w("cmd"), TokenKind::Op(Operator::RedirClobber).into(), w("f")]
         );
     }
 
@@ -7586,7 +7601,7 @@ mod tests {
     fn lex_redir_then_pipe_unaffected() {
         assert_eq!(
             tokenize("> |").unwrap(),
-            vec![Token::Op(Operator::RedirOut), Token::Op(Operator::Pipe)]
+            vec![TokenKind::Op(Operator::RedirOut), TokenKind::Op(Operator::Pipe)]
         );
     }
 
@@ -7602,7 +7617,7 @@ mod tests {
         let tokens = tokenize("[[").unwrap();
         assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
         assert!(
-            matches!(&tokens[0], Token::Word(Word(parts))
+            matches!(&tokens[0].kind, TokenKind::Word(Word(parts))
                 if parts.len() == 1
                 && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "[[")
             ),
@@ -7616,7 +7631,7 @@ mod tests {
         let tokens = tokenize("]]").unwrap();
         assert_eq!(tokens.len(), 1, "expected 1 token, got {:?}", tokens);
         assert!(
-            matches!(&tokens[0], Token::Word(Word(parts))
+            matches!(&tokens[0].kind, TokenKind::Word(Word(parts))
                 if parts.len() == 1
                 && matches!(&parts[0], WordPart::Literal { text, quoted: false } if text == "]]")
             ),
@@ -7632,7 +7647,7 @@ mod tests {
         let tokens = tokenize("cmd[[foo]]").unwrap();
         // The whole thing is one word token (the lexer has no special-casing for [[ )].
         assert_eq!(tokens.len(), 1, "expected 1 word token, got {:?}", tokens);
-        assert!(matches!(&tokens[0], Token::Word(_)), "expected Word, got {:?}", tokens[0]);
+        assert!(matches!(&tokens[0].kind, TokenKind::Word(_)), "expected Word, got {:?}", tokens[0]);
     }
 
     #[test]
@@ -7729,7 +7744,7 @@ mod tests {
         // v233: `${var:}` — colon followed immediately by close brace — is
         // now a runtime BadSubst (matching bash) rather than a parse error.
         let toks = tokenize_words("${name:}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(&parts[0],
             WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { raw }, .. }
             if raw == "${name:}"
@@ -7879,8 +7894,8 @@ mod tests {
     fn ansi_c_quote_newline_escape() {
         let toks = tokenize("$'a\\nb'").expect("lex");
         // Single Word token with one quoted Literal containing "a\nb"
-        match &toks[0] {
-            Token::Word(Word(parts)) => {
+        match &toks[0].kind {
+            TokenKind::Word(Word(parts)) => {
                 assert_eq!(parts.len(), 1);
                 match ansi_c_inner(&parts[0]) {
                     WordPart::Literal { text, quoted } => {
@@ -7897,7 +7912,7 @@ mod tests {
     #[test]
     fn ansi_c_quote_tab_escape() {
         let toks = tokenize("$'a\\tb'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
         let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "a\tb");
@@ -7908,7 +7923,7 @@ mod tests {
     fn ansi_c_quote_backslash_and_quote() {
         // $'\\\'' → literal backslash + literal quote (two chars)
         let toks = tokenize("$'\\\\\\''").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\\'");
@@ -7918,7 +7933,7 @@ mod tests {
     fn ansi_c_quote_hex_escapes() {
         // \x48\x69 → "Hi"
         let toks = tokenize("$'\\x48\\x69'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "Hi");
     }
@@ -7927,7 +7942,7 @@ mod tests {
     fn ansi_c_quote_octal_escapes() {
         // \110\151 → "Hi"  (0o110=72='H', 0o151=105='i')
         let toks = tokenize("$'\\110\\151'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "Hi");
     }
@@ -7936,7 +7951,7 @@ mod tests {
     fn ansi_c_quote_octal_greedy_stops_at_non_octal() {
         // \18 → \1 followed by literal '8' → "\x01" + "8"
         let toks = tokenize("$'\\18'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\x018");
     }
@@ -7945,7 +7960,7 @@ mod tests {
     fn ansi_c_quote_unicode_4digit() {
         // é → é (U+00E9, "LATIN SMALL LETTER E WITH ACUTE")
         let toks = tokenize("$'\\u00e9'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "é");
     }
@@ -7954,7 +7969,7 @@ mod tests {
     fn ansi_c_quote_unicode_8digit() {
         // \U0001F600 → 😀 (grinning face)
         let toks = tokenize("$'\\U0001F600'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\u{1F600}");
     }
@@ -7963,7 +7978,7 @@ mod tests {
     fn ansi_c_quote_control_chars() {
         // \cA → \x01, \cZ → \x1A
         let toks = tokenize("$'\\cA\\cZ'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\x01\x1a");
     }
@@ -7972,7 +7987,7 @@ mod tests {
     fn ansi_c_quote_unknown_escape_preserves_both() {
         // \q → literal "\q" (two chars)
         let toks = tokenize("$'\\q'").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         let WordPart::Literal { text, .. } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "\\q");
     }
@@ -7980,7 +7995,7 @@ mod tests {
     #[test]
     fn ansi_c_quote_empty() {
         let toks = tokenize("$''").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         assert_eq!(parts.len(), 1);
         let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal") };
         assert_eq!(text, "");
@@ -8004,7 +8019,7 @@ mod tests {
     fn ansi_c_quote_concatenates_with_adjacent_word() {
         // $'a\nb'foo → single Word with two Literal parts
         let toks = tokenize("$'a\\nb'foo").expect("lex");
-        let Token::Word(Word(parts)) = &toks[0] else { panic!("expected Word") };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!("expected Word") };
         assert_eq!(parts.len(), 2);
         let WordPart::Literal { text, quoted } = ansi_c_inner(&parts[0]) else { panic!("expected Literal at [0]") };
         assert_eq!(text, "a\nb");
@@ -8021,8 +8036,8 @@ mod tests {
         // separators we don't care about).
         let word_texts: Vec<String> = toks
             .iter()
-            .filter_map(|t| match t {
-                Token::Word(Word(parts)) => {
+            .filter_map(|t| match &t.kind {
+                TokenKind::Word(Word(parts)) => {
                     let s: String = parts
                         .iter()
                         .filter_map(|p| match p {
@@ -8045,8 +8060,8 @@ mod tests {
         // a Var part followed by a Literal part.
         let word_tokens: Vec<&Vec<WordPart>> = toks
             .iter()
-            .filter_map(|t| match t {
-                Token::Word(Word(parts)) => Some(parts),
+            .filter_map(|t| match &t.kind {
+                TokenKind::Word(Word(parts)) => Some(parts),
                 _ => None,
             })
             .collect();
@@ -8062,14 +8077,14 @@ mod tests {
     #[test]
     fn tokenize_quoted_brace_not_expanded() {
         let toks = tokenize("echo \"{a,b}\"").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
         assert_eq!(word_count, 2, "expected 2 Words (echo + the quoted literal), got {word_count}");
     }
 
     #[test]
     fn tokenize_single_quoted_brace_not_expanded() {
         let toks = tokenize("echo '{a,b}'").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
         assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
     }
 
@@ -8080,7 +8095,7 @@ mod tests {
         // only fires on UNQUOTED Literals, so `\{a,b\}` survives
         // as a single Word.
         let toks = tokenize("echo \\{a,b\\}").expect("lex");
-        let word_count = toks.iter().filter(|t| matches!(t, Token::Word(_))).count();
+        let word_count = toks.iter().filter(|t| matches!(&t.kind, TokenKind::Word(_))).count();
         assert_eq!(word_count, 2, "expected 2 Words, got {word_count}");
     }
 
@@ -8088,8 +8103,8 @@ mod tests {
     fn arith_block_simple() {
         let tokens = tokenize("((1+2))").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::ArithBlock(s, _) => assert_eq!(s, "1+2"),
+        match &tokens[0].kind {
+            TokenKind::ArithBlock(s, _) => assert_eq!(s, "1+2"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -8119,11 +8134,11 @@ mod tests {
         // subshells (two LParens), not an ArithBlock.
         let toks = tokenize("((echo a)|cat); x=$((1+1))").unwrap();
         assert!(
-            !matches!(toks[0], Token::ArithBlock(..)),
+            !matches!(toks[0].kind, TokenKind::ArithBlock(..)),
             "head must not be an ArithBlock: {toks:?}"
         );
-        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
-        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
+        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
     }
 
     #[test]
@@ -8132,11 +8147,11 @@ mod tests {
         // NOT an arithmetic block. Lexes to two LParens, no ArithBlock.
         let toks = tokenize("((echo a) | cat)").unwrap();
         assert!(
-            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
             "must not be an ArithBlock: {toks:?}"
         );
-        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
-        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
+        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
     }
 
     #[test]
@@ -8144,7 +8159,7 @@ mod tests {
         // v184 regression: a `((` that DOES close as `))` stays an ArithBlock.
         let toks = tokenize("((1+2))").unwrap();
         assert_eq!(toks.len(), 1);
-        assert!(matches!(toks[0], Token::ArithBlock(..)));
+        assert!(matches!(toks[0].kind, TokenKind::ArithBlock(..)));
     }
 
     #[test]
@@ -8153,7 +8168,7 @@ mod tests {
         // `))` for the outer `((` → LParens, not an ArithBlock.
         let toks = tokenize("((( echo a ) ) )").unwrap();
         assert!(
-            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
             "must not be an ArithBlock: {toks:?}"
         );
     }
@@ -8162,8 +8177,8 @@ mod tests {
     fn arith_block_with_semicolons() {
         let tokens = tokenize("((a;b;c))").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::ArithBlock(s, _) => assert_eq!(s, "a;b;c"),
+        match &tokens[0].kind {
+            TokenKind::ArithBlock(s, _) => assert_eq!(s, "a;b;c"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -8175,8 +8190,8 @@ mod tests {
         // is the final two `)` of the input.
         let tokens = tokenize("((((a+b)*c)))").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::ArithBlock(s, _) => assert_eq!(s, "((a+b)*c)"),
+        match &tokens[0].kind {
+            TokenKind::ArithBlock(s, _) => assert_eq!(s, "((a+b)*c)"),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -8185,8 +8200,8 @@ mod tests {
     fn arith_block_with_internal_whitespace() {
         let tokens = tokenize("((  1 + 2  ))").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::ArithBlock(s, _) => assert_eq!(s, "  1 + 2  "),
+        match &tokens[0].kind {
+            TokenKind::ArithBlock(s, _) => assert_eq!(s, "  1 + 2  "),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -8195,8 +8210,8 @@ mod tests {
     fn arith_block_empty_body() {
         let tokens = tokenize("(())").unwrap();
         assert_eq!(tokens.len(), 1);
-        match &tokens[0] {
-            Token::ArithBlock(s, _) => assert_eq!(s, ""),
+        match &tokens[0].kind {
+            TokenKind::ArithBlock(s, _) => assert_eq!(s, ""),
             other => panic!("expected ArithBlock, got {other:?}"),
         }
     }
@@ -8209,11 +8224,11 @@ mod tests {
         // bash treats `((` as arithmetic only when a matching `))` is found.
         let toks = tokenize("((1+2").unwrap();
         assert!(
-            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
             "must not be an ArithBlock: {toks:?}"
         );
-        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
-        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
+        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
     }
 
     #[test]
@@ -8222,11 +8237,11 @@ mod tests {
         // v184 this falls back to nested subshells `( (` rather than erroring.
         let toks = tokenize("((1+2)").unwrap();
         assert!(
-            !toks.iter().any(|t| matches!(t, Token::ArithBlock(..))),
+            !toks.iter().any(|t| matches!(&t.kind, TokenKind::ArithBlock(..))),
             "must not be an ArithBlock: {toks:?}"
         );
-        assert!(matches!(toks[0], Token::Op(Operator::LParen)));
-        assert!(matches!(toks[1], Token::Op(Operator::LParen)));
+        assert!(matches!(toks[0].kind, TokenKind::Op(Operator::LParen)));
+        assert!(matches!(toks[1].kind, TokenKind::Op(Operator::LParen)));
     }
 
     #[test]
@@ -8237,11 +8252,11 @@ mod tests {
         let tokens = tokenize("( (cmd) )").unwrap();
         let lparen_count = tokens
             .iter()
-            .filter(|t| matches!(t, Token::Op(Operator::LParen)))
+            .filter(|t| matches!(&t.kind, TokenKind::Op(Operator::LParen)))
             .count();
         let arith_count = tokens
             .iter()
-            .filter(|t| matches!(t, Token::ArithBlock(..)))
+            .filter(|t| matches!(&t.kind, TokenKind::ArithBlock(..)))
             .count();
         assert_eq!(lparen_count, 2, "expected two LParen tokens: {tokens:?}");
         assert_eq!(arith_count, 0, "did not expect ArithBlock: {tokens:?}");
@@ -8572,8 +8587,8 @@ mod array_parse_tests {
             ("${v@k}", TransformOp::KvWords),
             ("${v@a}", TransformOp::AttrFlags),
         ] {
-            let parts = match &tokenize(src).unwrap()[0] {
-                Token::Word(Word(p)) => p.clone(),
+            let parts = match &tokenize(src).unwrap()[0].kind {
+                TokenKind::Word(Word(p)) => p.clone(),
                 _ => panic!(),
             };
             let WordPart::ParamExpansion {
@@ -8587,8 +8602,8 @@ mod array_parse_tests {
         }
         // v233: `@Z` and other unknown letters are runtime BadSubst, not parse errors.
         let toks = tokenize("${v@Z}").unwrap();
-        assert!(matches!(&toks[0],
-            Token::Word(Word(p)) if matches!(&p[0],
+        assert!(matches!(&toks[0].kind,
+            TokenKind::Word(Word(p)) if matches!(&p[0],
                 WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }
             )
         ), "expected BadSubst for @Z");
@@ -8714,8 +8729,8 @@ mod array_parse_tests {
     #[test]
     fn process_sub_in_is_a_word_part() {
         let toks = tokenize("cat <(echo hi)").unwrap();
-        let words: Vec<&Word> = toks.iter().filter_map(|t| match t {
-            Token::Word(w) => Some(w), _ => None,
+        let words: Vec<&Word> = toks.iter().filter_map(|t| match &t.kind {
+            TokenKind::Word(w) => Some(w), _ => None,
         }).collect();
         assert_eq!(words.len(), 2, "cat + one process-sub word");
         match &words[1].0[..] {
@@ -8727,8 +8742,8 @@ mod array_parse_tests {
     #[test]
     fn process_sub_out_direction() {
         let toks = tokenize("tee >(cat)").unwrap();
-        let w = toks.iter().find_map(|t| match t {
-            Token::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
+        let w = toks.iter().find_map(|t| match &t.kind {
+            TokenKind::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
             _ => None,
         }).expect("a process-sub word");
         assert!(matches!(w.0[0], WordPart::ProcessSub { dir: ProcDir::Out, .. }));
@@ -8737,23 +8752,23 @@ mod array_parse_tests {
     #[test]
     fn quoted_process_sub_is_literal() {
         let toks = tokenize("echo \"<(echo hi)\"").unwrap();
-        let has = toks.iter().any(|t| matches!(t,
-            Token::Word(w) if w.0.iter().any(|p| matches!(p, WordPart::ProcessSub { .. }))));
+        let has = toks.iter().any(|t| matches!(&t.kind,
+            TokenKind::Word(w) if w.0.iter().any(|p| matches!(p, WordPart::ProcessSub { .. }))));
         assert!(!has, "quoted <( must stay literal");
     }
 
     #[test]
     fn lone_redirect_still_redirect() {
         let toks = tokenize("cat < file").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirIn))),
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirIn))),
             "`< file` is still a redirect");
     }
 
     #[test]
     fn nested_process_sub_balances() {
         let toks = tokenize("cat <(cat <(echo deep))").unwrap();
-        let outer = toks.iter().find_map(|t| match t {
-            Token::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
+        let outer = toks.iter().find_map(|t| match &t.kind {
+            TokenKind::Word(w) if matches!(w.0.first(), Some(WordPart::ProcessSub { .. })) => Some(w),
             _ => None,
         }).expect("outer process sub");
         assert!(matches!(outer.0[0], WordPart::ProcessSub { dir: ProcDir::In, .. }));
@@ -8763,10 +8778,10 @@ mod array_parse_tests {
     fn redirect_from_process_sub_tokenizes() {
         // `wc < <(cmd)` -> Word("wc"), Op(RedirIn), Word(ProcessSub{In})
         let toks = tokenize("wc < <(printf hi)").unwrap();
-        assert!(toks.iter().any(|t| matches!(t, Token::Op(Operator::RedirIn))),
+        assert!(toks.iter().any(|t| matches!(&t.kind, TokenKind::Op(Operator::RedirIn))),
             "the standalone `<` is still a redirect operator");
-        let last_word = toks.iter().rev().find_map(|t| match t {
-            Token::Word(w) => Some(w), _ => None,
+        let last_word = toks.iter().rev().find_map(|t| match &t.kind {
+            TokenKind::Word(w) => Some(w), _ => None,
         }).expect("a trailing word");
         assert!(matches!(last_word.0.first(), Some(WordPart::ProcessSub { dir: ProcDir::In, .. })),
             "the `<(printf hi)` is a process-sub word");
@@ -8777,8 +8792,8 @@ mod array_parse_tests {
     /// Extract the first WordPart from a single-word tokenization result.
     fn first_word_part(input: &str) -> WordPart {
         let mut toks = crate::lexer::tokenize(input).expect("lex");
-        let word = match toks.remove(0) {
-            Token::Word(w) => w,
+        let word = match toks.remove(0).kind {
+            TokenKind::Word(w) => w,
             other => panic!("expected Word, got {other:?}"),
         };
         word.0.into_iter().next().expect("non-empty word")
@@ -8826,7 +8841,7 @@ mod array_parse_tests {
     fn extquote_name_decodes_to_identifier() {
         // `"${$'x1'}"` (double-quoted) -> name "x1"; unquoted is now bad subst (M-156).
         let toks = tokenize(r#""${$'x1'}""#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         // Unwrap a possible outer Quoted wrapper.
         let inner = match &parts[0] {
             WordPart::Quoted { parts, .. } => &parts[0],
@@ -8841,7 +8856,7 @@ mod array_parse_tests {
     fn extquote_name_concatenates() {
         // `"${a$'b'}"` (double-quoted) -> name "ab"; unquoted is now bad subst (M-156).
         let toks = tokenize(r#""${a$'b'}""#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         let inner = match &parts[0] {
             WordPart::Quoted { parts, .. } => &parts[0],
             other => other,
@@ -8855,7 +8870,7 @@ mod array_parse_tests {
     fn extquote_locale_name_is_bad_subst() {
         // `${$"x1"}` -> bash bad substitution.
         let toks = tokenize(r#"${$"x1"}"#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
     }
 
@@ -8864,7 +8879,7 @@ mod array_parse_tests {
         // `${$'x\ty'}` is UNQUOTED: fires at the quote-context gate (not the
         // invalid-name gate) — unquoted extquote name -> bad substitution.
         let toks = tokenize("${$'x\\ty'}").unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
     }
 
@@ -8874,7 +8889,7 @@ mod array_parse_tests {
         // decoded name "x<TAB>y" is not a valid identifier -> bad substitution.
         // This exercises the invalid-name gate (the path `!is_valid_param_name`).
         let toks = tokenize(r#""${$'x\ty'}""#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         let inner = match &parts[0] {
             WordPart::Quoted { parts, .. } => &parts[0],
             other => other,
@@ -8890,7 +8905,7 @@ mod array_parse_tests {
         // Top-level unquoted `${$'x1'}` -> BadSubst (the default tokenize path
         // is unquoted).
         let toks = tokenize(r#"${$'x1'}"#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         assert!(matches!(parts[0], WordPart::ParamExpansion { modifier: ParamModifier::BadSubst { .. }, .. }));
     }
 
@@ -8898,7 +8913,7 @@ mod array_parse_tests {
     fn extquote_name_double_quoted_decodes() {
         // Inside `"…"` the name decodes (no BadSubst).
         let toks = tokenize(r#""${$'x1'}""#).unwrap();
-        let Token::Word(Word(parts)) = &toks[0] else { panic!() };
+        let TokenKind::Word(Word(parts)) = &toks[0].kind else { panic!() };
         // The single part is the decoded name `x1` (Var or ParamExpansion),
         // NOT a BadSubst.
         let inner = match &parts[0] {

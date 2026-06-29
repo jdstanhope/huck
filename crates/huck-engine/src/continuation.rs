@@ -4,7 +4,7 @@
 //! disagree with them.
 
 use crate::command::{self, ParseError};
-use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, Token};
+use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, TokenKind};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ContinuationReason {
@@ -69,8 +69,8 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
         return Completeness::Incomplete(ContinuationReason::DoubleBracket);
     }
     if matches!(
-        tokens.last(),
-        Some(Token::Op(Operator::Pipe | Operator::And | Operator::Or))
+        tokens.last().map(|t| &t.kind),
+        Some(TokenKind::Op(Operator::Pipe | Operator::And | Operator::Or))
     ) {
         return Completeness::Incomplete(ContinuationReason::Operator);
     }
