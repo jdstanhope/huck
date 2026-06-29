@@ -495,8 +495,6 @@ pub struct Lexer<'a> {
     /// index of the next token next_token() will hand out (pull + future rewind).
     history: Vec<Token>,
     pos: usize,
-    /// Lex error captured mid-pull (read-time path). Surfaced once via take_error().
-    pending_error: Option<LexError>,
     /// True for a from_tokens() replay lexer: history is pre-filled, never scans.
     replay: bool,
     parts: Vec<WordPart>,
@@ -519,7 +517,6 @@ impl<'a> Lexer<'a> {
             brace_expand,
             history: Vec::new(),
             pos: 0,
-            pending_error: None,
             replay: false,
             parts: Vec::new(),
             current: String::new(),
@@ -1223,7 +1220,6 @@ impl<'a> Lexer<'a> {
             brace_expand: true,
             history: tokens,
             pos: 0,
-            pending_error: None,
             replay: true,
             parts: Vec::new(),
             current: String::new(),
@@ -1239,59 +1235,54 @@ impl<'a> Lexer<'a> {
     }
 
     /// Ensure history[idx] exists AND is backfill-ready (heredoc body present),
-    /// pulling lazily via scan_step. Mirrors next_token's readiness check so a
-    /// Heredoc token is never exposed before its body is collected (v238 rule).
-    /// On a lex error, stash it and stop — the pull then reports end-of-input.
-    /// scan_step appends to history WITHOUT advancing pos, so this never consumes.
-    fn fill_to(&mut self, idx: usize) {
-        if self.replay || self.pending_error.is_some() {
-            return;
+    /// pulling lazily via scan_step. Mirrors next_token's readiness rule so a
+    /// Heredoc token is never exposed before its body is collected (v238). On a lex
+    /// error, RETURN it (no stash). scan_step appends to history without advancing pos.
+    fn fill_to(&mut self, idx: usize) -> Result<(), LexError> {
+        if self.replay {
+            return Ok(());
         }
         loop {
             if self.history.len() > idx && !self.backfill_pending_at(idx) {
-                return;
+                return Ok(());
             }
-            match self.scan_step() {
-                Ok(Step::Produced) => {}
-                Ok(Step::Eof) => return,
-                Err(e) => { self.pending_error = Some(e); return; }
+            match self.scan_step()? {
+                Step::Produced => {}
+                Step::Eof => return Ok(()),
             }
         }
     }
 
-    pub fn peek(&mut self) -> Option<&Token> {
-        self.fill_to(self.pos);
-        self.history.get(self.pos)
+    pub fn peek(&mut self) -> Result<Option<&Token>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos))
     }
-    pub fn next(&mut self) -> Option<Token> {
-        self.fill_to(self.pos);
+    pub fn next(&mut self) -> Result<Option<Token>, LexError> {
+        self.fill_to(self.pos)?;
         let t = self.history.get(self.pos).cloned();
         if t.is_some() { self.pos += 1; }
-        t
+        Ok(t)
     }
-    pub fn peek_kind(&mut self) -> Option<&TokenKind> {
-        self.fill_to(self.pos);
-        self.history.get(self.pos).map(|t| &t.kind)
+    pub fn peek_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos).map(|t| &t.kind))
     }
-    pub fn peek2_kind(&mut self) -> Option<&TokenKind> {
-        self.fill_to(self.pos + 1);
-        self.history.get(self.pos + 1).map(|t| &t.kind)
+    pub fn peek2_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
+        self.fill_to(self.pos + 1)?;
+        Ok(self.history.get(self.pos + 1).map(|t| &t.kind))
     }
-    pub fn next_kind(&mut self) -> Option<TokenKind> {
-        self.next().map(|t| t.kind)
+    pub fn next_kind(&mut self) -> Result<Option<TokenKind>, LexError> {
+        Ok(self.next()?.map(|t| t.kind))
     }
-    pub fn peek_span(&mut self) -> Option<Span> {
-        self.fill_to(self.pos);
-        self.history.get(self.pos).map(|t| t.span)
+    pub fn peek_span(&mut self) -> Result<Option<Span>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos).map(|t| t.span))
     }
-    pub fn current_line(&mut self) -> u32 {
-        self.peek_span().map(|s| s.line).unwrap_or(0)
+    pub fn current_line(&mut self) -> Result<u32, LexError> {
+        Ok(self.peek_span()?.map(|s| s.line).unwrap_or(0))
     }
     pub fn remaining(&self) -> usize {
         self.history.len().saturating_sub(self.pos)
-    }
-    pub fn take_error(&mut self) -> Option<LexError> {
-        self.pending_error.take()
     }
 }
 
@@ -9255,23 +9246,38 @@ mod array_parse_tests {
         let toks = tokenize("echo foo | grep bar").unwrap();
         let mut lx = Lexer::from_tokens(toks.clone());
         assert_eq!(lx.remaining(), toks.len());
-        assert_eq!(lx.peek_kind(), Some(&toks[0].kind));
-        assert_eq!(lx.peek2_kind(), Some(&toks[1].kind));
-        assert_eq!(lx.peek_span(), Some(toks[0].span));
+        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[0].kind));
+        assert_eq!(lx.peek2_kind().unwrap(), Some(&toks[1].kind));
+        assert_eq!(lx.peek_span().unwrap(), Some(toks[0].span));
         let mut drained = Vec::new();
-        while let Some(t) = lx.next() { drained.push(t); }
+        while let Some(t) = lx.next().unwrap() { drained.push(t); }
         assert_eq!(drained, toks);
-        assert_eq!(lx.peek_kind(), None);
-        assert_eq!(lx.next_kind(), None);
-        assert!(lx.take_error().is_none());
+        assert_eq!(lx.peek_kind().unwrap(), None);
+        assert_eq!(lx.next_kind().unwrap(), None);
     }
 
     #[test]
     fn pull_next_kind_matches_next_dot_kind() {
         let toks = tokenize("a b c").unwrap();
         let mut lx = Lexer::from_tokens(toks.clone());
-        assert_eq!(lx.next_kind(), Some(toks[0].kind.clone()));
-        assert_eq!(lx.peek_kind(), Some(&toks[1].kind));
+        assert_eq!(lx.next_kind().unwrap(), Some(toks[0].kind.clone()));
+        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[1].kind));
+    }
+
+    #[test]
+    fn pull_surfaces_lex_error_as_err() {
+        // A genuinely unterminated construct: the pull returns Err at the failing scan.
+        let mut lx = Lexer::new("echo \"unterminated", LexerOptions::default(), true);
+        // drain until we hit the error
+        let mut got_err = false;
+        loop {
+            match lx.next() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => { got_err = true; break; }
+            }
+        }
+        assert!(got_err, "unterminated quote must surface as Err from the pull");
     }
 }
 
