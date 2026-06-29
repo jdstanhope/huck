@@ -50,13 +50,14 @@ pub struct CharCursor<'a> {
     s: &'a str,
     pos: usize,
     line: u32,
+    column: u32,            // NEW: 1-based character column
     peeked: Option<char>,
     peeked_len: usize,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, peeked: None, peeked_len: 0 }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0 }
     }
 
     /// Peek the next char without consuming it.
@@ -82,6 +83,9 @@ impl<'a> CharCursor<'a> {
         self.line
     }
 
+    /// 1-based character column of the next char to be produced.
+    pub fn column(&self) -> u32 { self.column }
+
     /// Byte slice of the source from `start` to the current offset. Used to
     /// reconstruct the raw `${…}` text for a deferred bad-substitution.
     pub fn slice_from(&self, start: usize) -> &str {
@@ -95,11 +99,11 @@ impl Iterator for CharCursor<'_> {
         if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
-            if c == '\n' { self.line += 1; }
+            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
             Some(c)
         } else if let Some(c) = self.s[self.pos..].chars().next() {
             self.pos += c.len_utf8();
-            if c == '\n' { self.line += 1; }
+            if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
             Some(c)
         } else {
             None
@@ -321,6 +325,20 @@ pub enum WordPart {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Word(pub Vec<WordPart>);
+
+/// A token's source location. `column` is a 1-based character column
+/// (Unicode scalars from the line start; a tab is one column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub offset: usize,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Span {
+    /// Placeholder span for synthesized tokens / test fixtures (line 0 = unknown).
+    pub fn unknown() -> Span { Span { offset: 0, line: 0, column: 0 } }
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
@@ -4089,6 +4107,25 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::command::RedirFd;
+
+    #[test]
+    fn char_cursor_tracks_offset_line_column() {
+        let mut c = CharCursor::new("ab\ncé\td");
+        // before consuming: at 'a'
+        assert_eq!((c.offset(), c.line(), c.column()), (0, 1, 1));
+        c.next();                       // consume 'a'
+        assert_eq!((c.offset(), c.line(), c.column()), (1, 1, 2)); // at 'b'
+        c.next();                       // consume 'b'
+        assert_eq!((c.offset(), c.line(), c.column()), (2, 1, 3)); // at '\n'
+        c.next();                       // consume '\n' -> next line, col resets
+        assert_eq!((c.offset(), c.line(), c.column()), (3, 2, 1)); // at 'c'
+        c.next();                       // consume 'c'
+        assert_eq!((c.offset(), c.line(), c.column()), (4, 2, 2)); // at 'é' (2 bytes)
+        c.next();                       // consume 'é' -> offset +2, column +1
+        assert_eq!((c.offset(), c.line(), c.column()), (6, 2, 3)); // at '\t'
+        c.next();                       // consume tab -> one column
+        assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
+    }
 
     #[test]
     fn split_modifier_operand_basic_split() {
