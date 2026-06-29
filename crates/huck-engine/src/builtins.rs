@@ -6347,7 +6347,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // Partial tokenize: keep the tokens produced BEFORE any lex error so the
         // complete units (e.g. an earlier `shopt -s extglob`) can run first; the
         // truncated trailing unit is re-lexed with the now-current extglob.
-        let (tokens, offsets, lex_lines, terr) = crate::lexer::tokenize_partial(
+        let (mut tokens, terr) = crate::lexer::tokenize_partial(
             &contents[start..],
             crate::lexer::LexerOptions { extglob, ..Default::default() },
         );
@@ -6370,30 +6370,23 @@ pub(crate) fn run_sourced_contents_in_sinks(
             }
             break;
         }
-        // The lexer's line numbers are 1-based relative to &contents[start..].
-        // Add the base line offset (number of newlines before `start` in the file)
-        // so each token line reflects its true position in the file.
-        // lex_lines.len() == total + 1 (includes sentinel); slice to total.
+        // Tokens carry their own span. Lexer span lines are 1-based within the
+        // chunk `&contents[start..]`; make them file-absolute by adding the count
+        // of newlines before `start`, so $LINENO reflects the true file line.
         let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
-        let token_lines: Vec<u32> = lex_lines[..total].iter().map(|&l| l + base_line).collect();
+        for t in &mut tokens {
+            t.span.line += base_line;
+        }
         // v231: honor `shopt expand_aliases` (and interactive) in the file/source/-c
-        // path. Expand aliases on the chunk tokens, remapping offsets/lines back to
-        // the ORIGINAL source tokens via a provenance map so byte-offset bookkeeping
-        // (`unit_end_abs`, `set -v`) stays anchored to the raw source bytes.
+        // path. Alias expansion preserves spans (body tokens inherit the alias-name
+        // token's span), so byte-offset bookkeeping (`unit_end_abs`, `set -v`) and
+        // $LINENO stay anchored to the raw source with no manual remap.
         let expand = shell.is_interactive
             || shell.shopt_options.get("expand_aliases").unwrap_or(false);
         let alias_gen = shell.alias_generation;
-        let (tokens, token_lines, offsets, total) = if expand && !shell.aliases.is_empty() {
-            match crate::alias_expand::expand_aliases_in_tokens_mapped(tokens, &shell.aliases) {
-                Ok((exp, map)) => {
-                    let e = exp.len();
-                    let offsets2: Vec<usize> = (0..e)
-                        .map(|j| offsets[map[j]])
-                        .chain(std::iter::once(offsets[total]))
-                        .collect();
-                    let lines2: Vec<u32> = (0..e).map(|j| token_lines[map[j]]).collect();
-                    (exp, lines2, offsets2, e)
-                }
+        let tokens = if expand && !shell.aliases.is_empty() {
+            match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
+                Ok(exp) => exp,
                 Err(le) => {
                     {
                         let mut err = crate::executor::err_writer(err_sink, sink);
@@ -6405,15 +6398,23 @@ pub(crate) fn run_sourced_contents_in_sinks(
                 }
             }
         } else {
-            (tokens, token_lines, offsets, total)
+            tokens
         };
-        let mut iter = crate::command::TokenCursor::new(tokens, token_lines);
+        // Sentinel byte position for "the unit consumed every remaining token":
+        // the chunk byte length on a clean lex, or the lex-error offset when the
+        // chunk was truncated by a lex error. Per-token byte offsets travel with
+        // the tokens (their spans) and are read live from the cursor below, so
+        // there is no parallel offsets array to keep in lockstep.
+        let sentinel = match &terr {
+            Some((_, foff)) => *foff,
+            None => contents.len() - start,
+        };
+        let mut iter = crate::command::TokenCursor::new(tokens);
 
         loop {
-            while matches!(iter.peek(), Some(crate::lexer::Token::Newline)) {
+            while matches!(iter.peek(), Some(crate::lexer::TokenKind::Newline)) {
                 iter.next();
             }
-            let unit_start_idx = total - iter.len();
             if iter.peek().is_none() {
                 // Consumed every complete token. If the chunk truncated at a lex
                 // error, the un-lexed tail begins at `prev_end` (the end of the
@@ -6447,14 +6448,19 @@ pub(crate) fn run_sourced_contents_in_sinks(
                 }
                 break 'outer;
             }
+            // Byte offset of this unit's first token, read straight from its span.
+            let unit_start_off = iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
             match crate::command::parse_one_unit(&mut iter) {
                 Ok(None) => {
                     break 'outer;
                 }
                 Ok(Some(seq)) => {
-                    let unit_end_idx = total - iter.len();
-                    let unit_start_abs = start + offsets[unit_start_idx];
-                    let unit_end_abs = start + offsets[unit_end_idx];
+                    // End offset = next unparsed token's start (or the sentinel
+                    // when this unit consumed the rest of the chunk).
+                    let unit_end_off = iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
+                    let consumed_all = iter.len() == 0;
+                    let unit_start_abs = start + unit_start_off;
+                    let unit_end_abs = start + unit_end_off;
 
                     if shell.shell_options.verbose {
                         let mut err = crate::executor::err_writer(err_sink, sink);
@@ -6495,19 +6501,19 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     let new_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
                     let new_expand = shell.is_interactive
                         || shell.shopt_options.get("expand_aliases").unwrap_or(false);
-                    // Note: when alias expansion ran, `total` was re-bound to the
-                    // EXPANDED token count, so `unit_end_idx == total` below still
-                    // means "consumed every token" in the expanded stream.
+                    // `consumed_all` reflects the live cursor (whose tokens are the
+                    // post-alias-expansion stream), so it correctly means "this
+                    // unit consumed every remaining token".
                     if new_extglob != extglob
                         || new_expand != expand
                         || (new_expand && shell.alias_generation != alias_gen)
                     {
-                        // If this flipping unit was the last complete token before
-                        // a lex truncation, the un-lexed tail begins at the start
-                        // of the failing line — `offsets[total]` is the
+                        // If this flipping unit consumed the last complete token
+                        // before a lex truncation, the un-lexed tail begins at the
+                        // start of the failing line — the sentinel is the
                         // mid-construct failure byte, not a clean boundary.
                         start = match &terr {
-                            Some((_, foff)) if unit_end_idx == total => {
+                            Some((_, foff)) if consumed_all => {
                                 line_start_of(start + *foff)
                             }
                             _ => unit_end_abs,
@@ -6525,7 +6531,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     // report the lex error instead. The `> start` guard also
                     // covers the first-unit case (nothing ran, prefix offset 0).
                     let now_extglob = shell.shopt_options.get("extglob").unwrap_or(false);
-                    let resume = start + offsets[unit_start_idx];
+                    let resume = start + unit_start_off;
                     if now_extglob != extglob && resume > start {
                         start = resume;
                         prev_end = start;
@@ -6552,17 +6558,17 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         e!(&mut *err,
                             "huck: {}: line {}: syntax error: {}",
                             path.display(),
-                            line_of(start + offsets[unit_start_idx]),
+                            line_of(start + unit_start_off),
                             crate::parse_error_message(&e)
                         );
                     }
                     last_status = 2;
                     for t in iter.by_ref() {
-                        if matches!(t, crate::lexer::Token::Newline) {
+                        if matches!(t, crate::lexer::TokenKind::Newline) {
                             break;
                         }
                     }
-                    prev_end = start + offsets[total - iter.len()];
+                    prev_end = start + iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
                 }
             }
             // When the chunk lexed cleanly, exiting here once the tokens run out

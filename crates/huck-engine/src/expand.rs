@@ -2326,8 +2326,8 @@ mod tests {
         use crate::lexer::tokenize;
         fn rt(src: &str) -> String {
             let toks = tokenize(src).expect("lex");
-            let w = toks.iter().find_map(|t| match t {
-                crate::lexer::Token::Word(w) => Some(w.clone()),
+            let w = toks.iter().find_map(|t| match &t.kind {
+                crate::lexer::TokenKind::Word(w) => Some(w.clone()),
                 _ => None,
             }).expect("a Word token");
             reconstruct_word_source(&w)

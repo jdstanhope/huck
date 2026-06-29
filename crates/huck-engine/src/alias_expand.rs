@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::lexer::{LexError, Operator, Token, Word, WordPart};
+use crate::lexer::{LexError, Operator, Span, Token, TokenKind, Word, WordPart};
 
 /// Compound-command context. The stack handles nesting (e.g. a `case`
 /// inside a `case` body).
@@ -41,7 +41,7 @@ pub fn expand_aliases_in_tokens_mapped(
 ) -> Result<(Vec<Token>, Vec<usize>), LexError> {
     let mut ex = Expander::new(aliases);
     for (src_idx, token) in tokens.into_iter().enumerate() {
-        ex.feed(token, src_idx)?;
+        ex.feed(token.kind, token.span, src_idx)?;
     }
     Ok((ex.out, ex.map))
 }
@@ -78,21 +78,21 @@ impl<'a> Expander<'a> {
         self.ctx.last().copied()
     }
 
-    fn push(&mut self, token: Token, src_idx: usize) {
-        self.out.push(token);
+    fn push(&mut self, kind: TokenKind, span: Span, src_idx: usize) {
+        self.out.push(Token { kind, span });
         self.map.push(src_idx);
     }
 
     /// Feed one source token, updating output, map, eligibility, and context.
-    fn feed(&mut self, token: Token, src_idx: usize) -> Result<(), LexError> {
-        match token {
-            Token::Word(w) => self.feed_word(w, src_idx),
-            Token::Op(op) => {
-                self.feed_op(op, src_idx);
+    fn feed(&mut self, kind: TokenKind, span: Span, src_idx: usize) -> Result<(), LexError> {
+        match kind {
+            TokenKind::Word(w) => self.feed_word(w, span, src_idx),
+            TokenKind::Op(op) => {
+                self.feed_op(op, span, src_idx);
                 Ok(())
             }
-            Token::Newline => {
-                self.feed_newline(src_idx);
+            TokenKind::Newline => {
+                self.feed_newline(span, src_idx);
                 Ok(())
             }
             // Heredoc / ArithBlock / RedirFd: not command-position changing.
@@ -101,13 +101,13 @@ impl<'a> Expander<'a> {
             // misfire function-definition detection on the closing `)`.
             other => {
                 self.last_was_open_paren = false;
-                self.push(other, src_idx);
+                self.push(other, span, src_idx);
                 Ok(())
             }
         }
     }
 
-    fn feed_word(&mut self, w: Word, src_idx: usize) -> Result<(), LexError> {
+    fn feed_word(&mut self, w: Word, span: Span, src_idx: usize) -> Result<(), LexError> {
         // Any word token breaks the "just saw LParen" chain.
         self.last_was_open_paren = false;
         let text = simple_word_text(&w);
@@ -119,7 +119,7 @@ impl<'a> Expander<'a> {
                 if text.as_deref() == Some("in") {
                     *self.ctx.last_mut().unwrap() = Ctx::CasePattern;
                 }
-                self.push(Token::Word(w), src_idx);
+                self.push(TokenKind::Word(w), span, src_idx);
                 self.eligible = false;
                 return Ok(());
             }
@@ -127,7 +127,7 @@ impl<'a> Expander<'a> {
                 if text.as_deref() == Some("esac") {
                     self.ctx.pop();
                 }
-                self.push(Token::Word(w), src_idx);
+                self.push(TokenKind::Word(w), span, src_idx);
                 self.eligible = false;
                 return Ok(());
             }
@@ -135,12 +135,12 @@ impl<'a> Expander<'a> {
                 if text.as_deref() == Some("in") {
                     *self.ctx.last_mut().unwrap() = Ctx::ForList;
                 }
-                self.push(Token::Word(w), src_idx);
+                self.push(TokenKind::Word(w), span, src_idx);
                 self.eligible = false;
                 return Ok(());
             }
             Some(Ctx::ForList) => {
-                self.push(Token::Word(w), src_idx);
+                self.push(TokenKind::Word(w), span, src_idx);
                 self.eligible = false;
                 return Ok(());
             }
@@ -148,7 +148,7 @@ impl<'a> Expander<'a> {
                 if text.as_deref() == Some("]]") {
                     self.ctx.pop();
                 }
-                self.push(Token::Word(w), src_idx);
+                self.push(TokenKind::Word(w), span, src_idx);
                 self.eligible = false;
                 return Ok(());
             }
@@ -159,24 +159,24 @@ impl<'a> Expander<'a> {
         if self.eligible {
             if let Some(t) = text.as_deref() {
                 if let Some(next_elig) = self.handle_reserved(t) {
-                    self.push(Token::Word(w), src_idx);
+                    self.push(TokenKind::Word(w), span, src_idx);
                     self.eligible = next_elig;
                     return Ok(());
                 }
                 if !self.active.contains(t)
                     && let Some(body) = self.aliases.get(t).cloned()
                 {
-                    return self.expand_alias(t.to_string(), body, src_idx);
+                    return self.expand_alias(t.to_string(), body, span, src_idx);
                 }
             }
             // Ordinary command word (no alias): consumes command position.
-            self.push(Token::Word(w), src_idx);
+            self.push(TokenKind::Word(w), span, src_idx);
             self.eligible = false;
             return Ok(());
         }
 
         // Argument word.
-        self.push(Token::Word(w), src_idx);
+        self.push(TokenKind::Word(w), span, src_idx);
         self.eligible = false;
         Ok(())
     }
@@ -217,6 +217,7 @@ impl<'a> Expander<'a> {
         &mut self,
         name: String,
         body: String,
+        name_span: Span,
         src_idx: usize,
     ) -> Result<(), LexError> {
         self.active.insert(name.clone());
@@ -224,8 +225,10 @@ impl<'a> Expander<'a> {
         // The alias body begins at command position.
         self.eligible = true;
         for inner in inner_tokens {
-            // Body tokens inherit the alias-name token's source index.
-            self.feed(inner, src_idx)?;
+            // Body tokens inherit the alias-name token's source index AND span
+            // (their own body-relative span is discarded), so an alias-expanded
+            // command reports the alias use's real source line for $LINENO.
+            self.feed(inner.kind, name_span, src_idx)?;
         }
         self.active.remove(&name);
         // Trailing-blank rule: a body ending in whitespace makes the next
@@ -234,11 +237,11 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    fn feed_op(&mut self, op: Operator, src_idx: usize) {
+    fn feed_op(&mut self, op: Operator, span: Span, src_idx: usize) {
         match self.top() {
             Some(Ctx::CasePattern) => {
                 self.last_was_open_paren = false;
-                self.push(Token::Op(op), src_idx);
+                self.push(TokenKind::Op(op), span, src_idx);
                 if matches!(op, Operator::RParen) {
                     *self.ctx.last_mut().unwrap() = Ctx::CaseBody;
                     self.eligible = true;
@@ -255,13 +258,13 @@ impl<'a> Expander<'a> {
                 ) =>
             {
                 self.last_was_open_paren = false;
-                self.push(Token::Op(op), src_idx);
+                self.push(TokenKind::Op(op), span, src_idx);
                 *self.ctx.last_mut().unwrap() = Ctx::CasePattern;
                 self.eligible = false;
             }
             Some(Ctx::ForName) | Some(Ctx::ForList) if matches!(op, Operator::Semi) => {
                 self.last_was_open_paren = false;
-                self.push(Token::Op(op), src_idx);
+                self.push(TokenKind::Op(op), span, src_idx);
                 self.ctx.pop();
                 self.eligible = true;
             }
@@ -270,7 +273,7 @@ impl<'a> Expander<'a> {
             | Some(Ctx::ForName)
             | Some(Ctx::ForList) => {
                 self.last_was_open_paren = false;
-                self.push(Token::Op(op), src_idx);
+                self.push(TokenKind::Op(op), span, src_idx);
                 self.eligible = false;
             }
             _ => {
@@ -283,7 +286,7 @@ impl<'a> Expander<'a> {
                 let func_def_close =
                     matches!(op, Operator::RParen) && self.last_was_open_paren;
                 self.last_was_open_paren = matches!(op, Operator::LParen);
-                self.push(Token::Op(op), src_idx);
+                self.push(TokenKind::Op(op), span, src_idx);
                 self.eligible = func_def_close
                     || matches!(
                         op,
@@ -298,23 +301,23 @@ impl<'a> Expander<'a> {
         }
     }
 
-    fn feed_newline(&mut self, src_idx: usize) {
+    fn feed_newline(&mut self, span: Span, src_idx: usize) {
         // A newline between `(` and `)` in `f(\n)` is unusual; reset the flag
         // conservatively so we don't misfire on multi-line constructs.
         self.last_was_open_paren = false;
         match self.top() {
             Some(Ctx::ForName) | Some(Ctx::ForList) => {
                 self.ctx.pop();
-                self.push(Token::Newline, src_idx);
+                self.push(TokenKind::Newline, span, src_idx);
                 self.eligible = true;
             }
             Some(Ctx::CaseSubject) | Some(Ctx::CasePattern) | Some(Ctx::DoubleBracket) => {
-                self.push(Token::Newline, src_idx);
+                self.push(TokenKind::Newline, span, src_idx);
                 self.eligible = false;
             }
             _ => {
                 // CaseBody or empty stack: newline is a command separator.
-                self.push(Token::Newline, src_idx);
+                self.push(TokenKind::Newline, span, src_idx);
                 self.eligible = true;
             }
         }
@@ -431,8 +434,8 @@ mod tests {
         let aliases = make_aliases(&[("ll", "ls -l")]);
         let toks = crate::lexer::tokenize("ll /usr").unwrap();
         let (out, map) = super::expand_aliases_in_tokens_mapped(toks, &aliases).unwrap();
-        let words: Vec<String> = out.iter().filter_map(|t| match t {
-            crate::lexer::Token::Word(w) => super::simple_word_text(w), _ => None }).collect();
+        let words: Vec<String> = out.iter().filter_map(|t| match &t.kind {
+            crate::lexer::TokenKind::Word(w) => super::simple_word_text(w), _ => None }).collect();
         assert_eq!(words, vec!["ls", "-l", "/usr"]);
         assert_eq!(map, vec![0, 0, 1]);
     }

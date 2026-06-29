@@ -336,6 +336,10 @@ pub struct Span {
 }
 
 impl Span {
+    /// A span at byte `offset`, 1-based source `line`, and 1-based character
+    /// `column`. Built at lex time from the `CharCursor` position of a token's
+    /// first character, so location travels with the token (no sidecar arrays).
+    pub fn new(offset: usize, line: u32, column: u32) -> Span { Span { offset, line, column } }
     /// Placeholder span for synthesized tokens / test fixtures (line 0 = unknown).
     pub fn unknown() -> Span { Span { offset: 0, line: 0, column: 0 } }
 }
@@ -443,12 +447,6 @@ pub fn tokenize_with_opts(input: &str, opts: LexerOptions) -> Result<Vec<Token>,
     }
 }
 
-/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
-/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
-/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
-/// trailing offset is `input.len()` on success, or the error byte offset on
-/// failure. This lets the source reader execute the complete units that lexed
-/// before the failure and re-lex the truncated trailing unit.
 /// Core tokenizer body. `brace_expand` controls whether unquoted braces are
 /// expanded into multiple Words (`true` for normal command words) or left as
 /// literal text in a single Word (`false` for array-literal elements, which are
@@ -483,28 +481,20 @@ fn tokenize_partial_inner(
     opts: LexerOptions,
     brace_expand: bool,
 ) -> PartialTokens {
-    let mut tokens: Vec<TokenKind> = Vec::new();
-    let mut offsets: Vec<usize> = Vec::new();
-    let mut lines: Vec<u32> = Vec::new();
-    // Lockstep push: always push offset and line together so they can never diverge.
-    macro_rules! push_pos {
-        ($off:expr, $ln:expr) => {{ offsets.push($off); lines.push($ln); }};
-    }
+    let mut tokens: Vec<Token> = Vec::new();
     // When `$glued` (no whitespace between the just-flushed Word and the
     // redirect operator about to be pushed), and that trailing Word is a pure
     // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
-    // same offset/line. Keeps `offsets`/`lines` parallel to `tokens`. Must be
+    // same span. Must be
     // invoked AFTER the preceding word has been flushed and BEFORE the operator
     // token is pushed.
     macro_rules! take_fd_prefix {
         ($glued:expr) => {{
             if $glued {
-                if let Some(fd) = fd_prefix_of(tokens.last()) {
-                    tokens.pop();
-                    let off = offsets.pop().expect("offset parallel to token");
-                    let ln = lines.pop().expect("line parallel to token");
-                    tokens.push(TokenKind::RedirFd(fd));
-                    push_pos!(off, ln);
+                if let Some(fd) = fd_prefix_of(tokens.last().map(|t| &t.kind)) {
+                    // Replace the digit/`{n}` word with a RedirFd at the SAME span.
+                    let span = tokens.pop().expect("fd-prefix word present").span;
+                    tokens.push(Token::new(TokenKind::RedirFd(fd), span));
                 }
             }
         }};
@@ -514,6 +504,7 @@ fn tokenize_partial_inner(
     let mut has_token = false;
     let mut token_start: usize = 0;
     let mut token_start_line: u32 = 1;
+    let mut token_start_col: u32 = 1;
     let mut in_assignment_value = false;
     // `[[ … ]]` context tracking for the `=~` regex operand. `dbracket_depth`
     // counts open `[[`; `expect_regex` is armed right after an `=~` keyword
@@ -541,9 +532,9 @@ fn tokenize_partial_inner(
                     // emit_word_with_braces) so no brace expansion applies.
                     let operand_start = chars.offset();
                     let operand_line = chars.line();
+                    let operand_col = chars.column();
                     let parts = scan_regex_operand(&mut chars, opts)?;
-                    tokens.push(TokenKind::Word(Word(parts)));
-                    push_pos!(operand_start, operand_line);
+                    tokens.push(Token::new(TokenKind::Word(Word(parts)), Span::new(operand_start, operand_line, operand_col)));
                     has_token = false;
                     continue;
                 }
@@ -553,6 +544,7 @@ fn tokenize_partial_inner(
         }
         let c_off = chars.offset();
         let c_line = chars.line();
+        let c_col = chars.column();
         let c = match chars.next() {
             Some(c) => c,
             None => break,
@@ -565,8 +557,7 @@ fn tokenize_partial_inner(
                     "lexer invariant: has_token was true but no parts were emitted"
                 );
                 let kw = single_unquoted_literal(&parts).map(str::to_owned);
-                let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                for _ in 0..n { push_pos!(token_start, token_start_line); }
+                emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                 match kw.as_deref() {
                     Some("[[") => dbracket_depth += 1,
                     Some("]]") => dbracket_depth = dbracket_depth.saturating_sub(1),
@@ -582,8 +573,7 @@ fn tokenize_partial_inner(
                 if !pending_heredocs.is_empty() {
                     collect_heredoc_bodies(&mut chars, &mut pending_heredocs, &mut tokens, opts)?;
                 }
-                tokens.push(TokenKind::Newline);
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
             }
             continue;
         }
@@ -596,6 +586,7 @@ fn tokenize_partial_inner(
         if !has_token {
             token_start = c_off;
             token_start_line = c_line;
+            token_start_col = c_col;
         }
 
         // extglob (`shopt -s extglob`): one of `? * + @ !` directly followed
@@ -730,66 +721,57 @@ fn tokenize_partial_inner(
             '|' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::Or));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::Or), Span::new(c_off, c_line, c_col)));
                 } else if chars.peek() == Some(&'&') {
                     // `|&` is bash shorthand for `2>&1 |`: merge the left command's
                     // stderr into the pipe, then pipe. Desugar at the token level so
                     // the existing pipeline/redirect machinery (incl. v176
                     // compound-stage redirects) handles it unchanged.
                     chars.next(); // consume the '&' of `|&`
-                    tokens.push(TokenKind::RedirFd(crate::command::RedirFd::Number(2)));
-                    push_pos!(c_off, c_line);
-                    tokens.push(TokenKind::Op(Operator::DupOut));
-                    push_pos!(c_off, c_line);
-                    tokens.push(TokenKind::Word(Word(vec![WordPart::Literal {
+                    tokens.push(Token::new(TokenKind::RedirFd(crate::command::RedirFd::Number(2)), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Word(Word(vec![WordPart::Literal {
                         text: "1".to_string(),
                         quoted: false,
-                    }])));
-                    push_pos!(c_off, c_line);
-                    tokens.push(TokenKind::Op(Operator::Pipe));
-                    push_pos!(c_off, c_line);
+                    }])), Span::new(c_off, c_line, c_col)));
+                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
                 } else {
-                    tokens.push(TokenKind::Op(Operator::Pipe));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::Pipe), Span::new(c_off, c_line, c_col)));
                 }
                 in_assignment_value = false;
             }
             '&' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::And));
+                    tokens.push(Token::from(TokenKind::Op(Operator::And)));
                 } else if chars.peek() == Some(&'>') {
                     chars.next();
                     if chars.peek() == Some(&'>') {
                         chars.next();
-                        tokens.push(TokenKind::Op(Operator::AndRedirAppend));
+                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirAppend)));
                     } else {
-                        tokens.push(TokenKind::Op(Operator::AndRedirOut));
+                        tokens.push(Token::from(TokenKind::Op(Operator::AndRedirOut)));
                     }
                 } else {
-                    tokens.push(TokenKind::Op(Operator::Background));
+                    tokens.push(Token::from(TokenKind::Op(Operator::Background)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             ';' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 let op = if chars.peek() == Some(&';') {
@@ -806,15 +788,13 @@ fn tokenize_partial_inner(
                 } else {
                     Operator::Semi
                 };
-                tokens.push(TokenKind::Op(op));
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Op(op), Span::new(c_off, c_line, c_col)));
                 in_assignment_value = false;
             }
             '(' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 // Detect `((` (contiguous, no whitespace). The peek/next
@@ -834,27 +814,25 @@ fn tokenize_partial_inner(
                     let saved = chars.clone();
                     chars.next(); // consume the second `(`
                     match scan_arith_block(&mut chars) {
-                        Ok(body) => tokens.push(TokenKind::ArithBlock(body, opts)),
+                        Ok(body) => tokens.push(Token::from(TokenKind::ArithBlock(body, opts))),
                         Err(_) => {
                             chars = saved;
-                            tokens.push(TokenKind::Op(Operator::LParen));
+                            tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
                         }
                     }
                 } else {
-                    tokens.push(TokenKind::Op(Operator::LParen));
+                    tokens.push(Token::from(TokenKind::Op(Operator::LParen)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             ')' => {
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
-                tokens.push(TokenKind::Op(Operator::RParen));
-                push_pos!(c_off, c_line);
+                tokens.push(Token::new(TokenKind::Op(Operator::RParen), Span::new(c_off, c_line, c_col)));
                 in_assignment_value = false;
             }
             '<' => {
@@ -863,8 +841,7 @@ fn tokenize_partial_inner(
                 let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'<') {
@@ -872,7 +849,7 @@ fn tokenize_partial_inner(
                     if chars.peek() == Some(&'<') {
                         chars.next(); // consume third '<' — here-string
                         take_fd_prefix!(glued);
-                        tokens.push(TokenKind::Op(Operator::HereString));
+                        tokens.push(Token::from(TokenKind::Op(Operator::HereString)));
                     } else {
                         let strip_tabs = if chars.peek() == Some(&'-') {
                             chars.next(); // consume '-'
@@ -888,11 +865,11 @@ fn tokenize_partial_inner(
                         // Push a placeholder TokenKind::Heredoc with empty body.
                         // The body is back-patched after the line's \n.
                         let placeholder_idx = tokens.len();
-                        tokens.push(TokenKind::Heredoc {
+                        tokens.push(Token::from(TokenKind::Heredoc {
                             body: Word(Vec::new()),
                             expand,
                             strip_tabs,
-                        });
+                        }));
                         pending_heredocs.push_back(PendingHeredoc {
                             delim,
                             expand,
@@ -900,7 +877,7 @@ fn tokenize_partial_inner(
                             token_idx: placeholder_idx,
                         });
                     }
-                    push_pos!(c_off, c_line);
+                    if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `<(cmd)` — process substitution. Consume the `(` and scan the
@@ -918,19 +895,16 @@ fn tokenize_partial_inner(
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::DupIn));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupIn), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'>') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::RedirReadWrite));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirReadWrite), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else {
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::RedirIn));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirIn), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 }
             }
@@ -938,27 +912,23 @@ fn tokenize_partial_inner(
                 let glued = has_token;
                 if has_token {
                     flush_literal(&mut parts, &mut current, false);
-                    let n = emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand)?;
-                    for _ in 0..n { push_pos!(token_start, token_start_line); }
+                    emit_word_with_braces(&mut tokens, std::mem::take(&mut parts), brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
                     has_token = false;
                 }
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::RedirAppend));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirAppend), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::DupOut));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::DupOut), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::RedirClobber));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirClobber), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 } else if chars.peek() == Some(&'(') {
                     // `>(cmd)` — process substitution. Consume the `(` and scan the
@@ -975,8 +945,7 @@ fn tokenize_partial_inner(
                     in_assignment_value = false;
                 } else {
                     take_fd_prefix!(glued);
-                    tokens.push(TokenKind::Op(Operator::RedirOut));
-                    push_pos!(c_off, c_line);
+                    tokens.push(Token::new(TokenKind::Op(Operator::RedirOut), Span::new(c_off, c_line, c_col)));
                     in_assignment_value = false;
                 }
             }
@@ -984,34 +953,34 @@ fn tokenize_partial_inner(
                 chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::RedirAppend));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirAppend)));
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::DupOut));
+                    tokens.push(Token::from(TokenKind::Op(Operator::DupOut)));
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::RedirClobber));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirClobber)));
                 } else {
-                    tokens.push(TokenKind::Op(Operator::RedirOut));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirOut)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             '2' if !has_token && chars.peek() == Some(&'>') => {
                 chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::RedirErrAppend));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrAppend)));
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::DupErr));
+                    tokens.push(Token::from(TokenKind::Op(Operator::DupErr)));
                 } else if chars.peek() == Some(&'|') {
                     chars.next();
-                    tokens.push(TokenKind::Op(Operator::RedirErrClobber));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErrClobber)));
                 } else {
-                    tokens.push(TokenKind::Op(Operator::RedirErr));
+                    tokens.push(Token::from(TokenKind::Op(Operator::RedirErr)));
                 }
-                push_pos!(c_off, c_line);
+                if let Some(t) = tokens.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
                 in_assignment_value = false;
             }
             '=' if !in_assignment_value && word_is_identifier_so_far(&current, &parts) => {
@@ -1157,8 +1126,7 @@ fn tokenize_partial_inner(
 
     if has_token {
         flush_literal(&mut parts, &mut current, false);
-        let n = emit_word_with_braces(&mut tokens, parts, brace_expand)?;
-        for _ in 0..n { push_pos!(token_start, token_start_line); }
+        emit_word_with_braces(&mut tokens, parts, brace_expand, Span::new(token_start, token_start_line, token_start_col))?;
     }
     // If there are unresolved pending heredocs after end-of-input, it's an error.
     if !pending_heredocs.is_empty() {
@@ -1167,10 +1135,6 @@ fn tokenize_partial_inner(
     Ok(())
     })();
 
-    // No sentinel: offsets/lines now parallel `tokens` exactly (one per token).
-    debug_assert_eq!(offsets.len(), tokens.len(), "offset sidecar must parallel tokens");
-    debug_assert_eq!(offsets.len(), lines.len(), "offsets/lines out of lockstep");
-    let tokens = zip_spans(input, tokens, &offsets, &lines);
     match result {
         Ok(()) => (tokens, None),
         // Partial: keep the tokens produced before the error; the error byte
@@ -1179,42 +1143,12 @@ fn tokenize_partial_inner(
     }
 }
 
-/// Pair each token KIND with its captured byte `offset`/`line` and a 1-based
-/// CHARACTER `column`, producing spanned `Token`s. Columns are computed in a
-/// single forward pass over `input` (O(n) total — no per-token rescan, so no
-/// O(n²) cliff on large inputs). `offsets` is non-decreasing because tokens are
-/// emitted in source order, so one walker suffices. The column definition
-/// matches `CharCursor::column` (Unicode scalars from the line start; tab = 1;
-/// reset after `'\n'`).
-fn zip_spans(input: &str, kinds: Vec<TokenKind>, offsets: &[usize], lines: &[u32]) -> Vec<Token> {
-    debug_assert_eq!(kinds.len(), offsets.len());
-    debug_assert_eq!(kinds.len(), lines.len());
-    let mut out = Vec::with_capacity(kinds.len());
-    let mut chars = input.char_indices();
-    let mut walk = 0usize; // byte offset of the next char `chars` will yield
-    let mut col = 1u32; // 1-based character column at `walk`
-    for (kind, (&offset, &line)) in kinds.into_iter().zip(offsets.iter().zip(lines.iter())) {
-        debug_assert!(offset >= walk, "token offsets must be non-decreasing");
-        while walk < offset {
-            match chars.next() {
-                Some((idx, c)) => {
-                    walk = idx + c.len_utf8();
-                    if c == '\n' { col = 1; } else { col += 1; }
-                }
-                None => break,
-            }
-        }
-        out.push(Token { kind, span: Span { offset, line, column: col } });
-    }
-    out
-}
-
-/// Like `tokenize_with_offsets`, but on a lex error returns the tokens produced
-/// BEFORE the error plus `Some((error, byte_offset))`. On success the third
-/// element is `None`. In BOTH cases `offsets.len() == tokens.len() + 1`: the
-/// trailing offset is `input.len()` on success, or the error byte offset on
-/// failure. This lets the source reader execute the complete units that lexed
-/// before the failure and re-lex the truncated trailing unit.
+/// Tokenizes `input`, returning `(tokens, error)`. On a lex error the tokens
+/// produced BEFORE the error are returned alongside `Some((error, byte_offset))`;
+/// on success the second element is `None`. Each token carries its own span, so
+/// there is no separate offsets sidecar — the byte offset of the truncation is
+/// the `byte_offset` in the error tuple. This lets the source reader execute the
+/// complete units that lexed before the failure and re-lex the truncated unit.
 pub fn tokenize_partial(
     input: &str,
     opts: LexerOptions,
@@ -1512,18 +1446,20 @@ fn split_on_sentinels(s: &str, placeholders: &[WordPart]) -> Vec<WordPart> {
 /// product). Callers that track byte offsets push the word's start offset this
 /// many times to keep the offset sidecar in lockstep with the token stream.
 fn emit_word_with_braces(
-    tokens: &mut Vec<TokenKind>,
+    tokens: &mut Vec<Token>,
     parts: Vec<WordPart>,
     brace_expand: bool,
+    span: Span,
 ) -> Result<usize, LexError> {
     if !brace_expand {
-        tokens.push(TokenKind::Word(Word(parts)));
+        tokens.push(Token::new(TokenKind::Word(Word(parts)), span));
         return Ok(1);
     }
     let products = brace_expand_parts(parts)?;
     let count = products.len();
     for p in products {
-        tokens.push(TokenKind::Word(Word(p)));
+        // Every brace-expansion product shares the source word's start span.
+        tokens.push(Token::new(TokenKind::Word(Word(p)), span));
     }
     Ok(count)
 }
@@ -1616,12 +1552,14 @@ fn parse_heredoc_delim(
 fn collect_heredoc_bodies(
     chars: &mut CharCursor<'_>,
     pending: &mut std::collections::VecDeque<PendingHeredoc>,
-    tokens: &mut [TokenKind],
+    tokens: &mut [Token],
     opts: LexerOptions,
 ) -> Result<(), LexError> {
     while let Some(ph) = pending.pop_front() {
         let body = collect_one_heredoc_body(chars, &ph, opts)?;
-        if let Some(TokenKind::Heredoc { body: slot, expand, strip_tabs }) = tokens.get_mut(ph.token_idx) {
+        if let Some(TokenKind::Heredoc { body: slot, expand, strip_tabs }) =
+            tokens.get_mut(ph.token_idx).map(|t| &mut t.kind)
+        {
             *slot = body;
             *expand = ph.expand;
             *strip_tabs = ph.strip_tabs;
@@ -4542,6 +4480,28 @@ mod tests {
         let toks = tokenize_with_opts("+(a|b)", LexerOptions { extglob: true, ..Default::default() }).unwrap();
         assert_eq!(toks.len(), 1, "expected one Word token, got {toks:?}");
         assert!(matches!(&toks[0].kind, TokenKind::Word(_)));
+    }
+
+    #[test]
+    fn span_columns_are_1based_char_columns_reset_per_line() {
+        // 1-based CHARACTER columns (Unicode scalars; tab counts as 1) captured at
+        // each token's first char, reset to 1 after a newline. Built at lex time
+        // from the CharCursor — no offsets/lines sidecar, no zip pass.
+        //          col: 1234567 8 12345
+        let src = "echo  hi\nαβ x";
+        let toks = tokenize(src).unwrap();
+        // "echo" starts at column 1.
+        assert_eq!(toks[0].span.column, 1);
+        // "hi" follows two spaces after "echo " -> column 7.
+        assert_eq!(toks[1].span.column, 7);
+        // Newline itself sits at column 9 (after "echo  hi").
+        let nl = toks.iter().position(|t| matches!(&t.kind, TokenKind::Newline)).unwrap();
+        assert_eq!(toks[nl].span.column, 9);
+        // After the newline, "αβ" starts at column 1 (two scalars, not bytes).
+        assert_eq!(toks[nl + 1].span.column, 1);
+        // "x" is one scalar ('α','β') + one space past column 1 -> column 4.
+        assert_eq!(toks[nl + 2].span.column, 4);
+        assert_eq!(toks[nl + 2].span.line, 2);
     }
 
     #[test]

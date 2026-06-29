@@ -376,34 +376,29 @@ pub fn process_line_in_sinks(
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let opts = lexer::LexerOptions { extglob: shell.extglob(), ..Default::default() };
-    let (tokens, _offsets, lex_lines) = match lexer::tokenize_with_offsets(line, opts) {
-        Ok((tokens, offsets, lines)) => (tokens, offsets, lines),
-        Err((e, _off)) => {
+    // Tokens now carry their own source span; no parallel offsets/lines sidecar.
+    let tokens = match lexer::tokenize_with_opts(line, opts) {
+        Ok(tokens) => tokens,
+        Err(e) => {
             { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
             return ExecOutcome::Continue(2);
         }
     };
-    // Per-token source lines stamped directly by the lexer (true O(n), no second pass).
-    // lex_lines.len() == tokens.len() + 1 (includes sentinel); slice to token count.
-    let lines: Vec<u32> = lex_lines[..tokens.len()].to_vec();
-    let (tokens, lines) = if expand_aliases {
+    // Alias expansion preserves spans (body tokens inherit the alias-name token's
+    // span), so $LINENO stays correct through expansion — no line remap needed.
+    let tokens = if expand_aliases {
         match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
-            Ok(t) => {
-                // If alias expansion changed the token count, fall back to zeros
-                // rather than corrupting the line index.
-                let l = if t.len() == lines.len() { lines } else { vec![0; t.len()] };
-                (t, l)
-            }
+            Ok(t) => t,
             Err(e) => {
                 { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
                 return ExecOutcome::Continue(2);
             }
         }
     } else {
-        (tokens, lines)
+        tokens
     };
 
-    match command::parse_with_lines(tokens, lines) {
+    match command::parse(tokens) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {

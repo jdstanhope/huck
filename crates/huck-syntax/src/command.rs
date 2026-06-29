@@ -1,4 +1,4 @@
-use crate::lexer::{Operator, Token, TokenKind, Word, WordPart};
+use crate::lexer::{Operator, Span, Token, TokenKind, Word, WordPart};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Keyword {
@@ -790,6 +790,12 @@ impl TokenCursor {
     /// Peek at the kind of the token after next without consuming anything.
     pub fn peek2(&self) -> Option<&TokenKind> {
         self.tokens.get(self.pos + 1)?.as_ref().map(|t| &t.kind)
+    }
+    /// Span (offset/line/column) of the next token to be returned, or `None`
+    /// past the end. Lets a caller map a parse position back to a source
+    /// location straight from the live token — no parallel offsets/lines array.
+    pub fn peek_span(&self) -> Option<Span> {
+        self.tokens.get(self.pos)?.as_ref().map(|t| t.span)
     }
 }
 impl Iterator for TokenCursor {
