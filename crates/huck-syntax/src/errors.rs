@@ -61,6 +61,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         ParseError::ArithForHeader(msg) => {
             format!("'for ((...))' header: {msg}")
         }
+        ParseError::Lex(e) => crate::lex_error_message(e),
     }
 }
 

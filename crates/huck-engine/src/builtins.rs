@@ -6409,13 +6409,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
             Some((_, foff)) => *foff,
             None => contents.len() - start,
         };
-        let mut iter = crate::command::TokenCursor::new(tokens);
+        let mut iter = crate::lexer::Lexer::from_tokens(tokens);
 
         loop {
-            while matches!(iter.peek(), Some(crate::lexer::TokenKind::Newline)) {
-                iter.next();
+            while matches!(iter.peek_kind().ok().flatten(), Some(crate::lexer::TokenKind::Newline)) {
+                let _ = iter.next_kind();
             }
-            if iter.peek().is_none() {
+            if iter.peek_kind().ok().flatten().is_none() {
                 // Consumed every complete token. If the chunk truncated at a lex
                 // error, the un-lexed tail begins at `prev_end` (the end of the
                 // last executed unit). Re-lex that tail ONLY if a command in this
@@ -6449,7 +6449,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
                 break 'outer;
             }
             // Byte offset of this unit's first token, read straight from its span.
-            let unit_start_off = iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
+            let unit_start_off = iter.peek_span().ok().flatten().map(|sp| sp.offset).unwrap_or(sentinel);
             match crate::command::parse_one_unit(&mut iter) {
                 Ok(None) => {
                     break 'outer;
@@ -6457,8 +6457,8 @@ pub(crate) fn run_sourced_contents_in_sinks(
                 Ok(Some(seq)) => {
                     // End offset = next unparsed token's start (or the sentinel
                     // when this unit consumed the rest of the chunk).
-                    let unit_end_off = iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
-                    let consumed_all = iter.len() == 0;
+                    let unit_end_off = iter.peek_span().ok().flatten().map(|sp| sp.offset).unwrap_or(sentinel);
+                    let consumed_all = iter.remaining() == 0;
                     let unit_start_abs = start + unit_start_off;
                     let unit_end_abs = start + unit_end_off;
 
@@ -6563,19 +6563,20 @@ pub(crate) fn run_sourced_contents_in_sinks(
                         );
                     }
                     last_status = 2;
-                    for t in iter.by_ref() {
-                        if matches!(t, crate::lexer::TokenKind::Newline) {
-                            break;
+                    loop {
+                        match iter.next_kind().ok().flatten() {
+                            Some(crate::lexer::TokenKind::Newline) | None => break,
+                            Some(_) => {}
                         }
                     }
-                    prev_end = start + iter.peek_span().map(|sp| sp.offset).unwrap_or(sentinel);
+                    prev_end = start + iter.peek_span().ok().flatten().map(|sp| sp.offset).unwrap_or(sentinel);
                 }
             }
             // When the chunk lexed cleanly, exiting here once the tokens run out
             // is correct. But if `terr` is Some, the chunk was truncated by a lex
             // error: loop back to the top so the iter-empty truncation branch can
             // re-lex the tail (if extglob flipped) or report the lex error.
-            if iter.peek().is_none() && terr.is_none() {
+            if iter.peek_kind().ok().flatten().is_none() && terr.is_none() {
                 break 'outer;
             }
         }

@@ -1,4 +1,4 @@
-use crate::lexer::{Operator, Span, Token, TokenKind, Word, WordPart};
+use crate::lexer::{Lexer, Operator, Token, TokenKind, Word, WordPart};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Keyword {
@@ -218,18 +218,18 @@ fn finalize_stage(
     // word is confirmed to be assignment-shaped, avoiding a deep clone on
     // every non-assignment first word.
     let mut inline: Vec<Assignment> = Vec::new();
-    let mut iter = std::iter::once(program).chain(args).peekable();
-    while let Some(w) = iter.peek() {
+    let mut word_iter = std::iter::once(program).chain(args).peekable();
+    while let Some(w) = word_iter.peek() {
         if !is_assignment_word(w) {
             break;
         }
-        let owned = iter.next().expect("just peeked Some");
+        let owned = word_iter.next().expect("just peeked Some");
         match try_split_assignment(owned) {
             Ok(a) => inline.push(a),
             Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
         }
     }
-    let remaining: Vec<Word> = iter.collect();
+    let remaining: Vec<Word> = word_iter.collect();
 
     if remaining.is_empty() && redirects.is_empty() && !inline.is_empty() {
         return SimpleCommand::Assign(inline, line);
@@ -755,6 +755,8 @@ pub enum ParseError {
     /// NEW (v78): `for ((header))` header did not split into exactly 3
     /// `;`-separated sections.
     ArithForHeader(String),
+    /// NEW (v239): a lex error surfaced while the parser pulled tokens live
+    Lex(Box<crate::lexer::LexError>),
 }
 
 impl std::fmt::Display for ParseError {
@@ -765,64 +767,19 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// A token stream the parser consumes. Each token carries its own `Span`, so
-/// location travels with the token (no parallel line/offset array). Replaces
-/// `Peekable<vec::IntoIter<Token>>`: same `peek`/`next`/`len`, plus
-/// `current_line()` / `peek_span()` reading the NEXT token's span. `current_line`
-/// is `0` ("unknown") when a token's span line is unset.
-pub struct TokenCursor {
-    tokens: Vec<Option<Token>>,
-    pos: usize,
-}
-impl TokenCursor {
-    pub fn new(tokens: Vec<Token>) -> Self {
-        let tokens = tokens.into_iter().map(Some).collect();
-        Self { tokens, pos: 0 }
+impl From<crate::lexer::LexError> for ParseError {
+    fn from(e: crate::lexer::LexError) -> Self {
+        ParseError::Lex(Box::new(e))
     }
-    /// Line of the next token to be returned (0 if unknown / past end), read
-    /// from that token's span. Used to stamp `Command.line` for `$LINENO`.
-    pub fn current_line(&self) -> u32 {
-        self.tokens.get(self.pos).and_then(|s| s.as_ref()).map(|t| t.span.line).unwrap_or(0)
-    }
-    /// Peek at the next token's KIND without consuming it.
-    pub fn peek(&self) -> Option<&TokenKind> {
-        self.tokens.get(self.pos)?.as_ref().map(|t| &t.kind)
-    }
-    /// Peek at the kind of the token after next without consuming anything.
-    pub fn peek2(&self) -> Option<&TokenKind> {
-        self.tokens.get(self.pos + 1)?.as_ref().map(|t| &t.kind)
-    }
-    /// Span (offset/line/column) of the next token to be returned, or `None`
-    /// past the end. Lets a caller map a parse position back to a source
-    /// location straight from the live token — no parallel offsets/lines array.
-    pub fn peek_span(&self) -> Option<Span> {
-        self.tokens.get(self.pos)?.as_ref().map(|t| t.span)
-    }
-}
-impl Iterator for TokenCursor {
-    type Item = TokenKind;
-    /// Consume and yield the next token's KIND. The span is dropped on
-    /// consumption — line stamping happens via `current_line()` before consuming
-    /// (the parser never needs a consumed token's span). This makes the parser
-    /// body identical to its pre-span form (old `Token` enum ≡ new `TokenKind`).
-    fn next(&mut self) -> Option<TokenKind> {
-        let slot = self.tokens.get_mut(self.pos)?;
-        let t = slot.take()?;   // move out, leaving None in the slot
-        self.pos += 1;
-        Some(t.kind)
-    }
-}
-impl ExactSizeIterator for TokenCursor {
-    fn len(&self) -> usize { self.tokens.len() - self.pos }
 }
 
-fn parse_cursor(cur: &mut TokenCursor) -> Result<Option<Sequence>, ParseError> {
-    skip_newlines(cur);
-    if cur.peek().is_none() {
+fn parse_cursor(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let seq = parse_sequence(cur, &[])?;
-    if cur.peek().is_some() {
+    let seq = parse_sequence(iter, &[])?;
+    if iter.peek_kind()?.is_some() {
         // A stray terminator (`;;`/`;&`/`;;&`) left after the top-level
         // sequence — `parse_sequence` peek-breaks on those (see below).
         return Err(ParseError::UnexpectedToken);
@@ -831,8 +788,23 @@ fn parse_cursor(cur: &mut TokenCursor) -> Result<Option<Sequence>, ParseError> {
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    let mut cur = TokenCursor::new(tokens);
-    parse_cursor(&mut cur)
+    let mut iter = Lexer::from_tokens(tokens);
+    parse_cursor(&mut iter)
+}
+
+/// Parse ONE top-level command unit from a pre-tokenized stream, stopping at
+/// (and consuming) the next top-level newline or EOF. Skips leading blank-line
+/// newlines. Returns `Ok(None)` when only newlines / EOF remain. Used by the
+/// non-interactive script reader.
+pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    if iter.peek_kind()?.is_none() {
+        return Ok(None);
+    }
+    let seq = parse_sequence_opts(iter, &[], true)?;
+    Ok(Some(seq))
 }
 
 /// Parses one sequence ELEMENT: a command, plus — if a `|` immediately
@@ -843,10 +815,10 @@ pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
 /// Returns `raw` unchanged when no `|` follows — so non-pipeline elements are
 /// byte-identical to before.
 fn parse_command_then_pipeline(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     let raw = parse_command(iter)?;
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
         // The bang wrapper in `parse_command` may have produced a 1-element
         // negated Pipeline around a compound/subshell first stage (e.g.
         // `! ( false ) | cat`). Since `!` negates the WHOLE pipeline, hoist
@@ -858,17 +830,17 @@ fn parse_command_then_pipeline(
             other => (false, other),
         };
         let mut stages = vec![first_stage];
-        iter.next(); // consume `|`
-        skip_newlines(iter);
+        iter.next_kind()?; // consume `|`
+        skip_newlines(iter)?;
         let mut more = true;
         while more {
             let (cmd, next_pipe) = parse_next_stage(iter)?;
             stages.push(cmd);
             if next_pipe {
                 // Simple stage already consumed its own `|`; continue.
-            } else if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
-                iter.next();
-                skip_newlines(iter);
+            } else if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+                iter.next_kind()?;
+                skip_newlines(iter)?;
             } else {
                 more = false;
             }
@@ -884,26 +856,10 @@ fn parse_command_then_pipeline(
 /// token is a keyword in `stop_at`. `stop_at` is empty only at the top
 /// level; a non-empty `stop_at` means we are inside a compound command.
 fn parse_sequence(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     stop_at: &[Keyword],
 ) -> Result<Sequence, ParseError> {
     parse_sequence_opts(iter, stop_at, false)
-}
-
-/// Parse ONE top-level command unit from a pre-tokenized stream, stopping at
-/// (and consuming) the next top-level newline or EOF. Skips leading blank-line
-/// newlines. Returns `Ok(None)` when only newlines / EOF remain. Used by the
-/// non-interactive script reader.
-pub fn parse_one_unit(
-    iter: &mut TokenCursor,
-) -> Result<Option<Sequence>, ParseError> {
-    while matches!(iter.peek(), Some(TokenKind::Newline)) {
-        iter.next();
-    }
-    if iter.peek().is_none() {
-        return Ok(None);
-    }
-    Ok(Some(parse_sequence_opts(iter, &[], true)?))
 }
 
 /// The shared body of [`parse_sequence`]. When `stop_at_top_newline` is set, a
@@ -912,7 +868,7 @@ pub fn parse_one_unit(
 /// top-level newline is a Semi-like continue connector (the historical
 /// behavior — all existing callers go through the `false` wrapper).
 fn parse_sequence_opts(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     stop_at: &[Keyword],
     stop_at_top_newline: bool,
 ) -> Result<Sequence, ParseError> {
@@ -921,7 +877,7 @@ fn parse_sequence_opts(
     let mut background = false;
 
     loop {
-        match iter.peek() {
+        match iter.peek_kind()? {
             None => break,
             Some(TokenKind::Op(
                 Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
@@ -934,7 +890,7 @@ fn parse_sequence_opts(
                 }
             }
         }
-        let token = iter.next().unwrap();
+        let token = iter.next_kind()?.unwrap();
         match token {
             TokenKind::Op(Operator::Background) => {
                 // `&` is a list separator (v98): it backgrounds the preceding
@@ -943,8 +899,8 @@ fn parse_sequence_opts(
                 // when the buffer is "cat <<EOF &\nbody\nEOF" the lexer emits a
                 // Newline after the heredoc body). Newlines after `&` are not
                 // meaningful as separators.
-                skip_newlines(iter);
-                match iter.peek() {
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
                     // Nothing meaningful follows -> trailing `&`: background the
                     // whole (final group of the) sequence.
                     None => {
@@ -983,12 +939,12 @@ fn parse_sequence_opts(
             TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
                 if stop_at_top_newline && matches!(token, TokenKind::Newline) {
                     // Unit mode: a top-level newline ends the command unit
-                    // (already consumed by iter.next() above). `;`, `&&`,
+                    // (already consumed by iter.next_kind()? above). `;`, `&&`,
                     // `||`, `&`, and compound-internal newlines are unaffected.
                     break;
                 }
-                skip_newlines(iter);
-                match iter.peek() {
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
                     None => break,
                     Some(TokenKind::Op(
                         Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
@@ -1002,11 +958,11 @@ fn parse_sequence_opts(
                 rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
             }
             TokenKind::Op(Operator::And) => {
-                skip_newlines(iter);
+                skip_newlines(iter)?;
                 rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
             TokenKind::Op(Operator::Or) => {
-                skip_newlines(iter);
+                skip_newlines(iter)?;
                 rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
             }
             other => {
@@ -1028,11 +984,11 @@ fn parse_sequence_opts(
 /// negation flag. Detected only here (command position), so `[ ! -e x ]` keeps
 /// `!` as an argument of `[`.
 fn parse_command(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     let mut bangs = 0usize;
-    while iter.peek().map(is_bang_word).unwrap_or(false) {
-        iter.next(); // consume `!`
+    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?; // consume `!`
         bangs += 1;
     }
     if bangs == 0 {
@@ -1053,13 +1009,13 @@ fn parse_command(
 
 /// Parses a single sequence element: a subshell, compound command, or pipeline.
 fn parse_command_inner(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
-    skip_newlines(iter);
+    skip_newlines(iter)?;
 
     // Standalone arith block: `((expr))` at command position.
-    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
-        let Some(TokenKind::ArithBlock(text, opts)) = iter.next() else {
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
+        let Some(TokenKind::ArithBlock(text, opts)) = iter.next_kind()? else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
@@ -1067,7 +1023,7 @@ fn parse_command_inner(
         return maybe_wrap_redirects(Command::Arith(body), iter);
     }
 
-    match iter.peek().and_then(keyword_of) {
+    match iter.peek_kind()?.and_then(keyword_of) {
         Some(Keyword::If) => maybe_wrap_redirects(Command::If(Box::new(parse_if(iter)?)), iter),
         Some(Keyword::While) | Some(Keyword::Until) => {
             maybe_wrap_redirects(Command::While(Box::new(parse_while(iter)?)), iter)
@@ -1077,7 +1033,7 @@ fn parse_command_inner(
             maybe_wrap_redirects(cmd, iter)
         }
         Some(Keyword::Select) => {
-            iter.next(); // consume `select`
+            iter.next_kind()?; // consume `select`
             let cmd = parse_select_command(iter)?;
             maybe_wrap_redirects(cmd, iter)
         }
@@ -1091,7 +1047,7 @@ fn parse_command_inner(
         }
         Some(Keyword::Function) => parse_function_keyword_def(iter),
         Some(Keyword::Coproc) => {
-            iter.next(); // consume `coproc`
+            iter.next_kind()?; // consume `coproc`
             let cmd = parse_coproc_command(iter)?;
             maybe_wrap_redirects(cmd, iter)
         }
@@ -1102,18 +1058,18 @@ fn parse_command_inner(
             // but in practice they don't overlap: function-def starts with
             // a Word token, not an Op(LParen). Still, the comment clarifies
             // intent.
-            if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
+            if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
                 let cmd = parse_subshell(iter)?;
                 return maybe_wrap_redirects(cmd, iter);
             }
             // Non-keyword, non-LParen: may be a function definition
             // `name() compound`, or a plain pipeline. Need two-token lookahead.
-            if matches!(iter.peek(), Some(TokenKind::Word(_))) {
+            if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
                 // Capture the line of the first word BEFORE consuming it.
-                let word_line = iter.current_line();
+                let word_line = iter.current_line()?;
                 // Consume the word; peek for `(`.
-                let Some(TokenKind::Word(w)) = iter.next() else { unreachable!() };
-                if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
+                let Some(TokenKind::Word(w)) = iter.next_kind()? else { unreachable!() };
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
                     return parse_function_def(w, iter);
                 }
                 // Detect inline assignments before `[[`:
@@ -1132,11 +1088,11 @@ fn parse_command_inner(
                     }
                     let mut extra_clones: Vec<Word> = Vec::new();
                     // Peel further consecutive assignment words.
-                    while let Some(TokenKind::Word(nw)) = iter.peek() {
+                    while let Some(TokenKind::Word(nw)) = iter.peek_kind()? {
                         if !is_assignment_word(nw) {
                             break;
                         }
-                        let Some(TokenKind::Word(nw)) = iter.next() else { unreachable!() };
+                        let Some(TokenKind::Word(nw)) = iter.next_kind()? else { unreachable!() };
                         let nw_clone = nw.clone();
                         match try_split_assignment(nw) {
                             Ok(a) => assigns.push(a),
@@ -1145,7 +1101,7 @@ fn parse_command_inner(
                         extra_clones.push(nw_clone);
                     }
                     // If `[[` follows, dispatch as DoubleBracket with assigns.
-                    if iter.peek().and_then(keyword_of) == Some(Keyword::DoubleBracketOpen) {
+                    if iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::DoubleBracketOpen) {
                         return parse_double_bracket_with_assigns(iter, assigns);
                     }
                     // Fallback: no `[[`. Restore the pipeline starting from the
@@ -1211,9 +1167,9 @@ fn is_function_body_shape(body: &Command) -> bool {
 /// newlines, guards against end-of-input, parses the body command,
 /// validates its shape, and returns the complete `FunctionDef` command.
 /// Shared by `parse_function_def` and `parse_function_keyword_def`.
-fn finish_function_body(name: String, iter: &mut TokenCursor) -> Result<Command, ParseError> {
-    skip_newlines(iter);
-    if iter.peek().is_none() {
+fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, ParseError> {
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedFunction);
     }
     let body = parse_command(iter)?;
@@ -1227,13 +1183,13 @@ fn finish_function_body(name: String, iter: &mut TokenCursor) -> Result<Command,
 /// (`name_word`) and verified the next token is `(`.
 fn parse_function_def(
     name_word: Word,
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     let name = valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
     // Consume `(`.
-    iter.next();
+    iter.next_kind()?;
     // Expect `)`.
-    match iter.next() {
+    match iter.next_kind()? {
         Some(TokenKind::Op(Operator::RParen)) => {}
         _ => return Err(ParseError::FunctionBody),
     }
@@ -1245,23 +1201,23 @@ fn parse_function_def(
 /// iterator). Consumes the keyword, the name, optional `()`, and
 /// the compound body.
 fn parse_function_keyword_def(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     // Consume `function` keyword.
-    iter.next();
+    iter.next_kind()?;
 
     // Read the name. Must be a Word that's a valid POSIX identifier
     // and not a reserved keyword.
-    let name_word = match iter.next() {
+    let name_word = match iter.next_kind()? {
         Some(TokenKind::Word(w)) => w,
         _ => return Err(ParseError::FunctionName),
     };
     let name = valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
 
     // Optionally consume `()`.
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
-        iter.next(); // consume `(`
-        match iter.next() {
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?; // consume `(`
+        match iter.next_kind()? {
             Some(TokenKind::Op(Operator::RParen)) => {}
             _ => return Err(ParseError::FunctionBody),
         }
@@ -1273,19 +1229,20 @@ fn parse_function_keyword_def(
 
 /// Consumes a run of `Newline` tokens. Newlines are soft separators —
 /// they are skipped wherever a command is expected but not yet present.
-fn skip_newlines(iter: &mut TokenCursor) {
-    while matches!(iter.peek(), Some(TokenKind::Newline)) {
-        iter.next();
+fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
     }
+    Ok(())
 }
 
 /// Consumes one token and checks it is the expected keyword.
 fn expect_keyword(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     expected: Keyword,
     on_missing: ParseError,
 ) -> Result<(), ParseError> {
-    match iter.next() {
+    match iter.next_kind()? {
         Some(ref t) if keyword_of(t) == Some(expected) => Ok(()),
         _ => Err(on_missing),
     }
@@ -1305,19 +1262,19 @@ fn expect_keyword(
 /// ending in a bare `|`/`&&`/`||` before `parse` is reached, so this
 /// path is unreachable through the shell.
 fn parse_compound_section(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     stop_at: &[Keyword],
     unterminated: ParseError,
 ) -> Result<Sequence, ParseError> {
     match parse_sequence(iter, stop_at) {
-        Err(ParseError::MissingCommand) if iter.peek().is_none() => Err(unterminated),
+        Err(ParseError::MissingCommand) if iter.peek_kind()?.is_none() => Err(unterminated),
         other => other,
     }
 }
 
 /// Parses `if LIST; then LIST; [elif LIST; then LIST;]... [else LIST;] fi`.
 fn parse_if(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<IfClause, ParseError> {
     expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
     let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
@@ -1329,8 +1286,8 @@ fn parse_if(
     )?;
 
     let mut elif_branches = Vec::new();
-    while iter.peek().and_then(keyword_of) == Some(Keyword::Elif) {
-        iter.next(); // consume `elif`
+    while iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::Elif) {
+        iter.next_kind()?; // consume `elif`
         let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
         expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
         let body = parse_compound_section(
@@ -1341,8 +1298,8 @@ fn parse_if(
         elif_branches.push(ElifBranch { condition, body });
     }
 
-    let else_body = if iter.peek().and_then(keyword_of) == Some(Keyword::Else) {
-        iter.next(); // consume `else`
+    let else_body = if iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::Else) {
+        iter.next_kind()?; // consume `else`
         Some(parse_compound_section(iter, &[Keyword::Fi], ParseError::UnterminatedIf)?)
     } else {
         None
@@ -1495,9 +1452,9 @@ fn parse_arith_for_header(
 /// separators before `do`, the `do` keyword, the body, and the `done`
 /// keyword.
 fn parse_arith_for_clause(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<ArithForClause, ParseError> {
-    let (header_text, arith_opts) = match iter.next() {
+    let (header_text, arith_opts) = match iter.next_kind()? {
         Some(TokenKind::ArithBlock(text, opts)) => (text, opts),
         _ => unreachable!("caller verified peek"),
     };
@@ -1505,10 +1462,10 @@ fn parse_arith_for_clause(
 
     // Skip `;` and newline separators between the header and `do`.
     while matches!(
-        iter.peek(),
+        iter.peek_kind()?,
         Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
     ) {
-        iter.next();
+        iter.next_kind()?;
     }
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
 
@@ -1522,17 +1479,17 @@ fn parse_arith_for_clause(
 /// or the bash arith form (`for ((init;cond;step)) do ...`). Consumes
 /// the `for` keyword itself.
 fn parse_for_command(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
 
     // Peek the next token to choose the variant. Skip newlines first so
     // `for\n((...))` works the same as `for ((...))`.
-    while matches!(iter.peek(), Some(TokenKind::Newline)) {
-        iter.next();
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
     }
 
-    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
         return Ok(Command::ArithFor(Box::new(parse_arith_for_clause(iter)?)));
     }
 
@@ -1544,8 +1501,8 @@ fn parse_for_command(
     // error — so two consecutive `(` here mean an arith-for header that hasn't
     // closed yet. Report it as UnterminatedLoop (the v19 classifier maps that to
     // "read more"), matching bash which prompts `>` for an unclosed `for ((`.
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen)))
-        && matches!(iter.peek2(), Some(TokenKind::Op(Operator::LParen)))
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
+        && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
     {
         return Err(ParseError::UnterminatedLoop);
     }
@@ -1556,12 +1513,12 @@ fn parse_for_command(
 /// Skips `;`/newline separators before `do`, then consumes `do`, the
 /// loop body, and `done`. Returns the parsed body `Sequence`. Shared
 /// by `parse_for_after_keyword` and `parse_select_command`.
-fn parse_do_body_done(iter: &mut TokenCursor) -> Result<Sequence, ParseError> {
+fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     while matches!(
-        iter.peek(),
+        iter.peek_kind()?,
         Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
     ) {
-        iter.next();
+        iter.next_kind()?;
     }
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
@@ -1572,31 +1529,31 @@ fn parse_do_body_done(iter: &mut TokenCursor) -> Result<Sequence, ParseError> {
 /// Parses `for NAME [in WORD...] sep do LIST done` AFTER the `for`
 /// keyword has already been consumed by the caller.
 fn parse_for_after_keyword(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<ForClause, ParseError> {
     // Loop variable. End-of-input means the command is incomplete (the
     // v19 classifier maps UnterminatedLoop to "read more"); a present
     // but invalid token is a genuine error.
-    let var = match iter.next() {
+    let var = match iter.next_kind()? {
         None => return Err(ParseError::UnterminatedLoop),
         Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
     };
 
     // POSIX allows a linebreak between the variable and `in`.
-    skip_newlines(iter);
+    skip_newlines(iter)?;
 
     // Optional `in` plus the word list.
     let mut words: Vec<Word> = Vec::new();
-    let has_in = if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
-        iter.next(); // consume `in`
+    let has_in = if iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::In) {
+        iter.next_kind()?; // consume `in`
         loop {
-            match iter.peek() {
+            match iter.peek_kind()? {
                 None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => break,
                 Some(tok) => {
                     if keyword_of(tok) == Some(Keyword::Do) {
                         break;
                     }
-                    match iter.next() {
+                    match iter.next_kind()? {
                         Some(TokenKind::Word(w)) => words.push(w),
                         Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                         _ => unreachable!("peek already ruled out Newline/Semi/None here"),
@@ -1618,29 +1575,29 @@ fn parse_for_after_keyword(
 /// but builds a `SelectClause` with `words: Option<Vec<Word>>` to distinguish
 /// the no-`in` form (None) from an explicit `in` clause (Some, possibly empty).
 fn parse_select_command(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     // Loop variable. End-of-input means the command is incomplete.
-    let var = match iter.next() {
+    let var = match iter.next_kind()? {
         None => return Err(ParseError::UnterminatedLoop),
         Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
     };
 
     // POSIX allows a linebreak between the variable and `in`.
-    skip_newlines(iter);
+    skip_newlines(iter)?;
 
     // Optional `in` plus the word list.
-    let words: Option<Vec<Word>> = if iter.peek().and_then(keyword_of) == Some(Keyword::In) {
-        iter.next(); // consume `in`
+    let words: Option<Vec<Word>> = if iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::In) {
+        iter.next_kind()?; // consume `in`
         let mut list: Vec<Word> = Vec::new();
         loop {
-            match iter.peek() {
+            match iter.peek_kind()? {
                 None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => break,
                 Some(tok) => {
                     if keyword_of(tok) == Some(Keyword::Do) {
                         break;
                     }
-                    match iter.next() {
+                    match iter.next_kind()? {
                         Some(TokenKind::Word(w)) => list.push(w),
                         Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                         _ => unreachable!("peek already ruled out Newline/Semi/None here"),
@@ -1663,15 +1620,15 @@ fn parse_select_command(
 /// the plain-word NAME starts a compound command.  Otherwise anonymous:
 /// name = "COPROC" and the body is the next ordinary command (simple or
 /// compound).
-fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
+fn parse_coproc_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Named form: a valid-identifier Word followed by a compound-command opener.
-    let is_named = matches!(iter.peek(), Some(TokenKind::Word(w))
+    let is_named = matches!(iter.peek_kind()?, Some(TokenKind::Word(w))
         if valid_identifier_text(w).is_some())
-        && is_compound_opener(iter.peek2());
+        && is_compound_opener(iter.peek2_kind()?);
 
     if is_named {
         // Consume the NAME word (we already verified it's a valid identifier).
-        let name = match iter.next() {
+        let name = match iter.next_kind()? {
             Some(TokenKind::Word(w)) => valid_identifier_text(&w)
                 .expect("verified above"),
             _ => unreachable!("peek matched TokenKind::Word"),
@@ -1708,28 +1665,28 @@ fn is_compound_opener(tok: Option<&TokenKind>) -> bool {
 
 /// Parses `case WORD in [clause]... esac`. The caller has peeked `case`.
 fn parse_case(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<CaseClause, ParseError> {
     expect_keyword(iter, Keyword::Case, ParseError::UnterminatedCase)?;
-    skip_newlines(iter);
+    skip_newlines(iter)?;
 
-    let subject = match iter.next() {
+    let subject = match iter.next_kind()? {
         None => return Err(ParseError::UnterminatedCase),
         Some(TokenKind::Word(w)) => w,
         Some(_) => return Err(ParseError::UnexpectedToken),
     };
 
-    skip_newlines(iter);
+    skip_newlines(iter)?;
     expect_keyword(iter, Keyword::In, ParseError::UnterminatedCase)?;
-    skip_newlines(iter);
+    skip_newlines(iter)?;
 
     let mut items: Vec<CaseItem> = Vec::new();
-    while iter.peek().and_then(keyword_of) != Some(Keyword::Esac) {
-        if iter.peek().is_none() {
+    while iter.peek_kind()?.and_then(keyword_of) != Some(Keyword::Esac) {
+        if iter.peek_kind()?.is_none() {
             return Err(ParseError::UnterminatedCase);
         }
         items.push(parse_case_item(iter)?);
-        skip_newlines(iter);
+        skip_newlines(iter)?;
     }
     expect_keyword(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
     Ok(CaseClause { subject, items })
@@ -1737,29 +1694,29 @@ fn parse_case(
 
 /// Parses one `[(] pattern [| pattern]... ) [body] [terminator]` clause.
 fn parse_case_item(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<CaseItem, ParseError> {
     // Optional leading `(`.
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
-        iter.next();
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?;
     }
 
     // Pattern list — Word (`|` Word)* `)`, non-empty.
     let mut patterns: Vec<Word> = Vec::new();
     loop {
-        skip_newlines(iter);
-        match iter.next() {
+        skip_newlines(iter)?;
+        match iter.next_kind()? {
             None => return Err(ParseError::UnterminatedCase),
             Some(TokenKind::Word(w)) => patterns.push(w),
             Some(_) => return Err(ParseError::UnexpectedToken),
         }
-        match iter.peek() {
+        match iter.peek_kind()? {
             None => return Err(ParseError::UnterminatedCase),
             Some(TokenKind::Op(Operator::Pipe)) => {
-                iter.next();
+                iter.next_kind()?;
             }
             Some(TokenKind::Op(Operator::RParen)) => {
-                iter.next();
+                iter.next_kind()?;
                 break;
             }
             Some(_) => return Err(ParseError::UnexpectedToken),
@@ -1767,8 +1724,8 @@ fn parse_case_item(
     }
 
     // Body — empty if the next token is a terminator or `esac`.
-    skip_newlines(iter);
-    let body = match iter.peek() {
+    skip_newlines(iter)?;
+    let body = match iter.peek_kind()? {
         None => return Err(ParseError::UnterminatedCase),
         Some(TokenKind::Op(
             Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
@@ -1778,17 +1735,17 @@ fn parse_case_item(
     };
 
     // Terminator — an absent one (next token is `esac` or end) is `Break`.
-    let terminator = match iter.peek() {
+    let terminator = match iter.peek_kind()? {
         Some(TokenKind::Op(Operator::DoubleSemi)) => {
-            iter.next();
+            iter.next_kind()?;
             CaseTerminator::Break
         }
         Some(TokenKind::Op(Operator::SemiAmp)) => {
-            iter.next();
+            iter.next_kind()?;
             CaseTerminator::FallThrough
         }
         Some(TokenKind::Op(Operator::DoubleSemiAmp)) => {
-            iter.next();
+            iter.next_kind()?;
             CaseTerminator::ContinueMatch
         }
         _ => CaseTerminator::Break,
@@ -1799,7 +1756,7 @@ fn parse_case_item(
 
 /// Parses `{ LIST }`. The caller has peeked the leading `{`.
 fn parse_brace_group(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Sequence, ParseError> {
     expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
     let body = parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
@@ -1815,19 +1772,19 @@ fn parse_brace_group(
 /// - `Err(ParseError::UnterminatedSubshell)` if no closing `)` is found.
 /// - `Ok(Command::Subshell { body })` otherwise.
 fn parse_subshell(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     // Consume `(`.
-    iter.next();
+    iter.next_kind()?;
 
     // Empty subshell `()` — immediately hit `)` with no commands inside.
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
-        iter.next(); // consume `)`
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+        iter.next_kind()?; // consume `)`
         return Err(ParseError::EmptySubshell);
     }
 
     // No tokens at all → unterminated.
-    if iter.peek().is_none() {
+    if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedSubshell);
     }
 
@@ -1842,7 +1799,7 @@ fn parse_subshell(
 /// - breaks on `TokenKind::Op(Operator::RParen)` (consuming it) instead of keywords.
 /// - returns `Err(UnterminatedSubshell)` if the token stream ends before `)`.
 fn parse_subshell_sequence(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Sequence, ParseError> {
     // Parse first command. It may itself be a subshell, compound command, etc.
     // — and, if followed by `|`, the rest of the pipeline.
@@ -1850,47 +1807,47 @@ fn parse_subshell_sequence(
 
     let mut rest = Vec::new();
     loop {
-        match iter.peek() {
+        match iter.peek_kind()? {
             // End of tokens before `)` → unterminated.
             None => return Err(ParseError::UnterminatedSubshell),
             // `)` terminates the subshell body — consume and return.
             Some(TokenKind::Op(Operator::RParen)) => {
-                iter.next();
+                iter.next_kind()?;
                 break;
             }
             Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline) => {
-                iter.next(); // consume `;` or newline
-                skip_newlines(iter);
+                iter.next_kind()?; // consume `;` or newline
+                skip_newlines(iter)?;
                 // Trailing `;` or newline before `)` — break cleanly.
-                if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
-                    iter.next(); // consume `)`
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+                    iter.next_kind()?; // consume `)`
                     break;
                 }
-                if iter.peek().is_none() {
+                if iter.peek_kind()?.is_none() {
                     return Err(ParseError::UnterminatedSubshell);
                 }
                 let cmd = parse_command_then_pipeline(iter)?;
                 rest.push((Connector::Semi, cmd));
             }
             Some(TokenKind::Op(Operator::Background)) => {
-                iter.next(); // consume `&`
+                iter.next_kind()?; // consume `&`
                 // `&` inside a subshell body backgrounds the preceding command
                 // and acts as a separator. Skip any redundant `;` or newlines
                 // that follow (`&;` is equivalent to `&` in bash).
                 while matches!(
-                    iter.peek(),
+                    iter.peek_kind()?,
                     Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
                 ) {
-                    iter.next();
+                    iter.next_kind()?;
                 }
-                skip_newlines(iter);
+                skip_newlines(iter)?;
                 // If `)` follows (or stream ends), this `&` terminates the
                 // whole body as a backgrounded sequence.
-                if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
-                    iter.next(); // consume `)`
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+                    iter.next_kind()?; // consume `)`
                     return Ok(Sequence { first, rest, background: true });
                 }
-                if iter.peek().is_none() {
+                if iter.peek_kind()?.is_none() {
                     return Err(ParseError::UnterminatedSubshell);
                 }
                 // More commands follow (`(cmd1 & cmd2)` pattern): parse the
@@ -1900,13 +1857,13 @@ fn parse_subshell_sequence(
                 rest.push((Connector::Amp, cmd));
             }
             Some(TokenKind::Op(Operator::And)) => {
-                iter.next();
-                skip_newlines(iter);
+                iter.next_kind()?;
+                skip_newlines(iter)?;
                 rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
             Some(TokenKind::Op(Operator::Or)) => {
-                iter.next();
-                skip_newlines(iter);
+                iter.next_kind()?;
+                skip_newlines(iter)?;
                 rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
             }
             // Any other token (stray keyword, another `(`, etc.) after a
@@ -1921,9 +1878,9 @@ fn parse_subshell_sequence(
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
 /// The caller has already peeked the leading `while`/`until`.
 fn parse_while(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<WhileClause, ParseError> {
-    let until = match iter.next().as_ref().and_then(keyword_of) {
+    let until = match iter.next_kind()?.as_ref().and_then(keyword_of) {
         Some(Keyword::While) => false,
         Some(Keyword::Until) => true,
         _ => unreachable!("parse_command guarantees a while/until keyword here"),
@@ -2078,13 +2035,13 @@ fn dup_op(source: Word, output: bool) -> RedirOp {
 
 /// True iff the next token begins a redirection: a `TokenKind::RedirFd` prefix,
 /// a `TokenKind::Heredoc`, or a redirect operator.
-fn next_is_redirect(iter: &mut TokenCursor) -> bool {
-    match iter.peek() {
+fn next_is_redirect(iter: &mut Lexer) -> Result<bool, ParseError> {
+    Ok(match iter.peek_kind()? {
         Some(TokenKind::RedirFd(_)) => true,
         Some(TokenKind::Heredoc { .. }) => true,
         Some(TokenKind::Op(op)) => is_redirect_op(op),
         _ => false,
-    }
+    })
 }
 
 /// Consumes a run of trailing redirect tokens (an optional `TokenKind::RedirFd`
@@ -2093,22 +2050,22 @@ fn next_is_redirect(iter: &mut TokenCursor) -> bool {
 /// (no last-wins merge — ordering matters for `2>&1 >f` vs `>f 2>&1`).
 /// Stops at the first non-redirect token.
 fn parse_trailing_redirects(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Vec<Redirection>, ParseError> {
     let mut redirs: Vec<Redirection> = Vec::new();
     loop {
         // Optional explicit fd-prefix (`3>`, `{fd}>`, `3<<EOF`).
-        let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek() {
-            let Some(TokenKind::RedirFd(fd)) = iter.next() else {
+        let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek_kind()? {
+            let Some(TokenKind::RedirFd(fd)) = iter.next_kind()? else {
                 unreachable!("peek confirmed RedirFd")
             };
             Some(fd)
         } else {
             None
         };
-        match iter.peek() {
+        match iter.peek_kind()? {
             Some(TokenKind::Heredoc { .. }) => {
-                let Some(TokenKind::Heredoc { body, expand, strip_tabs }) = iter.next() else {
+                let Some(TokenKind::Heredoc { body, expand, strip_tabs }) = iter.next_kind()? else {
                     unreachable!("peek confirmed Heredoc")
                 };
                 redirs.push(Redirection {
@@ -2118,8 +2075,8 @@ fn parse_trailing_redirects(
             }
             Some(TokenKind::Op(op)) if is_redirect_op(op) => {
                 let op = *op;
-                iter.next();
-                let target = match iter.next() {
+                iter.next_kind()?;
+                let target = match iter.next_kind()? {
                     Some(TokenKind::Word(word)) => word,
                     Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
@@ -2149,7 +2106,7 @@ fn parse_trailing_redirects(
 /// their own redirects inline in `parse_simple_stage`).
 fn maybe_wrap_redirects(
     cmd: Command,
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     let redirects = parse_trailing_redirects(iter)?;
     if !redirects.is_empty() {
@@ -2172,7 +2129,7 @@ fn maybe_wrap_redirects(
 fn parse_simple_stage(
     first: Option<Word>,
     prefix_tokens: Vec<TokenKind>,
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     first_line: u32,
 ) -> Result<(Command, bool), ParseError> {
     let mut program: Option<Word> = first;
@@ -2199,7 +2156,7 @@ fn parse_simple_stage(
         }
     }
 
-    while let Some(token) = iter.peek() {
+    while let Some(token) = iter.peek_kind()? {
         if matches!(
             token,
             TokenKind::Op(
@@ -2221,11 +2178,11 @@ fn parse_simple_stage(
         // delegate to the shared `parse_trailing_redirects` helper, appending
         // its ordered Redirections to this stage's. This keeps the simple- and
         // compound-command redirect semantics identical.
-        if next_is_redirect(iter) {
+        if next_is_redirect(iter)? {
             redirects.extend(parse_trailing_redirects(iter)?);
             continue;
         }
-        let token = iter.next().unwrap();
+        let token = iter.next_kind()?.unwrap();
         match token {
             TokenKind::Word(word) => {
                 if program.is_none() {
@@ -2241,7 +2198,7 @@ fn parse_simple_stage(
             }
             TokenKind::Op(Operator::Pipe) => {
                 pipe_follows = true;
-                skip_newlines(iter);
+                skip_newlines(iter)?;
                 break;
             }
             TokenKind::Op(Operator::LParen) => {
@@ -2321,12 +2278,12 @@ fn parse_simple_stage(
 /// (true only for simple stages that ended on `|`; compound stages never
 /// consume a trailing `|` — the outer loop checks for it).
 fn parse_next_stage(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<(Command, bool), ParseError> {
     // Standalone arith block: `((expr))` at pipeline-stage position
     // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
-    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
-        let Some(TokenKind::ArithBlock(text, opts)) = iter.next() else {
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
+        let Some(TokenKind::ArithBlock(text, opts)) = iter.next_kind()? else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
@@ -2334,7 +2291,7 @@ fn parse_next_stage(
         return Ok((maybe_wrap_redirects(Command::Arith(body), iter)?, false));
     }
 
-    match iter.peek().and_then(keyword_of) {
+    match iter.peek_kind()?.and_then(keyword_of) {
         Some(Keyword::If) => Ok((
             maybe_wrap_redirects(Command::If(Box::new(parse_if(iter)?)), iter)?,
             false,
@@ -2348,7 +2305,7 @@ fn parse_next_stage(
             Ok((maybe_wrap_redirects(cmd, iter)?, false))
         }
         Some(Keyword::Select) => {
-            iter.next(); // consume `select`
+            iter.next_kind()?; // consume `select`
             let cmd = parse_select_command(iter)?;
             Ok((maybe_wrap_redirects(cmd, iter)?, false))
         }
@@ -2369,24 +2326,24 @@ fn parse_next_stage(
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Bare `(` at pipeline-stage position → subshell.
-            if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
+            if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
                 let cmd = parse_subshell(iter)?;
                 return Ok((maybe_wrap_redirects(cmd, iter)?, false));
             }
             // Non-keyword: may be a function definition `name() compound` or
             // a plain simple stage. Need two-token lookahead.
-            if matches!(iter.peek(), Some(TokenKind::Word(_))) {
+            if matches!(iter.peek_kind()?, Some(TokenKind::Word(_))) {
                 // Capture line before consuming the first word.
-                let word_line = iter.current_line();
-                let Some(TokenKind::Word(w)) = iter.next() else { unreachable!() };
-                if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
+                let word_line = iter.current_line()?;
+                let Some(TokenKind::Word(w)) = iter.next_kind()? else { unreachable!() };
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
                     let cmd = parse_function_def(w, iter)?;
                     return Ok((cmd, false));
                 }
                 // Not a function def — simple stage with `w` as the first word.
                 parse_simple_stage(Some(w), vec![], iter, word_line)
             } else {
-                let first_line = iter.current_line();
+                let first_line = iter.current_line()?;
                 parse_simple_stage(None, vec![], iter, first_line)
             }
         }
@@ -2396,7 +2353,7 @@ fn parse_next_stage(
 fn parse_pipeline_with_first(
     first: Option<Word>,
     prefix_tokens: Vec<TokenKind>,
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     first_line: u32,
 ) -> Result<Pipeline, ParseError> {
     let mut commands: Vec<Command> = Vec::new();
@@ -2423,9 +2380,9 @@ fn parse_pipeline_with_first(
         // If the stage was a compound command (next_pipe=false from
         // parse_next_stage), it did not consume a trailing `|`; check manually.
         if !next_pipe {
-            if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
-                iter.next(); // consume `|`
-                skip_newlines(iter);
+            if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+                iter.next_kind()?; // consume `|`
+                skip_newlines(iter)?;
                 // pipe_follows remains true — loop continues.
             } else {
                 pipe_follows = false;
@@ -2438,9 +2395,9 @@ fn parse_pipeline_with_first(
 }
 
 fn parse_pipeline(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Pipeline, ParseError> {
-    let first_line = iter.current_line();
+    let first_line = iter.current_line()?;
     parse_pipeline_with_first(None, vec![], iter, first_line)
 }
 
@@ -2452,12 +2409,12 @@ fn parse_pipeline(
 /// body (i.e. we should stop trying to parse more at this precedence level).
 /// This means we've hit `]]` (DoubleBracketClose keyword), `)` (RParen for
 /// grouped sub-expressions), or end of input.
-fn is_test_expr_stop(iter: &mut TokenCursor) -> bool {
-    match iter.peek() {
+fn is_test_expr_stop(iter: &mut Lexer) -> Result<bool, ParseError> {
+    Ok(match iter.peek_kind()? {
         None => true,
         Some(tok) => keyword_of(tok) == Some(Keyword::DoubleBracketClose)
             || matches!(tok, TokenKind::Op(Operator::RParen)),
-    }
+    })
 }
 
 /// Peeks (consumes nothing) and reports whether the next token is a recognized
@@ -2469,9 +2426,9 @@ fn is_test_expr_stop(iter: &mut TokenCursor) -> bool {
 /// every other operator arrives as a `Word` because the lexer has no dedicated
 /// token for it.
 fn next_is_test_binary_operator(
-    iter: &mut TokenCursor,
-) -> bool {
-    match iter.peek() {
+    iter: &mut Lexer,
+) -> Result<bool, ParseError> {
+    Ok(match iter.peek_kind()? {
         Some(TokenKind::Op(Operator::RedirIn)) | Some(TokenKind::Op(Operator::RedirOut)) => true,
         Some(TokenKind::Word(w)) => matches!(
             word_literal_text(w),
@@ -2479,15 +2436,16 @@ fn next_is_test_binary_operator(
                 | "-le" | "-ge" | "-nt" | "-ot" | "-ef")
         ),
         _ => false,
-    }
+    })
 }
 
 /// Skips zero or more `TokenKind::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
-fn skip_test_newlines(iter: &mut TokenCursor) {
-    while matches!(iter.peek(), Some(TokenKind::Newline)) {
-        iter.next();
+fn skip_test_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
     }
+    Ok(())
 }
 
 /// Returns the Word's single unquoted Literal text, if it is exactly that shape.
@@ -2549,9 +2507,9 @@ fn is_bang_word(tok: &TokenKind) -> bool {
 /// continuation line, and on a present-but-wrong token (`]]`/an operator,
 /// i.e. a genuine missing operand) returns `ParseError::TestExprMissingOperand`.
 fn next_test_word(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Word, ParseError> {
-    match iter.peek() {
+    match iter.peek_kind()? {
         None => return Err(ParseError::UnterminatedDoubleBracket),
         Some(tok) => {
             if keyword_of(tok) == Some(Keyword::DoubleBracketClose)
@@ -2561,7 +2519,7 @@ fn next_test_word(
             }
         }
     }
-    match iter.next() {
+    match iter.next_kind()? {
         Some(TokenKind::Word(w)) => Ok(w),
         _ => Err(ParseError::TestExprMissingOperand),
     }
@@ -2569,42 +2527,42 @@ fn next_test_word(
 
 /// Lowest precedence: `||`.
 fn parse_test_or(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_and(iter)?;
-    skip_test_newlines(iter);
-    while matches!(iter.peek(), Some(TokenKind::Op(Operator::Or))) {
-        iter.next(); // consume `||`
-        skip_test_newlines(iter);
+    skip_test_newlines(iter)?;
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Or))) {
+        iter.next_kind()?; // consume `||`
+        skip_test_newlines(iter)?;
         let rhs = parse_test_and(iter)?;
         lhs = TestExpr::Or(Box::new(lhs), Box::new(rhs));
-        skip_test_newlines(iter);
+        skip_test_newlines(iter)?;
     }
     Ok(lhs)
 }
 
 /// Next precedence: `&&`.
 fn parse_test_and(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_not(iter)?;
-    skip_test_newlines(iter);
-    while matches!(iter.peek(), Some(TokenKind::Op(Operator::And))) {
-        iter.next(); // consume `&&`
-        skip_test_newlines(iter);
+    skip_test_newlines(iter)?;
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::And))) {
+        iter.next_kind()?; // consume `&&`
+        skip_test_newlines(iter)?;
         let rhs = parse_test_not(iter)?;
         lhs = TestExpr::And(Box::new(lhs), Box::new(rhs));
-        skip_test_newlines(iter);
+        skip_test_newlines(iter)?;
     }
     Ok(lhs)
 }
 
 /// Next precedence: `!` (right-associative).
 fn parse_test_not(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<TestExpr, ParseError> {
-    if iter.peek().map(is_bang_word).unwrap_or(false) {
-        iter.next(); // consume `!`
+    if iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?; // consume `!`
         let inner = parse_test_not(iter)?;
         return Ok(TestExpr::Not(Box::new(inner)));
     }
@@ -2613,14 +2571,14 @@ fn parse_test_not(
 
 /// Highest precedence: `( expr )` grouping or a single test atom.
 fn parse_test_primary(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<TestExpr, ParseError> {
     // Grouping: `( expr )`.
-    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
-        iter.next(); // consume `(`
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?; // consume `(`
         let inner = parse_test_or(iter)?;
         // Expect `)`.
-        match iter.next() {
+        match iter.next_kind()? {
             Some(TokenKind::Op(Operator::RParen)) => {}
             None => return Err(ParseError::UnterminatedDoubleBracket),
             _ => return Err(ParseError::TestExprMissingOperand),
@@ -2633,40 +2591,40 @@ fn parse_test_primary(
 /// Parses a single test — either a unary test (`-f path`) or a
 /// binary/regex test (`lhs op rhs`).
 fn parse_test_atom(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<TestExpr, ParseError> {
     // End of input mid-expression → unterminated (request continuation).
-    if iter.peek().is_none() {
+    if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedDoubleBracket);
     }
     // A present terminator (`]]` / `)`) with nothing before it → empty body.
-    if is_test_expr_stop(iter) {
+    if is_test_expr_stop(iter)? {
         return Err(ParseError::EmptyDoubleBracket);
     }
 
     // Peek at the first word to check if it is a unary op.
-    let first_word = match iter.peek() {
+    let first_word = match iter.peek_kind()? {
         Some(TokenKind::Word(w)) => w.clone(),
         _ => return Err(ParseError::TestExprMissingOperand),
     };
 
     // Unary op path: `-f`, `-d`, `-n`, `-z`, …
     if let Some(op) = try_unary_op(&first_word) {
-        iter.next(); // consume the op word
+        iter.next_kind()?; // consume the op word
         let operand = next_test_word(iter)?;
         return Ok(TestExpr::Unary { op, operand });
     }
 
     // Binary / regex path: lhs op rhs.
     // Consume the LHS word (first_word peeked above).
-    iter.next();
+    iter.next_kind()?;
     let lhs = first_word;
 
     // Bash: `[[ word ]]` ≡ `[[ -n word ]]`. When no binary operator follows the
     // operand (next token is `]]` / `)` / `&&` / `||` / end-of-input), the lhs
     // alone is a non-empty-string test. See `next_is_test_binary_operator` —
     // keep its operator set in sync with the match arms below.
-    if !next_is_test_binary_operator(iter) {
+    if !next_is_test_binary_operator(iter)? {
         return Ok(TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, operand: lhs });
     }
 
@@ -2674,7 +2632,7 @@ fn parse_test_atom(
     // `-eq`, etc. arrive as Word tokens because the lexer doesn't have them as
     // separate operators.  `<` and `>` ARE lexer operator tokens (RedirIn /
     // RedirOut) — handle those too.
-    let op_token = iter.next();
+    let op_token = iter.next_kind()?;
     match op_token {
         None => Err(ParseError::UnterminatedDoubleBracket),
         // `<` and `>` are lexed as RedirIn / RedirOut even inside `[[ ]]`.
@@ -2773,28 +2731,28 @@ fn parse_test_atom(
 /// Consumes `[[`, parses the test expression tree via Pratt precedence,
 /// then consumes `]]`. Returns `Command::DoubleBracket { expr, inline_assignments }`.
 fn parse_double_bracket(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     parse_double_bracket_with_assigns(iter, Vec::new())
 }
 
 fn parse_double_bracket_with_assigns(
-    iter: &mut TokenCursor,
+    iter: &mut Lexer,
     inline_assignments: Vec<Assignment>,
 ) -> Result<Command, ParseError> {
     // Consume `[[`.
-    iter.next();
+    iter.next_kind()?;
 
     // Skip newlines after `[[` (bash allows `[[\n expr ]]`).
-    skip_test_newlines(iter);
+    skip_test_newlines(iter)?;
 
     // Immediately hit `]]` — empty body.
-    if iter.peek().and_then(keyword_of) == Some(Keyword::DoubleBracketClose) {
+    if iter.peek_kind()?.and_then(keyword_of) == Some(Keyword::DoubleBracketClose) {
         return Err(ParseError::EmptyDoubleBracket);
     }
 
     // End of input — unterminated.
-    if iter.peek().is_none() {
+    if iter.peek_kind()?.is_none() {
         return Err(ParseError::UnterminatedDoubleBracket);
     }
 
@@ -2806,10 +2764,10 @@ fn parse_double_bracket_with_assigns(
         })?;
 
     // Skip newlines before `]]` (bash allows `expr\n]]`).
-    skip_test_newlines(iter);
+    skip_test_newlines(iter)?;
 
     // Consume `]]`.
-    match iter.next() {
+    match iter.next_kind()? {
         Some(tok) if keyword_of(&tok) == Some(Keyword::DoubleBracketClose) => {}
         None => return Err(ParseError::UnterminatedDoubleBracket),
         _ => return Err(ParseError::UnterminatedDoubleBracket),
@@ -2834,7 +2792,7 @@ mod tests {
     #[test]
     fn parse_one_unit_splits_on_top_level_newline() {
         let toks = crate::lexer::tokenize("echo a\necho b\n").unwrap();
-        let mut it = TokenCursor::new(toks);
+        let mut it = Lexer::from_tokens(toks);
         let u1 = parse_one_unit(&mut it).unwrap().expect("unit 1");
         assert!(u1.rest.is_empty());
         let u2 = parse_one_unit(&mut it).unwrap().expect("unit 2");
@@ -2846,7 +2804,7 @@ mod tests {
     fn parse_one_unit_keeps_semicolon_list_and_andor_together() {
         // `a; b && c` on one line is ONE unit (semicolon and && do not split).
         let toks = crate::lexer::tokenize("a; b && c\n").unwrap();
-        let mut it = TokenCursor::new(toks);
+        let mut it = Lexer::from_tokens(toks);
         let u = parse_one_unit(&mut it).unwrap().expect("unit");
         assert_eq!(u.rest.len(), 2); // (Semi, b), (And, c)
         assert!(parse_one_unit(&mut it).unwrap().is_none());
@@ -2855,7 +2813,7 @@ mod tests {
     #[test]
     fn parse_one_unit_keeps_multiline_if_as_one_unit() {
         let toks = crate::lexer::tokenize("if true\nthen echo hi\nfi\necho after\n").unwrap();
-        let mut it = TokenCursor::new(toks);
+        let mut it = Lexer::from_tokens(toks);
         let u1 = parse_one_unit(&mut it).unwrap().expect("if unit");
         // u1.first should be the If compound (tuple variant Command::If(_)).
         assert!(matches!(u1.first, Command::If(_)));
