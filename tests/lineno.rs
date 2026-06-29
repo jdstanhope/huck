@@ -31,3 +31,12 @@ fn huck(script: &str) -> String {
         .args(["-c", "echo a\nx=$LINENO\necho $x"]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\n2\n");
 }
+#[test] fn alias_expanded_command_reports_use_site_line() {
+    // v237: a token from an alias body inherits the alias-name token's span, so
+    // an alias whose body reads $LINENO reports the line where the alias is USED,
+    // not where it was defined. `e` is used on lines 3 and 4 -> 3, 4 (matches bash).
+    assert_eq!(
+        huck("shopt -s expand_aliases\nalias e='echo $LINENO'\ne\ne"),
+        "3\n4\n"
+    );
+}
