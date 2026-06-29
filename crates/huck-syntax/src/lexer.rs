@@ -507,6 +507,11 @@ pub struct Lexer<'a> {
     dbracket_depth: u32,
     expect_regex: bool,
     pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
+    aliases: std::collections::HashMap<String, String>,
+    active: std::collections::HashSet<String>,
+    /// Carries bash's trailing-blank rule across one expansion: a body ending in
+    /// whitespace makes the NEXT word command-position eligible.
+    alias_trailing_eligible: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -528,6 +533,9 @@ impl<'a> Lexer<'a> {
             dbracket_depth: 0,
             expect_regex: false,
             pending_heredocs: std::collections::VecDeque::new(),
+            aliases: std::collections::HashMap::new(),
+            active: std::collections::HashSet::new(),
+            alias_trailing_eligible: false,
         }
     }
 
@@ -1231,6 +1239,9 @@ impl<'a> Lexer<'a> {
             dbracket_depth: 0,
             expect_regex: false,
             pending_heredocs: std::collections::VecDeque::new(),
+            aliases: std::collections::HashMap::new(),
+            active: std::collections::HashSet::new(),
+            alias_trailing_eligible: false,
         }
     }
 
@@ -1284,6 +1295,62 @@ impl<'a> Lexer<'a> {
     pub fn remaining(&self) -> usize {
         self.history.len().saturating_sub(self.pos)
     }
+
+    pub fn set_aliases(&mut self, aliases: std::collections::HashMap<String, String>) {
+        self.aliases = aliases;
+    }
+
+    /// Expand a registered alias at command position by splicing its body tokens into
+    /// `history` ahead of `pos`. Mirrors Expander::expand_alias (recursion guard,
+    /// trailing-blank, span inheritance). Body tokens take the alias-name span.
+    fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
+        self.fill_to(self.pos)?;
+        let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
+        let TokenKind::Word(w) = &tok.kind else { return Ok(()) };
+        let Some(name) = word_literal_text(w) else { return Ok(()) };
+        if self.active.contains(&name) { return Ok(()); }
+        let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
+        let name_span = tok.span;
+        let body_tokens = tokenize(&body)?; // bad body → Err, propagated by callers
+        self.history.remove(self.pos);
+        let mut insert_at = self.pos;
+        for bt in body_tokens {
+            self.history.insert(insert_at, Token::new(bt.kind, name_span));
+            insert_at += 1;
+        }
+        // Recursion guard: re-enter with `name` active so the body's own first word
+        // expands if it is a *different* alias, but `name` cannot re-expand itself.
+        self.active.insert(name.clone());
+        self.maybe_expand_command_alias()?;
+        self.active.remove(&name);
+        self.alias_trailing_eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
+        Ok(())
+    }
+
+    pub fn peek_command_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
+        self.maybe_expand_command_alias()?;
+        self.peek_kind()
+    }
+
+    pub fn next_command(&mut self) -> Result<Option<Token>, LexError> {
+        self.maybe_expand_command_alias()?;
+        self.next()
+    }
+}
+
+/// Returns the concatenated literal text of a Word iff every part is an
+/// unquoted Literal. Returns None for any quoted, Var, Arith, CommandSub, or
+/// Tilde part — aliases only expand from plain unquoted identifiers.
+/// Mirrors `alias_expand::simple_word_text`.
+fn word_literal_text(w: &Word) -> Option<String> {
+    let mut s = String::new();
+    for part in &w.0 {
+        match part {
+            WordPart::Literal { text, quoted: false } => s.push_str(text),
+            _ => return None,
+        }
+    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn tokenize_partial_inner(
@@ -9278,6 +9345,83 @@ mod array_parse_tests {
             }
         }
         assert!(got_err, "unterminated quote must surface as Err from the pull");
+    }
+
+    // --- Task 4: alias storage + command-position expansion ---
+
+    fn lx_with_alias(input: &str, pairs: &[(&str, &str)]) -> Lexer<'static> {
+        let toks = tokenize(input).unwrap();
+        let mut lx = Lexer::from_tokens(toks);
+        let mut m = std::collections::HashMap::new();
+        for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
+        lx.set_aliases(m);
+        lx
+    }
+
+    fn wtext(k: &TokenKind) -> String {
+        // Test helper: extract all literal text (including quoted parts) so that
+        // quoted words like `'ll'` show as "ll" for assertion display. Recurses into
+        // WordPart::Quoted wrappers (single/double/etc). Distinct from
+        // word_literal_text (which returns None for quoted parts to block alias
+        // expansion); this is for verifying WHAT was returned, not WHETHER to expand.
+        fn extract(parts: &[WordPart], s: &mut String) {
+            for part in parts {
+                match part {
+                    WordPart::Literal { text, .. } => s.push_str(text),
+                    WordPart::Quoted { parts: inner, .. } => extract(inner, s),
+                    _ => {}
+                }
+            }
+        }
+        if let TokenKind::Word(w) = k {
+            let mut s = String::new();
+            extract(&w.0, &mut s);
+            s
+        } else {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn alias_expands_at_command_position() {
+        let mut lx = lx_with_alias("ll /tmp", &[("ll", "ls -l")]);
+        assert_eq!(lx.peek_command_kind().unwrap().map(wtext), Some("ls".into()));
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-l".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("/tmp".into()));
+    }
+
+    #[test]
+    fn alias_not_expanded_at_argument_position() {
+        let mut lx = lx_with_alias("echo ll", &[("ll", "ls -l")]);
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("ll".into()));
+    }
+
+    #[test]
+    fn alias_recursion_guard_terminates() {
+        let mut lx = lx_with_alias("ls", &[("ls", "ls -a")]);
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-a".into()));
+    }
+
+    #[test]
+    fn alias_trailing_blank_makes_next_word_eligible() {
+        let mut lx = lx_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
+    }
+
+    #[test]
+    fn quoted_word_not_expanded() {
+        let mut lx = lx_with_alias("'ll'", &[("ll", "ls")]);
+        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
+    }
+
+    #[test]
+    fn bad_alias_body_returns_err() {
+        let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
+        assert!(lx.next_command().is_err());
     }
 }
 
