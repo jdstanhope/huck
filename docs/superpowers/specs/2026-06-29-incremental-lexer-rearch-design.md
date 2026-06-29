@@ -91,6 +91,34 @@ the current batch lexer; the full `cargo test --workspace` suite + the 152
 `tests/scripts/*_diff_check.sh` harnesses already assert this transitively.
 This proves the incremental engine in isolation, with zero parser risk.
 
+Phase A is a **minimal extraction** (decided): lift the current
+`tokenize_partial_inner` loop body into the driver with the smallest possible
+diff — the ~10 local mode flags (`has_token`, `brace_expand`, `expect_regex`,
+`dbracket_depth`, `in_assignment_value`, …) become `Lexer` fields; the loop body
+becomes a `scan_step` that appends its 0..N produced tokens to `self.history`
+(instead of a local `tokens` vec) and advances the cursor. The clean Mode-stack
+decomposition (Section 3) is a SEPARATE follow-on (Phase A.2) layered on a proven
+`next_token`, NOT done in Phase A. Mechanism — `next_token` drains the history
+buffer, only scanning when it runs dry, so the existing "0 tokens (whitespace)"
+and "N tokens (brace expansion)" iterations map cleanly:
+
+```rust
+fn next_token(&mut self) -> Result<Option<Token>, LexError> {
+    loop {
+        if self.pos < self.history.len() {           // hand out buffered token
+            let t = self.history[self.pos].clone(); self.pos += 1; return Ok(Some(t));
+        }
+        match self.scan_step()? {                     // one old-loop iteration
+            Step::Eof => return Ok(None),             // appends 0..N to history
+            Step::Produced => continue,               // loop back to drain
+        }
+    }
+}
+// tokenize(): drain next_token() into a Vec<Token> — output byte-identical.
+// Heredoc body backfill (collect_*_bodies mutating earlier Heredoc tokens) and
+// tokenize_partial's partial+error contract both still work against `history`.
+```
+
 **Phase B — parser drives the lexer.** Once Phase A is verified, switch the
 parser to pull from the `Lexer` (`next`/`peek`/`push_mode`/`pop_mode`/
 `mark`/`rewind`) instead of consuming a `Vec<Token>`. This is where the
