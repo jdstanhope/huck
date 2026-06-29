@@ -528,8 +528,10 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Run the scan loop to completion, filling `self.history`. (T2 will split
-    /// this into one-iteration `scan_step` + a pull `next_token`.)
+    /// Exactly ONE iteration of the old scan loop: advance the cursor and append
+    /// 0..N tokens to `self.history`. Returns `Produced` while input remains (the
+    /// old `continue` / fall-through), or routes to `finish()` at end of input
+    /// (the old EOF `break`). `?` errors propagate unchanged.
     fn scan_step(&mut self) -> Result<Step, LexError> {
         // When `$glued` (no whitespace between the just-flushed Word and the
         // redirect operator about to be pushed), and that trailing Word is a pure
@@ -586,7 +588,7 @@ impl<'a> Lexer<'a> {
                 flush_literal(&mut self.parts, &mut self.current, false);
                 debug_assert!(
                     !self.parts.is_empty(),
-                    "lexer invariant: self.has_token was true but no self.parts were emitted"
+                    "lexer invariant: has_token was true but no parts were emitted"
                 );
                 let kw = single_unquoted_literal(&self.parts).map(str::to_owned);
                 emit_word_with_braces(&mut self.history, std::mem::take(&mut self.parts), self.brace_expand, Span::new(self.token_start, self.token_start_line, self.token_start_col))?;
@@ -698,8 +700,8 @@ impl<'a> Lexer<'a> {
             }
             '\\' => match self.cursor.next() {
                 Some('\n') => {
-                    // POSIX 2.2.1: `\<NL>` is line continuation — both self.cursor
-                    // are deleted. `self.has_token` stays at its self.current value, so
+                    // POSIX 2.2.1: `\<NL>` is line continuation — both chars
+                    // are deleted. `has_token` stays at its current value, so
                     // `echo\<NL>foo` becomes the single word "echofoo" while
                     // `echo \<NL>foo` keeps the space-driven separation.
                 }
@@ -1045,7 +1047,7 @@ impl<'a> Lexer<'a> {
                 let name = std::mem::take(&mut self.current);
                 debug_assert!(
                     self.parts.is_empty(),
-                    "word_is_identifier_so_far guarantees no prior self.parts"
+                    "word_is_identifier_so_far guarantees no prior parts"
                 );
                 self.parts.push(WordPart::AssignPrefix {
                     target: crate::command::AssignTarget::Bare(name),
@@ -1097,7 +1099,7 @@ impl<'a> Lexer<'a> {
                             Some(false)
                         }
                         Some('+') => {
-                            // Need to peek two self.cursor; clone iter for lookahead.
+                            // Need to peek two chars; clone iter for lookahead.
                             let mut peeker = self.cursor.clone();
                             peeker.next();
                             if peeker.peek() == Some(&'=') {
@@ -1118,7 +1120,7 @@ impl<'a> Lexer<'a> {
                         let name = std::mem::take(&mut self.current);
                         debug_assert!(
                             self.parts.is_empty(),
-                            "word_is_identifier_so_far guarantees no prior self.parts"
+                            "word_is_identifier_so_far guarantees no prior parts"
                         );
                         let subscript = parse_subscript_body(&raw_subscript, self.opts)?;
                         self.in_assignment_value = true;
@@ -1137,7 +1139,7 @@ impl<'a> Lexer<'a> {
                     None => {
                         // Not an indexed assignment. Fall back: append
                         // the `[`, the scanned subscript text, and the
-                        // closing `]` (if any) back into the self.current
+                        // closing `]` (if any) back into the current
                         // literal so the word behaves the same as
                         // before this arm existed.
                         self.has_token = true;
@@ -1221,6 +1223,12 @@ fn tokenize_partial_inner(
             Ok(None) => return (out, None),
             Err(e) => {
                 let off = lx.cursor.offset();
+                // Error path is terminal: include any tokens scanned but not yet
+                // handed out — e.g. an unterminated heredoc's placeholder, which
+                // the readiness rule kept buffered (its body will never arrive).
+                // This makes the partial set byte-identical to the batch lexer,
+                // while the readiness rule still governs normal incremental reads.
+                out.extend(lx.history[lx.pos..].iter().cloned());
                 return (out, Some((e, off)));
             }
         }
@@ -4708,6 +4716,23 @@ mod tests {
         }
         assert_eq!(stream, batch_tokens);
         assert_eq!(stream_err.map(|(_, o)| o), batch_err.map(|(_, o)| o));
+    }
+
+    #[test]
+    fn next_token_partial_unterminated_heredoc_keeps_buffered_tokens() {
+        // Unterminated heredoc: the readiness rule buffers the placeholder Heredoc
+        // (and trailing same-line tokens) during normal reads, but on the terminal
+        // error path tokenize_partial must still surface them — byte-identical to
+        // the batch lexer's partial set. Locks the error-path flush in
+        // tokenize_partial_inner.
+        let src = "cat <<EOF; echo hi";
+        let (toks, err) = tokenize_partial(src, LexerOptions::default());
+        assert!(matches!(err, Some((LexError::UnterminatedHeredoc, _))), "err: {err:?}");
+        // cat, Heredoc(placeholder), ;, echo, hi
+        assert_eq!(toks.len(), 5, "partial set should keep the buffered heredoc + trailing: {toks:?}");
+        assert_eq!(word_text(&toks[0]).as_deref(), Some("cat"));
+        assert!(matches!(&toks[1].kind, TokenKind::Heredoc { .. }), "toks[1] should be the Heredoc placeholder: {:?}", toks[1]);
+        assert_eq!(word_text(&toks[4]).as_deref(), Some("hi"));
     }
 
     #[test]
