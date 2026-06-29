@@ -12,7 +12,7 @@
 
 use std::io::Read;
 
-use huck_syntax::{tokenize_with_opts, LexerOptions, Token, Word, WordPart};
+use huck_syntax::{TokenKind, tokenize_with_opts, LexerOptions, Token, Word, WordPart};
 
 fn main() {
     let mut input = String::new();
@@ -42,10 +42,10 @@ fn print_tokens(tokens: &[Token]) {
 }
 
 fn token_label(t: &Token) -> String {
-    match t {
-        Token::Word(w) => format!("Word            {}", describe_word(w)),
-        Token::Op(op) => format!("Op              {op:?}"),
-        Token::Heredoc { expand, strip_tabs, body } => {
+    match &t.kind {
+        TokenKind::Word(w) => format!("Word            {}", describe_word(w)),
+        TokenKind::Op(op) => format!("Op              {op:?}"),
+        TokenKind::Heredoc { expand, strip_tabs, body } => {
             // The lexer collapses `<<DELIM` + body lines into one Heredoc
             // token at the `<<` position. The delim itself is not emitted.
             format!(
@@ -53,9 +53,9 @@ fn token_label(t: &Token) -> String {
                 describe_word(body),
             )
         }
-        Token::Newline => "Newline".to_string(),
-        Token::ArithBlock(body, _opts) => format!("ArithBlock      ((  {body}  ))"),
-        Token::RedirFd(fd) => format!("RedirFd         {fd:?}"),
+        TokenKind::Newline => "Newline".to_string(),
+        TokenKind::ArithBlock(body, _opts) => format!("ArithBlock      ((  {body}  ))"),
+        TokenKind::RedirFd(fd) => format!("RedirFd         {fd:?}"),
         _ => "Token           <unknown>".to_string(),
     }
 }

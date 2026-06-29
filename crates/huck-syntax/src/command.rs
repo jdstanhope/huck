@@ -1,4 +1,4 @@
-use crate::lexer::{Operator, Token, Word, WordPart};
+use crate::lexer::{Operator, Token, TokenKind, Word, WordPart};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Keyword {
@@ -54,8 +54,8 @@ impl Keyword {
 /// Returns the keyword a token represents, or `None`. A token is a
 /// keyword only when it is a `Word` of exactly one part — an *unquoted*
 /// `Literal` whose text equals the keyword.
-fn keyword_of(token: &Token) -> Option<Keyword> {
-    let Token::Word(Word(parts)) = token else { return None };
+fn keyword_of(token: &TokenKind) -> Option<Keyword> {
+    let TokenKind::Word(Word(parts)) = token else { return None };
     if parts.len() != 1 {
         return None;
     }
@@ -771,36 +771,38 @@ impl std::error::Error for ParseError {}
 /// token to be returned). Lines are `0` ("unknown") unless built with real lines.
 pub struct TokenCursor {
     tokens: Vec<Option<Token>>,
-    lines: Vec<u32>,
     pos: usize,
 }
 impl TokenCursor {
-    pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
-        debug_assert!(lines.is_empty() || lines.len() == tokens.len(),
-            "lines must parallel tokens");
+    pub fn new(tokens: Vec<Token>) -> Self {
         let tokens = tokens.into_iter().map(Some).collect();
-        Self { tokens, lines, pos: 0 }
+        Self { tokens, pos: 0 }
     }
-    /// Line of the next token to be returned (0 if unknown / past end).
+    /// Line of the next token to be returned (0 if unknown / past end), read
+    /// from that token's span. Used to stamp `Command.line` for `$LINENO`.
     pub fn current_line(&self) -> u32 {
-        self.lines.get(self.pos).copied().unwrap_or(0)
+        self.tokens.get(self.pos).and_then(|s| s.as_ref()).map(|t| t.span.line).unwrap_or(0)
     }
-    /// Peek at the next token without consuming it.
-    pub fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)?.as_ref()
+    /// Peek at the next token's KIND without consuming it.
+    pub fn peek(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos)?.as_ref().map(|t| &t.kind)
     }
-    /// Peek at the token after next without consuming anything.
-    pub fn peek2(&self) -> Option<&Token> {
-        self.tokens.get(self.pos + 1)?.as_ref()
+    /// Peek at the kind of the token after next without consuming anything.
+    pub fn peek2(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + 1)?.as_ref().map(|t| &t.kind)
     }
 }
 impl Iterator for TokenCursor {
-    type Item = Token;
-    fn next(&mut self) -> Option<Token> {
+    type Item = TokenKind;
+    /// Consume and yield the next token's KIND. The span is dropped on
+    /// consumption — line stamping happens via `current_line()` before consuming
+    /// (the parser never needs a consumed token's span). This makes the parser
+    /// body identical to its pre-span form (old `Token` enum ≡ new `TokenKind`).
+    fn next(&mut self) -> Option<TokenKind> {
         let slot = self.tokens.get_mut(self.pos)?;
         let t = slot.take()?;   // move out, leaving None in the slot
         self.pos += 1;
-        Some(t)
+        Some(t.kind)
     }
 }
 impl ExactSizeIterator for TokenCursor {
@@ -822,13 +824,7 @@ fn parse_cursor(cur: &mut TokenCursor) -> Result<Option<Sequence>, ParseError> {
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    let n = tokens.len();
-    let mut cur = TokenCursor::new(tokens, vec![0; n]);
-    parse_cursor(&mut cur)
-}
-
-pub fn parse_with_lines(tokens: Vec<Token>, lines: Vec<u32>) -> Result<Option<Sequence>, ParseError> {
-    let mut cur = TokenCursor::new(tokens, lines);
+    let mut cur = TokenCursor::new(tokens);
     parse_cursor(&mut cur)
 }
 
@@ -843,7 +839,7 @@ fn parse_command_then_pipeline(
     iter: &mut TokenCursor,
 ) -> Result<Command, ParseError> {
     let raw = parse_command(iter)?;
-    if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
         // The bang wrapper in `parse_command` may have produced a 1-element
         // negated Pipeline around a compound/subshell first stage (e.g.
         // `! ( false ) | cat`). Since `!` negates the WHOLE pipeline, hoist
@@ -863,7 +859,7 @@ fn parse_command_then_pipeline(
             stages.push(cmd);
             if next_pipe {
                 // Simple stage already consumed its own `|`; continue.
-            } else if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+            } else if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
                 iter.next();
                 skip_newlines(iter);
             } else {
@@ -894,7 +890,7 @@ fn parse_sequence(
 pub fn parse_one_unit(
     iter: &mut TokenCursor,
 ) -> Result<Option<Sequence>, ParseError> {
-    while matches!(iter.peek(), Some(Token::Newline)) {
+    while matches!(iter.peek(), Some(TokenKind::Newline)) {
         iter.next();
     }
     if iter.peek().is_none() {
@@ -904,7 +900,7 @@ pub fn parse_one_unit(
 }
 
 /// The shared body of [`parse_sequence`]. When `stop_at_top_newline` is set, a
-/// top-level `Token::Newline` terminates the command unit (used by
+/// top-level `TokenKind::Newline` terminates the command unit (used by
 /// [`parse_one_unit`] for the non-interactive script reader); otherwise a
 /// top-level newline is a Semi-like continue connector (the historical
 /// behavior — all existing callers go through the `false` wrapper).
@@ -920,7 +916,7 @@ fn parse_sequence_opts(
     loop {
         match iter.peek() {
             None => break,
-            Some(Token::Op(
+            Some(TokenKind::Op(
                 Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
             )) => break,
             Some(tok) => {
@@ -933,7 +929,7 @@ fn parse_sequence_opts(
         }
         let token = iter.next().unwrap();
         match token {
-            Token::Op(Operator::Background) => {
+            TokenKind::Op(Operator::Background) => {
                 // `&` is a list separator (v98): it backgrounds the preceding
                 // and-or group. Skip any trailing Newline tokens that the
                 // heredoc body collector emits at the end of the input (e.g.
@@ -960,14 +956,14 @@ fn parse_sequence_opts(
                     }
                     // A case-clause terminator ends the clause body -> trailing
                     // `&` for the last group.
-                    Some(Token::Op(
+                    Some(TokenKind::Op(
                         Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
                     )) => {
                         background = true;
                         break;
                     }
                     // Another `&` (`cmd & &`) has no preceding command -> invalid.
-                    Some(Token::Op(Operator::Background)) => {
+                    Some(TokenKind::Op(Operator::Background)) => {
                         return Err(ParseError::UnexpectedBackground);
                     }
                     // A command follows -> `&` is a separator: background the
@@ -977,8 +973,8 @@ fn parse_sequence_opts(
                     }
                 }
             }
-            Token::Op(Operator::Semi) | Token::Newline => {
-                if stop_at_top_newline && matches!(token, Token::Newline) {
+            TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
+                if stop_at_top_newline && matches!(token, TokenKind::Newline) {
                     // Unit mode: a top-level newline ends the command unit
                     // (already consumed by iter.next() above). `;`, `&&`,
                     // `||`, `&`, and compound-internal newlines are unaffected.
@@ -987,7 +983,7 @@ fn parse_sequence_opts(
                 skip_newlines(iter);
                 match iter.peek() {
                     None => break,
-                    Some(Token::Op(
+                    Some(TokenKind::Op(
                         Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
                     )) => break,
                     Some(tok) => {
@@ -998,11 +994,11 @@ fn parse_sequence_opts(
                 }
                 rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
             }
-            Token::Op(Operator::And) => {
+            TokenKind::Op(Operator::And) => {
                 skip_newlines(iter);
                 rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
-            Token::Op(Operator::Or) => {
+            TokenKind::Op(Operator::Or) => {
                 skip_newlines(iter);
                 rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
             }
@@ -1055,8 +1051,8 @@ fn parse_command_inner(
     skip_newlines(iter);
 
     // Standalone arith block: `((expr))` at command position.
-    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
-        let Some(Token::ArithBlock(text, opts)) = iter.next() else {
+    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
+        let Some(TokenKind::ArithBlock(text, opts)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
@@ -1099,18 +1095,18 @@ fn parse_command_inner(
             // but in practice they don't overlap: function-def starts with
             // a Word token, not an Op(LParen). Still, the comment clarifies
             // intent.
-            if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+            if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
                 let cmd = parse_subshell(iter)?;
                 return maybe_wrap_redirects(cmd, iter);
             }
             // Non-keyword, non-LParen: may be a function definition
             // `name() compound`, or a plain pipeline. Need two-token lookahead.
-            if matches!(iter.peek(), Some(Token::Word(_))) {
+            if matches!(iter.peek(), Some(TokenKind::Word(_))) {
                 // Capture the line of the first word BEFORE consuming it.
                 let word_line = iter.current_line();
                 // Consume the word; peek for `(`.
-                let Some(Token::Word(w)) = iter.next() else { unreachable!() };
-                if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+                let Some(TokenKind::Word(w)) = iter.next() else { unreachable!() };
+                if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
                     return parse_function_def(w, iter);
                 }
                 // Detect inline assignments before `[[`:
@@ -1129,11 +1125,11 @@ fn parse_command_inner(
                     }
                     let mut extra_clones: Vec<Word> = Vec::new();
                     // Peel further consecutive assignment words.
-                    while let Some(Token::Word(nw)) = iter.peek() {
+                    while let Some(TokenKind::Word(nw)) = iter.peek() {
                         if !is_assignment_word(nw) {
                             break;
                         }
-                        let Some(Token::Word(nw)) = iter.next() else { unreachable!() };
+                        let Some(TokenKind::Word(nw)) = iter.next() else { unreachable!() };
                         let nw_clone = nw.clone();
                         match try_split_assignment(nw) {
                             Ok(a) => assigns.push(a),
@@ -1162,8 +1158,8 @@ fn parse_command_inner(
                     // drained — the outer parse_sequence needs `iter` intact to
                     // pick up any trailing `;`/`&&`/`||` separators after this
                     // pipeline ends.
-                    let prefix: Vec<Token> =
-                        extra_clones.into_iter().map(Token::Word).collect();
+                    let prefix: Vec<TokenKind> =
+                        extra_clones.into_iter().map(TokenKind::Word).collect();
                     return Ok(Command::Pipeline(
                         parse_pipeline_with_first(Some(w_clone), prefix, iter, word_line)?
                     ));
@@ -1231,7 +1227,7 @@ fn parse_function_def(
     iter.next();
     // Expect `)`.
     match iter.next() {
-        Some(Token::Op(Operator::RParen)) => {}
+        Some(TokenKind::Op(Operator::RParen)) => {}
         _ => return Err(ParseError::FunctionBody),
     }
     finish_function_body(name, iter)
@@ -1250,16 +1246,16 @@ fn parse_function_keyword_def(
     // Read the name. Must be a Word that's a valid POSIX identifier
     // and not a reserved keyword.
     let name_word = match iter.next() {
-        Some(Token::Word(w)) => w,
+        Some(TokenKind::Word(w)) => w,
         _ => return Err(ParseError::FunctionName),
     };
     let name = valid_function_name_text(&name_word).ok_or(ParseError::FunctionName)?;
 
     // Optionally consume `()`.
-    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
         iter.next(); // consume `(`
         match iter.next() {
-            Some(Token::Op(Operator::RParen)) => {}
+            Some(TokenKind::Op(Operator::RParen)) => {}
             _ => return Err(ParseError::FunctionBody),
         }
     }
@@ -1271,7 +1267,7 @@ fn parse_function_keyword_def(
 /// Consumes a run of `Newline` tokens. Newlines are soft separators —
 /// they are skipped wherever a command is expected but not yet present.
 fn skip_newlines(iter: &mut TokenCursor) {
-    while matches!(iter.peek(), Some(Token::Newline)) {
+    while matches!(iter.peek(), Some(TokenKind::Newline)) {
         iter.next();
     }
 }
@@ -1360,7 +1356,7 @@ fn valid_identifier_text(word: &Word) -> Option<String> {
         return None;
     };
     // Reject reserved keywords. Build a single-Word token to reuse keyword_of.
-    let tok = Token::Word(Word(vec![WordPart::Literal {
+    let tok = TokenKind::Word(Word(vec![WordPart::Literal {
         text: text.clone(),
         quoted: false,
     }]));
@@ -1395,7 +1391,7 @@ fn valid_function_name_text(word: &Word) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    let tok = Token::Word(Word(vec![WordPart::Literal {
+    let tok = TokenKind::Word(Word(vec![WordPart::Literal {
         text: text.clone(),
         quoted: false,
     }]));
@@ -1410,8 +1406,8 @@ fn valid_function_name_text(word: &Word) -> Option<String> {
 /// parse time (including reserved words like `if`, and non-identifiers like
 /// `a-b`); the identifier rule is enforced at RUNTIME (`run_for`). So this does
 /// NOT apply the keyword / charset checks of `valid_identifier_text`.
-fn for_variable_name(token: &Token) -> Option<String> {
-    let Token::Word(w) = token else { return None };
+fn for_variable_name(token: &TokenKind) -> Option<String> {
+    let TokenKind::Word(w) = token else { return None };
     if w.0.len() != 1 {
         return None;
     }
@@ -1488,14 +1484,14 @@ fn parse_arith_for_header(
 
 /// Parses the body of `for ((header)) [;|newline]* do BODY done`. The
 /// caller has consumed `for` and verified the next token is
-/// `Token::ArithBlock`. This function consumes the ArithBlock, the
+/// `TokenKind::ArithBlock`. This function consumes the ArithBlock, the
 /// separators before `do`, the `do` keyword, the body, and the `done`
 /// keyword.
 fn parse_arith_for_clause(
     iter: &mut TokenCursor,
 ) -> Result<ArithForClause, ParseError> {
     let (header_text, arith_opts) = match iter.next() {
-        Some(Token::ArithBlock(text, opts)) => (text, opts),
+        Some(TokenKind::ArithBlock(text, opts)) => (text, opts),
         _ => unreachable!("caller verified peek"),
     };
     let (init, cond, step) = parse_arith_for_header(&header_text, arith_opts)?;
@@ -1503,7 +1499,7 @@ fn parse_arith_for_clause(
     // Skip `;` and newline separators between the header and `do`.
     while matches!(
         iter.peek(),
-        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+        Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
     ) {
         iter.next();
     }
@@ -1525,15 +1521,15 @@ fn parse_for_command(
 
     // Peek the next token to choose the variant. Skip newlines first so
     // `for\n((...))` works the same as `for ((...))`.
-    while matches!(iter.peek(), Some(Token::Newline)) {
+    while matches!(iter.peek(), Some(TokenKind::Newline)) {
         iter.next();
     }
 
-    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
+    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
         return Ok(Command::ArithFor(Box::new(parse_arith_for_clause(iter)?)));
     }
 
-    // v184: an arith-for header `((init;cond;step))` lexes as `Token::ArithBlock`
+    // v184: an arith-for header `((init;cond;step))` lexes as `TokenKind::ArithBlock`
     // only when its `((` closes with a matching `))`. An *unterminated* `((`
     // (e.g. the REPL line `for ((;;`) now falls back to two `LParen` tokens, so
     // here we see `for` immediately followed by `(` `(`. In bash, `for` may only
@@ -1541,8 +1537,8 @@ fn parse_for_command(
     // error — so two consecutive `(` here mean an arith-for header that hasn't
     // closed yet. Report it as UnterminatedLoop (the v19 classifier maps that to
     // "read more"), matching bash which prompts `>` for an unclosed `for ((`.
-    if matches!(iter.peek(), Some(Token::Op(Operator::LParen)))
-        && matches!(iter.peek2(), Some(Token::Op(Operator::LParen)))
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen)))
+        && matches!(iter.peek2(), Some(TokenKind::Op(Operator::LParen)))
     {
         return Err(ParseError::UnterminatedLoop);
     }
@@ -1556,7 +1552,7 @@ fn parse_for_command(
 fn parse_do_body_done(iter: &mut TokenCursor) -> Result<Sequence, ParseError> {
     while matches!(
         iter.peek(),
-        Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+        Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
     ) {
         iter.next();
     }
@@ -1588,14 +1584,14 @@ fn parse_for_after_keyword(
         iter.next(); // consume `in`
         loop {
             match iter.peek() {
-                None | Some(Token::Newline) | Some(Token::Op(Operator::Semi)) => break,
+                None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => break,
                 Some(tok) => {
                     if keyword_of(tok) == Some(Keyword::Do) {
                         break;
                     }
                     match iter.next() {
-                        Some(Token::Word(w)) => words.push(w),
-                        Some(Token::Op(_)) => return Err(ParseError::UnexpectedToken),
+                        Some(TokenKind::Word(w)) => words.push(w),
+                        Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                         _ => unreachable!("peek already ruled out Newline/Semi/None here"),
                     }
                 }
@@ -1632,14 +1628,14 @@ fn parse_select_command(
         let mut list: Vec<Word> = Vec::new();
         loop {
             match iter.peek() {
-                None | Some(Token::Newline) | Some(Token::Op(Operator::Semi)) => break,
+                None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => break,
                 Some(tok) => {
                     if keyword_of(tok) == Some(Keyword::Do) {
                         break;
                     }
                     match iter.next() {
-                        Some(Token::Word(w)) => list.push(w),
-                        Some(Token::Op(_)) => return Err(ParseError::UnexpectedToken),
+                        Some(TokenKind::Word(w)) => list.push(w),
+                        Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
                         _ => unreachable!("peek already ruled out Newline/Semi/None here"),
                     }
                 }
@@ -1662,16 +1658,16 @@ fn parse_select_command(
 /// compound).
 fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
     // Named form: a valid-identifier Word followed by a compound-command opener.
-    let is_named = matches!(iter.peek(), Some(Token::Word(w))
+    let is_named = matches!(iter.peek(), Some(TokenKind::Word(w))
         if valid_identifier_text(w).is_some())
         && is_compound_opener(iter.peek2());
 
     if is_named {
         // Consume the NAME word (we already verified it's a valid identifier).
         let name = match iter.next() {
-            Some(Token::Word(w)) => valid_identifier_text(&w)
+            Some(TokenKind::Word(w)) => valid_identifier_text(&w)
                 .expect("verified above"),
-            _ => unreachable!("peek matched Token::Word"),
+            _ => unreachable!("peek matched TokenKind::Word"),
         };
         let body = parse_command_inner(iter)?;
         return Ok(Command::Coproc { name, body: Box::new(body) });
@@ -1684,10 +1680,10 @@ fn parse_coproc_command(iter: &mut TokenCursor) -> Result<Command, ParseError> {
 
 /// True if `tok` is the first token of a compound command
 /// (`{`, `(`, if/while/until/for/case/select, `[[`, `((`).
-fn is_compound_opener(tok: Option<&Token>) -> bool {
+fn is_compound_opener(tok: Option<&TokenKind>) -> bool {
     match tok {
-        Some(Token::Op(Operator::LParen)) => true,
-        Some(Token::ArithBlock(..)) => true,
+        Some(TokenKind::Op(Operator::LParen)) => true,
+        Some(TokenKind::ArithBlock(..)) => true,
         Some(t) => matches!(
             keyword_of(t),
             Some(Keyword::LBrace)
@@ -1712,7 +1708,7 @@ fn parse_case(
 
     let subject = match iter.next() {
         None => return Err(ParseError::UnterminatedCase),
-        Some(Token::Word(w)) => w,
+        Some(TokenKind::Word(w)) => w,
         Some(_) => return Err(ParseError::UnexpectedToken),
     };
 
@@ -1737,7 +1733,7 @@ fn parse_case_item(
     iter: &mut TokenCursor,
 ) -> Result<CaseItem, ParseError> {
     // Optional leading `(`.
-    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
         iter.next();
     }
 
@@ -1747,15 +1743,15 @@ fn parse_case_item(
         skip_newlines(iter);
         match iter.next() {
             None => return Err(ParseError::UnterminatedCase),
-            Some(Token::Word(w)) => patterns.push(w),
+            Some(TokenKind::Word(w)) => patterns.push(w),
             Some(_) => return Err(ParseError::UnexpectedToken),
         }
         match iter.peek() {
             None => return Err(ParseError::UnterminatedCase),
-            Some(Token::Op(Operator::Pipe)) => {
+            Some(TokenKind::Op(Operator::Pipe)) => {
                 iter.next();
             }
-            Some(Token::Op(Operator::RParen)) => {
+            Some(TokenKind::Op(Operator::RParen)) => {
                 iter.next();
                 break;
             }
@@ -1767,7 +1763,7 @@ fn parse_case_item(
     skip_newlines(iter);
     let body = match iter.peek() {
         None => return Err(ParseError::UnterminatedCase),
-        Some(Token::Op(
+        Some(TokenKind::Op(
             Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
         )) => None,
         Some(tok) if keyword_of(tok) == Some(Keyword::Esac) => None,
@@ -1776,15 +1772,15 @@ fn parse_case_item(
 
     // Terminator — an absent one (next token is `esac` or end) is `Break`.
     let terminator = match iter.peek() {
-        Some(Token::Op(Operator::DoubleSemi)) => {
+        Some(TokenKind::Op(Operator::DoubleSemi)) => {
             iter.next();
             CaseTerminator::Break
         }
-        Some(Token::Op(Operator::SemiAmp)) => {
+        Some(TokenKind::Op(Operator::SemiAmp)) => {
             iter.next();
             CaseTerminator::FallThrough
         }
-        Some(Token::Op(Operator::DoubleSemiAmp)) => {
+        Some(TokenKind::Op(Operator::DoubleSemiAmp)) => {
             iter.next();
             CaseTerminator::ContinueMatch
         }
@@ -1818,7 +1814,7 @@ fn parse_subshell(
     iter.next();
 
     // Empty subshell `()` — immediately hit `)` with no commands inside.
-    if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
         iter.next(); // consume `)`
         return Err(ParseError::EmptySubshell);
     }
@@ -1836,7 +1832,7 @@ fn parse_subshell(
 
 /// Parses a sequence of commands terminated by `)`. Mirrors `parse_sequence`
 /// but:
-/// - breaks on `Token::Op(Operator::RParen)` (consuming it) instead of keywords.
+/// - breaks on `TokenKind::Op(Operator::RParen)` (consuming it) instead of keywords.
 /// - returns `Err(UnterminatedSubshell)` if the token stream ends before `)`.
 fn parse_subshell_sequence(
     iter: &mut TokenCursor,
@@ -1851,15 +1847,15 @@ fn parse_subshell_sequence(
             // End of tokens before `)` → unterminated.
             None => return Err(ParseError::UnterminatedSubshell),
             // `)` terminates the subshell body — consume and return.
-            Some(Token::Op(Operator::RParen)) => {
+            Some(TokenKind::Op(Operator::RParen)) => {
                 iter.next();
                 break;
             }
-            Some(Token::Op(Operator::Semi)) | Some(Token::Newline) => {
+            Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline) => {
                 iter.next(); // consume `;` or newline
                 skip_newlines(iter);
                 // Trailing `;` or newline before `)` — break cleanly.
-                if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+                if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
                     iter.next(); // consume `)`
                     break;
                 }
@@ -1869,21 +1865,21 @@ fn parse_subshell_sequence(
                 let cmd = parse_command_then_pipeline(iter)?;
                 rest.push((Connector::Semi, cmd));
             }
-            Some(Token::Op(Operator::Background)) => {
+            Some(TokenKind::Op(Operator::Background)) => {
                 iter.next(); // consume `&`
                 // `&` inside a subshell body backgrounds the preceding command
                 // and acts as a separator. Skip any redundant `;` or newlines
                 // that follow (`&;` is equivalent to `&` in bash).
                 while matches!(
                     iter.peek(),
-                    Some(Token::Op(Operator::Semi)) | Some(Token::Newline)
+                    Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
                 ) {
                     iter.next();
                 }
                 skip_newlines(iter);
                 // If `)` follows (or stream ends), this `&` terminates the
                 // whole body as a backgrounded sequence.
-                if matches!(iter.peek(), Some(Token::Op(Operator::RParen))) {
+                if matches!(iter.peek(), Some(TokenKind::Op(Operator::RParen))) {
                     iter.next(); // consume `)`
                     return Ok(Sequence { first, rest, background: true });
                 }
@@ -1896,12 +1892,12 @@ fn parse_subshell_sequence(
                 let cmd = parse_command_then_pipeline(iter)?;
                 rest.push((Connector::Amp, cmd));
             }
-            Some(Token::Op(Operator::And)) => {
+            Some(TokenKind::Op(Operator::And)) => {
                 iter.next();
                 skip_newlines(iter);
                 rest.push((Connector::And, parse_command_then_pipeline(iter)?));
             }
-            Some(Token::Op(Operator::Or)) => {
+            Some(TokenKind::Op(Operator::Or)) => {
                 iter.next();
                 skip_newlines(iter);
                 rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
@@ -1956,7 +1952,7 @@ fn is_redirect_op(op: &Operator) -> bool {
 
 /// Builds the ordered `Redirection`(s) for a redirect operator + target word.
 ///
-/// `fd_prefix` is `Some` when an explicit `Token::RedirFd` preceded the
+/// `fd_prefix` is `Some` when an explicit `TokenKind::RedirFd` preceded the
 /// operator (`3>`, `{fd}>`), else `None`. Most operators map to a single
 /// `Redirection` with `fd = fd_prefix.unwrap_or(Default)`. The stderr-default
 /// operators (`2>`/`2>>`/`2>&`/`2>|`) default their fd to `Number(2)` when no
@@ -2073,19 +2069,19 @@ fn dup_op(source: Word, output: bool) -> RedirOp {
     }
 }
 
-/// True iff the next token begins a redirection: a `Token::RedirFd` prefix,
-/// a `Token::Heredoc`, or a redirect operator.
+/// True iff the next token begins a redirection: a `TokenKind::RedirFd` prefix,
+/// a `TokenKind::Heredoc`, or a redirect operator.
 fn next_is_redirect(iter: &mut TokenCursor) -> bool {
     match iter.peek() {
-        Some(Token::RedirFd(_)) => true,
-        Some(Token::Heredoc { .. }) => true,
-        Some(Token::Op(op)) => is_redirect_op(op),
+        Some(TokenKind::RedirFd(_)) => true,
+        Some(TokenKind::Heredoc { .. }) => true,
+        Some(TokenKind::Op(op)) => is_redirect_op(op),
         _ => false,
     }
 }
 
-/// Consumes a run of trailing redirect tokens (an optional `Token::RedirFd`
-/// prefix, then a redirect operator + target word, or a `Token::Heredoc`)
+/// Consumes a run of trailing redirect tokens (an optional `TokenKind::RedirFd`
+/// prefix, then a redirect operator + target word, or a `TokenKind::Heredoc`)
 /// from `iter`, building an ORDERED list of `Redirection`s in source order
 /// (no last-wins merge — ordering matters for `2>&1 >f` vs `>f 2>&1`).
 /// Stops at the first non-redirect token.
@@ -2095,8 +2091,8 @@ fn parse_trailing_redirects(
     let mut redirs: Vec<Redirection> = Vec::new();
     loop {
         // Optional explicit fd-prefix (`3>`, `{fd}>`, `3<<EOF`).
-        let fd_prefix = if let Some(Token::RedirFd(_)) = iter.peek() {
-            let Some(Token::RedirFd(fd)) = iter.next() else {
+        let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek() {
+            let Some(TokenKind::RedirFd(fd)) = iter.next() else {
                 unreachable!("peek confirmed RedirFd")
             };
             Some(fd)
@@ -2104,8 +2100,8 @@ fn parse_trailing_redirects(
             None
         };
         match iter.peek() {
-            Some(Token::Heredoc { .. }) => {
-                let Some(Token::Heredoc { body, expand, strip_tabs }) = iter.next() else {
+            Some(TokenKind::Heredoc { .. }) => {
+                let Some(TokenKind::Heredoc { body, expand, strip_tabs }) = iter.next() else {
                     unreachable!("peek confirmed Heredoc")
                 };
                 redirs.push(Redirection {
@@ -2113,16 +2109,16 @@ fn parse_trailing_redirects(
                     op: RedirOp::Heredoc { body, expand, strip_tabs },
                 });
             }
-            Some(Token::Op(op)) if is_redirect_op(op) => {
+            Some(TokenKind::Op(op)) if is_redirect_op(op) => {
                 let op = *op;
                 iter.next();
                 let target = match iter.next() {
-                    Some(Token::Word(word)) => word,
-                    Some(Token::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::Newline) | None => return Err(ParseError::MissingRedirectTarget),
-                    Some(Token::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
-                    Some(Token::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(TokenKind::Word(word)) => word,
+                    Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                    Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                    Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
                 };
                 redirs.extend(build_redirections(op, target, fd_prefix));
             }
@@ -2168,7 +2164,7 @@ fn maybe_wrap_redirects(
 /// (captured by the caller before consuming that token).
 fn parse_simple_stage(
     first: Option<Word>,
-    prefix_tokens: Vec<Token>,
+    prefix_tokens: Vec<TokenKind>,
     iter: &mut TokenCursor,
     first_line: u32,
 ) -> Result<(Command, bool), ParseError> {
@@ -2178,28 +2174,28 @@ fn parse_simple_stage(
     let mut pipe_follows = false;
 
     // Drain prefix_tokens first (extra assignment words re-injected by the
-    // multi-assign speculative-peel path). These are always Token::Word items
+    // multi-assign speculative-peel path). These are always TokenKind::Word items
     // so we process them directly without going through the pipeline-terminator
     // peek-break that guards the main loop.
     for tok in prefix_tokens {
         match tok {
-            Token::Word(word) => {
+            TokenKind::Word(word) => {
                 if program.is_none() {
                     program = Some(word);
                 } else {
                     args.push(word);
                 }
             }
-            // prefix_tokens only ever contains Token::Word items in the
+            // prefix_tokens only ever contains TokenKind::Word items in the
             // current caller; guard other variants to prevent silent misbehaviour.
-            _ => unreachable!("prefix_tokens should only contain Token::Word"),
+            _ => unreachable!("prefix_tokens should only contain TokenKind::Word"),
         }
     }
 
     while let Some(token) = iter.peek() {
         if matches!(
             token,
-            Token::Op(
+            TokenKind::Op(
                 Operator::Semi
                     | Operator::And
                     | Operator::Or
@@ -2210,7 +2206,7 @@ fn parse_simple_stage(
                     // RParen terminates a subshell body — stop without
                     // consuming so parse_subshell_sequence can handle it.
                     | Operator::RParen
-            ) | Token::Newline
+            ) | TokenKind::Newline
         ) {
             break;
         }
@@ -2224,51 +2220,51 @@ fn parse_simple_stage(
         }
         let token = iter.next().unwrap();
         match token {
-            Token::Word(word) => {
+            TokenKind::Word(word) => {
                 if program.is_none() {
                     program = Some(word);
                 } else {
                     args.push(word);
                 }
             }
-            Token::Newline => {
+            TokenKind::Newline => {
                 // Unreachable: the peek-break above stops the loop on a
                 // Newline before it is ever consumed here.
                 unreachable!("Newline terminates the stage via the peek-break above");
             }
-            Token::Op(Operator::Pipe) => {
+            TokenKind::Op(Operator::Pipe) => {
                 pipe_follows = true;
                 skip_newlines(iter);
                 break;
             }
-            Token::Op(Operator::LParen) => {
+            TokenKind::Op(Operator::LParen) => {
                 // A `(` mid-argument (e.g. `cmd (args)`) is a syntax error.
                 // Note: `(` at command-start is dispatched by parse_command
                 // before parse_simple_stage is called.
                 return Err(ParseError::UnexpectedToken);
             }
-            Token::ArithBlock(..) => {
+            TokenKind::ArithBlock(..) => {
                 // `((...))` mid-argument (e.g. `cmd ((1+2))`) is a syntax
                 // error. The standalone arith block at command-start is
                 // dispatched by parse_command before parse_simple_stage runs.
                 return Err(ParseError::UnexpectedToken);
             }
-            Token::Op(Operator::RParen) => {
+            TokenKind::Op(Operator::RParen) => {
                 // Unreachable: the peek-break above stops on RParen.
                 unreachable!("RParen terminates the stage via the peek-break above");
             }
-            Token::Heredoc { .. } => {
+            TokenKind::Heredoc { .. } => {
                 // Unreachable: the redirect-delegation branch above consumes
                 // heredoc tokens before this match.
                 unreachable!("Heredoc consumed by parse_trailing_redirects branch");
             }
-            Token::Op(_) => {
+            TokenKind::Op(_) => {
                 // A non-terminator, non-redirect operator at this point is a
                 // syntax error (redirect ops are consumed by the delegation
                 // branch; terminators break via the peek-break above).
                 return Err(ParseError::UnexpectedToken);
             }
-            Token::RedirFd(_) => {
+            TokenKind::RedirFd(_) => {
                 // Unreachable: next_is_redirect consumes RedirFd prefixes via
                 // the delegation branch above before this match.
                 unreachable!("RedirFd consumed by parse_trailing_redirects branch");
@@ -2322,8 +2318,8 @@ fn parse_next_stage(
 ) -> Result<(Command, bool), ParseError> {
     // Standalone arith block: `((expr))` at pipeline-stage position
     // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
-    if matches!(iter.peek(), Some(Token::ArithBlock(..))) {
-        let Some(Token::ArithBlock(text, opts)) = iter.next() else {
+    if matches!(iter.peek(), Some(TokenKind::ArithBlock(..))) {
+        let Some(TokenKind::ArithBlock(text, opts)) = iter.next() else {
             unreachable!("matches! guard above guarantees ArithBlock")
         };
         let body = crate::lexer::arith_string_to_word(&text, opts)
@@ -2366,17 +2362,17 @@ fn parse_next_stage(
         Some(other) => Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {
             // Bare `(` at pipeline-stage position → subshell.
-            if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+            if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
                 let cmd = parse_subshell(iter)?;
                 return Ok((maybe_wrap_redirects(cmd, iter)?, false));
             }
             // Non-keyword: may be a function definition `name() compound` or
             // a plain simple stage. Need two-token lookahead.
-            if matches!(iter.peek(), Some(Token::Word(_))) {
+            if matches!(iter.peek(), Some(TokenKind::Word(_))) {
                 // Capture line before consuming the first word.
                 let word_line = iter.current_line();
-                let Some(Token::Word(w)) = iter.next() else { unreachable!() };
-                if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+                let Some(TokenKind::Word(w)) = iter.next() else { unreachable!() };
+                if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
                     let cmd = parse_function_def(w, iter)?;
                     return Ok((cmd, false));
                 }
@@ -2392,7 +2388,7 @@ fn parse_next_stage(
 
 fn parse_pipeline_with_first(
     first: Option<Word>,
-    prefix_tokens: Vec<Token>,
+    prefix_tokens: Vec<TokenKind>,
     iter: &mut TokenCursor,
     first_line: u32,
 ) -> Result<Pipeline, ParseError> {
@@ -2420,7 +2416,7 @@ fn parse_pipeline_with_first(
         // If the stage was a compound command (next_pipe=false from
         // parse_next_stage), it did not consume a trailing `|`; check manually.
         if !next_pipe {
-            if matches!(iter.peek(), Some(Token::Op(Operator::Pipe))) {
+            if matches!(iter.peek(), Some(TokenKind::Op(Operator::Pipe))) {
                 iter.next(); // consume `|`
                 skip_newlines(iter);
                 // pipe_follows remains true — loop continues.
@@ -2453,7 +2449,7 @@ fn is_test_expr_stop(iter: &mut TokenCursor) -> bool {
     match iter.peek() {
         None => true,
         Some(tok) => keyword_of(tok) == Some(Keyword::DoubleBracketClose)
-            || matches!(tok, Token::Op(Operator::RParen)),
+            || matches!(tok, TokenKind::Op(Operator::RParen)),
     }
 }
 
@@ -2469,8 +2465,8 @@ fn next_is_test_binary_operator(
     iter: &mut TokenCursor,
 ) -> bool {
     match iter.peek() {
-        Some(Token::Op(Operator::RedirIn)) | Some(Token::Op(Operator::RedirOut)) => true,
-        Some(Token::Word(w)) => matches!(
+        Some(TokenKind::Op(Operator::RedirIn)) | Some(TokenKind::Op(Operator::RedirOut)) => true,
+        Some(TokenKind::Word(w)) => matches!(
             word_literal_text(w),
             Some("==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
                 | "-le" | "-ge" | "-nt" | "-ot" | "-ef")
@@ -2479,10 +2475,10 @@ fn next_is_test_binary_operator(
     }
 }
 
-/// Skips zero or more `Token::Newline` tokens inside a `[[ … ]]` expression.
+/// Skips zero or more `TokenKind::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
 fn skip_test_newlines(iter: &mut TokenCursor) {
-    while matches!(iter.peek(), Some(Token::Newline)) {
+    while matches!(iter.peek(), Some(TokenKind::Newline)) {
         iter.next();
     }
 }
@@ -2533,9 +2529,9 @@ fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
 
 
 /// Returns true if `w` is the literal word `!` (unquoted).
-fn is_bang_word(tok: &Token) -> bool {
+fn is_bang_word(tok: &TokenKind) -> bool {
     match tok {
-        Token::Word(w) => word_literal_text(w) == Some("!"),
+        TokenKind::Word(w) => word_literal_text(w) == Some("!"),
         _ => false,
     }
 }
@@ -2552,14 +2548,14 @@ fn next_test_word(
         None => return Err(ParseError::UnterminatedDoubleBracket),
         Some(tok) => {
             if keyword_of(tok) == Some(Keyword::DoubleBracketClose)
-                || matches!(tok, Token::Op(_))
+                || matches!(tok, TokenKind::Op(_))
             {
                 return Err(ParseError::TestExprMissingOperand);
             }
         }
     }
     match iter.next() {
-        Some(Token::Word(w)) => Ok(w),
+        Some(TokenKind::Word(w)) => Ok(w),
         _ => Err(ParseError::TestExprMissingOperand),
     }
 }
@@ -2570,7 +2566,7 @@ fn parse_test_or(
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_and(iter)?;
     skip_test_newlines(iter);
-    while matches!(iter.peek(), Some(Token::Op(Operator::Or))) {
+    while matches!(iter.peek(), Some(TokenKind::Op(Operator::Or))) {
         iter.next(); // consume `||`
         skip_test_newlines(iter);
         let rhs = parse_test_and(iter)?;
@@ -2586,7 +2582,7 @@ fn parse_test_and(
 ) -> Result<TestExpr, ParseError> {
     let mut lhs = parse_test_not(iter)?;
     skip_test_newlines(iter);
-    while matches!(iter.peek(), Some(Token::Op(Operator::And))) {
+    while matches!(iter.peek(), Some(TokenKind::Op(Operator::And))) {
         iter.next(); // consume `&&`
         skip_test_newlines(iter);
         let rhs = parse_test_not(iter)?;
@@ -2613,12 +2609,12 @@ fn parse_test_primary(
     iter: &mut TokenCursor,
 ) -> Result<TestExpr, ParseError> {
     // Grouping: `( expr )`.
-    if matches!(iter.peek(), Some(Token::Op(Operator::LParen))) {
+    if matches!(iter.peek(), Some(TokenKind::Op(Operator::LParen))) {
         iter.next(); // consume `(`
         let inner = parse_test_or(iter)?;
         // Expect `)`.
         match iter.next() {
-            Some(Token::Op(Operator::RParen)) => {}
+            Some(TokenKind::Op(Operator::RParen)) => {}
             None => return Err(ParseError::UnterminatedDoubleBracket),
             _ => return Err(ParseError::TestExprMissingOperand),
         }
@@ -2643,7 +2639,7 @@ fn parse_test_atom(
 
     // Peek at the first word to check if it is a unary op.
     let first_word = match iter.peek() {
-        Some(Token::Word(w)) => w.clone(),
+        Some(TokenKind::Word(w)) => w.clone(),
         _ => return Err(ParseError::TestExprMissingOperand),
     };
 
@@ -2675,15 +2671,15 @@ fn parse_test_atom(
     match op_token {
         None => Err(ParseError::UnterminatedDoubleBracket),
         // `<` and `>` are lexed as RedirIn / RedirOut even inside `[[ ]]`.
-        Some(Token::Op(Operator::RedirIn)) => {
+        Some(TokenKind::Op(Operator::RedirIn)) => {
             let rhs = next_test_word(iter)?;
             Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs })
         }
-        Some(Token::Op(Operator::RedirOut)) => {
+        Some(TokenKind::Op(Operator::RedirOut)) => {
             let rhs = next_test_word(iter)?;
             Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs })
         }
-        Some(Token::Word(op_word)) => {
+        Some(TokenKind::Word(op_word)) => {
             let op_text = match word_literal_text(&op_word) {
                 Some(t) => t.to_string(),
                 None => return Err(ParseError::TestExprBadOperator(
@@ -2821,7 +2817,7 @@ mod tests {
     use crate::lexer::WordPart;
 
     fn w_tok(s: &str) -> Token {
-        Token::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }]))
+        TokenKind::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])).into()
     }
 
     fn ww(s: &str) -> Word {
@@ -2831,8 +2827,7 @@ mod tests {
     #[test]
     fn parse_one_unit_splits_on_top_level_newline() {
         let toks = crate::lexer::tokenize("echo a\necho b\n").unwrap();
-        let n = toks.len();
-        let mut it = TokenCursor::new(toks, vec![0; n]);
+        let mut it = TokenCursor::new(toks);
         let u1 = parse_one_unit(&mut it).unwrap().expect("unit 1");
         assert!(u1.rest.is_empty());
         let u2 = parse_one_unit(&mut it).unwrap().expect("unit 2");
@@ -2844,8 +2839,7 @@ mod tests {
     fn parse_one_unit_keeps_semicolon_list_and_andor_together() {
         // `a; b && c` on one line is ONE unit (semicolon and && do not split).
         let toks = crate::lexer::tokenize("a; b && c\n").unwrap();
-        let n = toks.len();
-        let mut it = TokenCursor::new(toks, vec![0; n]);
+        let mut it = TokenCursor::new(toks);
         let u = parse_one_unit(&mut it).unwrap().expect("unit");
         assert_eq!(u.rest.len(), 2); // (Semi, b), (And, c)
         assert!(parse_one_unit(&mut it).unwrap().is_none());
@@ -2854,8 +2848,7 @@ mod tests {
     #[test]
     fn parse_one_unit_keeps_multiline_if_as_one_unit() {
         let toks = crate::lexer::tokenize("if true\nthen echo hi\nfi\necho after\n").unwrap();
-        let n = toks.len();
-        let mut it = TokenCursor::new(toks, vec![0; n]);
+        let mut it = TokenCursor::new(toks);
         let u1 = parse_one_unit(&mut it).unwrap().expect("if unit");
         // u1.first should be the If compound (tuple variant Command::If(_)).
         assert!(matches!(u1.first, Command::If(_)));
@@ -2968,7 +2961,7 @@ mod tests {
 
     #[test]
     fn parse_redirect_out() {
-        let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirOut), w_tok("f")])
+        let seq = parse(vec![w_tok("ls"), TokenKind::Op(Operator::RedirOut).into(), w_tok("f")])
             .unwrap()
             .unwrap();
         assert_eq!(exec_stdout(&seq), Some(Redirect::Truncate(ww("f"))));
@@ -2976,7 +2969,7 @@ mod tests {
 
     #[test]
     fn parse_redirect_append() {
-        let seq = parse(vec![w_tok("ls"), Token::Op(Operator::RedirAppend), w_tok("f")])
+        let seq = parse(vec![w_tok("ls"), TokenKind::Op(Operator::RedirAppend).into(), w_tok("f")])
             .unwrap()
             .unwrap();
         assert_eq!(exec_stdout(&seq), Some(Redirect::Append(ww("f"))));
@@ -2984,7 +2977,7 @@ mod tests {
 
     #[test]
     fn parse_redirect_in() {
-        let seq = parse(vec![w_tok("cat"), Token::Op(Operator::RedirIn), w_tok("f")])
+        let seq = parse(vec![w_tok("cat"), TokenKind::Op(Operator::RedirIn).into(), w_tok("f")])
             .unwrap()
             .unwrap();
         assert_eq!(exec_stdin(&seq), Some(Redirect::Read(ww("f"))));
@@ -2992,7 +2985,7 @@ mod tests {
 
     #[test]
     fn parse_redirect_stderr() {
-        let seq = parse(vec![w_tok("cmd"), Token::Op(Operator::RedirErr), w_tok("e")])
+        let seq = parse(vec![w_tok("cmd"), TokenKind::Op(Operator::RedirErr).into(), w_tok("e")])
             .unwrap()
             .unwrap();
         assert_eq!(exec_stderr(&seq), Some(Redirect::Truncate(ww("e"))));
@@ -3002,7 +2995,7 @@ mod tests {
     fn parse_redirect_stderr_append() {
         let seq = parse(vec![
             w_tok("cmd"),
-            Token::Op(Operator::RedirErrAppend),
+            TokenKind::Op(Operator::RedirErrAppend).into(),
             w_tok("e"),
         ])
         .unwrap()
@@ -3015,7 +3008,7 @@ mod tests {
     fn parse_clobber_stdout() {
         let seq = parse(vec![
             w_tok("cmd"),
-            Token::Op(Operator::RedirClobber),
+            TokenKind::Op(Operator::RedirClobber).into(),
             w_tok("f"),
         ])
         .unwrap()
@@ -3027,7 +3020,7 @@ mod tests {
     fn parse_clobber_stderr() {
         let seq = parse(vec![
             w_tok("cmd"),
-            Token::Op(Operator::RedirErrClobber),
+            TokenKind::Op(Operator::RedirErrClobber).into(),
             w_tok("e"),
         ])
         .unwrap()
@@ -3037,7 +3030,7 @@ mod tests {
 
     #[test]
     fn parse_two_stage_pipeline() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Pipe), w_tok("b")])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::Pipe).into(), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3050,9 +3043,9 @@ mod tests {
     fn parse_three_stage_pipeline() {
         let seq = parse(vec![
             w_tok("a"),
-            Token::Op(Operator::Pipe),
+            TokenKind::Op(Operator::Pipe).into(),
             w_tok("b"),
-            Token::Op(Operator::Pipe),
+            TokenKind::Op(Operator::Pipe).into(),
             w_tok("c"),
         ])
         .unwrap()
@@ -3063,7 +3056,7 @@ mod tests {
     #[test]
     fn parse_leading_pipe_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::Pipe), w_tok("a")]),
+            parse(vec![TokenKind::Op(Operator::Pipe).into(), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3071,7 +3064,7 @@ mod tests {
     #[test]
     fn parse_trailing_pipe_is_missing_command() {
         assert_eq!(
-            parse(vec![w_tok("a"), Token::Op(Operator::Pipe)]),
+            parse(vec![w_tok("a"), TokenKind::Op(Operator::Pipe).into()]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3081,8 +3074,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 w_tok("a"),
-                Token::Op(Operator::Pipe),
-                Token::Op(Operator::Pipe),
+                TokenKind::Op(Operator::Pipe).into(),
+                TokenKind::Op(Operator::Pipe).into(),
                 w_tok("b"),
             ]),
             Err(ParseError::MissingCommand)
@@ -3095,7 +3088,7 @@ mod tests {
         // assignment) parses to an empty-program ExecCommand carrying the
         // redirect. The executor performs the redirection for its side effect
         // (truncating/creating the file) and exits 0, matching bash.
-        let seq = parse(vec![Token::Op(Operator::RedirOut), w_tok("f")])
+        let seq = parse(vec![TokenKind::Op(Operator::RedirOut).into(), w_tok("f")])
             .unwrap()
             .expect("redirect-only command should parse");
         let cmds = &first_pipeline(&seq).commands;
@@ -3118,7 +3111,7 @@ mod tests {
         // (a leading `;`) stays a genuine MissingCommand — only the redirect-only
         // case is diverted to an empty-program Exec.
         assert_eq!(
-            parse(vec![Token::Op(Operator::Semi), w_tok("a")]),
+            parse(vec![TokenKind::Op(Operator::Semi).into(), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3126,7 +3119,7 @@ mod tests {
     #[test]
     fn parse_redirect_without_target_is_error() {
         assert_eq!(
-            parse(vec![w_tok("ls"), Token::Op(Operator::RedirOut)]),
+            parse(vec![w_tok("ls"), TokenKind::Op(Operator::RedirOut).into()]),
             Err(ParseError::MissingRedirectTarget)
         );
     }
@@ -3136,8 +3129,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 w_tok("ls"),
-                Token::Op(Operator::RedirOut),
-                Token::Op(Operator::Pipe),
+                TokenKind::Op(Operator::RedirOut).into(),
+                TokenKind::Op(Operator::Pipe).into(),
                 w_tok("b"),
             ]),
             Err(ParseError::RedirectTargetIsOperator)
@@ -3146,7 +3139,7 @@ mod tests {
 
     #[test]
     fn parse_semicolon_sequence() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), w_tok("b")])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::Semi).into(), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("a", &[]))]);
@@ -3156,7 +3149,7 @@ mod tests {
 
     #[test]
     fn parse_and_sequence() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::And), w_tok("b")])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::And).into(), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.rest[0].0, Connector::And);
@@ -3164,7 +3157,7 @@ mod tests {
 
     #[test]
     fn parse_or_sequence() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Or), w_tok("b")])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::Or).into(), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.rest[0].0, Connector::Or);
@@ -3172,7 +3165,7 @@ mod tests {
 
     #[test]
     fn parse_trailing_semicolon_is_allowed() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi)])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::Semi).into()])
             .unwrap()
             .unwrap();
         assert_eq!(first_pipeline(&seq).commands, vec![Command::Simple(plain("a", &[]))]);
@@ -3182,7 +3175,7 @@ mod tests {
     #[test]
     fn parse_trailing_and_is_missing_command() {
         assert_eq!(
-            parse(vec![w_tok("a"), Token::Op(Operator::And)]),
+            parse(vec![w_tok("a"), TokenKind::Op(Operator::And).into()]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3190,7 +3183,7 @@ mod tests {
     #[test]
     fn parse_leading_semicolon_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::Semi), w_tok("a")]),
+            parse(vec![TokenKind::Op(Operator::Semi).into(), w_tok("a")]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3200,8 +3193,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 w_tok("a"),
-                Token::Op(Operator::And),
-                Token::Op(Operator::And),
+                TokenKind::Op(Operator::And).into(),
+                TokenKind::Op(Operator::And).into(),
                 w_tok("b"),
             ]),
             Err(ParseError::MissingCommand)
@@ -3231,10 +3224,10 @@ mod tests {
     #[test]
     fn parse_assignment_with_expansion_in_value() {
         let var_part = WordPart::Var { name: "BAR".to_string(), quoted: false };
-        let prog = Token::Word(Word(vec![
+        let prog: Token = TokenKind::Word(Word(vec![
             WordPart::Literal { text: "FOO=".to_string(), quoted: false },
             var_part,
-        ]));
+        ])).into();
         let seq = parse(vec![prog]).unwrap().unwrap();
         let expected_value = Word(vec![
             WordPart::Literal { text: "".to_string(), quoted: false },
@@ -3269,7 +3262,7 @@ mod tests {
         // `FOO=bar > f` — assignment prefix with redirect, no program word.
         let seq = parse(vec![
             w_tok("FOO=bar"),
-            Token::Op(Operator::RedirOut),
+            TokenKind::Op(Operator::RedirOut).into(),
             w_tok("f"),
         ])
         .unwrap()
@@ -3289,7 +3282,7 @@ mod tests {
     fn parse_assignment_in_pipeline_stage() {
         let seq = parse(vec![
             w_tok("FOO=bar"),
-            Token::Op(Operator::Pipe),
+            TokenKind::Op(Operator::Pipe).into(),
             w_tok("cat"),
         ])
         .unwrap()
@@ -3325,7 +3318,7 @@ mod tests {
             WordPart::Literal { text: "FOO=".to_string(), quoted: false },
             WordPart::CommandSub { sequence: inner_seq, quoted: false },
         ]);
-        let seq = parse(vec![Token::Word(program_word)]).unwrap().unwrap();
+        let seq = parse(vec![TokenKind::Word(program_word).into()]).unwrap().unwrap();
         assert_eq!(first_pipeline(&seq).commands.len(), 1);
         match &first_pipeline(&seq).commands[0] {
             Command::Simple(SimpleCommand::Assign(items, _)) => {
@@ -3346,7 +3339,7 @@ mod tests {
 
     #[test]
     fn parse_command_with_background() {
-        let seq = parse(vec![w_tok("sleep"), w_tok("1"), Token::Op(Operator::Background)])
+        let seq = parse(vec![w_tok("sleep"), w_tok("1"), TokenKind::Op(Operator::Background).into()])
             .unwrap()
             .unwrap();
         assert!(seq.background);
@@ -3359,9 +3352,9 @@ mod tests {
         // cmd1 | cmd2 &
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::Pipe),
+            TokenKind::Op(Operator::Pipe).into(),
             w_tok("cmd2"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3373,7 +3366,7 @@ mod tests {
     #[test]
     fn parse_background_alone_is_missing_command() {
         assert_eq!(
-            parse(vec![Token::Op(Operator::Background)]),
+            parse(vec![TokenKind::Op(Operator::Background).into()]),
             Err(ParseError::MissingCommand)
         );
     }
@@ -3384,7 +3377,7 @@ mod tests {
         // backgrounded, cmd2 follows), not an error.
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
             w_tok("cmd2"),
         ])
         .unwrap()
@@ -3399,8 +3392,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 w_tok("cmd"),
-                Token::Op(Operator::Background),
-                Token::Op(Operator::Background),
+                TokenKind::Op(Operator::Background).into(),
+                TokenKind::Op(Operator::Background).into(),
             ]),
             Err(ParseError::UnexpectedBackground)
         );
@@ -3411,9 +3404,9 @@ mod tests {
         // cmd1 && cmd2 &
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::And),
+            TokenKind::Op(Operator::And).into(),
             w_tok("cmd2"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3426,9 +3419,9 @@ mod tests {
         // cmd1 ; cmd2 &
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::Semi),
+            TokenKind::Op(Operator::Semi).into(),
             w_tok("cmd2"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3442,9 +3435,9 @@ mod tests {
         // group and `cmd3` follows. rest = [(And, cmd2), (Amp, cmd3)].
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::And),
+            TokenKind::Op(Operator::And).into(),
             w_tok("cmd2"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
             w_tok("cmd3"),
         ])
         .unwrap()
@@ -3460,9 +3453,9 @@ mod tests {
         // v98: `a & b &` → rest = [(Amp, b)], background = true.
         let seq = parse(vec![
             w_tok("a"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
             w_tok("b"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3477,9 +3470,9 @@ mod tests {
         // (one and-or group, trailing `&`).
         let seq = parse(vec![
             w_tok("a"),
-            Token::Op(Operator::And),
+            TokenKind::Op(Operator::And).into(),
             w_tok("b"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3493,13 +3486,13 @@ mod tests {
         // cmd1 && cmd2 || cmd3 ; cmd4 &
         let seq = parse(vec![
             w_tok("cmd1"),
-            Token::Op(Operator::And),
+            TokenKind::Op(Operator::And).into(),
             w_tok("cmd2"),
-            Token::Op(Operator::Or),
+            TokenKind::Op(Operator::Or).into(),
             w_tok("cmd3"),
-            Token::Op(Operator::Semi),
+            TokenKind::Op(Operator::Semi).into(),
             w_tok("cmd4"),
-            Token::Op(Operator::Background),
+            TokenKind::Op(Operator::Background).into(),
         ])
         .unwrap()
         .unwrap();
@@ -3561,8 +3554,8 @@ mod tests {
     fn parse_simple_case() {
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"), w_tok("hi"),
-            Token::Op(Operator::DoubleSemi),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"), w_tok("hi"),
+            TokenKind::Op(Operator::DoubleSemi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         let clause = first_case(&seq);
@@ -3575,15 +3568,15 @@ mod tests {
     #[test]
     fn parse_case_multiline_matches_singleline() {
         let multiline = parse(vec![
-            kw("case"), w_tok("x"), kw("in"), Token::Newline,
-            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"), Token::Newline,
-            Token::Op(Operator::DoubleSemi), Token::Newline,
+            kw("case"), w_tok("x"), kw("in"), TokenKind::Newline.into(),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"), TokenKind::Newline.into(),
+            TokenKind::Op(Operator::DoubleSemi).into(), TokenKind::Newline.into(),
             kw("esac"),
         ]).unwrap().unwrap();
         let singleline = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
-            Token::Op(Operator::DoubleSemi),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+            TokenKind::Op(Operator::DoubleSemi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         assert_eq!(multiline, singleline);
@@ -3593,9 +3586,9 @@ mod tests {
     fn parse_case_alternation() {
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::Pipe), w_tok("b"),
-            Token::Op(Operator::Pipe), w_tok("c"), Token::Op(Operator::RParen),
-            w_tok("echo"), Token::Op(Operator::DoubleSemi),
+            w_tok("a"), TokenKind::Op(Operator::Pipe).into(), w_tok("b"),
+            TokenKind::Op(Operator::Pipe).into(), w_tok("c"), TokenKind::Op(Operator::RParen).into(),
+            w_tok("echo"), TokenKind::Op(Operator::DoubleSemi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         assert_eq!(first_case(&seq).items[0].patterns.len(), 3);
@@ -3605,8 +3598,8 @@ mod tests {
     fn parse_case_leading_paren() {
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            Token::Op(Operator::LParen), w_tok("a"), Token::Op(Operator::RParen),
-            w_tok("echo"), Token::Op(Operator::DoubleSemi),
+            TokenKind::Op(Operator::LParen).into(), w_tok("a"), TokenKind::Op(Operator::RParen).into(),
+            w_tok("echo"), TokenKind::Op(Operator::DoubleSemi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         assert_eq!(first_case(&seq).items[0].patterns.len(), 1);
@@ -3616,8 +3609,8 @@ mod tests {
     fn parse_case_empty_body() {
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::RParen),
-            Token::Op(Operator::DoubleSemi),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(),
+            TokenKind::Op(Operator::DoubleSemi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         assert!(first_case(&seq).items[0].body.is_none());
@@ -3627,12 +3620,12 @@ mod tests {
     fn parse_case_terminators() {
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
-            Token::Op(Operator::DoubleSemi),
-            w_tok("b"), Token::Op(Operator::RParen), w_tok("echo"),
-            Token::Op(Operator::SemiAmp),
-            w_tok("c"), Token::Op(Operator::RParen), w_tok("echo"),
-            Token::Op(Operator::DoubleSemiAmp),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+            TokenKind::Op(Operator::DoubleSemi).into(),
+            w_tok("b"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+            TokenKind::Op(Operator::SemiAmp).into(),
+            w_tok("c"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+            TokenKind::Op(Operator::DoubleSemiAmp).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         let items = &first_case(&seq).items;
@@ -3647,8 +3640,8 @@ mod tests {
         // separator (here `;`) is required before `esac`, as for `fi`/`done`.
         let seq = parse(vec![
             kw("case"), w_tok("x"), kw("in"),
-            w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
-            Token::Op(Operator::Semi),
+            w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+            TokenKind::Op(Operator::Semi).into(),
             kw("esac"),
         ]).unwrap().unwrap();
         assert_eq!(first_case(&seq).items[0].terminator, CaseTerminator::Break);
@@ -3676,8 +3669,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 kw("case"), w_tok("x"), kw("in"),
-                w_tok("a"), Token::Op(Operator::RParen), w_tok("echo"),
-                Token::Op(Operator::DoubleSemi),
+                w_tok("a"), TokenKind::Op(Operator::RParen).into(), w_tok("echo"),
+                TokenKind::Op(Operator::DoubleSemi).into(),
             ]),
             Err(ParseError::UnterminatedCase)
         );
@@ -3688,8 +3681,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 kw("case"), w_tok("x"), kw("in"),
-                w_tok("a"), w_tok("b"), Token::Op(Operator::RParen),
-                w_tok("echo"), Token::Op(Operator::DoubleSemi),
+                w_tok("a"), w_tok("b"), TokenKind::Op(Operator::RParen).into(),
+                w_tok("echo"), TokenKind::Op(Operator::DoubleSemi).into(),
                 kw("esac"),
             ]),
             Err(ParseError::UnexpectedToken)
@@ -3701,8 +3694,8 @@ mod tests {
         // for x in a b c ; do echo ; done
         let seq = parse(vec![
             kw("for"), w_tok("x"), kw("in"),
-            w_tok("a"), w_tok("b"), w_tok("c"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            w_tok("a"), w_tok("b"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
@@ -3717,13 +3710,13 @@ mod tests {
     #[test]
     fn parse_for_multiline_matches_singleline() {
         let multiline = parse(vec![
-            kw("for"), w_tok("x"), kw("in"), w_tok("a"), Token::Newline,
-            kw("do"), w_tok("echo"), Token::Newline,
+            kw("for"), w_tok("x"), kw("in"), w_tok("a"), TokenKind::Newline.into(),
+            kw("do"), w_tok("echo"), TokenKind::Newline.into(),
             kw("done"),
         ]).unwrap().unwrap();
         let singleline = parse(vec![
-            kw("for"), w_tok("x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("for"), w_tok("x"), kw("in"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert_eq!(multiline, singleline);
@@ -3732,8 +3725,8 @@ mod tests {
     #[test]
     fn parse_for_no_in_has_empty_words() {
         let seq = parse(vec![
-            kw("for"), w_tok("x"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("for"), w_tok("x"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
@@ -3744,8 +3737,8 @@ mod tests {
     #[test]
     fn parse_for_empty_in_list() {
         let seq = parse(vec![
-            kw("for"), w_tok("x"), kw("in"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("for"), w_tok("x"), kw("in"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
@@ -3757,7 +3750,7 @@ mod tests {
     fn parse_for_do_terminates_word_list() {
         let seq = parse(vec![
             kw("for"), w_tok("x"), kw("in"), w_tok("a"), w_tok("b"),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert_eq!(first_for(&seq).words.len(), 2);
@@ -3767,8 +3760,8 @@ mod tests {
     fn parse_for_keyword_words_in_list() {
         let seq = parse(vec![
             kw("for"), w_tok("x"), kw("in"), w_tok("then"), w_tok("else"),
-            Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi),
+            TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert_eq!(first_for(&seq).words.len(), 2);
@@ -3777,9 +3770,9 @@ mod tests {
     #[test]
     fn parse_for_in_on_next_line() {
         let seq = parse(vec![
-            kw("for"), w_tok("x"), Token::Newline,
-            kw("in"), w_tok("a"), Token::Newline,
-            kw("do"), w_tok("echo"), Token::Newline,
+            kw("for"), w_tok("x"), TokenKind::Newline.into(),
+            kw("in"), w_tok("a"), TokenKind::Newline.into(),
+            kw("do"), w_tok("echo"), TokenKind::Newline.into(),
             kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
@@ -3792,8 +3785,8 @@ mod tests {
         // v180: any single word is accepted as the loop var at PARSE time; the
         // identifier is validated (non-fatally) at RUNTIME, not parse time.
         let seq = parse(vec![
-            kw("for"), w_tok("2x"), kw("in"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+            kw("for"), w_tok("2x"), kw("in"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
         assert_eq!(clause.var, "2x");
@@ -3805,8 +3798,8 @@ mod tests {
         // v180: a reserved word (`in`) is a valid identifier and is accepted as
         // the loop var; with no second `in` it is the no-in (positional) form.
         let seq = parse(vec![
-            kw("for"), kw("in"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+            kw("for"), kw("in"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("done"),
         ]).unwrap().unwrap();
         let clause = first_for(&seq);
         assert_eq!(clause.var, "in");
@@ -3827,8 +3820,8 @@ mod tests {
         assert_eq!(
             parse(vec![
                 kw("for"), w_tok("x"), kw("in"), w_tok("a"),
-                Token::Op(Operator::Pipe), w_tok("b"), Token::Op(Operator::Semi),
-                kw("do"), w_tok("echo"), Token::Op(Operator::Semi), kw("done"),
+                TokenKind::Op(Operator::Pipe).into(), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+                kw("do"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("done"),
             ]),
             Err(ParseError::UnexpectedToken)
         );
@@ -3918,8 +3911,8 @@ mod tests {
     #[test]
     fn parse_simple_if() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let c = first_if(&seq);
@@ -3932,9 +3925,9 @@ mod tests {
     #[test]
     fn parse_if_else() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("else"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("else"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         assert!(first_if(&seq).else_body.is_some());
@@ -3943,11 +3936,11 @@ mod tests {
     #[test]
     fn parse_if_elif_else() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("elif"), w_tok("c"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("d"), Token::Op(Operator::Semi),
-            kw("else"), w_tok("e"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("elif"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("d"), TokenKind::Op(Operator::Semi).into(),
+            kw("else"), w_tok("e"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let c = first_if(&seq);
@@ -3958,9 +3951,9 @@ mod tests {
     #[test]
     fn parse_if_with_andor_condition() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::And), w_tok("b"),
-            Token::Op(Operator::Semi),
-            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::And).into(), w_tok("b"),
+            TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let c = first_if(&seq);
@@ -3971,9 +3964,9 @@ mod tests {
     #[test]
     fn parse_if_multi_command_body() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi), w_tok("c"),
-            Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(), w_tok("c"),
+            TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         assert_eq!(first_if(&seq).then_body.rest.len(), 1);
@@ -3982,9 +3975,9 @@ mod tests {
     #[test]
     fn parse_if_followed_by_command() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("fi"), Token::Op(Operator::Semi), w_tok("echo"),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("fi"), TokenKind::Op(Operator::Semi).into(), w_tok("echo"),
         ]).unwrap().unwrap();
         assert!(matches!(seq.first, Command::If(_)));
         assert_eq!(seq.rest.len(), 1);
@@ -3995,9 +3988,9 @@ mod tests {
     #[test]
     fn parse_if_joined_with_and() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("fi"), Token::Op(Operator::And), w_tok("echo"),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("fi"), TokenKind::Op(Operator::And).into(), w_tok("echo"),
         ]).unwrap().unwrap();
         assert_eq!(seq.rest[0].0, Connector::And);
     }
@@ -4005,11 +3998,11 @@ mod tests {
     #[test]
     fn parse_nested_if() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
             kw("then"),
-            kw("if"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
-            kw("fi"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
+            kw("fi"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         assert!(matches!(first_if(&seq).then_body.first, Command::If(_)));
@@ -4018,7 +4011,7 @@ mod tests {
     #[test]
     fn parse_if_unterminated_is_error() {
         let r = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
             kw("then"), w_tok("b"),
         ]);
         assert_eq!(r, Err(ParseError::UnterminatedIf));
@@ -4027,7 +4020,7 @@ mod tests {
     #[test]
     fn parse_if_missing_then_is_error() {
         let r = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi), kw("fi"),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(), kw("fi"),
         ]);
         assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))));
     }
@@ -4051,8 +4044,8 @@ mod tests {
     #[test]
     fn parse_if_empty_condition_is_missing_command() {
         let r = parse(vec![
-            kw("if"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
+            kw("if"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(), kw("fi"),
         ]);
         assert_eq!(r, Err(ParseError::MissingCommand));
     }
@@ -4071,8 +4064,8 @@ mod tests {
         // `if a; then b; fi fi` — a stray `fi` after a complete `if`.
         // Must be a clean parse error, never a panic.
         let r = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"), kw("fi"),
         ]);
         assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))), "got {r:?}");
@@ -4083,8 +4076,8 @@ mod tests {
         // v98: `if a & then b; fi` — the `&` backgrounds the condition `a`
         // (bash-correct); the condition sequence has background=true.
         let c = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Background),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi), kw("fi"),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Background).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(), kw("fi"),
         ]).unwrap().unwrap();
         match &c.first {
             Command::If(clause) => {
@@ -4097,8 +4090,8 @@ mod tests {
     #[test]
     fn parse_simple_while() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         let c = first_while(&seq);
@@ -4110,8 +4103,8 @@ mod tests {
     #[test]
     fn parse_until_sets_flag() {
         let seq = parse(vec![
-            kw("until"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("until"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert!(first_while(&seq).until);
@@ -4120,9 +4113,9 @@ mod tests {
     #[test]
     fn parse_while_andor_condition() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::And), w_tok("b"),
-            Token::Op(Operator::Semi),
-            kw("do"), w_tok("c"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::And).into(), w_tok("b"),
+            TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         let c = first_while(&seq);
@@ -4133,9 +4126,9 @@ mod tests {
     #[test]
     fn parse_while_multi_command_body() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Semi), w_tok("c"),
-            Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Semi).into(), w_tok("c"),
+            TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert_eq!(first_while(&seq).body.rest.len(), 1);
@@ -4144,9 +4137,9 @@ mod tests {
     #[test]
     fn parse_while_followed_by_command() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("done"), Token::Op(Operator::Semi), w_tok("echo"),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("done"), TokenKind::Op(Operator::Semi).into(), w_tok("echo"),
         ]).unwrap().unwrap();
         assert!(matches!(seq.first, Command::While(_)));
         assert_eq!(seq.rest.len(), 1);
@@ -4156,11 +4149,11 @@ mod tests {
     #[test]
     fn parse_nested_while() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
             kw("do"),
-            kw("while"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("c"), Token::Op(Operator::Semi),
-            kw("done"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
+            kw("done"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert!(matches!(first_while(&seq).body.first, Command::While(_)));
@@ -4169,11 +4162,11 @@ mod tests {
     #[test]
     fn parse_while_with_if_body() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
             kw("do"),
-            kw("if"), w_tok("b"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("c"), Token::Op(Operator::Semi),
-            kw("fi"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("c"), TokenKind::Op(Operator::Semi).into(),
+            kw("fi"), TokenKind::Op(Operator::Semi).into(),
             kw("done"),
         ]).unwrap().unwrap();
         assert!(matches!(first_while(&seq).body.first, Command::If(_)));
@@ -4182,7 +4175,7 @@ mod tests {
     #[test]
     fn parse_while_unterminated_is_error() {
         let r = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
             kw("do"), w_tok("b"),
         ]);
         assert_eq!(r, Err(ParseError::UnterminatedLoop));
@@ -4191,7 +4184,7 @@ mod tests {
     #[test]
     fn parse_while_missing_do_is_error() {
         let r = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi), kw("done"),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(), kw("done"),
         ]);
         assert!(matches!(r, Err(ParseError::UnexpectedKeyword(_))));
     }
@@ -4215,8 +4208,8 @@ mod tests {
     #[test]
     fn parse_while_empty_condition_is_missing_command() {
         let r = parse(vec![
-            kw("while"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Semi), kw("done"),
+            kw("while"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Semi).into(), kw("done"),
         ]);
         assert_eq!(r, Err(ParseError::MissingCommand));
     }
@@ -4226,8 +4219,8 @@ mod tests {
         // v98: `while a; do b & done` — the `&` backgrounds `b` in the loop
         // body (bash-correct); the body sequence has background=true.
         let c = parse(vec![
-            kw("while"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("do"), w_tok("b"), Token::Op(Operator::Background),
+            kw("while"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("do"), w_tok("b"), TokenKind::Op(Operator::Background).into(),
             kw("done"),
         ]).unwrap().unwrap();
         match &c.first {
@@ -4250,13 +4243,13 @@ mod tests {
     #[test]
     fn multiline_if_parses_same_as_singleline() {
         let multiline = parse(vec![
-            kw("if"), w_tok("a"), Token::Newline,
-            kw("then"), w_tok("b"), Token::Newline,
+            kw("if"), w_tok("a"), TokenKind::Newline.into(),
+            kw("then"), w_tok("b"), TokenKind::Newline.into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let singleline = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         assert_eq!(multiline, singleline);
@@ -4265,9 +4258,9 @@ mod tests {
     #[test]
     fn newline_after_then_is_skipped() {
         let seq = parse(vec![
-            kw("if"), w_tok("a"), Token::Newline,
-            kw("then"), Token::Newline,
-            w_tok("b"), Token::Newline,
+            kw("if"), w_tok("a"), TokenKind::Newline.into(),
+            kw("then"), TokenKind::Newline.into(),
+            w_tok("b"), TokenKind::Newline.into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let clause = first_if(&seq);
@@ -4280,8 +4273,8 @@ mod tests {
     #[test]
     fn multiline_while_parses() {
         let seq = parse(vec![
-            kw("while"), w_tok("a"), Token::Newline,
-            kw("do"), w_tok("b"), Token::Newline,
+            kw("while"), w_tok("a"), TokenKind::Newline.into(),
+            kw("do"), w_tok("b"), TokenKind::Newline.into(),
             kw("done"),
         ]).unwrap().unwrap();
         let clause = first_while(&seq);
@@ -4294,7 +4287,7 @@ mod tests {
 
     #[test]
     fn newline_separates_top_level_commands() {
-        let seq = parse(vec![w_tok("a"), Token::Newline, w_tok("b")])
+        let seq = parse(vec![w_tok("a"), TokenKind::Newline.into(), w_tok("b")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.rest.len(), 1);
@@ -4303,7 +4296,7 @@ mod tests {
 
     #[test]
     fn leading_newlines_are_skipped() {
-        let seq = parse(vec![Token::Newline, Token::Newline, w_tok("a")])
+        let seq = parse(vec![TokenKind::Newline.into(), TokenKind::Newline.into(), w_tok("a")])
             .unwrap()
             .unwrap();
         assert_eq!(seq.first, Command::Pipeline(Pipeline { negate: false, commands: vec![Command::Simple(plain("a", &[]))] }));
@@ -4311,13 +4304,13 @@ mod tests {
 
     #[test]
     fn all_newline_buffer_is_none() {
-        assert_eq!(parse(vec![Token::Newline, Token::Newline]), Ok(None));
+        assert_eq!(parse(vec![TokenKind::Newline.into(), TokenKind::Newline.into()]), Ok(None));
     }
 
     #[test]
     fn newline_after_pipe_continues_pipeline() {
         let seq = parse(vec![
-            w_tok("a"), Token::Op(Operator::Pipe), Token::Newline, w_tok("b"),
+            w_tok("a"), TokenKind::Op(Operator::Pipe).into(), TokenKind::Newline.into(), w_tok("b"),
         ]).unwrap().unwrap();
         let p = first_pipeline(&seq);
         assert_eq!(p.commands.len(), 2);
@@ -4325,7 +4318,7 @@ mod tests {
 
     #[test]
     fn trailing_semicolon_then_newline_is_not_an_error() {
-        let seq = parse(vec![w_tok("a"), Token::Op(Operator::Semi), Token::Newline])
+        let seq = parse(vec![w_tok("a"), TokenKind::Op(Operator::Semi).into(), TokenKind::Newline.into()])
             .unwrap()
             .unwrap();
         assert_eq!(seq.rest.len(), 0);
@@ -4334,9 +4327,9 @@ mod tests {
     #[test]
     fn then_followed_by_semicolon_still_errors() {
         let result = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), Token::Op(Operator::Semi),
-            w_tok("b"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), TokenKind::Op(Operator::Semi).into(),
+            w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]);
         assert_eq!(result, Err(ParseError::MissingCommand));
@@ -4345,8 +4338,8 @@ mod tests {
     #[test]
     fn stray_word_after_compound_errors_without_panic() {
         let result = parse(vec![
-            kw("if"), w_tok("a"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("b"), Token::Op(Operator::Semi),
+            kw("if"), w_tok("a"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("b"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"), w_tok("extra"),
         ]);
         assert_eq!(result, Err(ParseError::UnexpectedToken));
@@ -4355,7 +4348,7 @@ mod tests {
     #[test]
     fn stray_close_paren_is_error() {
         assert_eq!(
-            parse(vec![w_tok("echo"), Token::Op(Operator::RParen)]),
+            parse(vec![w_tok("echo"), TokenKind::Op(Operator::RParen).into()]),
             Err(ParseError::UnexpectedToken)
         );
     }
@@ -4365,7 +4358,7 @@ mod tests {
         // `echo(` with no matching `)` — looks like an incomplete function
         // definition, so FunctionBody is the right error (missing `)`).
         assert_eq!(
-            parse(vec![w_tok("echo"), Token::Op(Operator::LParen)]),
+            parse(vec![w_tok("echo"), TokenKind::Op(Operator::LParen).into()]),
             Err(ParseError::FunctionBody)
         );
     }
@@ -4373,7 +4366,7 @@ mod tests {
     #[test]
     fn stray_double_semi_is_error() {
         assert_eq!(
-            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemi)]),
+            parse(vec![w_tok("echo"), TokenKind::Op(Operator::DoubleSemi).into()]),
             Err(ParseError::UnexpectedToken)
         );
     }
@@ -4381,7 +4374,7 @@ mod tests {
     #[test]
     fn stray_semi_amp_is_error() {
         assert_eq!(
-            parse(vec![w_tok("echo"), Token::Op(Operator::SemiAmp)]),
+            parse(vec![w_tok("echo"), TokenKind::Op(Operator::SemiAmp).into()]),
             Err(ParseError::UnexpectedToken)
         );
     }
@@ -4389,20 +4382,20 @@ mod tests {
     #[test]
     fn stray_double_semi_amp_is_error() {
         assert_eq!(
-            parse(vec![w_tok("echo"), Token::Op(Operator::DoubleSemiAmp)]),
+            parse(vec![w_tok("echo"), TokenKind::Op(Operator::DoubleSemiAmp).into()]),
             Err(ParseError::UnexpectedToken)
         );
     }
 
     #[test]
     fn if_with_no_body_at_end_of_input_is_unterminated() {
-        let result = parse(vec![kw("if"), w_tok("a"), Token::Newline, kw("then")]);
+        let result = parse(vec![kw("if"), w_tok("a"), TokenKind::Newline.into(), kw("then")]);
         assert_eq!(result, Err(ParseError::UnterminatedIf));
     }
 
     #[test]
     fn while_with_no_body_at_end_of_input_is_unterminated() {
-        let result = parse(vec![kw("while"), w_tok("a"), Token::Newline, kw("do")]);
+        let result = parse(vec![kw("while"), w_tok("a"), TokenKind::Newline.into(), kw("do")]);
         assert_eq!(result, Err(ParseError::UnterminatedLoop));
     }
 
@@ -4410,7 +4403,7 @@ mod tests {
     fn parse_brace_group_simple() {
         // { echo hi ; }
         let seq = parse(vec![
-            kw("{"), w_tok("echo"), w_tok("hi"), Token::Op(Operator::Semi), kw("}"),
+            kw("{"), w_tok("echo"), w_tok("hi"), TokenKind::Op(Operator::Semi).into(), kw("}"),
         ]).unwrap().unwrap();
         let body = match &seq.first {
             Command::BraceGroup(b) => b.as_ref(),
@@ -4422,10 +4415,10 @@ mod tests {
     #[test]
     fn parse_brace_group_multiline_matches_singleline() {
         let multi = parse(vec![
-            kw("{"), Token::Newline, w_tok("echo"), Token::Newline, kw("}"),
+            kw("{"), TokenKind::Newline.into(), w_tok("echo"), TokenKind::Newline.into(), kw("}"),
         ]).unwrap().unwrap();
         let single = parse(vec![
-            kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+            kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("}"),
         ]).unwrap().unwrap();
         assert_eq!(multi, single);
     }
@@ -4434,7 +4427,7 @@ mod tests {
     fn parse_brace_group_unterminated() {
         // missing `}`
         assert_eq!(
-            parse(vec![kw("{"), w_tok("echo"), Token::Op(Operator::Semi)]),
+            parse(vec![kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into()]),
             Err(ParseError::UnterminatedBrace)
         );
     }
@@ -4450,8 +4443,8 @@ mod tests {
     fn parse_simple_function_def() {
         // foo() { echo hi; }
         let seq = parse(vec![
-            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-            kw("{"), w_tok("echo"), w_tok("hi"), Token::Op(Operator::Semi), kw("}"),
+            w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+            kw("{"), w_tok("echo"), w_tok("hi"), TokenKind::Op(Operator::Semi).into(), kw("}"),
         ]).unwrap().unwrap();
         let (name, body) = first_function(&seq);
         assert_eq!(name, "foo");
@@ -4462,9 +4455,9 @@ mod tests {
     fn parse_function_with_if_body() {
         // foo() if true; then echo; fi
         let seq = parse(vec![
-            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-            kw("if"), w_tok("true"), Token::Op(Operator::Semi),
-            kw("then"), w_tok("echo"), Token::Op(Operator::Semi),
+            w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+            kw("if"), w_tok("true"), TokenKind::Op(Operator::Semi).into(),
+            kw("then"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(),
             kw("fi"),
         ]).unwrap().unwrap();
         let (name, body) = first_function(&seq);
@@ -4502,14 +4495,14 @@ mod tests {
         // "foo"() { echo; } — a quoted name is still not a valid function name.
         // (Since v175, bash-legal special-char names like 1foo/foo-bar ARE valid;
         // the remaining guards are single-unquoted-Literal + not-a-keyword.)
-        let quoted_name = Token::Word(Word(vec![WordPart::Literal {
+        let quoted_name: Token = TokenKind::Word(Word(vec![WordPart::Literal {
             text: "foo".to_string(),
             quoted: true,
-        }]));
+        }])).into();
         assert_eq!(
             parse(vec![
-                quoted_name, Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+                quoted_name, TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+                kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("}"),
             ]),
             Err(ParseError::FunctionName)
         );
@@ -4520,8 +4513,8 @@ mod tests {
         // foo( { echo; }
         assert_eq!(
             parse(vec![
-                w_tok("foo"), Token::Op(Operator::LParen),
-                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+                w_tok("foo"), TokenKind::Op(Operator::LParen).into(),
+                kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("}"),
             ]),
             Err(ParseError::FunctionBody)
         );
@@ -4532,7 +4525,7 @@ mod tests {
         // foo() echo hi  — body is a Pipeline, not a compound
         assert_eq!(
             parse(vec![
-                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
                 w_tok("echo"), w_tok("hi"),
             ]),
             Err(ParseError::FunctionBody)
@@ -4544,7 +4537,7 @@ mod tests {
         // `foo()` then EOF — body not yet typed; classifier should treat as incomplete.
         assert_eq!(
             parse(vec![
-                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
+                w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
             ]),
             Err(ParseError::UnterminatedFunction)
         );
@@ -4555,9 +4548,9 @@ mod tests {
         // foo() bar() { echo; }  — body must be a compound, not another function def
         assert_eq!(
             parse(vec![
-                w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-                w_tok("bar"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-                kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
+                w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+                w_tok("bar"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+                kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("}"),
             ]),
             Err(ParseError::FunctionBody)
         );
@@ -4568,7 +4561,7 @@ mod tests {
         // `echo hi (` — `(` after a pipeline arg goes via parse_pipeline,
         // not function-def detection (which only fires on the FIRST token).
         assert_eq!(
-            parse(vec![w_tok("echo"), w_tok("hi"), Token::Op(Operator::LParen)]),
+            parse(vec![w_tok("echo"), w_tok("hi"), TokenKind::Op(Operator::LParen).into()]),
             Err(ParseError::UnexpectedToken)
         );
     }
@@ -4577,9 +4570,9 @@ mod tests {
     fn parse_function_def_followed_by_call() {
         // foo() { echo; } ; foo
         let seq = parse(vec![
-            w_tok("foo"), Token::Op(Operator::LParen), Token::Op(Operator::RParen),
-            kw("{"), w_tok("echo"), Token::Op(Operator::Semi), kw("}"),
-            Token::Op(Operator::Semi),
+            w_tok("foo"), TokenKind::Op(Operator::LParen).into(), TokenKind::Op(Operator::RParen).into(),
+            kw("{"), w_tok("echo"), TokenKind::Op(Operator::Semi).into(), kw("}"),
+            TokenKind::Op(Operator::Semi).into(),
             w_tok("foo"),
         ]).unwrap().unwrap();
         assert!(matches!(seq.first, Command::FunctionDef { .. }));
@@ -4931,7 +4924,7 @@ mod tests {
 
     #[test]
     fn parse_subshell_nested() {
-        // v78: `((cmd))` (no whitespace) now lexes as `Token::ArithBlock`,
+        // v78: `((cmd))` (no whitespace) now lexes as `TokenKind::ArithBlock`,
         // matching bash. Use `( (cmd) )` with whitespace between the
         // outer and inner `(` to keep the nested-subshell semantics.
         let tokens = crate::lexer::tokenize("( (echo hi) )").unwrap();
@@ -5913,12 +5906,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_with_lines_stamps_exec_command_lines() {
+    fn parse_stamps_exec_command_lines_from_token_spans() {
         let src = "echo a\necho b\necho c"; // 3 commands on lines 1,2,3
-        let (toks, _offs, lex_lines) = crate::lexer::tokenize_with_offsets(src, crate::lexer::LexerOptions::default()).unwrap();
-        // lex_lines.len() == tokens.len() + 1 (includes sentinel); drop it.
-        let lines: Vec<u32> = lex_lines[..toks.len()].to_vec();
-        let seq = parse_with_lines(toks, lines).unwrap().unwrap();
+        // Tokens now carry their own line in `span`; `parse` stamps Command.line
+        // from those spans — no parallel lines vector.
+        let toks = crate::lexer::tokenize(src).unwrap();
+        let seq = parse(toks).unwrap().unwrap();
         assert_eq!(collect_exec_lines(&seq), vec![1, 2, 3]);
     }
 
