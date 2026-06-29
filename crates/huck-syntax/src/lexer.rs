@@ -487,7 +487,7 @@ enum Step {
 /// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
 /// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
 /// intact (batch internally); T2 splits it into a pull `next_token`.
-struct Lexer<'a> {
+pub struct Lexer<'a> {
     cursor: CharCursor<'a>,
     opts: LexerOptions,
     brace_expand: bool,
@@ -495,6 +495,10 @@ struct Lexer<'a> {
     /// index of the next token next_token() will hand out (pull + future rewind).
     history: Vec<Token>,
     pos: usize,
+    /// Lex error captured mid-pull (read-time path). Surfaced once via take_error().
+    pending_error: Option<LexError>,
+    /// True for a from_tokens() replay lexer: history is pre-filled, never scans.
+    replay: bool,
     parts: Vec<WordPart>,
     current: String,
     has_token: bool,
@@ -515,6 +519,8 @@ impl<'a> Lexer<'a> {
             brace_expand,
             history: Vec::new(),
             pos: 0,
+            pending_error: None,
+            replay: false,
             parts: Vec::new(),
             current: String::new(),
             has_token: false,
@@ -1206,6 +1212,86 @@ impl<'a> Lexer<'a> {
     #[cfg(test)]
     fn cursor_offset(&self) -> usize {
         self.cursor.offset()
+    }
+
+    /// Build a replay lexer over already-tokenized input (Task 2 bridge). history is
+    /// pre-filled; scanning is a no-op so the pull never errors.
+    pub fn from_tokens(tokens: Vec<Token>) -> Lexer<'static> {
+        Lexer {
+            cursor: CharCursor::new(""),
+            opts: LexerOptions::default(),
+            brace_expand: true,
+            history: tokens,
+            pos: 0,
+            pending_error: None,
+            replay: true,
+            parts: Vec::new(),
+            current: String::new(),
+            has_token: false,
+            token_start: 0,
+            token_start_line: 1,
+            token_start_col: 1,
+            in_assignment_value: false,
+            dbracket_depth: 0,
+            expect_regex: false,
+            pending_heredocs: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Ensure history[idx] exists AND is backfill-ready (heredoc body present),
+    /// pulling lazily via scan_step. Mirrors next_token's readiness check so a
+    /// Heredoc token is never exposed before its body is collected (v238 rule).
+    /// On a lex error, stash it and stop — the pull then reports end-of-input.
+    /// scan_step appends to history WITHOUT advancing pos, so this never consumes.
+    fn fill_to(&mut self, idx: usize) {
+        if self.replay || self.pending_error.is_some() {
+            return;
+        }
+        loop {
+            if self.history.len() > idx && !self.backfill_pending_at(idx) {
+                return;
+            }
+            match self.scan_step() {
+                Ok(Step::Produced) => {}
+                Ok(Step::Eof) => return,
+                Err(e) => { self.pending_error = Some(e); return; }
+            }
+        }
+    }
+
+    pub fn peek(&mut self) -> Option<&Token> {
+        self.fill_to(self.pos);
+        self.history.get(self.pos)
+    }
+    pub fn next(&mut self) -> Option<Token> {
+        self.fill_to(self.pos);
+        let t = self.history.get(self.pos).cloned();
+        if t.is_some() { self.pos += 1; }
+        t
+    }
+    pub fn peek_kind(&mut self) -> Option<&TokenKind> {
+        self.fill_to(self.pos);
+        self.history.get(self.pos).map(|t| &t.kind)
+    }
+    pub fn peek2_kind(&mut self) -> Option<&TokenKind> {
+        self.fill_to(self.pos + 1);
+        self.history.get(self.pos + 1).map(|t| &t.kind)
+    }
+    pub fn next_kind(&mut self) -> Option<TokenKind> {
+        self.next().map(|t| t.kind)
+    }
+    pub fn peek_span(&mut self) -> Option<Span> {
+        self.fill_to(self.pos);
+        self.history.get(self.pos).map(|t| t.span)
+    }
+    pub fn current_line(&mut self) -> u32 {
+        self.peek_span().map(|s| s.line).unwrap_or(0)
+    }
+    pub fn remaining(&self) -> usize {
+        self.history.len().saturating_sub(self.pos)
+    }
+    pub fn take_error(&mut self) -> Option<LexError> {
+        self.pending_error.take()
     }
 }
 
@@ -9162,6 +9248,30 @@ mod array_parse_tests {
             other => panic!("expected name-bearing part, got {other:?}"),
         };
         assert_eq!(name, "x1");
+    }
+
+    #[test]
+    fn pull_api_reproduces_token_sequence() {
+        let toks = tokenize("echo foo | grep bar").unwrap();
+        let mut lx = Lexer::from_tokens(toks.clone());
+        assert_eq!(lx.remaining(), toks.len());
+        assert_eq!(lx.peek_kind(), Some(&toks[0].kind));
+        assert_eq!(lx.peek2_kind(), Some(&toks[1].kind));
+        assert_eq!(lx.peek_span(), Some(toks[0].span));
+        let mut drained = Vec::new();
+        while let Some(t) = lx.next() { drained.push(t); }
+        assert_eq!(drained, toks);
+        assert_eq!(lx.peek_kind(), None);
+        assert_eq!(lx.next_kind(), None);
+        assert!(lx.take_error().is_none());
+    }
+
+    #[test]
+    fn pull_next_kind_matches_next_dot_kind() {
+        let toks = tokenize("a b c").unwrap();
+        let mut lx = Lexer::from_tokens(toks.clone());
+        assert_eq!(lx.next_kind(), Some(toks[0].kind.clone()));
+        assert_eq!(lx.peek_kind(), Some(&toks[1].kind));
     }
 }
 
