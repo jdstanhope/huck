@@ -3,9 +3,9 @@
 //! tests; production still uses the lexer's pre-built Words + command.rs.
 #![allow(dead_code, unused_imports)]
 
-use crate::command::ParseError;
+use crate::command::{Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError};
 use crate::lexer::{
-    CaseDirection, Lexer, Mode, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
+    CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
     SubscriptKind, TokenKind, TransformOp, Word, WordPart,
 };
 
@@ -419,6 +419,11 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     Ok(result)
 }
 
+pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    let _ = iter;
+    unimplemented!("parse_sequence: Task 2")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +638,33 @@ mod tests {
                 "expected UnsupportedExpansion for {s}"
             );
         }
+    }
+
+    // ── v242 differential harness ────────────────────────────────────────────
+
+    fn old_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        crate::command::parse(&mut Lexer::from_tokens(toks))
+    }
+    fn new_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        parse_sequence(&mut Lexer::from_tokens(toks))
+    }
+    /// In-scope: the new parser must produce the SAME AST as command.rs (the oracle).
+    fn diff_cmd(s: &str) {
+        assert_eq!(new_seq(s).unwrap(), old_seq(s).unwrap(), "command AST mismatch for {s:?}");
+    }
+    /// Deferred: the new parser must return UnsupportedCommand.
+    fn diff_unsupported(s: &str) {
+        assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
+    }
+    // tests added in later tasks
+
+    #[test]
+    fn v242_scaffolding_exists() {
+        let _ = crate::command::ParseError::UnsupportedCommand;
+        // harness compiles + the entry is callable
+        let _ = old_seq("echo a");
     }
 }

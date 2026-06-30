@@ -760,6 +760,9 @@ pub enum ParseError {
     /// A nested expansion the parser-driven path does not handle yet
     /// (`$(…)` / `$((…))` / backtick inside a `${…}` operand). v241 boundary.
     UnsupportedExpansion,
+    /// A command-level construct the parser-driven flat command parser does not
+    /// model yet (subshell, arith command, compound command, heredoc, …). v242 boundary.
+    UnsupportedCommand,
 }
 
 impl std::fmt::Display for ParseError {
