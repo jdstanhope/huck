@@ -3,7 +3,10 @@
 //! tests; production still uses the lexer's pre-built Words + command.rs.
 #![allow(dead_code, unused_imports)]
 
-use crate::command::{Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError};
+use crate::command::{
+    Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
+    Redirection, RedirFd, RedirOp, FileMode, word_literal_text,
+};
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
     SubscriptKind, TokenKind, TransformOp, Word, WordPart,
@@ -468,22 +471,193 @@ fn next_is_redirect_token(iter: &mut Lexer) -> Result<bool, ParseError> {
     })
 }
 
-/// Parses a simple command (program + args, with optional leading assignments)
-/// from a flat token stream.  Mirrors `parse_simple_stage` + `finalize_stage`
-/// in `command.rs` (FLAT subset — no redirects in Task 2/3).
+/// Builds a literal `Word` from a plain string.  Mirrors `lit_word` in `command.rs`.
+fn lit_word_local(s: &str) -> Word {
+    Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
+}
+
+/// Builds the `RedirOp` for a dup operator (`>&` / `<&`).
+/// Mirrors `dup_op` in `command.rs`.
+fn dup_op_local(source: Word, output: bool) -> RedirOp {
+    if word_literal_text(&source) == Some("-") {
+        RedirOp::Close
+    } else {
+        RedirOp::Dup { source, output }
+    }
+}
+
+/// Builds the ordered `Redirection`(s) for a redirect operator + target word.
+/// Mirrors `build_redirections` in `command.rs` exactly (including the
+/// stderr-default operators and the `&>`/`&>>` two-element desugaring).
+fn build_redirections_local(
+    op: Operator,
+    target: Word,
+    fd_prefix: Option<RedirFd>,
+) -> Vec<Redirection> {
+    let err_fd = || fd_prefix.clone().unwrap_or(RedirFd::Number(2));
+    let plain_fd = || fd_prefix.clone().unwrap_or(RedirFd::Default);
+    match op {
+        Operator::RedirIn => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::ReadOnly, target },
+        }],
+        Operator::RedirOut => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Truncate, target },
+        }],
+        Operator::RedirAppend => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Append, target },
+        }],
+        Operator::RedirClobber => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::Clobber, target },
+        }],
+        Operator::RedirReadWrite => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::File { mode: FileMode::ReadWrite, target },
+        }],
+        Operator::RedirErr => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Truncate, target },
+        }],
+        Operator::RedirErrAppend => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Append, target },
+        }],
+        Operator::RedirErrClobber => vec![Redirection {
+            fd: err_fd(),
+            op: RedirOp::File { mode: FileMode::Clobber, target },
+        }],
+        Operator::HereString => vec![Redirection {
+            fd: plain_fd(),
+            op: RedirOp::HereString(target),
+        }],
+        Operator::DupOut => {
+            let redir_op = dup_op_local(target, true);
+            // When the source is `-` (Close), use fd 1 as the directional
+            // default (output dup targets stdout). `plain_fd()` falls back to
+            // `Default` which resolves to 0 — the wrong fd.
+            let fd = if matches!(redir_op, RedirOp::Close) {
+                fd_prefix.clone().unwrap_or(RedirFd::Number(1))
+            } else {
+                plain_fd()
+            };
+            vec![Redirection { fd, op: redir_op }]
+        }
+        Operator::DupErr => {
+            let redir_op = dup_op_local(target, true);
+            // DupErr already uses err_fd() which defaults to Number(2).
+            vec![Redirection { fd: err_fd(), op: redir_op }]
+        }
+        Operator::DupIn => {
+            let redir_op = dup_op_local(target, false);
+            // When the source is `-` (Close), use fd 0.  plain_fd() also
+            // resolves to 0 via Default, but we make it explicit for symmetry.
+            let fd = if matches!(redir_op, RedirOp::Close) {
+                fd_prefix.clone().unwrap_or(RedirFd::Number(0))
+            } else {
+                plain_fd()
+            };
+            vec![Redirection { fd, op: redir_op }]
+        }
+        Operator::AndRedirOut => vec![
+            Redirection {
+                fd: plain_fd(),
+                op: RedirOp::File { mode: FileMode::Truncate, target },
+            },
+            Redirection {
+                fd: RedirFd::Number(2),
+                op: RedirOp::Dup { source: lit_word_local("1"), output: true },
+            },
+        ],
+        Operator::AndRedirAppend => vec![
+            Redirection {
+                fd: plain_fd(),
+                op: RedirOp::File { mode: FileMode::Append, target },
+            },
+            Redirection {
+                fd: RedirFd::Number(2),
+                op: RedirOp::Dup { source: lit_word_local("1"), output: true },
+            },
+        ],
+        // is_redirect_op_kind gates the callers; no other operator reaches here.
+        _ => unreachable!("build_redirections_local called with a non-redirect operator"),
+    }
+}
+
+/// Parses a SINGLE redirect token group (optional `RedirFd` prefix + redirect
+/// operator + target word) from `iter`.  Mirrors one iteration of
+/// `parse_trailing_redirects` in `command.rs`.
+///
+/// Returns `UnsupportedCommand` for heredocs and here-strings (deferred).
+fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> {
+    // Optional explicit fd-prefix (`3>`, `{fd}>`).
+    let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek_kind()? {
+        let Some(TokenKind::RedirFd(fd)) = iter.next_kind()? else {
+            unreachable!("peek confirmed RedirFd")
+        };
+        Some(fd)
+    } else {
+        None
+    };
+
+    match iter.peek_kind()? {
+        Some(TokenKind::Heredoc { .. }) => {
+            // Heredoc — deferred to a future task.
+            Err(ParseError::UnsupportedCommand)
+        }
+        Some(TokenKind::Op(op)) if is_redirect_op_kind(op) => {
+            let op = *op;
+            iter.next_kind()?; // consume the redirect operator
+            // HereString (`<<<`) — deferred.
+            if matches!(op, Operator::HereString) {
+                return Err(ParseError::UnsupportedCommand);
+            }
+            let target = match iter.next_kind()? {
+                Some(TokenKind::Word(word)) => word,
+                Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
+                // Phase C atom variants (dormant — never emitted in Command mode)
+                Some(_) => return Err(ParseError::RedirectTargetIsOperator),
+            };
+            Ok(build_redirections_local(op, target, fd_prefix))
+        }
+        _ => {
+            // A bare fd-prefix with no following redirect operator: defensively
+            // guard (the lexer only emits RedirFd glued to an op, but be safe).
+            if fd_prefix.is_some() {
+                return Err(ParseError::MissingRedirectTarget);
+            }
+            // Should not be reached (caller checks next_is_redirect_token first).
+            Err(ParseError::UnsupportedCommand)
+        }
+    }
+}
+
+/// Parses a simple command (program + args + redirects, with optional leading
+/// assignments) from a flat token stream.  Mirrors `parse_simple_stage` +
+/// `finalize_stage` in `command.rs`.
 ///
 /// Stops — without consuming — at any stage/list terminator:
 /// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
 ///
-/// Redirect tokens mid-command are deferred to Task 4 and return
-/// `UnsupportedCommand`.
+/// Redirects are parsed in source order and interleaved with words — a
+/// redirect may appear before, between, or after words.  Heredocs and
+/// here-strings return `UnsupportedCommand` (deferred).
 ///
 /// Leading `NAME=value` words (and `NAME+=value` / `NAME[i]=value` forms)
-/// become `inline_assignments`.  A line of ONLY assignments (no program word)
-/// produces `Command::Simple(SimpleCommand::Assign(…))`.
+/// become `inline_assignments`.  A line of ONLY assignments with NO redirects
+/// produces `Command::Simple(SimpleCommand::Assign(…))`.  A command with
+/// redirects but no program word produces an empty-program `ExecCommand`
+/// (mirrors `finalize_stage`'s empty-remaining + redirects branch).
 fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     let line = iter.current_line()?;
     let mut all_words: Vec<Word> = Vec::new();
+    let mut redirects: Vec<Redirection> = Vec::new();
 
     loop {
         let Some(token) = iter.peek_kind()? else { break };
@@ -504,9 +678,12 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         ) {
             break;
         }
-        // Redirect tokens — deferred to Task 4.
+        // Redirect tokens — parse in source order, extending the redirects
+        // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
+        // delegation in `parse_simple_stage`.
         if next_is_redirect_token(iter)? {
-            return Err(ParseError::UnsupportedCommand);
+            redirects.extend(parse_one_redirect(iter)?);
+            continue;
         }
         // Consume the token.
         let kind = iter.next_kind()?.unwrap();
@@ -516,7 +693,7 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         }
     }
 
-    if all_words.is_empty() {
+    if all_words.is_empty() && redirects.is_empty() {
         return Err(ParseError::MissingCommand);
     }
 
@@ -537,11 +714,25 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     }
     let remaining: Vec<Word> = word_iter.collect();
 
-    // Bare-assign line: all words were assignments, no program word follows.
-    // `inline_assignments` is non-empty here because `all_words` was non-empty
-    // (the is_empty guard above ensures this).
-    if remaining.is_empty() {
+    // Bare-assign line: all words were assignments, no program word follows,
+    // AND no redirects.  Mirrors `finalize_stage`'s guard exactly:
+    //   `remaining.is_empty() && redirects.is_empty() && !inline.is_empty()`.
+    if remaining.is_empty() && redirects.is_empty() && !inline_assignments.is_empty() {
         return Ok(Command::Simple(SimpleCommand::Assign(inline_assignments, line)));
+    }
+
+    // Empty-program case: redirect-only or assignment+redirect commands
+    // (e.g. `>out`, `2>err`, `A=1 >out`).  Mirrors `finalize_stage`'s second
+    // empty-remaining branch and the `program=None+redirects` early-return in
+    // `parse_simple_stage`.
+    if remaining.is_empty() {
+        return Ok(Command::Simple(SimpleCommand::Exec(ExecCommand {
+            inline_assignments,
+            program: Word(Vec::new()),
+            args: Vec::new(),
+            redirects,
+            line,
+        })));
     }
 
     let mut remaining_iter = remaining.into_iter();
@@ -552,7 +743,7 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         inline_assignments,
         program,
         args,
-        redirects: vec![],
+        redirects,
         line,
     })))
 }
@@ -907,5 +1098,30 @@ mod tests {
         let _ = crate::command::ParseError::UnsupportedCommand;
         // harness compiles + the entry is callable
         let _ = old_seq("echo a");
+    }
+
+    // T4 tests
+
+    #[test]
+    fn cmd_redirects() {
+        diff_cmd("cmd >out");
+        diff_cmd("cmd >>out");
+        diff_cmd("cmd <in");
+        diff_cmd("cmd 2>err");
+        diff_cmd("cmd >out 2>&1");
+        diff_cmd("cmd 2>&1 >out");       // order matters
+        diff_cmd(">out cmd");            // leading redirect
+        diff_cmd("cmd a >o b <i c");     // interleaved
+        diff_cmd("3>f cmd");             // RedirFd prefix
+        diff_cmd("cmd >|f");             // clobber
+        diff_cmd("cmd <>f");             // read-write
+        diff_cmd("cmd <&3");             // dup-in
+        diff_cmd("cmd &>f");             // and-redirect
+    }
+
+    #[test]
+    fn cmd_heredoc_deferred() {
+        diff_unsupported("cat <<<word");
+        // (heredoc body cases need a newline; keep to here-string for the dispatch test)
     }
 }
