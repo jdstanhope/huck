@@ -592,6 +592,11 @@ pub struct Lexer<'a> {
     /// Parser-controlled lexing-mode stack (Phase C). Never empty; `Command` is
     /// the floor. Dormant in v240 — only `Command` is pushed in production.
     modes: Vec<Mode>,
+    /// Tracks whether the `ParamExpansion` head mode has already emitted
+    /// `ParamName` (true = post-name phase; false = pre-name phase). Reset
+    /// to `false` each time `Mode::ParamExpansion` is pushed. Dormant unless
+    /// `Mode::ParamExpansion` is the active mode.
+    param_head_seen_name: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -617,6 +622,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            param_head_seen_name: false,
         }
     }
 
@@ -626,6 +632,9 @@ impl<'a> Lexer<'a> {
 
     #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn push_mode(&mut self, m: Mode) {
+        if m == Mode::ParamExpansion {
+            self.param_head_seen_name = false;
+        }
         self.modes.push(m);
     }
 
@@ -700,12 +709,281 @@ impl<'a> Lexer<'a> {
         self.modes = m.modes.clone();
     }
 
-    /// Scan one step under the current mode. v240: only `Command` is implemented;
-    /// any other active mode is a bug (production never pushes one yet).
+    /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
+    /// remaining Phase C modes are forward declarations (never pushed in production).
     fn scan_step(&mut self) -> Result<Step, LexError> {
         match self.current_mode() {
             Mode::Command => self.scan_step_command(),
+            Mode::ParamExpansion => self.scan_step_param_head(),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
+        }
+    }
+
+    /// Emits one head atom of a `${…}` expansion under `Mode::ParamExpansion`.
+    ///
+    /// The atom sequence is:
+    ///   ParamOpen → [ParamLengthPrefix|ParamIndirect] → ParamName
+    ///   → [LBracket (yields; parser pushes subscript mode)] → [ParamOp] → ParamClose
+    ///
+    /// One atom per call. `param_head_seen_name` tracks pre-/post-name phase.
+    /// Mirrors `scan_braced_param_expansion` (lexer.rs:3284) char-by-char for
+    /// operator recognition; emits atoms instead of building WordParts.
+    fn scan_step_param_head(&mut self) -> Result<Step, LexError> {
+        // ── Phase 0: opener `${` (cursor sits on `$` at mode entry) ──────────────
+        if self.cursor.peek() == Some(&'$') {
+            let mut probe = self.cursor.clone();
+            probe.next(); // skip `$`
+            if probe.peek() == Some(&'{') {
+                let off = self.cursor.offset();
+                let l   = self.cursor.line();
+                let c   = self.cursor.column();
+                self.cursor.next(); // `$`
+                self.cursor.next(); // `{`
+                self.param_head_seen_name = false;
+                self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                return Ok(Step::Produced);
+            }
+            // Cursor is at `$` but not followed by `{` — shouldn't happen in
+            // normal usage (the parser only pushes this mode when it sees `${`).
+            // Fall through; EOF path below handles it gracefully.
+        }
+
+        // ── Phase 1: pre-name (emit prefix and/or ParamName) ─────────────────────
+        if !self.param_head_seen_name {
+            let off = self.cursor.offset();
+            let l   = self.cursor.line();
+            let c   = self.cursor.column();
+
+            match self.cursor.peek().copied() {
+                // `${#}` = arg-count special param; `${#name}` = length prefix.
+                Some('#') => {
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `#`
+                    if probe.peek() == Some(&'}') {
+                        // Bare `${#}` — emit the `#` as the ParamName.
+                        self.cursor.next();
+                        self.param_head_seen_name = true;
+                        self.history.push(Token::new(TokenKind::ParamName("#".into()), Span::new(off, l, c)));
+                    } else {
+                        // `${#name}` — emit length prefix; name comes next call.
+                        self.cursor.next();
+                        self.history.push(Token::new(TokenKind::ParamLengthPrefix, Span::new(off, l, c)));
+                    }
+                    return Ok(Step::Produced);
+                }
+
+                // `${!}` = last-bg-pid special param; `${!name}` = indirect.
+                Some('!') => {
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `!`
+                    if probe.peek() == Some(&'}') {
+                        // Bare `${!}` — emit the `!` as the ParamName.
+                        self.cursor.next();
+                        self.param_head_seen_name = true;
+                        self.history.push(Token::new(TokenKind::ParamName("!".into()), Span::new(off, l, c)));
+                    } else {
+                        // `${!name…}` — emit indirect prefix; name comes next call.
+                        self.cursor.next();
+                        self.history.push(Token::new(TokenKind::ParamIndirect, Span::new(off, l, c)));
+                    }
+                    return Ok(Step::Produced);
+                }
+
+                // Special single-char names: @ * - ? $
+                // These are consumed as the full name.
+                Some(sc @ ('@' | '*' | '-' | '?' | '$')) => {
+                    self.cursor.next();
+                    self.param_head_seen_name = true;
+                    self.history.push(Token::new(TokenKind::ParamName(sc.to_string()), Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // Positional parameter: ${1}, ${10}, ${42}
+                Some(d) if d.is_ascii_digit() => {
+                    let mut name = String::new();
+                    while let Some(&dc) = self.cursor.peek() {
+                        if dc.is_ascii_digit() { name.push(dc); self.cursor.next(); } else { break; }
+                    }
+                    self.param_head_seen_name = true;
+                    self.history.push(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // Regular identifier name: [_A-Za-z][_A-Za-z0-9]*
+                Some(nc) if nc == '_' || nc.is_ascii_alphabetic() => {
+                    let mut name = String::new();
+                    while let Some(&nc2) = self.cursor.peek() {
+                        if nc2 == '_' || nc2.is_ascii_alphanumeric() {
+                            name.push(nc2);
+                            self.cursor.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.param_head_seen_name = true;
+                    self.history.push(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // EOF inside `${` — error.
+                None => return Err(LexError::UnterminatedBrace),
+
+                // Unrecognised char in name position — bad substitution.
+                // Emit an empty ParamName so the parser can detect it, then
+                // the post-name phase will see the closing `}` or unrecognised
+                // char and emit ParamClose (consuming to `}`).
+                Some(_) => {
+                    self.param_head_seen_name = true;
+                    self.history.push(Token::new(TokenKind::ParamName("".into()), Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+            }
+        }
+
+        // ── Phase 2: post-name (emit LBracket, ParamOp, or ParamClose) ──────────
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+
+        match self.cursor.peek().copied() {
+            // Closing brace → ParamClose (bare name or after subscript/op).
+            Some('}') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // Subscript opener → LBracket; parser will push subscript mode.
+            Some('[') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `:` — either `:-`, `:=`, `:?`, `:+` (colon forms) or `:` alone (Substring).
+            Some(':') => {
+                self.cursor.next(); // consume `:`
+                let kind = match self.cursor.peek().copied() {
+                    Some('-') => { self.cursor.next(); ParamOpKind::UseDefault(true)    }
+                    Some('=') => { self.cursor.next(); ParamOpKind::AssignDefault(true) }
+                    Some('?') => { self.cursor.next(); ParamOpKind::ErrorIfUnset(true)  }
+                    Some('+') => { self.cursor.next(); ParamOpKind::UseAlternate(true)  }
+                    // `:` not followed by one of the four → Substring; only `:` consumed.
+                    _         =>                       ParamOpKind::Substring,
+                };
+                self.history.push(Token::new(TokenKind::ParamOp(kind), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // Bare (non-colon) forms.
+            Some('-') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::UseDefault(false)),    Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('=') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::AssignDefault(false)), Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('?') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::ErrorIfUnset(false)),  Span::new(off, l, c))); Ok(Step::Produced) }
+            Some('+') => { self.cursor.next(); self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::UseAlternate(false)),  Span::new(off, l, c))); Ok(Step::Produced) }
+
+            // `#` / `##` → RemovePrefix.
+            Some('#') => {
+                self.cursor.next();
+                let longest = self.cursor.peek() == Some(&'#');
+                if longest { self.cursor.next(); }
+                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::RemovePrefix(longest)), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `%` / `%%` → RemoveSuffix.
+            Some('%') => {
+                self.cursor.next();
+                let longest = self.cursor.peek() == Some(&'%');
+                if longest { self.cursor.next(); }
+                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::RemoveSuffix(longest)), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `/` / `//` / `/#` / `/%` → Substitute.
+            Some('/') => {
+                self.cursor.next();
+                let kind = if self.cursor.peek() == Some(&'/') {
+                    self.cursor.next();
+                    SubstKind::All
+                } else {
+                    match self.cursor.peek().copied() {
+                        Some('#') => { self.cursor.next(); SubstKind::Prefix }
+                        Some('%') => { self.cursor.next(); SubstKind::Suffix }
+                        _         =>                       SubstKind::First
+                    }
+                };
+                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Substitute(kind)), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `^` / `^^` → Case(Upper).
+            Some('^') => {
+                self.cursor.next();
+                let all = self.cursor.peek() == Some(&'^');
+                if all { self.cursor.next(); }
+                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Upper, all)), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `,` / `,,` → Case(Lower).
+            Some(',') => {
+                self.cursor.next();
+                let all = self.cursor.peek() == Some(&',');
+                if all { self.cursor.next(); }
+                self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Case(CaseDirection::Lower, all)), Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `@<letter>` → Transform.
+            Some('@') => {
+                self.cursor.next(); // consume `@`
+                let op_off = self.cursor.offset();
+                let op_l   = self.cursor.line();
+                let op_c   = self.cursor.column();
+                let transform_op = match self.cursor.peek().copied() {
+                    Some('P') => { self.cursor.next(); Some(TransformOp::PromptExpand) }
+                    Some('Q') => { self.cursor.next(); Some(TransformOp::Quote) }
+                    Some('U') => { self.cursor.next(); Some(TransformOp::Upper) }
+                    Some('L') => { self.cursor.next(); Some(TransformOp::Lower) }
+                    Some('u') => { self.cursor.next(); Some(TransformOp::UpperFirst) }
+                    Some('E') => { self.cursor.next(); Some(TransformOp::EscapeExpand) }
+                    Some('A') => { self.cursor.next(); Some(TransformOp::AssignDecl) }
+                    Some('K') => { self.cursor.next(); Some(TransformOp::KvString) }
+                    Some('k') => { self.cursor.next(); Some(TransformOp::KvWords) }
+                    Some('a') => { self.cursor.next(); Some(TransformOp::AttrFlags) }
+                    _         => None,
+                };
+                match transform_op {
+                    Some(op) => {
+                        self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Transform(op)), Span::new(off, l, c)));
+                    }
+                    None => {
+                        // Unknown/missing op letter — bad substitution.
+                        // Consume to `}` and emit ParamClose so the head mode terminates.
+                        let _ = (op_off, op_l, op_c); // unused in this path
+                        while let Some(ch) = self.cursor.peek().copied() {
+                            if ch == '}' { self.cursor.next(); break; }
+                            self.cursor.next();
+                        }
+                        self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
+                    }
+                }
+                Ok(Step::Produced)
+            }
+
+            // EOF inside the expansion.
+            None => Err(LexError::UnterminatedBrace),
+
+            // Unrecognised char after name — bad substitution.
+            // Consume to `}` and emit ParamClose.
+            Some(_) => {
+                while let Some(ch) = self.cursor.peek().copied() {
+                    if ch == '}' { self.cursor.next(); break; }
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
         }
     }
 
@@ -1419,6 +1697,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            param_head_seen_name: false,
         }
     }
 
@@ -8859,6 +9138,110 @@ mod tests {
             .count();
         assert_eq!(lparen_count, 2, "expected two LParen tokens: {tokens:?}");
         assert_eq!(arith_count, 0, "did not expect ArithBlock: {tokens:?}");
+    }
+
+    // ── v241 T2: ParamExpansion head-mode tests ────────────────────────────────
+
+    /// Drive `Mode::ParamExpansion` directly and collect all head atoms through
+    /// (and including) `ParamClose`.
+    fn head_atoms(s: &str) -> Vec<TokenKind> {
+        let mut lx = Lexer::new(s, LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamExpansion);
+        let mut out = Vec::new();
+        while let Some(t) = lx.next_token().unwrap() {
+            let stop = matches!(t.kind, TokenKind::ParamClose);
+            out.push(t.kind);
+            if stop { break; }
+        }
+        out
+    }
+
+    /// Like `head_atoms` but stops after the first `ParamOp` is emitted
+    /// (operand is a different mode, so we stop at the operator boundary).
+    fn head_atoms_until_op(s: &str) -> Vec<TokenKind> {
+        let mut lx = Lexer::new(s, LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamExpansion);
+        let mut out = Vec::new();
+        while let Some(t) = lx.next_token().unwrap() {
+            let stop = matches!(t.kind, TokenKind::ParamOp(_));
+            out.push(t.kind);
+            if stop { break; }
+        }
+        out
+    }
+
+    #[test]
+    fn head_bare_name() {
+        assert_eq!(
+            head_atoms("${name}"),
+            vec![
+                TokenKind::ParamOpen,
+                TokenKind::ParamName("name".into()),
+                TokenKind::ParamClose,
+            ]
+        );
+    }
+
+    #[test]
+    fn head_value_operator() {
+        // stops emitting at the operator; operand is a different mode (Task 3)
+        let a = head_atoms_until_op("${x:-foo}");
+        assert_eq!(
+            a,
+            vec![
+                TokenKind::ParamOpen,
+                TokenKind::ParamName("x".into()),
+                TokenKind::ParamOp(ParamOpKind::UseDefault(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn head_length_and_indirect() {
+        assert_eq!(
+            head_atoms("${#x}"),
+            vec![
+                TokenKind::ParamOpen,
+                TokenKind::ParamLengthPrefix,
+                TokenKind::ParamName("x".into()),
+                TokenKind::ParamClose,
+            ]
+        );
+        assert_eq!(
+            head_atoms("${!x}"),
+            vec![
+                TokenKind::ParamOpen,
+                TokenKind::ParamIndirect,
+                TokenKind::ParamName("x".into()),
+                TokenKind::ParamClose,
+            ]
+        );
+    }
+
+    #[test]
+    fn head_special_param_names() {
+        // bare special-param names: ${@} ${#} ${?} ${!}
+        for (s, n) in [("${@}", "@"), ("${#}", "#"), ("${?}", "?"), ("${!}", "!")] {
+            assert_eq!(
+                head_atoms(s),
+                vec![
+                    TokenKind::ParamOpen,
+                    TokenKind::ParamName(n.into()),
+                    TokenKind::ParamClose,
+                ],
+                "for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_subscript() {
+        // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
+        let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamExpansion);
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::LBracket));
     }
 }
 
