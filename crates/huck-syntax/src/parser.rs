@@ -441,9 +441,10 @@ fn is_bang_word(tok: &TokenKind) -> bool {
 }
 
 /// Returns `true` if `token` is a reserved word (keyword) that the new flat
-/// parser defers to `UnsupportedCommand`.  Mirrors `keyword_of` in
-/// `command.rs` for the compound-opener set, plus `time` (a timing-prefix
-/// reserved word not yet emitted as a structured AST variant — L-58).
+/// parser defers to `UnsupportedCommand`.  Mirrors `command.rs`'s `keyword_of`
+/// EXACTLY (the same 19 compound-opener keywords) — `time` is deliberately NOT
+/// here, because `command.rs` has no `time` handling and parses `time …` as a
+/// plain command; the new parser must match that (see `cmd_time_is_plain_command`).
 fn keyword_of_tok(token: &TokenKind) -> bool {
     let TokenKind::Word(Word(parts)) = token else { return false };
     if parts.len() != 1 { return false; }
