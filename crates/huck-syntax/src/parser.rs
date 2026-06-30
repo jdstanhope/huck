@@ -468,19 +468,22 @@ fn next_is_redirect_token(iter: &mut Lexer) -> Result<bool, ParseError> {
     })
 }
 
-/// Parses a simple command (program + args) from a flat token stream.
-/// Mirrors `parse_simple_stage` in `command.rs` (FLAT subset — no
-/// assignments or redirects in Task 2).
+/// Parses a simple command (program + args, with optional leading assignments)
+/// from a flat token stream.  Mirrors `parse_simple_stage` + `finalize_stage`
+/// in `command.rs` (FLAT subset — no redirects in Task 2/3).
 ///
 /// Stops — without consuming — at any stage/list terminator:
 /// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
 ///
 /// Redirect tokens mid-command are deferred to Task 4 and return
 /// `UnsupportedCommand`.
+///
+/// Leading `NAME=value` words (and `NAME+=value` / `NAME[i]=value` forms)
+/// become `inline_assignments`.  A line of ONLY assignments (no program word)
+/// produces `Command::Simple(SimpleCommand::Assign(…))`.
 fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     let line = iter.current_line()?;
-    let mut program: Option<Word> = None;
-    let mut args: Vec<Word> = Vec::new();
+    let mut all_words: Vec<Word> = Vec::new();
 
     loop {
         let Some(token) = iter.peek_kind()? else { break };
@@ -508,24 +511,46 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         // Consume the token.
         let kind = iter.next_kind()?.unwrap();
         match kind {
-            TokenKind::Word(word) => {
-                if program.is_none() {
-                    program = Some(word);
-                } else {
-                    args.push(word);
-                }
-            }
+            TokenKind::Word(word) => all_words.push(word),
             _ => return Err(ParseError::UnsupportedCommand),
         }
     }
 
-    let prog = match program {
-        Some(p) => p,
-        None => return Err(ParseError::MissingCommand),
-    };
+    if all_words.is_empty() {
+        return Err(ParseError::MissingCommand);
+    }
+
+    // Peel leading assignments from the front — mirrors `finalize_stage`.
+    // Uses `is_assignment_word` (cheap peek) then `try_split_assignment`
+    // (consuming move) to match the oracle's assignment-detection exactly.
+    let mut inline_assignments: Vec<Assignment> = Vec::new();
+    let mut word_iter = all_words.into_iter().peekable();
+    while let Some(w) = word_iter.peek() {
+        if !crate::command::is_assignment_word(w) {
+            break;
+        }
+        let owned = word_iter.next().expect("just peeked Some");
+        match crate::command::try_split_assignment(owned) {
+            Ok(a) => inline_assignments.push(a),
+            Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
+        }
+    }
+    let remaining: Vec<Word> = word_iter.collect();
+
+    // Bare-assign line: all words were assignments, no program word follows.
+    // `inline_assignments` is non-empty here because `all_words` was non-empty
+    // (the is_empty guard above ensures this).
+    if remaining.is_empty() {
+        return Ok(Command::Simple(SimpleCommand::Assign(inline_assignments, line)));
+    }
+
+    let mut remaining_iter = remaining.into_iter();
+    let program = remaining_iter.next().expect("non-empty remaining");
+    let args: Vec<Word> = remaining_iter.collect();
+
     Ok(Command::Simple(SimpleCommand::Exec(ExecCommand {
-        inline_assignments: vec![],
-        program: prog,
+        inline_assignments,
+        program,
         args,
         redirects: vec![],
         line,
@@ -859,6 +884,20 @@ mod tests {
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
         }
+    }
+
+    // T3 tests
+
+    #[test]
+    fn cmd_assignments() {
+        diff_cmd("A=1 cmd");
+        diff_cmd("A=1 B=2 cmd x y");
+        diff_cmd("A=1");                 // bare assign -> SimpleCommand::Assign
+        diff_cmd("A=1 B=2");             // bare multi-assign
+        diff_cmd("A=$x cmd");
+        diff_cmd("A+=v cmd");            // append
+        diff_cmd("arr[0]=v cmd");        // subscripted (AssignPrefix)
+        diff_cmd("PATH=/x:/y cmd");
     }
 
     // tests added in later tasks
