@@ -602,9 +602,11 @@ impl<'a> Lexer<'a> {
 
     #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn pop_mode(&mut self) -> Mode {
-        let m = self.modes.pop().expect("pop_mode on an empty mode stack");
-        debug_assert!(!self.modes.is_empty(), "Command is the floor and must never be popped");
-        m
+        // Guard BEFORE popping so the floor is protected even in release builds:
+        // popping the last element would leave `modes` empty and make the next
+        // `current_mode()` panic with a confusing message.
+        debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
+        self.modes.pop().expect("pop_mode on an empty mode stack")
     }
 
     /// Checkpoint the scanning state for a later `rewind`. Must be called at a
@@ -647,6 +649,13 @@ impl<'a> Lexer<'a> {
     #[allow(dead_code)] // dormant until parser calls it in Phase C iterations
     pub(crate) fn rewind(&mut self, m: &Mark) {
         debug_assert!(m.pos <= self.history.len(), "rewind target beyond history");
+        // Like `mark`, `rewind` is only valid at a pull boundary: it does not
+        // clear the word-accumulation buffers, so a mid-word rewind would leak
+        // partial state into the next token. (Both points are clean today.)
+        debug_assert!(
+            self.current.is_empty() && self.parts.is_empty() && !self.has_token,
+            "rewind() must be called at a pull boundary (no word mid-accumulation)"
+        );
         if !self.replay {
             self.history.truncate(m.pos);
             self.cursor.seek(m.resume.0, m.resume.1, m.resume.2);
