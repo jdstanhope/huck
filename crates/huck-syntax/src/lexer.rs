@@ -1300,6 +1300,23 @@ impl<'a> Lexer<'a> {
         self.aliases = aliases;
     }
 
+    /// Returns the current byte offset of the scanner cursor within the input
+    /// slice. After a lex error from `parse_one_unit`, this is the position
+    /// where the scanner gave up — used by the source loop to compute the
+    /// restart line (`next_line_start(start + iter.cursor_pos())`).
+    pub fn cursor_pos(&self) -> usize {
+        self.cursor.offset()
+    }
+
+    /// Set the starting line number for span generation. Call after `new_live`
+    /// when the input slice starts mid-file (`start > 0`) so that token spans
+    /// carry file-absolute line numbers and `$LINENO` reflects the true file
+    /// line rather than a chunk-relative one.
+    pub fn set_base_line(&mut self, base_line: u32) {
+        self.cursor.line = 1 + base_line;
+        self.token_start_line = 1 + base_line;
+    }
+
     /// Expand a registered alias at command position by splicing its body tokens into
     /// `history` ahead of `pos`. Mirrors Expander::expand_alias (recursion guard,
     /// trailing-blank, span inheritance). Body tokens take the alias-name span.
