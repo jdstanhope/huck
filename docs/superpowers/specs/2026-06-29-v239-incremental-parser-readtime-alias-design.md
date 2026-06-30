@@ -80,10 +80,14 @@ pub fn next_kind(&mut self)  -> Result<Option<TokenKind>, LexError>;
 pub fn peek_span(&mut self) -> Result<Option<Span>, LexError>;
 pub fn current_line(&mut self) -> Result<u32, LexError>;
 pub fn remaining(&self) -> usize;   // non-scanning; replaces TokenCursor::len
-// command position: expand a registered alias IN PLACE, then behave like
-// peek/next. The alias body is lexed, so these are fallible too.
-pub fn peek_command_kind(&mut self) -> Result<Option<&TokenKind>, LexError>;
-pub fn next_command(&mut self) -> Result<Option<Token>, LexError>;
+// command position: expand a registered alias at `pos` IN PLACE (splice body
+// tokens into history). The alias body is lexed, so this is fallible. The parser
+// calls this ONCE at command-position entry, then consumes with plain peek/next
+// (calling it AND a *_command pull would double-expand — T4 review Finding 1).
+pub fn expand_command_alias(&mut self) -> Result<(), LexError>;
+// trailing-blank rule: after an alias whose value ends in a blank, the next word
+// is alias-eligible. The parser reads+clears this before each argument word.
+pub fn take_trailing_eligible(&mut self) -> bool;
 // refreshable alias map (§3) — NO take_error; errors are returned, not stashed
 pub fn set_aliases(&mut self, aliases: HashMap<String, String>);
 ```
@@ -154,12 +158,15 @@ bash semantics).
   loop) becomes `iter.remaining()` (no `?` — non-scanning). A few helpers that pull
   and currently return `bool`/`()` must become `Result<_, ParseError>`; the compiler
   enumerates this bounded cascade.
-- **At command position** — the grammar point(s) where the parser is about to read
-  a command name (`command.rs:1115` in `parse_command_inner`, `2381` in
-  `parse_next_stage`) — it calls `peek_command_kind`/`next_command` instead of
-  `peek_kind`/`next_kind`, so the lexer expands a registered alias there.
-  Everywhere else (arguments, operators, redirections) the plain `*_kind` variants
-  are used, so no alias expansion happens off command position.
+- **At command position** — the parser calls `iter.expand_command_alias()?` at the
+  TOP of `parse_command_inner` and `parse_next_stage` (before any keyword/Word peek),
+  then consumes with the plain `*_kind` pull. Expanding *before* the keyword dispatch
+  is required so `alias x=if` yields the `if` keyword and `alias foo=bar; foo(){…}`
+  expands the func-def name (both verified against bash/huck). The trailing-blank rule
+  is handled by `take_trailing_eligible()` + a re-expand in the argument loop. Non-
+  command grammar positions (case patterns, for-lists, `[[ ]]`, case/for/function NAME
+  words) are read by their own parse fns, never through these two, so they are never
+  expanded — matching bash.
 - **Error model — fallible pull, `?`-propagated.** Every scanning pull method
   returns `Result<…, LexError>`; a `LexError` hit while pulling (main line *or*
   alias body) is **returned at the failing call** and propagates through `?`,
@@ -273,11 +280,12 @@ To keep intermediate states byte-identical:
    `current_line?`/`remaining`) with `ParseError::Lex(Box<LexError>)` + `From`, the
    alias pre-pass still running and feeding a `from_tokens` replay lexer. Rename + `?`
    + bounded helper cascade; behavior-preserving under the oracle.
-2. **Make the pull live and fold alias in:** add `peek_command_kind`/`next_command`
-   + the alias map + expansion mechanics; have the parser call the command-position
-   variants at the two sites; switch the REPL to live `Lexer::new_live(...)`; retire
-   the pre-pass, `TokenCursor`, and the `alias_generation` hack; add `set_aliases` +
-   the between-unit refresh. Byte-identical, now incremental.
+2. **Make the pull live and fold alias in:** add the alias map + expansion mechanics
+   (T4: `maybe_expand_command_alias`) and `expand_command_alias`/`take_trailing_eligible`
+   (T5); have the parser call `expand_command_alias()` at command-position entry and
+   re-expand in the arg loop per the trailing-blank flag; switch the REPL to live
+   `Lexer::new_live(...)`; retire the pre-pass, `TokenCursor`, and the `alias_generation`
+   hack; add `set_aliases` + the between-unit refresh. Byte-identical, now incremental.
 3. **Edge consumers:** rework continuation (replay lexers), confirm `source`
    multi-unit offset slicing, the `$(...)`-not-expanded invariant, and that a bad
    alias body propagates as `ParseError::Lex` via `?`.
@@ -285,7 +293,7 @@ To keep intermediate states byte-identical:
 ## Definition of done
 
 - The parser pulls from `&mut Lexer` **live**, holds no `Vec`, and calls
-  `peek_command_kind`/`next_command` exactly at command position.
+  `expand_command_alias` exactly at command position (then plain `*_kind` pulls).
 - Alias expansion happens inside the lexer's command-position pull; the
   `huck-engine` pre-pass, the `alias_generation` re-tokenize hack, and
   `TokenCursor` are deleted.

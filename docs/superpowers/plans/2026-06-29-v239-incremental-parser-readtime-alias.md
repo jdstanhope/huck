@@ -458,45 +458,85 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Parser calls command-position methods; REPL goes live; other callers adapt to `&mut Lexer`
+### Task 5: Parser drives command-position alias expansion; REPL goes live; other callers adapt to `&mut Lexer`
 
-Hook the two command-position sites to `peek_command_kind`/`next_command` (with `?`), change `parse` to take `&mut Lexer`, and make the **REPL** build a live `Lexer` with the alias map (read-time alias). The other `parse` callers — continuation, command-substitution bodies, function reconstruction, prompt cmdsub — are **alias-free today** (none call `expand_aliases_in_tokens`), so keep them byte-identical: keep `tokenize` then wrap the vec in `Lexer::from_tokens` (replay, no aliases) and call `parse(&mut lx)`. **Do NOT pass the alias map to `$(...)` bodies** — current huck does not expand aliases inside command substitution; doing so would diverge. The `source` loop goes live in Task 6.
+Make alias expansion live. The parser calls `expand_command_alias()` at the **start** of command position; the REPL builds a live `Lexer`. The other `parse` callers — continuation, `$(...)` bodies, function reconstruction, prompt cmdsub — are **alias-free today** (none call `expand_aliases_in_tokens`), so keep them byte-identical via `Lexer::from_tokens` (replay, no aliases). **Do NOT pass the alias map to `$(...)` bodies** — current huck does not expand aliases inside command substitution.
+
+**This task's design is pinned to verified bash/huck semantics** (probed against the release binary — all must stay byte-identical):
+- `alias x=if` → expands to the **keyword** `if`. So expansion must happen **before** the keyword-dispatch peek, i.e. at the very top of `parse_command_inner`/`parse_next_stage`, NOT at the later Word-check peek.
+- `alias foo=bar` then `foo() {…}` → the function-definition **name expands** (`bar` is defined). So expand-at-top is correct; do **not** add a func-def-name guard.
+- Trailing blank: `alias a='b '` makes the **next word** alias-eligible even in argument position; the chain continues only while each expanded value ends in a blank (`a x y` with `a='echo '`, `x=X`, `y=Y` → `X y`: `x` expands, `y` does not).
+- No trailing blank → the argument is **not** expanded (`alias a=echo; alias c=hello; <newline> a c` → prints `c`).
+
+**Why not the old `peek_command_kind`/`next_command` pair (T4):** `peek_command_kind` splices the expansion into `history`, so peeking then `next_command`-ing the same position double-expands (T4 review Finding 1). Instead, expansion happens **once** via an explicit `expand_command_alias()` at command-position entry, and the parser consumes with the **plain** `peek_kind`/`next_kind`. `peek_command_kind`/`next_command` are **removed** this task.
 
 **Files:**
-- Modify: `crates/huck-syntax/src/command.rs` (sites 1115, 2381; `parse` signature)
-- Modify: `crates/huck-engine/src/shell.rs` (REPL ≈380-401), `continuation.rs` (≈50-77), `crates/huck-syntax/src/lexer.rs` (`parse_substitution_body` ≈2876), `shell_state.rs` (≈687), `prompt.rs` (≈249)
+- Modify: `crates/huck-syntax/src/lexer.rs` (`expand_command_alias`, `take_trailing_eligible`, `new_live`, `maybe_expand` reset; remove `peek_command_kind`/`next_command`; update the 6 T4 tests; `parse_substitution_body`)
+- Modify: `crates/huck-syntax/src/command.rs` (expand-at-top of `parse_command_inner`+`parse_next_stage`; arg-loop hook in `parse_simple_stage`; `parse` signature)
+- Modify: `crates/huck-engine/src/shell.rs` (REPL ≈380-401), `continuation.rs` (≈50-77), `shell_state.rs` (≈687), `prompt.rs` (≈249)
 
 **Interfaces:**
-- Consumes: `Lexer::new_live`, `peek_command_kind`, `next_command`, `set_aliases`, `from_tokens`.
-- Produces: `pub fn parse(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError>` (signature change); `pub fn new_live(input, &aliases, opts) -> Lexer` on `Lexer`.
+- Consumes: T4's `maybe_expand_command_alias`, `aliases`/`active`/`alias_trailing_eligible` fields, `from_tokens`.
+- Produces (on `Lexer`):
+  - `pub fn expand_command_alias(&mut self) -> Result<(), LexError>` — wraps `maybe_expand_command_alias`.
+  - `pub fn take_trailing_eligible(&mut self) -> bool` — returns `alias_trailing_eligible`, resets it to `false`.
+  - `pub fn new_live(input, &aliases, opts) -> Lexer`.
+  - REMOVED: `peek_command_kind`, `next_command`.
+- Produces (on `command`): `pub fn parse(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError>` (signature change).
 
-- [ ] **Step 1: Hook the two command-position sites**
+- [ ] **Step 1: Lexer — `expand_command_alias`, `take_trailing_eligible`, `new_live`; fix `maybe_expand` eligibility reset; remove the `*_command` pair**
 
-In `parse_command_inner` (`command.rs:1111-1115`):
+In `maybe_expand_command_alias`, set the trailing flag to `false` up front so a non-expanding word (not a word / not literal / not an alias) leaves it false — this is what stops the chain (probe P5/P6). Add the reset right after `self.fill_to(self.pos)?;`:
 ```rust
-if matches!(iter.peek_command_kind()?, Some(TokenKind::Word(_))) {
-    let word_line = iter.current_line()?;
-    let Some(TokenKind::Word(w)) = iter.next_command()?.map(|t| t.kind) else { unreachable!() };
+fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
+    self.fill_to(self.pos)?;
+    self.alias_trailing_eligible = false;   // NEW: default; the expand path re-sets it from the body's trailing blank
+    let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
+    // … unchanged: word_literal_text gate, active guard, alias lookup, splice,
+    //    recursion-guarded re-entry, and the final
+    //    self.alias_trailing_eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
+}
 ```
-In `parse_next_stage` (`command.rs:2378-2381`): the same change (`peek_command_kind()?` / `next_command()?.map(|t| t.kind)`). These are the ONLY two sites that use the `*_command` variants.
+(The final `= body.chars()…` line stays; the outermost frame runs it last, so for `a='b '` it ends `true`. The new up-front `= false` only changes the no-expansion outcome.)
 
-- [ ] **Step 2: Change `parse` signature; expose `Lexer::new_live`**
-
-In `lexer.rs`:
+Add:
 ```rust
+pub fn expand_command_alias(&mut self) -> Result<(), LexError> {
+    self.maybe_expand_command_alias()
+}
+pub fn take_trailing_eligible(&mut self) -> bool {
+    let e = self.alias_trailing_eligible;
+    self.alias_trailing_eligible = false;
+    e
+}
 pub fn new_live(input: &'a str, aliases: &std::collections::HashMap<String, String>, opts: LexerOptions) -> Lexer<'a> {
     let mut lx = Lexer::new(input, opts, true);
     lx.aliases = aliases.clone();
     lx
 }
 ```
-In `command.rs`, `parse` becomes a thin wrapper (callers now own the lexer):
+**Delete `peek_command_kind` and `next_command`.** Update the 6 T4 unit tests that called them: replace `lx.peek_command_kind()?` with `{ lx.expand_command_alias()?; lx.peek_kind()? }` and `lx.next_command()?` with `{ lx.expand_command_alias()?; lx.next()? }`. (The `alias_trailing_blank_makes_next_word_eligible` test already drives two expansions in sequence and still passes; keep it.)
+
+- [ ] **Step 2: Parser — expand at command-position entry, hook the argument loop, change `parse` signature**
+
+(a) `parse` becomes a thin wrapper:
 ```rust
 pub fn parse(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     parse_cursor(iter)
 }
 ```
-Note: the `Vec<Token>` callers that don't alias-expand (continuation, comsub, function-body, prompt — Step 4) now wrap with `Lexer::from_tokens(...)`; the alias-expanding REPL (Step 3) and the source loop (Task 6) use `new_live`.
+(b) **Command-position entry.** At the TOP of `parse_command_inner` — right after `skip_newlines(iter)?;` and BEFORE the `ArithBlock`/keyword/Word peeks — add:
+```rust
+iter.expand_command_alias()?;
+```
+Do the same at the TOP of `parse_next_stage` (before its first peek). This is the only expansion trigger for the command word; the existing peeks/consumes stay plain `peek_kind`/`next_kind` (they now see the already-expanded `history`). This ordering is REQUIRED so `alias x=if` feeds the keyword dispatch and `foo()`-defs expand the name (probes P1/P2).
+(c) **Trailing-blank in the argument loop.** In `parse_simple_stage`, find the loop that reads the stage's arguments/redirections. At the TOP of each iteration, BEFORE the peek that classifies the next token, add:
+```rust
+if iter.take_trailing_eligible() {
+    iter.expand_command_alias()?;
+}
+```
+So when the command word's alias value ended in a blank, the next word is alias-checked (and the chain continues while each expanded value ends in a blank). For the overwhelmingly common case (no blank-ending alias) `take_trailing_eligible()` returns `false` and this is a no-op. (Non-command grammar positions — case patterns, for-lists, `[[ ]]` interiors, `case`/`for`/function NAME words — are read by their own parse functions, NOT through `parse_command_inner`/`parse_next_stage`/`parse_simple_stage`, so they are never alias-expanded, matching bash.)
 
 - [ ] **Step 3: REPL — build a live lexer (drop the pre-pass)**
 
@@ -659,7 +699,15 @@ fn bad_alias_body_surfaces_as_parse_error() {
 
 - [ ] **Step 3: `$(...)`-not-expanded + new bash-diff harness**
 
-Create `tests/scripts/alias_readtime_diff_check.sh` modeled on the existing `alias*_diff_check.sh` harness shape, covering: command-position vs argument-position; recursion; trailing-blank; alias to a reserved word (`alias x='if'`); cross-unit def-then-use; **alias NOT expanded inside `$(...)`** (matches current huck); quoted word not expanded. Each fragment run through bash and `target/release/huck`, asserting identical output.
+Create `tests/scripts/alias_readtime_diff_check.sh` modeled on the existing `alias*_diff_check.sh` harness shape, with each fragment run through bash and `target/release/huck` asserting identical output. **All aliases must be defined on a line BEFORE their use** (same-unit defs don't take effect — these are multi-line fragments). Cover at minimum these verified cases (the design is pinned to them):
+- alias→keyword: `alias x=if⏎x true; then echo Y; fi` → `Y`
+- func-def name expands: `alias foo=bar⏎foo() { echo INFUNC; }⏎declare -F` → defines `bar`
+- trailing-blank chains to an alias arg: `alias a="b "⏎alias b=echo⏎alias c=hello⏎a c` → `hello`
+- trailing-blank, arg not an alias: `alias a="b "⏎alias b=echo⏎a hi` → `hi`
+- NO trailing blank, arg IS an alias (must NOT expand): `alias a=echo⏎alias c=hello⏎a c` → `c`
+- trailing-blank chain stops at the 2nd arg: `alias a="echo "⏎alias x=X⏎alias y=Y⏎a x y` → `X y`
+- recursion guard: `alias ls="ls -a"` then `ls` (terminates)
+- cross-unit def-then-use; quoted word not expanded; **alias NOT expanded inside `$(...)`** (matches current huck).
 
 - [ ] **Step 4: Full suite + ALL harnesses (incl. the new one)**
 
