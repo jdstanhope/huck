@@ -455,7 +455,6 @@ fn keyword_of_tok(token: &TokenKind) -> bool {
         | "for" | "in" | "case" | "esac"
         | "select" | "function" | "{" | "}"
         | "[[" | "]]" | "coproc"
-        | "time"   // timing-prefix reserved word — deferred (no Timed AST node yet, L-58)
     )
 }
 
@@ -1170,11 +1169,12 @@ mod tests {
     }
 
     #[test]
-    fn cmd_time_deferred() {
-        // `time` is a timing-prefix reserved word (L-58).  The new parser defers
-        // it; the oracle parses it as a simple command name, so we use
-        // diff_unsupported (not diff_cmd) to avoid the mismatch.
-        diff_unsupported("time cmd");
-        diff_unsupported("time -p cmd");
+    fn cmd_time_is_plain_command() {
+        // `command.rs` has NO special `time` handling — it parses `time …` as a
+        // plain command named `time`. The new parser MUST match the oracle (not
+        // defer), so these are diff_cmd. (When huck later adds a `Timed` AST node,
+        // both parsers change together; until then `time` is just a command word.)
+        diff_cmd("time cmd");
+        diff_cmd("time -p cmd");
     }
 }
