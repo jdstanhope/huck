@@ -438,153 +438,6 @@ fn keyword_of_tok(token: &TokenKind) -> bool {
     )
 }
 
-/// Returns `true` if the operator is a redirect operator.
-/// Mirrors `is_redirect_op` in `command.rs`.
-fn is_redirect_op_kind(op: &Operator) -> bool {
-    matches!(
-        op,
-        Operator::RedirIn
-            | Operator::RedirOut
-            | Operator::RedirAppend
-            | Operator::RedirErr
-            | Operator::RedirErrAppend
-            | Operator::HereString
-            | Operator::DupOut
-            | Operator::DupErr
-            | Operator::DupIn
-            | Operator::RedirReadWrite
-            | Operator::AndRedirOut
-            | Operator::AndRedirAppend
-            | Operator::RedirClobber
-            | Operator::RedirErrClobber
-    )
-}
-
-/// Returns `true` if the next token is a redirect (fd-prefix, heredoc, or
-/// redirect operator).  Mirrors `next_is_redirect` in `command.rs`.
-fn next_is_redirect_token(iter: &mut Lexer) -> Result<bool, ParseError> {
-    Ok(match iter.peek_kind()? {
-        Some(TokenKind::RedirFd(_)) => true,
-        Some(TokenKind::Heredoc { .. }) => true,
-        Some(TokenKind::Op(op)) => is_redirect_op_kind(op),
-        _ => false,
-    })
-}
-
-/// Builds a literal `Word` from a plain string.  Mirrors `lit_word` in `command.rs`.
-fn lit_word_local(s: &str) -> Word {
-    Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
-}
-
-/// Builds the `RedirOp` for a dup operator (`>&` / `<&`).
-/// Mirrors `dup_op` in `command.rs`.
-fn dup_op_local(source: Word, output: bool) -> RedirOp {
-    if word_literal_text(&source) == Some("-") {
-        RedirOp::Close
-    } else {
-        RedirOp::Dup { source, output }
-    }
-}
-
-/// Builds the ordered `Redirection`(s) for a redirect operator + target word.
-/// Mirrors `build_redirections` in `command.rs` exactly (including the
-/// stderr-default operators and the `&>`/`&>>` two-element desugaring).
-fn build_redirections_local(
-    op: Operator,
-    target: Word,
-    fd_prefix: Option<RedirFd>,
-) -> Vec<Redirection> {
-    let err_fd = || fd_prefix.clone().unwrap_or(RedirFd::Number(2));
-    let plain_fd = || fd_prefix.clone().unwrap_or(RedirFd::Default);
-    match op {
-        Operator::RedirIn => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::ReadOnly, target },
-        }],
-        Operator::RedirOut => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Truncate, target },
-        }],
-        Operator::RedirAppend => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Append, target },
-        }],
-        Operator::RedirClobber => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::Clobber, target },
-        }],
-        Operator::RedirReadWrite => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::File { mode: FileMode::ReadWrite, target },
-        }],
-        Operator::RedirErr => vec![Redirection {
-            fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Truncate, target },
-        }],
-        Operator::RedirErrAppend => vec![Redirection {
-            fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Append, target },
-        }],
-        Operator::RedirErrClobber => vec![Redirection {
-            fd: err_fd(),
-            op: RedirOp::File { mode: FileMode::Clobber, target },
-        }],
-        Operator::HereString => vec![Redirection {
-            fd: plain_fd(),
-            op: RedirOp::HereString(target),
-        }],
-        Operator::DupOut => {
-            let redir_op = dup_op_local(target, true);
-            // When the source is `-` (Close), use fd 1 as the directional
-            // default (output dup targets stdout). `plain_fd()` falls back to
-            // `Default` which resolves to 0 — the wrong fd.
-            let fd = if matches!(redir_op, RedirOp::Close) {
-                fd_prefix.clone().unwrap_or(RedirFd::Number(1))
-            } else {
-                plain_fd()
-            };
-            vec![Redirection { fd, op: redir_op }]
-        }
-        Operator::DupErr => {
-            let redir_op = dup_op_local(target, true);
-            // DupErr already uses err_fd() which defaults to Number(2).
-            vec![Redirection { fd: err_fd(), op: redir_op }]
-        }
-        Operator::DupIn => {
-            let redir_op = dup_op_local(target, false);
-            // When the source is `-` (Close), use fd 0.  plain_fd() also
-            // resolves to 0 via Default, but we make it explicit for symmetry.
-            let fd = if matches!(redir_op, RedirOp::Close) {
-                fd_prefix.clone().unwrap_or(RedirFd::Number(0))
-            } else {
-                plain_fd()
-            };
-            vec![Redirection { fd, op: redir_op }]
-        }
-        Operator::AndRedirOut => vec![
-            Redirection {
-                fd: plain_fd(),
-                op: RedirOp::File { mode: FileMode::Truncate, target },
-            },
-            Redirection {
-                fd: RedirFd::Number(2),
-                op: RedirOp::Dup { source: lit_word_local("1"), output: true },
-            },
-        ],
-        Operator::AndRedirAppend => vec![
-            Redirection {
-                fd: plain_fd(),
-                op: RedirOp::File { mode: FileMode::Append, target },
-            },
-            Redirection {
-                fd: RedirFd::Number(2),
-                op: RedirOp::Dup { source: lit_word_local("1"), output: true },
-            },
-        ],
-        // is_redirect_op_kind gates the callers; no other operator reaches here.
-        _ => unreachable!("build_redirections_local called with a non-redirect operator"),
-    }
-}
 
 /// Parses a SINGLE redirect token group (optional `RedirFd` prefix + redirect
 /// operator + target word) from `iter`.  Mirrors one iteration of
@@ -607,7 +460,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             // Heredoc — deferred to a future task.
             Err(ParseError::UnsupportedCommand)
         }
-        Some(TokenKind::Op(op)) if is_redirect_op_kind(op) => {
+        Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
             let op = *op;
             iter.next_kind()?; // consume the redirect operator
             // HereString (`<<<`) — deferred.
@@ -624,7 +477,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
                 // Phase C atom variants (dormant — never emitted in Command mode)
                 Some(_) => return Err(ParseError::RedirectTargetIsOperator),
             };
-            Ok(build_redirections_local(op, target, fd_prefix))
+            Ok(crate::command::build_redirections(op, target, fd_prefix))
         }
         _ => {
             // A bare fd-prefix with no following redirect operator: defensively
@@ -632,7 +485,7 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             if fd_prefix.is_some() {
                 return Err(ParseError::MissingRedirectTarget);
             }
-            // Should not be reached (caller checks next_is_redirect_token first).
+            // Should not be reached (caller checks next_is_redirect first).
             Err(ParseError::UnsupportedCommand)
         }
     }
@@ -681,7 +534,7 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         // Redirect tokens — parse in source order, extending the redirects
         // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
         // delegation in `parse_simple_stage`.
-        if next_is_redirect_token(iter)? {
+        if crate::command::next_is_redirect(iter)? {
             redirects.extend(parse_one_redirect(iter)?);
             continue;
         }
@@ -1117,6 +970,8 @@ mod tests {
         diff_cmd("cmd <>f");             // read-write
         diff_cmd("cmd <&3");             // dup-in
         diff_cmd("cmd &>f");             // and-redirect
+        diff_cmd("cmd >&2");             // dup-out to stderr
+        diff_cmd("cmd 2>&-");            // close fd 2
     }
 
     #[test]

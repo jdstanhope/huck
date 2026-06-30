@@ -201,7 +201,7 @@ pub fn is_assignment_word(w: &crate::lexer::Word) -> bool {
 
 /// Constructs a single-part unquoted literal `Word` from a static string.
 /// Used by the parser to synthesize the "1" source-word in `&>` / `&>>` desugaring.
-fn lit_word(s: &str) -> Word {
+pub(crate) fn lit_word(s: &str) -> Word {
     Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])
 }
 
@@ -1900,7 +1900,7 @@ fn parse_while(
 
 /// True for the operators that introduce a redirection (and thus a trailing
 /// target word). Excludes pipeline/grouping operators (`|`, `(`, `)`, etc.).
-fn is_redirect_op(op: &Operator) -> bool {
+pub(crate) fn is_redirect_op(op: &Operator) -> bool {
     matches!(
         op,
         Operator::RedirIn
@@ -1928,7 +1928,7 @@ fn is_redirect_op(op: &Operator) -> bool {
 /// operators (`2>`/`2>>`/`2>&`/`2>|`) default their fd to `Number(2)` when no
 /// explicit prefix is given. `&>`/`&>>` desugar to TWO redirections
 /// (file-to-stdout + `2>&1`).
-fn build_redirections(
+pub(crate) fn build_redirections(
     op: Operator,
     target: Word,
     fd_prefix: Option<RedirFd>,
@@ -2031,7 +2031,7 @@ fn build_redirections(
 }
 
 /// `>&w`/`<&w`: a `-` source word closes the fd; otherwise a Dup.
-fn dup_op(source: Word, output: bool) -> RedirOp {
+pub(crate) fn dup_op(source: Word, output: bool) -> RedirOp {
     if word_literal_text(&source) == Some("-") {
         RedirOp::Close
     } else {
@@ -2041,7 +2041,7 @@ fn dup_op(source: Word, output: bool) -> RedirOp {
 
 /// True iff the next token begins a redirection: a `TokenKind::RedirFd` prefix,
 /// a `TokenKind::Heredoc`, or a redirect operator.
-fn next_is_redirect(iter: &mut Lexer) -> Result<bool, ParseError> {
+pub(crate) fn next_is_redirect(iter: &mut Lexer) -> Result<bool, ParseError> {
     Ok(match iter.peek_kind()? {
         Some(TokenKind::RedirFd(_)) => true,
         Some(TokenKind::Heredoc { .. }) => true,
