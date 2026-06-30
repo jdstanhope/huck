@@ -440,8 +440,10 @@ fn is_bang_word(tok: &TokenKind) -> bool {
     }
 }
 
-/// Returns `true` if `token` is a reserved word (keyword).
-/// Mirrors `keyword_of` in `command.rs` exactly.
+/// Returns `true` if `token` is a reserved word (keyword) that the new flat
+/// parser defers to `UnsupportedCommand`.  Mirrors `keyword_of` in
+/// `command.rs` for the compound-opener set, plus `time` (a timing-prefix
+/// reserved word not yet emitted as a structured AST variant — L-58).
 fn keyword_of_tok(token: &TokenKind) -> bool {
     let TokenKind::Word(Word(parts)) = token else { return false };
     if parts.len() != 1 { return false; }
@@ -453,6 +455,7 @@ fn keyword_of_tok(token: &TokenKind) -> bool {
         | "for" | "in" | "case" | "esac"
         | "select" | "function" | "{" | "}"
         | "[[" | "]]" | "coproc"
+        | "time"   // timing-prefix reserved word — deferred (no Timed AST node yet, L-58)
     )
 }
 
@@ -698,18 +701,114 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
     parse_pipeline(iter)
 }
 
-/// Task 2: single command only; Task 6 adds `&&`/`||` connectors.
-/// Mirrors `parse_sequence_opts` in `command.rs`.
-fn parse_and_or(iter: &mut Lexer) -> Result<Command, ParseError> {
-    parse_command_then_pipeline(iter)
+/// Parses the full flat and-or list (the complete `Sequence`).  Mirrors
+/// `parse_sequence_opts` in `command.rs` with `stop_at = &[]` and
+/// `stop_at_top_newline = false` — the `parse` (non-unit) contract where a
+/// top-level `Newline` is a Semi-like continue connector, NOT a unit
+/// terminator.
+///
+/// After the first pipeline, loops consuming:
+/// - `Op(Semi)` / `Newline` → `Connector::Semi`
+/// - `Op(And)` → `Connector::And`
+/// - `Op(Or)` → `Connector::Or`
+/// - `Op(Background)`:
+///   - trailing (nothing meaningful follows) → sets `background = true`
+///   - `& &` → `Err(UnexpectedBackground)`
+///   - `& cmd` → `Connector::Amp` separator
+///
+/// Stops (without consuming) at EOF or case terminators
+/// (`;;` / `;&` / `;;&`).
+fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    let first = parse_command_then_pipeline(iter)?;
+    let mut rest: Vec<(Connector, Command)> = Vec::new();
+    let mut background = false;
+
+    loop {
+        match iter.peek_kind()? {
+            // EOF — end of list.
+            None => break,
+            // Case-clause terminators (`;;` / `;&` / `;;&`) — break without
+            // consuming; at the flat top level these become stray tokens caught
+            // by `parse_sequence`.
+            Some(TokenKind::Op(
+                Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+            )) => break,
+            _ => {}
+        }
+
+        // Consume the connector token.
+        let token = iter.next_kind()?.unwrap();
+        match token {
+            // ── `&` — background / Amp separator ────────────────────────────
+            TokenKind::Op(Operator::Background) => {
+                // Skip any newlines emitted after heredoc bodies (mirrors oracle).
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
+                    // Nothing follows → trailing `&`: background the whole sequence.
+                    None => {
+                        background = true;
+                        break;
+                    }
+                    // A case-clause terminator → trailing `&` for the last group.
+                    Some(TokenKind::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => {
+                        background = true;
+                        break;
+                    }
+                    // Another `&` with no preceding command → `cmd & &` is invalid.
+                    Some(TokenKind::Op(Operator::Background)) => {
+                        return Err(ParseError::UnexpectedBackground);
+                    }
+                    // A command follows → `&` is a separator; background the
+                    // preceding group and continue the list.
+                    Some(_) => {
+                        rest.push((Connector::Amp, parse_command_then_pipeline(iter)?));
+                    }
+                }
+            }
+
+            // ── `;` or newline — semi-like connector ─────────────────────────
+            // `stop_at_top_newline = false`: top-level newline is a Semi
+            // connector (`a\nb` = one Sequence), not a unit terminator.
+            TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
+                    None => break,
+                    Some(TokenKind::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => break,
+                    Some(_) => {}
+                }
+                rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── `&&` — and connector ─────────────────────────────────────────
+            TokenKind::Op(Operator::And) => {
+                skip_newlines(iter)?;
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── `||` — or connector ──────────────────────────────────────────
+            TokenKind::Op(Operator::Or) => {
+                skip_newlines(iter)?;
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── anything else (e.g. stray word / `|` after a closed block) ──
+            _ => {
+                return Err(ParseError::UnexpectedToken);
+            }
+        }
+    }
+
+    Ok(Sequence { first, rest, background })
 }
 
 /// Entry point for the new flat command-list parser.  Mirrors `parse` /
 /// `parse_cursor` in `command.rs`.
 ///
-/// Returns `Ok(None)` on empty input (newlines only or EOF).  Task 2
-/// builds a 1-command `Sequence`; connectors (`;`, `&&`, `||`, `&`) come
-/// in Tasks 6 and later.
+/// Returns `Ok(None)` on empty input (newlines only or EOF).
 pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     // Skip leading newlines (mirrors `parse_cursor` → `skip_newlines`).
     while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
@@ -718,8 +817,13 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let first = parse_and_or(iter)?;
-    Ok(Some(Sequence { first, rest: vec![], background: false }))
+    let seq = parse_and_or(iter)?;
+    // Mirror `parse_cursor`: a stray terminator (`;;`/`;&`/`;;&`) left after
+    // the top-level sequence → `UnexpectedToken`.
+    if iter.peek_kind()?.is_some() {
+        return Err(ParseError::UnexpectedToken);
+    }
+    Ok(Some(seq))
 }
 
 #[cfg(test)]
@@ -1039,5 +1143,38 @@ mod tests {
         diff_cmd("echo x | grep y | wc -l");
         diff_cmd("A=1 cmd | other");
         diff_cmd("cmd >o | other");
+    }
+
+
+    // T6 tests
+
+    #[test]
+    fn cmd_and_or_lists() {
+        diff_cmd("a; b");
+        diff_cmd("a; b; c");
+        diff_cmd("x && y");
+        diff_cmd("x || y");
+        diff_cmd("x && y || z");
+        diff_cmd("a | b && c | d");
+        diff_cmd("p &");                  // trailing background
+        diff_cmd("p & q");                // & as separator (Connector::Amp)
+        diff_cmd("a\nb");                 // newline as connector (parse contract)
+        diff_cmd("a; b &");
+        diff_cmd("! a | b && c");
+    }
+
+    #[test]
+    fn cmd_invalid_double_background() {
+        // `cmd & &` → command.rs returns UnexpectedBackground; match it exactly.
+        assert_eq!(new_seq("cmd & &"), old_seq("cmd & &"));
+    }
+
+    #[test]
+    fn cmd_time_deferred() {
+        // `time` is a timing-prefix reserved word (L-58).  The new parser defers
+        // it; the oracle parses it as a simple command name, so we use
+        // diff_unsupported (not diff_cmd) to avoid the mismatch.
+        diff_unsupported("time cmd");
+        diff_unsupported("time -p cmd");
     }
 }
