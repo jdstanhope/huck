@@ -170,6 +170,21 @@ pub enum CaseDirection {
     Lower,  // , / ,,
 }
 
+#[allow(dead_code)] // Phase C atoms; dormant in v241
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubstKind { First, All, Prefix, Suffix }   // / , // , /# , /%
+
+#[allow(dead_code)] // Phase C atoms; dormant in v241
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParamOpKind {
+    UseDefault(bool), AssignDefault(bool), ErrorIfUnset(bool), UseAlternate(bool), // bool = colon-prefixed
+    RemovePrefix(bool), RemoveSuffix(bool),   // bool = longest (## / %%)
+    Substitute(SubstKind),
+    Case(CaseDirection, bool),                // bool = all (^^ / ,,)
+    Transform(TransformOp),
+    Substring,
+}
+
 /// Scalar and whole-array `${var@OP}` transform operators (bash 5.x).
 /// Per-element across arrays via the per-element arm in expand.rs;
 /// whole-array via the sibling whole-array arm; scalar via the
@@ -376,6 +391,16 @@ pub enum TokenKind {
     /// when a digit-run or `{ident}` Word immediately precedes (no
     /// whitespace) a redirect operator (or heredoc).
     RedirFd(crate::command::RedirFd),
+    // --- Phase C parser-driven atoms (dormant in v241; emitted only under the
+    // ParamExpansion/operand modes, consumed only by parser.rs). ---
+    ParamOpen, ParamClose, LBracket, RBracket, ParamSep,
+    ParamName(String),
+    ParamLengthPrefix, ParamIndirect,
+    #[allow(private_interfaces)] // ParamOpKind is pub(crate); TokenKind is pub — dormant in v241
+    ParamOp(ParamOpKind),
+    Lit { text: String, quoted: bool },
+    DollarName(String),
+    DeferredExpansion,   // $( / $(( / backtick inside an operand — v241 stops here
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -503,6 +528,10 @@ pub(crate) enum Mode {
     Subshell,       // ( … )
     CommandSub,     // $( … ) / `…`
     ParamExpansion, // ${ … }
+    ParamWordOperand,
+    ParamSubstPatternOperand,
+    ParamSubstringOffsetOperand,
+    ParamSubscriptOperand,
     Arith,          // $(( … )) / (( … )) / $[ … ]
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
