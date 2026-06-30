@@ -422,6 +422,24 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     Ok(result)
 }
 
+/// Skip over any `Newline` tokens without consuming anything else.
+/// Mirrors `skip_newlines` in `command.rs`.
+fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    Ok(())
+}
+
+/// Returns `true` if the token is a standalone `!` word (pipeline negation).
+/// Mirrors `is_bang_word` in `command.rs`.
+fn is_bang_word(tok: &TokenKind) -> bool {
+    match tok {
+        TokenKind::Word(w) => word_literal_text(w) == Some("!"),
+        _ => false,
+    }
+}
+
 /// Returns `true` if `token` is a reserved word (keyword).
 /// Mirrors `keyword_of` in `command.rs` exactly.
 fn keyword_of_tok(token: &TokenKind) -> bool {
@@ -601,10 +619,12 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     })))
 }
 
-/// Parses a single command (dispatch).  Mirrors `parse_command_inner` +
-/// `keyword_of` in `command.rs`.  Every non-simple branch returns
-/// `UnsupportedCommand` in Task 2; simple commands are wrapped in a
-/// 1-element `Command::Pipeline` to match the oracle.
+/// Parses a single pipeline STAGE (dispatch).  Mirrors the non-`!` /
+/// non-pipeline dispatch logic of `parse_command_inner` in `command.rs`.
+/// Every non-simple branch returns `UnsupportedCommand` (deferred).
+///
+/// Returns the BARE stage command — no `Pipeline` wrapper.  The caller
+/// (`parse_pipeline`) collects stages and wraps them.
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // EOF with no token.
     if iter.peek_kind()?.is_none() {
@@ -637,17 +657,45 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Simple command: parse and wrap in a 1-element Pipeline (matching the
-    // oracle, where `parse_command_inner` always produces `Command::Pipeline`
-    // for simple commands via `parse_pipeline_with_first`).
-    let cmd = parse_simple(iter)?;
-    Ok(Command::Pipeline(Pipeline { negate: false, commands: vec![cmd] }))
+    // Simple command: parse and return BARE (not wrapped in Pipeline).
+    // `parse_pipeline` collects stages and wraps them.
+    parse_simple(iter)
 }
 
-/// Task 2: single command only; Task 5 adds `|` pipeline chaining.
+/// Parses a pipeline: an optional leading run of `!` words (odd count →
+/// negate), then simple-command stages joined by `|`.  Mirrors
+/// `parse_command` (bang handling) + `parse_pipeline_with_first` +
+/// `parse_next_stage` in `command.rs`.
+///
+/// Always returns `Command::Pipeline(…)` — even a single stage is
+/// wrapped, matching the oracle's behaviour for simple commands.
+fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // Count leading `!` words (each one flips the negate flag).
+    let mut bangs = 0usize;
+    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?; // consume `!`
+        bangs += 1;
+    }
+    let negate = bangs % 2 == 1;
+
+    // Parse the first stage.
+    let first = parse_command(iter)?;
+    let mut commands = vec![first];
+
+    // While a `|` follows, consume it, skip newlines, and parse the next stage.
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+        iter.next_kind()?; // consume `|`
+        skip_newlines(iter)?;
+        commands.push(parse_command(iter)?);
+    }
+
+    Ok(Command::Pipeline(Pipeline { negate, commands }))
+}
+
 /// Mirrors `parse_command_then_pipeline` in `command.rs`.
+/// Delegates to `parse_pipeline` (which handles `!` + `|` stages).
 fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
-    parse_command(iter)
+    parse_pipeline(iter)
 }
 
 /// Task 2: single command only; Task 6 adds `&&`/`||` connectors.
@@ -978,5 +1026,18 @@ mod tests {
     fn cmd_heredoc_deferred() {
         diff_unsupported("cat <<<word");
         // (heredoc body cases need a newline; keep to here-string for the dispatch test)
+    }
+
+    // T5 tests
+
+    #[test]
+    fn cmd_pipelines() {
+        diff_cmd("a | b");
+        diff_cmd("a | b | c");
+        diff_cmd("! a");
+        diff_cmd("! a | b");
+        diff_cmd("echo x | grep y | wc -l");
+        diff_cmd("A=1 cmd | other");
+        diff_cmd("cmd >o | other");
     }
 }
