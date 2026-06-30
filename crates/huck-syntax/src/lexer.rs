@@ -528,10 +528,10 @@ pub(crate) enum Mode {
     Subshell,       // ( … )
     CommandSub,     // $( … ) / `…`
     ParamExpansion { seen_name: bool }, // ${ … }
-    ParamWordOperand,
-    ParamSubstPatternOperand,
-    ParamSubstringOffsetOperand,
-    ParamSubscriptOperand,
+    ParamWordOperand            { in_dquote: bool },
+    ParamSubstPatternOperand    { in_dquote: bool },
+    ParamSubstringOffsetOperand { in_dquote: bool },
+    ParamSubscriptOperand       { in_dquote: bool },
     Arith,          // $(( … )) / (( … )) / $[ … ]
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
@@ -709,10 +709,10 @@ impl<'a> Lexer<'a> {
         match self.current_mode() {
             Mode::Command => self.scan_step_command(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
-            Mode::ParamWordOperand            => self.scan_step_param_operand(None,       '}'),
-            Mode::ParamSubstPatternOperand    => self.scan_step_param_operand(Some('/'),  '}'),
-            Mode::ParamSubstringOffsetOperand => self.scan_step_param_operand(Some(':'),  '}'),
-            Mode::ParamSubscriptOperand       => self.scan_step_param_operand(None,       ']'),
+            Mode::ParamWordOperand            { in_dquote } => self.scan_step_param_operand(None,      '}', in_dquote),
+            Mode::ParamSubstPatternOperand    { in_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote),
+            Mode::ParamSubstringOffsetOperand { in_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote),
+            Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1005,159 +1005,307 @@ impl<'a> Lexer<'a> {
     /// their content atoms into `self.history` in one call — avoids per-frame
     /// dquote state).  Mirrors `parse_braced_operand_opts` (lexer.rs ~3389) for
     /// char decisions but emits `TokenKind` atoms instead of building `WordPart`s.
-    fn scan_step_param_operand(&mut self, sep: Option<char>, end: char) -> Result<Step, LexError> {
+    /// Updates the `in_dquote` field of whichever operand `Mode` is currently on
+    /// the mode stack.  Called after all cursor borrows are released to avoid
+    /// borrow-checker conflicts (mirrors the `seen_name` write-back pattern from T2).
+    fn set_operand_in_dquote(&mut self, val: bool) {
+        match self.modes.last_mut() {
+            Some(
+                Mode::ParamWordOperand            { in_dquote }
+                | Mode::ParamSubstPatternOperand    { in_dquote }
+                | Mode::ParamSubstringOffsetOperand { in_dquote }
+                | Mode::ParamSubscriptOperand       { in_dquote },
+            ) => *in_dquote = val,
+            _ => {}
+        }
+    }
+
+    /// Emits ONE atom per call for a parameter operand.
+    ///
+    /// `sep`       — the optional intra-operand separator char (`/` or `:`), or `None`.
+    /// `end`       — the operand terminator: `}` for word/pattern/offset, `]` for subscript.
+    /// `in_dquote` — snapshot of this frame's `in_dquote` flag (copied from the mode
+    ///               variant by `scan_step`; written back via `set_operand_in_dquote`).
+    ///
+    /// **Flat, non-recursive tokenization of `"…"` spans:**
+    ///
+    /// When `in_dquote == false` and the next char is `"`, the opening `"` is consumed
+    /// and the FIRST interior atom is emitted in the SAME call (to guarantee forward
+    /// progress).  If the interior contains a `$`/backtick trigger or if the literal
+    /// run didn't reach the closing `"`, `in_dquote` is set to `true` in the mode
+    /// frame so subsequent calls scan the rest of the span.  A closing `"` while
+    /// `in_dquote == true` consumes it, flips the frame back to `false`, and returns
+    /// `Step::Produced` without a token (the cursor advanced — no spin).
+    ///
+    /// The critical invariant: inside a `"…"` span, `}`, `/`, `:`, etc. are treated
+    /// as ordinary literals and are NOT emitted as `ParamClose`/`ParamSep`.  Only
+    /// `"`, `$`, `` ` ``, and `\` are special.
+    fn scan_step_param_operand(&mut self, sep: Option<char>, end: char, in_dquote: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
         let l   = self.cursor.line();
         let c   = self.cursor.column();
 
-        match self.cursor.peek().copied() {
-            // EOF inside an operand — the enclosing ${…} is unterminated.
-            None => Err(LexError::UnterminatedBrace),
+        if in_dquote {
+            // ── Inside a double-quoted span ───────────────────────────────────
+            match self.cursor.peek().copied() {
+                None => return Err(LexError::UnterminatedQuote),
 
-            // Unquoted `end` char (`}` or `]`) — emit the matching close atom.
-            Some(ch) if ch == end => {
-                self.cursor.next();
-                let kind = if end == '}' { TokenKind::ParamClose } else { TokenKind::RBracket };
-                self.history.push(Token::new(kind, Span::new(off, l, c)));
-                Ok(Step::Produced)
-            }
+                // Closing `"` — flip frame back to unquoted; no token emitted this call.
+                // Returning `Step::Produced` is safe: the cursor advanced, so no spin.
+                Some('"') => {
+                    self.cursor.next();
+                    self.set_operand_in_dquote(false);
+                    return Ok(Step::Produced);
+                }
 
-            // Unquoted separator char (`/` or `:`) — emit ParamSep.
-            Some(ch) if Some(ch) == sep => {
-                self.cursor.next();
-                self.history.push(Token::new(TokenKind::ParamSep, Span::new(off, l, c)));
-                Ok(Step::Produced)
-            }
+                // Backslash: special only before `$`, `` ` ``, `"`, `\` inside `"…"`.
+                Some('\\') => {
+                    self.cursor.next(); // consume `\`
+                    match self.cursor.peek().copied() {
+                        Some(e @ ('$' | '`' | '"' | '\\')) => {
+                            self.cursor.next();
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: e.to_string(), quoted: true },
+                                Span::new(off, l, c),
+                            ));
+                        }
+                        _ => {
+                            let mut s = String::from("\\");
+                            if let Some(ch) = self.cursor.next() { s.push(ch); }
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: s, quoted: true },
+                                Span::new(off, l, c),
+                            ));
+                        }
+                    }
+                    return Ok(Step::Produced);
+                }
 
-            // `$` — decide based on the next char.
-            Some('$') => {
-                let mut probe = self.cursor.clone();
-                probe.next(); // skip `$`
-                match probe.peek().copied() {
-                    // `${` — emit ParamOpen; the parser pushes a nested ParamExpansion.
-                    Some('{') => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // `{`
-                        self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
-                        Ok(Step::Produced)
+                // Backtick command substitution.
+                Some('`') => {
+                    self.cursor.next();
+                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // `$` — nested expansion inside `"…"`.
+                Some('$') => {
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `$`
+                    match probe.peek().copied() {
+                        // `${` — emit ParamOpen; the parser pushes a nested ParamExpansion.
+                        // Our frame's `in_dquote=true` is preserved in `modes` and restored
+                        // after the parser pops the nested frame (mark/rewind is stack-safe).
+                        Some('{') => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `{`
+                            self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                        }
+                        Some('(') => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `(`
+                            self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        }
+                        Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // special char
+                            self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(off, l, c)));
+                        }
+                        Some(d) if d.is_ascii_digit() => {
+                            self.cursor.next(); // `$`
+                            let digit = self.cursor.next().unwrap();
+                            self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(off, l, c)));
+                        }
+                        Some(nc) if is_name_start(nc) => {
+                            self.cursor.next(); // `$`
+                            let name = scan_var_name(&mut self.cursor);
+                            self.history.push(Token::new(TokenKind::DollarName(name), Span::new(off, l, c)));
+                        }
+                        _ => {
+                            self.cursor.next(); // lone `$`
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: "$".into(), quoted: true },
+                                Span::new(off, l, c),
+                            ));
+                        }
                     }
-                    // `$(` — emit DeferredExpansion; v241 stops at the opener.
-                    Some('(') => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // `(`
-                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                        Ok(Step::Produced)
-                    }
-                    // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
-                    Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // special char
-                        self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(off, l, c)));
-                        Ok(Step::Produced)
-                    }
-                    // Positional parameter: `$0`–`$9`.
-                    Some(d) if d.is_ascii_digit() => {
-                        self.cursor.next(); // `$`
-                        let digit = self.cursor.next().unwrap();
-                        self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(off, l, c)));
-                        Ok(Step::Produced)
-                    }
-                    // Regular variable name: `$name`.
-                    Some(nc) if is_name_start(nc) => {
-                        self.cursor.next(); // `$`
-                        let name = scan_var_name(&mut self.cursor);
-                        self.history.push(Token::new(TokenKind::DollarName(name), Span::new(off, l, c)));
-                        Ok(Step::Produced)
-                    }
-                    // `$` not followed by anything special → treat as a literal `$`.
-                    _ => {
+                    return Ok(Step::Produced);
+                }
+
+                // Literal run inside `"…"`: `}`, `/`, `:`, `]` etc. are NOT terminators.
+                Some(_) => {
+                    let mut text = String::new();
+                    while let Some(&ch) = self.cursor.peek() {
+                        if matches!(ch, '"' | '$' | '`' | '\\') { break; }
+                        text.push(ch);
                         self.cursor.next();
-                        self.history.push(Token::new(
-                            TokenKind::Lit { text: "$".into(), quoted: false },
-                            Span::new(off, l, c),
-                        ));
-                        Ok(Step::Produced)
                     }
+                    // text is non-empty: the match arm fired on a non-special char.
+                    self.history.push(Token::new(
+                        TokenKind::Lit { text, quoted: true },
+                        Span::new(off, l, c),
+                    ));
+                    return Ok(Step::Produced);
                 }
             }
+        } else {
+            // ── Outside double-quoted span ────────────────────────────────────
+            match self.cursor.peek().copied() {
+                // EOF inside an operand — the enclosing `${…}` is unterminated.
+                None => return Err(LexError::UnterminatedBrace),
 
-            // Backtick command-substitution — emit DeferredExpansion, consume opener.
-            Some('`') => {
-                self.cursor.next();
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                Ok(Step::Produced)
-            }
-
-            // Single-quoted span: everything is literal (backslash is NOT special inside `'…'`).
-            Some('\'') => {
-                self.cursor.next(); // consume opening `'`
-                let mut text = String::new();
-                loop {
-                    match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
-                        Some('\'') => break,
-                        Some(ch) => text.push(ch),
-                    }
+                // Unquoted `end` char (`}` or `]`) — emit the matching close atom.
+                Some(ch) if ch == end => {
+                    self.cursor.next();
+                    let kind = if end == '}' { TokenKind::ParamClose } else { TokenKind::RBracket };
+                    self.history.push(Token::new(kind, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
                 }
-                self.history.push(Token::new(
-                    TokenKind::Lit { text, quoted: true },
-                    Span::new(off, l, c),
-                ));
-                Ok(Step::Produced)
-            }
 
-            // Double-quoted span: `$`/backtick are expansion triggers; everything else
-            // is a quoted literal.  Consume the ENTIRE `"…"` span in ONE `scan_step`
-            // call (emitting all inner atoms into `self.history`) to avoid needing any
-            // persistent per-frame dquote state.
-            //
-            // For `$(`, `${`, and `` ` `` inside `"…"`, we emit `DeferredExpansion`
-            // and break out of the inner loop (v241 stops there; the body content is
-            // left unconsumed and will be misread if scanning continues — acceptable
-            // since these modes are dormant in v241 production).
-            Some('"') => {
-                self.cursor.next(); // consume opening `"`
-                let hist_before = self.history.len();
-                'dquote: loop {
-                    let atom_off = self.cursor.offset();
-                    let atom_l   = self.cursor.line();
-                    let atom_c   = self.cursor.column();
+                // Unquoted separator char (`/` or `:`) — emit ParamSep.
+                Some(ch) if Some(ch) == sep => {
+                    self.cursor.next();
+                    self.history.push(Token::new(TokenKind::ParamSep, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // `$` — decide based on the next char.
+                Some('$') => {
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `$`
+                    match probe.peek().copied() {
+                        // `${` — emit ParamOpen; the parser pushes a nested ParamExpansion.
+                        Some('{') => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `{`
+                            self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                        }
+                        // `$(` — emit DeferredExpansion; v241 stops at the opener.
+                        Some('(') => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `(`
+                            self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        }
+                        // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
+                        Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // special char
+                            self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(off, l, c)));
+                        }
+                        // Positional parameter: `$0`–`$9`.
+                        Some(d) if d.is_ascii_digit() => {
+                            self.cursor.next(); // `$`
+                            let digit = self.cursor.next().unwrap();
+                            self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(off, l, c)));
+                        }
+                        // Regular variable name: `$name`.
+                        Some(nc) if is_name_start(nc) => {
+                            self.cursor.next(); // `$`
+                            let name = scan_var_name(&mut self.cursor);
+                            self.history.push(Token::new(TokenKind::DollarName(name), Span::new(off, l, c)));
+                        }
+                        // Lone `$` — literal.
+                        _ => {
+                            self.cursor.next();
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: "$".into(), quoted: false },
+                                Span::new(off, l, c),
+                            ));
+                        }
+                    }
+                    return Ok(Step::Produced);
+                }
+
+                // Backtick command-substitution — emit DeferredExpansion, consume opener.
+                Some('`') => {
+                    self.cursor.next();
+                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+
+                // Single-quoted span: everything literal (backslash NOT special inside `'…'`).
+                Some('\'') => {
+                    self.cursor.next(); // consume opening `'`
+                    let mut text = String::new();
+                    loop {
+                        match self.cursor.next() {
+                            None => return Err(LexError::UnterminatedQuote),
+                            Some('\'') => break,
+                            Some(ch) => text.push(ch),
+                        }
+                    }
+                    self.history.push(Token::new(
+                        TokenKind::Lit { text, quoted: true },
+                        Span::new(off, l, c),
+                    ));
+                    return Ok(Step::Produced);
+                }
+
+                // Opening `"` — begin a double-quoted span.
+                //
+                // To guarantee forward progress (emit at least one token per call),
+                // we consume the `"` and immediately scan the FIRST interior atom.
+                // The `in_dquote` frame flag is set to `true` only when more atoms
+                // remain inside the span (i.e. the literal run didn't reach the
+                // closing `"` in this same call, or the first interior char is a
+                // `$`/backtick trigger that the parser must handle before we see `"`).
+                Some('"') => {
+                    self.cursor.next(); // consume opening `"`
+                    let in_off = self.cursor.offset();
+                    let in_l   = self.cursor.line();
+                    let in_c   = self.cursor.column();
                     match self.cursor.peek().copied() {
                         None => return Err(LexError::UnterminatedQuote),
+
+                        // Empty `""` — emit empty quoted Lit (preserves `""` = empty-string
+                        // semantics); in_dquote stays false.
                         Some('"') => {
-                            self.cursor.next(); // closing `"`
-                            break 'dquote;
+                            self.cursor.next(); // consume closing `"`
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: String::new(), quoted: true },
+                                Span::new(in_off, in_l, in_c),
+                            ));
+                            return Ok(Step::Produced);
                         }
+
+                        // Backslash as the first char inside `"…"`.
                         Some('\\') => {
                             self.cursor.next(); // consume `\`
-                            // Inside `"…"`, backslash is special only before `$ ` " \`.
                             match self.cursor.peek().copied() {
                                 Some(e @ ('$' | '`' | '"' | '\\')) => {
                                     self.cursor.next();
                                     self.history.push(Token::new(
                                         TokenKind::Lit { text: e.to_string(), quoted: true },
-                                        Span::new(atom_off, atom_l, atom_c),
+                                        Span::new(in_off, in_l, in_c),
                                     ));
                                 }
                                 _ => {
-                                    // Non-special `\x` — keep both chars as a literal run.
                                     let mut s = String::from("\\");
                                     if let Some(ch) = self.cursor.next() { s.push(ch); }
                                     self.history.push(Token::new(
                                         TokenKind::Lit { text: s, quoted: true },
-                                        Span::new(atom_off, atom_l, atom_c),
+                                        Span::new(in_off, in_l, in_c),
                                     ));
                                 }
                             }
+                            // We don't know if we've reached the closing `"` yet;
+                            // set in_dquote=true so subsequent calls stay inside the span.
+                            self.set_operand_in_dquote(true);
+                            return Ok(Step::Produced);
                         }
+
+                        // Backtick as the first char inside `"…"`.
                         Some('`') => {
                             self.cursor.next();
                             self.history.push(Token::new(
                                 TokenKind::DeferredExpansion,
-                                Span::new(atom_off, atom_l, atom_c),
+                                Span::new(in_off, in_l, in_c),
                             ));
-                            break 'dquote; // can't consume the backtick body inline
+                            self.set_operand_in_dquote(true);
+                            return Ok(Step::Produced);
                         }
+
+                        // `$` as the first char inside `"…"`.
                         Some('$') => {
                             let mut probe = self.cursor.clone();
                             probe.next(); // skip `$`
@@ -1165,114 +1313,108 @@ impl<'a> Lexer<'a> {
                                 Some('{') => {
                                     self.cursor.next(); // `$`
                                     self.cursor.next(); // `{`
-                                    self.history.push(Token::new(
-                                        TokenKind::DeferredExpansion,
-                                        Span::new(atom_off, atom_l, atom_c),
-                                    ));
-                                    break 'dquote; // can't recurse into ${} mid-span
+                                    // Emit ParamOpen; in_dquote=true survives the nested
+                                    // ParamExpansion push/pop because it lives in our frame.
+                                    self.history.push(Token::new(TokenKind::ParamOpen, Span::new(in_off, in_l, in_c)));
+                                    self.set_operand_in_dquote(true);
                                 }
                                 Some('(') => {
                                     self.cursor.next(); // `$`
                                     self.cursor.next(); // `(`
-                                    self.history.push(Token::new(
-                                        TokenKind::DeferredExpansion,
-                                        Span::new(atom_off, atom_l, atom_c),
-                                    ));
-                                    break 'dquote; // can't consume $() body inline
+                                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(in_off, in_l, in_c)));
+                                    self.set_operand_in_dquote(true);
                                 }
                                 Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                                     self.cursor.next(); // `$`
-                                    self.cursor.next(); // special
-                                    self.history.push(Token::new(
-                                        TokenKind::DollarName(sp.to_string()),
-                                        Span::new(atom_off, atom_l, atom_c),
-                                    ));
+                                    self.cursor.next(); // special char
+                                    self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(in_off, in_l, in_c)));
+                                    self.set_operand_in_dquote(true);
                                 }
                                 Some(d) if d.is_ascii_digit() => {
                                     self.cursor.next(); // `$`
-                                    let d = self.cursor.next().unwrap();
-                                    self.history.push(Token::new(
-                                        TokenKind::DollarName(d.to_string()),
-                                        Span::new(atom_off, atom_l, atom_c),
-                                    ));
+                                    let digit = self.cursor.next().unwrap();
+                                    self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(in_off, in_l, in_c)));
+                                    self.set_operand_in_dquote(true);
                                 }
                                 Some(nc) if is_name_start(nc) => {
                                     self.cursor.next(); // `$`
                                     let name = scan_var_name(&mut self.cursor);
-                                    self.history.push(Token::new(
-                                        TokenKind::DollarName(name),
-                                        Span::new(atom_off, atom_l, atom_c),
-                                    ));
+                                    self.history.push(Token::new(TokenKind::DollarName(name), Span::new(in_off, in_l, in_c)));
+                                    self.set_operand_in_dquote(true);
                                 }
                                 _ => {
-                                    // bare `$` inside `"…"` → literal
-                                    self.cursor.next();
+                                    self.cursor.next(); // lone `$`
                                     self.history.push(Token::new(
                                         TokenKind::Lit { text: "$".into(), quoted: true },
-                                        Span::new(atom_off, atom_l, atom_c),
+                                        Span::new(in_off, in_l, in_c),
                                     ));
+                                    self.set_operand_in_dquote(true);
                                 }
                             }
+                            return Ok(Step::Produced);
                         }
+
+                        // Literal run as the first content inside `"…"`.
+                        // Stop at the next `"`, `$`, `` ` ``, or `\`.
+                        // If the run ends at the closing `"`, consume it in this same call
+                        // (avoids an extra round-trip for the common `"plain text"` case).
                         Some(_) => {
-                            // Accumulate a maximal literal run (stops at the next special char).
                             let mut text = String::new();
                             while let Some(&ch) = self.cursor.peek() {
-                                if matches!(ch, '"' | '\\' | '$' | '`') { break; }
+                                if matches!(ch, '"' | '$' | '`' | '\\') { break; }
                                 text.push(ch);
                                 self.cursor.next();
                             }
-                            if !text.is_empty() {
-                                self.history.push(Token::new(
-                                    TokenKind::Lit { text, quoted: true },
-                                    Span::new(atom_off, atom_l, atom_c),
-                                ));
+                            // text is non-empty: the match arm matched a non-special char.
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text, quoted: true },
+                                Span::new(in_off, in_l, in_c),
+                            ));
+                            // If we stopped exactly at the closing `"`, consume it here so
+                            // in_dquote stays false; otherwise set in_dquote=true.
+                            if self.cursor.peek() == Some(&'"') {
+                                self.cursor.next(); // consume closing `"`
+                                // in_dquote stays false — no frame update needed
+                            } else {
+                                self.set_operand_in_dquote(true);
                             }
+                            return Ok(Step::Produced);
                         }
                     }
                 }
-                // If the span was empty (e.g. `""`), ensure at least one atom is queued
-                // so `next_token` doesn't loop forever on `Step::Produced`.
-                if self.history.len() == hist_before {
+
+                // Backslash escape outside `"…"`: the next char is always literal
+                // (mirrors `parse_braced_operand_opts` for the unquoted path).
+                Some('\\') => {
+                    self.cursor.next(); // consume `\`
+                    let text = match self.cursor.next() {
+                        Some(ch) => ch.to_string(),
+                        None     => "\\".to_string(), // trailing `\` at EOF — keep as literal
+                    };
                     self.history.push(Token::new(
-                        TokenKind::Lit { text: String::new(), quoted: true },
+                        TokenKind::Lit { text, quoted: true },
                         Span::new(off, l, c),
                     ));
+                    return Ok(Step::Produced);
                 }
-                Ok(Step::Produced)
-            }
 
-            // Backslash escape outside `"…"`: next char is always literal, regardless
-            // of what it is (mirrors `parse_braced_operand_opts` for the unquoted path).
-            Some('\\') => {
-                self.cursor.next(); // consume `\`
-                let text = match self.cursor.next() {
-                    Some(ch) => ch.to_string(),
-                    None     => "\\".to_string(), // trailing `\` at EOF — keep as literal
-                };
-                self.history.push(Token::new(
-                    TokenKind::Lit { text, quoted: true },
-                    Span::new(off, l, c),
-                ));
-                Ok(Step::Produced)
-            }
-
-            // Unquoted literal run: accumulate until the next special char or terminator.
-            Some(_) => {
-                let mut text = String::new();
-                while let Some(&ch) = self.cursor.peek() {
-                    let is_term = ch == end || Some(ch) == sep;
-                    if is_term || matches!(ch, '$' | '\'' | '"' | '\\' | '`') { break; }
-                    text.push(ch);
-                    self.cursor.next();
+                // Unquoted literal run: accumulate until the next special char or terminator.
+                Some(_) => {
+                    let mut text = String::new();
+                    while let Some(&ch) = self.cursor.peek() {
+                        let is_term = ch == end || Some(ch) == sep;
+                        if is_term || matches!(ch, '$' | '\'' | '"' | '\\' | '`') { break; }
+                        text.push(ch);
+                        self.cursor.next();
+                    }
+                    // `text` is non-empty: the outer match arm matched `Some(_)` (a non-special
+                    // char) so we consumed at least one char into the run above.
+                    self.history.push(Token::new(
+                        TokenKind::Lit { text, quoted: false },
+                        Span::new(off, l, c),
+                    ));
+                    return Ok(Step::Produced);
                 }
-                // `text` is non-empty: the outer match arm matched `Some(_)` (a non-special
-                // char) so we consumed at least one char into the run above.
-                self.history.push(Token::new(
-                    TokenKind::Lit { text, quoted: false },
-                    Span::new(off, l, c),
-                ));
-                Ok(Step::Produced)
             }
         }
     }
@@ -9596,7 +9738,7 @@ mod tests {
     #[test]
     fn operand_plain_literal() {
         assert_eq!(
-            operand_atoms("foo}", Mode::ParamWordOperand),
+            operand_atoms("foo}", Mode::ParamWordOperand { in_dquote: false }),
             vec![
                 TokenKind::Lit { text: "foo".into(), quoted: false },
                 TokenKind::ParamClose,
@@ -9608,19 +9750,19 @@ mod tests {
     fn operand_var_and_nested() {
         // Plain `$a` followed by terminator.
         assert_eq!(
-            operand_atoms("$a}", Mode::ParamWordOperand),
+            operand_atoms("$a}", Mode::ParamWordOperand { in_dquote: false }),
             vec![TokenKind::DollarName("a".into()), TokenKind::ParamClose]
         );
         // Nested `${b}` — the parser would push ParamExpansion mode on ParamOpen;
         // in this standalone test the first atom is ParamOpen and that is sufficient.
-        let nested = operand_atoms("${b}}", Mode::ParamWordOperand);
+        let nested = operand_atoms("${b}}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(nested[0], TokenKind::ParamOpen);
     }
 
     #[test]
     fn operand_subst_separator() {
         assert_eq!(
-            operand_atoms("pat/", Mode::ParamSubstPatternOperand),
+            operand_atoms("pat/", Mode::ParamSubstPatternOperand { in_dquote: false }),
             vec![
                 TokenKind::Lit { text: "pat".into(), quoted: false },
                 TokenKind::ParamSep,
@@ -9631,7 +9773,7 @@ mod tests {
     #[test]
     fn operand_substring_separator() {
         assert_eq!(
-            operand_atoms("1:", Mode::ParamSubstringOffsetOperand),
+            operand_atoms("1:", Mode::ParamSubstringOffsetOperand { in_dquote: false }),
             vec![
                 TokenKind::Lit { text: "1".into(), quoted: false },
                 TokenKind::ParamSep,
@@ -9641,18 +9783,60 @@ mod tests {
 
     #[test]
     fn operand_deferred_cmdsub() {
-        let a = operand_atoms("$(x)}", Mode::ParamWordOperand);
+        let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(a[0], TokenKind::DeferredExpansion);
     }
 
     #[test]
     fn operand_subscript_close() {
         assert_eq!(
-            operand_atoms("3]", Mode::ParamSubscriptOperand),
+            operand_atoms("3]", Mode::ParamSubscriptOperand { in_dquote: false }),
             vec![
                 TokenKind::Lit { text: "3".into(), quoted: false },
                 TokenKind::RBracket,
             ]
+        );
+    }
+
+    #[test]
+    fn operand_dquote_simple_is_one_lit() {
+        // `"a}b"` — no expansion: ONE quoted Lit (the `}` is literal because it's
+        // inside `"…"`), then ParamClose.
+        let a = operand_atoms("\"a}b\"}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(
+            a,
+            vec![
+                TokenKind::Lit { text: "a}b".into(), quoted: true },
+                TokenKind::ParamClose,
+            ]
+        );
+    }
+
+    #[test]
+    fn operand_dquote_with_nested_expansion_splits() {
+        // `"a${y}b"` — split into a quoted Lit for `a`, then ParamOpen (NOT
+        // DeferredExpansion).  The parser would push ParamExpansion on ParamOpen;
+        // this test confirms the lexer emits the correct flat tokens.
+        let mut lx = Lexer::new("\"a${y}b\"}", LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::Lit { text: "a".into(), quoted: true }
+        );
+        assert_eq!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::ParamOpen
+        );
+    }
+
+    #[test]
+    fn operand_dquote_var_inside() {
+        // `"$a"` — a DollarName token, not a DeferredExpansion.
+        let mut lx = Lexer::new("\"$a\"}", LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(
+            lx.next_token().unwrap().unwrap().kind,
+            TokenKind::DollarName("a".into())
         );
     }
 }

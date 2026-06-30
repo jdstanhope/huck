@@ -31,7 +31,7 @@ mod tests {
         let _ = TokenKind::ParamOpen;
         let _ = TokenKind::Lit { text: "x".into(), quoted: false };
         let _ = ParamOpKind::Substitute(SubstKind::All);
-        let _ = Mode::ParamWordOperand;
+        let _ = Mode::ParamWordOperand { in_dquote: false };
         let _ = crate::command::ParseError::UnsupportedExpansion;
     }
 }
