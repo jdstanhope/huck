@@ -131,79 +131,82 @@ Binding on every iteration in this roadmap:
   `Sequence`, `ParamModifier`, etc.). An iteration that must change an AST shape
   flags it explicitly and updates every consumer (`expand.rs`, `generate.rs`,
   `executor.rs`, `procsub.rs`) in the same change.
-- **No new lexer→parser edges.** The existing one is removed in v241; until
-  then the `ParseError::Lex(Box<LexError>)` stopgap stays.
+- **No new lexer→parser edges.** The existing one is removed in the Stage-2
+  parser rewrite; until then the `ParseError::Lex(Box<LexError>)` stopgap stays.
 - Each iteration is **independently shippable and reviewed** (subagent-driven
   development), and merges only when the oracle is green.
 
-## 5. Iteration sequence
+## 5. Implementation strategy & iteration sequence
 
-Ordering decision (approved): build the **mode stack + mark/rewind machinery
-first** (no behavior change), then make the parser drive it — so comsub/subshell
-go straight to inline parsing with no throwaway intermediate.
+**Approved strategy (2026-06-30): build and fully validate the stacked lexer
+FIRST, driven by tests that simulate the parser; THEN rewrite the parser in one
+pass to drive it and delete the old scanners.** Rationale: shell grammar nests
+arbitrarily (anything under anything), so the parser migration does NOT decompose
+cleanly by expansion type — but the lexer can be proven correct independently,
+and the parser-simulating tests become the executable specification the parser
+rewrite follows.
 
-### v240 — Internal mode stack + `mark`/`rewind`-with-cursor-reset
-**Scope:** Refactor the ~10 ad-hoc `Lexer` flags (`has_token`,
-`in_assignment_value`, `dbracket_depth`, `expect_regex`, `brace_expand`, the
-three dquote representations `quoted`/`enclosing_dquote`/`opts.in_dquote`,
-`alias_trailing_eligible`) into a `modes: Vec<Mode>` stack with per-mode scan
-logic, and implement `mark()` / `rewind(mark)` with `CharCursor` byte-offset
-reset + history truncation.
-**Behavior:** none changes — modes are INTERNAL, the parser is uninvolved, the
-public API still hands the parser a token stream that produces identical
-`Word`s. This is pure scaffolding, but it is where the rewind-and-re-lex
-capability (the `((` enabler) is born and unit-tested in isolation.
-**Risk:** high-care (touches the whole lexer) but de-risked by being
-behavior-preserving with the full byte-identical oracle.
-**Done when:** flags are gone, the mode stack drives `scan_step`, `mark`/`rewind`
-have direct unit tests (including a re-lex-under-different-mode test), suite +
-harnesses byte-identical.
+### Stage 1 — build the stacked lexer (additive, DORMANT in production)
 
-### v241 — Parser drives comsub / subshell inline (removes the edge, drops the Box)
-**Scope:** The lexer emits opener tokens for `$(` / `` ` `` / subshell `(`; the
-parser pushes `CommandSub` / `Subshell` mode and parses the body **inline as a
-command list**, assembling `WordPart::CommandSub` / `ProcessSub` / a subshell
-command itself. Delete `parse_substitution_body` and `scan_paren_substitution` /
-`scan_backtick_substitution`'s parser call; remove `LexError::SubstitutionParseError`
-(and `LexError::Substitution`); un-box `ParseError::Lex`.
-**Behavior:** byte-identical (same `Sequence` built, now by the parser).
-**Risk:** medium — the first real parser-driven Word assembly; must handle
-comsub embedded mid-word (`a$(b)c`), inside `"…"`, in regex/extglob operands,
-and the `case…esac`-aware `)` boundary that `scan_cmdsub_body` tracks today.
-**Done when:** the lexer no longer references `command::parse`; `Box` gone;
-suite + harnesses green.
+Add, *alongside* the existing batch `Word` path (not replacing it):
+- the `modes: Vec<Mode>` stack + `mark`/`rewind`-with-cursor-reset (§3.3);
+- new `TokenKind` variants for word-part-level tokens (expansion
+  openers/closers and pieces), **additive to the current `Word(Word)` token and
+  not in conflict** with the existing Word/WordPart AST;
+- per-mode "scan one token" logic for each mode in the set (§3.1).
 
-### v242 — `Arith` mode + the `((` disambiguation
-**Scope:** `$((` / `((` / `$[` lex under `Arith` mode; the parser parses the
-arithmetic body (today's `ArithBlock` + `arith_string_to_word` folds into this).
-Implement the `((` arith-vs-nested-subshell resolution via the §3.3
-checkpoint/rewind path.
-**Risk:** medium — the rewind path is exercised for real here; nested `$( )` /
-`${ }` inside arith must compose.
-**Done when:** `((3+3))` and `( (a); b )` both byte-identical; arith no longer a
-deferred raw string.
+Each new mode is **dormant in production**: the parser does not push it yet, so
+the default `Command` path still produces the exact old `Word` tokens. Therefore
+**every Stage-1 iteration is byte-identical** (the full oracle stays green; the
+new code is exercised only by unit tests). Validation is **parser-simulating
+tests** — tests that push/pop modes and pull tokens, asserting the token stream
+for deeply nested structures: `$( ${x:-$(…)} )`, `$(( (a) + $b ))`,
+`${x/$(…)/$y}`, comsub inside `"…"`, the `((`-vs-`( ( )` ambiguity via
+mark/rewind, heredocs. These tests are the worked examples Stage 2 implements
+against.
 
-### v243+ — `ParamExpansion` mode: collapse the 6 drifted `${}` scanners
-**Scope:** `${…}` lexes under one `ParamExpansion` mode, assembled by the parser,
-replacing `scan_braced_param_expansion` / `scan_braced_operand` /
-`scan_braced_name` / `scan_braced_name_ext` / `scan_braced_skip` /
-`scan_substitution_operand` and the three dquote flags. Retires the v233–235
-bug-chain subsystem and the open items in `huck-param-expansion-debt`.
-**Risk:** highest correctness risk in the roadmap (the most bug-prone area);
-**likely several sub-iterations** (e.g. name/subscript first, then each modifier
-family). Each sub-iteration byte-identical.
-**Done when:** one brace scanner remains; the param-expansion error-model
-backlog (`${#$'x1'}`, `${x@QQ}`, `${x[i}`) is revisited under the unified path.
+Indicative iterations (each adds modes + parser-simulating tests; dormant /
+byte-identical):
+- **v240** — mode-stack infrastructure + `mark`/`rewind`-with-cursor-reset + the
+  new word-part `TokenKind`s; first modes proven by tests: the `Command` mode
+  (the ~10 ad-hoc flags — `has_token`, `in_assignment_value`, `dbracket_depth`,
+  `expect_regex`, `brace_expand`, the three dquote reps, `alias_trailing_eligible`
+  — re-expressed as mode state) and `Subshell`.
+- **v241+** — one or two modes per iteration with parser-simulating tests:
+  `CommandSub`/backtick, `Arith` (incl. the `((` mark/rewind disambiguation),
+  `ParamExpansion` (the single collapsed brace scanner replacing the 6 drifted
+  ones), `ArrayLiteral`, `DoubleBracket`/`Regex`, `HeredocBody`. Stage 1 ends
+  when the stacked lexer can produce every nesting structure under test.
 
-### v24x — Finalize separation (residual parser-AST type deps)
-**Scope:** Remove the lexer's remaining compile-time dependencies on parser AST
-types where they no longer belong (e.g. relocate shared AST, or make
-`CommandSub`/`ProcessSub` carry a parser-built type without the lexer naming it).
-Achieve true module separation: `huck-syntax`'s lexer no longer depends on its
-parser.
-**Risk:** low–medium, mechanical once assembly has moved.
-**Done when:** the lexer compiles without referencing `command::` parser types
-(beyond shared leaf types intentionally kept).
+### Stage 2 — rewrite the parser onto the stacked lexer (one pass) + delete old scanners
+
+- Rewrite the parser to assemble Words / comsub / arith / subshells / params by
+  **driving the stacked lexer** (push/pop modes, mark/rewind), using the Stage-1
+  parser-simulating tests as the worked examples. Comsub/subshell bodies become
+  inline command-list parses. Remove `parse_substitution_body` and the
+  lexer→parser edge; remove `LexError::SubstitutionParseError` /
+  `LexError::Substitution`; **un-box `ParseError::Lex`**.
+- **De-risk the one-shot switch with differential testing**: keep the old
+  fat-lexer+parser path available behind a flag during the transition and assert
+  **old AST == new AST** across the entire `*_diff_check.sh` corpus (plus a fuzz
+  pass) *before* deleting the old code. The parser-simulating tests prove the
+  lexer; the differential gate proves the parser rewrite; together they make the
+  big-bang switch safe.
+- Once green, **delete the old scanners** (`scan_braced_*`, the substitution
+  scanners, `scan_array_literal`/`scan_regex_operand`/`scan_extglob_group` and
+  the other context scanners the modes subsume) and the dormant-path scaffolding.
+
+This stage is necessarily large (the parser rewrite is monolithic — see
+rationale), but it is bounded: it ships only when the differential gate and the
+full oracle are green, and it is the ONLY non-byte-identical-by-construction step
+(it is made safe by construction instead).
+
+### Stage 3 — finalize separation (residual parser-AST type deps)
+Remove the lexer's remaining compile-time dependencies on parser AST types
+(`CommandSub`/`ProcessSub` carrying `Sequence`, `AssignTarget`, `RedirFd`,
+`ParseError`) — relocate shared AST or introduce a lexer-local body type the
+parser finalizes — so `huck-syntax`'s lexer no longer depends on its parser.
+Mechanical once assembly has moved.
 
 ## 6. Open design questions (resolve in the iteration that hits each)
 
@@ -211,8 +214,8 @@ parser.
   *deferred* (collected after the redirect line's newline). How the
   `HeredocBody` mode interacts with the pull + mark/rewind model — when bodies
   are scanned, how back-patching works without a batch pass — is unresolved.
-  Tackled when heredocs move into the mode stack (not v240–v242). Until then the
-  current `collect_heredoc_bodies` back-patch is preserved unchanged.
+  Tackled in the Stage-1 `HeredocBody` mode iteration. Until then the current
+  `collect_heredoc_bodies` back-patch is preserved unchanged.
 - **Exact `mark`/`rewind` flush semantics across push/pop.** Rule of thumb:
   pushing/popping a mode invalidates buffered lookahead produced under a
   different mode. Pin the precise rule (and interaction with heredoc deferral)
@@ -222,9 +225,12 @@ parser.
 - **Speculative constructs beyond `((`.** `case` pattern lists, `for`/`select`
   headers, and function-def `NAME()` detection: confirm whether each needs a
   mode, a mark/rewind speculation, or stays in `Command` mode. Inventory before
-  v242/v243.
-- **Residual type deps strategy** (v24x): relocate shared AST vs. introduce a
+  the Arith / ParamExpansion mode iterations.
+- **Residual type deps strategy** (Stage 3): relocate shared AST vs. introduce a
   lexer-local body type the parser finalizes.
+- **Differential-testing harness (Stage 2).** How the old and new
+  lexer+parser paths coexist behind a flag, and what the AST-equality comparison
+  + fuzz corpus look like — designed at the start of Stage 2.
 
 ## 7. Appendix — current-state inventory (audit 2026-06-30)
 
