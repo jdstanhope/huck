@@ -126,12 +126,19 @@ parser-controlled mode stack + rewind replace the ad-hoc flags, and command
 substitution stops re-lexing recursively (the parser just pushes a CommandSub
 mode). True lexer/parser separation lands here.
 
-**Phase C (eventual, maybe) — lift expansion structure to the parser.** Today a
-`"foo${x}bar"` is ONE Word token carrying `WordPart`s; the `${…}`/`$((…))`/`$(…)`
-sub-structure is built by scanners inside the Word. A later phase could make the
-parser see expansion structure as real tokens (full separation). Open whether
-this is worth it — the Word/WordPart model is reasonable and Phase C is the
-biggest change. Deferred; not required for A or B.
+**Phase C — lift expansion structure to the parser (COMMITTED, parser-driven).**
+Today a `"foo${x}bar"` is ONE Word token carrying `WordPart`s; the
+`${…}`/`$((…))`/`$(…)` sub-structure is built by scanners inside the Word. Phase C
+inverts this: the PARSER builds words / comsub / arith / subshells and *informs
+the lexer* which tokenization mode to apply per region (the Section 2/3 mode
+stack), with a `mark`/`rewind`-and-re-lex capability for ambiguous openers like
+`((` (arith-command vs. nested subshell). The direction is settled (no longer
+"eventual, maybe") and the full multi-iteration roadmap — end-state, mode set,
+the `((` checkpoint/rewind mechanism, the ordered iteration sequence (mode stack
++ mark/rewind first → parser-driven comsub/subshell → arith → `${}` scanner
+collapse → finalize), invariants, and open questions — lives in
+**`2026-06-30-phase-c-parser-driven-frontend-roadmap.md`**. See also memory
+`huck-frontend-parser-driven-direction`.
 
 **Dependency-direction debt (surfaced by v239, fix in a later round).** Because
 `parse_substitution_body` lives in `lexer.rs` and calls `command::parse`, the
