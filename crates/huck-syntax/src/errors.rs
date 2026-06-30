@@ -61,7 +61,10 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         ParseError::ArithForHeader(msg) => {
             format!("'for ((...))' header: {msg}")
         }
-        ParseError::Lex(e) => crate::lex_error_message(e),
+        ParseError::Lex(e) => {
+            let s = crate::lex_error_message(e);
+            s.strip_prefix(": ").map(|t| t.to_string()).unwrap_or(s)
+        }
     }
 }
 
@@ -128,6 +131,21 @@ mod tests {
     fn parse_error_display_equals_free_function() {
         let err = ParseError::MissingCommand;
         assert_eq!(format!("{err}"), parse_error_message(&err));
+    }
+
+    #[test]
+    fn parse_error_lex_strips_leading_colon_space() {
+        // LexError::UnterminatedQuote renders as ": unterminated quote" via
+        // lex_error_message. When wrapped in ParseError::Lex, parse_error_message
+        // must strip the leading ": " so callers using "huck: syntax error: {}"
+        // produce a single separator, not a double one.
+        let err = ParseError::Lex(Box::new(LexError::UnterminatedQuote));
+        let msg = parse_error_message(&err);
+        assert!(
+            !msg.starts_with(": "),
+            "parse_error_message for ParseError::Lex should NOT start with \": \", got: {msg:?}"
+        );
+        assert_eq!(msg, "unterminated quote");
     }
 
     #[test]
