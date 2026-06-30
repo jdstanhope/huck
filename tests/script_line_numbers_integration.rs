@@ -49,3 +49,37 @@ fn multiline_construct_points_at_first_line() {
     assert!(se.contains("syntax error"), "stderr: {se:?}");
     assert!(se.contains("line 2:"), "expected first-line 'line 2:', got: {se:?}");
 }
+
+// --- v239 regression guards: a lex error that begins a unit in the live source
+// loop must be REPORTED (not silently swallowed) and at the failing token's
+// physical line, not the cursor's post-scan EOF line. ---
+
+#[test]
+fn lex_error_as_only_unit_is_reported_line_one() {
+    // Whole script is a single unterminated-quote token (no prior unit): the
+    // newline-skip peek hits the lex error first. Must report, not stay silent.
+    let (_o, se, c) = run_script("'unterminated\n");
+    assert!(se.contains("syntax error"), "lex error must be reported: {se:?}");
+    assert!(se.contains("line 1:"), "expected 'line 1:', got: {se:?}");
+    assert_eq!(c, 2, "exit code should be 2, got {c}");
+}
+
+#[test]
+fn lex_error_as_first_token_of_second_unit_reports_its_line() {
+    // A clean unit, then a unit beginning with an unterminated quote. The error
+    // surfaces via the post-unit boundary peek; it must report line 2 (the token's
+    // start), not line 3 (where the failed scan ran the cursor to EOF).
+    let (so, se, c) = run_script("echo ok\n'unterminated\n");
+    assert!(so.contains("ok"), "first unit should run: {so:?}");
+    assert!(se.contains("syntax error"), "lex error must be reported: {se:?}");
+    assert!(se.contains("line 2:"), "expected 'line 2:', got: {se:?}");
+    assert_eq!(c, 2, "exit code should be 2, got {c}");
+}
+
+#[test]
+fn lex_error_after_blank_line_counts_the_blank() {
+    // The blank line must be counted in the physical line: error on line 3.
+    let (_o, se, _c) = run_script("echo a\n\n'bad\n");
+    assert!(se.contains("syntax error"), "stderr: {se:?}");
+    assert!(se.contains("line 3:"), "expected 'line 3:', got: {se:?}");
+}

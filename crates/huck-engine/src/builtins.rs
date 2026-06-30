@@ -6339,10 +6339,45 @@ pub(crate) fn run_sourced_contents_in_sinks(
         let sentinel = contents.len() - start;
 
         loop {
-            while matches!(iter.peek_kind().ok().flatten(), Some(crate::lexer::TokenKind::Newline)) {
-                let _ = iter.next_kind();
+            // Skip blank lines between units. A lex error while peeking here means
+            // the NEXT unit begins with an invalid/unterminated token (e.g. an
+            // unterminated quote as the first token). The old tokenize_partial path
+            // surfaced this via its `total == 0 && terr.is_some()` guard; the live
+            // pull must do the same or the error is silently dropped (the failed
+            // scan runs the cursor to EOF and leaves the lexer with a half-built
+            // token that would otherwise be emitted as a spurious empty Word).
+            // `cursor_pos()` captured BEFORE the erroring peek is the failing
+            // token's start offset (the pull is lazy: when fill_to must scan, the
+            // cursor sits at the next token's start), giving the correct error line.
+            loop {
+                let tok_off = iter.cursor_pos();
+                match iter.peek_kind() {
+                    Ok(Some(crate::lexer::TokenKind::Newline)) => {
+                        let _ = iter.next_kind();
+                    }
+                    Ok(_) => break,
+                    Err(le) => {
+                        {
+                            let mut err = crate::executor::err_writer(err_sink, sink);
+                            e!(&mut *err,
+                                "huck: {}: line {}: syntax error: {}",
+                                path.display(),
+                                line_of(start + tok_off),
+                                crate::parse_error_message(
+                                    &crate::command::ParseError::Lex(Box::new(le))
+                                )
+                            );
+                        }
+                        last_status = 2;
+                        start = next_line_start(start + tok_off);
+                        prev_end = start;
+                        continue 'outer;
+                    }
+                }
             }
             // Byte offset of this unit's first token, read straight from its span.
+            // peek_span cannot error here: the newline-skip above broke on an Ok
+            // peek of this same token, so it is already scanned into history.
             let unit_start_off = iter.peek_span().ok().flatten().map(|sp| sp.offset).unwrap_or(sentinel);
             match crate::command::parse_one_unit(&mut iter) {
                 Ok(None) => {
@@ -6359,6 +6394,12 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     // failed peek already advanced the cursor to EOF, so a
                     // subsequent peek_kind returns Ok(None) and the error would
                     // otherwise be silently swallowed.
+                    // Cursor position BEFORE the peek: if peek_span has to scan and
+                    // the next token errors, this is that token's start offset (the
+                    // pull is lazy, so the cursor sits at the next token's start).
+                    // The failed scan then runs the cursor to EOF, so we must capture
+                    // the start here to report the error at the correct line.
+                    let tok_off_before = iter.cursor_pos();
                     let (unit_end_off, pending_lex_err) = match iter.peek_span() {
                         Ok(Some(sp)) => (sp.offset, None),
                         Ok(None) => (sentinel, None),
@@ -6366,7 +6407,10 @@ pub(crate) fn run_sourced_contents_in_sinks(
                             let err_abs = (start + iter.cursor_pos()).min(contents.len());
                             let line_start_abs =
                                 contents[..err_abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                            (line_start_abs.saturating_sub(start), Some(le))
+                            // unit_end (boundary for span / extglob-flip restart) =
+                            // start of the failing line; carry the token-start offset
+                            // separately for the error report + skip-restart.
+                            (line_start_abs.saturating_sub(start), Some((le, tok_off_before)))
                         }
                     };
                     let unit_start_abs = start + unit_start_off;
@@ -6419,13 +6463,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     let new_expand = shell.is_interactive
                         || shell.shopt_options.get("expand_aliases").unwrap_or(false);
                     if new_extglob != extglob || new_expand != expand {
-                        start = unit_end_abs;
-                        prev_end = start;
-                        continue 'outer;
                         // pending_lex_err is intentionally discarded here: a
                         // settings flip (extglob / expand_aliases) triggers a
                         // full re-lex of the remainder with updated options, so
                         // the failing token will be re-evaluated there.
+                        start = unit_end_abs;
+                        prev_end = start;
+                        continue 'outer;
                     }
 
                     // The token immediately after this unit triggered a lex error
@@ -6433,21 +6477,22 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     // scan advanced the cursor to EOF, so a subsequent peek_kind
                     // would return Ok(None) and the error would never reach
                     // parse_one_unit. Report it now and restart from the next line.
-                    if let Some(le) = pending_lex_err {
-                        let foff = iter.cursor_pos();
+                    if let Some((le, tok_off)) = pending_lex_err {
+                        // Report at the failing token's START line (not the cursor's
+                        // post-scan EOF position), and restart just past that line.
                         {
                             let mut err = crate::executor::err_writer(err_sink, sink);
                             e!(&mut *err,
                                 "huck: {}: line {}: syntax error: {}",
                                 path.display(),
-                                line_of(start + foff),
+                                line_of(start + tok_off),
                                 crate::parse_error_message(
                                     &crate::command::ParseError::Lex(Box::new(le))
                                 )
                             );
                         }
                         last_status = 2;
-                        start = next_line_start(start + foff);
+                        start = next_line_start(start + tok_off);
                         prev_end = start;
                         continue 'outer;
                     }
