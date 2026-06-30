@@ -442,7 +442,7 @@ fn is_bang_word(tok: &TokenKind) -> bool {
 
 /// Returns `true` if `token` is a reserved word (keyword) that the new flat
 /// parser defers to `UnsupportedCommand`.  Mirrors `command.rs`'s `keyword_of`
-/// EXACTLY (the same 19 compound-opener keywords) — `time` is deliberately NOT
+/// EXACTLY (the same compound-opener keyword set) — `time` is deliberately NOT
 /// here, because `command.rs` has no `time` handling and parses `time …` as a
 /// plain command; the new parser must match that (see `cmd_time_is_plain_command`).
 fn keyword_of_tok(token: &TokenKind) -> bool {
@@ -629,6 +629,11 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// Returns the BARE stage command — no `Pipeline` wrapper.  The caller
 /// (`parse_pipeline`) collects stages and wraps them.
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // Skip leading newlines, mirroring `command.rs`'s `parse_command_inner`
+    // (command.rs:1019) — e.g. a newline between a `!` prefix and the command
+    // (`!\ncmd`) is not a separator. (Alias expansion, the oracle's next line,
+    // is out of v242's flat-command scope — the replay tokens are already final.)
+    skip_newlines(iter)?;
     // EOF with no token.
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::MissingCommand);
@@ -1143,6 +1148,8 @@ mod tests {
         diff_cmd("echo x | grep y | wc -l");
         diff_cmd("A=1 cmd | other");
         diff_cmd("cmd >o | other");
+        diff_cmd("! ! a");                 // double-bang cancels (negate=false)
+        diff_cmd("!\ncmd");                // newline after `!` is skipped (M1: parse_command top skip_newlines)
     }
 
 
