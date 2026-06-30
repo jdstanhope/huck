@@ -483,6 +483,23 @@ enum Step {
     Eof,
 }
 
+/// The lexing-rule context the lexer scans under. v240 implements only
+/// `Command`; the other variants are forward declarations for later Phase C
+/// iterations and are never the active mode in production yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // variants used in Phase C iterations; dormant in v240
+pub(crate) enum Mode {
+    Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
+    Subshell,       // ( … )
+    CommandSub,     // $( … ) / `…`
+    ParamExpansion, // ${ … }
+    Arith,          // $(( … )) / (( … )) / $[ … ]
+    ArrayLiteral,   // a=( … )
+    DoubleBracket,  // [[ … ]]
+    Regex,          // RHS of =~
+    HeredocBody,    // <<EOF …
+}
+
 /// Incremental tokenizer state (v238 Phase A). Holds what were
 /// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
 /// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
@@ -512,6 +529,9 @@ pub struct Lexer<'a> {
     /// Carries bash's trailing-blank rule across one expansion: a body ending in
     /// whitespace makes the NEXT word command-position eligible.
     alias_trailing_eligible: bool,
+    /// Parser-controlled lexing-mode stack (Phase C). Never empty; `Command` is
+    /// the floor. Dormant in v240 — only `Command` is pushed in production.
+    modes: Vec<Mode>,
 }
 
 impl<'a> Lexer<'a> {
@@ -536,6 +556,32 @@ impl<'a> Lexer<'a> {
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
+            modes: vec![Mode::Command],
+        }
+    }
+
+    fn current_mode(&self) -> Mode {
+        *self.modes.last().expect("mode stack is never empty (Command is the floor)")
+    }
+
+    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
+    pub(crate) fn push_mode(&mut self, m: Mode) {
+        self.modes.push(m);
+    }
+
+    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
+    pub(crate) fn pop_mode(&mut self) -> Mode {
+        let m = self.modes.pop().expect("pop_mode on an empty mode stack");
+        debug_assert!(!self.modes.is_empty(), "Command is the floor and must never be popped");
+        m
+    }
+
+    /// Scan one step under the current mode. v240: only `Command` is implemented;
+    /// any other active mode is a bug (production never pushes one yet).
+    fn scan_step(&mut self) -> Result<Step, LexError> {
+        match self.current_mode() {
+            Mode::Command => self.scan_step_command(),
+            other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
 
@@ -543,7 +589,7 @@ impl<'a> Lexer<'a> {
     /// 0..N tokens to `self.history`. Returns `Produced` while input remains (the
     /// old `continue` / fall-through), or routes to `finish()` at end of input
     /// (the old EOF `break`). `?` errors propagate unchanged.
-    fn scan_step(&mut self) -> Result<Step, LexError> {
+    fn scan_step_command(&mut self) -> Result<Step, LexError> {
         // When `$glued` (no whitespace between the just-flushed Word and the
         // redirect operator about to be pushed), and that trailing Word is a pure
         // digit-run or `{ident}`, replace it with a `TokenKind::RedirFd` occupying the
@@ -1248,6 +1294,7 @@ impl<'a> Lexer<'a> {
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
+            modes: vec![Mode::Command],
         }
     }
 
@@ -4797,6 +4844,19 @@ mod tests {
         assert_eq!(lx.next_token().unwrap().unwrap(), w("grep"));
         assert_eq!(lx.next_token().unwrap().unwrap(), w("bar"));
         assert!(lx.next_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn mode_stack_push_pop_current() {
+        let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
+        assert_eq!(lx.current_mode(), Mode::Command);
+        lx.push_mode(Mode::Arith);
+        assert_eq!(lx.current_mode(), Mode::Arith);
+        lx.push_mode(Mode::CommandSub);
+        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        assert_eq!(lx.pop_mode(), Mode::CommandSub);
+        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.current_mode(), Mode::Command);
     }
 
     #[test]
