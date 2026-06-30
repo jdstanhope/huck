@@ -6322,8 +6322,6 @@ pub(crate) fn run_sourced_contents_in_sinks(
         // v239 T6: drive the loop with a single live Lexer that expands aliases
         // at command position as the parser reads tokens. Between units the alias
         // map is refreshed (`set_aliases`) so cross-unit def-then-use works.
-        // This replaces the old tokenize_partial pre-pass + expand_aliases_in_tokens
-        // pre-pass + alias_generation re-tokenize-restart path.
         let expand = shell.is_interactive
             || shell.shopt_options.get("expand_aliases").unwrap_or(false);
         let opts = crate::lexer::LexerOptions { extglob, ..Default::default() };
@@ -6588,7 +6586,6 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                 continue;
             }
             shell.aliases.insert(name.to_string(), value.to_string());
-            shell.alias_generation += 1;
         } else {
             match shell.aliases.get(arg) {
                 Some(v) => {
@@ -6611,7 +6608,6 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     }
     if args[0] == "-a" {
         shell.aliases.clear();
-        shell.alias_generation += 1;
         return ExecOutcome::Continue(0);
     }
     let mut any_failed = false;
@@ -6619,8 +6615,6 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         if shell.aliases.remove(name).is_none() {
             e!(err, "huck: unalias: {name}: not found");
             any_failed = true;
-        } else {
-            shell.alias_generation += 1;
         }
     }
     ExecOutcome::Continue(if any_failed { 1 } else { 0 })
@@ -13573,18 +13567,3 @@ mod normalize_logical_tests {
     }
 }
 
-#[cfg(test)]
-mod alias_generation_tests {
-    #[test]
-    fn alias_generation_bumps_on_define_and_unalias() {
-        let mut sh = crate::shell_state::Shell::new();
-        let g0 = sh.alias_generation;
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        super::builtin_alias(&["foo=bar".into()], &mut out, &mut err, &mut sh);
-        assert!(sh.alias_generation > g0, "define must bump");
-        let g1 = sh.alias_generation;
-        super::builtin_unalias(&["foo".into()], &mut err, &mut sh);
-        assert!(sh.alias_generation > g1, "unalias must bump");
-    }
-}

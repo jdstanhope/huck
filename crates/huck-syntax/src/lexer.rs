@@ -1219,6 +1219,12 @@ impl<'a> Lexer<'a> {
         self.cursor.offset()
     }
 
+    /// Test-only: number of tokens scanned into history so far. Used by
+    /// incrementality tests to assert that `parse_one_unit` does not eagerly
+    /// scan the entire input.
+    #[cfg(test)]
+    pub fn scanned_token_count(&self) -> usize { self.history.len() }
+
     /// Build a replay lexer over already-tokenized input (Task 2 bridge). history is
     /// pre-filled; scanning is a no-op so the pull never errors.
     pub fn from_tokens(tokens: Vec<Token>) -> Lexer<'static> {
@@ -9462,6 +9468,26 @@ mod array_parse_tests {
     fn bad_alias_body_returns_err() {
         let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
         assert!(lx.expand_command_alias().is_err());
+    }
+
+    // --- Task 7: incrementality + live-lexer error tests ---
+
+    #[test]
+    fn parser_pull_is_incremental_not_batch() {
+        let input = (0..50).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n");
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live(&input, &empty, LexerOptions::default());
+        let _ = crate::command::parse_one_unit(&mut lx).unwrap();
+        assert!(lx.scanned_token_count() < 10, "scanned too much: not incremental");
+    }
+
+    #[test]
+    fn bad_alias_body_surfaces_as_parse_error() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
+        let mut lx = Lexer::new_live("x", &m, LexerOptions::default());
+        let r = crate::command::parse(&mut lx);
+        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))));
     }
 }
 

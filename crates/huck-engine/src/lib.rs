@@ -8,7 +8,6 @@
 mod macros;
 pub(crate) use macros::bash_io_error;
 
-pub mod alias_expand;
 pub mod arith;
 pub(crate) mod array_transforms;
 pub mod builtins;

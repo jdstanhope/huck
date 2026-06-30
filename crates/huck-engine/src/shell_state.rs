@@ -419,13 +419,8 @@ pub struct Shell {
     /// slot). Re-defining a function keeps its export mark.
     pub exported_functions: std::collections::HashSet<String>,
     /// User-defined aliases. `name` → expansion text. Populated by
-    /// the `alias` builtin; consumed by `expand_aliases_in_tokens`
-    /// during interactive REPL input.
+    /// the `alias` builtin; expanded at command position by the live lexer.
     pub aliases: std::collections::HashMap<String, String>,
-    /// Bumped on every successful mutation of `aliases` (the `alias`/`unalias`
-    /// builtins). The non-interactive source loop re-tokenizes the remainder when
-    /// this changes, so a newly-defined alias affects subsequently-parsed commands.
-    pub alias_generation: u64,
     #[allow(dead_code)]
     pub jobs: JobTable,
     pub sigchld_flag: Arc<AtomicBool>,
@@ -762,7 +757,6 @@ impl Shell {
             functions: Rc::new(HashMap::new()),
             exported_functions: std::collections::HashSet::new(),
             aliases: std::collections::HashMap::new(),
-            alias_generation: 0,
             jobs: JobTable::new(),
             sigchld_flag: Arc::new(AtomicBool::new(false)),
             sigint_flag: Arc::new(AtomicBool::new(false)),
