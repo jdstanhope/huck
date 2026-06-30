@@ -1324,8 +1324,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// Expand a registered alias at command position by splicing its body tokens into
-    /// `history` ahead of `pos`. Mirrors Expander::expand_alias (recursion guard,
-    /// trailing-blank, span inheritance). Body tokens take the alias-name span.
+    /// `history` ahead of `pos`. Implements bash's read-time alias rules (recursion
+    /// guard, trailing-blank, span inheritance). Body tokens take the alias-name span.
     fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
         self.fill_to(self.pos)?;
         self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
@@ -1379,7 +1379,6 @@ impl<'a> Lexer<'a> {
 /// Returns the concatenated literal text of a Word iff every part is an
 /// unquoted Literal. Returns None for any quoted, Var, Arith, CommandSub, or
 /// Tilde part — aliases only expand from plain unquoted identifiers.
-/// Mirrors `alias_expand::simple_word_text`.
 fn word_literal_text(w: &Word) -> Option<String> {
     let mut s = String::new();
     for part in &w.0 {
