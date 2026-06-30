@@ -872,11 +872,11 @@ mod tests {
     use super::*;
     fn rt(src: &str) -> (String, String) {
         use crate::{command, lexer};
-        let a = command::parse(lexer::tokenize(src).expect("lex"))
+        let a = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).expect("lex")))
             .expect("parse")
             .expect("non-empty");
         let s1 = sequence_to_source(&a, 0);
-        let b = command::parse(lexer::tokenize(&s1).expect("lex s1"))
+        let b = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&s1).expect("lex s1")))
             .expect("parse s1")
             .expect("non-empty s1");
         let s2 = sequence_to_source(&b, 0);
@@ -885,7 +885,7 @@ mod tests {
     #[test]
     fn exported_function_value_form() {
         use crate::{command, lexer};
-        let seq = command::parse(lexer::tokenize("f(){ echo hi; }").unwrap())
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ echo hi; }").unwrap()))
             .unwrap()
             .unwrap();
         let body = match seq.first {
@@ -896,7 +896,7 @@ mod tests {
         assert!(v.starts_with("() "), "{v}");
         assert!(v.contains("echo hi"), "{v}");
         // re-parseable when prefixed with a name:
-        let reparse = command::parse(lexer::tokenize(&format!("f {v}")).unwrap())
+        let reparse = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&format!("f {v}")).unwrap()))
             .unwrap()
             .unwrap();
         assert!(matches!(reparse.first, command::Command::FunctionDef { .. }));
@@ -910,9 +910,9 @@ mod tests {
     fn assert_rt_ast_eq(src: &str) {
         use crate::{command, lexer};
         assert_rt(src);
-        let a = command::parse(lexer::tokenize(src).unwrap()).unwrap().unwrap();
+        let a = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).unwrap())).unwrap().unwrap();
         let s1 = sequence_to_source(&a, 0);
-        let b = command::parse(lexer::tokenize(&s1).unwrap()).unwrap().unwrap();
+        let b = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&s1).unwrap())).unwrap().unwrap();
         // Compare structure in canonical source form: generate->parse legitimately
         // reflows physical lines (`;`-joined commands onto separate lines), so AST
         // `line` metadata differs even when structure is identical. The source
@@ -1174,7 +1174,7 @@ mod tests {
         use crate::{command, lexer};
 
         // input direction: <(...)
-        let seq_in = command::parse(lexer::tokenize("f() { cat <(echo a); }").expect("lex"))
+        let seq_in = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f() { cat <(echo a); }").expect("lex")))
             .expect("parse")
             .expect("non-empty");
         let body_in = match seq_in.first {
@@ -1185,7 +1185,7 @@ mod tests {
         assert!(rendered_in.contains("<(echo a)"), "got: {rendered_in}");
 
         // output direction: >(...)
-        let seq_out = command::parse(lexer::tokenize("g() { tee >(cat); }").expect("lex"))
+        let seq_out = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("g() { tee >(cat); }").expect("lex")))
             .expect("parse")
             .expect("non-empty");
         let body_out = match seq_out.first {
@@ -1199,7 +1199,7 @@ mod tests {
     #[test]
     fn arith_command_renders_unquoted() {
         use crate::{command, lexer};
-        let seq = command::parse(lexer::tokenize("f(){ (( i < 3 )); }").unwrap())
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ (( i < 3 )); }").unwrap()))
             .unwrap().unwrap();
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn arith_expansion_renders_unquoted() {
         use crate::{command, lexer};
-        let seq = command::parse(lexer::tokenize("f(){ i=$(( i + 1 )); }").unwrap())
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ i=$(( i + 1 )); }").unwrap()))
             .unwrap().unwrap();
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
@@ -1221,7 +1221,7 @@ mod tests {
     #[test]
     fn arith_with_var_renders_unquoted() {
         use crate::{command, lexer};
-        let seq = command::parse(lexer::tokenize("f(){ (( x + $y )); }").unwrap())
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize("f(){ (( x + $y )); }").unwrap()))
             .unwrap().unwrap();
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         let s = function_to_source(&name, &body);
@@ -1231,7 +1231,7 @@ mod tests {
     // ── Task 2 (v218): bash print_cmd.c exact-match tests ──
     fn declf(src: &str) -> String {
         use crate::{command, lexer};
-        let seq = command::parse(lexer::tokenize(src).unwrap()).unwrap().unwrap();
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(src).unwrap())).unwrap().unwrap();
         let command::Command::FunctionDef { name, body } = seq.first else {
             panic!("expected a function def")
         };
@@ -1431,7 +1431,7 @@ mod tests {
     fn declf_word(body_word_src: &str) -> String {
         use crate::{command, lexer};
         let src = format!("f(){{ echo {body_word_src}; }}");
-        let seq = command::parse(lexer::tokenize(&src).unwrap()).unwrap().unwrap();
+        let seq = command::parse(&mut lexer::Lexer::from_tokens(lexer::tokenize(&src).unwrap())).unwrap().unwrap();
         let command::Command::FunctionDef { name, body } = seq.first else { panic!() };
         function_to_source(&name, &body)
     }

@@ -7254,7 +7254,7 @@ mod tests {
         shell.set("v", "hi".into());
         let parse_expr = |src: &str| {
             let toks = crate::lexer::tokenize(src).expect("lex");
-            match crate::command::parse(toks).expect("parse").expect("seq").first {
+            match crate::command::parse(&mut crate::lexer::Lexer::from_tokens(toks)).expect("parse").expect("seq").first {
                 crate::command::Command::DoubleBracket { expr, .. } => *expr,
                 other => panic!("expected [[ ]], got {other:?}"),
             }
@@ -8187,7 +8187,7 @@ mod tests {
         let mut shell = Shell::new();
         // Define a no-op function via the parser.
         if let Some(tokens) = crate::lexer::tokenize("myfunc() { echo ok; }").ok()
-            && let Ok(Some(seq)) = crate::command::parse(tokens)
+            && let Ok(Some(seq)) = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens))
         {
             let _ = execute(&seq, &mut shell, "myfunc() { echo ok; }");
         }
@@ -8429,7 +8429,7 @@ mod tests {
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "/bin/sh -c 'echo out; echo err >&2'";
             let tokens = crate::lexer::tokenize(src).expect("lex");
-            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
@@ -8452,7 +8452,7 @@ mod tests {
             let mut err = StderrSink::Merged;
             let src = "/bin/sh -c 'printf out; printf err 1>&2; printf out2'";
             let tokens = crate::lexer::tokenize(src).expect("lex");
-            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf), "outerrout2");
@@ -8476,7 +8476,7 @@ mod tests {
             // Second stage `cat` reads (empty) and writes nothing → stdout empty.
             let src = "/bin/sh -c 'echo err >&2' | cat";
             let tokens = crate::lexer::tokenize(src).expect("lex");
-            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "");
@@ -8499,7 +8499,7 @@ mod tests {
             let mut err = StderrSink::Capture(&mut buf_err);
             let src = "( echo out; echo err >&2 )";
             let tokens = crate::lexer::tokenize(src).expect("lex");
-            let seq = crate::command::parse(tokens).expect("parse").expect("seq");
+            let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("seq");
             execute_with_sink(&seq, &mut shell, src, &mut out, &mut err);
         }
         assert_eq!(String::from_utf8_lossy(&buf_out), "out\n");
@@ -8562,7 +8562,7 @@ mod tests {
         let mut shell = Shell::new();
         // Register myfunc in the function table via the parser.
         if let Ok(tokens) = crate::lexer::tokenize("myfunc() { :; }")
-            && let Ok(Some(seq)) = crate::command::parse(tokens)
+            && let Ok(Some(seq)) = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens))
         {
             let _ = execute(&seq, &mut shell, "myfunc() { :; }");
         }
@@ -8697,7 +8697,7 @@ mod tests {
                 Ok(t) if !t.is_empty() => t,
                 _ => continue,
             };
-            match crate::command::parse(tokens) {
+            match crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)) {
                 Ok(Some(seq)) => {
                     let outcome = execute(&seq, shell, &buf);
                     buf.clear();
@@ -8717,7 +8717,7 @@ mod tests {
         // Execute any remaining buffered content.
         if !buf.is_empty()
             && let Ok(tokens) = crate::lexer::tokenize(&buf)
-            && let Ok(Some(seq)) = crate::command::parse(tokens)
+            && let Ok(Some(seq)) = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens))
         {
             let _ = execute(&seq, shell, &buf);
         }
@@ -8926,7 +8926,7 @@ mod tests {
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
         let toks = crate::lexer::tokenize("true && true &").unwrap();
-        let seq = crate::command::parse(toks).unwrap().unwrap();
+        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(toks)).unwrap().unwrap();
         let outcome = execute(&seq, &mut shell, "true && true &");
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         // Cleanup: SIGTERM any bg job so the test doesn't leak.
@@ -8943,7 +8943,7 @@ mod tests {
         use crate::shell_state::Shell;
         let mut shell = Shell::new();
         let toks = crate::lexer::tokenize("sleep 30 && true &").unwrap();
-        let seq = crate::command::parse(toks).unwrap().unwrap();
+        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(toks)).unwrap().unwrap();
         let _ = execute(&seq, &mut shell, "sleep 30 && true &");
         assert_eq!(shell.jobs.iter().count(), 1, "expected exactly one job");
         // Cleanup.
@@ -9094,7 +9094,7 @@ mod array_assign_tests {
             src.push('\n');
         }
         let tokens = crate::lexer::tokenize(&src).expect("tokenize");
-        let seq = crate::command::parse(tokens)
+        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens))
             .expect("parse ok")
             .expect("non-empty parse");
         execute(&seq, shell, &src);

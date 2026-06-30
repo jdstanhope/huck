@@ -487,7 +487,7 @@ enum Step {
 /// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
 /// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
 /// intact (batch internally); T2 splits it into a pull `next_token`.
-struct Lexer<'a> {
+pub struct Lexer<'a> {
     cursor: CharCursor<'a>,
     opts: LexerOptions,
     brace_expand: bool,
@@ -495,6 +495,8 @@ struct Lexer<'a> {
     /// index of the next token next_token() will hand out (pull + future rewind).
     history: Vec<Token>,
     pos: usize,
+    /// True for a from_tokens() replay lexer: history is pre-filled, never scans.
+    replay: bool,
     parts: Vec<WordPart>,
     current: String,
     has_token: bool,
@@ -505,6 +507,11 @@ struct Lexer<'a> {
     dbracket_depth: u32,
     expect_regex: bool,
     pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
+    aliases: std::collections::HashMap<String, String>,
+    active: std::collections::HashSet<String>,
+    /// Carries bash's trailing-blank rule across one expansion: a body ending in
+    /// whitespace makes the NEXT word command-position eligible.
+    alias_trailing_eligible: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -515,6 +522,7 @@ impl<'a> Lexer<'a> {
             brace_expand,
             history: Vec::new(),
             pos: 0,
+            replay: false,
             parts: Vec::new(),
             current: String::new(),
             has_token: false,
@@ -525,6 +533,9 @@ impl<'a> Lexer<'a> {
             dbracket_depth: 0,
             expect_regex: false,
             pending_heredocs: std::collections::VecDeque::new(),
+            aliases: std::collections::HashMap::new(),
+            active: std::collections::HashSet::new(),
+            alias_trailing_eligible: false,
         }
     }
 
@@ -1207,6 +1218,176 @@ impl<'a> Lexer<'a> {
     fn cursor_offset(&self) -> usize {
         self.cursor.offset()
     }
+
+    /// Test-only: number of tokens scanned into history so far. Used by
+    /// incrementality tests to assert that `parse_one_unit` does not eagerly
+    /// scan the entire input.
+    #[cfg(test)]
+    pub fn scanned_token_count(&self) -> usize { self.history.len() }
+
+    /// Build a replay lexer over already-tokenized input (Task 2 bridge). history is
+    /// pre-filled; scanning is a no-op so the pull never errors.
+    pub fn from_tokens(tokens: Vec<Token>) -> Lexer<'static> {
+        Lexer {
+            cursor: CharCursor::new(""),
+            opts: LexerOptions::default(),
+            brace_expand: true,
+            history: tokens,
+            pos: 0,
+            replay: true,
+            parts: Vec::new(),
+            current: String::new(),
+            has_token: false,
+            token_start: 0,
+            token_start_line: 1,
+            token_start_col: 1,
+            in_assignment_value: false,
+            dbracket_depth: 0,
+            expect_regex: false,
+            pending_heredocs: std::collections::VecDeque::new(),
+            aliases: std::collections::HashMap::new(),
+            active: std::collections::HashSet::new(),
+            alias_trailing_eligible: false,
+        }
+    }
+
+    /// Ensure history[idx] exists AND is backfill-ready (heredoc body present),
+    /// pulling lazily via scan_step. Mirrors next_token's readiness rule so a
+    /// Heredoc token is never exposed before its body is collected (v238). On a lex
+    /// error, RETURN it (no stash). scan_step appends to history without advancing pos.
+    fn fill_to(&mut self, idx: usize) -> Result<(), LexError> {
+        if self.replay {
+            return Ok(());
+        }
+        loop {
+            if self.history.len() > idx && !self.backfill_pending_at(idx) {
+                return Ok(());
+            }
+            match self.scan_step()? {
+                Step::Produced => {}
+                Step::Eof => return Ok(()),
+            }
+        }
+    }
+
+    pub fn peek(&mut self) -> Result<Option<&Token>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos))
+    }
+    pub fn next(&mut self) -> Result<Option<Token>, LexError> {
+        self.fill_to(self.pos)?;
+        let t = self.history.get(self.pos).cloned();
+        if t.is_some() { self.pos += 1; }
+        Ok(t)
+    }
+    pub fn peek_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos).map(|t| &t.kind))
+    }
+    pub fn peek2_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
+        self.fill_to(self.pos + 1)?;
+        Ok(self.history.get(self.pos + 1).map(|t| &t.kind))
+    }
+    pub fn next_kind(&mut self) -> Result<Option<TokenKind>, LexError> {
+        Ok(self.next()?.map(|t| t.kind))
+    }
+    pub fn peek_span(&mut self) -> Result<Option<Span>, LexError> {
+        self.fill_to(self.pos)?;
+        Ok(self.history.get(self.pos).map(|t| t.span))
+    }
+    pub fn current_line(&mut self) -> Result<u32, LexError> {
+        Ok(self.peek_span()?.map(|s| s.line).unwrap_or(0))
+    }
+    pub fn remaining(&self) -> usize {
+        self.history.len().saturating_sub(self.pos)
+    }
+
+    pub fn set_aliases(&mut self, aliases: std::collections::HashMap<String, String>) {
+        self.aliases = aliases;
+    }
+
+    /// Returns the current byte offset of the scanner cursor within the input
+    /// slice. After a lex error from `parse_one_unit`, this is the position
+    /// where the scanner gave up — used by the source loop to compute the
+    /// restart line (`next_line_start(start + iter.cursor_pos())`).
+    pub fn cursor_pos(&self) -> usize {
+        self.cursor.offset()
+    }
+
+    /// Set the starting line number for span generation. Call after `new_live`
+    /// when the input slice starts mid-file (`start > 0`) so that token spans
+    /// carry file-absolute line numbers and `$LINENO` reflects the true file
+    /// line rather than a chunk-relative one.
+    pub fn set_base_line(&mut self, base_line: u32) {
+        self.cursor.line = 1 + base_line;
+        self.token_start_line = 1 + base_line;
+    }
+
+    /// Expand a registered alias at command position by splicing its body tokens into
+    /// `history` ahead of `pos`. Implements bash's read-time alias rules (recursion
+    /// guard, trailing-blank, span inheritance). Body tokens take the alias-name span.
+    fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
+        self.fill_to(self.pos)?;
+        self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
+        let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
+        let TokenKind::Word(w) = &tok.kind else { return Ok(()) };
+        let Some(name) = word_literal_text(w) else { return Ok(()) };
+        if self.active.contains(&name) { return Ok(()); }
+        let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
+        let name_span = tok.span;
+        let body_tokens = tokenize(&body)?; // bad body → Err, propagated by callers
+        self.history.remove(self.pos);
+        let mut insert_at = self.pos;
+        for bt in body_tokens {
+            self.history.insert(insert_at, Token::new(bt.kind, name_span));
+            insert_at += 1;
+        }
+        // Recursion guard: re-enter with `name` active so the body's own first word
+        // expands if it is a *different* alias, but `name` cannot re-expand itself.
+        self.active.insert(name.clone());
+        self.maybe_expand_command_alias()?;
+        self.active.remove(&name);
+        self.alias_trailing_eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
+        Ok(())
+    }
+
+    /// Expand the alias at command position. Call this at the top of any
+    /// command-position parse entry point; the parser then reads via the plain
+    /// `peek_kind`/`next_kind` API which sees the already-expanded history.
+    pub fn expand_command_alias(&mut self) -> Result<(), LexError> {
+        self.maybe_expand_command_alias()
+    }
+
+    /// Return and reset the trailing-blank eligibility flag. Returns `true`
+    /// (and clears to `false`) when the most recent alias expansion ended with
+    /// a blank, making the next argument word eligible for alias expansion.
+    pub fn take_trailing_eligible(&mut self) -> bool {
+        let e = self.alias_trailing_eligible;
+        self.alias_trailing_eligible = false;
+        e
+    }
+
+    /// Build a live lexer for the REPL: the lexer scans `input` incrementally
+    /// and expands registered aliases at command position.
+    pub fn new_live(input: &'a str, aliases: &std::collections::HashMap<String, String>, opts: LexerOptions) -> Lexer<'a> {
+        let mut lx = Lexer::new(input, opts, true);
+        lx.aliases = aliases.clone();
+        lx
+    }
+}
+
+/// Returns the concatenated literal text of a Word iff every part is an
+/// unquoted Literal. Returns None for any quoted, Var, Arith, CommandSub, or
+/// Tilde part — aliases only expand from plain unquoted identifiers.
+fn word_literal_text(w: &Word) -> Option<String> {
+    let mut s = String::new();
+    for part in &w.0 {
+        match part {
+            WordPart::Literal { text, quoted: false } => s.push_str(text),
+            _ => return None,
+        }
+    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn tokenize_partial_inner(
@@ -2880,7 +3061,8 @@ fn parse_substitution_body(body: &str, opts: LexerOptions) -> Result<crate::comm
     // ("unknown"), matching pre-span behavior (script-relative $LINENO inside
     // `$( )` would need offset propagation, out of scope here).
     for t in &mut tokens { t.span.line = 0; }
-    let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
+    let mut lx = Lexer::from_tokens(tokens);
+    let parsed = crate::command::parse(&mut lx).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
 }
 
@@ -8506,7 +8688,7 @@ mod array_parse_tests {
     /// `name=value cmd args` inline-prefix shapes.
     fn parse_assignments(input: &str) -> Vec<Assignment> {
         let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -8522,7 +8704,7 @@ mod array_parse_tests {
     /// name matches.
     fn find_param_expansion(input: &str, name: &str) -> WordPart {
         let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -8748,7 +8930,7 @@ mod array_parse_tests {
         // ParamExpansion. Verify by checking that no ParamExpansion
         // appears at all.
         let tokens = crate::lexer::tokenize("echo ${a}").expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             _ => panic!(),
@@ -9162,6 +9344,149 @@ mod array_parse_tests {
             other => panic!("expected name-bearing part, got {other:?}"),
         };
         assert_eq!(name, "x1");
+    }
+
+    #[test]
+    fn pull_api_reproduces_token_sequence() {
+        let toks = tokenize("echo foo | grep bar").unwrap();
+        let mut lx = Lexer::from_tokens(toks.clone());
+        assert_eq!(lx.remaining(), toks.len());
+        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[0].kind));
+        assert_eq!(lx.peek2_kind().unwrap(), Some(&toks[1].kind));
+        assert_eq!(lx.peek_span().unwrap(), Some(toks[0].span));
+        let mut drained = Vec::new();
+        while let Some(t) = lx.next().unwrap() { drained.push(t); }
+        assert_eq!(drained, toks);
+        assert_eq!(lx.peek_kind().unwrap(), None);
+        assert_eq!(lx.next_kind().unwrap(), None);
+    }
+
+    #[test]
+    fn pull_next_kind_matches_next_dot_kind() {
+        let toks = tokenize("a b c").unwrap();
+        let mut lx = Lexer::from_tokens(toks.clone());
+        assert_eq!(lx.next_kind().unwrap(), Some(toks[0].kind.clone()));
+        assert_eq!(lx.peek_kind().unwrap(), Some(&toks[1].kind));
+    }
+
+    #[test]
+    fn pull_surfaces_lex_error_as_err() {
+        // A genuinely unterminated construct: the pull returns Err at the failing scan.
+        let mut lx = Lexer::new("echo \"unterminated", LexerOptions::default(), true);
+        // drain until we hit the error
+        let mut got_err = false;
+        loop {
+            match lx.next() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => { got_err = true; break; }
+            }
+        }
+        assert!(got_err, "unterminated quote must surface as Err from the pull");
+    }
+
+    // --- Task 4: alias storage + command-position expansion ---
+
+    fn lx_with_alias(input: &str, pairs: &[(&str, &str)]) -> Lexer<'static> {
+        let toks = tokenize(input).unwrap();
+        let mut lx = Lexer::from_tokens(toks);
+        let mut m = std::collections::HashMap::new();
+        for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
+        lx.set_aliases(m);
+        lx
+    }
+
+    fn wtext(k: &TokenKind) -> String {
+        // Test helper: extract all literal text (including quoted parts) so that
+        // quoted words like `'ll'` show as "ll" for assertion display. Recurses into
+        // WordPart::Quoted wrappers (single/double/etc). Distinct from
+        // word_literal_text (which returns None for quoted parts to block alias
+        // expansion); this is for verifying WHAT was returned, not WHETHER to expand.
+        fn extract(parts: &[WordPart], s: &mut String) {
+            for part in parts {
+                match part {
+                    WordPart::Literal { text, .. } => s.push_str(text),
+                    WordPart::Quoted { parts: inner, .. } => extract(inner, s),
+                    _ => {}
+                }
+            }
+        }
+        if let TokenKind::Word(w) = k {
+            let mut s = String::new();
+            extract(&w.0, &mut s);
+            s
+        } else {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn alias_expands_at_command_position() {
+        let mut lx = lx_with_alias("ll /tmp", &[("ll", "ls -l")]);
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.peek_kind().unwrap().map(|k| wtext(k)), Some("ls".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-l".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("/tmp".into()));
+    }
+
+    #[test]
+    fn alias_not_expanded_at_argument_position() {
+        let mut lx = lx_with_alias("echo ll", &[("ll", "ls -l")]);
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("ll".into()));
+    }
+
+    #[test]
+    fn alias_recursion_guard_terminates() {
+        let mut lx = lx_with_alias("ls", &[("ls", "ls -a")]);
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-a".into()));
+    }
+
+    #[test]
+    fn alias_trailing_blank_makes_next_word_eligible() {
+        let mut lx = lx_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
+    }
+
+    #[test]
+    fn quoted_word_not_expanded() {
+        let mut lx = lx_with_alias("'ll'", &[("ll", "ls")]);
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
+    }
+
+    #[test]
+    fn bad_alias_body_returns_err() {
+        let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
+        assert!(lx.expand_command_alias().is_err());
+    }
+
+    // --- Task 7: incrementality + live-lexer error tests ---
+
+    #[test]
+    fn parser_pull_is_incremental_not_batch() {
+        let input = (0..50).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n");
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live(&input, &empty, LexerOptions::default());
+        let _ = crate::command::parse_one_unit(&mut lx).unwrap();
+        assert!(lx.scanned_token_count() < 10, "scanned too much: not incremental");
+    }
+
+    #[test]
+    fn bad_alias_body_surfaces_as_parse_error() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
+        let mut lx = Lexer::new_live("x", &m, LexerOptions::default());
+        let r = crate::command::parse(&mut lx);
+        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))));
     }
 }
 

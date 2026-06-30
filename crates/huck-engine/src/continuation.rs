@@ -65,7 +65,9 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     // to `Operator` before the parser can identify the real reason).  The parser
     // result is cloned away; the trailing-operator check runs on the original
     // token slice if the parser didn't signal `DoubleBracket`.
-    if let Err(ParseError::UnterminatedDoubleBracket) = command::parse(tokens.clone()) {
+    if let Err(ParseError::UnterminatedDoubleBracket) =
+        command::parse(&mut lexer::Lexer::from_tokens(tokens.clone()))
+    {
         return Completeness::Incomplete(ContinuationReason::DoubleBracket);
     }
     if matches!(
@@ -74,7 +76,7 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     ) {
         return Completeness::Incomplete(ContinuationReason::Operator);
     }
-    match command::parse(tokens) {
+    match command::parse(&mut lexer::Lexer::from_tokens(tokens)) {
         Ok(_) => Completeness::Complete,
         Err(ParseError::UnterminatedSubshell) => {
             Completeness::Incomplete(ContinuationReason::Subshell)

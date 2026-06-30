@@ -23,5 +23,12 @@ checkf "trailing space"   'shopt -s expand_aliases; alias a="b "; alias b="echo"
 checkf "redefine"         'shopt -s expand_aliases; alias g="echo one"; g; alias g="echo two"; g'
 checkf "set -v echo raw"  'set -v; shopt -s expand_aliases; alias ll="echo LL"; ll /usr'
 
+# v239 T6: cross-unit def-then-use — alias defined on line N, used on line N+1.
+# The live lexer's between-unit set_aliases refresh makes the new alias visible
+# to the parser of the NEXT unit. Same-unit (semicolon) must still NOT expand.
+checkf "cross-unit def-then-use" $'shopt -s expand_aliases\nalias greet=\'echo hi\'\ngreet'
+checkf "cross-unit same-unit no-expand" $'shopt -s expand_aliases\nalias greet=\'echo hi\'; greet'
+checkf "cross-unit unalias mid-run" $'shopt -s expand_aliases\nalias g=\'echo GO\'\ng\nunalias g\ng'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

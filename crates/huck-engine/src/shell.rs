@@ -376,29 +376,13 @@ pub fn process_line_in_sinks(
     err_sink: &mut crate::executor::StderrSink,
 ) -> ExecOutcome {
     let opts = lexer::LexerOptions { extglob: shell.extglob(), ..Default::default() };
-    // Tokens now carry their own source span; no parallel offsets/lines sidecar.
-    let tokens = match lexer::tokenize_with_opts(line, opts) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
-            return ExecOutcome::Continue(2);
-        }
-    };
-    // Alias expansion preserves spans (body tokens inherit the alias-name token's
-    // span), so $LINENO stays correct through expansion — no line remap needed.
-    let tokens = if expand_aliases {
-        match crate::alias_expand::expand_aliases_in_tokens(tokens, &shell.aliases) {
-            Ok(t) => t,
-            Err(e) => {
-                { let mut err = crate::executor::err_writer(err_sink, sink); e!(&mut *err, "huck: syntax error{}", crate::lex_error_message(&e)); }
-                return ExecOutcome::Continue(2);
-            }
-        }
-    } else {
-        tokens
-    };
-
-    match command::parse(tokens) {
+    // Build a live lexer that expands aliases at command position as the parser
+    // reads tokens. For non-interactive / non-alias paths, use an empty alias map
+    // so the live lexer is alias-free (byte-identical to the old token pre-pass).
+    let empty = std::collections::HashMap::new();
+    let aliases = if expand_aliases { &shell.aliases } else { &empty };
+    let mut lx = lexer::Lexer::new_live(line, aliases, opts);
+    match command::parse(&mut lx) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {

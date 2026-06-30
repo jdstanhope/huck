@@ -53,38 +53,49 @@ the duplicate command-position logic the pre-pass reimplemented.
 ### 1. Lexer: command-position pull + alias map
 
 The `Lexer` (made `pub`) gains a parser-facing pull API, alongside the existing
-internal `next_token`. The pull is **infallible at the call sites** (returns
-`Option`, not `Result`): a lex error encountered while pulling is **stashed** and
-the pull reports end-of-input; the parse entry points retrieve it once via
-`take_error()` and return it as `ParseError::Lex`. This keeps the ~150 parser
-`peek`/`next` sites free of `?` (see Error model, §4, and Risks).
+internal `next_token`. The pull is **fallible: every scanning method returns
+`Result<…, LexError>`** — a lex error hit while scanning is **returned at the
+failing call**, not stashed. `impl From<LexError> for ParseError` (it wraps
+`Lex(Box<LexError>)`) makes each of the ~150 parser sites `iter.peek_kind()?`: the
+`?` propagates and converts the error. (`Box` because `LexError` already contains a
+`ParseError` via `SubstitutionParseError`, so an unboxed `ParseError::Lex(LexError)`
+would be a recursive type — E0072. Removing that lexer→parser edge is deferred to
+Phase C of the re-arch; until then the `Box` stays.) This replaces the v239-T1
+`pending_error`/`take_error` stash, which was a side-channel hack.
 
 The **primary** pull yields whole `Token`s (kind **+ span**), so location travels
 into the parser; **kind convenience** methods serve the many sites that only match
-on kind, so the parser-side change at those sites is a pure mechanical rename
-(`iter.peek()` → `iter.peek_kind()`, etc.), not a semantic rewrite:
+on kind, so the parser-side change at those sites is `iter.peek()` →
+`iter.peek_kind()?` — a near-mechanical rename plus a `?`:
 
 ```rust
 // primary: whole Token (span included)
-pub fn peek(&mut self)  -> Option<&Token>;
-pub fn next(&mut self)  -> Option<Token>;
+pub fn peek(&mut self)  -> Result<Option<&Token>, LexError>;
+pub fn next(&mut self)  -> Result<Option<Token>, LexError>;
 // kind convenience — the find-replace targets for the existing peek/next sites
-pub fn peek_kind(&mut self)  -> Option<&TokenKind>;
-pub fn peek2_kind(&mut self) -> Option<&TokenKind>;
-pub fn next_kind(&mut self)  -> Option<TokenKind>;
-// location (as today)
-pub fn peek_span(&mut self) -> Option<Span>;
-pub fn current_line(&mut self) -> u32;
-pub fn remaining(&self) -> usize;   // replaces TokenCursor's ExactSizeIterator::len
-// command position: expand a registered alias IN PLACE, then behave like
-// peek/next. Idempotent — expansion buffers into `history`, so calling twice
-// expands once.
-pub fn peek_command_kind(&mut self) -> Option<&TokenKind>;
-pub fn next_command(&mut self) -> Option<Token>;
-// error retrieval + refreshable alias map (§3)
-pub fn take_error(&mut self) -> Option<LexError>;
+pub fn peek_kind(&mut self)  -> Result<Option<&TokenKind>, LexError>;
+pub fn peek2_kind(&mut self) -> Result<Option<&TokenKind>, LexError>;
+pub fn next_kind(&mut self)  -> Result<Option<TokenKind>, LexError>;
+// location
+pub fn peek_span(&mut self) -> Result<Option<Span>, LexError>;
+pub fn current_line(&mut self) -> Result<u32, LexError>;
+pub fn remaining(&self) -> usize;   // non-scanning; replaces TokenCursor::len
+// command position: expand a registered alias at `pos` IN PLACE (splice body
+// tokens into history). The alias body is lexed, so this is fallible. The parser
+// calls this ONCE at command-position entry, then consumes with plain peek/next
+// (calling it AND a *_command pull would double-expand — T4 review Finding 1).
+pub fn expand_command_alias(&mut self) -> Result<(), LexError>;
+// trailing-blank rule: after an alias whose value ends in a blank, the next word
+// is alias-eligible. The parser reads+clears this before each argument word.
+pub fn take_trailing_eligible(&mut self) -> bool;
+// refreshable alias map (§3) — NO take_error; errors are returned, not stashed
 pub fn set_aliases(&mut self, aliases: HashMap<String, String>);
 ```
+
+`Result<Option<T>, LexError>` encodes three distinct outcomes the parser must
+tell apart: `Err` = scan failed; `Ok(None)` = clean end of input (NOT an error);
+`Ok(Some(t))` = next token. The two layers are orthogonal — `Result` = "did it
+error", `Option` = "token or end" — so neither collapses into the other.
 
 Construction takes the alias map and options:
 `Lexer::new(input, aliases, opts)` (or `new_with_aliases`; `brace_expand` stays a
@@ -141,28 +152,31 @@ bash semantics).
   and wrap the vec in `Lexer::from_tokens` (replay) — byte-identical.
 - Internal `fn …(iter: &mut TokenCursor)` parser functions take `iter: &mut Lexer`
   (same parameter name). The ~150 `iter.peek()`/`iter.peek2()`/`iter.next()` sites
-  become a **pure mechanical rename** to `iter.peek_kind()`/`iter.peek2_kind()`/
-  `iter.next_kind()` — same `Option<&TokenKind>` / `Option<TokenKind>` returns, no
-  `?`, no `.kind` rewrite. (Because the cursor is always the single `iter` param,
-  replacing those exact strings is safe.) `peek_span`/`current_line` are unchanged;
-  `iter.len()` (source loop) becomes `iter.remaining()`.
-- **At command position** — the grammar point(s) where the parser is about to read
-  a command name (`command.rs:1115` in `parse_command_inner`, `2381` in
-  `parse_next_stage`) — it calls `peek_command_kind`/`next_command` instead of
-  `peek_kind`/`next_kind`, so the lexer expands a registered alias there.
-  Everywhere else (arguments, operators, redirections) the plain `*_kind` variants
-  are used, so no alias expansion happens off command position.
-- **Error model — infallible pull, stash-and-check.** The pull stays infallible at
-  the call sites (returns `Option`); a `LexError` hit while pulling (main line *or*
-  alias body) is **stashed** in the lexer and the pull reports end-of-input. After
-  parsing, the entry points (`parse`, `parse_one_unit`, and the comsub sub-parse)
-  call `lexer.take_error()`; if set, they discard the parse result and return
-  `ParseError::Lex(LexError)`. Outcome is identical to today (the lex error wins,
-  `process_line` → `Continue(2)`), but the parser body needs no `?` threading. (See
-  Risks for the one incremental-vs-batch behavioral note: on a line carrying *both*
-  an early parse error and a later lex error, the incremental parser reports the
-  parse error first — like bash — whereas today's batch lexer reports the lex error;
-  verify against the harnesses.)
+  become `iter.peek_kind()?`/`iter.peek2_kind()?`/`iter.next_kind()?` — a rename plus
+  a `?` (the cursor is always the single `iter` param, so replacing those exact
+  strings is safe). `peek_span`/`current_line` also gain `?`; `iter.len()` (source
+  loop) becomes `iter.remaining()` (no `?` — non-scanning). A few helpers that pull
+  and currently return `bool`/`()` must become `Result<_, ParseError>`; the compiler
+  enumerates this bounded cascade.
+- **At command position** — the parser calls `iter.expand_command_alias()?` at the
+  TOP of `parse_command_inner` and `parse_next_stage` (before any keyword/Word peek),
+  then consumes with the plain `*_kind` pull. Expanding *before* the keyword dispatch
+  is required so `alias x=if` yields the `if` keyword and `alias foo=bar; foo(){…}`
+  expands the func-def name (both verified against bash/huck). The trailing-blank rule
+  is handled by `take_trailing_eligible()` + a re-expand in the argument loop. Non-
+  command grammar positions (case patterns, for-lists, `[[ ]]`, case/for/function NAME
+  words) are read by their own parse fns, never through these two, so they are never
+  expanded — matching bash.
+- **Error model — fallible pull, `?`-propagated.** Every scanning pull method
+  returns `Result<…, LexError>`; a `LexError` hit while pulling (main line *or*
+  alias body) is **returned at the failing call** and propagates through `?`,
+  converting to `ParseError::Lex(Box<LexError>)` via `From`. No stash, no
+  `take_error`. The outcome is the same as today (a lex error wins, `process_line` →
+  `Continue(2)`), now expressed as ordinary error propagation. (See Risks for the
+  one incremental-vs-batch behavioral note: on a line carrying *both* an early parse
+  error and a later lex error, the incremental parser reports the parse error first
+  — like bash — whereas today's batch lexer reports the lex error; verify against the
+  harnesses.)
 
 ### 5. Retire `TokenCursor`, the alias pre-pass, and the re-tokenize hack
 
@@ -225,8 +239,8 @@ Direct tests:
 7. **Incremental pull (parser-level).** Parsing consumes tokens without a
    materialized vec — assert the lexer cursor stays near the consumed prefix
    mid-parse (à la v238's laziness proof, but driven by the parser).
-8. **Stash-and-check lex error.** A bad alias body (`alias x='echo "'`; `x`)
-   surfaces as `ParseError::Lex` via `take_error()`, with the same effect as today
+8. **Propagated lex error.** A bad alias body (`alias x='echo "'`; `x`) surfaces as
+   `ParseError::Lex` via `?` from the failing pull, with the same effect as today
    (`syntax error`, exit 2).
 9. **Parity** for `source` multi-unit + offset slicing, continuation double-parse, and that `$(...)` bodies are still NOT alias-expanded (no behavior change).
 
@@ -240,10 +254,13 @@ Direct tests:
   rules (recursion, trailing-blank, reserved-word interplay). Mitigation: port the
   `Expander`'s mechanics faithfully; the `alias*` harnesses + the direct tests
   above pin them; keep the v232 regression cases as explicit tests.
-- **Cursor-rename breadth.** ~150 `iter.peek()/peek2()/next()` sites are renamed to
-  the `*_kind` variants. Pure mechanical find-replace of exact strings (the cursor
-  is always the single `iter` param), no `?`, no `.kind` rewrite — low individual
-  risk; the compiler catches a miss. Do it in one pass under the oracle.
+- **Cursor-rename breadth + cascade.** ~150 `iter.peek()/peek2()/next()` sites are
+  renamed to the `*_kind` variants **and given `?`**. The rename is exact-string
+  find-replace (the cursor is always the single `iter` param); the `?` triggers a
+  bounded cascade where a few pulling helpers that returned `bool`/`()` must become
+  `Result<_, ParseError>`. The compiler enumerates both a wrongly-`?`'d non-cursor
+  `iter` and the helper cascade. Do it in one pass under the oracle; never
+  `.unwrap()` a pull to silence the cascade.
 - **Incremental error ordering.** Going incremental means a line with *both* an
   early parse error and a later lex error now reports the parse error first (like
   bash), versus today's batch lexer reporting the lex error. Mitigation: verify
@@ -256,33 +273,36 @@ Direct tests:
 
 To keep intermediate states byte-identical:
 
-1. **Flip the parser to pull from `&mut Lexer`** (the `*_kind` pull + `peek_span`/
-   `current_line`/`remaining` + stash/`take_error`), with the alias pre-pass still
-   running and feeding a lexer built from the pre-expanded tokens (`from_tokens`
-   replay). Mechanical rename + entry `take_error` check; behavior-preserving —
-   isolates the large signature/rename change under the oracle.
-2. **Make the pull live and fold alias in:** add `peek_command_kind`/`next_command`
-   + the alias map + expansion mechanics; have the parser call the command-position
-   variants at the two sites; switch callers to live `Lexer::new(...)`; retire the
-   pre-pass, `TokenCursor`, and the `alias_generation` hack; add `set_aliases` + the
-   between-unit refresh. Byte-identical, now incremental.
-3. **Edge consumers:** rework continuation (two lexers), confirm `source`
-   multi-unit offset slicing, the `$(...)`-not-expanded invariant, and the stash/`take_error` path
-   for bad alias bodies.
+0. **Result-ize the pull API** (supersedes the v239-T1 `Option`+stash): convert the
+   pull methods + `fill_to` to `Result<…, LexError>`, delete `pending_error`/
+   `take_error`. lexer-only; nothing calls them yet but the unit tests — byte-identical.
+1. **Flip the parser to pull from `&mut Lexer`** (the `*_kind?` pull + `peek_span?`/
+   `current_line?`/`remaining`) with `ParseError::Lex(Box<LexError>)` + `From`, the
+   alias pre-pass still running and feeding a `from_tokens` replay lexer. Rename + `?`
+   + bounded helper cascade; behavior-preserving under the oracle.
+2. **Make the pull live and fold alias in:** add the alias map + expansion mechanics
+   (T4: `maybe_expand_command_alias`) and `expand_command_alias`/`take_trailing_eligible`
+   (T5); have the parser call `expand_command_alias()` at command-position entry and
+   re-expand in the arg loop per the trailing-blank flag; switch the REPL to live
+   `Lexer::new_live(...)`; retire the pre-pass, `TokenCursor`, and the `alias_generation`
+   hack; add `set_aliases` + the between-unit refresh. Byte-identical, now incremental.
+3. **Edge consumers:** rework continuation (replay lexers), confirm `source`
+   multi-unit offset slicing, the `$(...)`-not-expanded invariant, and that a bad
+   alias body propagates as `ParseError::Lex` via `?`.
 
 ## Definition of done
 
 - The parser pulls from `&mut Lexer` **live**, holds no `Vec`, and calls
-  `peek_command_kind`/`next_command` exactly at command position.
+  `expand_command_alias` exactly at command position (then plain `*_kind` pulls).
 - Alias expansion happens inside the lexer's command-position pull; the
   `huck-engine` pre-pass, the `alias_generation` re-tokenize hack, and
   `TokenCursor` are deleted.
 - The lexer owns a refreshable alias map; the multi-unit loop re-syncs it between
   units; cross-unit def-then-use works and same-unit defs do not expand.
-- The pull is infallible at the call sites; lex errors (main line and alias bodies)
-  are stashed and surfaced once at the entry as `ParseError::Lex`, with today's
-  effect.
-- `Lexer` is `pub`; `parse`/`parse_one_unit` take `&mut Lexer`; `parse_str`
-  convenience exists; all callers updated.
+- The pull is fallible (`Result<…, LexError>`); lex errors (main line and alias
+  bodies) propagate via `?` to `ParseError::Lex(Box<LexError>)`, with today's effect.
+  No `pending_error`/`take_error` stash.
+- `Lexer` is `pub`; `parse`/`parse_one_unit` take `&mut Lexer`; `new_live` builds
+  the alias-expanding REPL/source lexer; all callers updated.
 - All direct tests pass; `cargo test --workspace` green; all 152 harnesses green
   (release), alias harnesses included; 0 warnings.

@@ -133,6 +133,18 @@ parser see expansion structure as real tokens (full separation). Open whether
 this is worth it — the Word/WordPart model is reasonable and Phase C is the
 biggest change. Deferred; not required for A or B.
 
+**Dependency-direction debt (surfaced by v239, fix in a later round).** Because
+`parse_substitution_body` lives in `lexer.rs` and calls `command::parse`, the
+lexer depends on the parser: `LexError::SubstitutionParseError` wraps a
+`ParseError`. v239 adds the reverse edge — `ParseError::Lex(LexError)` so the
+parser can surface a lex error hit mid-pull (e.g. a bad alias body) — which closes
+the two enums into a **recursive type** (E0072). v239 breaks the cycle with a
+`Box<LexError>` as a deliberate stopgap. The correct fix is to **remove the
+lexer→parser edge**: the parser (not the lexer) parses `$(…)`/`${…}` bodies, so
+`LexError` no longer contains a `ParseError` and the `Box` becomes unnecessary.
+That is precisely Phase C (comsub stops recursive re-lex+parse inside the lexer).
+Until then, keep the `Box`; do not add more lexer→parser calls.
+
 ## Section 3 — the mode set (OPEN)
 
 Map the ~30 current scanners onto a small set of parser-pushable modes vs.
