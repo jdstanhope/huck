@@ -91,6 +91,16 @@ impl<'a> CharCursor<'a> {
     pub fn slice_from(&self, start: usize) -> &str {
         &self.s[start..self.pos]
     }
+
+    /// Reposition the cursor to a byte offset with explicit line/column, clearing
+    /// any pending 1-char peek. Used by `Lexer::rewind` to re-lex from a checkpoint.
+    pub fn seek(&mut self, offset: usize, line: u32, column: u32) {
+        self.pos = offset;
+        self.line = line;
+        self.column = column;
+        self.peeked = None;
+        self.peeked_len = 0;
+    }
 }
 
 impl Iterator for CharCursor<'_> {
@@ -500,6 +510,27 @@ pub(crate) enum Mode {
     HeredocBody,    // <<EOF …
 }
 
+/// A checkpoint of the lexer's scanning state. `rewind` restores it and re-lexes
+/// from `resume`. Taken only at a pull boundary (no word mid-accumulation), so
+/// the word-accumulation buffers need not be captured.
+///
+/// NOTE: `mark`/`rewind` must not span heredoc-body collection — `pending_heredocs`
+/// is intentionally not captured; that interaction is designed when heredocs enter
+/// the mode stack.
+#[derive(Debug, Clone)]
+pub(crate) struct Mark {
+    pos: usize,                 // self.pos (pull index) at mark time
+    resume: (usize, u32, u32),  // (offset, line, column) to resume scanning from
+    brace_expand: bool,
+    has_token: bool,
+    in_assignment_value: bool,
+    dbracket_depth: u32,
+    expect_regex: bool,
+    opts: LexerOptions,
+    alias_trailing_eligible: bool,
+    modes: Vec<Mode>,
+}
+
 /// Incremental tokenizer state (v238 Phase A). Holds what were
 /// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
 /// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
@@ -574,6 +605,61 @@ impl<'a> Lexer<'a> {
         let m = self.modes.pop().expect("pop_mode on an empty mode stack");
         debug_assert!(!self.modes.is_empty(), "Command is the floor and must never be popped");
         m
+    }
+
+    /// Checkpoint the scanning state for a later `rewind`. Must be called at a
+    /// pull boundary (no partial word). The resume point is the span of the
+    /// next-to-hand-out token when lookahead is buffered, else the live cursor.
+    ///
+    /// NOTE: `mark`/`rewind` must not span heredoc-body collection —
+    /// `pending_heredocs` is intentionally not captured; that interaction is
+    /// designed when heredocs enter the mode stack.
+    #[allow(dead_code)] // dormant until parser calls it in Phase C iterations
+    pub(crate) fn mark(&self) -> Mark {
+        debug_assert!(
+            self.current.is_empty() && self.parts.is_empty() && !self.has_token,
+            "mark() must be taken at a pull boundary (no word mid-accumulation)"
+        );
+        let resume = if self.pos < self.history.len() {
+            let s = self.history[self.pos].span;
+            (s.offset, s.line, s.column)
+        } else {
+            (self.cursor.offset(), self.cursor.line(), self.cursor.column())
+        };
+        Mark {
+            pos: self.pos,
+            resume,
+            brace_expand: self.brace_expand,
+            has_token: self.has_token,
+            in_assignment_value: self.in_assignment_value,
+            dbracket_depth: self.dbracket_depth,
+            expect_regex: self.expect_regex,
+            opts: self.opts,
+            alias_trailing_eligible: self.alias_trailing_eligible,
+            modes: self.modes.clone(),
+        }
+    }
+
+    /// Restore a `Mark`: discard buffered/produced tokens at/after it, seek the
+    /// cursor back, and restore flags + mode stack. The next pull re-lexes from
+    /// the checkpoint under the now-current mode. A replay (`from_tokens`) lexer
+    /// never scans, so history is left intact and only `pos`/flags are reset.
+    #[allow(dead_code)] // dormant until parser calls it in Phase C iterations
+    pub(crate) fn rewind(&mut self, m: &Mark) {
+        debug_assert!(m.pos <= self.history.len(), "rewind target beyond history");
+        if !self.replay {
+            self.history.truncate(m.pos);
+            self.cursor.seek(m.resume.0, m.resume.1, m.resume.2);
+        }
+        self.pos = m.pos;
+        self.brace_expand = m.brace_expand;
+        self.has_token = m.has_token;
+        self.in_assignment_value = m.in_assignment_value;
+        self.dbracket_depth = m.dbracket_depth;
+        self.expect_regex = m.expect_regex;
+        self.opts = m.opts;
+        self.alias_trailing_eligible = m.alias_trailing_eligible;
+        self.modes = m.modes.clone();
     }
 
     /// Scan one step under the current mode. v240: only `Command` is implemented;
@@ -9547,6 +9633,96 @@ mod array_parse_tests {
         let mut lx = Lexer::new_live("x", &m, LexerOptions::default());
         let r = crate::command::parse(&mut lx);
         assert!(matches!(r, Err(crate::command::ParseError::Lex(_))));
+    }
+
+    // --- Task 2 (v240): mark/rewind checkpoint tests ---
+
+    #[test]
+    fn rewind_reproduces_tokens_same_mode() {
+        let mut lx = Lexer::new("echo one two; echo three", LexerOptions::default(), true);
+        let m = lx.mark();
+        let first: Vec<Token> = (0..4).map(|_| lx.next_token().unwrap().unwrap()).collect();
+        lx.rewind(&m);
+        let again: Vec<Token> = (0..4).map(|_| lx.next_token().unwrap().unwrap()).collect();
+        // `Token` equality compares kind (v237's kind-only PartialEq); compare spans
+        // separately to prove the cursor reset to the exact byte offsets.
+        assert_eq!(first, again);
+        let first_spans: Vec<Span> = first.iter().map(|t| t.span).collect();
+        let again_spans: Vec<Span> = again.iter().map(|t| t.span).collect();
+        assert_eq!(first_spans, again_spans);
+    }
+
+    #[test]
+    fn rewind_across_buffered_lookahead() {
+        let mut lx = Lexer::new("alpha beta gamma", LexerOptions::default(), true);
+        // Buffer history[0] without consuming it (pos stays 0) so mark() resumes
+        // from the buffered token's span, not the advanced cursor.
+        lx.fill_to(0).unwrap();
+        assert_eq!(lx.pos, 0);
+        assert!(lx.history.len() >= 1);
+        let m = lx.mark();
+        let a = lx.next_token().unwrap().unwrap();
+        let b = lx.next_token().unwrap().unwrap();
+        lx.rewind(&m);
+        let a2 = lx.next_token().unwrap().unwrap();
+        let b2 = lx.next_token().unwrap().unwrap();
+        assert_eq!(a, a2);
+        assert_eq!(b, b2);
+        assert_eq!((a.span, b.span), (a2.span, b2.span));
+    }
+
+    #[test]
+    fn rewind_restores_line_and_column() {
+        let mut lx = Lexer::new("a\nbb\nccc", LexerOptions::default(), true);
+        let _ = lx.next_token().unwrap().unwrap(); // Word "a" (line 1)
+        let _ = lx.next_token().unwrap().unwrap(); // Newline (line 1)
+        let m = lx.mark();                         // at start of "bb" on line 2
+        let bb1 = lx.next_token().unwrap().unwrap().span;
+        assert_eq!(bb1.line, 2);
+        lx.rewind(&m);
+        let bb2 = lx.next_token().unwrap().unwrap().span;
+        assert_eq!((bb1.offset, bb1.line, bb1.column), (bb2.offset, bb2.line, bb2.column));
+    }
+
+    #[test]
+    fn rewind_restores_mode_stack() {
+        let mut lx = Lexer::new("x", LexerOptions::default(), true);
+        lx.push_mode(Mode::Arith);
+        let m = lx.mark();
+        lx.push_mode(Mode::CommandSub);
+        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        lx.rewind(&m);
+        assert_eq!(lx.current_mode(), Mode::Arith);
+        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.current_mode(), Mode::Command);
+    }
+
+    #[test]
+    fn rewind_restores_scalar_flags() {
+        let mut lx = Lexer::new("[[ $x =~ ab*c ]] && echo y", LexerOptions::default(), true);
+        let _ = lx.next_token().unwrap().unwrap(); // [[
+        let _ = lx.next_token().unwrap().unwrap(); // $x
+        assert_eq!(lx.dbracket_depth, 1);          // inside [[ … ]]
+        let m = lx.mark();
+        while lx.next_token().unwrap().is_some() {} // drain to EOF; depth returns to 0
+        assert_eq!(lx.dbracket_depth, 0);
+        lx.rewind(&m);
+        assert_eq!(lx.dbracket_depth, 1);          // restored from the snapshot
+    }
+
+    #[test]
+    fn rewind_on_replay_lexer_does_not_truncate() {
+        let toks = tokenize_with_opts("echo hi there", LexerOptions::default()).unwrap();
+        let mut lx = Lexer::from_tokens(toks);
+        let m = lx.mark();
+        let a = lx.next_token().unwrap().unwrap();
+        let _ = lx.next_token().unwrap().unwrap();
+        let len_before = lx.history.len();
+        lx.rewind(&m);
+        assert_eq!(lx.history.len(), len_before); // replay history is NOT truncated
+        let a2 = lx.next_token().unwrap().unwrap();
+        assert_eq!(a, a2);
+        assert_eq!(a.span, a2.span);
     }
 }
 
