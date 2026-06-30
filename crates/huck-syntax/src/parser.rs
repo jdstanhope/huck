@@ -4,7 +4,10 @@
 #![allow(dead_code, unused_imports)]
 
 use crate::command::ParseError;
-use crate::lexer::{Lexer, Mode, ParamModifier, ParamOpKind, SubscriptKind, TokenKind, Word, WordPart};
+use crate::lexer::{
+    CaseDirection, Lexer, Mode, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
+    SubscriptKind, TokenKind, TransformOp, Word, WordPart,
+};
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
 /// at a boundary atom (`ParamClose` / `ParamSep` / `RBracket`).  Does NOT
@@ -151,9 +154,20 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 
     // 5. Dispatch on `ParamClose` (bare/length/indirect/subscript) or `ParamOp`.
     let result = match iter.next_kind()? {
+        // ── Bare close: ${name}, ${#name}, ${!name}, ${name[sub]}, ${@}, ${*}, ${}
         Some(TokenKind::ParamClose) => {
-            if subscript.is_some() {
-                // `${a[i]}` / `${a[@]}` / `${a[*]}`
+            if indirect && matches!(subscript, Some(SubscriptKind::All) | Some(SubscriptKind::Star)) {
+                // `${!arr[@]}` / `${!arr[*]}` — indirect array-keys form.
+                // Mirrors the production: IndirectKeys modifier, indirect:false.
+                WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::IndirectKeys,
+                    quoted,
+                    subscript,
+                    indirect: false,
+                }
+            } else if subscript.is_some() {
+                // `${a[i]}` / `${a[@]}` / `${a[*]}` — bare subscripted reference.
                 WordPart::ParamExpansion {
                     name,
                     modifier: ParamModifier::None,
@@ -162,7 +176,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     indirect,
                 }
             } else if indirect {
-                // `${!name}` — indirect scalar expansion.
+                // `${!name}` — indirect scalar expansion with no modifier.
                 WordPart::ParamExpansion {
                     name,
                     modifier: ParamModifier::None,
@@ -171,7 +185,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     indirect: true,
                 }
             } else if length_form {
-                // `${#name}` — string/array length.
+                // `${#name}` — length.
                 WordPart::ParamExpansion {
                     name,
                     modifier: ParamModifier::Length,
@@ -179,50 +193,219 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     subscript: None,
                     indirect: false,
                 }
+            } else if name == "@" {
+                // `${@}` — all positional args (joined=false).
+                // Mirrors `scan_braced_param_expansion`'s `Some('@')` early-return.
+                WordPart::AllArgs { quoted, joined: false }
+            } else if name == "*" {
+                // `${*}` — all positional args (joined=true).
+                WordPart::AllArgs { quoted, joined: true }
+            } else if name.is_empty() {
+                // `${}` — bad substitution at runtime.
+                WordPart::ParamExpansion {
+                    name: String::new(),
+                    modifier: ParamModifier::BadSubst { raw: "${}".to_string() },
+                    quoted,
+                    subscript: None,
+                    indirect: false,
+                }
             } else {
                 // `${name}` — plain variable reference.
-                // Matches production's bare `Var` for unmodified braced references.
                 WordPart::Var { name, quoted }
             }
         }
 
+        // ── Operator: pattern removal, substitute, case, transform, substring
         Some(TokenKind::ParamOp(op_kind)) => {
-            // Production passes `enclosing_dquote=false` specifically for
-            // ErrorIfUnset; all other value-family ops use the outer `quoted`.
-            let op_quoted = match op_kind {
-                ParamOpKind::ErrorIfUnset(_) => false,
-                _ => quoted,
-            };
-            iter.push_mode(Mode::ParamWordOperand { in_dquote: false });
-            let word = match parse_word(iter, op_quoted) {
-                Ok(w) => w,
-                Err(e) => {
-                    iter.pop_mode(); // ParamWordOperand
-                    iter.pop_mode(); // ParamExpansion
-                    return Err(e);
+            // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
+            // NOTE: macros are scoped to this function.
+            macro_rules! word_in_mode {
+                ($mode:expr, $wquoted:expr) => {{
+                    iter.push_mode($mode);
+                    match parse_word(iter, $wquoted) {
+                        Ok(w) => {
+                            iter.pop_mode();
+                            w
+                        }
+                        Err(e) => {
+                            iter.pop_mode(); // the operand mode
+                            iter.pop_mode(); // ParamExpansion
+                            return Err(e);
+                        }
+                    }
+                }};
+            }
+            // Macro: consume ParamClose; on failure pop ParamExpansion and return Err.
+            macro_rules! expect_close {
+                () => {
+                    match iter.next_kind()? {
+                        Some(TokenKind::ParamClose) => {}
+                        _ => {
+                            iter.pop_mode(); // ParamExpansion
+                            return Err(ParseError::UnsupportedExpansion);
+                        }
+                    }
+                };
+            }
+
+            match op_kind {
+                // ── Value family: UseDefault / AssignDefault / ErrorIfUnset / UseAlternate
+                // Production: `modifier_with_operand(chars, quoted/false, ...)`.
+                // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
+                ParamOpKind::UseDefault(colon) => {
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::UseDefault { word, colon },
+                        quoted, subscript, indirect,
+                    }
                 }
-            };
-            iter.pop_mode(); // ParamWordOperand
-            // Expect closing `}`.
-            match iter.next_kind()? {
-                Some(TokenKind::ParamClose) => {}
-                _ => {
-                    iter.pop_mode(); // ParamExpansion
-                    return Err(ParseError::UnsupportedExpansion);
+                ParamOpKind::AssignDefault(colon) => {
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::AssignDefault { word, colon },
+                        quoted, subscript, indirect,
+                    }
+                }
+                ParamOpKind::ErrorIfUnset(colon) => {
+                    // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::ErrorIfUnset { word, colon },
+                        quoted, subscript, indirect,
+                    }
+                }
+                ParamOpKind::UseAlternate(colon) => {
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::UseAlternate { word, colon },
+                        quoted, subscript, indirect,
+                    }
+                }
+
+                // ── Pattern removal: RemovePrefix / RemoveSuffix
+                // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
+                ParamOpKind::RemovePrefix(longest) => {
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::RemovePrefix { pattern, longest },
+                        quoted, subscript, indirect,
+                    }
+                }
+                ParamOpKind::RemoveSuffix(longest) => {
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::RemoveSuffix { pattern, longest },
+                        quoted, subscript, indirect,
+                    }
+                }
+
+                // ── Substitute: ${var/pat/repl} / ${var//…} / ${var/#…} / ${var/%…}
+                // Pattern in ParamSubstPatternOperand (sep=/); replacement in ParamWordOperand.
+                // Both operands: enclosing_dquote=false (mirrors scan_substitution_operand).
+                // Absent replacement (no ParamSep) → empty Word, matching bash ${var/pat}.
+                ParamOpKind::Substitute(subst_kind) => {
+                    let (anchor, all) = match subst_kind {
+                        SubstKind::First  => (SubstAnchor::None,   false),
+                        SubstKind::All    => (SubstAnchor::None,   true),
+                        SubstKind::Prefix => (SubstAnchor::Prefix, false),
+                        SubstKind::Suffix => (SubstAnchor::Suffix, false),
+                    };
+
+                    // Pattern in subst-pattern mode (sep = `/`).
+                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false });
+                    let pattern = match parse_word(iter, false) {
+                        Ok(w) => { iter.pop_mode(); w }
+                        Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                    };
+
+                    // Optional `/replacement`.
+                    let replacement =
+                        if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
+                            iter.next_kind()?; // consume `/`
+                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false)
+                        } else {
+                            Word(vec![])
+                        };
+
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name,
+                        modifier: ParamModifier::Substitute { pattern, replacement, anchor, all },
+                        quoted, subscript, indirect,
+                    }
+                }
+
+                // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
+                // Production: `scan_optional_braced_operand` — empty body → None.
+                ParamOpKind::Case(direction, all) => {
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    expect_close!();
+                    let pattern = if word.0.is_empty() { None } else { Some(word) };
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::Case { direction, all, pattern },
+                        quoted, subscript, indirect,
+                    }
+                }
+
+                // ── Transform: ${var@Q} / ${var@U} / etc.
+                // No operand: the operator letter was already consumed by the head mode.
+                // Only a ParamClose follows.
+                ParamOpKind::Transform(op) => {
+                    expect_close!();
+                    WordPart::ParamExpansion {
+                        name, modifier: ParamModifier::Transform { op },
+                        quoted, subscript, indirect,
+                    }
+                }
+
+                // ── Substring: ${var:offset} / ${var:offset:length}
+                // Offset in ParamSubstringOffsetOperand (sep = `:`); length in ParamWordOperand.
+                // Empty offset (${var:}) → BadSubst, matching dispatch_braced_modifier's
+                // `Some(':') / Some('}') → recover_bad_subst` branch.
+                ParamOpKind::Substring => {
+                    // Offset in substring-offset mode (sep = `:`).
+                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false });
+                    let offset = match parse_word(iter, false) {
+                        Ok(w) => { iter.pop_mode(); w }
+                        Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                    };
+
+                    // Optional `:length`.
+                    let length =
+                        if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
+                            iter.next_kind()?; // consume `:`
+                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false))
+                        } else {
+                            None
+                        };
+
+                    expect_close!();
+
+                    if offset.0.is_empty() {
+                        // `${x:}` — bad substitution at runtime.  Raw reconstructed from name.
+                        let raw = format!("${{{name}:}}");
+                        WordPart::ParamExpansion {
+                            name: String::new(),
+                            modifier: ParamModifier::BadSubst { raw },
+                            quoted,
+                            subscript: None,
+                            indirect: false,
+                        }
+                    } else {
+                        WordPart::ParamExpansion {
+                            name,
+                            modifier: ParamModifier::Substring { offset, length },
+                            quoted, subscript, indirect,
+                        }
+                    }
                 }
             }
-            let modifier = match op_kind {
-                ParamOpKind::UseDefault(colon)    => ParamModifier::UseDefault    { word, colon },
-                ParamOpKind::AssignDefault(colon) => ParamModifier::AssignDefault { word, colon },
-                ParamOpKind::ErrorIfUnset(colon)  => ParamModifier::ErrorIfUnset  { word, colon },
-                ParamOpKind::UseAlternate(colon)  => ParamModifier::UseAlternate  { word, colon },
-                _ => {
-                    // Task 5 fills the remaining operators (pattern, substring, case, transform).
-                    iter.pop_mode(); // ParamExpansion
-                    unimplemented!("parse_param_expansion: operator not yet implemented (Task 5)")
-                }
-            };
-            WordPart::ParamExpansion { name, modifier, quoted, subscript, indirect }
         }
 
         _ => {
@@ -240,8 +423,9 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 mod tests {
     use super::*;
     use crate::lexer::{
-        tokenize_with_opts, Lexer, LexerOptions, Mode, ParamModifier, ParamOpKind,
-        SubstKind, SubscriptKind, TokenKind, Word, WordPart,
+        tokenize_with_opts, CaseDirection, Lexer, LexerOptions, Mode, ParamModifier,
+        ParamOpKind, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
+        WordPart,
     };
     use crate::command::ParseError;
 
@@ -344,5 +528,110 @@ mod tests {
         // heuristic got this wrong; carrying quoted on the atom fixes it.
         diff_ok("${x:-\"${y}c\"}");
         diff_ok("${x:-\"$v${y}\"}");
+    }
+
+    // ── T5 tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_removal_and_case() {
+        for s in [
+            "${x#p}", "${x##p}", "${x%p}", "${x%%p}",
+            "${x^p}", "${x^^}", "${x,p}", "${x,,}",
+            "${x#$a}", "${x##${p}}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_substitute() {
+        for s in [
+            "${x/p/r}", "${x//p/r}", "${x/#p/r}", "${x/%p/r}",
+            "${x/p}", "${x//p}", "${x/$a/$b}", "${x/p/}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_substring() {
+        for s in [
+            "${x:1}", "${x:1:2}", "${x:$o}", "${x:$o:$l}", "${x: -1}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_transform() {
+        for s in [
+            "${x@Q}", "${x@P}", "${x@U}", "${x@L}", "${x@u}",
+            "${x@E}", "${x@A}", "${x@K}", "${x@k}", "${x@a}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_indirect_and_special() {
+        // NOTE: `${!pre*}` / `${!pre@}` (PrefixNames) are NOT tested here because
+        // the head mode's post-name path for unrecognised chars (`*`, `@` when not
+        // a valid Transform letter) consumes to `}` and emits ParamClose — making
+        // `${!pre*}` atom-identical to `${!pre}`.  This is a T2 head-mode
+        // limitation; fixing it requires the head mode to emit a distinct marker
+        // for `*`/`@` in indirect-prefix context.  Deferred to a follow-up task.
+        for s in [
+            "${!x}", "${!x[@]}", "${!x[*]}",
+            "${@}", "${*}", "${#}", "${?}", "${$}", "${!}", "${-}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_badsubst() {
+        // `${x@}` is NOT tested here: the head mode's `@` arm (post-name) emits
+        // ParamClose after consuming `@+}` on the bad-op path, making the token
+        // stream for `${x@}` identical to `${x}`.  The parser cannot distinguish
+        // them without a dedicated bad-subst atom from the head mode.
+        // Deferred to a T2/T3 head-mode fix.
+        assert_eq!(new_part("${}", false), old_part("${}", false), "badsubst ${{}}");
+        assert_eq!(new_part("${x:}", false), old_part("${x:}", false), "badsubst ${{x:}}");
+    }
+
+    #[test]
+    fn diff_dquote_operands() {
+        // T3 fix: double-quoted operands tokenize FLAT (per-frame in_dquote). A simple
+        // `"…"` is one quoted Lit (`}` stays literal); a `"…"` with a nested `${}` recurses.
+        // These MUST match the production lexer's flat WordPart::Literal{quoted:true}
+        // (no Quoted wrapper — verified at parse_braced_operand_opts lexer.rs:3735).
+        for s in [
+            "${x:-\"a}b\"}",
+            "${x:-\"a${y}b\"}",
+            "${x:-\"$v\"}",
+            "${x:-pre\"mid\"post}",
+            "${x#\"$p\"}",
+            "${x/\"a/b\"/c}",
+        ] {
+            diff_ok(s);
+        }
+    }
+
+    #[test]
+    fn diff_deferred_returns_unsupported() {
+        use crate::lexer::{Lexer, LexerOptions};
+        // $(…)/arith/backtick remain deferred even INSIDE a double-quoted operand.
+        for s in [
+            "${x:-$(cmd)}", "${x:-$((1+1))}", "${x:-`cmd`}", "${x:-\"$(cmd)\"}",
+        ] {
+            let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+            assert!(
+                matches!(
+                    parse_param_expansion(&mut lx, false),
+                    Err(crate::command::ParseError::UnsupportedExpansion)
+                ),
+                "expected UnsupportedExpansion for {s}"
+            );
+        }
     }
 }
