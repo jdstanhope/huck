@@ -1,4 +1,4 @@
-use crate::lexer::{Lexer, Operator, Token, TokenKind, Word, WordPart};
+use crate::lexer::{Lexer, Operator, TokenKind, Word, WordPart};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Keyword {
@@ -787,9 +787,8 @@ fn parse_cursor(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     Ok(Some(seq))
 }
 
-pub fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
-    let mut iter = Lexer::from_tokens(tokens);
-    parse_cursor(&mut iter)
+pub fn parse(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    parse_cursor(iter)
 }
 
 /// Parse ONE top-level command unit from a pre-tokenized stream, stopping at
@@ -1012,6 +1011,7 @@ fn parse_command_inner(
     iter: &mut Lexer,
 ) -> Result<Command, ParseError> {
     skip_newlines(iter)?;
+    iter.expand_command_alias()?;
 
     // Standalone arith block: `((expr))` at command position.
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
@@ -2156,7 +2156,16 @@ fn parse_simple_stage(
         }
     }
 
-    while let Some(token) = iter.peek_kind()? {
+    loop {
+        // Trailing-blank alias chain: if the last command-position expansion
+        // ended with a blank, the next argument word is eligible for alias
+        // expansion too. take_trailing_eligible() returns true at most once
+        // per expansion (it resets the flag), so this is a no-op in the
+        // overwhelmingly common non-alias or non-trailing-blank case.
+        if iter.take_trailing_eligible() {
+            iter.expand_command_alias()?;
+        }
+        let Some(token) = iter.peek_kind()? else { break };
         if matches!(
             token,
             TokenKind::Op(
@@ -2280,6 +2289,7 @@ fn parse_simple_stage(
 fn parse_next_stage(
     iter: &mut Lexer,
 ) -> Result<(Command, bool), ParseError> {
+    iter.expand_command_alias()?;
     // Standalone arith block: `((expr))` at pipeline-stage position
     // (e.g., `((x++)) | cat`). Mirrors the dispatch in parse_command.
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
@@ -2779,7 +2789,14 @@ fn parse_double_bracket_with_assigns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::WordPart;
+    use crate::lexer::{Token, WordPart};
+
+    /// Test-only: accept a token vec and feed it through a from_tokens Lexer.
+    /// Shadows the public `parse(&mut Lexer)` so existing test code that passes
+    /// `Vec<Token>` doesn't need to be changed.
+    fn parse(tokens: Vec<Token>) -> Result<Option<Sequence>, ParseError> {
+        super::parse(&mut Lexer::from_tokens(tokens))
+    }
 
     fn w_tok(s: &str) -> Token {
         TokenKind::Word(Word(vec![WordPart::Literal { text: s.to_string(), quoted: false }])).into()

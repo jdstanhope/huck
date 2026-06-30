@@ -40,7 +40,7 @@ fn main() {
         }
     };
 
-    let sequence = match parse(tokens) {
+    let sequence = match parse(&mut huck_syntax::lexer::Lexer::from_tokens(tokens)) {
         Ok(Some(s)) => s,
         Ok(None) => {
             println!("(empty input)");

@@ -16,10 +16,11 @@
 //!
 //! ```rust
 //! use huck_syntax::{parse, tokenize};
+//! use huck_syntax::lexer::Lexer;
 //!
 //! let src = "echo hello";
 //! let tokens = tokenize(src).expect("lex");
-//! let seq = parse(tokens).expect("parse").expect("non-empty");
+//! let seq = parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
 //! // The Sequence has a first Command and no trailing commands.
 //! assert!(seq.rest.is_empty());
 //! assert!(!seq.background);

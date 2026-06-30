@@ -1305,6 +1305,7 @@ impl<'a> Lexer<'a> {
     /// trailing-blank, span inheritance). Body tokens take the alias-name span.
     fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
         self.fill_to(self.pos)?;
+        self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
         let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
         let TokenKind::Word(w) = &tok.kind else { return Ok(()) };
         let Some(name) = word_literal_text(w) else { return Ok(()) };
@@ -1327,14 +1328,28 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    pub fn peek_command_kind(&mut self) -> Result<Option<&TokenKind>, LexError> {
-        self.maybe_expand_command_alias()?;
-        self.peek_kind()
+    /// Expand the alias at command position. Call this at the top of any
+    /// command-position parse entry point; the parser then reads via the plain
+    /// `peek_kind`/`next_kind` API which sees the already-expanded history.
+    pub fn expand_command_alias(&mut self) -> Result<(), LexError> {
+        self.maybe_expand_command_alias()
     }
 
-    pub fn next_command(&mut self) -> Result<Option<Token>, LexError> {
-        self.maybe_expand_command_alias()?;
-        self.next()
+    /// Return and reset the trailing-blank eligibility flag. Returns `true`
+    /// (and clears to `false`) when the most recent alias expansion ended with
+    /// a blank, making the next argument word eligible for alias expansion.
+    pub fn take_trailing_eligible(&mut self) -> bool {
+        let e = self.alias_trailing_eligible;
+        self.alias_trailing_eligible = false;
+        e
+    }
+
+    /// Build a live lexer for the REPL: the lexer scans `input` incrementally
+    /// and expands registered aliases at command position.
+    pub fn new_live(input: &'a str, aliases: &std::collections::HashMap<String, String>, opts: LexerOptions) -> Lexer<'a> {
+        let mut lx = Lexer::new(input, opts, true);
+        lx.aliases = aliases.clone();
+        lx
     }
 }
 
@@ -3024,7 +3039,8 @@ fn parse_substitution_body(body: &str, opts: LexerOptions) -> Result<crate::comm
     // ("unknown"), matching pre-span behavior (script-relative $LINENO inside
     // `$( )` would need offset propagation, out of scope here).
     for t in &mut tokens { t.span.line = 0; }
-    let parsed = crate::command::parse(tokens).map_err(LexError::SubstitutionParseError)?;
+    let mut lx = Lexer::from_tokens(tokens);
+    let parsed = crate::command::parse(&mut lx).map_err(LexError::SubstitutionParseError)?;
     Ok(parsed.unwrap_or_else(empty_sequence))
 }
 
@@ -8650,7 +8666,7 @@ mod array_parse_tests {
     /// `name=value cmd args` inline-prefix shapes.
     fn parse_assignments(input: &str) -> Vec<Assignment> {
         let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -8666,7 +8682,7 @@ mod array_parse_tests {
     /// name matches.
     fn find_param_expansion(input: &str, name: &str) -> WordPart {
         let tokens = crate::lexer::tokenize(input).expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -8892,7 +8908,7 @@ mod array_parse_tests {
         // ParamExpansion. Verify by checking that no ParamExpansion
         // appears at all.
         let tokens = crate::lexer::tokenize("echo ${a}").expect("lex");
-        let seq = crate::command::parse(tokens).expect("parse").expect("non-empty");
+        let seq = crate::command::parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             _ => panic!(),
@@ -9385,8 +9401,10 @@ mod array_parse_tests {
     #[test]
     fn alias_expands_at_command_position() {
         let mut lx = lx_with_alias("ll /tmp", &[("ll", "ls -l")]);
-        assert_eq!(lx.peek_command_kind().unwrap().map(wtext), Some("ls".into()));
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.peek_kind().unwrap().map(|k| wtext(k)), Some("ls".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
         assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-l".into()));
         assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("/tmp".into()));
     }
@@ -9394,34 +9412,39 @@ mod array_parse_tests {
     #[test]
     fn alias_not_expanded_at_argument_position() {
         let mut lx = lx_with_alias("echo ll", &[("ll", "ls -l")]);
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
         assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("ll".into()));
     }
 
     #[test]
     fn alias_recursion_guard_terminates() {
         let mut lx = lx_with_alias("ls", &[("ls", "ls -a")]);
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
         assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-a".into()));
     }
 
     #[test]
     fn alias_trailing_blank_makes_next_word_eligible() {
         let mut lx = lx_with_alias("a c", &[("a", "b "), ("c", "d")]);
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
     }
 
     #[test]
     fn quoted_word_not_expanded() {
         let mut lx = lx_with_alias("'ll'", &[("ll", "ls")]);
-        assert_eq!(lx.next_command().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
+        lx.expand_command_alias().unwrap();
+        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
     }
 
     #[test]
     fn bad_alias_body_returns_err() {
         let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
-        assert!(lx.next_command().is_err());
+        assert!(lx.expand_command_alias().is_err());
     }
 }
 

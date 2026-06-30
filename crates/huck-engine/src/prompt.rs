@@ -247,7 +247,7 @@ fn scan_backtick_close(bytes: &[u8], start: usize) -> Option<usize> {
 /// lex/parse error returns an empty string.
 fn run_prompt_cmdsub(body: &str, shell: &mut Shell) -> String {
     let raw = match crate::lexer::tokenize(body) {
-        Ok(toks) => match crate::command::parse(toks) {
+        Ok(toks) => match crate::command::parse(&mut crate::lexer::Lexer::from_tokens(toks)) {
             Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
             _ => String::new(),
         },
