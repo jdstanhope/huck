@@ -15,12 +15,6 @@ use crate::lexer::{Lexer, Mode, ParamModifier, ParamOpKind, SubscriptKind, Token
 /// `quoted`.  Nested `${…}` expansions inherit the effective quoted value.
 pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError> {
     let mut parts = Vec::new();
-    // Tracks whether the most-recently seen `Lit` atom was emitted inside a
-    // `"…"` span of the operand.  Used to propagate `quoted:true` into a
-    // following `ParamOpen` or `DollarName` that immediately follows quoted
-    // literal text (e.g. `"a${y}b"` in an operand: `Lit{"a",q:true}` sets
-    // this, then the `${y}` inherits `true`).
-    let mut in_dquote_span = false;
 
     loop {
         // ── boundary: stop without consuming ─────────────────────────────────
@@ -36,8 +30,14 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
         // ── nested `${…}` ────────────────────────────────────────────────────
         // `parse_param_expansion` owns its push/pop and consumes the buffered
         // `ParamOpen` token — we must NOT consume it here first.
-        if matches!(iter.peek_kind()?, Some(TokenKind::ParamOpen)) {
-            let eff = quoted || in_dquote_span;
+        if matches!(iter.peek_kind()?, Some(TokenKind::ParamOpen { .. })) {
+            // The atom carries its own `quoted` context (set by the lexer from
+            // its per-frame `in_dquote` flag); OR with the enclosing `quoted`.
+            let atom_q = match iter.peek_kind()? {
+                Some(TokenKind::ParamOpen { quoted: q }) => *q,
+                _ => unreachable!(),
+            };
+            let eff = quoted || atom_q;
             let p = parse_param_expansion(iter, eff)?;
             parts.push(p);
             continue;
@@ -47,15 +47,12 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
         let kind = iter.next_kind()?.expect("non-boundary atom after peek");
         match kind {
             TokenKind::Lit { text, quoted: atom_q } => {
-                // A `Lit{quoted:true}` was emitted inside a `"…"` span; record
-                // this so a following `ParamOpen` / `DollarName` inherits it.
-                in_dquote_span = atom_q;
                 parts.push(WordPart::Literal { text, quoted: atom_q || quoted });
             }
-            TokenKind::DollarName(n) => {
-                // DollarName carries no `quoted` field; use the enclosing
-                // quoted value (or the in-dquote-span flag if applicable).
-                let eff = quoted || in_dquote_span;
+            TokenKind::DollarName { name: n, quoted: atom_q } => {
+                // The atom carries its own `quoted` context (set by the lexer
+                // from its per-frame `in_dquote` flag); OR with enclosing.
+                let eff = quoted || atom_q;
                 let part = match n.as_str() {
                     "@" => WordPart::AllArgs   { quoted: eff, joined: false },
                     "*" => WordPart::AllArgs   { quoted: eff, joined: true  },
@@ -100,7 +97,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // 1. Push the mode and consume the `ParamOpen` (`${`) token.
     iter.push_mode(Mode::ParamExpansion { seen_name: false });
     match iter.next_kind()? {
-        Some(TokenKind::ParamOpen) => {}
+        Some(TokenKind::ParamOpen { .. }) => {}
         _ => {
             iter.pop_mode();
             return Err(ParseError::UnsupportedExpansion);
@@ -303,7 +300,7 @@ mod tests {
 
     #[test]
     fn scaffolding_types_exist() {
-        let _ = TokenKind::ParamOpen;
+        let _ = TokenKind::ParamOpen { quoted: false };
         let _ = TokenKind::Lit { text: "x".into(), quoted: false };
         let _ = ParamOpKind::Substitute(SubstKind::All);
         let _ = Mode::ParamWordOperand { in_dquote: false };
@@ -336,8 +333,16 @@ mod tests {
     fn diff_dquote_operand() {
         // Confirm T3 flattening: `"a${y}b"` inside an operand produces
         // [Literal{"a",q:true}, Var{name:"y",q:true}, Literal{"b",q:true}].
-        // The `Lit{q:true}` before `ParamOpen` propagates in_dquote_span so
-        // the nested `${y}` is assembled with `quoted:true`.
+        // The atom now carries `quoted` directly, so the nested `${y}` is
+        // assembled with `quoted:true` without any heuristic.
         diff_ok("${x:-\"a${y}b\"}");
+    }
+
+    #[test]
+    fn diff_dquote_expansion_first() {
+        // dquote operand starting with the expansion (no leading literal) — the
+        // heuristic got this wrong; carrying quoted on the atom fixes it.
+        diff_ok("${x:-\"${y}c\"}");
+        diff_ok("${x:-\"$v${y}\"}");
     }
 }

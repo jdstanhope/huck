@@ -393,13 +393,13 @@ pub enum TokenKind {
     RedirFd(crate::command::RedirFd),
     // --- Phase C parser-driven atoms (dormant in v241; emitted only under the
     // ParamExpansion/operand modes, consumed only by parser.rs). ---
-    ParamOpen, ParamClose, LBracket, RBracket, ParamSep,
+    ParamOpen { quoted: bool }, ParamClose, LBracket, RBracket, ParamSep,
     ParamName(String),
     ParamLengthPrefix, ParamIndirect,
     #[allow(private_interfaces)] // ParamOpKind is pub(crate); TokenKind is pub — dormant in v241
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
-    DollarName(String),
+    DollarName { name: String, quoted: bool },
     DeferredExpansion,   // $( / $(( / backtick inside an operand — v241 stops here
 }
 
@@ -740,7 +740,7 @@ impl<'a> Lexer<'a> {
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
                 // seen_name is already false on the freshly-pushed frame; no reset needed.
-                self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
                 return Ok(Step::Produced);
             }
             // Cursor is at `$` but not followed by `{` — shouldn't happen in
@@ -1099,7 +1099,7 @@ impl<'a> Lexer<'a> {
                         Some('{') => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `{`
-                            self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
                         }
                         Some('(') => {
                             self.cursor.next(); // `$`
@@ -1109,17 +1109,17 @@ impl<'a> Lexer<'a> {
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // special char
-                            self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
                         }
                         Some(d) if d.is_ascii_digit() => {
                             self.cursor.next(); // `$`
                             let digit = self.cursor.next().unwrap();
-                            self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
                         }
                         Some(nc) if is_name_start(nc) => {
                             self.cursor.next(); // `$`
                             let name = scan_var_name(&mut self.cursor);
-                            self.history.push(Token::new(TokenKind::DollarName(name), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
                         }
                         _ => {
                             self.cursor.next(); // lone `$`
@@ -1178,7 +1178,7 @@ impl<'a> Lexer<'a> {
                         Some('{') => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `{`
-                            self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
                         }
                         // `$(` — emit DeferredExpansion; v241 stops at the opener.
                         Some('(') => {
@@ -1190,19 +1190,19 @@ impl<'a> Lexer<'a> {
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
                             self.cursor.next(); // special char
-                            self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
                         }
                         // Positional parameter: `$0`–`$9`.
                         Some(d) if d.is_ascii_digit() => {
                             self.cursor.next(); // `$`
                             let digit = self.cursor.next().unwrap();
-                            self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
                         }
                         // Regular variable name: `$name`.
                         Some(nc) if is_name_start(nc) => {
                             self.cursor.next(); // `$`
                             let name = scan_var_name(&mut self.cursor);
-                            self.history.push(Token::new(TokenKind::DollarName(name), Span::new(off, l, c)));
+                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
                         }
                         // Lone `$` — literal.
                         _ => {
@@ -1315,7 +1315,7 @@ impl<'a> Lexer<'a> {
                                     self.cursor.next(); // `{`
                                     // Emit ParamOpen; in_dquote=true survives the nested
                                     // ParamExpansion push/pop because it lives in our frame.
-                                    self.history.push(Token::new(TokenKind::ParamOpen, Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(in_off, in_l, in_c)));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some('(') => {
@@ -1327,19 +1327,19 @@ impl<'a> Lexer<'a> {
                                 Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                                     self.cursor.next(); // `$`
                                     self.cursor.next(); // special char
-                                    self.history.push(Token::new(TokenKind::DollarName(sp.to_string()), Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(in_off, in_l, in_c)));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(d) if d.is_ascii_digit() => {
                                     self.cursor.next(); // `$`
                                     let digit = self.cursor.next().unwrap();
-                                    self.history.push(Token::new(TokenKind::DollarName(digit.to_string()), Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(in_off, in_l, in_c)));
                                     self.set_operand_in_dquote(true);
                                 }
                                 Some(nc) if is_name_start(nc) => {
                                     self.cursor.next(); // `$`
                                     let name = scan_var_name(&mut self.cursor);
-                                    self.history.push(Token::new(TokenKind::DollarName(name), Span::new(in_off, in_l, in_c)));
+                                    self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(in_off, in_l, in_c)));
                                     self.set_operand_in_dquote(true);
                                 }
                                 _ => {
@@ -9606,7 +9606,7 @@ mod tests {
         assert_eq!(
             head_atoms("${name}"),
             vec![
-                TokenKind::ParamOpen,
+                TokenKind::ParamOpen { quoted: false },
                 TokenKind::ParamName("name".into()),
                 TokenKind::ParamClose,
             ]
@@ -9620,7 +9620,7 @@ mod tests {
         assert_eq!(
             a,
             vec![
-                TokenKind::ParamOpen,
+                TokenKind::ParamOpen { quoted: false },
                 TokenKind::ParamName("x".into()),
                 TokenKind::ParamOp(ParamOpKind::UseDefault(true)),
             ]
@@ -9632,7 +9632,7 @@ mod tests {
         assert_eq!(
             head_atoms("${#x}"),
             vec![
-                TokenKind::ParamOpen,
+                TokenKind::ParamOpen { quoted: false },
                 TokenKind::ParamLengthPrefix,
                 TokenKind::ParamName("x".into()),
                 TokenKind::ParamClose,
@@ -9641,7 +9641,7 @@ mod tests {
         assert_eq!(
             head_atoms("${!x}"),
             vec![
-                TokenKind::ParamOpen,
+                TokenKind::ParamOpen { quoted: false },
                 TokenKind::ParamIndirect,
                 TokenKind::ParamName("x".into()),
                 TokenKind::ParamClose,
@@ -9656,7 +9656,7 @@ mod tests {
             assert_eq!(
                 head_atoms(s),
                 vec![
-                    TokenKind::ParamOpen,
+                    TokenKind::ParamOpen { quoted: false },
                     TokenKind::ParamName(n.into()),
                     TokenKind::ParamClose,
                 ],
@@ -9670,7 +9670,7 @@ mod tests {
         // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
         let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
         lx.push_mode(Mode::ParamExpansion { seen_name: false });
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::LBracket));
     }
@@ -9692,7 +9692,7 @@ mod tests {
         lx.push_mode(Mode::ParamExpansion { seen_name: false });
 
         // Outer frame: pull ParamOpen (${ of outer).
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
         // Outer frame: pull ParamName("a") → seen_name becomes true.
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
         // Outer frame must now be in seen_name=true (post-name phase).
@@ -9704,7 +9704,7 @@ mod tests {
         // Simulate parser detecting nested ${b} and pushing a fresh inner frame.
         lx.push_mode(Mode::ParamExpansion { seen_name: false });
         // Inner frame: pull ParamOpen (the ${ of ${b}).
-        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
         // Inner frame: pull ParamName("b") → inner seen_name becomes true.
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "b"));
 
@@ -9751,12 +9751,12 @@ mod tests {
         // Plain `$a` followed by terminator.
         assert_eq!(
             operand_atoms("$a}", Mode::ParamWordOperand { in_dquote: false }),
-            vec![TokenKind::DollarName("a".into()), TokenKind::ParamClose]
+            vec![TokenKind::DollarName { name: "a".into(), quoted: false }, TokenKind::ParamClose]
         );
         // Nested `${b}` — the parser would push ParamExpansion mode on ParamOpen;
         // in this standalone test the first atom is ParamOpen and that is sufficient.
         let nested = operand_atoms("${b}}", Mode::ParamWordOperand { in_dquote: false });
-        assert_eq!(nested[0], TokenKind::ParamOpen);
+        assert_eq!(nested[0], TokenKind::ParamOpen { quoted: false });
     }
 
     #[test]
@@ -9825,7 +9825,7 @@ mod tests {
         );
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
-            TokenKind::ParamOpen
+            TokenKind::ParamOpen { quoted: true }
         );
     }
 
@@ -9836,7 +9836,7 @@ mod tests {
         lx.push_mode(Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
-            TokenKind::DollarName("a".into())
+            TokenKind::DollarName { name: "a".into(), quoted: true }
         );
     }
 }
