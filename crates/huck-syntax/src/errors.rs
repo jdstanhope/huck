@@ -65,6 +65,7 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
             let s = crate::lex_error_message(e);
             s.strip_prefix(": ").map(|t| t.to_string()).unwrap_or(s)
         }
+        ParseError::UnsupportedExpansion => "unsupported expansion".to_string(),
     }
 }
 

@@ -60,6 +60,7 @@ pub mod command;
 pub mod errors;
 pub mod generate;
 pub mod lexer;
+pub mod parser;
 pub mod util;
 
 // --- curated root re-exports ----------------------------------------

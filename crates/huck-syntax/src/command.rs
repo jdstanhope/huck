@@ -757,6 +757,9 @@ pub enum ParseError {
     ArithForHeader(String),
     /// NEW (v239): a lex error surfaced while the parser pulled tokens live
     Lex(Box<crate::lexer::LexError>),
+    /// A nested expansion the parser-driven path does not handle yet
+    /// (`$(…)` / `$((…))` / backtick inside a `${…}` operand). v241 boundary.
+    UnsupportedExpansion,
 }
 
 impl std::fmt::Display for ParseError {
@@ -2083,6 +2086,8 @@ fn parse_trailing_redirects(
                     Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
                     Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
+                    // Phase C atom variants (dormant in v241 — never emitted in Command mode)
+                    Some(_) => return Err(ParseError::RedirectTargetIsOperator),
                 };
                 redirs.extend(build_redirections(op, target, fd_prefix));
             }
@@ -2242,6 +2247,8 @@ fn parse_simple_stage(
                 // the delegation branch above before this match.
                 unreachable!("RedirFd consumed by parse_trailing_redirects branch");
             }
+            // Phase C atom variants (dormant in v241 — never emitted in Command mode)
+            _ => unreachable!("Phase C atom reached Command-mode simple-command parser"),
         }
     }
 
