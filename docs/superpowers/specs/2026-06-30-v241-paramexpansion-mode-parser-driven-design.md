@@ -96,9 +96,16 @@ thread (or a sibling mode), and the differential corpus will catch it. Modes tha
 → `:`) ARE distinct because their *termination* differs; value and pattern differ in
 neither termination nor tokenization, so they share `ParamWordOperand`.
 
-The `ParamOpen` atom itself is emitted by **`Command` mode** (and recursively by the
-operand modes) when it sees `$` immediately followed by `{` — this is a 1-char peek,
-not a look-ahead-for-`}`. The parser then `push_mode(ParamExpansion)`.
+**Entry / who emits `ParamOpen` (v241 dormancy):** `Command` mode is the production
+path and must stay **byte-identical**, so it is NOT changed to emit atoms in v241.
+Instead, `parser.rs` enters the new path by `push_mode(ParamExpansion)` itself, and the
+`ParamExpansion` head mode (and the operand modes) recognize `$` immediately followed by
+`{` and emit `ParamOpen` (a 1-char peek, not a look-ahead-for-`}`). So a `${…}` is lexed
+under `ParamExpansion`/operand modes — never the production `Command` mode. (In the
+eventual Stage-2 switch, `Command` mode will emit `ParamOpen` too and the real parser
+will push the mode; that is out of scope here.) The differential test sets this up by
+calling `parser::parse_word`/`parse_param_expansion` on a fresh `Lexer` positioned at the
+`${`.
 
 ## 2. New `TokenKind` atoms
 

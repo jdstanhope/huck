@@ -527,7 +527,7 @@ pub(crate) enum Mode {
     Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
     Subshell,       // ( … )
     CommandSub,     // $( … ) / `…`
-    ParamExpansion, // ${ … }
+    ParamExpansion { seen_name: bool }, // ${ … }
     ParamWordOperand,
     ParamSubstPatternOperand,
     ParamSubstringOffsetOperand,
@@ -591,12 +591,9 @@ pub struct Lexer<'a> {
     alias_trailing_eligible: bool,
     /// Parser-controlled lexing-mode stack (Phase C). Never empty; `Command` is
     /// the floor. Dormant in v240 — only `Command` is pushed in production.
+    /// Each `ParamExpansion` frame carries its own `seen_name` phase flag so
+    /// nested `${…}` expansions and `mark`/`rewind` are both stack-safe.
     modes: Vec<Mode>,
-    /// Tracks whether the `ParamExpansion` head mode has already emitted
-    /// `ParamName` (true = post-name phase; false = pre-name phase). Reset
-    /// to `false` each time `Mode::ParamExpansion` is pushed. Dormant unless
-    /// `Mode::ParamExpansion` is the active mode.
-    param_head_seen_name: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -622,7 +619,6 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
-            param_head_seen_name: false,
         }
     }
 
@@ -632,9 +628,6 @@ impl<'a> Lexer<'a> {
 
     #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn push_mode(&mut self, m: Mode) {
-        if m == Mode::ParamExpansion {
-            self.param_head_seen_name = false;
-        }
         self.modes.push(m);
     }
 
@@ -714,7 +707,7 @@ impl<'a> Lexer<'a> {
     fn scan_step(&mut self) -> Result<Step, LexError> {
         match self.current_mode() {
             Mode::Command => self.scan_step_command(),
-            Mode::ParamExpansion => self.scan_step_param_head(),
+            Mode::ParamExpansion { .. } => self.scan_step_param_head(),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -725,7 +718,9 @@ impl<'a> Lexer<'a> {
     ///   ParamOpen → [ParamLengthPrefix|ParamIndirect] → ParamName
     ///   → [LBracket (yields; parser pushes subscript mode)] → [ParamOp] → ParamClose
     ///
-    /// One atom per call. `param_head_seen_name` tracks pre-/post-name phase.
+    /// One atom per call. Per-frame `seen_name` in `Mode::ParamExpansion { seen_name }`
+    /// tracks pre-/post-name phase; stored in the mode stack so nested `${…}` and
+    /// `mark`/`rewind` are both stack-safe.
     /// Mirrors `scan_braced_param_expansion` (lexer.rs:3284) char-by-char for
     /// operator recognition; emits atoms instead of building WordParts.
     fn scan_step_param_head(&mut self) -> Result<Step, LexError> {
@@ -739,7 +734,7 @@ impl<'a> Lexer<'a> {
                 let c   = self.cursor.column();
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
-                self.param_head_seen_name = false;
+                // seen_name is already false on the freshly-pushed frame; no reset needed.
                 self.history.push(Token::new(TokenKind::ParamOpen, Span::new(off, l, c)));
                 return Ok(Step::Produced);
             }
@@ -748,11 +743,28 @@ impl<'a> Lexer<'a> {
             // Fall through; EOF path below handles it gracefully.
         }
 
+        // Copy `seen_name` out of the mode frame so we don't hold a &mut borrow
+        // across cursor work.
+        let seen_name = matches!(self.modes.last(), Some(Mode::ParamExpansion { seen_name: true }));
+
         // ── Phase 1: pre-name (emit prefix and/or ParamName) ─────────────────────
-        if !self.param_head_seen_name {
+        if !seen_name {
             let off = self.cursor.offset();
             let l   = self.cursor.line();
             let c   = self.cursor.column();
+
+            // Helper macro: mark the current ParamExpansion frame as having seen
+            // a name, then push `tok` and return Produced. The `self.modes` write
+            // comes AFTER all cursor work is done to avoid borrow conflicts.
+            macro_rules! emit_param_name {
+                ($tok:expr) => {{
+                    if let Some(Mode::ParamExpansion { seen_name }) = self.modes.last_mut() {
+                        *seen_name = true;
+                    }
+                    self.history.push($tok);
+                    return Ok(Step::Produced);
+                }};
+            }
 
             match self.cursor.peek().copied() {
                 // `${#}` = arg-count special param; `${#name}` = length prefix.
@@ -762,8 +774,7 @@ impl<'a> Lexer<'a> {
                     if probe.peek() == Some(&'}') {
                         // Bare `${#}` — emit the `#` as the ParamName.
                         self.cursor.next();
-                        self.param_head_seen_name = true;
-                        self.history.push(Token::new(TokenKind::ParamName("#".into()), Span::new(off, l, c)));
+                        emit_param_name!(Token::new(TokenKind::ParamName("#".into()), Span::new(off, l, c)));
                     } else {
                         // `${#name}` — emit length prefix; name comes next call.
                         self.cursor.next();
@@ -779,8 +790,7 @@ impl<'a> Lexer<'a> {
                     if probe.peek() == Some(&'}') {
                         // Bare `${!}` — emit the `!` as the ParamName.
                         self.cursor.next();
-                        self.param_head_seen_name = true;
-                        self.history.push(Token::new(TokenKind::ParamName("!".into()), Span::new(off, l, c)));
+                        emit_param_name!(Token::new(TokenKind::ParamName("!".into()), Span::new(off, l, c)));
                     } else {
                         // `${!name…}` — emit indirect prefix; name comes next call.
                         self.cursor.next();
@@ -793,9 +803,7 @@ impl<'a> Lexer<'a> {
                 // These are consumed as the full name.
                 Some(sc @ ('@' | '*' | '-' | '?' | '$')) => {
                     self.cursor.next();
-                    self.param_head_seen_name = true;
-                    self.history.push(Token::new(TokenKind::ParamName(sc.to_string()), Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    emit_param_name!(Token::new(TokenKind::ParamName(sc.to_string()), Span::new(off, l, c)));
                 }
 
                 // Positional parameter: ${1}, ${10}, ${42}
@@ -804,9 +812,7 @@ impl<'a> Lexer<'a> {
                     while let Some(&dc) = self.cursor.peek() {
                         if dc.is_ascii_digit() { name.push(dc); self.cursor.next(); } else { break; }
                     }
-                    self.param_head_seen_name = true;
-                    self.history.push(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
                 }
 
                 // Regular identifier name: [_A-Za-z][_A-Za-z0-9]*
@@ -820,9 +826,7 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
-                    self.param_head_seen_name = true;
-                    self.history.push(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
                 }
 
                 // EOF inside `${` — error.
@@ -833,9 +837,7 @@ impl<'a> Lexer<'a> {
                 // the post-name phase will see the closing `}` or unrecognised
                 // char and emit ParamClose (consuming to `}`).
                 Some(_) => {
-                    self.param_head_seen_name = true;
-                    self.history.push(Token::new(TokenKind::ParamName("".into()), Span::new(off, l, c)));
-                    return Ok(Step::Produced);
+                    emit_param_name!(Token::new(TokenKind::ParamName("".into()), Span::new(off, l, c)));
                 }
             }
         }
@@ -1697,7 +1699,6 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
-            param_head_seen_name: false,
         }
     }
 
@@ -9146,7 +9147,7 @@ mod tests {
     /// (and including) `ParamClose`.
     fn head_atoms(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion);
+        lx.push_mode(Mode::ParamExpansion { seen_name: false });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamClose);
@@ -9160,7 +9161,7 @@ mod tests {
     /// (operand is a different mode, so we stop at the operator boundary).
     fn head_atoms_until_op(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion);
+        lx.push_mode(Mode::ParamExpansion { seen_name: false });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamOp(_));
@@ -9238,10 +9239,53 @@ mod tests {
     fn head_subscript() {
         // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
         let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion);
+        lx.push_mode(Mode::ParamExpansion { seen_name: false });
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::LBracket));
+    }
+
+    /// Prove stack-safety: pushing a nested `ParamExpansion` frame must not
+    /// corrupt the outer frame's `seen_name` phase.  Before the fix the phase
+    /// was held in a flat `param_head_seen_name` field on `Lexer`, so any push
+    /// reset it to `false` — the outer frame "forgot" it had already seen its
+    /// name.  Now each `Mode::ParamExpansion { seen_name }` carries the state
+    /// in the stack frame itself, so nesting is safe.
+    #[test]
+    fn head_nested_param_expansion_phase_is_per_frame() {
+        // We drive the outer frame manually: push it, pull ParamOpen then
+        // ParamName("a") so the outer frame transitions to seen_name=true.
+        // Then simulate the parser entering a nested ${b} by pushing a fresh
+        // inner frame, pull its ParamOpen + ParamName("b"), then pop it.
+        // The outer frame's seen_name must still be true afterwards.
+        let mut lx = Lexer::new("${a${b}}", LexerOptions::default(), true);
+        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+
+        // Outer frame: pull ParamOpen (${ of outer).
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        // Outer frame: pull ParamName("a") → seen_name becomes true.
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
+        // Outer frame must now be in seen_name=true (post-name phase).
+        assert!(
+            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true })),
+            "outer frame should be seen_name=true after pulling its name"
+        );
+
+        // Simulate parser detecting nested ${b} and pushing a fresh inner frame.
+        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        // Inner frame: pull ParamOpen (the ${ of ${b}).
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen));
+        // Inner frame: pull ParamName("b") → inner seen_name becomes true.
+        assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "b"));
+
+        // Parser exits the nested expansion: pop the inner frame.
+        lx.pop_mode();
+
+        // The OUTER frame must still be seen_name=true (was corrupted before fix).
+        assert!(
+            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true })),
+            "outer frame seen_name must survive nested push/pop"
+        );
     }
 }
 
