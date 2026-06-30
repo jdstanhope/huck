@@ -419,9 +419,190 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     Ok(result)
 }
 
+/// Returns `true` if `token` is a reserved word (keyword).
+/// Mirrors `keyword_of` in `command.rs` exactly.
+fn keyword_of_tok(token: &TokenKind) -> bool {
+    let TokenKind::Word(Word(parts)) = token else { return false };
+    if parts.len() != 1 { return false; }
+    let WordPart::Literal { text, quoted: false } = &parts[0] else { return false; };
+    matches!(
+        text.as_str(),
+        "if" | "then" | "elif" | "else" | "fi"
+        | "while" | "until" | "do" | "done"
+        | "for" | "in" | "case" | "esac"
+        | "select" | "function" | "{" | "}"
+        | "[[" | "]]" | "coproc"
+    )
+}
+
+/// Returns `true` if the operator is a redirect operator.
+/// Mirrors `is_redirect_op` in `command.rs`.
+fn is_redirect_op_kind(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::RedirIn
+            | Operator::RedirOut
+            | Operator::RedirAppend
+            | Operator::RedirErr
+            | Operator::RedirErrAppend
+            | Operator::HereString
+            | Operator::DupOut
+            | Operator::DupErr
+            | Operator::DupIn
+            | Operator::RedirReadWrite
+            | Operator::AndRedirOut
+            | Operator::AndRedirAppend
+            | Operator::RedirClobber
+            | Operator::RedirErrClobber
+    )
+}
+
+/// Returns `true` if the next token is a redirect (fd-prefix, heredoc, or
+/// redirect operator).  Mirrors `next_is_redirect` in `command.rs`.
+fn next_is_redirect_token(iter: &mut Lexer) -> Result<bool, ParseError> {
+    Ok(match iter.peek_kind()? {
+        Some(TokenKind::RedirFd(_)) => true,
+        Some(TokenKind::Heredoc { .. }) => true,
+        Some(TokenKind::Op(op)) => is_redirect_op_kind(op),
+        _ => false,
+    })
+}
+
+/// Parses a simple command (program + args) from a flat token stream.
+/// Mirrors `parse_simple_stage` in `command.rs` (FLAT subset — no
+/// assignments or redirects in Task 2).
+///
+/// Stops — without consuming — at any stage/list terminator:
+/// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
+///
+/// Redirect tokens mid-command are deferred to Task 4 and return
+/// `UnsupportedCommand`.
+fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
+    let mut program: Option<Word> = None;
+    let mut args: Vec<Word> = Vec::new();
+
+    loop {
+        let Some(token) = iter.peek_kind()? else { break };
+        // Stage/list terminators — stop without consuming.
+        if matches!(
+            token,
+            TokenKind::Op(
+                Operator::Pipe
+                    | Operator::Semi
+                    | Operator::And
+                    | Operator::Or
+                    | Operator::Background
+                    | Operator::RParen
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp
+            ) | TokenKind::Newline
+        ) {
+            break;
+        }
+        // Redirect tokens — deferred to Task 4.
+        if next_is_redirect_token(iter)? {
+            return Err(ParseError::UnsupportedCommand);
+        }
+        // Consume the token.
+        let kind = iter.next_kind()?.unwrap();
+        match kind {
+            TokenKind::Word(word) => {
+                if program.is_none() {
+                    program = Some(word);
+                } else {
+                    args.push(word);
+                }
+            }
+            _ => return Err(ParseError::UnsupportedCommand),
+        }
+    }
+
+    let prog = match program {
+        Some(p) => p,
+        None => return Err(ParseError::MissingCommand),
+    };
+    Ok(Command::Simple(SimpleCommand::Exec(ExecCommand {
+        inline_assignments: vec![],
+        program: prog,
+        args,
+        redirects: vec![],
+        line,
+    })))
+}
+
+/// Parses a single command (dispatch).  Mirrors `parse_command_inner` +
+/// `keyword_of` in `command.rs`.  Every non-simple branch returns
+/// `UnsupportedCommand` in Task 2; simple commands are wrapped in a
+/// 1-element `Command::Pipeline` to match the oracle.
+fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // EOF with no token.
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::MissingCommand);
+    }
+    // `(( expr ))` at command position.
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Bare `(` → subshell.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Heredoc / `<<<` at command position.
+    if matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Heredoc { .. }) | Some(TokenKind::Op(Operator::HereString))
+    ) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Reserved word (keyword).
+    if let Some(tok) = iter.peek_kind()? {
+        if keyword_of_tok(tok) {
+            return Err(ParseError::UnsupportedCommand);
+        }
+    }
+    // Function definition `name() compound` — two-token lookahead.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Word(_)))
+        && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
+    {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Simple command: parse and wrap in a 1-element Pipeline (matching the
+    // oracle, where `parse_command_inner` always produces `Command::Pipeline`
+    // for simple commands via `parse_pipeline_with_first`).
+    let cmd = parse_simple(iter)?;
+    Ok(Command::Pipeline(Pipeline { negate: false, commands: vec![cmd] }))
+}
+
+/// Task 2: single command only; Task 5 adds `|` pipeline chaining.
+/// Mirrors `parse_command_then_pipeline` in `command.rs`.
+fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
+    parse_command(iter)
+}
+
+/// Task 2: single command only; Task 6 adds `&&`/`||` connectors.
+/// Mirrors `parse_sequence_opts` in `command.rs`.
+fn parse_and_or(iter: &mut Lexer) -> Result<Command, ParseError> {
+    parse_command_then_pipeline(iter)
+}
+
+/// Entry point for the new flat command-list parser.  Mirrors `parse` /
+/// `parse_cursor` in `command.rs`.
+///
+/// Returns `Ok(None)` on empty input (newlines only or EOF).  Task 2
+/// builds a 1-command `Sequence`; connectors (`;`, `&&`, `||`, `&`) come
+/// in Tasks 6 and later.
 pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
-    let _ = iter;
-    unimplemented!("parse_sequence: Task 2")
+    // Skip leading newlines (mirrors `parse_cursor` → `skip_newlines`).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    if iter.peek_kind()?.is_none() {
+        return Ok(None);
+    }
+    let first = parse_and_or(iter)?;
+    Ok(Some(Sequence { first, rest: vec![], background: false }))
 }
 
 #[cfg(test)]
@@ -659,6 +840,27 @@ mod tests {
         assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
     }
+    // T2 tests
+
+    #[test]
+    fn cmd_single_simple() {
+        diff_cmd("echo");
+        diff_cmd("echo a");
+        diff_cmd("echo a b c");
+        diff_cmd("echo \"$x\" 'y' z");
+        assert_eq!(new_seq("").unwrap(), None);       // empty input
+        assert_eq!(new_seq("\n\n").unwrap(), None);   // only newlines
+    }
+
+    #[test]
+    fn cmd_deferred_boundary() {
+        for s in ["( a )", "(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
+                  "for i in a; do x; done", "case x in y) z;; esac", "{ a; }",
+                  "[[ -n x ]]", "f() { x; }", "coproc x"] {
+            diff_unsupported(s);
+        }
+    }
+
     // tests added in later tasks
 
     #[test]
