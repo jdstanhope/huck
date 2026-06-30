@@ -72,6 +72,30 @@ Glob-literalness is encoded by the `quoted` flag on each `Lit` atom (false outsi
 `"…"`), exactly as today's operand Words encode it; no separate "pattern" lexing is
 needed at the atom level.
 
+### Rationale: why value and pattern operands share one mode
+
+Value and pattern operands **tokenize identically** — the value-vs-pattern difference
+is *semantic* (what the engine does at expand time), not *lexical* (how bytes split
+into tokens). Both are a `Word` of literal-runs + `$`-expansions that ends at the first
+unquoted `}`. Concretely, the operand text `*.txt` produces the **same** operand `Word`
+`[ Literal { text: "*.txt", quoted: false } ]` whether it follows `:-` (`${x:-*.txt}`,
+value) or `#` (`${x#*.txt}`, pattern); quoting it (`"*.txt"`) flips `quoted:true` in
+both, identically. "This `*` is a glob metacharacter" is therefore NOT a lexing-mode
+property — it is carried by the `quoted` flag (false ⇒ glob-active), the same flag in
+both cases. The **parser** supplies the value-vs-pattern meaning by the
+`ParamModifier` it builds (`UseDefault{word}` vs `RemovePrefix{pattern}`) from the
+operator it read; the **engine** treats `RemovePrefix.pattern` as a glob and
+`UseDefault.word` as a value. The divergence lives in the parser + engine, never in the
+lexer. This mirrors huck today: `modifier_with_operand` (lexer.rs:4178) is the single
+shared helper for both value and pattern operands. The lone lexical nuance the current
+code adds for pattern operands — threading `in_dquote` so a `$'…'`-as-name inside a
+*nested* `${…}` in the pattern validates (M-156) — only affects the `$'…'`-name form,
+which v241 excludes; when that form is added later, this mode gains the `in_dquote`
+thread (or a sibling mode), and the differential corpus will catch it. Modes that
+**split on a separator** (`ParamSubstPatternOperand` → `/`, `ParamSubstringOffsetOperand`
+→ `:`) ARE distinct because their *termination* differs; value and pattern differ in
+neither termination nor tokenization, so they share `ParamWordOperand`.
+
 The `ParamOpen` atom itself is emitted by **`Command` mode** (and recursively by the
 operand modes) when it sees `$` immediately followed by `{` — this is a 1-char peek,
 not a look-ahead-for-`}`. The parser then `push_mode(ParamExpansion)`.
