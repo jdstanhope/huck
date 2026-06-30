@@ -525,15 +525,31 @@ fn diff_badsubst() {
     }
 }
 #[test]
+fn diff_dquote_operands() {
+    // T3 fix: double-quoted operands tokenize FLAT (per-frame in_dquote). A simple
+    // "…" is one quoted Lit (} stays literal); a "…" with a nested ${} recurses.
+    // These MUST match the production lexer's flat WordPart::Literal{quoted:true}
+    // (no Quoted wrapper — verified at parse_braced_operand_opts lexer.rs:3735).
+    for s in ["${x:-\"a}b\"}", "${x:-\"a${y}b\"}", "${x:-\"$v\"}",
+              "${x:-pre\"mid\"post}", "${x#\"$p\"}", "${x/\"a/b\"/c}"] { diff_ok(s); }
+}
+#[test]
 fn diff_deferred_returns_unsupported() {
     use crate::lexer::{Lexer, LexerOptions};
-    for s in ["${x:-$(cmd)}","${x:-$((1+1))}","${x:-`cmd`}"] {
+    // $(…)/arith/backtick remain deferred even INSIDE a double-quoted operand.
+    for s in ["${x:-$(cmd)}","${x:-$((1+1))}","${x:-`cmd`}","${x:-\"$(cmd)\"}"] {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
         assert!(matches!(parse_param_expansion(&mut lx, false),
                          Err(crate::command::ParseError::UnsupportedExpansion)), "for {s}");
     }
 }
 ```
+
+NOTE for `parse_word` (Task 4): it threads the enclosing `quoted` and must set each
+operand part's `quoted` to `atom.quoted || enclosing_quoted` (so a bare operand inside an
+outer-dquoted `${…}` is quoted, while a literal `"…"` span is always quoted). The
+`diff_ok` quoted variant (which passes `quoted=true`) enforces this; the production
+`parse_braced_operand_opts` (`q = enclosing_dquote`) is the oracle.
 
 - [ ] **Step 1: Write the failing tests** — add all `diff_*` tests above.
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p huck-syntax --lib diff_ 2>&1 | tail -30` (unimplemented arms panic / mismatches).
