@@ -1842,6 +1842,44 @@ impl<'a> Lexer<'a> {
                             self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(so, sl, sc)));
                             return Ok(Step::Produced);
                         }
+                        Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                            // Special parameter (`$?`/`$@`/`$*`/`$#`/`$$`/`$!`/`$-`) —
+                            // mirrors `scan_step_param_operand`'s dquote `$`-handling
+                            // (lexer.rs ~1140) and the oracle `scan_dollar_expansion`
+                            // (~3444-3471), which special-cases each of these one
+                            // char at a time. `parse_arith_body`'s `DollarName` match
+                            // already maps `"@"`→AllArgs{joined:false}, `"*"`→
+                            // AllArgs{joined:true}, `"?"`→LastStatus, else→Var — so no
+                            // parser change is needed here.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // special char
+                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some(d) if d.is_ascii_digit() => {
+                            // Positional parameter `$N` — the oracle
+                            // (`scan_dollar_expansion` ~3472-3475) consumes exactly
+                            // ONE digit (not a run): `$12` is `$1` followed by a
+                            // literal `2`, matching bash (only `${10}` reaches the
+                            // 10th positional param). `scan_step_param_operand`'s
+                            // dquote digit arm (~1145-1149) does the same.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            let digit = self.cursor.next().unwrap();
+                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
                         _ => {
                             // Bare `$` (e.g. before an operator) — literal.
                             self.cursor.next();

@@ -2657,4 +2657,16 @@ mod tests {
         diff_arith("$(( `echo 1` ))");
         diff_arith("$(( $x + ${y} + 2 ))");
     }
+
+    // ── v246 T3 fix tests (special/positional params) ──────────────────────────
+
+    #[test]
+    fn arith_special_params() {
+        diff_arith("$(( $? ))");
+        diff_arith("$(( $1 ))");
+        diff_arith("$(( $1 + $2 ))");
+        diff_arith("$(( $# ))");
+        diff_arith("$(( $@ ))");
+        diff_arith("$(( $* ))");
+    }
 }
