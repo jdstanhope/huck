@@ -400,8 +400,8 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $( / $(( / backtick inside an operand — v241 stops here
-    CmdSubOpen,          // $( opener atom (v244 CommandSub mode)
+    DeferredExpansion,   // $(( / backtick inside an operand — still deferred (unquoted $(cmd) handled by CmdSubOpen in v244)
+    CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
