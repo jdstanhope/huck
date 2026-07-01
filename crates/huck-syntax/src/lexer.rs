@@ -1782,6 +1782,73 @@ impl<'a> Lexer<'a> {
                     }
                     return Ok(Step::Produced);
                 }
+                Some('`') => {
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
+                    return Ok(Step::Produced);
+                }
+                Some('$') => {
+                    // Classify what follows `$` (Task 4 adds the `$((` nested-arith branch).
+                    // NOTE: arithmetic contexts always treat embedded expansions as
+                    // `quoted: true` (matches the production oracle `arith_string_to_word`,
+                    // which hardcodes `true` for every recursive `scan_dollar_expansion`/
+                    // backtick call regardless of the outer `$((…))`'s own quoted flag) —
+                    // so these arms use a literal `true`, not the mode's `in_dquote` field.
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `$`
+                    match probe.peek().copied() {
+                        Some('{') => {
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `{`
+                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some('(') => {
+                            // `$(` cmdsub (Task 4 splits out `$((` → ArithOpen).  Zero-width
+                            // signal: do NOT consume; cursor stays at `$`.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {
+                            // `$name` variable — consume `$` + name run, emit DollarName.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            let mut name = String::new();
+                            while let Some(ch) = self.cursor.peek().copied() {
+                                if ch.is_ascii_alphanumeric() || ch == '_' { name.push(ch); self.cursor.next(); } else { break; }
+                            }
+                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        _ => {
+                            // Bare `$` (e.g. before an operator) — literal.
+                            self.cursor.next();
+                            text.push('$');
+                        }
+                    }
+                }
                 Some(ch) => {
                     self.cursor.next();
                     text.push(ch);

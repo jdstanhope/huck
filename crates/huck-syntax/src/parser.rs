@@ -704,18 +704,56 @@ enum ArithBodyOutcome { Closed(Word), Bail }
 
 /// Assemble the arith body `Word` by pulling atoms until `ArithClose` (→ `Closed`)
 /// or `ArithBail` (→ `Bail`, consumed here so the parser can rewind cleanly).
-/// Embedded expansions are added in Task 3.
+///
+/// `parse_param_expansion` consumes its OWN `ParamOpen` token (which the lexer
+/// already emits WITH `${` consumed — not zero-width, mirrors the
+/// `scan_step_param_operand` precedent), so it's dispatched on a PEEK (not a
+/// consume) exactly like `parse_word`'s `ParamOpen` arm.
+///
+/// `parse_command_sub`/`parse_backtick_sub`, by contrast, expect to consume a
+/// FRESH `CmdSubOpen`/`BeginBacktick` scanned under their OWN pushed mode: the
+/// signal atom `scan_step_arith` emits for `$(`/`` ` `` is zero-width (mirrors
+/// `scan_step_param_operand`'s `$(cmd)` signal — cursor stays at `$`/`` ` ``), so
+/// it must be discarded here via `next_kind()` BEFORE calling the sub-parser —
+/// otherwise `push_mode` + the sub-parser's own `next_kind()` would just replay
+/// the stale zero-width signal instead of triggering a real scan that consumes
+/// `$(`/`` ` ``. This mirrors `parse_word`'s `CmdSubOpen`/`BeginBacktick` arms,
+/// which consume via the generic `next_kind()` before dispatching.
+///
+/// Every embedded expansion inside an arith body is `quoted: true` — this matches
+/// the production oracle `arith_string_to_word` (lexer.rs), which hardcodes `true`
+/// for every recursive `scan_dollar_expansion`/backtick call regardless of the
+/// outer `$((…))`'s own quoted flag (arithmetic contexts never word-split, so
+/// nested parts behave as if quoted). Hence `true` is passed to the sub-parsers
+/// here, not `_in_dquote` (which is the OUTER `$((…))`'s own quoted flag, only
+/// used for the resulting `WordPart::Arith { quoted, .. }` in
+/// `parse_arith_expansion`, not for what's inside the body).
 fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutcome, ParseError> {
     let mut parts: Vec<WordPart> = Vec::new();
     loop {
-        match iter.next_kind()? {
-            Some(TokenKind::ArithClose) => return Ok(ArithBodyOutcome::Closed(Word(parts))),
-            Some(TokenKind::ArithBail)  => return Ok(ArithBodyOutcome::Bail),
-            Some(TokenKind::Lit { text, quoted }) => {
-                parts.push(WordPart::Literal { text, quoted });
+        match iter.peek_kind()? {
+            Some(TokenKind::ArithClose) => { iter.next_kind()?; return Ok(ArithBodyOutcome::Closed(Word(parts))); }
+            Some(TokenKind::ArithBail)  => { return Ok(ArithBodyOutcome::Bail); } // Task 5 consumes/rewinds
+            Some(TokenKind::ParamOpen { .. })  => { parts.push(parse_param_expansion(iter, true)?); }
+            Some(TokenKind::CmdSubOpen)        => { iter.next_kind()?; parts.push(parse_command_sub(iter, true)?); }
+            Some(TokenKind::BeginBacktick)     => { iter.next_kind()?; parts.push(parse_backtick_sub(iter, true)?); }
+            Some(TokenKind::Lit { .. })        => {
+                if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
+                    parts.push(WordPart::Literal { text, quoted });
+                }
             }
-            Some(_other) => return Err(ParseError::UnsupportedExpansion),
-            None => return Err(ParseError::UnsupportedExpansion),
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted }) = iter.next_kind()? {
+                    let part = match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted, joined: false },
+                        "*" => WordPart::AllArgs { quoted, joined: true },
+                        "?" => WordPart::LastStatus { quoted },
+                        _   => WordPart::Var { name, quoted },
+                    };
+                    parts.push(part);
+                }
+            }
+            _ => return Err(ParseError::UnsupportedExpansion),
         }
     }
 }
@@ -2600,5 +2638,23 @@ mod tests {
     fn arith_unterminated_errs() {
         assert!(new_arith("$((1+2", false).is_err(), "unterminated must Err");
         assert!(new_arith("$(( ", false).is_err(), "unterminated must Err");
+    }
+
+    // ── v246 T3 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_grouping_parens() {
+        diff_arith("$(( (1+2)*3 ))");
+        diff_arith("$(( ((1+2)) ))");
+        diff_arith("$(( a*(b+c) ))");
+    }
+
+    #[test]
+    fn arith_embedded_expansions() {
+        diff_arith("$(( $x + 1 ))");
+        diff_arith("$(( ${y} ))");
+        diff_arith("$(( $(echo 1) ))");
+        diff_arith("$(( `echo 1` ))");
+        diff_arith("$(( $x + ${y} + 2 ))");
     }
 }
