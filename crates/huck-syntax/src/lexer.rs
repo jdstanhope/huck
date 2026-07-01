@@ -101,6 +101,22 @@ impl<'a> CharCursor<'a> {
         self.peeked = None;
         self.peeked_len = 0;
     }
+
+    /// Peek at the nth character (0-indexed) from the current position WITHOUT
+    /// consuming anything.  `n=0` is equivalent to `peek()` (but returns by value).
+    /// Used by `Mode::Backtick` to look past a run of backslashes before a backtick.
+    ///
+    /// Bounded: scans at most `n+1` chars forward; does NOT advance `pos` or modify
+    /// `peeked`.  Never panics — returns `None` when fewer than `n+1` chars remain.
+    pub fn peek_nth(&self, n: usize) -> Option<char> {
+        // `self.pos` always points at the raw byte offset of the next character
+        // (the `peeked` buffer, if any, starts at `self.pos`).
+        let mut it = self.s[self.pos..].chars();
+        for _ in 0..n {
+            it.next()?;
+        }
+        it.next()
+    }
 }
 
 impl Iterator for CharCursor<'_> {
@@ -402,6 +418,9 @@ pub enum TokenKind {
     DollarName { name: String, quoted: bool },
     DeferredExpansion,   // $(( / backtick inside an operand — still deferred (unquoted $(cmd) handled by CmdSubOpen in v244)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
+    // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
+    BeginBacktick,       // opening ` — emitted by scan_step_backtick at depth 0
+    EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -528,6 +547,7 @@ pub(crate) enum Mode {
     Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
     Subshell,       // ( … )
     CommandSub { body_started: bool },  // $( … ) / `…`
+    Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
     ParamExpansion { seen_name: bool }, // ${ … }
     ParamWordOperand            { in_dquote: bool },
     ParamSubstPatternOperand    { in_dquote: bool },
@@ -715,6 +735,7 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubstringOffsetOperand { in_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote),
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
+            Mode::Backtick { depth } => self.scan_step_backtick(depth),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1479,6 +1500,14 @@ impl<'a> Lexer<'a> {
             // Body is Command-mode tokens; the parser owns the terminating `)`.
             self.scan_step_command()
         }
+    }
+
+    /// Stub for `Mode::Backtick { depth }` scanning — implemented in v245 Task 2.
+    /// The arm in `scan_step` is wired (so the mode compiles and can be pushed/popped
+    /// in tests), but the body is unreachable until Task 2 fills it in.
+    #[allow(dead_code)]
+    fn scan_step_backtick(&mut self, _depth: u32) -> Result<Step, LexError> {
+        unreachable!("v245 Task 2")
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append
@@ -5753,6 +5782,29 @@ mod tests {
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::Arith);
         assert_eq!(lx.current_mode(), Mode::Command);
+    }
+
+    #[test]
+    fn char_cursor_peek_nth_does_not_advance() {
+        // peek_nth must not consume any characters — the cursor position must be
+        // identical before and after the call.  Uses the CharCursor directly.
+        let mut cur = crate::lexer::CharCursor::new("abc");
+        // Pre-fill the peeked slot (mirrors normal lexer usage where peek() was called).
+        let p0 = cur.peek().copied();
+        assert_eq!(p0, Some('a'), "peek() should return 'a'");
+
+        // peek_nth(0) == first char ('a'), same as peek() — no advancement.
+        assert_eq!(cur.peek_nth(0), Some('a'), "peek_nth(0) should be 'a'");
+        // peek_nth(1) looks one further ahead.
+        assert_eq!(cur.peek_nth(1), Some('b'), "peek_nth(1) should be 'b'");
+        assert_eq!(cur.peek_nth(2), Some('c'), "peek_nth(2) should be 'c'");
+        // Past-end returns None.
+        assert_eq!(cur.peek_nth(3), None, "peek_nth(3) past end should be None");
+
+        // The cursor has not advanced — next() must still yield 'a'.
+        assert_eq!(cur.next(), Some('a'), "cursor should not have advanced");
+        // Now first unconsumed char is 'b'; peek_nth(0) returns 'b'.
+        assert_eq!(cur.peek_nth(0), Some('b'), "after consuming 'a', peek_nth(0) should be 'b'");
     }
 
     #[test]

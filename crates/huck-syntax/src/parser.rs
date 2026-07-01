@@ -553,6 +553,19 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
+/// Assemble a `WordPart::CommandSub` for a `` `…` `` backtick substitution.
+/// Pushes `Mode::Backtick { depth: 0 }` itself, so callers must position the
+/// lexer at the opening backtick (under any mode — the push ensures the backtick
+/// is scanned as atoms rather than a pre-built Word token).
+///
+/// SKELETON — v245 Task 1.  Task 2 fills in the body tokenization + recursive-
+/// depth escaping logic.  The mode push is here so that the differential harness
+/// helpers can compile and call `iter.push_mode(Mode::Backtick { .. })`.
+pub(crate) fn parse_backtick_sub(iter: &mut Lexer, _quoted: bool) -> Result<WordPart, ParseError> {
+    iter.push_mode(crate::lexer::Mode::Backtick { depth: 0 });
+    unimplemented!("parse_backtick_sub: v245 Task 2")
+}
+
 /// Skip over any `Newline` tokens without consuming anything else.
 /// Mirrors `skip_newlines` in `command.rs`.
 fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
@@ -2151,5 +2164,53 @@ mod tests {
     fn cs_error_parity() {
         let new = new_cs("$(echo", false);
         assert!(new.is_err(), "unterminated comsub must Err, got {new:?}");
+    }
+
+    // ── v245 T1: backtick command-substitution differential harness ──────────
+    //
+    // THE PRODUCTION LEXER IS THE ORACLE.  When `new_bt` ≠ `old_bt`, fix the
+    // new path to match — never weaken or skip the comparison.
+
+    /// Build the expected `WordPart::CommandSub` (from a backtick substitution)
+    /// using the PRODUCTION lexer (oracle).  Wraps `s` in `"…"` when
+    /// `quoted=true` to simulate a double-quoted context.
+    fn old_bt(s: &str, quoted: bool) -> WordPart {
+        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
+        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
+        match &toks[0].kind {
+            TokenKind::Word(w) => find_command_sub(&w.0).expect("no comsub part in production token"),
+            _ => panic!("production token is not a Word for {src:?}"),
+        }
+    }
+
+    /// Build the expected `WordPart::CommandSub` using the NEW parser-driven
+    /// backtick path (skeleton in Task 1; full body in Task 2+).
+    fn new_bt(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
+        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        parse_backtick_sub(&mut lx, quoted)
+    }
+
+    /// Assert that the new and old paths produce identical results for both
+    /// unquoted and quoted contexts.
+    fn diff_bt(s: &str) {
+        assert_eq!(new_bt(s, false).unwrap(), old_bt(s, false), "unquoted {s:?}");
+        assert_eq!(new_bt(s, true).unwrap(),  old_bt(s, true),  "quoted   {s:?}");
+    }
+
+    fn diff_bt_deferred(s: &str) {
+        assert!(matches!(new_bt(s, false), Err(ParseError::UnsupportedExpansion)),
+                "expected deferred for {s:?}, got {:?}", new_bt(s, false));
+    }
+
+    // ── v245 T1 scaffolding test ─────────────────────────────────────────────
+
+    #[test]
+    fn bt_scaffolding_exists() {
+        // Verify that the new Mode variant and atom kinds compile.
+        let _ = Mode::Backtick { depth: 0 };
+        let _ = TokenKind::BeginBacktick;
+        let _ = TokenKind::EndBacktick;
+        // The production oracle must be callable for a simple backtick substitution.
+        let _ = old_bt("`echo hi`", false);
     }
 }
