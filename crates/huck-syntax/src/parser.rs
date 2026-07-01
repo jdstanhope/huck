@@ -700,22 +700,40 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
 /// command substitution of a subshell (`$( (…) )`).  Owns the push/pop lifecycle;
 /// pops the `Arith` frame on ALL exit paths.
+enum ArithBodyOutcome { Closed(Word), Bail }
+
+/// Assemble the arith body `Word` by pulling atoms until `ArithClose` (→ `Closed`)
+/// or `ArithBail` (→ `Bail`, consumed here so the parser can rewind cleanly).
+/// Embedded expansions are added in Task 3.
+fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutcome, ParseError> {
+    let mut parts: Vec<WordPart> = Vec::new();
+    loop {
+        match iter.next_kind()? {
+            Some(TokenKind::ArithClose) => return Ok(ArithBodyOutcome::Closed(Word(parts))),
+            Some(TokenKind::ArithBail)  => return Ok(ArithBodyOutcome::Bail),
+            Some(TokenKind::Lit { text, quoted }) => {
+                parts.push(WordPart::Literal { text, quoted });
+            }
+            Some(_other) => return Err(ParseError::UnsupportedExpansion),
+            None => return Err(ParseError::UnsupportedExpansion),
+        }
+    }
+}
+
 pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false });
-    let result = (|| -> Result<Word, ParseError> {
+    let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
             _ => return Err(ParseError::UnsupportedExpansion),
         }
-        // Body assembly lands in Task 2+.  For now, expect an immediate close.
-        match iter.next_kind()? {
-            Some(TokenKind::ArithClose) => Ok(Word(Vec::new())),
-            _ => Err(ParseError::UnsupportedExpansion),
-        }
+        parse_arith_body(iter, quoted)
     })();
     iter.pop_mode();
-    let body = result?;
-    Ok(WordPart::Arith { body, quoted })
+    match result? {
+        ArithBodyOutcome::Closed(body) => Ok(WordPart::Arith { body, quoted }),
+        ArithBodyOutcome::Bail => Err(ParseError::UnsupportedExpansion), // Task 5 replaces this
+    }
 }
 
 /// Skip over any `Newline` tokens without consuming anything else.
@@ -2549,7 +2567,6 @@ mod tests {
     }
 
     /// Assert new == old for both unquoted and quoted contexts.
-    #[allow(dead_code)] // used starting Task 2+ once body assembly lands
     fn diff_arith(s: &str) {
         assert_eq!(new_arith(s, false).unwrap(), old_arith(s, false), "unquoted {s:?}");
         assert_eq!(new_arith(s, true).unwrap(),  old_arith(s, true),  "quoted   {s:?}");
@@ -2566,5 +2583,22 @@ mod tests {
         // Production `$(( ))` yields Arith { body: Word([...]) }; the skeleton only
         // guarantees the harness wires up, so just assert new_arith succeeds here.
         assert!(new_arith("$(())", false).is_ok(), "skeleton must parse $(())");
+    }
+
+    // ── v246 T2 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_depth0_plain() {
+        diff_arith("$((1+2))");
+        diff_arith("$(( 1 + 2 ))");
+        diff_arith("$((0))");
+        diff_arith("$((a+1))");   // bare identifier is literal body text
+        diff_arith("$(( x * y ))");
+    }
+
+    #[test]
+    fn arith_unterminated_errs() {
+        assert!(new_arith("$((1+2", false).is_err(), "unterminated must Err");
+        assert!(new_arith("$(( ", false).is_err(), "unterminated must Err");
     }
 }

@@ -1712,36 +1712,82 @@ impl<'a> Lexer<'a> {
 
     /// `Mode::Arith { paren_depth, in_dquote, body_started }` scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
-    fn scan_step_arith(&mut self, _paren_depth: u32, _in_dquote: bool, body_started: bool) -> Result<Step, LexError> {
+    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool) -> Result<Step, LexError> {
         if !body_started {
-            // Consume the opening `$((` and emit ArithOpen (real logic Task 2).
             let off = self.cursor.offset();
             let l = self.cursor.line();
             let c = self.cursor.column();
-            // Best-effort consume `$` `(` `(` if present (robust for tests).
-            if self.cursor.peek() == Some(&'$') { self.cursor.next(); }
-            if self.cursor.peek() == Some(&'(') { self.cursor.next(); }
-            if self.cursor.peek() == Some(&'(') { self.cursor.next(); }
+            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "scan_step_arith entry: expected `$` of `$((`");
+            self.cursor.next(); // `$`
+            self.cursor.next(); // `(`
+            self.cursor.next(); // `(`
             if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
                 *body_started = true;
             }
             self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
             return Ok(Step::Produced);
         }
-        // Body scanning is Task 2+. As a Task-1 scaffolding exception, handle the
-        // trivial empty-body close (`$(())`) so the harness round-trips; anything
-        // else errors loudly (an accidental live call on real body content should
-        // be obvious rather than silently mis-scanned).
-        if self.cursor.peek() == Some(&')') && self.cursor.peek_nth(1) == Some(')') {
-            let off = self.cursor.offset();
-            let l = self.cursor.line();
-            let c = self.cursor.column();
-            self.cursor.next();
-            self.cursor.next();
-            self.history.push(Token::new(TokenKind::ArithClose, Span::new(off, l, c)));
-            return Ok(Step::Produced);
+
+        // Body: accumulate a literal run until a paren event / EOF.  Use a LOCAL
+        // `depth` (seeded from the frame's value) and sync it back to the field on
+        // every return, so `(a)` handled within ONE call counts correctly.
+        let off = self.cursor.offset();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
+        let mut text = String::new();
+        let mut depth = paren_depth;
+        // Helper: write `depth` back into the top Arith frame before returning.
+        macro_rules! sync_depth { () => {
+            if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() { *paren_depth = depth; }
+        }; }
+        loop {
+            match self.cursor.peek().copied() {
+                None => {
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    return Err(LexError::UnterminatedArith);
+                }
+                Some('(') => {
+                    self.cursor.next();
+                    text.push('(');
+                    depth += 1;
+                }
+                Some(')') if depth > 0 => {
+                    self.cursor.next();
+                    text.push(')');
+                    depth -= 1;
+                }
+                Some(')') => {
+                    // depth == 0: flush any pending literal FIRST (emit the
+                    // terminator/bail on the NEXT call), else classify now.
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    let poff = self.cursor.offset();
+                    let pl = self.cursor.line();
+                    let pc = self.cursor.column();
+                    if self.cursor.peek_nth(1) == Some(')') {
+                        self.cursor.next(); // first `)`
+                        self.cursor.next(); // second `)`
+                        self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                    } else {
+                        // NOT a `))` close — the `$( (…) )` wrinkle.  Do NOT consume;
+                        // the parser rewinds.  (Task 5 consumes ArithBail.)
+                        self.history.push(Token::new(TokenKind::ArithBail, Span::new(poff, pl, pc)));
+                    }
+                    return Ok(Step::Produced);
+                }
+                Some(ch) => {
+                    self.cursor.next();
+                    text.push(ch);
+                }
+            }
         }
-        Err(LexError::UnterminatedArith)
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append
