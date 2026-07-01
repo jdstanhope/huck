@@ -1815,15 +1815,25 @@ impl<'a> Lexer<'a> {
                             return Ok(Step::Produced);
                         }
                         Some('(') => {
-                            // `$(` cmdsub (Task 4 splits out `$((` → ArithOpen).  Zero-width
-                            // signal: do NOT consume; cursor stays at `$`.
+                            // Distinguish `$((` (nested arith) from `$(` (cmdsub) via one
+                            // bounded peek. Both are zero-width signals: do NOT consume;
+                            // cursor stays at `$`.
                             if !text.is_empty() {
                                 sync_depth!();
                                 self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
                                 return Ok(Step::Produced);
                             }
                             let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
-                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
+                            let mut p2 = self.cursor.clone();
+                            p2.next(); // `$`
+                            p2.next(); // first `(`
+                            if p2.peek() == Some(&'(') {
+                                // `$((` nested arith — emit a zero-width ArithOpen signal.
+                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(so, sl, sc)));
+                            } else {
+                                // `$(` cmdsub — emit a zero-width CmdSubOpen signal.
+                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
+                            }
                             return Ok(Step::Produced);
                         }
                         Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {

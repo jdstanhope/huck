@@ -737,6 +737,19 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
             Some(TokenKind::ParamOpen { .. })  => { parts.push(parse_param_expansion(iter, true)?); }
             Some(TokenKind::CmdSubOpen)        => { iter.next_kind()?; parts.push(parse_command_sub(iter, true)?); }
             Some(TokenKind::BeginBacktick)     => { iter.next_kind()?; parts.push(parse_backtick_sub(iter, true)?); }
+            // Nested `$((` — mirrors the `CmdSubOpen`/`BeginBacktick` arms above: the
+            // atom peeked here is the zero-width SIGNAL `scan_step_arith` emits without
+            // consuming `$((` (cursor stays at `$`), so it must be discarded via
+            // `next_kind()` BEFORE calling `parse_arith_expansion` — otherwise that
+            // function's own `push_mode` + `next_kind()` would just replay the stale
+            // signal instead of triggering a real scan that consumes `$((` under the
+            // NEW frame (leading to a spurious extra recursion once the real `$((`
+            // consumption is later mis-peeked as another nested open).
+            // `true`, not `_in_dquote`: every embedded expansion inside an arith body is
+            // `quoted: true` regardless of the outer body's own quoted flag (see the
+            // doc comment above this function; matches the production oracle
+            // `arith_string_to_word`/`scan_dollar_expansion`, which hardcodes `true`).
+            Some(TokenKind::ArithOpen)         => { iter.next_kind()?; parts.push(parse_arith_expansion(iter, true)?); }
             Some(TokenKind::Lit { .. })        => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     parts.push(WordPart::Literal { text, quoted });
@@ -2668,5 +2681,14 @@ mod tests {
         diff_arith("$(( $# ))");
         diff_arith("$(( $@ ))");
         diff_arith("$(( $* ))");
+    }
+
+    // ── v246 T4 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_nested() {
+        diff_arith("$(( 3 * $((5*10)) ))");
+        diff_arith("$(( $((1+1)) + $((2+2)) ))");
+        diff_arith("$(( $(( $((1)) )) ))");
     }
 }
