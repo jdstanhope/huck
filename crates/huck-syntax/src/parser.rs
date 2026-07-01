@@ -440,23 +440,84 @@ fn is_bang_word(tok: &TokenKind) -> bool {
     }
 }
 
-/// Returns `true` if `token` is a reserved word (keyword) that the new flat
-/// parser defers to `UnsupportedCommand`.  Mirrors `command.rs`'s `keyword_of`
-/// EXACTLY (the same compound-opener keyword set) — `time` is deliberately NOT
-/// here, because `command.rs` has no `time` handling and parses `time …` as a
-/// plain command; the new parser must match that (see `cmd_time_is_plain_command`).
+/// Reserved-word kinds.  Mirrors `command.rs`'s `Keyword` exactly so that
+/// Tasks 2–7 can share the same stop-at sets and function signatures.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Keyword {
+    If, Then, Elif, Else, Fi,
+    While, Until, Do, Done,
+    For, In, Case, Esac,
+    LBrace, RBrace,
+    DoubleBracketOpen,   // `[[`
+    DoubleBracketClose,  // `]]`
+    Function, Select, Coproc,
+}
+
+impl Keyword {
+    fn name(self) -> &'static str {
+        match self {
+            Keyword::If       => "if",
+            Keyword::Then     => "then",
+            Keyword::Elif     => "elif",
+            Keyword::Else     => "else",
+            Keyword::Fi       => "fi",
+            Keyword::While    => "while",
+            Keyword::Until    => "until",
+            Keyword::Do       => "do",
+            Keyword::Done     => "done",
+            Keyword::For      => "for",
+            Keyword::In       => "in",
+            Keyword::Case     => "case",
+            Keyword::Esac     => "esac",
+            Keyword::LBrace   => "{",
+            Keyword::RBrace   => "}",
+            Keyword::DoubleBracketOpen  => "[[",
+            Keyword::DoubleBracketClose => "]]",
+            Keyword::Function => "function",
+            Keyword::Select   => "select",
+            Keyword::Coproc   => "coproc",
+        }
+    }
+}
+
+/// Returns the keyword a `TokenKind` represents, or `None`.  A token is a
+/// keyword only when it is a `Word` of exactly one part — an *unquoted*
+/// `Literal` whose text equals the keyword.  Mirrors `keyword_of` in
+/// `command.rs`.
+pub(crate) fn keyword_kind(token: &TokenKind) -> Option<Keyword> {
+    let TokenKind::Word(Word(parts)) = token else { return None };
+    if parts.len() != 1 { return None; }
+    let WordPart::Literal { text, quoted: false } = &parts[0] else { return None; };
+    match text.as_str() {
+        "if"       => Some(Keyword::If),
+        "then"     => Some(Keyword::Then),
+        "elif"     => Some(Keyword::Elif),
+        "else"     => Some(Keyword::Else),
+        "fi"       => Some(Keyword::Fi),
+        "while"    => Some(Keyword::While),
+        "until"    => Some(Keyword::Until),
+        "do"       => Some(Keyword::Do),
+        "done"     => Some(Keyword::Done),
+        "for"      => Some(Keyword::For),
+        "in"       => Some(Keyword::In),
+        "case"     => Some(Keyword::Case),
+        "esac"     => Some(Keyword::Esac),
+        "{"        => Some(Keyword::LBrace),
+        "}"        => Some(Keyword::RBrace),
+        "[["       => Some(Keyword::DoubleBracketOpen),
+        "]]"       => Some(Keyword::DoubleBracketClose),
+        "function" => Some(Keyword::Function),
+        "select"   => Some(Keyword::Select),
+        "coproc"   => Some(Keyword::Coproc),
+        _          => None,
+    }
+}
+
+/// Returns `true` if `token` is a reserved word (keyword).  Delegates to
+/// `keyword_kind` so there is ONE keyword table.  `time` is NOT a keyword
+/// (see `cmd_time_is_plain_command`).
 fn keyword_of_tok(token: &TokenKind) -> bool {
-    let TokenKind::Word(Word(parts)) = token else { return false };
-    if parts.len() != 1 { return false; }
-    let WordPart::Literal { text, quoted: false } = &parts[0] else { return false; };
-    matches!(
-        text.as_str(),
-        "if" | "then" | "elif" | "else" | "fi"
-        | "while" | "until" | "do" | "done"
-        | "for" | "in" | "case" | "esac"
-        | "select" | "function" | "{" | "}"
-        | "[[" | "]]" | "coproc"
-    )
+    keyword_kind(token).is_some()
 }
 
 
@@ -622,17 +683,16 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     })))
 }
 
-/// Parses a single pipeline STAGE (dispatch).  Mirrors the non-`!` /
-/// non-pipeline dispatch logic of `parse_command_inner` in `command.rs`.
-/// Every non-simple branch returns `UnsupportedCommand` (deferred).
+/// Parses a single command stage (dispatch).  Mirrors the dispatch logic of
+/// `parse_command_inner` in `command.rs`.
 ///
-/// Returns the BARE stage command — no `Pipeline` wrapper.  The caller
-/// (`parse_pipeline`) collects stages and wraps them.
+/// Returns the BARE stage command — `parse_pipeline` decides Pipeline wrapping.
+///
+/// Compound commands currently supported:
+///   `{` → `parse_brace_group` (Task 1)
+/// All other compound-opening keywords → `UnsupportedCommand` (Tasks 2–7).
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
-    // Skip leading newlines, mirroring `command.rs`'s `parse_command_inner`
-    // (command.rs:1019) — e.g. a newline between a `!` prefix and the command
-    // (`!\ncmd`) is not a separator. (Alias expansion, the oracle's next line,
-    // is out of v242's flat-command scope — the replay tokens are already final.)
+    // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
     skip_newlines(iter)?;
     // EOF with no token.
     if iter.peek_kind()?.is_none() {
@@ -642,7 +702,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Bare `(` → subshell.
+    // Bare `(` → subshell (deferred).
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         return Err(ParseError::UnsupportedCommand);
     }
@@ -653,30 +713,35 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     ) {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Reserved word (keyword).
+    // Reserved word (keyword): `{` dispatches to brace group; all others defer.
     if let Some(tok) = iter.peek_kind()? {
-        if keyword_of_tok(tok) {
-            return Err(ParseError::UnsupportedCommand);
+        match keyword_kind(tok) {
+            Some(Keyword::LBrace) => return parse_brace_group(iter),
+            Some(_) => return Err(ParseError::UnsupportedCommand),
+            None => {}
         }
     }
-    // Function definition `name() compound` — two-token lookahead.
+    // Function definition `name() compound` — two-token lookahead (deferred).
     if matches!(iter.peek_kind()?, Some(TokenKind::Word(_)))
         && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
     {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Simple command: parse and return BARE (not wrapped in Pipeline).
-    // `parse_pipeline` collects stages and wraps them.
+    // Simple command: parse and return BARE.  `parse_pipeline` wraps it.
     parse_simple(iter)
 }
 
 /// Parses a pipeline: an optional leading run of `!` words (odd count →
-/// negate), then simple-command stages joined by `|`.  Mirrors
-/// `parse_command` (bang handling) + `parse_pipeline_with_first` +
+/// negate), then command stages joined by `|`.  Mirrors
+/// `parse_command` (bang handling) + `parse_command_then_pipeline` +
 /// `parse_next_stage` in `command.rs`.
 ///
-/// Always returns `Command::Pipeline(…)` — even a single stage is
-/// wrapped, matching the oracle's behaviour for simple commands.
+/// Wrapping behaviour mirrors the oracle exactly:
+/// - Simple commands without `|`: wrapped in `Command::Pipeline(…)` (oracle:
+///   `parse_pipeline_with_first` always returns Pipeline).
+/// - Compound commands without `|`: returned as-is, or Pipeline-wrapped only
+///   when `!` negate applies (oracle: `parse_command_then_pipeline` returns raw).
+/// - Any command with `|`: all stages collected into `Command::Pipeline(…)`.
 fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Count leading `!` words (each one flips the negate flag).
     let mut bangs = 0usize;
@@ -686,18 +751,37 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
     }
     let negate = bangs % 2 == 1;
 
-    // Parse the first stage.
+    // Parse the first stage command (may be simple or compound).
     let first = parse_command(iter)?;
-    let mut commands = vec![first];
 
-    // While a `|` follows, consume it, skip newlines, and parse the next stage.
-    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
-        iter.next_kind()?; // consume `|`
-        skip_newlines(iter)?;
-        commands.push(parse_command(iter)?);
+    // No `|` follows — wrapping decision mirrors the oracle:
+    //   simple  → always wrap in Pipeline (oracle: parse_pipeline_with_first)
+    //   compound, no negate → return as-is (oracle: parse_command_then_pipeline)
+    //   compound, negate    → wrap so the Pipeline carries the negate flag
+    if !matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+        return Ok(match first {
+            Command::Simple(_) => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
+            cmd if negate      => Command::Pipeline(Pipeline { negate: true, commands: vec![cmd] }),
+            cmd                => cmd,
+        });
     }
 
-    Ok(Command::Pipeline(Pipeline { negate, commands }))
+    // A `|` follows — collect all stages into a Pipeline.
+    let mut stages = vec![first];
+    iter.next_kind()?; // consume `|`
+    skip_newlines(iter)?;
+
+    loop {
+        stages.push(parse_command(iter)?);
+        if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+            iter.next_kind()?; // consume `|`
+            skip_newlines(iter)?;
+        } else {
+            break;
+        }
+    }
+
+    Ok(Command::Pipeline(Pipeline { negate, commands: stages }))
 }
 
 /// Mirrors `parse_command_then_pipeline` in `command.rs`.
@@ -707,10 +791,14 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
 }
 
 /// Parses the full flat and-or list (the complete `Sequence`).  Mirrors
-/// `parse_sequence_opts` in `command.rs` with `stop_at = &[]` and
-/// `stop_at_top_newline = false` — the `parse` (non-unit) contract where a
-/// top-level `Newline` is a Semi-like continue connector, NOT a unit
-/// terminator.
+/// `parse_sequence_opts` in `command.rs` with `stop_at_top_newline = false`
+/// — the `parse` (non-unit) contract where a top-level `Newline` is a
+/// Semi-like continue connector, NOT a unit terminator.
+///
+/// `stop_at` is a set of keywords that terminate the list WITHOUT consuming
+/// the terminator token — used by compound commands to stop before their
+/// closing keyword (e.g. `stop_at = &[Keyword::RBrace]` inside `{ … }`).
+/// Three stop checks mirror `parse_sequence_opts` ~890/917/958.
 ///
 /// After the first pipeline, loops consuming:
 /// - `Op(Semi)` / `Newline` → `Connector::Semi`
@@ -721,24 +809,29 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
 ///   - `& &` → `Err(UnexpectedBackground)`
 ///   - `& cmd` → `Connector::Amp` separator
 ///
-/// Stops (without consuming) at EOF or case terminators
-/// (`;;` / `;&` / `;;&`).
-fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+/// Stops (without consuming) at EOF, case terminators (`;;`/`;&`/`;;&`),
+/// or a `stop_at` keyword.
+pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequence, ParseError> {
     let first = parse_command_then_pipeline(iter)?;
     let mut rest: Vec<(Connector, Command)> = Vec::new();
     let mut background = false;
 
     loop {
+        // ── Stop check 1: before consuming any connector (mirrors ~890) ──────
         match iter.peek_kind()? {
             // EOF — end of list.
             None => break,
-            // Case-clause terminators (`;;` / `;&` / `;;&`) — break without
-            // consuming; at the flat top level these become stray tokens caught
-            // by `parse_sequence`.
+            // Case-clause terminators — break without consuming.
             Some(TokenKind::Op(
                 Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
             )) => break,
-            _ => {}
+            Some(tok) => {
+                if let Some(kw) = keyword_kind(tok) {
+                    if stop_at.contains(&kw) {
+                        break;
+                    }
+                }
+            }
         }
 
         // Consume the connector token.
@@ -754,6 +847,15 @@ fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
                         background = true;
                         break;
                     }
+                    // ── Stop check 2: stop_at keyword after `&` (~917) ────────
+                    Some(tok)
+                        if keyword_kind(tok)
+                            .map(|k| stop_at.contains(&k))
+                            .unwrap_or(false) =>
+                    {
+                        background = true;
+                        break;
+                    }
                     // A case-clause terminator → trailing `&` for the last group.
                     Some(TokenKind::Op(
                         Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
@@ -765,8 +867,7 @@ fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
                     Some(TokenKind::Op(Operator::Background)) => {
                         return Err(ParseError::UnexpectedBackground);
                     }
-                    // A command follows → `&` is a separator; background the
-                    // preceding group and continue the list.
+                    // A command follows → `&` is a separator.
                     Some(_) => {
                         rest.push((Connector::Amp, parse_command_then_pipeline(iter)?));
                     }
@@ -774,16 +875,19 @@ fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
             }
 
             // ── `;` or newline — semi-like connector ─────────────────────────
-            // `stop_at_top_newline = false`: top-level newline is a Semi
-            // connector (`a\nb` = one Sequence), not a unit terminator.
             TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
                 skip_newlines(iter)?;
+                // ── Stop check 3: stop_at keyword after `;`/newline (~958) ───
                 match iter.peek_kind()? {
                     None => break,
                     Some(TokenKind::Op(
                         Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
                     )) => break,
-                    Some(_) => {}
+                    Some(tok) => {
+                        if keyword_kind(tok).map(|k| stop_at.contains(&k)).unwrap_or(false) {
+                            break;
+                        }
+                    }
                 }
                 rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
             }
@@ -801,7 +905,10 @@ fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
             }
 
             // ── anything else (e.g. stray word / `|` after a closed block) ──
-            _ => {
+            other => {
+                if let Some(kw) = keyword_kind(&other) {
+                    return Err(ParseError::UnexpectedKeyword(kw.name().to_string()));
+                }
                 return Err(ParseError::UnexpectedToken);
             }
         }
@@ -822,13 +929,72 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let seq = parse_and_or(iter)?;
+    let seq = parse_and_or(iter, &[])?;
     // Mirror `parse_cursor`: a stray terminator (`;;`/`;&`/`;;&`) left after
     // the top-level sequence → `UnexpectedToken`.
     if iter.peek_kind()?.is_some() {
         return Err(ParseError::UnexpectedToken);
     }
     Ok(Some(seq))
+}
+
+/// Expects a specific keyword token; returns `on_missing` if the next token
+/// is not the expected keyword.  Mirrors `expect_keyword` in `command.rs`.
+fn expect_keyword(
+    iter: &mut Lexer,
+    expected: Keyword,
+    on_missing: ParseError,
+) -> Result<(), ParseError> {
+    match iter.next_kind()? {
+        Some(ref t) if keyword_kind(t) == Some(expected) => Ok(()),
+        _ => Err(on_missing),
+    }
+}
+
+/// Parses a compound command's body (`LIST` terminated by a keyword in
+/// `stop_at`).  If the body is empty AND the iterator is exhausted, the
+/// compound is unterminated — return `unterminated` instead of
+/// `MissingCommand`.  Mirrors `parse_compound_section` in `command.rs`.
+pub(crate) fn parse_compound_section(
+    iter: &mut Lexer,
+    stop_at: &[Keyword],
+    unterminated: ParseError,
+) -> Result<Sequence, ParseError> {
+    match parse_and_or(iter, stop_at) {
+        Err(ParseError::MissingCommand) if iter.peek_kind()?.is_none() => Err(unterminated),
+        other => other,
+    }
+}
+
+/// Wraps a freshly-parsed compound command in `Command::Redirected` when one
+/// or more redirects immediately follow its terminator; otherwise returns the
+/// command unchanged.  Mirrors `maybe_wrap_redirects` in `command.rs`.
+pub(crate) fn maybe_wrap_redirects(
+    cmd: Command,
+    iter: &mut Lexer,
+) -> Result<Command, ParseError> {
+    let mut redirects: Vec<Redirection> = Vec::new();
+    while crate::command::next_is_redirect(iter)? {
+        redirects.extend(parse_one_redirect(iter)?);
+    }
+    if !redirects.is_empty() {
+        Ok(Command::Redirected { inner: Box::new(cmd), redirects })
+    } else {
+        Ok(cmd)
+    }
+}
+
+/// Parses `{ LIST }`.  Expects the `{` keyword, a compound section stopping
+/// at `}`, then the `}` keyword.  Trailing redirects are handled by
+/// `maybe_wrap_redirects`.  Mirrors `parse_brace_group` in `command.rs`
+/// (with `maybe_wrap_redirects` inlined from the caller, since
+/// `parse_command` returns `Command` rather than a bare `Sequence`).
+fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
+    expect_keyword(iter, Keyword::LBrace, ParseError::UnterminatedBrace)?;
+    let body =
+        parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
+    expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
+    maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
 }
 
 #[cfg(test)]
@@ -1066,6 +1232,10 @@ mod tests {
         assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
     }
+    /// Error parity: the new parser must return the SAME error as the oracle.
+    fn diff_err(s: &str) {
+        assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
+    }
     // T2 tests
 
     #[test]
@@ -1080,11 +1250,29 @@ mod tests {
 
     #[test]
     fn cmd_deferred_boundary() {
+        // `{ a; }` removed: brace groups are now in-scope (Task 1).
         for s in ["( a )", "(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
-                  "for i in a; do x; done", "case x in y) z;; esac", "{ a; }",
+                  "for i in a; do x; done", "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
         }
+    }
+
+    // T1 tests
+
+    #[test]
+    fn cmd_brace_group() {
+        diff_cmd("{ a; }");
+        diff_cmd("{ a; b; }");
+        diff_cmd("{ a; b; c; }");
+        diff_cmd("{ echo hi; }");
+        diff_cmd("{ { a; } }");            // nested
+        diff_cmd("{ a; } >f");             // trailing redirect -> Command::Redirected
+        diff_cmd("{ a; } >f 2>&1");
+        diff_cmd("{ a; } | cat");          // brace as pipeline stage
+        diff_cmd("a | { b; }");
+        diff_cmd("{ a; }; { b; }");        // two brace groups in a sequence
+        diff_err("{ a");                   // UnterminatedBrace parity
     }
 
     // T3 tests
