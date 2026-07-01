@@ -583,6 +583,7 @@ pub(crate) struct Mark {
     opts: LexerOptions,
     alias_trailing_eligible: bool,
     modes: Vec<Mode>,
+    retokenize_arith_as_cmdsub: bool,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -619,6 +620,13 @@ pub struct Lexer<'a> {
     /// Each `ParamExpansion` frame carries its own `seen_name` phase flag so
     /// nested `${…}` expansions and `mark`/`rewind` are both stack-safe.
     modes: Vec<Mode>,
+    /// One-shot v246 flag: when set, the CommandSub scanner treats a `$((` opener
+    /// as `$(` + a subshell `(` (the `$( (…) )` wrinkle) instead of deferring it
+    /// as arithmetic. Set by `parse_arith_expansion` on an `ArithBail` rewind,
+    /// cleared the moment `scan_step_command_sub` consumes the `$(`. Captured in
+    /// `Mark`/restored by `rewind` so a rewind that spans setting it stays
+    /// consistent.
+    retokenize_arith_as_cmdsub: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -644,6 +652,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            retokenize_arith_as_cmdsub: false,
         }
     }
 
@@ -663,6 +672,14 @@ impl<'a> Lexer<'a> {
         // `current_mode()` panic with a confusing message.
         debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
         self.modes.pop().expect("pop_mode on an empty mode stack")
+    }
+
+    /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
+    /// sees is tokenized as `$(` + a subshell `(` rather than deferred as arith.
+    /// Cleared the moment `scan_step_command_sub` consumes that `$(`.
+    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
+    pub(crate) fn set_retokenize_arith_as_cmdsub(&mut self) {
+        self.retokenize_arith_as_cmdsub = true;
     }
 
     /// Checkpoint the scanning state for a later `rewind`. Must be called at a
@@ -695,6 +712,7 @@ impl<'a> Lexer<'a> {
             opts: self.opts,
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
+            retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
         }
     }
 
@@ -725,6 +743,7 @@ impl<'a> Lexer<'a> {
         self.opts = m.opts;
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
+        self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -1495,10 +1514,15 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Produced);
             }
             self.cursor.next(); // consume `(`
-            if self.cursor.peek() == Some(&'(') {
+            if self.cursor.peek() == Some(&'(') && !self.retokenize_arith_as_cmdsub {
                 // `$((` — arithmetic expansion; defer to runtime.
                 self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
             } else {
+                // Either a real `$(cmd)`, OR the v246 wrinkle retry: treat `$((` as
+                // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
+                // stays unconsumed (cursor is on it) and lexes as the subshell
+                // opener in the body.
+                self.retokenize_arith_as_cmdsub = false;
                 // Flip the top-of-stack frame to body_started: true.
                 if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
                     *body_started = true;
@@ -2615,6 +2639,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            retokenize_arith_as_cmdsub: false,
         }
     }
 

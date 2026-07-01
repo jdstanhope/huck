@@ -772,6 +772,12 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
 }
 
 pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    // Mark BEFORE pushing the Arith mode / consuming the `$((` opener, so an
+    // `ArithBail` rewind returns to the `$((` start with the pre-push mode stack
+    // (mark captures `self.modes`). `parse_arith_expansion` is always called at a
+    // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
+    // pull-boundary assert holds.
+    let mark = iter.mark();
     iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
@@ -783,7 +789,15 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     iter.pop_mode();
     match result? {
         ArithBodyOutcome::Closed(body) => Ok(WordPart::Arith { body, quoted }),
-        ArithBodyOutcome::Bail => Err(ParseError::UnsupportedExpansion), // Task 5 replaces this
+        ArithBodyOutcome::Bail => {
+            // The `$((` was really `$( (…) )` (a command-sub whose body starts with
+            // a subshell): a depth-0 `)` not followed by `)` bailed the arith scan.
+            // Rewind to the `$((` start, tell the lexer to tokenize that `$((` as
+            // `$(` + `(`, and re-drive as a command substitution.
+            iter.rewind(&mark);
+            iter.set_retokenize_arith_as_cmdsub();
+            parse_command_sub(iter, quoted)
+        }
     }
 }
 
@@ -2660,6 +2674,9 @@ mod tests {
         diff_arith("$(( (1+2)*3 ))");
         diff_arith("$(( ((1+2)) ))");
         diff_arith("$(( a*(b+c) ))");
+        // Paren-BALANCED body that merely looks command-shaped: `(echo hi)` closes
+        // at depth 0 as `))`, so production keeps it as Arith (not the wrinkle).
+        diff_arith("$(( (echo hi) ))");
     }
 
     #[test]
@@ -2681,6 +2698,33 @@ mod tests {
         diff_arith("$(( $# ))");
         diff_arith("$(( $@ ))");
         diff_arith("$(( $* ))");
+    }
+
+    // ── v246 T5 tests (the `$( (…) )` wrinkle) ────────────────────────────────
+
+    #[test]
+    fn arith_wrinkle_falls_back_to_cmdsub() {
+        // `$((cat) )` / `$((echo hi) )` are really `$( (cat) )` / `$( (echo hi) )` —
+        // a command-sub whose body starts with a subshell.  A depth-0 `)` not
+        // followed by `)` makes the arith scan Bail; the parser rewinds to the
+        // `$((` start and re-drives as a command substitution.  Both paths agree.
+        for s in ["$((cat) )", "$((echo hi) )"] {
+            assert_eq!(new_arith(s, false).unwrap(), old_cs(s, false), "wrinkle {s:?}");
+            assert_eq!(new_arith(s, true).unwrap(),  old_cs(s, true),  "wrinkle quoted {s:?}");
+        }
+    }
+
+    #[test]
+    fn arith_wrinkle_cmdsub_body_error_matches() {
+        // `$((a)b)` is really `$( (a)b )`, whose subshell body `(a)b` is itself a
+        // syntax error (a bare word immediately after `)`).  Production errors on
+        // it; the new path must ALSO error — reaching that error via the ArithBail
+        // → cmdsub retry, not by spuriously succeeding as arith.
+        assert!(new_arith("$((a)b)", false).is_err(), "new path must error on $((a)b)");
+        assert!(
+            tokenize_with_opts("$((a)b)", LexerOptions::default()).is_err(),
+            "production errors on $((a)b) too"
+        );
     }
 
     // ── v246 T4 tests ────────────────────────────────────────────────────────
