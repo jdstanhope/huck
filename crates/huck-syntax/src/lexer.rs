@@ -1620,10 +1620,34 @@ impl<'a> Lexer<'a> {
                                 // (produces WordPart::Quoted { Backslash, [Literal(c)] }).
                             }
                         }
+                    } else if self.cursor.peek() == Some(&'`') {
+                        // A BARE '`' (B = 0) that is NOT a delimiter at this depth.
+                        // Only reachable at D ≥ 2, where a close needs B = 2^(D−1)−1 ≥ 1
+                        // and an open needs B = 2^D−1 ≥ 3 — a lone '`' matches neither.
+                        // Treat it as ORDINARY body content (a literal '`'): NEVER
+                        // delegate to scan_step_command's production '`' arm, which
+                        // would invoke the fat recursive backtick scanner (wrong under
+                        // Mode::Backtick).  Leaving the depth counter untouched lets the
+                        // missing escaped closer surface as an unterminated error at EOF,
+                        // matching the recursive oracle (a stray bare '`' at D≥2 only
+                        // occurs in malformed input).
+                        let off = self.cursor.offset();
+                        let l   = self.cursor.line();
+                        let c   = self.cursor.column();
+                        self.cursor.next(); // consume the bare '`'
+                        if !self.has_token {
+                            self.token_start      = off;
+                            self.token_start_line = l;
+                            self.token_start_col  = c;
+                        }
+                        self.has_token = true;
+                        self.current.push('`');
+                        return Ok(Step::Produced);
                     }
-                    // \c / trailing `\`, or a bare '`' that is not a delimiter at
-                    // this depth (only reachable at D ≥ 2; T5 refines) — delegate
-                    // to Command-mode scanning for the escaped char / literal.
+                    // \c / trailing `\` (the run is an escape, not a delimiter) —
+                    // delegate to Command-mode scanning for the escaped char.  A bare
+                    // '`' can no longer reach here: at D=1 it is the close (handled
+                    // above), at D≥2 it is body content (handled just above).
                     self.scan_step_command()
                 }
                 _ => {

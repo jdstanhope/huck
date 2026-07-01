@@ -2389,4 +2389,18 @@ mod tests {
         diff_bt("`echo \\`echo hi\\``");
         diff_bt("`x \\`y | z\\` w`");            // pipeline in the nested body
     }
+
+    // ── v245 T5: depth-2 nesting — `\\\`` opens/closes a level-2 child ────────
+    //
+    // Proves the unified depth-aware `\`-run decode GENERALIZES to arbitrary
+    // depth: at D=2 the child-open delimiter is `\\\`` (3 backslashes, B=2^2−1=3)
+    // and the close is `\`` (1 backslash, B=2^1−1=1); at D=3 the open is again
+    // `\\\`` (B=2^3−1... no — the formula is B=f(run,depth), pinned to the oracle
+    // below).  (Rust `\\\\\\`` == the shell's `\\\`` — three backslashes + `.)
+    #[test]
+    fn bt_depth2_nesting() {
+        diff_bt("`a \\`b \\\\\\`c\\\\\\` d\\` e`");   // depth-2: \\\` around c
+        diff_bt("`\\`\\\\\\`x\\\\\\`\\``");             // depth-2 at the start
+        diff_bt("`echo \\`echo \\\\\\`echo hi\\\\\\`\\``");
+    }
 }
