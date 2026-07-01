@@ -1627,10 +1627,16 @@ impl<'a> Lexer<'a> {
                         // Treat it as ORDINARY body content (a literal '`'): NEVER
                         // delegate to scan_step_command's production '`' arm, which
                         // would invoke the fat recursive backtick scanner (wrong under
-                        // Mode::Backtick).  Leaving the depth counter untouched lets the
-                        // missing escaped closer surface as an unterminated error at EOF,
-                        // matching the recursive oracle (a stray bare '`' at D≥2 only
-                        // occurs in malformed input).
+                        // Mode::Backtick).
+                        //
+                        // KNOWN DIVERGENCE [deferred, v245, dormant]: this is a LENIENT
+                        // ACCEPT.  The recursive production oracle rejects these malformed
+                        // inputs at the lex stage (LexError::UnterminatedSubstitution), but
+                        // the new path produces Ok.  Well-formed inputs are byte-identical
+                        // (see bt_depth2_nesting); the divergence is malformed-input-only.
+                        // Pinned by bt_malformed_divergence_deferred — that test must be
+                        // updated (or deleted) when Stage-2 live-wiring reconciles this by
+                        // making the new path reject these inputs too.
                         let off = self.cursor.offset();
                         let l   = self.cursor.line();
                         let c   = self.cursor.column();

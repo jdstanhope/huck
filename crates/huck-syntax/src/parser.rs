@@ -2403,4 +2403,39 @@ mod tests {
         diff_bt("`\\`\\\\\\`x\\\\\\`\\``");             // depth-2 at the start
         diff_bt("`echo \\`echo \\\\\\`echo hi\\\\\\`\\``");
     }
+
+    // ── v245 T5 (addendum): pin the bare-backtick-at-D≥2 malformed-input divergence ──
+    //
+    // KNOWN DIVERGENCE [deferred, v245]: the single-pass scan_step_backtick
+    // leniently accepts some malformed inputs that the recursive production oracle
+    // REJECTS at the lex stage.  Well-formed nesting is byte-identical (see
+    // bt_depth2_nesting).  Pinned here so the future Stage-2 live-wiring
+    // reconciles it (make the new path reject too) rather than silently shipping a
+    // parser that accepts what bash rejects.
+    #[test]
+    fn bt_malformed_divergence_deferred() {
+        // KNOWN DIVERGENCE [deferred, v245]: at backtick depth >= 2, a bare ` is
+        // not a valid delimiter (well-formed nesting always escapes deeper
+        // delimiters).  scan_step_backtick leniently consumes it as literal body
+        // content, so the NEW path accepts these MALFORMED inputs while the
+        // recursive production oracle rejects them at the lex stage with
+        // LexError::Substitution(UnterminatedSubstitution).  See the comment at
+        // the bare-`-at-D≥2 branch in scan_step_backtick (lexer.rs) and
+        // bt_depth2_nesting for the byte-identical well-formed proof.
+        for s in [
+            "`\\`x` y\\` z`",   // shell: `\`x` y\` z`  — bare ` inside D=2 body
+            "`\\`a`b\\``",      // shell: `\`a`b\``      — bare ` inside D=2 body
+        ] {
+            // Production oracle rejects at the lex stage:
+            assert!(
+                tokenize_with_opts(s, LexerOptions::default()).is_err(),
+                "expected production lex to reject malformed {s:?}",
+            );
+            // New (parser-driven) path currently accepts (DIVERGENCE):
+            assert!(
+                new_bt(s, false).is_ok(),
+                "new path currently accepts malformed {s:?} — update this test if reconciled",
+            );
+        }
+    }
 }
