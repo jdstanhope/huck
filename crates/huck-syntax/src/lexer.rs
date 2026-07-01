@@ -1561,6 +1561,43 @@ impl<'a> Lexer<'a> {
                     Ok(Step::Produced)
                 }
                 _ => {
+                    // Depth-aware backslash unescape (POSIX backtick rules):
+                    //   \$  → consume `\`, expose `$` to the next scan_step_backtick
+                    //         call (expandable dollar: `\$x` → variable `$x`).
+                    //   \\  → consume both `\`, emit unquoted literal `\`.
+                    //   \c  → delegate to scan_step_command (produces quoted literal `c`,
+                    //         matching parse_substitution_body("\c") for preserved escapes).
+                    // Anything other than `\` falls through to scan_step_command.
+                    if self.cursor.peek() == Some(&'\\') {
+                        match self.cursor.peek_nth(1) {
+                            Some('$') => {
+                                // \$ → drop the `\`; `$` becomes the next char for
+                                // scan_step_command to process as an expandable dollar.
+                                self.cursor.next(); // consume '\'
+                                return Ok(Step::Produced);
+                            }
+                            Some('\\') => {
+                                // \\ → consume both backslashes, emit unquoted literal `\`.
+                                let off = self.cursor.offset();
+                                let l   = self.cursor.line();
+                                let c   = self.cursor.column();
+                                self.cursor.next(); // consume first '\'
+                                self.cursor.next(); // consume second '\'
+                                if !self.has_token {
+                                    self.token_start     = off;
+                                    self.token_start_line = l;
+                                    self.token_start_col  = c;
+                                }
+                                self.has_token = true;
+                                self.current.push('\\');
+                                return Ok(Step::Produced);
+                            }
+                            _ => {
+                                // \c or trailing `\`: let scan_step_command handle it
+                                // (produces WordPart::Quoted { Backslash, [Literal(c)] }).
+                            }
+                        }
+                    }
                     // Normal body character — delegate to Command-mode scanning.
                     // The '`' arm inside scan_step_command cannot fire because we've
                     // already confirmed the next char is not '`'.

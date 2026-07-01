@@ -2337,4 +2337,17 @@ mod tests {
         diff_bt("`if x; then y; fi`");
         diff_bt("``");                 // empty -> empty Sequence
     }
+
+    // ── v245 T3: body content — \$/\\ unescape, $()/${} in body, quoted ─────
+
+    #[test]
+    fn bt_body_content() {
+        diff_bt("`echo \\$x`");        // \$ -> variable $x
+        diff_bt("`echo \\\\`");        // \\ -> literal backslash
+        diff_bt("`echo \\n`");         // \n -> preserved (backslash + n)
+        diff_bt("`echo $(date)`");     // $() in body -> fat-built, passes through
+        diff_bt("`echo ${x}`");        // ${} in body -> fat-built
+        diff_bt("`echo $HOME`");       // bare $ expands
+        diff_bt("`echo \"quoted\"`");  // dquotes in body
+    }
 }
