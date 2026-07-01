@@ -167,11 +167,16 @@ At `Mode::Backtick { depth = D }`, when the next char is `\` or `` ` ``, peek th
 (length `B`) + the char after it (a small LOCAL `CharCursor::peek_nth` peek, bounded by `2^D`) and classify:
 - run of `B` backslashes then `` ` `` with **`B = 2^(D-1) − 1`** → **`EndBacktick`** (close this level; lexer `depth → D-1`).
 - run of `B` backslashes then `` ` `` with **`B = 2^D − 1`** → **`BeginBacktick`** (open a child; lexer `depth → D+1`).
-- otherwise (run not followed by `` ` ``, or `B` not a delimiter count) → it is ESCAPE/body content: strip ONE
-  backslash for `\\` / `\$` / a delimiter-level `` \` `` that isn't at a matching count, and DELEGATE the rest to
-  `scan_step_command` (so a surviving `\` re-tokenizes — escaping the next char or literal at end); preserve other
-  `\c`. (This is the correct general form of T3's `\$`/`\\`: consume the ONE stripping backslash, delegate the rest —
-  NEVER "consume both + push literal".)
+- otherwise (run not followed by `` ` ``, or `B` not a delimiter count) → the backslash run is ESCAPE/body content,
+  processed by peeking the WHOLE run first (never one-at-a-time — consuming one `\` from `\\` would leave `\`` which
+  misreads as a delimiter):
+  - `\$` → consume the `\`, DELEGATE `$` to `scan_step_command` (it starts an expansion → `Var`/etc.).
+  - `\\` → consume BOTH backslashes, then handle the surviving single `\` INLINE, mirroring `scan_step_command`'s `\`
+    arm on the NEXT char: `` ` ``/EOF → unquoted literal `\`; `\n` → line-continuation (drop both); else → consume the
+    next char and push `Quoted { Backslash, [Literal(next)] }`. (Do NOT delegate the survivor — `scan_step_backtick`
+    would re-intercept the `\`. Do NOT "consume both + push a bare literal `\`" — that is the T3 bug.)
+  - other `\c` → delegate the whole `\c` to `scan_step_command` → `Quoted{Backslash}(c)` (matches `unescape_backtick`
+    preserving it).
 
 Sanity: at D=1, close needs `B=0` (bare `` ` ``), open needs `B=1` (`` \` ``); a `\\` (2) is NEITHER → escaped backslash.
 At D=2, close needs `B=1` (`` \` ``), open needs `B=3` (`` \\\` ``); a `\\` (2) needs one more peek — continues to `` \\\` `` → open, else escape.
