@@ -2349,5 +2349,8 @@ mod tests {
         diff_bt("`echo ${x}`");        // ${} in body -> fat-built
         diff_bt("`echo $HOME`");       // bare $ expands
         diff_bt("`echo \"quoted\"`");  // dquotes in body
+        diff_bt("`echo \\\\x`");       // \\x -> Quoted{Backslash,[Literal("x")]}
+        diff_bt("`echo \\\\ x`");      // \\ <space> -> quoted space (no word-split)
+        diff_bt("`echo \\\\$HOME`");   // \\$ -> Quoted{Backslash,[Literal("$")]}, no expand
     }
 }

@@ -1564,7 +1564,9 @@ impl<'a> Lexer<'a> {
                     // Depth-aware backslash unescape (POSIX backtick rules):
                     //   \$  → consume `\`, expose `$` to the next scan_step_backtick
                     //         call (expandable dollar: `\$x` → variable `$x`).
-                    //   \\  → consume both `\`, emit unquoted literal `\`.
+                    //   \\  → consume both `\`; the surviving `\` re-tokenizes: emits
+                    //         Quoted{Backslash,[Literal(X)]} for `\\X`, unquoted literal `\`
+                    //         before body-end/terminator, line-continuation for `\\<NL>`.
                     //   \c  → delegate to scan_step_command (produces quoted literal `c`,
                     //         matching parse_substitution_body("\c") for preserved escapes).
                     // Anything other than `\` falls through to scan_step_command.
@@ -1577,19 +1579,42 @@ impl<'a> Lexer<'a> {
                                 return Ok(Step::Produced);
                             }
                             Some('\\') => {
-                                // \\ → consume both backslashes, emit unquoted literal `\`.
+                                // \\ → consume both backslashes, then re-tokenize the
+                                // surviving `\` inline (mirroring scan_step_command's `\`
+                                // arm on the NEXT char, but without delegating so the
+                                // closing '`' terminator is NOT consumed here).
                                 let off = self.cursor.offset();
                                 let l   = self.cursor.line();
                                 let c   = self.cursor.column();
                                 self.cursor.next(); // consume first '\'
                                 self.cursor.next(); // consume second '\'
-                                if !self.has_token {
-                                    self.token_start     = off;
-                                    self.token_start_line = l;
-                                    self.token_start_col  = c;
+                                match self.cursor.peek().copied() {
+                                    None | Some('`') => {
+                                        // Lone `\` before body-end or terminator: unquoted literal.
+                                        if !self.has_token {
+                                            self.token_start      = off;
+                                            self.token_start_line = l;
+                                            self.token_start_col  = c;
+                                        }
+                                        self.has_token = true;
+                                        self.current.push('\\');
+                                    }
+                                    Some('\n') => { self.cursor.next(); } // line continuation: drop both
+                                    Some(ch) => {
+                                        self.cursor.next(); // consume the escaped char
+                                        flush_literal(&mut self.parts, &mut self.current, false);
+                                        if !self.has_token {
+                                            self.token_start      = off;
+                                            self.token_start_line = l;
+                                            self.token_start_col  = c;
+                                        }
+                                        self.has_token = true;
+                                        self.parts.push(WordPart::Quoted {
+                                            style: QuoteStyle::Backslash,
+                                            parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
+                                        });
+                                    }
                                 }
-                                self.has_token = true;
-                                self.current.push('\\');
                                 return Ok(Step::Produced);
                             }
                             _ => {
