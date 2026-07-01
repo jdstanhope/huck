@@ -25,11 +25,17 @@ as a nested OPENER, and turns every `\c` into a `Quoted{Backslash}` literal inst
 backtick's `` \` ``/`\\`/`\$` unescaping — e.g. `` `echo \$x` `` must yield the VARIABLE
 `$x`, which requires `\$`→`$` BEFORE tokenizing).
 
-**The inversion (this design):** the lexer carries a running nesting **depth** and, per
-character, emits a `BeginBacktick`/`EndBacktick`/body atom based on that state — never
-looking past the current character. The escaping *level* of each backtick, compared to
-the current depth, decides begin vs end. The parser assembles the (arbitrarily nested)
-structure by pushing/popping a `Backtick` mode. No scan-ahead, no unescape-then-retokenize.
+**The inversion (this design):** the **LEXER owns** a running nesting **depth** (it is a
+lexing-context concern — it changes how the next character tokenizes), and per character
+emits a `BeginBacktick`/`EndBacktick`/body atom based on that owned state. The escaping
+*level* of each backtick, compared to the current depth, decides begin vs end. Deciding
+this needs only a **small local lookahead** — the run of backslashes immediately before a
+backtick, bounded by the depth — done at the `CharCursor` level (bounded peek), NOT an
+unbounded scan for a matching delimiter. The **parser** consumes the resulting flat atom
+stream and assembles the (arbitrarily nested) `WordPart::CommandSub` tree via its own
+Begin/End matching. Crucially: **the lexer never reads parser state** (no lexer→parser
+dependency — the same coupling we removed with the old `scan_substitution_body` edge); it
+reads only its OWN depth. No scan-ahead, no unescape-then-retokenize.
 
 ## Scope (in)
 
@@ -37,14 +43,19 @@ structure by pushing/popping a `Backtick` mode. No scan-ahead, no unescape-then-
   is handled natively, not deferred). Unquoted and inside `"…"`.
 - **`Mode::Backtick { depth }`** — a new `Mode` variant carrying the nesting counter as
   PER-FRAME state (the v241 `seen_name`/`in_dquote` pattern), so it rides the mode stack
-  and is `mark`/`rewind`-safe. `depth` = how many backtick levels are currently open.
+  and is `mark`/`rewind`-safe. `depth` = how many backtick levels are currently open. It is
+  **LEXER-OWNED**: the lexer mutates it as scanning state (increments when it emits a
+  `BeginBacktick`, decrements on `EndBacktick`); the parser never reads or writes it.
 - **`TokenKind::BeginBacktick` / `TokenKind::EndBacktick`** — the flat delimiter atoms
   (a `` ` `` opening a child vs closing the current level).
-- **`scan_step_backtick(depth)`** — reading forward ONE character at a time:
-  - on a backtick (with its preceding backslash run): decode its escaping *level* and
-    compare to `depth` → emit `BeginBacktick` (level opens a child) or `EndBacktick`
-    (level closes the current). NO lookahead — the decision is `f(current char + run of
-    preceding backslashes already consumed, current depth)`.
+- **`scan_step_backtick`** — dispatched under `Mode::Backtick`; reads the lexer's OWN
+  `depth` from that mode and mutates it. Never reads parser state.
+  - on a backtick: decode its escaping *level* from the immediately-preceding backslash
+    run — a SMALL LOCAL lookahead (bounded by the depth), done at the `CharCursor` level
+    (bounded multi-char peek; the run is contiguous, not a distant delimiter) — and compare
+    to `depth` → emit `BeginBacktick` (opens a child; the lexer increments its `depth`) or
+    `EndBacktick` (closes the current; the lexer decrements). This is state + local peek,
+    NOT an unbounded scan for a matching `` ` ``.
   - on `\$` / `\\` (at the current depth's escaping): depth-aware unescape to `$` / `\`.
   - on other `\c`: preserve (matching `unescape_backtick`).
   - otherwise: tokenize body content as ordinary Command tokens (so a `$(…)` / `${…}` in
@@ -56,13 +67,17 @@ structure by pushing/popping a `Backtick` mode. No scan-ahead, no unescape-then-
   MATCH the production oracle (`scan_backtick_body` + `unescape_backtick` applied
   recursively, one level per nesting depth). The differential across depths 0/1/2 pins it
   exactly; the mechanism is uniform for deeper levels.
-- **`parse_backtick_sub(iter, quoted) -> Result<WordPart, ParseError>`** — on
-  `BeginBacktick`: push `Mode::Backtick { depth }`, parse the body as a `Sequence`
-  terminated by `EndBacktick` (the backtick analogue of v243's `parse_subshell_sequence`
-  stopping on `Op(RParen)`), recursing into `parse_backtick_sub` when a body word hits a
-  nested `BeginBacktick`; on `EndBacktick` pop and return `WordPart::CommandSub {
-  sequence, quoted }`. Empty `` `` `` → an empty `Sequence` (matching `empty_sequence`, as
-  v244). `zero_lines_in_sequence` to match the oracle's body line-zeroing.
+- **`parse_backtick_sub(iter, quoted) -> Result<WordPart, ParseError>`** — ENTERS backtick
+  tokenization (pushes `Mode::Backtick` — the parser→lexer "switch tokenization style"
+  signal, the committed direction; the DEPTH inside is lexer-owned, the parser neither sets
+  nor reads it), then CONSUMES the flat atom stream: the opening `BeginBacktick`, the body
+  parsed as a `Sequence` terminated by `EndBacktick` (the backtick analogue of v243's
+  `parse_subshell_sequence` stopping on `Op(RParen)`), recursing into `parse_backtick_sub`
+  when a body word hits a nested `BeginBacktick`; on the matching `EndBacktick` it exits the
+  mode and returns `WordPart::CommandSub { sequence, quoted }`. The parser's Begin/End
+  matching (its recursion) and the lexer's depth counter are INDEPENDENT — they agree on
+  the nesting but neither drives the other. Empty `` `` `` → an empty `Sequence` (matching
+  `empty_sequence`, as v244). `zero_lines_in_sequence` to match the oracle's line-zeroing.
 - **Primary contexts:** the incremental-lexer sites `scan_step_command` unquoted-word
   (lexer.rs ~1705) and inside-`"…"` (~1639), mirroring v244. `parse_backtick_sub` takes
   `quoted` and threads it onto the `WordPart::CommandSub`.
@@ -90,9 +105,15 @@ structure by pushing/popping a `Backtick` mode. No scan-ahead, no unescape-then-
   `Mode::Backtick`. The new mode + atoms + `scan_step_backtick` + `parse_backtick_sub` +
   the operand dispatch are reached ONLY by tests and the dormant parser path. `cargo test
   --workspace` green, 0 warnings; release harness byte-identical.
-- **The lexer NEVER scans ahead** — `scan_step_backtick` emits one atom per step; the
-  nesting is resolved by the depth STATE (in `Mode::Backtick`) modifying the emitted token
-  kind, and by the PARSER's push/pop — not by looking for a matching `` ` ``.
+- **The lexer NEVER scans ahead for a matching delimiter** — `scan_step_backtick` emits one
+  atom per step; nesting is resolved by the lexer's OWN depth STATE (in `Mode::Backtick`)
+  renaming the emitted token, plus the parser's Begin/End matching to build the AST — not by
+  looking for a matching `` ` ``. A SMALL, LOCAL, bounded `CharCursor` peek over the
+  contiguous backslash run before a backtick (to decode its escaping level) is explicitly
+  allowed — it is not the forbidden unbounded scan.
+- **The lexer does NOT depend on the parser** — `scan_step_backtick` reads only lexer state
+  (its own `depth`); it never calls the parser or reads parser AST. (The parser→lexer mode
+  signal is the allowed direction; lexer→parser is not.)
 - **`command.rs` untouched**; reuse `WordPart::CommandSub { sequence, quoted }` (no AST
   change), `ParseError::UnsupportedExpansion` (for any residual defer), and the v244
   differential harness. Changes live in `lexer.rs` (mode, atoms, `scan_step_backtick`,
@@ -125,10 +146,20 @@ oracle's `UnterminatedSubstitution`/parse error).
   (depth-0 → depth-1 → depth-2), each level's decode pinned by the differential vs the
   recursive oracle; do NOT hand-derive a closed-form and skip the differential. Confirm the
   `2^L − 1`-backslash intuition against the oracle per level rather than assuming it.
-- **Who owns `depth`:** the PARSER pushes `Mode::Backtick { depth+1 }` on consuming
-  `BeginBacktick` and pops on `EndBacktick` (as v244's parser owns push/pop); the lexer
-  READS `current_mode`'s `depth` to pick the token kind. Confirm the sequencing (lexer
-  reads depth D, emits atom, parser adjusts the stack, next step reads the new depth).
+- **Who owns `depth` (settled):** the LEXER owns it. It lives in `Mode::Backtick { depth }`
+  and is mutated BY THE LEXER (increment on emitting `BeginBacktick`, decrement on
+  `EndBacktick`); the lexer reads only its own `depth`, never parser state. The parser
+  enters/exits the `Mode::Backtick` (the parser→lexer mode signal) and matches Begin/End to
+  build the AST, but does NOT set or track the depth. Resolve the entry/exit choreography in
+  the plan (parser pushes `Mode::Backtick` to enter; the lexer sets `depth=1` on the first
+  `BeginBacktick` and pops back to `Command` when `depth` returns to 0) — but keep the depth
+  strictly lexer-owned. This is deliberately different from v244 (where the `$()` structure,
+  not a lexing-context counter, was parser-driven); here the depth is intrinsic to how each
+  character tokenizes, so it must be the lexer's.
+- **CharCursor bounded peek:** decoding a backtick's escaping level needs to look at the
+  contiguous backslash run before it (bounded by depth). Confirm `CharCursor` supports the
+  needed multi-char peek, or extend it — this is bounded LOCAL peeking, explicitly allowed,
+  and must not be turned into a scan for a matching `` ` ``.
 - **Begin-vs-end rule:** at depth D, a backtick at escaping-level `D` opens a child
   (`BeginBacktick`), at level `D−1` closes the current (`EndBacktick`); at depth 0 a bare
   `` ` `` is `BeginBacktick`. Verify this stack rule against the oracle for depths 0/1/2.
