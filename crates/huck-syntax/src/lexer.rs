@@ -416,7 +416,7 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $(( inside an operand — still deferred ($(cmd) handled by CmdSubOpen in v244; backtick handled by BeginBacktick in v245 T6)
+    DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
@@ -1152,6 +1152,16 @@ impl<'a> Lexer<'a> {
                             self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
                         }
                         Some('(') => {
+                            // NOTE (v246 T6): unlike the unquoted operand site below,
+                            // this continuing-nested-dquote site is NOT wired to
+                            // ArithOpen. `CmdSubOpen` was likewise never wired here for
+                            // `$(cmd)` (still deferred) — see the `DeferredExpansion`
+                            // TokenKind doc comment. Signal atoms (ArithOpen/CmdSubOpen/
+                            // BeginBacktick) carry no `quoted` bit of their own, so
+                            // wiring this site would silently drop the "inside a nested
+                            // `"…"`" quoted-context onto the resulting WordPart (verified:
+                            // produces `quoted:false` where the oracle emits `true`).
+                            // Both `$((` and `$(cmd)` remain deferred here.
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `(`
                             self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
@@ -1237,10 +1247,11 @@ impl<'a> Lexer<'a> {
                             let mut probe2 = probe.clone();
                             probe2.next(); // skip first `(`
                             if probe2.peek() == Some(&'(') {
-                                // `$((` — arithmetic expansion; still deferred.
-                                self.cursor.next(); // `$`
-                                self.cursor.next(); // `(`
-                                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                                // v246: `$((` — arithmetic expansion. Emit a ZERO-WIDTH
+                                // ArithOpen signal (do NOT consume `$((`); cursor stays at
+                                // `$` so parse_arith_expansion (which pushes Mode::Arith,
+                                // whose first scan consumes `$((`) can own it.
+                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                             } else {
                                 // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
                                 // Cursor stays at `$` so parse_command_sub (which pushes
@@ -10262,13 +10273,15 @@ mod tests {
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            // CmdSubOpen / BeginBacktick are parser hand-off signals: without the
-            // parser pushing Mode::CommandSub / Mode::Backtick, further scanning
-            // would spin on the same `$(` / `` ` `` (the signal is emitted without
-            // advancing the cursor). Stop here just like we stop at boundary atoms.
+            // CmdSubOpen / BeginBacktick / ArithOpen are parser hand-off signals:
+            // without the parser pushing Mode::CommandSub / Mode::Backtick /
+            // Mode::Arith, further scanning would spin on the same `$(` / `` ` `` /
+            // `$((` (the signal is emitted without advancing the cursor). Stop here
+            // just like we stop at boundary atoms. (v246 T6: ArithOpen added — this
+            // exact omission OOM-crashed a prior session; see v245 T6 for BeginBacktick.)
             let stop = matches!(t.kind,
                 TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
-                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick);
+                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick | TokenKind::ArithOpen);
             out.push(t.kind);
             if stop { break; }
         }
@@ -10325,17 +10338,24 @@ mod tests {
     fn operand_deferred_cmdsub() {
         // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
         // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
-        // `$((` remains DeferredExpansion (still deferred).
+        // v246 T6: `$((` emits ArithOpen (signal to parse_arith_expansion).
         let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
 
-        // `$((` is still deferred — must still emit DeferredExpansion.
+        // `$((` now emits ArithOpen (v246 T6) — no longer DeferredExpansion.
         let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
-        assert_eq!(b[0], TokenKind::DeferredExpansion, "$((…)) must remain DeferredExpansion");
+        assert_eq!(b[0], TokenKind::ArithOpen, "$((…)) must emit ArithOpen signal");
 
         // Backtick now emits BeginBacktick signal (v245 T6).
         let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
+    }
+
+    #[test]
+    fn operand_arith_signal() {
+        // v246 T6: `$((` in an unquoted operand emits ArithOpen (zero-width signal).
+        let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
     }
 
     #[test]

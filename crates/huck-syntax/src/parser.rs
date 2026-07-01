@@ -82,8 +82,16 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 let bt = parse_backtick_sub(iter, quoted)?;
                 parts.push(bt);
             }
+            TokenKind::ArithOpen => {
+                // v246 T6: `$((…))` signal from scan_step_param_operand.
+                // Cursor is at `$((` — parse_arith_expansion pushes Mode::Arith
+                // whose first scan consumes `$((`.
+                let a = parse_arith_expansion(iter, quoted)?;
+                parts.push(a);
+            }
             TokenKind::DeferredExpansion => {
-                // `$((…))` inside an operand — still deferred.
+                // `$(cmd)` / `$((…))` inside a nested `"…"` operand span — still
+                // deferred (see the `DeferredExpansion` doc comment).
                 return Err(ParseError::UnsupportedExpansion);
             }
             _ => {
@@ -1983,12 +1991,14 @@ mod tests {
     #[test]
     fn diff_deferred_returns_unsupported() {
         use crate::lexer::{Lexer, LexerOptions};
-        // `$((…))` remains deferred; `$(…)` inside `"…"` in an operand is deferred
-        // too (only the unquoted-operand `$(` path is wired in v244 T4).
+        // `$(…)` inside `"…"` in an operand is deferred (only the unquoted-operand
+        // `$(` path is wired — for CmdSubOpen in v244 T4 and for ArithOpen in v246
+        // T6; both in-dquote sites remain deferred for `$(cmd)` and `$((`).
         // `${x:-$(cmd)}` (unquoted operand) is now in-scope — moved to cs_in_param_operand.
         // `${x:-`cmd`}` (unquoted-operand backtick) is now in-scope — moved to bt_in_param_operand (v245 T6).
+        // `${x:-$((1+1))}` (unquoted operand) is now in-scope — moved to arith_in_param_operand (v246 T6).
         for s in [
-            "${x:-$((1+1))}", "${x:-\"$(cmd)\"}",
+            "${x:-\"$(cmd)\"}",
         ] {
             let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
             assert!(
@@ -2734,5 +2744,19 @@ mod tests {
         diff_arith("$(( 3 * $((5*10)) ))");
         diff_arith("$(( $((1+1)) + $((2+2)) ))");
         diff_arith("$(( $(( $((1)) )) ))");
+    }
+
+    // ── v246 T6 tests: operand wiring + error parity ────────────────────────
+
+    #[test]
+    fn arith_in_param_operand() {
+        diff_ok("${x:-$((1+1))}");
+        diff_ok("${x:+$((n))}");
+        diff_ok("${x:-a$((i))b}");
+    }
+
+    #[test]
+    fn arith_error_parity() {
+        assert!(new_arith("$((1+1", false).is_err(), "unterminated arith must Err");
     }
 }
