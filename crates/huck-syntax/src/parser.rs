@@ -82,8 +82,16 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 let bt = parse_backtick_sub(iter, quoted)?;
                 parts.push(bt);
             }
+            TokenKind::ArithOpen => {
+                // v246 T6: `$((…))` signal from scan_step_param_operand.
+                // Cursor is at `$((` — parse_arith_expansion pushes Mode::Arith
+                // whose first scan consumes `$((`.
+                let a = parse_arith_expansion(iter, quoted)?;
+                parts.push(a);
+            }
             TokenKind::DeferredExpansion => {
-                // `$((…))` inside an operand — still deferred.
+                // `$(cmd)` / `$((…))` inside a nested `"…"` operand span — still
+                // deferred (see the `DeferredExpansion` doc comment).
                 return Err(ParseError::UnsupportedExpansion);
             }
             _ => {
@@ -690,6 +698,115 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
     if pushed { iter.pop_mode(); }
     let sequence = result?;
     Ok(WordPart::CommandSub { sequence, quoted })
+}
+
+/// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
+///
+/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false }`;
+/// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
+/// parser assembles the body `Word` (literal runs + embedded expansions), stops on
+/// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
+/// command substitution of a subshell (`$( (…) )`).  Owns the push/pop lifecycle;
+/// pops the `Arith` frame on ALL exit paths.
+enum ArithBodyOutcome { Closed(Word), Bail }
+
+/// Assemble the arith body `Word` by pulling atoms until `ArithClose` (→ `Closed`)
+/// or `ArithBail` (→ `Bail`, consumed here so the parser can rewind cleanly).
+///
+/// `parse_param_expansion` consumes its OWN `ParamOpen` token (which the lexer
+/// already emits WITH `${` consumed — not zero-width, mirrors the
+/// `scan_step_param_operand` precedent), so it's dispatched on a PEEK (not a
+/// consume) exactly like `parse_word`'s `ParamOpen` arm.
+///
+/// `parse_command_sub`/`parse_backtick_sub`, by contrast, expect to consume a
+/// FRESH `CmdSubOpen`/`BeginBacktick` scanned under their OWN pushed mode: the
+/// signal atom `scan_step_arith` emits for `$(`/`` ` `` is zero-width (mirrors
+/// `scan_step_param_operand`'s `$(cmd)` signal — cursor stays at `$`/`` ` ``), so
+/// it must be discarded here via `next_kind()` BEFORE calling the sub-parser —
+/// otherwise `push_mode` + the sub-parser's own `next_kind()` would just replay
+/// the stale zero-width signal instead of triggering a real scan that consumes
+/// `$(`/`` ` ``. This mirrors `parse_word`'s `CmdSubOpen`/`BeginBacktick` arms,
+/// which consume via the generic `next_kind()` before dispatching.
+///
+/// Every embedded expansion inside an arith body is `quoted: true` — this matches
+/// the production oracle `arith_string_to_word` (lexer.rs), which hardcodes `true`
+/// for every recursive `scan_dollar_expansion`/backtick call regardless of the
+/// outer `$((…))`'s own quoted flag (arithmetic contexts never word-split, so
+/// nested parts behave as if quoted). Hence `true` is passed to the sub-parsers
+/// here, not `_in_dquote` (which is the OUTER `$((…))`'s own quoted flag, only
+/// used for the resulting `WordPart::Arith { quoted, .. }` in
+/// `parse_arith_expansion`, not for what's inside the body).
+fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutcome, ParseError> {
+    let mut parts: Vec<WordPart> = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::ArithClose) => { iter.next_kind()?; return Ok(ArithBodyOutcome::Closed(Word(parts))); }
+            Some(TokenKind::ArithBail)  => { return Ok(ArithBodyOutcome::Bail); } // Task 5 consumes/rewinds
+            Some(TokenKind::ParamOpen { .. })  => { parts.push(parse_param_expansion(iter, true)?); }
+            Some(TokenKind::CmdSubOpen)        => { iter.next_kind()?; parts.push(parse_command_sub(iter, true)?); }
+            Some(TokenKind::BeginBacktick)     => { iter.next_kind()?; parts.push(parse_backtick_sub(iter, true)?); }
+            // Nested `$((` — mirrors the `CmdSubOpen`/`BeginBacktick` arms above: the
+            // atom peeked here is the zero-width SIGNAL `scan_step_arith` emits without
+            // consuming `$((` (cursor stays at `$`), so it must be discarded via
+            // `next_kind()` BEFORE calling `parse_arith_expansion` — otherwise that
+            // function's own `push_mode` + `next_kind()` would just replay the stale
+            // signal instead of triggering a real scan that consumes `$((` under the
+            // NEW frame (leading to a spurious extra recursion once the real `$((`
+            // consumption is later mis-peeked as another nested open).
+            // `true`, not `_in_dquote`: every embedded expansion inside an arith body is
+            // `quoted: true` regardless of the outer body's own quoted flag (see the
+            // doc comment above this function; matches the production oracle
+            // `arith_string_to_word`/`scan_dollar_expansion`, which hardcodes `true`).
+            Some(TokenKind::ArithOpen)         => { iter.next_kind()?; parts.push(parse_arith_expansion(iter, true)?); }
+            Some(TokenKind::Lit { .. })        => {
+                if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
+                    parts.push(WordPart::Literal { text, quoted });
+                }
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted }) = iter.next_kind()? {
+                    let part = match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted, joined: false },
+                        "*" => WordPart::AllArgs { quoted, joined: true },
+                        "?" => WordPart::LastStatus { quoted },
+                        _   => WordPart::Var { name, quoted },
+                    };
+                    parts.push(part);
+                }
+            }
+            _ => return Err(ParseError::UnsupportedExpansion),
+        }
+    }
+}
+
+pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    // Mark BEFORE pushing the Arith mode / consuming the `$((` opener, so an
+    // `ArithBail` rewind returns to the `$((` start with the pre-push mode stack
+    // (mark captures `self.modes`). `parse_arith_expansion` is always called at a
+    // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
+    // pull-boundary assert holds.
+    let mark = iter.mark();
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false });
+    let result = (|| -> Result<ArithBodyOutcome, ParseError> {
+        match iter.next_kind()? {
+            Some(TokenKind::ArithOpen) => {}
+            _ => return Err(ParseError::UnsupportedExpansion),
+        }
+        parse_arith_body(iter, quoted)
+    })();
+    iter.pop_mode();
+    match result? {
+        ArithBodyOutcome::Closed(body) => Ok(WordPart::Arith { body, quoted }),
+        ArithBodyOutcome::Bail => {
+            // The `$((` was really `$( (…) )` (a command-sub whose body starts with
+            // a subshell): a depth-0 `)` not followed by `)` bailed the arith scan.
+            // Rewind to the `$((` start, tell the lexer to tokenize that `$((` as
+            // `$(` + `(`, and re-drive as a command substitution.
+            iter.rewind(&mark);
+            iter.set_retokenize_arith_as_cmdsub();
+            parse_command_sub(iter, quoted)
+        }
+    }
 }
 
 /// Skip over any `Newline` tokens without consuming anything else.
@@ -1874,12 +1991,14 @@ mod tests {
     #[test]
     fn diff_deferred_returns_unsupported() {
         use crate::lexer::{Lexer, LexerOptions};
-        // `$((…))` remains deferred; `$(…)` inside `"…"` in an operand is deferred
-        // too (only the unquoted-operand `$(` path is wired in v244 T4).
+        // `$(…)` inside `"…"` in an operand is deferred (only the unquoted-operand
+        // `$(` path is wired — for CmdSubOpen in v244 T4 and for ArithOpen in v246
+        // T6; both in-dquote sites remain deferred for `$(cmd)` and `$((`).
         // `${x:-$(cmd)}` (unquoted operand) is now in-scope — moved to cs_in_param_operand.
         // `${x:-`cmd`}` (unquoted-operand backtick) is now in-scope — moved to bt_in_param_operand (v245 T6).
+        // `${x:-$((1+1))}` (unquoted operand) is now in-scope — moved to arith_in_param_operand (v246 T6).
         for s in [
-            "${x:-$((1+1))}", "${x:-\"$(cmd)\"}",
+            "${x:-\"$(cmd)\"}",
         ] {
             let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
             assert!(
@@ -2486,5 +2605,202 @@ mod tests {
     fn bt_error_parity() {
         let new = new_bt("`echo", false);
         assert!(new.is_err(), "unterminated backtick must Err, got {new:?}");
+    }
+
+    // ── v246 T1: arithmetic-expansion differential harness ───────────────────
+    //
+    // THE PRODUCTION LEXER IS THE ORACLE.  When `new_arith` ≠ `old_arith`, fix
+    // the new path to match — never weaken or skip the comparison.
+
+    fn find_arith(parts: &[WordPart]) -> Option<WordPart> {
+        for p in parts {
+            match p {
+                WordPart::Arith { .. } => return Some(p.clone()),
+                WordPart::Quoted { parts, .. } => {
+                    if let Some(f) = find_arith(parts) { return Some(f); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Production oracle: the `WordPart::Arith` the batch lexer builds for `s`.
+    fn old_arith(s: &str, quoted: bool) -> WordPart {
+        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
+        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
+        match &toks[0].kind {
+            TokenKind::Word(w) => find_arith(&w.0).expect("no arith part in production token"),
+            _ => panic!("production token is not a Word for {src:?}"),
+        }
+    }
+
+    /// New parser-driven path.
+    fn new_arith(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
+        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        parse_arith_expansion(&mut lx, quoted)
+    }
+
+    /// Assert new == old for both unquoted and quoted contexts.
+    fn diff_arith(s: &str) {
+        assert_eq!(new_arith(s, false).unwrap(), old_arith(s, false), "unquoted {s:?}");
+        assert_eq!(new_arith(s, true).unwrap(),  old_arith(s, true),  "quoted   {s:?}");
+    }
+
+    // ── v246 T1 scaffolding test ──────────────────────────────────────────────
+
+    #[test]
+    fn arith_scaffolding_exists() {
+        let _ = TokenKind::ArithOpen;
+        let _ = TokenKind::ArithClose;
+        let _ = TokenKind::ArithBail;
+        // Empty arith `$(( ))` round-trips through the skeleton (body filled in Task 2+).
+        // Production `$(( ))` yields Arith { body: Word([...]) }; the skeleton only
+        // guarantees the harness wires up, so just assert new_arith succeeds here.
+        assert!(new_arith("$(())", false).is_ok(), "skeleton must parse $(())");
+    }
+
+    // ── v246 T2 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_depth0_plain() {
+        diff_arith("$((1+2))");
+        diff_arith("$(( 1 + 2 ))");
+        diff_arith("$((0))");
+        diff_arith("$((a+1))");   // bare identifier is literal body text
+        diff_arith("$(( x * y ))");
+    }
+
+    #[test]
+    fn arith_unterminated_errs() {
+        assert!(new_arith("$((1+2", false).is_err(), "unterminated must Err");
+        assert!(new_arith("$(( ", false).is_err(), "unterminated must Err");
+    }
+
+    // ── v246 T3 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_grouping_parens() {
+        diff_arith("$(( (1+2)*3 ))");
+        diff_arith("$(( ((1+2)) ))");
+        diff_arith("$(( a*(b+c) ))");
+        // Paren-BALANCED body that merely looks command-shaped: `(echo hi)` closes
+        // at depth 0 as `))`, so production keeps it as Arith (not the wrinkle).
+        diff_arith("$(( (echo hi) ))");
+    }
+
+    #[test]
+    fn arith_embedded_expansions() {
+        diff_arith("$(( $x + 1 ))");
+        diff_arith("$(( ${y} ))");
+        diff_arith("$(( $(echo 1) ))");
+        diff_arith("$(( `echo 1` ))");
+        diff_arith("$(( $x + ${y} + 2 ))");
+    }
+
+    // ── v246 T3 fix tests (special/positional params) ──────────────────────────
+
+    #[test]
+    fn arith_special_params() {
+        diff_arith("$(( $? ))");
+        diff_arith("$(( $1 ))");
+        diff_arith("$(( $1 + $2 ))");
+        diff_arith("$(( $# ))");
+        diff_arith("$(( $@ ))");
+        diff_arith("$(( $* ))");
+    }
+
+    // ── v246 T5 tests (the `$( (…) )` wrinkle) ────────────────────────────────
+
+    #[test]
+    fn arith_wrinkle_falls_back_to_cmdsub() {
+        // `$((cat) )` / `$((echo hi) )` are really `$( (cat) )` / `$( (echo hi) )` —
+        // a command-sub whose body starts with a subshell.  A depth-0 `)` not
+        // followed by `)` makes the arith scan Bail; the parser rewinds to the
+        // `$((` start and re-drives as a command substitution.  Both paths agree.
+        for s in ["$((cat) )", "$((echo hi) )"] {
+            assert_eq!(new_arith(s, false).unwrap(), old_cs(s, false), "wrinkle {s:?}");
+            assert_eq!(new_arith(s, true).unwrap(),  old_cs(s, true),  "wrinkle quoted {s:?}");
+        }
+    }
+
+    #[test]
+    fn arith_wrinkle_cmdsub_body_error_matches() {
+        // `$((a)b)` is really `$( (a)b )`, whose subshell body `(a)b` is itself a
+        // syntax error (a bare word immediately after `)`).  Production errors on
+        // it; the new path must ALSO error — reaching that error via the ArithBail
+        // → cmdsub retry, not by spuriously succeeding as arith.
+        assert!(new_arith("$((a)b)", false).is_err(), "new path must error on $((a)b)");
+        assert!(
+            tokenize_with_opts("$((a)b)", LexerOptions::default()).is_err(),
+            "production errors on $((a)b) too"
+        );
+    }
+
+    // ── v246 T4 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arith_nested() {
+        diff_arith("$(( 3 * $((5*10)) ))");
+        diff_arith("$(( $((1+1)) + $((2+2)) ))");
+        diff_arith("$(( $(( $((1)) )) ))");
+    }
+
+    // ── v246 T6 tests: operand wiring + error parity ────────────────────────
+
+    #[test]
+    fn arith_in_param_operand() {
+        diff_ok("${x:-$((1+1))}");
+        diff_ok("${x:+$((n))}");
+        diff_ok("${x:-a$((i))b}");
+    }
+
+    #[test]
+    fn arith_error_parity() {
+        assert!(new_arith("$((1+1", false).is_err(), "unterminated arith must Err");
+    }
+
+    // ── v246 follow-up: nested + operand wrinkle-bail tests ────────────────────
+    //
+    // T5 proved the top-level wrinkle (`$((cat) )` bailing to a cmdsub-of-
+    // subshell) matches the oracle; these tests prove the bail ALSO matches when
+    // it happens (a) embedded inside an OUTER arith body that itself closes
+    // legitimately, and (b) embedded inside a `${…}` operand.  All four/three
+    // inputs below were verified against the oracle (`old_arith`/`old_part` via
+    // `diff_arith`/`diff_ok`) before writing this test — no divergence found, so
+    // no `*_divergence_deferred` pin is needed here.
+
+    #[test]
+    fn arith_wrinkle_nested_in_outer_arith() {
+        // The inner `$((cat) )` bails to a `$( (cat) )` cmdsub-of-subshell; the
+        // outer `$((...))` still closes legitimately as arith, so the WHOLE
+        // expression is genuinely arith at the top level (diff_arith applies).
+        diff_arith("$(( $((cat) ) ))");             // bail alone in the outer body
+        diff_arith("$(( 1 + $((echo hi) ) ))");      // bail alongside other arith text
+        diff_arith("$(( $((cat) ) + 1 ))");           // bail followed by more arith text
+        diff_arith("$(( $(( $((cat) ) )) ))");        // bail nested two arith levels deep
+    }
+
+    #[test]
+    fn arith_wrinkle_bail_in_operand() {
+        // The bail happening inside a `${…}` operand (rather than at the
+        // top level or nested in an outer arith) — routes through
+        // parse_param_expansion, so diff_ok (not diff_arith) is the right harness.
+        diff_ok("${x:-$((cat) )}");
+        diff_ok("${x:+$((cat) )}");
+        diff_ok("${x:-a$((cat) )b}");                 // bail between literals in an operand
+    }
+
+    #[test]
+    fn arith_wrinkle_nested_error_parity() {
+        // `$(( $((a)b) ))`: the inner `$((a)b)` bails to a cmdsub-of-subshell
+        // whose body `(a)b` is itself a syntax error (bare word after `)`,
+        // same shape as arith_wrinkle_cmdsub_body_error_matches but nested one
+        // arith level deeper).  Both paths must error.
+        assert!(new_arith("$(( $((a)b) ))", false).is_err(), "new path must error");
+        assert!(
+            tokenize_with_opts("$(( $((a)b) ))", LexerOptions::default()).is_err(),
+            "production errors on $(( $((a)b) )) too"
+        );
     }
 }

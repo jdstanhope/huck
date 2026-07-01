@@ -416,11 +416,15 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $(( inside an operand — still deferred ($(cmd) handled by CmdSubOpen in v244; backtick handled by BeginBacktick in v245 T6)
+    DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
+    // --- Phase C v246: arithmetic-expansion atoms (dormant). ---
+    ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
+    ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
+    ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -553,7 +557,13 @@ pub(crate) enum Mode {
     ParamSubstPatternOperand    { in_dquote: bool },
     ParamSubstringOffsetOperand { in_dquote: bool },
     ParamSubscriptOperand       { in_dquote: bool },
-    Arith,          // $(( … )) / (( … )) / $[ … ]
+    // `in_dquote` is set (by `set_operand_in_dquote`'s callers) for symmetry with
+    // the other operand modes above, but `scan_step_arith` never reads it
+    // (`_in_dquote`) — the oracle hardcodes `quoted: true` for arith bodies (they
+    // are never word-split), so there is no quoted/unquoted branch to select.
+    // Kept for now rather than removed; may carry a future signal (e.g. if arith
+    // ever needs to distinguish a quoted-bit).
+    Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
@@ -579,6 +589,7 @@ pub(crate) struct Mark {
     opts: LexerOptions,
     alias_trailing_eligible: bool,
     modes: Vec<Mode>,
+    retokenize_arith_as_cmdsub: bool,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -615,6 +626,13 @@ pub struct Lexer<'a> {
     /// Each `ParamExpansion` frame carries its own `seen_name` phase flag so
     /// nested `${…}` expansions and `mark`/`rewind` are both stack-safe.
     modes: Vec<Mode>,
+    /// One-shot v246 flag: when set, the CommandSub scanner treats a `$((` opener
+    /// as `$(` + a subshell `(` (the `$( (…) )` wrinkle) instead of deferring it
+    /// as arithmetic. Set by `parse_arith_expansion` on an `ArithBail` rewind,
+    /// cleared the moment `scan_step_command_sub` consumes the `$(`. Captured in
+    /// `Mark`/restored by `rewind` so a rewind that spans setting it stays
+    /// consistent.
+    retokenize_arith_as_cmdsub: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -640,6 +658,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            retokenize_arith_as_cmdsub: false,
         }
     }
 
@@ -659,6 +678,14 @@ impl<'a> Lexer<'a> {
         // `current_mode()` panic with a confusing message.
         debug_assert!(self.modes.len() > 1, "Command is the floor and must never be popped");
         self.modes.pop().expect("pop_mode on an empty mode stack")
+    }
+
+    /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
+    /// sees is tokenized as `$(` + a subshell `(` rather than deferred as arith.
+    /// Cleared the moment `scan_step_command_sub` consumes that `$(`.
+    #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
+    pub(crate) fn set_retokenize_arith_as_cmdsub(&mut self) {
+        self.retokenize_arith_as_cmdsub = true;
     }
 
     /// Checkpoint the scanning state for a later `rewind`. Must be called at a
@@ -691,6 +718,7 @@ impl<'a> Lexer<'a> {
             opts: self.opts,
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
+            retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
         }
     }
 
@@ -721,6 +749,7 @@ impl<'a> Lexer<'a> {
         self.opts = m.opts;
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
+        self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -736,6 +765,8 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
+            Mode::Arith { paren_depth, in_dquote, body_started } =>
+                self.scan_step_arith(paren_depth, in_dquote, body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1127,6 +1158,16 @@ impl<'a> Lexer<'a> {
                             self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
                         }
                         Some('(') => {
+                            // NOTE (v246 T6): unlike the unquoted operand site below,
+                            // this continuing-nested-dquote site is NOT wired to
+                            // ArithOpen. `CmdSubOpen` was likewise never wired here for
+                            // `$(cmd)` (still deferred) — see the `DeferredExpansion`
+                            // TokenKind doc comment. Signal atoms (ArithOpen/CmdSubOpen/
+                            // BeginBacktick) carry no `quoted` bit of their own, so
+                            // wiring this site would silently drop the "inside a nested
+                            // `"…"`" quoted-context onto the resulting WordPart (verified:
+                            // produces `quoted:false` where the oracle emits `true`).
+                            // Both `$((` and `$(cmd)` remain deferred here.
                             self.cursor.next(); // `$`
                             self.cursor.next(); // `(`
                             self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
@@ -1212,10 +1253,11 @@ impl<'a> Lexer<'a> {
                             let mut probe2 = probe.clone();
                             probe2.next(); // skip first `(`
                             if probe2.peek() == Some(&'(') {
-                                // `$((` — arithmetic expansion; still deferred.
-                                self.cursor.next(); // `$`
-                                self.cursor.next(); // `(`
-                                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                                // v246: `$((` — arithmetic expansion. Emit a ZERO-WIDTH
+                                // ArithOpen signal (do NOT consume `$((`); cursor stays at
+                                // `$` so parse_arith_expansion (which pushes Mode::Arith,
+                                // whose first scan consumes `$((`) can own it.
+                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
                             } else {
                                 // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
                                 // Cursor stays at `$` so parse_command_sub (which pushes
@@ -1489,10 +1531,15 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Produced);
             }
             self.cursor.next(); // consume `(`
-            if self.cursor.peek() == Some(&'(') {
+            if self.cursor.peek() == Some(&'(') && !self.retokenize_arith_as_cmdsub {
                 // `$((` — arithmetic expansion; defer to runtime.
                 self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
             } else {
+                // Either a real `$(cmd)`, OR the v246 wrinkle retry: treat `$((` as
+                // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
+                // stays unconsumed (cursor is on it) and lexes as the subshell
+                // opener in the body.
+                self.retokenize_arith_as_cmdsub = false;
                 // Flip the top-of-stack frame to body_started: true.
                 if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
                     *body_started = true;
@@ -1702,6 +1749,201 @@ impl<'a> Lexer<'a> {
         let kind = if open { TokenKind::BeginBacktick } else { TokenKind::EndBacktick };
         self.history.push(Token::new(kind, Span::new(off, l, c)));
         Ok(())
+    }
+
+    /// `Mode::Arith { paren_depth, in_dquote, body_started }` scanner — v246.
+    /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
+    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool) -> Result<Step, LexError> {
+        if !body_started {
+            let off = self.cursor.offset();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
+            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "scan_step_arith entry: expected `$` of `$((`");
+            self.cursor.next(); // `$`
+            self.cursor.next(); // `(`
+            self.cursor.next(); // `(`
+            if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+
+        // Body: accumulate a literal run until a paren event / EOF.  Use a LOCAL
+        // `depth` (seeded from the frame's value) and sync it back to the field on
+        // every return, so `(a)` handled within ONE call counts correctly.
+        let off = self.cursor.offset();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
+        let mut text = String::new();
+        let mut depth = paren_depth;
+        // Helper: write `depth` back into the top Arith frame before returning.
+        macro_rules! sync_depth { () => {
+            if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() { *paren_depth = depth; }
+        }; }
+        loop {
+            match self.cursor.peek().copied() {
+                None => {
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    return Err(LexError::UnterminatedArith);
+                }
+                Some('(') => {
+                    self.cursor.next();
+                    text.push('(');
+                    depth += 1;
+                }
+                Some(')') if depth > 0 => {
+                    self.cursor.next();
+                    text.push(')');
+                    depth -= 1;
+                }
+                Some(')') => {
+                    // depth == 0: flush any pending literal FIRST (emit the
+                    // terminator/bail on the NEXT call), else classify now.
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    let poff = self.cursor.offset();
+                    let pl = self.cursor.line();
+                    let pc = self.cursor.column();
+                    if self.cursor.peek_nth(1) == Some(')') {
+                        self.cursor.next(); // first `)`
+                        self.cursor.next(); // second `)`
+                        self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                    } else {
+                        // NOT a `))` close — the `$( (…) )` wrinkle.  Do NOT consume;
+                        // the parser rewinds.  (Task 5 consumes ArithBail.)
+                        self.history.push(Token::new(TokenKind::ArithBail, Span::new(poff, pl, pc)));
+                    }
+                    return Ok(Step::Produced);
+                }
+                Some('`') => {
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
+                    return Ok(Step::Produced);
+                }
+                Some('$') => {
+                    // Classify what follows `$` (Task 4 adds the `$((` nested-arith branch).
+                    // NOTE: arithmetic contexts always treat embedded expansions as
+                    // `quoted: true` (matches the production oracle `arith_string_to_word`,
+                    // which hardcodes `true` for every recursive `scan_dollar_expansion`/
+                    // backtick call regardless of the outer `$((…))`'s own quoted flag) —
+                    // so these arms use a literal `true`, not the mode's `in_dquote` field.
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `$`
+                    match probe.peek().copied() {
+                        Some('{') => {
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `{`
+                            self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some('(') => {
+                            // Distinguish `$((` (nested arith) from `$(` (cmdsub) via one
+                            // bounded peek. Both are zero-width signals: do NOT consume;
+                            // cursor stays at `$`.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            let mut p2 = self.cursor.clone();
+                            p2.next(); // `$`
+                            p2.next(); // first `(`
+                            if p2.peek() == Some(&'(') {
+                                // `$((` nested arith — emit a zero-width ArithOpen signal.
+                                self.history.push(Token::new(TokenKind::ArithOpen, Span::new(so, sl, sc)));
+                            } else {
+                                // `$(` cmdsub — emit a zero-width CmdSubOpen signal.
+                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
+                            }
+                            return Ok(Step::Produced);
+                        }
+                        Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {
+                            // `$name` variable — consume `$` + name run, emit DollarName.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            let mut name = String::new();
+                            while let Some(ch) = self.cursor.peek().copied() {
+                                if ch.is_ascii_alphanumeric() || ch == '_' { name.push(ch); self.cursor.next(); } else { break; }
+                            }
+                            self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                            // Special parameter (`$?`/`$@`/`$*`/`$#`/`$$`/`$!`/`$-`) —
+                            // mirrors `scan_step_param_operand`'s dquote `$`-handling
+                            // (lexer.rs ~1140) and the oracle `scan_dollar_expansion`
+                            // (~3444-3471), which special-cases each of these one
+                            // char at a time. `parse_arith_body`'s `DollarName` match
+                            // already maps `"@"`→AllArgs{joined:false}, `"*"`→
+                            // AllArgs{joined:true}, `"?"`→LastStatus, else→Var — so no
+                            // parser change is needed here.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // special char
+                            self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        Some(d) if d.is_ascii_digit() => {
+                            // Positional parameter `$N` — the oracle
+                            // (`scan_dollar_expansion` ~3472-3475) consumes exactly
+                            // ONE digit (not a run): `$12` is `$1` followed by a
+                            // literal `2`, matching bash (only `${10}` reaches the
+                            // 10th positional param). `scan_step_param_operand`'s
+                            // dquote digit arm (~1145-1149) does the same.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            let digit = self.cursor.next().unwrap();
+                            self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                        _ => {
+                            // Bare `$` (e.g. before an operator) — literal.
+                            self.cursor.next();
+                            text.push('$');
+                        }
+                    }
+                }
+                Some(ch) => {
+                    self.cursor.next();
+                    text.push(ch);
+                }
+            }
+        }
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append
@@ -2414,6 +2656,7 @@ impl<'a> Lexer<'a> {
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
+            retokenize_arith_as_cmdsub: false,
         }
     }
 
@@ -5969,12 +6212,12 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith);
-        assert_eq!(lx.current_mode(), Mode::Arith);
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -10036,13 +10279,15 @@ mod tests {
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            // CmdSubOpen / BeginBacktick are parser hand-off signals: without the
-            // parser pushing Mode::CommandSub / Mode::Backtick, further scanning
-            // would spin on the same `$(` / `` ` `` (the signal is emitted without
-            // advancing the cursor). Stop here just like we stop at boundary atoms.
+            // CmdSubOpen / BeginBacktick / ArithOpen are parser hand-off signals:
+            // without the parser pushing Mode::CommandSub / Mode::Backtick /
+            // Mode::Arith, further scanning would spin on the same `$(` / `` ` `` /
+            // `$((` (the signal is emitted without advancing the cursor). Stop here
+            // just like we stop at boundary atoms. (v246 T6: ArithOpen added — this
+            // exact omission OOM-crashed a prior session; see v245 T6 for BeginBacktick.)
             let stop = matches!(t.kind,
                 TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
-                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick);
+                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick | TokenKind::ArithOpen);
             out.push(t.kind);
             if stop { break; }
         }
@@ -10099,17 +10344,24 @@ mod tests {
     fn operand_deferred_cmdsub() {
         // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
         // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
-        // `$((` remains DeferredExpansion (still deferred).
+        // v246 T6: `$((` emits ArithOpen (signal to parse_arith_expansion).
         let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
 
-        // `$((` is still deferred — must still emit DeferredExpansion.
+        // `$((` now emits ArithOpen (v246 T6) — no longer DeferredExpansion.
         let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
-        assert_eq!(b[0], TokenKind::DeferredExpansion, "$((…)) must remain DeferredExpansion");
+        assert_eq!(b[0], TokenKind::ArithOpen, "$((…)) must emit ArithOpen signal");
 
         // Backtick now emits BeginBacktick signal (v245 T6).
         let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
+    }
+
+    #[test]
+    fn operand_arith_signal() {
+        // v246 T6: `$((` in an unquoted operand emits ArithOpen (zero-width signal).
+        let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
     }
 
     #[test]
@@ -11029,13 +11281,13 @@ mod array_parse_tests {
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith);
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         let m = lx.mark();
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith);
-        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
