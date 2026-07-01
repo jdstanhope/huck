@@ -162,7 +162,25 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** Modify `crates/huck-syntax/src/lexer.rs`, `crates/huck-syntax/src/parser.rs`.
 
-**What to build — the FIRST nesting level (the escaping decode begins):** under `Mode::Backtick { depth }`, a backtick preceded by the level-appropriate backslash run is a nested delimiter. At depth 1: a `` \` `` (escaping level 1) → `BeginBacktick` (open child, depth → 2); the matching `` \` `` at depth 2 → `EndBacktick` (close, depth → 1); a bare `` ` `` at depth 1 still closes the outer (depth → 0). Decode the escaping level from the contiguous preceding backslash run (bounded `CharCursor` peek). `parse_backtick_sub` recurses on a nested `BeginBacktick` (a body word contains a nested `WordPart::CommandSub`). **Derive the level-1 decode by matching `old_bt` (the recursive oracle) — do not assume a formula; the corpus is the authority.**
+**THE UNIFIED DEPTH-AWARE `\`-RUN DECODE (T4 builds it; T5 generalizes; supersedes T2/T3's isolated `\`-handling).**
+At `Mode::Backtick { depth = D }`, when the next char is `\` or `` ` ``, peek the CONTIGUOUS backslash run
+(length `B`) + the char after it (a small LOCAL `CharCursor::peek_nth` peek, bounded by `2^D`) and classify:
+- run of `B` backslashes then `` ` `` with **`B = 2^(D-1) − 1`** → **`EndBacktick`** (close this level; lexer `depth → D-1`).
+- run of `B` backslashes then `` ` `` with **`B = 2^D − 1`** → **`BeginBacktick`** (open a child; lexer `depth → D+1`).
+- otherwise (run not followed by `` ` ``, or `B` not a delimiter count) → it is ESCAPE/body content: strip ONE
+  backslash for `\\` / `\$` / a delimiter-level `` \` `` that isn't at a matching count, and DELEGATE the rest to
+  `scan_step_command` (so a surviving `\` re-tokenizes — escaping the next char or literal at end); preserve other
+  `\c`. (This is the correct general form of T3's `\$`/`\\`: consume the ONE stripping backslash, delegate the rest —
+  NEVER "consume both + push literal".)
+
+Sanity: at D=1, close needs `B=0` (bare `` ` ``), open needs `B=1` (`` \` ``); a `\\` (2) is NEITHER → escaped backslash.
+At D=2, close needs `B=1` (`` \` ``), open needs `B=3` (`` \\\` ``); a `\\` (2) needs one more peek — continues to `` \\\` `` → open, else escape.
+
+**Task 4 = depth-1 (D=1) of this decode** (bare `` ` `` close, `` \` `` open) + `parse_backtick_sub` recursing on a nested
+`BeginBacktick` (a body word contains a nested `WordPart::CommandSub`). **ALSO fix the T3 `\\` bug as part of this**: change the
+`\\` handling to consume ONE backslash and delegate the rest (add corpus cases `` `echo \\x` `` and `` `echo \\ y` `` — verify
+each against `old_bt`; the current "consume both + push literal `\`" is wrong for `\\`-followed-by-a-char). **Derive by matching
+`old_bt` (the recursive oracle) — validate the `2^D−1` formula against the oracle per level rather than blindly trusting it.**
 
 - [ ] **Step 1: Write failing tests:**
 ```rust
