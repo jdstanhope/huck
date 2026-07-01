@@ -643,7 +643,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn current_mode(&self) -> Mode {
+    pub(crate) fn current_mode(&self) -> Mode {
         *self.modes.last().expect("mode stack is never empty (Command is the floor)")
     }
 
@@ -1530,47 +1530,45 @@ impl<'a> Lexer<'a> {
             self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
             Ok(Step::Produced)
         } else {
-            // BODY (depth = 1): pre-peek to intercept the terminator.
+            // BODY at depth D = `depth` (≥ 1): pre-peek to intercept nested
+            // delimiters (open a child / close this level) vs. body content.
             match self.cursor.peek() {
                 None => {
                     // EOF inside body — flush any pending word, signal Eof.
                     self.finish()
                 }
-                Some(&'`') => {
-                    // Closing backtick: terminator.
-                    let off = self.cursor.offset();
-                    let l   = self.cursor.line();
-                    let c   = self.cursor.column();
-                    self.cursor.next(); // consume '`'
-                    // Flush any pending word token that immediately precedes '`'.
-                    if self.has_token {
-                        flush_literal(&mut self.parts, &mut self.current, false);
-                        emit_word_with_braces(
-                            &mut self.history,
-                            std::mem::take(&mut self.parts),
-                            self.brace_expand,
-                            Span::new(self.token_start, self.token_start_line, self.token_start_col),
-                        )?;
-                        self.has_token = false;
+                Some(&'`') | Some(&'\\') => {
+                    // THE UNIFIED DEPTH-AWARE `\`-RUN DECODE.  Peek the CONTIGUOUS
+                    // backslash run (length B) and the char after it — a bounded
+                    // LOCAL peek (≤ 2^D chars), NOT a scan for a matching '`':
+                    //   B backslashes then '`' with B = 2^(D-1) − 1 → close (D → D−1).
+                    //   B backslashes then '`' with B = 2^D − 1     → open  (D → D+1).
+                    //   otherwise → the run is ESCAPE / body content.
+                    // At D=1: close needs B=0 (bare '`'); open needs B=1 (`\``).
+                    let mut b = 0usize;
+                    while self.cursor.peek_nth(b) == Some('\\') {
+                        b += 1;
                     }
-                    // Flip the mode frame: depth 1 → 0.
-                    if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
-                        *d = 0;
-                    }
-                    self.history.push(Token::new(TokenKind::EndBacktick, Span::new(off, l, c)));
-                    Ok(Step::Produced)
-                }
-                _ => {
-                    // Depth-aware backslash unescape (POSIX backtick rules):
-                    //   \$  → consume `\`, expose `$` to the next scan_step_backtick
-                    //         call (expandable dollar: `\$x` → variable `$x`).
-                    //   \\  → consume both `\`; the surviving `\` re-tokenizes: emits
-                    //         Quoted{Backslash,[Literal(X)]} for `\\X`, unquoted literal `\`
-                    //         before body-end/terminator, line-continuation for `\\<NL>`.
-                    //   \c  → delegate to scan_step_command (produces quoted literal `c`,
-                    //         matching parse_substitution_body("\c") for preserved escapes).
-                    // Anything other than `\` falls through to scan_step_command.
-                    if self.cursor.peek() == Some(&'\\') {
+                    let after   = self.cursor.peek_nth(b);
+                    let close_b = (1usize << (depth - 1)) - 1; // 2^(D-1) − 1
+                    let open_b  = (1usize << depth) - 1;       // 2^D − 1
+                    if after == Some('`') && b == close_b {
+                        // Close this level: consume the run + '`', flip depth D→D-1.
+                        self.emit_backtick_delim(b, /*open=*/ false)?;
+                        return Ok(Step::Produced);
+                    } else if after == Some('`') && b == open_b {
+                        // Open a child: consume the run + '`', flip depth D→D+1.
+                        self.emit_backtick_delim(b, /*open=*/ true)?;
+                        return Ok(Step::Produced);
+                    } else if self.cursor.peek() == Some(&'\\') {
+                        // ESCAPE / body content (the run is NOT a delimiter).
+                        // Process by peeking the WHOLE run (never one-at-a-time):
+                        //   \$  → consume `\`, expose `$` to the next scan_step_backtick
+                        //         call (expandable dollar: `\$x` → variable `$x`).
+                        //   \\  → consume both `\`; the surviving `\` re-tokenizes: emits
+                        //         Quoted{Backslash,[Literal(X)]} for `\\X`, unquoted literal
+                        //         `\` before body-end/terminator, line-continuation for `\\<NL>`.
+                        //   \c  → delegate to scan_step_command (produces quoted literal `c`).
                         match self.cursor.peek_nth(1) {
                             Some('$') => {
                                 // \$ → drop the `\`; `$` becomes the next char for
@@ -1623,13 +1621,53 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
+                    // \c / trailing `\`, or a bare '`' that is not a delimiter at
+                    // this depth (only reachable at D ≥ 2; T5 refines) — delegate
+                    // to Command-mode scanning for the escaped char / literal.
+                    self.scan_step_command()
+                }
+                _ => {
                     // Normal body character — delegate to Command-mode scanning.
                     // The '`' arm inside scan_step_command cannot fire because we've
-                    // already confirmed the next char is not '`'.
+                    // already confirmed the next char is neither '`' nor '\'.
                     self.scan_step_command()
                 }
             }
         }
+    }
+
+    /// Emit a backtick delimiter atom (`BeginBacktick` on open, `EndBacktick` on
+    /// close) for a `Mode::Backtick` body.  Consumes the `run_len` contiguous
+    /// backslashes and the delimiting `` ` ``, flushes any pending word token that
+    /// immediately precedes the delimiter, and mutates the top `Backtick` frame's
+    /// depth in place (+1 on open, −1 on close).  The LEXER owns depth.
+    fn emit_backtick_delim(&mut self, run_len: usize, open: bool) -> Result<(), LexError> {
+        // Span at the START of the backslash run (or the '`' when run_len == 0).
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+        for _ in 0..run_len {
+            self.cursor.next(); // consume a run backslash
+        }
+        self.cursor.next(); // consume the delimiting '`'
+        // Flush any pending word token that immediately precedes the delimiter.
+        if self.has_token {
+            flush_literal(&mut self.parts, &mut self.current, false);
+            emit_word_with_braces(
+                &mut self.history,
+                std::mem::take(&mut self.parts),
+                self.brace_expand,
+                Span::new(self.token_start, self.token_start_line, self.token_start_col),
+            )?;
+            self.has_token = false;
+        }
+        // Mutate depth in the top Backtick frame (single continuous counter).
+        if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
+            if open { *d += 1; } else { *d -= 1; }
+        }
+        let kind = if open { TokenKind::BeginBacktick } else { TokenKind::EndBacktick };
+        self.history.push(Token::new(kind, Span::new(off, l, c)));
+        Ok(())
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append

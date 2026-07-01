@@ -622,20 +622,35 @@ fn parse_backtick_body_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError
 }
 
 /// Assemble a `WordPart::CommandSub` for a `` `…` `` backtick substitution.
-/// Pushes `Mode::Backtick { depth: 0 }` itself, so callers must position the
-/// lexer at the opening backtick (under any mode — the push ensures the backtick
-/// is scanned as atoms rather than a pre-built Word token).
 ///
-/// Owns the full push/pop lifecycle of its `Backtick` frame and consumes the
-/// opening `BeginBacktick` atom plus (via `parse_backtick_body_sequence`) the
-/// closing `EndBacktick` atom.  Mode is popped on ALL exit paths.
+/// **OUTER call** (top mode is not `Backtick`): pushes `Mode::Backtick { depth: 0 }`
+/// itself, so callers must position the lexer at the opening backtick (the push
+/// ensures the backtick is scanned as atoms rather than a pre-built Word token).
+///
+/// **NESTED recursion** (top mode is already `Backtick`, i.e. this is a `` \` ``
+/// child inside a backtick body): the LEXER already owns the SINGLE depth counter
+/// and has emitted the child's `BeginBacktick` (incrementing depth in place), so
+/// this call must NOT push another frame — it consumes the buffered `BeginBacktick`
+/// and parses the child body under the same continuous depth.  The child's
+/// matching `EndBacktick` (lexer depth −1) terminates it.
+///
+/// Owns the push/pop lifecycle of its `Backtick` frame on the OUTER path and
+/// pops on ALL outer exit paths (Ok / empty / error).  Nested recursion neither
+/// pushes nor pops (the single frame is owned by the outer call).
 pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
-    // 1. Push the mode and pull the opening BeginBacktick atom.
-    iter.push_mode(Mode::Backtick { depth: 0 });
+    // Detect nested recursion: a `` \` `` child is entered while the top mode is
+    // already `Backtick` (the lexer has flipped the single frame's depth up and
+    // emitted the child's `BeginBacktick`).  Only the OUTER call owns push/pop.
+    let pushed = !matches!(iter.current_mode(), Mode::Backtick { .. });
+
+    // 1. Push the mode (outer only) and pull the opening BeginBacktick atom.
+    if pushed {
+        iter.push_mode(Mode::Backtick { depth: 0 });
+    }
     match iter.next_kind()? {
         Some(TokenKind::BeginBacktick) => {} // continue
         _ => {
-            iter.pop_mode();
+            if pushed { iter.pop_mode(); }
             return Err(ParseError::UnsupportedExpansion);
         }
     }
@@ -659,8 +674,8 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
                 seq
             }
             Err(e) => {
-                // Pop the Backtick frame before propagating.
-                iter.pop_mode();
+                // Pop the Backtick frame (outer only) before propagating.
+                if pushed { iter.pop_mode(); }
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
                     other => other,
@@ -670,8 +685,8 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
         }
     };
 
-    // 3. Pop the Backtick frame.
-    iter.pop_mode();
+    // 3. Pop the Backtick frame (outer only).
+    if pushed { iter.pop_mode(); }
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
@@ -867,6 +882,16 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
             | TokenKind::EndBacktick
         ) {
             break;
+        }
+        // Nested `` \` `` backtick child inside a backtick body — the lexer has
+        // emitted a `BeginBacktick` (single-frame depth already incremented).
+        // Recurse to assemble a standalone Word carrying its `WordPart::CommandSub`.
+        // (Glued adjacency `` a\`b\`c `` — one word with literal + CommandSub parts
+        // — is not yet handled; deferred, untested at this level.)
+        if matches!(token, TokenKind::BeginBacktick) {
+            let part = parse_backtick_sub(iter, false)?;
+            all_words.push(Word(vec![part]));
+            continue;
         }
         // Redirect tokens — parse in source order, extending the redirects
         // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
@@ -2352,5 +2377,16 @@ mod tests {
         diff_bt("`echo \\\\x`");       // \\x -> Quoted{Backslash,[Literal("x")]}
         diff_bt("`echo \\\\ x`");      // \\ <space> -> quoted space (no word-split)
         diff_bt("`echo \\\\$HOME`");   // \\$ -> Quoted{Backslash,[Literal("$")]}, no expand
+    }
+
+    // ── v245 T4: depth-1 nesting — `\`` opens/closes a child backtick ─────────
+
+    #[test]
+    fn bt_depth1_nesting() {
+        diff_bt("`echo \\`date\\``");            // `echo `date`` (nested once)
+        diff_bt("`a \\`b\\` c`");                // outer body: a `b` c
+        diff_bt("`\\`inner\\``");                // nested at the start
+        diff_bt("`echo \\`echo hi\\``");
+        diff_bt("`x \\`y | z\\` w`");            // pipeline in the nested body
     }
 }
