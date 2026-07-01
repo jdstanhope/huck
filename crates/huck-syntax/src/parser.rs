@@ -5,7 +5,7 @@
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
-    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch,
+    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
 };
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
@@ -718,6 +718,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         match keyword_kind(tok) {
             Some(Keyword::LBrace) => return parse_brace_group(iter),
             Some(Keyword::If)     => return parse_if(iter),
+            Some(Keyword::While) | Some(Keyword::Until) => return parse_while(iter),
             Some(_) => return Err(ParseError::UnsupportedCommand),
             None => {}
         }
@@ -1039,6 +1040,23 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     let clause = IfClause { condition, then_body, elif_branches, else_body };
     maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
+}
+
+/// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
+/// Mirrors `parse_while` (~1886) in `command.rs`: consume the opener keyword
+/// (setting `until`), then condition stops at `do`, then body stops at `done`.
+/// Trailing redirects are handled by `maybe_wrap_redirects`.
+fn parse_while(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let until = match iter.next_kind()?.as_ref().and_then(|t| keyword_kind(t)) {
+        Some(Keyword::While) => false,
+        Some(Keyword::Until) => true,
+        _ => unreachable!("parse_command guarantees a while/until keyword here"),
+    };
+    let condition = parse_compound_section(iter, &[Keyword::Do], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    maybe_wrap_redirects(Command::While(Box::new(WhileClause { condition, body, until })), iter)
 }
 
 /// Parses a `( LIST )` subshell.  Mirrors `parse_subshell` (~1780) in
@@ -1423,6 +1441,22 @@ mod tests {
         diff_err("if x; then y");                                       // UnterminatedIf parity
     }
 
+    // v243 T4 tests
+
+    #[test]
+    fn cmd_while_until() {
+        diff_cmd("while x; do y; done");
+        diff_cmd("until x; do y; done");
+        diff_cmd("while x; do a; b; done");
+        diff_cmd("while x | y; do z; done");                       // pipeline condition
+        diff_cmd("while x; do if y; then z; fi; done");            // nested if in body
+        diff_cmd("while x; do while y; do z; done; done");         // nested loop
+        diff_cmd("until x; do ( a ); done");                       // subshell in body
+        diff_cmd("while x; do y; done | cat");                     // as pipeline stage
+        diff_cmd("while x; do y; done <f");                        // trailing redirect
+        diff_err("while x; do y");                                  // UnterminatedLoop parity
+    }
+
     // v242 T2 tests
 
     #[test]
@@ -1439,7 +1473,8 @@ mod tests {
     fn cmd_deferred_boundary() {
         // `{ a; }` removed: brace groups are now in-scope (Task 1).
         // `( a )` removed: subshells are now in-scope (Task 2).
-        for s in ["(( 1+2 ))", "while x; do y; done",
+        // `while x; do y; done` removed: while/until are now in-scope (Task 4).
+        for s in ["(( 1+2 ))",
                   "for i in a; do x; done", "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
