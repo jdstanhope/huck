@@ -2085,4 +2085,17 @@ mod tests {
         diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
         diff_cs("$({ echo x; })");                  // comsub of a brace group
     }
+
+    // v244 T3 tests
+
+    #[test]
+    fn cs_nesting_quoting() {
+        diff_cs("$(echo $(date))");               // nested: inner fat-built, outer new-path
+        diff_cs("$(echo ${x})");                  // ${…} in a body word (fat-built, passes through)
+        diff_cs("$(a $(b) $(c))");                // two nested
+        diff_cs("$(echo \"$(date)\")");           // nested inside dquotes in the body
+        diff_cs("$(<file)");                       // body is a bare redirect
+        diff_cs("$(cat < in > out)");
+        diff_cs("$(echo hi\n)");                   // trailing newline in body
+    }
 }
