@@ -702,9 +702,9 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Bare `(` → subshell (deferred).
+    // Bare `(` → subshell.
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
-        return Err(ParseError::UnsupportedCommand);
+        return parse_subshell(iter);
     }
     // Heredoc / `<<<` at command position.
     if matches!(
@@ -997,6 +997,114 @@ fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
     maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
 }
 
+/// Parses a `( LIST )` subshell.  Mirrors `parse_subshell` (~1780) in
+/// `command.rs`:
+/// - Consumes the leading `(`.
+/// - `()` (immediate `)`) → `Err(EmptySubshell)`.
+/// - No tokens → `Err(UnterminatedSubshell)`.
+/// - Otherwise delegates to `parse_subshell_sequence` (bespoke connector
+///   loop that terminates on `)`, NOT on a keyword).
+/// - Wraps trailing redirects via `maybe_wrap_redirects`.
+fn parse_subshell(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // Consume `(`.
+    iter.next_kind()?;
+
+    // Empty subshell `()` — immediately hit `)` with no commands inside.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+        iter.next_kind()?; // consume `)`
+        return Err(ParseError::EmptySubshell);
+    }
+
+    // No tokens at all → unterminated.
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::UnterminatedSubshell);
+    }
+
+    let body = parse_subshell_sequence(iter)?;
+    maybe_wrap_redirects(Command::Subshell { body: Box::new(body) }, iter)
+}
+
+/// Parses a sequence of commands terminated by `)`.  Mirrors
+/// `parse_subshell_sequence` (~1807) in `command.rs`:
+/// - Breaks on `Op(RParen)` (consuming it) instead of on a keyword.
+/// - Returns `Err(UnterminatedSubshell)` if the token stream ends before `)`.
+///
+/// This is a BESPOKE loop — it does NOT use `parse_and_or(stop_at)` because
+/// the subshell stops on `)` (an operator token), not on a keyword.
+fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    // Parse the first command (may itself be a subshell, compound, etc.)
+    // and — if followed by `|` — the rest of the pipeline.
+    let first = parse_command_then_pipeline(iter)?;
+
+    let mut rest = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            // End of tokens before `)` → unterminated.
+            None => return Err(ParseError::UnterminatedSubshell),
+            // `)` terminates the subshell body — consume and return.
+            Some(TokenKind::Op(Operator::RParen)) => {
+                iter.next_kind()?;
+                break;
+            }
+            Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline) => {
+                iter.next_kind()?; // consume `;` or newline
+                skip_newlines(iter)?;
+                // Trailing `;` or newline before `)` — break cleanly.
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+                    iter.next_kind()?; // consume `)`
+                    break;
+                }
+                if iter.peek_kind()?.is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                let cmd = parse_command_then_pipeline(iter)?;
+                rest.push((Connector::Semi, cmd));
+            }
+            Some(TokenKind::Op(Operator::Background)) => {
+                iter.next_kind()?; // consume `&`
+                // `&` inside a subshell body backgrounds the preceding command
+                // and acts as a separator.  Skip any redundant `;` or newlines
+                // that follow (`&;` is equivalent to `&` in bash).
+                while matches!(
+                    iter.peek_kind()?,
+                    Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
+                ) {
+                    iter.next_kind()?;
+                }
+                skip_newlines(iter)?;
+                // If `)` follows (or stream ends), this `&` terminates the
+                // whole body as a backgrounded sequence.
+                if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+                    iter.next_kind()?; // consume `)`
+                    return Ok(Sequence { first, rest, background: true });
+                }
+                if iter.peek_kind()?.is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                // More commands follow (`(cmd1 & cmd2)` pattern): parse the
+                // next command and continue.
+                let cmd = parse_command_then_pipeline(iter)?;
+                rest.push((Connector::Amp, cmd));
+            }
+            Some(TokenKind::Op(Operator::And)) => {
+                iter.next_kind()?;
+                skip_newlines(iter)?;
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
+            }
+            Some(TokenKind::Op(Operator::Or)) => {
+                iter.next_kind()?;
+                skip_newlines(iter)?;
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
+            }
+            // Any other token (stray keyword, another `(`, etc.) after a
+            // complete command and before `)` is unexpected.
+            Some(_) => return Err(ParseError::UnterminatedSubshell),
+        }
+    }
+
+    Ok(Sequence { first, rest, background: false })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,7 +1344,25 @@ mod tests {
     fn diff_err(s: &str) {
         assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
     }
-    // T2 tests
+    // v243 T2 tests
+
+    #[test]
+    fn cmd_subshell() {
+        diff_cmd("( a )");
+        diff_cmd("( a; b )");
+        diff_cmd("( a | b )");
+        diff_cmd("( a && b || c )");
+        diff_cmd("( a; b; )");             // trailing ;
+        diff_cmd("( (a) )");               // nested subshell
+        diff_cmd("( { a; } )");            // brace group inside subshell
+        diff_cmd("{ ( a ); }");            // subshell inside brace group
+        diff_cmd("( a ) >f");              // trailing redirect
+        diff_cmd("( a ) | b");             // subshell as pipeline stage
+        diff_err("()");                    // EmptySubshell parity
+        diff_err("( a");                   // unterminated parity
+    }
+
+    // v242 T2 tests
 
     #[test]
     fn cmd_single_simple() {
@@ -1251,7 +1377,8 @@ mod tests {
     #[test]
     fn cmd_deferred_boundary() {
         // `{ a; }` removed: brace groups are now in-scope (Task 1).
-        for s in ["( a )", "(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
+        // `( a )` removed: subshells are now in-scope (Task 2).
+        for s in ["(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
                   "for i in a; do x; done", "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
