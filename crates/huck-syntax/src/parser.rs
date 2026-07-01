@@ -2068,4 +2068,21 @@ mod tests {
         diff_cs("$(true)");
         diff_cs("$()");            // empty -> empty Sequence (NOT EmptySubshell)
     }
+
+    #[test]
+    fn cs_body_grammar() {
+        diff_cs("$(a; b)");
+        diff_cs("$(a; b; c)");
+        diff_cs("$(a | b)");
+        diff_cs("$(a | b | c)");
+        diff_cs("$(a && b || c)");
+        diff_cs("$(a; b;)");                       // trailing ;
+        diff_cs("$(a &)");                          // background in body
+        diff_cs("$(if x; then y; fi)");             // compound body (v243)
+        diff_cs("$(for i in a b; do echo $i; done)");
+        diff_cs("$(while x; do y; done)");
+        diff_cs("$(case $z in a) b;; esac)");
+        diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
+        diff_cs("$({ echo x; })");                  // comsub of a brace group
+    }
 }
