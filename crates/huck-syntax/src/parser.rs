@@ -526,11 +526,26 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
         }
     } else {
         // Non-empty body: delegate to parse_subshell_sequence (which consumes `)`).
-        let mut seq = parse_subshell_sequence(iter)?;
-        // Zero all source-line fields to match the production oracle, which
-        // parses the body in isolation after zeroing all token spans.
-        zero_lines_in_sequence(&mut seq);
-        seq
+        match parse_subshell_sequence(iter) {
+            Ok(mut seq) => {
+                // Zero all source-line fields to match the production oracle, which
+                // parses the body in isolation after zeroing all token spans.
+                zero_lines_in_sequence(&mut seq);
+                seq
+            }
+            Err(e) => {
+                // Pop the CommandSub frame before propagating.  Map UnsupportedCommand
+                // (body-deferred constructs: `[[`, function-def, coproc, …) to
+                // UnsupportedExpansion so parse_command_sub has a consistent return
+                // type for all deferrals.
+                iter.pop_mode();
+                let mapped = match e {
+                    ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    other => other,
+                };
+                return Err(mapped);
+            }
+        }
     };
 
     // 3. Pop the CommandSub frame.
@@ -2118,5 +2133,23 @@ mod tests {
         diff_ok("${x:-a$(b)c}");                    // comsub between literals in an operand
         diff_ok("${x/$(a)/$(b)}");                  // pattern + replacement operands
         diff_ok("${x:-$(echo $(date))}");            // nested comsub inside an operand
+    }
+
+    // ── v244 T5 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cs_deferred_boundary() {
+        diff_cs_deferred("$((1+2))");               // arith expansion (WordPart::Arith, not comsub)
+        diff_cs_deferred("$(( a + b ))");
+        diff_cs_deferred("`echo hi`");              // backtick (own iteration)
+        diff_cs_deferred("$([[ -n x ]])");          // body defers ([[ ]])
+        diff_cs_deferred("$(f() { x; })");          // body defers (function-def)
+        diff_cs_deferred("$(coproc x)");            // body defers (coproc)
+    }
+
+    #[test]
+    fn cs_error_parity() {
+        let new = new_cs("$(echo", false);
+        assert!(new.is_err(), "unterminated comsub must Err, got {new:?}");
     }
 }

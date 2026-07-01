@@ -1446,13 +1446,23 @@ impl<'a> Lexer<'a> {
     /// in Command mode.  The terminating `)` comes out as `Op(RParen)`.
     fn scan_step_command_sub(&mut self, body_started: bool) -> Result<Step, LexError> {
         if !body_started {
-            // Record position BEFORE consuming `$(`.
+            // Record position BEFORE consuming the opener.
             let off = self.cursor.offset();
             let l   = self.cursor.line();
             let c   = self.cursor.column();
-            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "CommandSub: cursor must be on '$'");
+            // If cursor is not on `$` (e.g. a backtick `` ` `` — its own iteration),
+            // emit DeferredExpansion rather than panicking.  This keeps the dormant
+            // CommandSub mode robust when tests call parse_command_sub with non-`$(` input.
+            if self.cursor.peek() != Some(&'$') {
+                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                return Ok(Step::Produced);
+            }
             self.cursor.next(); // consume `$`
-            debug_assert_eq!(self.cursor.peek(), Some(&'('), "CommandSub: '$' must be followed by '('");
+            // If the char after `$` is not `(`, also defer gracefully.
+            if self.cursor.peek() != Some(&'(') {
+                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                return Ok(Step::Produced);
+            }
             self.cursor.next(); // consume `(`
             if self.cursor.peek() == Some(&'(') {
                 // `$((` — arithmetic expansion; defer to runtime.
