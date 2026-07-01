@@ -6,7 +6,7 @@
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
-    ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator,
+    ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
 };
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
@@ -68,8 +68,15 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 };
                 parts.push(part);
             }
+            TokenKind::CmdSubOpen => {
+                // v244 T4: `$(cmd)` signal from scan_step_param_operand.
+                // The cursor is at `$(` — parse_command_sub pushes Mode::CommandSub
+                // and scan_step_command_sub(false) owns consuming `$(`.
+                let cs = parse_command_sub(iter, quoted)?;
+                parts.push(cs);
+            }
             TokenKind::DeferredExpansion => {
-                // `$(…)` / `$((…))` / backtick inside an operand — v241 boundary.
+                // `$((…))` / backtick inside an operand — still deferred.
                 return Err(ParseError::UnsupportedExpansion);
             }
             _ => {
@@ -421,6 +428,129 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // 6. Pop the ParamExpansion frame.
     iter.pop_mode();
     Ok(result)
+}
+
+/// Recursively zero all source-line fields (`ExecCommand.line` /
+/// `SimpleCommand::Assign(_, line)`) in a `Sequence`.
+///
+/// The production oracle (`parse_substitution_body`) resets all token spans
+/// to `line = 0` before parsing, so every command-AST node inside a `$(…)`
+/// body carries `line: 0` ("unknown").  The new parser-driven path parses
+/// in-situ with the live cursor, so lines are script-relative by default.
+/// Calling this helper after `parse_subshell_sequence` aligns the two paths.
+fn zero_lines_in_sequence(seq: &mut Sequence) {
+    zero_lines_in_command(&mut seq.first);
+    for (_, cmd) in &mut seq.rest {
+        zero_lines_in_command(cmd);
+    }
+}
+
+fn zero_lines_in_command(cmd: &mut Command) {
+    match cmd {
+        Command::Simple(sc) => zero_lines_in_simple(sc),
+        Command::Pipeline(p) => {
+            for c in &mut p.commands { zero_lines_in_command(c); }
+        }
+        Command::BraceGroup(seq) => zero_lines_in_sequence(seq),
+        Command::Subshell { body } => zero_lines_in_sequence(body),
+        Command::If(clause) => {
+            zero_lines_in_sequence(&mut clause.condition);
+            zero_lines_in_sequence(&mut clause.then_body);
+            for branch in &mut clause.elif_branches {
+                zero_lines_in_sequence(&mut branch.condition);
+                zero_lines_in_sequence(&mut branch.body);
+            }
+            if let Some(b) = &mut clause.else_body { zero_lines_in_sequence(b); }
+        }
+        Command::While(clause) => {
+            zero_lines_in_sequence(&mut clause.condition);
+            zero_lines_in_sequence(&mut clause.body);
+        }
+        Command::For(clause) => zero_lines_in_sequence(&mut clause.body),
+        Command::Select(clause) => zero_lines_in_sequence(&mut clause.body),
+        Command::Case(clause) => {
+            for item in &mut clause.items {
+                if let Some(b) = &mut item.body { zero_lines_in_sequence(b); }
+            }
+        }
+        Command::FunctionDef { body, .. } => zero_lines_in_command(body),
+        Command::DoubleBracket { .. } => {} // no line field in TestExpr
+        Command::Arith(_) => {}
+        Command::ArithFor(clause) => zero_lines_in_sequence(&mut clause.body),
+        Command::Redirected { inner, .. } => zero_lines_in_command(inner),
+        Command::Coproc { body, .. } => zero_lines_in_command(body),
+    }
+}
+
+fn zero_lines_in_simple(sc: &mut SimpleCommand) {
+    match sc {
+        SimpleCommand::Assign(_, line) => *line = 0,
+        SimpleCommand::Exec(e) => e.line = 0,
+    }
+}
+
+/// Assemble a `WordPart::CommandSub` for a `$(…)` expansion. Pushes
+/// `Mode::CommandSub` itself, so callers must position the lexer at `$(`
+/// (under any mode — the push ensures `$(` is scanned as atoms rather than
+/// a pre-built Word token).
+///
+/// Owns the full push/pop lifecycle of its `CommandSub` frame and consumes
+/// the opening `CmdSubOpen` atom plus (via `parse_subshell_sequence`) the
+/// closing `)` token.
+pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    // 1. Push the mode and pull the opening atom.
+    iter.push_mode(Mode::CommandSub { body_started: false });
+    match iter.next_kind()? {
+        Some(TokenKind::DeferredExpansion) => {
+            // `$((` — arithmetic; defer to runtime.
+            iter.pop_mode();
+            return Err(ParseError::UnsupportedExpansion);
+        }
+        Some(TokenKind::CmdSubOpen) => {} // continue
+        _ => {
+            iter.pop_mode();
+            return Err(ParseError::UnsupportedExpansion);
+        }
+    }
+
+    // 2. Dispatch: empty body or non-empty body.
+    let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+        // Empty body `$()` — consume `)` and construct the same Sequence the
+        // production oracle yields via `parse_substitution_body("")` →
+        // `unwrap_or_else(empty_sequence)`.
+        iter.next_kind()?; // consume `)`
+        Sequence {
+            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+            rest: Vec::new(),
+            background: false,
+        }
+    } else {
+        // Non-empty body: delegate to parse_subshell_sequence (which consumes `)`).
+        match parse_subshell_sequence(iter) {
+            Ok(mut seq) => {
+                // Zero all source-line fields to match the production oracle, which
+                // parses the body in isolation after zeroing all token spans.
+                zero_lines_in_sequence(&mut seq);
+                seq
+            }
+            Err(e) => {
+                // Pop the CommandSub frame before propagating.  Map UnsupportedCommand
+                // (body-deferred constructs: `[[`, function-def, coproc, …) to
+                // UnsupportedExpansion so parse_command_sub has a consistent return
+                // type for all deferrals.
+                iter.pop_mode();
+                let mapped = match e {
+                    ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    other => other,
+                };
+                return Err(mapped);
+            }
+        }
+    };
+
+    // 3. Pop the CommandSub frame.
+    iter.pop_mode();
+    Ok(WordPart::CommandSub { sequence, quoted })
 }
 
 /// Skip over any `Newline` tokens without consuming anything else.
@@ -1593,9 +1723,11 @@ mod tests {
     #[test]
     fn diff_deferred_returns_unsupported() {
         use crate::lexer::{Lexer, LexerOptions};
-        // $(…)/arith/backtick remain deferred even INSIDE a double-quoted operand.
+        // `$((…))` / backtick remain deferred; `$(…)` inside `"…"` in an operand
+        // is deferred too (only the unquoted-operand `$(` path is wired in v244 T4).
+        // `${x:-$(cmd)}` (unquoted operand) is now in-scope — moved to cs_in_param_operand.
         for s in [
-            "${x:-$(cmd)}", "${x:-$((1+1))}", "${x:-`cmd`}", "${x:-\"$(cmd)\"}",
+            "${x:-$((1+1))}", "${x:-`cmd`}", "${x:-\"$(cmd)\"}",
         ] {
             let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
             assert!(
@@ -1898,5 +2030,126 @@ mod tests {
                 assert_eq!(new_seq(s), old_seq(s), "for-arith-unterminated mismatch for {s:?}");
             }
         }
+    }
+
+    // ── v244 T1: command-substitution differential harness ───────────────────
+    //
+    // THE PRODUCTION LEXER IS THE ORACLE.  When `new_cs` ≠ `old_cs`, fix
+    // the new path to match — never weaken or skip the comparison.
+
+    /// Recursively find the first `CommandSub` `WordPart` in a slice.
+    /// Descends into `Quoted` wrappers (the production lexer wraps `$(…)` inside
+    /// `"…"` in a `Quoted { style: Double, parts: [CommandSub{…}] }` node).
+    fn find_command_sub(parts: &[WordPart]) -> Option<WordPart> {
+        for p in parts {
+            match p {
+                WordPart::CommandSub { .. } => return Some(p.clone()),
+                WordPart::Quoted { parts, .. } => {
+                    if let Some(cs) = find_command_sub(parts) {
+                        return Some(cs);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Build the expected `WordPart::CommandSub` using the PRODUCTION lexer (oracle).
+    /// Wraps `s` in `"…"` when `quoted=true` to simulate a double-quoted context.
+    fn old_cs(s: &str, quoted: bool) -> WordPart {
+        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
+        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
+        match &toks[0].kind {
+            TokenKind::Word(w) => find_command_sub(&w.0)
+                .expect("no comsub part in production token"),
+            _ => panic!("production token is not a Word for {src:?}"),
+        }
+    }
+
+    /// Build the expected `WordPart::CommandSub` using the NEW parser-driven path.
+    fn new_cs(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
+        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        parse_command_sub(&mut lx, quoted)
+    }
+
+    /// Assert that the new and old paths produce identical results for both
+    /// unquoted and quoted contexts.
+    fn diff_cs(s: &str) {
+        assert_eq!(new_cs(s, false).unwrap(), old_cs(s, false), "unquoted {s:?}");
+        assert_eq!(new_cs(s, true).unwrap(),  old_cs(s, true),  "quoted   {s:?}");
+    }
+
+    fn diff_cs_deferred(s: &str) {
+        assert!(matches!(new_cs(s, false), Err(ParseError::UnsupportedExpansion)),
+                "expected deferred for {s:?}, got {:?}", new_cs(s, false));
+    }
+
+    #[test]
+    fn cs_simple() {
+        diff_cs("$(echo hi)");
+        diff_cs("$(echo hi there)");
+        diff_cs("$(true)");
+        diff_cs("$()");            // empty -> empty Sequence (NOT EmptySubshell)
+    }
+
+    #[test]
+    fn cs_body_grammar() {
+        diff_cs("$(a; b)");
+        diff_cs("$(a; b; c)");
+        diff_cs("$(a | b)");
+        diff_cs("$(a | b | c)");
+        diff_cs("$(a && b || c)");
+        diff_cs("$(a; b;)");                       // trailing ;
+        diff_cs("$(a &)");                          // background in body
+        diff_cs("$(if x; then y; fi)");             // compound body (v243)
+        diff_cs("$(for i in a b; do echo $i; done)");
+        diff_cs("$(while x; do y; done)");
+        diff_cs("$(case $z in a) b;; esac)");
+        diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
+        diff_cs("$({ echo x; })");                  // comsub of a brace group
+    }
+
+    // v244 T3 tests
+
+    #[test]
+    fn cs_nesting_quoting() {
+        diff_cs("$(echo $(date))");               // nested: inner fat-built, outer new-path
+        diff_cs("$(echo ${x})");                  // ${…} in a body word (fat-built, passes through)
+        diff_cs("$(a $(b) $(c))");                // two nested
+        diff_cs("$(echo \"$(date)\")");           // nested inside dquotes in the body
+        diff_cs("$(<file)");                       // body is a bare redirect
+        diff_cs("$(cat < in > out)");
+        diff_cs("$(echo hi\n)");                   // trailing newline in body
+    }
+
+    // ── v244 T4 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cs_in_param_operand() {
+        diff_ok("${x:-$(echo d)}");
+        diff_ok("${x:+$(cmd)}");
+        diff_ok("${x=$(a b)}");
+        diff_ok("${x:-a$(b)c}");                    // comsub between literals in an operand
+        diff_ok("${x/$(a)/$(b)}");                  // pattern + replacement operands
+        diff_ok("${x:-$(echo $(date))}");            // nested comsub inside an operand
+    }
+
+    // ── v244 T5 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cs_deferred_boundary() {
+        diff_cs_deferred("$((1+2))");               // arith expansion (WordPart::Arith, not comsub)
+        diff_cs_deferred("$(( a + b ))");
+        diff_cs_deferred("`echo hi`");              // backtick (own iteration)
+        diff_cs_deferred("$([[ -n x ]])");          // body defers ([[ ]])
+        diff_cs_deferred("$(f() { x; })");          // body defers (function-def)
+        diff_cs_deferred("$(coproc x)");            // body defers (coproc)
+    }
+
+    #[test]
+    fn cs_error_parity() {
+        let new = new_cs("$(echo", false);
+        assert!(new.is_err(), "unterminated comsub must Err, got {new:?}");
     }
 }
