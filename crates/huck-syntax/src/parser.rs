@@ -650,50 +650,45 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
     // emitted the child's `BeginBacktick`).  Only the OUTER call owns push/pop.
     let pushed = !matches!(iter.current_mode(), Mode::Backtick { .. });
 
-    // 1. Push the mode (outer only) and pull the opening BeginBacktick atom.
+    // 1. Push the mode (outer only).  The fallible body runs inside an
+    //    immediately-invoked closure so that EVERY exit path — including a
+    //    `LexError` surfaced by `?` on a body pull — flows through the single
+    //    `pop_mode` below (outer only).  Nested recursion neither pushes nor pops.
     if pushed {
         iter.push_mode(Mode::Backtick { depth: 0 });
     }
-    match iter.next_kind()? {
-        Some(TokenKind::BeginBacktick) => {} // continue
-        _ => {
-            if pushed { iter.pop_mode(); }
-            return Err(ParseError::UnsupportedExpansion);
+    let result = (|| -> Result<Sequence, ParseError> {
+        // Pull the opening BeginBacktick atom.
+        match iter.next_kind()? {
+            Some(TokenKind::BeginBacktick) => {} // continue
+            _ => return Err(ParseError::UnsupportedExpansion),
         }
-    }
 
-    // 2. Dispatch: empty body or non-empty body.
-    let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
-        // Empty body `` `` `` — consume EndBacktick and return the same Sequence
-        // that the production oracle yields via `parse_substitution_body("")`.
-        iter.next_kind()?; // consume EndBacktick
-        Sequence {
-            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
-            rest: Vec::new(),
-            background: false,
+        // Dispatch: empty body or non-empty body.
+        if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
+            // Empty body `` `` `` — consume EndBacktick and return the same Sequence
+            // that the production oracle yields via `parse_substitution_body("")`.
+            iter.next_kind()?; // consume EndBacktick
+            Ok(Sequence {
+                first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+                rest: Vec::new(),
+                background: false,
+            })
+        } else {
+            // Non-empty body: parse_backtick_body_sequence consumes EndBacktick.
+            let mut seq = parse_backtick_body_sequence(iter).map_err(|e| match e {
+                ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                other => other,
+            })?;
+            // Zero all source-line fields to match the production oracle.
+            zero_lines_in_sequence(&mut seq);
+            Ok(seq)
         }
-    } else {
-        // Non-empty body: parse_backtick_body_sequence consumes EndBacktick.
-        match parse_backtick_body_sequence(iter) {
-            Ok(mut seq) => {
-                // Zero all source-line fields to match the production oracle.
-                zero_lines_in_sequence(&mut seq);
-                seq
-            }
-            Err(e) => {
-                // Pop the Backtick frame (outer only) before propagating.
-                if pushed { iter.pop_mode(); }
-                let mapped = match e {
-                    ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
-                    other => other,
-                };
-                return Err(mapped);
-            }
-        }
-    };
+    })();
 
-    // 3. Pop the Backtick frame (outer only).
+    // 2. Pop the Backtick frame (outer only) on EVERY path, then propagate.
     if pushed { iter.pop_mode(); }
+    let sequence = result?;
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
@@ -2443,6 +2438,37 @@ mod tests {
             assert!(
                 new_bt(s, false).is_ok(),
                 "new path currently accepts malformed {s:?} — update this test if reconciled",
+            );
+        }
+    }
+
+    #[test]
+    fn bt_backslash_run_divergence_deferred() {
+        // KNOWN DIVERGENCE [deferred, v245 — reconcile at Stage-2 live-wiring]:
+        // the body `\`-run decode in scan_step_backtick consumes backslashes two
+        // at a time incrementally, but the production oracle collapses the WHOLE
+        // contiguous run first (backtick unescape: `\\`→`\`, `\$`→`$`, `` \` ``→`` ` ``)
+        // and THEN re-lexes the survivors as a command.  The two passes agree for
+        // runs of 1–3 backslashes (the corpus in bt_body_content), but diverge for
+        // runs >= 4 and for an ODD run immediately before `$`/`` ` ``.  Worst case:
+        // `` `echo \\\$x` `` — the new path decodes to Var{x} (EXPANDS $x) while the
+        // oracle keeps `$x` literal.  These are WELL-FORMED inputs, unlike the
+        // malformed class in bt_malformed_divergence_deferred.  All are dormant
+        // (parser-driven path is not live), so there is no production impact today.
+        // Deferred to a dedicated follow-on iteration with a full parity matrix.
+        for s in [
+            "`echo \\\\\\\\x`",     // shell: `echo \\\\x`   (4 backslashes + x)
+            "`echo \\\\\\\\ x`",    // shell: `echo \\\\ x`  (4 backslashes + space)
+            "`echo \\\\\\\\\\\\x`", // shell: `echo \\\\\\x` (6 backslashes + x)
+            "`echo \\\\\\$x`",      // shell: `echo \\\$x`   (3 backslashes + $x — spurious expand)
+        ] {
+            // Both paths succeed, but they DISAGREE (the divergence).  If a future
+            // fix makes them agree, this assertion fires — delete the pin then.
+            let new = new_bt(s, false).expect("new path should parse");
+            let old = old_bt(s, false);
+            assert_ne!(
+                new, old,
+                "new path now MATCHES oracle for {s:?} — divergence reconciled, remove this pin",
             );
         }
     }
