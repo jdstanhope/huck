@@ -101,6 +101,22 @@ impl<'a> CharCursor<'a> {
         self.peeked = None;
         self.peeked_len = 0;
     }
+
+    /// Peek at the nth character (0-indexed) from the current position WITHOUT
+    /// consuming anything.  `n=0` is equivalent to `peek()` (but returns by value).
+    /// Used by `Mode::Backtick` to look past a run of backslashes before a backtick.
+    ///
+    /// Bounded: scans at most `n+1` chars forward; does NOT advance `pos` or modify
+    /// `peeked`.  Never panics — returns `None` when fewer than `n+1` chars remain.
+    pub fn peek_nth(&self, n: usize) -> Option<char> {
+        // `self.pos` always points at the raw byte offset of the next character
+        // (the `peeked` buffer, if any, starts at `self.pos`).
+        let mut it = self.s[self.pos..].chars();
+        for _ in 0..n {
+            it.next()?;
+        }
+        it.next()
+    }
 }
 
 impl Iterator for CharCursor<'_> {
@@ -400,8 +416,11 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $(( / backtick inside an operand — still deferred (unquoted $(cmd) handled by CmdSubOpen in v244)
+    DeferredExpansion,   // $(( inside an operand — still deferred ($(cmd) handled by CmdSubOpen in v244; backtick handled by BeginBacktick in v245 T6)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
+    // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
+    BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
+    EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -528,6 +547,7 @@ pub(crate) enum Mode {
     Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
     Subshell,       // ( … )
     CommandSub { body_started: bool },  // $( … ) / `…`
+    Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
     ParamExpansion { seen_name: bool }, // ${ … }
     ParamWordOperand            { in_dquote: bool },
     ParamSubstPatternOperand    { in_dquote: bool },
@@ -623,7 +643,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn current_mode(&self) -> Mode {
+    pub(crate) fn current_mode(&self) -> Mode {
         *self.modes.last().expect("mode stack is never empty (Command is the floor)")
     }
 
@@ -715,6 +735,7 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubstringOffsetOperand { in_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote),
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
+            Mode::Backtick { depth } => self.scan_step_backtick(depth),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1083,10 +1104,12 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
-                // Backtick command substitution.
+                // Backtick command substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
+                // Cursor stays at `` ` `` so parse_backtick_sub (which pushes Mode::Backtick)
+                // can own consuming the `` ` `` via scan_step_backtick(depth=0).
+                // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.cursor.next();
-                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1231,10 +1254,12 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
-                // Backtick command-substitution — emit DeferredExpansion, consume opener.
+                // Backtick command-substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
+                // Cursor stays at `` ` `` so parse_backtick_sub (which pushes Mode::Backtick)
+                // can own consuming the `` ` `` via scan_step_backtick(depth=0).
+                // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.cursor.next();
-                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1479,6 +1504,204 @@ impl<'a> Lexer<'a> {
             // Body is Command-mode tokens; the parser owns the terminating `)`.
             self.scan_step_command()
         }
+    }
+
+    /// `Mode::Backtick { depth }` scanner — v245 Task 2.
+    ///
+    /// **depth 0 — entry:** cursor sits on the opening `` ` ``.  Consume it,
+    /// flip the top-of-stack frame to `depth = 1`, emit `BeginBacktick`.
+    ///
+    /// **depth 1 — body:** pre-peek the next char:
+    /// - `` ` `` → closing backtick (terminator): flush any pending word token,
+    ///   flip depth back to 0, emit `EndBacktick`.
+    /// - EOF → defer to `finish()` (unterminated; parser surfaces the error).
+    /// - anything else → delegate to `scan_step_command()`.  Because we've
+    ///   already confirmed the char is NOT `` ` ``, the `` '`' `` arm inside
+    ///   `scan_step_command` can never fire for this step, keeping production
+    ///   `scan_step_command` behavior byte-identical.
+    fn scan_step_backtick(&mut self, depth: u32) -> Result<Step, LexError> {
+        if depth == 0 {
+            // ENTRY: consume the opening backtick and emit BeginBacktick.
+            let off = self.cursor.offset();
+            let l   = self.cursor.line();
+            let c   = self.cursor.column();
+            debug_assert_eq!(self.cursor.peek(), Some(&'`'), "scan_step_backtick depth=0: expected opening `");
+            self.cursor.next(); // consume '`'
+            // Flip the mode frame: depth 0 → 1.
+            if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
+                *d = 1;
+            }
+            self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+            Ok(Step::Produced)
+        } else {
+            // BODY at depth D = `depth` (≥ 1): pre-peek to intercept nested
+            // delimiters (open a child / close this level) vs. body content.
+            match self.cursor.peek() {
+                None => {
+                    // EOF inside body — flush any pending word, signal Eof.
+                    self.finish()
+                }
+                Some(&'`') | Some(&'\\') => {
+                    // THE UNIFIED DEPTH-AWARE `\`-RUN DECODE.  Peek the CONTIGUOUS
+                    // backslash run (length B) and the char after it — a bounded
+                    // LOCAL peek (≤ 2^D chars), NOT a scan for a matching '`':
+                    //   B backslashes then '`' with B = 2^(D-1) − 1 → close (D → D−1).
+                    //   B backslashes then '`' with B = 2^D − 1     → open  (D → D+1).
+                    //   otherwise → the run is ESCAPE / body content.
+                    // At D=1: close needs B=0 (bare '`'); open needs B=1 (`\``).
+                    let mut b = 0usize;
+                    while self.cursor.peek_nth(b) == Some('\\') {
+                        b += 1;
+                    }
+                    let after   = self.cursor.peek_nth(b);
+                    let close_b = (1usize << (depth - 1)) - 1; // 2^(D-1) − 1
+                    let open_b  = (1usize << depth) - 1;       // 2^D − 1
+                    if after == Some('`') && b == close_b {
+                        // Close this level: consume the run + '`', flip depth D→D-1.
+                        self.emit_backtick_delim(b, /*open=*/ false)?;
+                        return Ok(Step::Produced);
+                    } else if after == Some('`') && b == open_b {
+                        // Open a child: consume the run + '`', flip depth D→D+1.
+                        self.emit_backtick_delim(b, /*open=*/ true)?;
+                        return Ok(Step::Produced);
+                    } else if self.cursor.peek() == Some(&'\\') {
+                        // ESCAPE / body content (the run is NOT a delimiter).
+                        // Process by peeking the WHOLE run (never one-at-a-time):
+                        //   \$  → consume `\`, expose `$` to the next scan_step_backtick
+                        //         call (expandable dollar: `\$x` → variable `$x`).
+                        //   \\  → consume both `\`; the surviving `\` re-tokenizes: emits
+                        //         Quoted{Backslash,[Literal(X)]} for `\\X`, unquoted literal
+                        //         `\` before body-end/terminator, line-continuation for `\\<NL>`.
+                        //   \c  → delegate to scan_step_command (produces quoted literal `c`).
+                        match self.cursor.peek_nth(1) {
+                            Some('$') => {
+                                // \$ → drop the `\`; `$` becomes the next char for
+                                // scan_step_command to process as an expandable dollar.
+                                self.cursor.next(); // consume '\'
+                                return Ok(Step::Produced);
+                            }
+                            Some('\\') => {
+                                // \\ → consume both backslashes, then re-tokenize the
+                                // surviving `\` inline (mirroring scan_step_command's `\`
+                                // arm on the NEXT char, but without delegating so the
+                                // closing '`' terminator is NOT consumed here).
+                                let off = self.cursor.offset();
+                                let l   = self.cursor.line();
+                                let c   = self.cursor.column();
+                                self.cursor.next(); // consume first '\'
+                                self.cursor.next(); // consume second '\'
+                                match self.cursor.peek().copied() {
+                                    None | Some('`') => {
+                                        // Lone `\` before body-end or terminator: unquoted literal.
+                                        if !self.has_token {
+                                            self.token_start      = off;
+                                            self.token_start_line = l;
+                                            self.token_start_col  = c;
+                                        }
+                                        self.has_token = true;
+                                        self.current.push('\\');
+                                    }
+                                    Some('\n') => { self.cursor.next(); } // line continuation: drop both
+                                    Some(ch) => {
+                                        self.cursor.next(); // consume the escaped char
+                                        flush_literal(&mut self.parts, &mut self.current, false);
+                                        if !self.has_token {
+                                            self.token_start      = off;
+                                            self.token_start_line = l;
+                                            self.token_start_col  = c;
+                                        }
+                                        self.has_token = true;
+                                        self.parts.push(WordPart::Quoted {
+                                            style: QuoteStyle::Backslash,
+                                            parts: vec![WordPart::Literal { text: ch.to_string(), quoted: true }],
+                                        });
+                                    }
+                                }
+                                return Ok(Step::Produced);
+                            }
+                            _ => {
+                                // \c or trailing `\`: let scan_step_command handle it
+                                // (produces WordPart::Quoted { Backslash, [Literal(c)] }).
+                            }
+                        }
+                    } else if self.cursor.peek() == Some(&'`') {
+                        // A BARE '`' (B = 0) that is NOT a delimiter at this depth.
+                        // Only reachable at D ≥ 2, where a close needs B = 2^(D−1)−1 ≥ 1
+                        // and an open needs B = 2^D−1 ≥ 3 — a lone '`' matches neither.
+                        // Treat it as ORDINARY body content (a literal '`'): NEVER
+                        // delegate to scan_step_command's production '`' arm, which
+                        // would invoke the fat recursive backtick scanner (wrong under
+                        // Mode::Backtick).
+                        //
+                        // KNOWN DIVERGENCE [deferred, v245, dormant]: this is a LENIENT
+                        // ACCEPT.  The recursive production oracle rejects these malformed
+                        // inputs at the lex stage (LexError::UnterminatedSubstitution), but
+                        // the new path produces Ok.  Well-formed inputs are byte-identical
+                        // (see bt_depth2_nesting); the divergence is malformed-input-only.
+                        // Pinned by bt_malformed_divergence_deferred — that test must be
+                        // updated (or deleted) when Stage-2 live-wiring reconciles this by
+                        // making the new path reject these inputs too.
+                        let off = self.cursor.offset();
+                        let l   = self.cursor.line();
+                        let c   = self.cursor.column();
+                        self.cursor.next(); // consume the bare '`'
+                        if !self.has_token {
+                            self.token_start      = off;
+                            self.token_start_line = l;
+                            self.token_start_col  = c;
+                        }
+                        self.has_token = true;
+                        self.current.push('`');
+                        return Ok(Step::Produced);
+                    }
+                    // \c / trailing `\` (the run is an escape, not a delimiter) —
+                    // delegate to Command-mode scanning for the escaped char.  A bare
+                    // '`' can no longer reach here: at D=1 it is the close (handled
+                    // above), at D≥2 it is body content (handled just above).
+                    self.scan_step_command()
+                }
+                _ => {
+                    // Normal body character — delegate to Command-mode scanning.
+                    // The '`' arm inside scan_step_command cannot fire because we've
+                    // already confirmed the next char is neither '`' nor '\'.
+                    self.scan_step_command()
+                }
+            }
+        }
+    }
+
+    /// Emit a backtick delimiter atom (`BeginBacktick` on open, `EndBacktick` on
+    /// close) for a `Mode::Backtick` body.  Consumes the `run_len` contiguous
+    /// backslashes and the delimiting `` ` ``, flushes any pending word token that
+    /// immediately precedes the delimiter, and mutates the top `Backtick` frame's
+    /// depth in place (+1 on open, −1 on close).  The LEXER owns depth.
+    fn emit_backtick_delim(&mut self, run_len: usize, open: bool) -> Result<(), LexError> {
+        // Span at the START of the backslash run (or the '`' when run_len == 0).
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+        for _ in 0..run_len {
+            self.cursor.next(); // consume a run backslash
+        }
+        self.cursor.next(); // consume the delimiting '`'
+        // Flush any pending word token that immediately precedes the delimiter.
+        if self.has_token {
+            flush_literal(&mut self.parts, &mut self.current, false);
+            emit_word_with_braces(
+                &mut self.history,
+                std::mem::take(&mut self.parts),
+                self.brace_expand,
+                Span::new(self.token_start, self.token_start_line, self.token_start_col),
+            )?;
+            self.has_token = false;
+        }
+        // Mutate depth in the top Backtick frame (single continuous counter).
+        if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
+            if open { *d += 1; } else { *d -= 1; }
+        }
+        let kind = if open { TokenKind::BeginBacktick } else { TokenKind::EndBacktick };
+        self.history.push(Token::new(kind, Span::new(off, l, c)));
+        Ok(())
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append
@@ -5756,6 +5979,29 @@ mod tests {
     }
 
     #[test]
+    fn char_cursor_peek_nth_does_not_advance() {
+        // peek_nth must not consume any characters — the cursor position must be
+        // identical before and after the call.  Uses the CharCursor directly.
+        let mut cur = crate::lexer::CharCursor::new("abc");
+        // Pre-fill the peeked slot (mirrors normal lexer usage where peek() was called).
+        let p0 = cur.peek().copied();
+        assert_eq!(p0, Some('a'), "peek() should return 'a'");
+
+        // peek_nth(0) == first char ('a'), same as peek() — no advancement.
+        assert_eq!(cur.peek_nth(0), Some('a'), "peek_nth(0) should be 'a'");
+        // peek_nth(1) looks one further ahead.
+        assert_eq!(cur.peek_nth(1), Some('b'), "peek_nth(1) should be 'b'");
+        assert_eq!(cur.peek_nth(2), Some('c'), "peek_nth(2) should be 'c'");
+        // Past-end returns None.
+        assert_eq!(cur.peek_nth(3), None, "peek_nth(3) past end should be None");
+
+        // The cursor has not advanced — next() must still yield 'a'.
+        assert_eq!(cur.next(), Some('a'), "cursor should not have advanced");
+        // Now first unconsumed char is 'b'; peek_nth(0) returns 'b'.
+        assert_eq!(cur.peek_nth(0), Some('b'), "after consuming 'a', peek_nth(0) should be 'b'");
+    }
+
+    #[test]
     fn next_token_drain_equals_tokenize() {
         // Draining the pull API must equal the batch tokenize() byte-for-byte.
         for src in [
@@ -9790,12 +10036,13 @@ mod tests {
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            // CmdSubOpen is a parser hand-off signal: without the parser pushing
-            // Mode::CommandSub, further scanning would spin on the same `$(`.
-            // Stop here just like we stop at boundary atoms.
+            // CmdSubOpen / BeginBacktick are parser hand-off signals: without the
+            // parser pushing Mode::CommandSub / Mode::Backtick, further scanning
+            // would spin on the same `$(` / `` ` `` (the signal is emitted without
+            // advancing the cursor). Stop here just like we stop at boundary atoms.
             let stop = matches!(t.kind,
                 TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
-                    | TokenKind::CmdSubOpen);
+                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick);
             out.push(t.kind);
             if stop { break; }
         }
@@ -9850,14 +10097,19 @@ mod tests {
 
     #[test]
     fn operand_deferred_cmdsub() {
-        // v244 T4: unquoted `$(cmd)` in an operand now emits CmdSubOpen (signal to
-        // parse_command_sub); `$((` and backtick still emit DeferredExpansion.
+        // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
+        // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
+        // `$((` remains DeferredExpansion (still deferred).
         let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
 
         // `$((` is still deferred — must still emit DeferredExpansion.
         let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(b[0], TokenKind::DeferredExpansion, "$((…)) must remain DeferredExpansion");
+
+        // Backtick now emits BeginBacktick signal (v245 T6).
+        let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
     }
 
     #[test]
