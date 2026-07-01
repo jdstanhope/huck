@@ -416,10 +416,10 @@ pub enum TokenKind {
     ParamOp(ParamOpKind),
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
-    DeferredExpansion,   // $(( / backtick inside an operand — still deferred (unquoted $(cmd) handled by CmdSubOpen in v244)
+    DeferredExpansion,   // $(( inside an operand — still deferred ($(cmd) handled by CmdSubOpen in v244; backtick handled by BeginBacktick in v245 T6)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
-    BeginBacktick,       // opening ` — emitted by scan_step_backtick at depth 0
+    BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
 }
 
@@ -1104,10 +1104,12 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
-                // Backtick command substitution.
+                // Backtick command substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
+                // Cursor stays at `` ` `` so parse_backtick_sub (which pushes Mode::Backtick)
+                // can own consuming the `` ` `` via scan_step_backtick(depth=0).
+                // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.cursor.next();
-                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1252,10 +1254,12 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
 
-                // Backtick command-substitution — emit DeferredExpansion, consume opener.
+                // Backtick command-substitution — emit BeginBacktick SIGNAL without consuming `` ` ``.
+                // Cursor stays at `` ` `` so parse_backtick_sub (which pushes Mode::Backtick)
+                // can own consuming the `` ` `` via scan_step_backtick(depth=0).
+                // Mirrors the CmdSubOpen-signal pattern for `$(` (v244 T4).
                 Some('`') => {
-                    self.cursor.next();
-                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -10032,12 +10036,13 @@ mod tests {
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            // CmdSubOpen is a parser hand-off signal: without the parser pushing
-            // Mode::CommandSub, further scanning would spin on the same `$(`.
-            // Stop here just like we stop at boundary atoms.
+            // CmdSubOpen / BeginBacktick are parser hand-off signals: without the
+            // parser pushing Mode::CommandSub / Mode::Backtick, further scanning
+            // would spin on the same `$(` / `` ` `` (the signal is emitted without
+            // advancing the cursor). Stop here just like we stop at boundary atoms.
             let stop = matches!(t.kind,
                 TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
-                    | TokenKind::CmdSubOpen);
+                    | TokenKind::CmdSubOpen | TokenKind::BeginBacktick);
             out.push(t.kind);
             if stop { break; }
         }
@@ -10092,14 +10097,19 @@ mod tests {
 
     #[test]
     fn operand_deferred_cmdsub() {
-        // v244 T4: unquoted `$(cmd)` in an operand now emits CmdSubOpen (signal to
-        // parse_command_sub); `$((` and backtick still emit DeferredExpansion.
+        // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
+        // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
+        // `$((` remains DeferredExpansion (still deferred).
         let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
 
         // `$((` is still deferred — must still emit DeferredExpansion.
         let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
         assert_eq!(b[0], TokenKind::DeferredExpansion, "$((…)) must remain DeferredExpansion");
+
+        // Backtick now emits BeginBacktick signal (v245 T6).
+        let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
     }
 
     #[test]
