@@ -2759,4 +2759,48 @@ mod tests {
     fn arith_error_parity() {
         assert!(new_arith("$((1+1", false).is_err(), "unterminated arith must Err");
     }
+
+    // ── v246 follow-up: nested + operand wrinkle-bail tests ────────────────────
+    //
+    // T5 proved the top-level wrinkle (`$((cat) )` bailing to a cmdsub-of-
+    // subshell) matches the oracle; these tests prove the bail ALSO matches when
+    // it happens (a) embedded inside an OUTER arith body that itself closes
+    // legitimately, and (b) embedded inside a `${…}` operand.  All four/three
+    // inputs below were verified against the oracle (`old_arith`/`old_part` via
+    // `diff_arith`/`diff_ok`) before writing this test — no divergence found, so
+    // no `*_divergence_deferred` pin is needed here.
+
+    #[test]
+    fn arith_wrinkle_nested_in_outer_arith() {
+        // The inner `$((cat) )` bails to a `$( (cat) )` cmdsub-of-subshell; the
+        // outer `$((...))` still closes legitimately as arith, so the WHOLE
+        // expression is genuinely arith at the top level (diff_arith applies).
+        diff_arith("$(( $((cat) ) ))");             // bail alone in the outer body
+        diff_arith("$(( 1 + $((echo hi) ) ))");      // bail alongside other arith text
+        diff_arith("$(( $((cat) ) + 1 ))");           // bail followed by more arith text
+        diff_arith("$(( $(( $((cat) ) )) ))");        // bail nested two arith levels deep
+    }
+
+    #[test]
+    fn arith_wrinkle_bail_in_operand() {
+        // The bail happening inside a `${…}` operand (rather than at the
+        // top level or nested in an outer arith) — routes through
+        // parse_param_expansion, so diff_ok (not diff_arith) is the right harness.
+        diff_ok("${x:-$((cat) )}");
+        diff_ok("${x:+$((cat) )}");
+        diff_ok("${x:-a$((cat) )b}");                 // bail between literals in an operand
+    }
+
+    #[test]
+    fn arith_wrinkle_nested_error_parity() {
+        // `$(( $((a)b) ))`: the inner `$((a)b)` bails to a cmdsub-of-subshell
+        // whose body `(a)b` is itself a syntax error (bare word after `)`,
+        // same shape as arith_wrinkle_cmdsub_body_error_matches but nested one
+        // arith level deeper).  Both paths must error.
+        assert!(new_arith("$(( $((a)b) ))", false).is_err(), "new path must error");
+        assert!(
+            tokenize_with_opts("$(( $((a)b) ))", LexerOptions::default()).is_err(),
+            "production errors on $(( $((a)b) )) too"
+        );
+    }
 }

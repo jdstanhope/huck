@@ -557,6 +557,12 @@ pub(crate) enum Mode {
     ParamSubstPatternOperand    { in_dquote: bool },
     ParamSubstringOffsetOperand { in_dquote: bool },
     ParamSubscriptOperand       { in_dquote: bool },
+    // `in_dquote` is set (by `set_operand_in_dquote`'s callers) for symmetry with
+    // the other operand modes above, but `scan_step_arith` never reads it
+    // (`_in_dquote`) — the oracle hardcodes `quoted: true` for arith bodies (they
+    // are never word-split), so there is no quoted/unquoted branch to select.
+    // Kept for now rather than removed; may carry a future signal (e.g. if arith
+    // ever needs to distinguish a quoted-bit).
     Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
