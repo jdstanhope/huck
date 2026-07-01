@@ -692,6 +692,32 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
+/// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
+///
+/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false }`;
+/// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
+/// parser assembles the body `Word` (literal runs + embedded expansions), stops on
+/// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
+/// command substitution of a subshell (`$( (…) )`).  Owns the push/pop lifecycle;
+/// pops the `Arith` frame on ALL exit paths.
+pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false });
+    let result = (|| -> Result<Word, ParseError> {
+        match iter.next_kind()? {
+            Some(TokenKind::ArithOpen) => {}
+            _ => return Err(ParseError::UnsupportedExpansion),
+        }
+        // Body assembly lands in Task 2+.  For now, expect an immediate close.
+        match iter.next_kind()? {
+            Some(TokenKind::ArithClose) => Ok(Word(Vec::new())),
+            _ => Err(ParseError::UnsupportedExpansion),
+        }
+    })();
+    iter.pop_mode();
+    let body = result?;
+    Ok(WordPart::Arith { body, quoted })
+}
+
 /// Skip over any `Newline` tokens without consuming anything else.
 /// Mirrors `skip_newlines` in `command.rs`.
 fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
@@ -2486,5 +2512,59 @@ mod tests {
     fn bt_error_parity() {
         let new = new_bt("`echo", false);
         assert!(new.is_err(), "unterminated backtick must Err, got {new:?}");
+    }
+
+    // ── v246 T1: arithmetic-expansion differential harness ───────────────────
+    //
+    // THE PRODUCTION LEXER IS THE ORACLE.  When `new_arith` ≠ `old_arith`, fix
+    // the new path to match — never weaken or skip the comparison.
+
+    fn find_arith(parts: &[WordPart]) -> Option<WordPart> {
+        for p in parts {
+            match p {
+                WordPart::Arith { .. } => return Some(p.clone()),
+                WordPart::Quoted { parts, .. } => {
+                    if let Some(f) = find_arith(parts) { return Some(f); }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Production oracle: the `WordPart::Arith` the batch lexer builds for `s`.
+    fn old_arith(s: &str, quoted: bool) -> WordPart {
+        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
+        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
+        match &toks[0].kind {
+            TokenKind::Word(w) => find_arith(&w.0).expect("no arith part in production token"),
+            _ => panic!("production token is not a Word for {src:?}"),
+        }
+    }
+
+    /// New parser-driven path.
+    fn new_arith(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
+        let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
+        parse_arith_expansion(&mut lx, quoted)
+    }
+
+    /// Assert new == old for both unquoted and quoted contexts.
+    #[allow(dead_code)] // used starting Task 2+ once body assembly lands
+    fn diff_arith(s: &str) {
+        assert_eq!(new_arith(s, false).unwrap(), old_arith(s, false), "unquoted {s:?}");
+        assert_eq!(new_arith(s, true).unwrap(),  old_arith(s, true),  "quoted   {s:?}");
+    }
+
+    // ── v246 T1 scaffolding test ──────────────────────────────────────────────
+
+    #[test]
+    fn arith_scaffolding_exists() {
+        let _ = TokenKind::ArithOpen;
+        let _ = TokenKind::ArithClose;
+        let _ = TokenKind::ArithBail;
+        // Empty arith `$(( ))` round-trips through the skeleton (body filled in Task 2+).
+        // Production `$(( ))` yields Arith { body: Word([...]) }; the skeleton only
+        // guarantees the harness wires up, so just assert new_arith succeeds here.
+        assert!(new_arith("$(())", false).is_ok(), "skeleton must parse $(())");
     }
 }

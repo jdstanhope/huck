@@ -421,6 +421,10 @@ pub enum TokenKind {
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
+    // --- Phase C v246: arithmetic-expansion atoms (dormant). ---
+    ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
+    ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
+    ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -553,7 +557,7 @@ pub(crate) enum Mode {
     ParamSubstPatternOperand    { in_dquote: bool },
     ParamSubstringOffsetOperand { in_dquote: bool },
     ParamSubscriptOperand       { in_dquote: bool },
-    Arith,          // $(( … )) / (( … )) / $[ … ]
+    Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
@@ -736,6 +740,8 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
+            Mode::Arith { paren_depth, in_dquote, body_started } =>
+                self.scan_step_arith(paren_depth, in_dquote, body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1702,6 +1708,40 @@ impl<'a> Lexer<'a> {
         let kind = if open { TokenKind::BeginBacktick } else { TokenKind::EndBacktick };
         self.history.push(Token::new(kind, Span::new(off, l, c)));
         Ok(())
+    }
+
+    /// `Mode::Arith { paren_depth, in_dquote, body_started }` scanner — v246.
+    /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
+    fn scan_step_arith(&mut self, _paren_depth: u32, _in_dquote: bool, body_started: bool) -> Result<Step, LexError> {
+        if !body_started {
+            // Consume the opening `$((` and emit ArithOpen (real logic Task 2).
+            let off = self.cursor.offset();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
+            // Best-effort consume `$` `(` `(` if present (robust for tests).
+            if self.cursor.peek() == Some(&'$') { self.cursor.next(); }
+            if self.cursor.peek() == Some(&'(') { self.cursor.next(); }
+            if self.cursor.peek() == Some(&'(') { self.cursor.next(); }
+            if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+        // Body scanning is Task 2+. As a Task-1 scaffolding exception, handle the
+        // trivial empty-body close (`$(())`) so the harness round-trips; anything
+        // else errors loudly (an accidental live call on real body content should
+        // be obvious rather than silently mis-scanned).
+        if self.cursor.peek() == Some(&')') && self.cursor.peek_nth(1) == Some(')') {
+            let off = self.cursor.offset();
+            let l = self.cursor.line();
+            let c = self.cursor.column();
+            self.cursor.next();
+            self.cursor.next();
+            self.history.push(Token::new(TokenKind::ArithClose, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+        Err(LexError::UnterminatedArith)
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append
@@ -5969,12 +6009,12 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith);
-        assert_eq!(lx.current_mode(), Mode::Arith);
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -11029,13 +11069,13 @@ mod array_parse_tests {
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith);
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         let m = lx.mark();
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith);
-        assert_eq!(lx.pop_mode(), Mode::Arith);
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
