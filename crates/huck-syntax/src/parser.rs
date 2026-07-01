@@ -6,7 +6,7 @@
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
-    ForClause, SelectClause,
+    ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator,
 };
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
@@ -690,8 +690,10 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
 /// Returns the BARE stage command — `parse_pipeline` decides Pipeline wrapping.
 ///
 /// Compound commands currently supported:
-///   `{` → `parse_brace_group` (Task 1)
-/// All other compound-opening keywords → `UnsupportedCommand` (Tasks 2–7).
+///   `{` → `parse_brace_group` (Task 1), `(` → `parse_subshell` (Task 2),
+///   `if` (Task 3), `while`/`until` (Task 4), `for`/`select` (Task 5),
+///   `case` (Task 6).
+/// All other compound-opening keywords → `UnsupportedCommand`.
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
     skip_newlines(iter)?;
@@ -714,7 +716,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     ) {
         return Err(ParseError::UnsupportedCommand);
     }
-    // Reserved word (keyword): `{` dispatches to brace group; all others defer.
+    // Reserved word (keyword): dispatch to compound parsers; unknown → defer.
     if let Some(tok) = iter.peek_kind()? {
         match keyword_kind(tok) {
             Some(Keyword::LBrace) => return parse_brace_group(iter),
@@ -722,6 +724,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
             Some(Keyword::While) | Some(Keyword::Until) => return parse_while(iter),
             Some(Keyword::For)    => return parse_for(iter),
             Some(Keyword::Select) => return parse_select(iter),
+            Some(Keyword::Case)   => return parse_case(iter),
             Some(_) => return Err(ParseError::UnsupportedCommand),
             None => {}
         }
@@ -1164,6 +1167,95 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     let body = parse_do_body_done(iter)?;
     maybe_wrap_redirects(Command::Select(Box::new(SelectClause { var, words, body })), iter)
+}
+
+/// Parses `case WORD in [clause]... esac`.  Mirrors `parse_case` (~1673) in
+/// `command.rs`.  Returns `Command::Case(Box::new(CaseClause{subject, items}))`.
+fn parse_case(iter: &mut Lexer) -> Result<Command, ParseError> {
+    expect_keyword(iter, Keyword::Case, ParseError::UnterminatedCase)?;
+    skip_newlines(iter)?;
+
+    let subject = match iter.next_kind()? {
+        None => return Err(ParseError::UnterminatedCase),
+        Some(TokenKind::Word(w)) => w,
+        Some(_) => return Err(ParseError::UnexpectedToken),
+    };
+
+    skip_newlines(iter)?;
+    expect_keyword(iter, Keyword::In, ParseError::UnterminatedCase)?;
+    skip_newlines(iter)?;
+
+    let mut items: Vec<CaseItem> = Vec::new();
+    while iter.peek_kind()?.and_then(|t| keyword_kind(t)) != Some(Keyword::Esac) {
+        if iter.peek_kind()?.is_none() {
+            return Err(ParseError::UnterminatedCase);
+        }
+        items.push(parse_case_item(iter)?);
+        skip_newlines(iter)?;
+    }
+    expect_keyword(iter, Keyword::Esac, ParseError::UnterminatedCase)?;
+    maybe_wrap_redirects(Command::Case(Box::new(CaseClause { subject, items })), iter)
+}
+
+/// Parses one `[(] pattern [| pattern]... ) [body] [terminator]` clause.
+/// Mirrors `parse_case_item` (~1702) in `command.rs`.
+fn parse_case_item(iter: &mut Lexer) -> Result<CaseItem, ParseError> {
+    // Optional leading `(`.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?;
+    }
+
+    // Pattern list — Word (`|` Word)* `)`, non-empty.
+    let mut patterns: Vec<Word> = Vec::new();
+    loop {
+        skip_newlines(iter)?;
+        match iter.next_kind()? {
+            None => return Err(ParseError::UnterminatedCase),
+            Some(TokenKind::Word(w)) => patterns.push(w),
+            Some(_) => return Err(ParseError::UnexpectedToken),
+        }
+        match iter.peek_kind()? {
+            None => return Err(ParseError::UnterminatedCase),
+            Some(TokenKind::Op(Operator::Pipe)) => {
+                iter.next_kind()?;
+            }
+            Some(TokenKind::Op(Operator::RParen)) => {
+                iter.next_kind()?;
+                break;
+            }
+            Some(_) => return Err(ParseError::UnexpectedToken),
+        }
+    }
+
+    // Body — `None` for an empty body (next token is a terminator or `esac`).
+    skip_newlines(iter)?;
+    let body = match iter.peek_kind()? {
+        None => return Err(ParseError::UnterminatedCase),
+        Some(TokenKind::Op(
+            Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+        )) => None,
+        Some(tok) if keyword_kind(tok) == Some(Keyword::Esac) => None,
+        Some(_) => Some(parse_and_or(iter, &[Keyword::Esac])?),
+    };
+
+    // Terminator — an absent one (next token is `esac` or end) is an implicit `Break`.
+    let terminator = match iter.peek_kind()? {
+        Some(TokenKind::Op(Operator::DoubleSemi)) => {
+            iter.next_kind()?;
+            CaseTerminator::Break
+        }
+        Some(TokenKind::Op(Operator::SemiAmp)) => {
+            iter.next_kind()?;
+            CaseTerminator::FallThrough
+        }
+        Some(TokenKind::Op(Operator::DoubleSemiAmp)) => {
+            iter.next_kind()?;
+            CaseTerminator::ContinueMatch
+        }
+        _ => CaseTerminator::Break,
+    };
+
+    Ok(CaseItem { patterns, body, terminator })
 }
 
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
@@ -1617,8 +1709,8 @@ mod tests {
         // `( a )` removed: subshells are now in-scope (Task 2).
         // `while x; do y; done` removed: while/until are now in-scope (Task 4).
         // `for i in a; do x; done` removed: for/select are now in-scope (Task 5).
+        // `case x in …; esac` removed: case is now in-scope (Task 6).
         for s in ["(( 1+2 ))",
-                  "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
         }
@@ -1738,5 +1830,25 @@ mod tests {
         // both parsers change together; until then `time` is just a command word.)
         diff_cmd("time cmd");
         diff_cmd("time -p cmd");
+    }
+
+    // v243 T6 tests
+
+    #[test]
+    fn cmd_case() {
+        diff_cmd("case $x in a) 1;; esac");
+        diff_cmd("case $x in a) 1;; b) 2;; esac");
+        diff_cmd("case $x in a|b|c) 1;; esac");       // pattern list
+        diff_cmd("case $x in (a) 1;; esac");          // leading paren
+        diff_cmd("case x in a) ;; esac");             // empty body
+        diff_cmd("case x in a) 1;; *) 2;; esac");     // default
+        diff_cmd("case $x in a) 1;& b) 2;; esac");    // ;& fallthrough
+        diff_cmd("case $x in a) 1;;& b) 2;; esac");   // ;;& continue-match
+        diff_cmd("case $x in a) if y; then z; fi;; esac");  // compound in body
+        diff_cmd("case $x in a) case $y in b) c;; esac;; esac");  // nested case
+        diff_cmd("case $x in a) 1;; esac | cat");    // case as pipeline stage
+        diff_cmd("case $x in a) 1;; esac >f");        // trailing redirect
+        diff_cmd("for i in a; do case $i in q) x;; esac; done");  // case in for body
+        diff_err("case x in");                         // unterminated parity
     }
 }
