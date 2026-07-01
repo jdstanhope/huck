@@ -1090,6 +1090,15 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
         return Err(ParseError::UnsupportedCommand);
     }
 
+    // Mirror command.rs parse_for_command: an unterminated `((` (e.g. `for (( `) lexes
+    // as two LParen tokens rather than ArithBlock.  Two consecutive `(` after `for`
+    // always mean an arith-for header that hasn't closed → UnterminatedLoop.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
+        && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
+    {
+        return Err(ParseError::UnterminatedLoop);
+    }
+
     // Read the loop variable name.
     let var = match iter.next_kind()? {
         None => return Err(ParseError::UnterminatedLoop),
@@ -1850,5 +1859,44 @@ mod tests {
         diff_cmd("case $x in a) 1;; esac >f");        // trailing redirect
         diff_cmd("for i in a; do case $i in q) x;; esac; done");  // case in for body
         diff_err("case x in");                         // unterminated parity
+    }
+
+    // v243 T7 tests
+
+    #[test]
+    fn cmd_compound_deferred_still() {
+        diff_unsupported("(( 1+2 ))");                              // arith command (ArithBlock seam)
+        diff_unsupported("(( x + $y ))");
+        diff_unsupported("[[ -n x ]]");                             // test grammar
+        diff_unsupported("f() { x; }");                             // function def (name())
+        diff_unsupported("function f { x; }");                      // function def (keyword)
+        diff_unsupported("coproc x");
+        diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
+        diff_unsupported("cat <<<w");                               // here-string
+    }
+
+    #[test]
+    fn cmd_deep_nesting() {
+        diff_cmd("if x; then while y; do case $z in a) ( b );; esac; done; fi");
+        diff_cmd("{ for i in a b; do if $i; then echo $i; fi; done; }");
+        diff_cmd("while x; do { a; ( b ); }; done");
+        diff_cmd("case $x in a) for i in 1 2; do echo $i; done;; b) { y; };; esac");
+        diff_cmd("( if x; then y; else z; fi ) | { cat; }");
+    }
+
+    #[test]
+    fn cmd_for_arith_unterminated_edge() {
+        // T5 Minor: unterminated `for ((` (two consecutive LParen not forming an ArithBlock)
+        // — the oracle guards it as UnterminatedLoop; parse_for may fall through to the
+        // var-name read. Verify against the oracle. If tokenize itself errors (so neither
+        // parser is reached), note that instead.
+        for s in ["for (( ", "for ((", "for (()"] {
+            // Only compare if the input LEXES (both sides use the same tokens). If
+            // tokenize_with_opts errors, skip (document in your report) — a lex error
+            // means the parser is never reached and there is no divergence to fix.
+            if tokenize_with_opts(s, LexerOptions::default()).is_ok() {
+                assert_eq!(new_seq(s), old_seq(s), "for-arith-unterminated mismatch for {s:?}");
+            }
+        }
     }
 }
