@@ -401,6 +401,7 @@ pub enum TokenKind {
     Lit { text: String, quoted: bool },
     DollarName { name: String, quoted: bool },
     DeferredExpansion,   // $( / $(( / backtick inside an operand — v241 stops here
+    CmdSubOpen,          // $( opener atom (v244 CommandSub mode)
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -526,7 +527,7 @@ enum Step {
 pub(crate) enum Mode {
     Command,        // default: today's scan_step body (the ONLY mode implemented in v240)
     Subshell,       // ( … )
-    CommandSub,     // $( … ) / `…`
+    CommandSub { body_started: bool },  // $( … ) / `…`
     ParamExpansion { seen_name: bool }, // ${ … }
     ParamWordOperand            { in_dquote: bool },
     ParamSubstPatternOperand    { in_dquote: bool },
@@ -713,6 +714,7 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubstPatternOperand    { in_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote),
             Mode::ParamSubstringOffsetOperand { in_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote),
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
+            Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -1416,6 +1418,43 @@ impl<'a> Lexer<'a> {
                     return Ok(Step::Produced);
                 }
             }
+        }
+    }
+
+    /// Emits atoms for `Mode::CommandSub { body_started }`.
+    ///
+    /// When `body_started == false` (the frame was just pushed), the cursor sits on
+    /// `$`; consume `$` and `(`, then:
+    ///   - next char is `(` → emit `DeferredExpansion` (defer `$((`).
+    ///   - otherwise → flip the frame to `body_started: true` and emit `CmdSubOpen`.
+    ///
+    /// When `body_started == true`, the opener has already been emitted; delegate
+    /// entirely to `scan_step_command()` so body tokens are produced one at a time
+    /// in Command mode.  The terminating `)` comes out as `Op(RParen)`.
+    fn scan_step_command_sub(&mut self, body_started: bool) -> Result<Step, LexError> {
+        if !body_started {
+            // Record position BEFORE consuming `$(`.
+            let off = self.cursor.offset();
+            let l   = self.cursor.line();
+            let c   = self.cursor.column();
+            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "CommandSub: cursor must be on '$'");
+            self.cursor.next(); // consume `$`
+            debug_assert_eq!(self.cursor.peek(), Some(&'('), "CommandSub: '$' must be followed by '('");
+            self.cursor.next(); // consume `(`
+            if self.cursor.peek() == Some(&'(') {
+                // `$((` — arithmetic expansion; defer to runtime.
+                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+            } else {
+                // Flip the top-of-stack frame to body_started: true.
+                if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
+                    *body_started = true;
+                }
+                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+            }
+            Ok(Step::Produced)
+        } else {
+            // Body is Command-mode tokens; the parser owns the terminating `)`.
+            self.scan_step_command()
         }
     }
 
@@ -5686,9 +5725,9 @@ mod tests {
         assert_eq!(lx.current_mode(), Mode::Command);
         lx.push_mode(Mode::Arith);
         assert_eq!(lx.current_mode(), Mode::Arith);
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
-        assert_eq!(lx.pop_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub { body_started: false });
+        assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
+        assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::Arith);
         assert_eq!(lx.current_mode(), Mode::Command);
     }
@@ -10706,8 +10745,8 @@ mod array_parse_tests {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
         lx.push_mode(Mode::Arith);
         let m = lx.mark();
-        lx.push_mode(Mode::CommandSub);
-        assert_eq!(lx.current_mode(), Mode::CommandSub);
+        lx.push_mode(Mode::CommandSub { body_started: false });
+        assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
         assert_eq!(lx.current_mode(), Mode::Arith);
         assert_eq!(lx.pop_mode(), Mode::Arith);
