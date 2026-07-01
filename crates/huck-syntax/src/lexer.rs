@@ -1502,12 +1502,72 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Stub for `Mode::Backtick { depth }` scanning — implemented in v245 Task 2.
-    /// The arm in `scan_step` is wired (so the mode compiles and can be pushed/popped
-    /// in tests), but the body is unreachable until Task 2 fills it in.
-    #[allow(dead_code)]
-    fn scan_step_backtick(&mut self, _depth: u32) -> Result<Step, LexError> {
-        unreachable!("v245 Task 2")
+    /// `Mode::Backtick { depth }` scanner — v245 Task 2.
+    ///
+    /// **depth 0 — entry:** cursor sits on the opening `` ` ``.  Consume it,
+    /// flip the top-of-stack frame to `depth = 1`, emit `BeginBacktick`.
+    ///
+    /// **depth 1 — body:** pre-peek the next char:
+    /// - `` ` `` → closing backtick (terminator): flush any pending word token,
+    ///   flip depth back to 0, emit `EndBacktick`.
+    /// - EOF → defer to `finish()` (unterminated; parser surfaces the error).
+    /// - anything else → delegate to `scan_step_command()`.  Because we've
+    ///   already confirmed the char is NOT `` ` ``, the `` '`' `` arm inside
+    ///   `scan_step_command` can never fire for this step, keeping production
+    ///   `scan_step_command` behavior byte-identical.
+    fn scan_step_backtick(&mut self, depth: u32) -> Result<Step, LexError> {
+        if depth == 0 {
+            // ENTRY: consume the opening backtick and emit BeginBacktick.
+            let off = self.cursor.offset();
+            let l   = self.cursor.line();
+            let c   = self.cursor.column();
+            debug_assert_eq!(self.cursor.peek(), Some(&'`'), "scan_step_backtick depth=0: expected opening `");
+            self.cursor.next(); // consume '`'
+            // Flip the mode frame: depth 0 → 1.
+            if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
+                *d = 1;
+            }
+            self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+            Ok(Step::Produced)
+        } else {
+            // BODY (depth = 1): pre-peek to intercept the terminator.
+            match self.cursor.peek() {
+                None => {
+                    // EOF inside body — flush any pending word, signal Eof.
+                    self.finish()
+                }
+                Some(&'`') => {
+                    // Closing backtick: terminator.
+                    let off = self.cursor.offset();
+                    let l   = self.cursor.line();
+                    let c   = self.cursor.column();
+                    self.cursor.next(); // consume '`'
+                    // Flush any pending word token that immediately precedes '`'.
+                    if self.has_token {
+                        flush_literal(&mut self.parts, &mut self.current, false);
+                        emit_word_with_braces(
+                            &mut self.history,
+                            std::mem::take(&mut self.parts),
+                            self.brace_expand,
+                            Span::new(self.token_start, self.token_start_line, self.token_start_col),
+                        )?;
+                        self.has_token = false;
+                    }
+                    // Flip the mode frame: depth 1 → 0.
+                    if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
+                        *d = 0;
+                    }
+                    self.history.push(Token::new(TokenKind::EndBacktick, Span::new(off, l, c)));
+                    Ok(Step::Produced)
+                }
+                _ => {
+                    // Normal body character — delegate to Command-mode scanning.
+                    // The '`' arm inside scan_step_command cannot fire because we've
+                    // already confirmed the next char is not '`'.
+                    self.scan_step_command()
+                }
+            }
+        }
     }
 
     /// Exactly ONE iteration of the old scan loop: advance the cursor and append

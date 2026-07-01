@@ -553,17 +553,126 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     Ok(WordPart::CommandSub { sequence, quoted })
 }
 
+/// Parse the body of a backtick substitution: a `Sequence` of commands
+/// terminated by `EndBacktick`.  Mirrors `parse_subshell_sequence` but stops
+/// on `TokenKind::EndBacktick` instead of `Op(RParen)`.  Consumes the
+/// `EndBacktick` token before returning.
+fn parse_backtick_body_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    let first = parse_command_then_pipeline(iter)?;
+
+    let mut rest = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            // EOF before EndBacktick → unterminated.
+            None => return Err(ParseError::UnterminatedSubshell),
+            // EndBacktick terminates the body — consume and return.
+            Some(TokenKind::EndBacktick) => {
+                iter.next_kind()?; // consume EndBacktick
+                break;
+            }
+            Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline) => {
+                iter.next_kind()?; // consume `;` or newline
+                skip_newlines(iter)?;
+                // Trailing `;` or newline before the closing backtick — break cleanly.
+                if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
+                    iter.next_kind()?; // consume EndBacktick
+                    break;
+                }
+                if iter.peek_kind()?.is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                let cmd = parse_command_then_pipeline(iter)?;
+                rest.push((Connector::Semi, cmd));
+            }
+            Some(TokenKind::Op(Operator::Background)) => {
+                iter.next_kind()?; // consume `&`
+                while matches!(
+                    iter.peek_kind()?,
+                    Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
+                ) {
+                    iter.next_kind()?;
+                }
+                skip_newlines(iter)?;
+                if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
+                    iter.next_kind()?; // consume EndBacktick
+                    return Ok(Sequence { first, rest, background: true });
+                }
+                if iter.peek_kind()?.is_none() {
+                    return Err(ParseError::UnterminatedSubshell);
+                }
+                let cmd = parse_command_then_pipeline(iter)?;
+                rest.push((Connector::Amp, cmd));
+            }
+            Some(TokenKind::Op(Operator::And)) => {
+                iter.next_kind()?;
+                skip_newlines(iter)?;
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
+            }
+            Some(TokenKind::Op(Operator::Or)) => {
+                iter.next_kind()?;
+                skip_newlines(iter)?;
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
+            }
+            // Unexpected token after a complete command.
+            Some(_) => return Err(ParseError::UnterminatedSubshell),
+        }
+    }
+
+    Ok(Sequence { first, rest, background: false })
+}
+
 /// Assemble a `WordPart::CommandSub` for a `` `…` `` backtick substitution.
 /// Pushes `Mode::Backtick { depth: 0 }` itself, so callers must position the
 /// lexer at the opening backtick (under any mode — the push ensures the backtick
 /// is scanned as atoms rather than a pre-built Word token).
 ///
-/// SKELETON — v245 Task 1.  Task 2 fills in the body tokenization + recursive-
-/// depth escaping logic.  The mode push is here so that the differential harness
-/// helpers can compile and call `iter.push_mode(Mode::Backtick { .. })`.
-pub(crate) fn parse_backtick_sub(iter: &mut Lexer, _quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(crate::lexer::Mode::Backtick { depth: 0 });
-    unimplemented!("parse_backtick_sub: v245 Task 2")
+/// Owns the full push/pop lifecycle of its `Backtick` frame and consumes the
+/// opening `BeginBacktick` atom plus (via `parse_backtick_body_sequence`) the
+/// closing `EndBacktick` atom.  Mode is popped on ALL exit paths.
+pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    // 1. Push the mode and pull the opening BeginBacktick atom.
+    iter.push_mode(Mode::Backtick { depth: 0 });
+    match iter.next_kind()? {
+        Some(TokenKind::BeginBacktick) => {} // continue
+        _ => {
+            iter.pop_mode();
+            return Err(ParseError::UnsupportedExpansion);
+        }
+    }
+
+    // 2. Dispatch: empty body or non-empty body.
+    let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::EndBacktick)) {
+        // Empty body `` `` `` — consume EndBacktick and return the same Sequence
+        // that the production oracle yields via `parse_substitution_body("")`.
+        iter.next_kind()?; // consume EndBacktick
+        Sequence {
+            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+            rest: Vec::new(),
+            background: false,
+        }
+    } else {
+        // Non-empty body: parse_backtick_body_sequence consumes EndBacktick.
+        match parse_backtick_body_sequence(iter) {
+            Ok(mut seq) => {
+                // Zero all source-line fields to match the production oracle.
+                zero_lines_in_sequence(&mut seq);
+                seq
+            }
+            Err(e) => {
+                // Pop the Backtick frame before propagating.
+                iter.pop_mode();
+                let mapped = match e {
+                    ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    other => other,
+                };
+                return Err(mapped);
+            }
+        }
+    };
+
+    // 3. Pop the Backtick frame.
+    iter.pop_mode();
+    Ok(WordPart::CommandSub { sequence, quoted })
 }
 
 /// Skip over any `Newline` tokens without consuming anything else.
@@ -754,6 +863,8 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
                     | Operator::SemiAmp
                     | Operator::DoubleSemiAmp
             ) | TokenKind::Newline
+            // `EndBacktick` terminates the body of a `` `…` `` substitution.
+            | TokenKind::EndBacktick
         ) {
             break;
         }
@@ -2212,5 +2323,18 @@ mod tests {
         let _ = TokenKind::EndBacktick;
         // The production oracle must be callable for a simple backtick substitution.
         let _ = old_bt("`echo hi`", false);
+    }
+
+    // ── v245 T2: depth-0 backtick core ──────────────────────────────────────
+
+    #[test]
+    fn bt_depth0() {
+        diff_bt("`echo hi`");
+        diff_bt("`echo hi there`");
+        diff_bt("`a | b`");
+        diff_bt("`a && b || c`");
+        diff_bt("`a; b`");
+        diff_bt("`if x; then y; fi`");
+        diff_bt("``");                 // empty -> empty Sequence
     }
 }
