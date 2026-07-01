@@ -3,9 +3,12 @@
 //! tests; production still uses the lexer's pre-built Words + command.rs.
 #![allow(dead_code, unused_imports)]
 
-use crate::command::ParseError;
+use crate::command::{
+    Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
+    Redirection, RedirFd, RedirOp, FileMode, word_literal_text,
+};
 use crate::lexer::{
-    CaseDirection, Lexer, Mode, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
+    CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
     SubscriptKind, TokenKind, TransformOp, Word, WordPart,
 };
 
@@ -419,6 +422,415 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     Ok(result)
 }
 
+/// Skip over any `Newline` tokens without consuming anything else.
+/// Mirrors `skip_newlines` in `command.rs`.
+fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    Ok(())
+}
+
+/// Returns `true` if the token is a standalone `!` word (pipeline negation).
+/// Mirrors `is_bang_word` in `command.rs`.
+fn is_bang_word(tok: &TokenKind) -> bool {
+    match tok {
+        TokenKind::Word(w) => word_literal_text(w) == Some("!"),
+        _ => false,
+    }
+}
+
+/// Returns `true` if `token` is a reserved word (keyword) that the new flat
+/// parser defers to `UnsupportedCommand`.  Mirrors `command.rs`'s `keyword_of`
+/// EXACTLY (the same compound-opener keyword set) — `time` is deliberately NOT
+/// here, because `command.rs` has no `time` handling and parses `time …` as a
+/// plain command; the new parser must match that (see `cmd_time_is_plain_command`).
+fn keyword_of_tok(token: &TokenKind) -> bool {
+    let TokenKind::Word(Word(parts)) = token else { return false };
+    if parts.len() != 1 { return false; }
+    let WordPart::Literal { text, quoted: false } = &parts[0] else { return false; };
+    matches!(
+        text.as_str(),
+        "if" | "then" | "elif" | "else" | "fi"
+        | "while" | "until" | "do" | "done"
+        | "for" | "in" | "case" | "esac"
+        | "select" | "function" | "{" | "}"
+        | "[[" | "]]" | "coproc"
+    )
+}
+
+
+/// Parses a SINGLE redirect token group (optional `RedirFd` prefix + redirect
+/// operator + target word) from `iter`.  Mirrors one iteration of
+/// `parse_trailing_redirects` in `command.rs`.
+///
+/// Returns `UnsupportedCommand` for heredocs and here-strings (deferred).
+fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> {
+    // Optional explicit fd-prefix (`3>`, `{fd}>`).
+    let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek_kind()? {
+        let Some(TokenKind::RedirFd(fd)) = iter.next_kind()? else {
+            unreachable!("peek confirmed RedirFd")
+        };
+        Some(fd)
+    } else {
+        None
+    };
+
+    match iter.peek_kind()? {
+        Some(TokenKind::Heredoc { .. }) => {
+            // Heredoc — deferred to a future task.
+            Err(ParseError::UnsupportedCommand)
+        }
+        Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
+            let op = *op;
+            iter.next_kind()?; // consume the redirect operator
+            // HereString (`<<<`) — deferred.
+            if matches!(op, Operator::HereString) {
+                return Err(ParseError::UnsupportedCommand);
+            }
+            let target = match iter.next_kind()? {
+                Some(TokenKind::Word(word)) => word,
+                Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
+                Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
+                // Phase C atom variants (dormant — never emitted in Command mode)
+                Some(_) => return Err(ParseError::RedirectTargetIsOperator),
+            };
+            Ok(crate::command::build_redirections(op, target, fd_prefix))
+        }
+        _ => {
+            // A bare fd-prefix with no following redirect operator: defensively
+            // guard (the lexer only emits RedirFd glued to an op, but be safe).
+            if fd_prefix.is_some() {
+                return Err(ParseError::MissingRedirectTarget);
+            }
+            // Should not be reached (caller checks next_is_redirect first).
+            Err(ParseError::UnsupportedCommand)
+        }
+    }
+}
+
+/// Parses a simple command (program + args + redirects, with optional leading
+/// assignments) from a flat token stream.  Mirrors `parse_simple_stage` +
+/// `finalize_stage` in `command.rs`.
+///
+/// Stops — without consuming — at any stage/list terminator:
+/// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
+///
+/// Redirects are parsed in source order and interleaved with words — a
+/// redirect may appear before, between, or after words.  Heredocs and
+/// here-strings return `UnsupportedCommand` (deferred).
+///
+/// Leading `NAME=value` words (and `NAME+=value` / `NAME[i]=value` forms)
+/// become `inline_assignments`.  A line of ONLY assignments with NO redirects
+/// produces `Command::Simple(SimpleCommand::Assign(…))`.  A command with
+/// redirects but no program word produces an empty-program `ExecCommand`
+/// (mirrors `finalize_stage`'s empty-remaining + redirects branch).
+fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let line = iter.current_line()?;
+    let mut all_words: Vec<Word> = Vec::new();
+    let mut redirects: Vec<Redirection> = Vec::new();
+
+    loop {
+        let Some(token) = iter.peek_kind()? else { break };
+        // Stage/list terminators — stop without consuming.
+        if matches!(
+            token,
+            TokenKind::Op(
+                Operator::Pipe
+                    | Operator::Semi
+                    | Operator::And
+                    | Operator::Or
+                    | Operator::Background
+                    | Operator::RParen
+                    | Operator::DoubleSemi
+                    | Operator::SemiAmp
+                    | Operator::DoubleSemiAmp
+            ) | TokenKind::Newline
+        ) {
+            break;
+        }
+        // Redirect tokens — parse in source order, extending the redirects
+        // list.  Mirrors the `next_is_redirect` + `parse_trailing_redirects`
+        // delegation in `parse_simple_stage`.
+        if crate::command::next_is_redirect(iter)? {
+            redirects.extend(parse_one_redirect(iter)?);
+            continue;
+        }
+        // Consume the token.
+        let kind = iter.next_kind()?.unwrap();
+        match kind {
+            TokenKind::Word(word) => all_words.push(word),
+            _ => return Err(ParseError::UnsupportedCommand),
+        }
+    }
+
+    if all_words.is_empty() && redirects.is_empty() {
+        return Err(ParseError::MissingCommand);
+    }
+
+    // Peel leading assignments from the front — mirrors `finalize_stage`.
+    // Uses `is_assignment_word` (cheap peek) then `try_split_assignment`
+    // (consuming move) to match the oracle's assignment-detection exactly.
+    let mut inline_assignments: Vec<Assignment> = Vec::new();
+    let mut word_iter = all_words.into_iter().peekable();
+    while let Some(w) = word_iter.peek() {
+        if !crate::command::is_assignment_word(w) {
+            break;
+        }
+        let owned = word_iter.next().expect("just peeked Some");
+        match crate::command::try_split_assignment(owned) {
+            Ok(a) => inline_assignments.push(a),
+            Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
+        }
+    }
+    let remaining: Vec<Word> = word_iter.collect();
+
+    // Bare-assign line: all words were assignments, no program word follows,
+    // AND no redirects.  Mirrors `finalize_stage`'s guard exactly:
+    //   `remaining.is_empty() && redirects.is_empty() && !inline.is_empty()`.
+    if remaining.is_empty() && redirects.is_empty() && !inline_assignments.is_empty() {
+        return Ok(Command::Simple(SimpleCommand::Assign(inline_assignments, line)));
+    }
+
+    // Empty-program case: redirect-only or assignment+redirect commands
+    // (e.g. `>out`, `2>err`, `A=1 >out`).  Mirrors `finalize_stage`'s second
+    // empty-remaining branch and the `program=None+redirects` early-return in
+    // `parse_simple_stage`.
+    if remaining.is_empty() {
+        return Ok(Command::Simple(SimpleCommand::Exec(ExecCommand {
+            inline_assignments,
+            program: Word(Vec::new()),
+            args: Vec::new(),
+            redirects,
+            line,
+        })));
+    }
+
+    let mut remaining_iter = remaining.into_iter();
+    let program = remaining_iter.next().expect("non-empty remaining");
+    let args: Vec<Word> = remaining_iter.collect();
+
+    Ok(Command::Simple(SimpleCommand::Exec(ExecCommand {
+        inline_assignments,
+        program,
+        args,
+        redirects,
+        line,
+    })))
+}
+
+/// Parses a single pipeline STAGE (dispatch).  Mirrors the non-`!` /
+/// non-pipeline dispatch logic of `parse_command_inner` in `command.rs`.
+/// Every non-simple branch returns `UnsupportedCommand` (deferred).
+///
+/// Returns the BARE stage command — no `Pipeline` wrapper.  The caller
+/// (`parse_pipeline`) collects stages and wraps them.
+fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // Skip leading newlines, mirroring `command.rs`'s `parse_command_inner`
+    // (command.rs:1019) — e.g. a newline between a `!` prefix and the command
+    // (`!\ncmd`) is not a separator. (Alias expansion, the oracle's next line,
+    // is out of v242's flat-command scope — the replay tokens are already final.)
+    skip_newlines(iter)?;
+    // EOF with no token.
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::MissingCommand);
+    }
+    // `(( expr ))` at command position.
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Bare `(` → subshell.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Heredoc / `<<<` at command position.
+    if matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Heredoc { .. }) | Some(TokenKind::Op(Operator::HereString))
+    ) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Reserved word (keyword).
+    if let Some(tok) = iter.peek_kind()? {
+        if keyword_of_tok(tok) {
+            return Err(ParseError::UnsupportedCommand);
+        }
+    }
+    // Function definition `name() compound` — two-token lookahead.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Word(_)))
+        && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
+    {
+        return Err(ParseError::UnsupportedCommand);
+    }
+    // Simple command: parse and return BARE (not wrapped in Pipeline).
+    // `parse_pipeline` collects stages and wraps them.
+    parse_simple(iter)
+}
+
+/// Parses a pipeline: an optional leading run of `!` words (odd count →
+/// negate), then simple-command stages joined by `|`.  Mirrors
+/// `parse_command` (bang handling) + `parse_pipeline_with_first` +
+/// `parse_next_stage` in `command.rs`.
+///
+/// Always returns `Command::Pipeline(…)` — even a single stage is
+/// wrapped, matching the oracle's behaviour for simple commands.
+fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // Count leading `!` words (each one flips the negate flag).
+    let mut bangs = 0usize;
+    while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?; // consume `!`
+        bangs += 1;
+    }
+    let negate = bangs % 2 == 1;
+
+    // Parse the first stage.
+    let first = parse_command(iter)?;
+    let mut commands = vec![first];
+
+    // While a `|` follows, consume it, skip newlines, and parse the next stage.
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
+        iter.next_kind()?; // consume `|`
+        skip_newlines(iter)?;
+        commands.push(parse_command(iter)?);
+    }
+
+    Ok(Command::Pipeline(Pipeline { negate, commands }))
+}
+
+/// Mirrors `parse_command_then_pipeline` in `command.rs`.
+/// Delegates to `parse_pipeline` (which handles `!` + `|` stages).
+fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
+    parse_pipeline(iter)
+}
+
+/// Parses the full flat and-or list (the complete `Sequence`).  Mirrors
+/// `parse_sequence_opts` in `command.rs` with `stop_at = &[]` and
+/// `stop_at_top_newline = false` — the `parse` (non-unit) contract where a
+/// top-level `Newline` is a Semi-like continue connector, NOT a unit
+/// terminator.
+///
+/// After the first pipeline, loops consuming:
+/// - `Op(Semi)` / `Newline` → `Connector::Semi`
+/// - `Op(And)` → `Connector::And`
+/// - `Op(Or)` → `Connector::Or`
+/// - `Op(Background)`:
+///   - trailing (nothing meaningful follows) → sets `background = true`
+///   - `& &` → `Err(UnexpectedBackground)`
+///   - `& cmd` → `Connector::Amp` separator
+///
+/// Stops (without consuming) at EOF or case terminators
+/// (`;;` / `;&` / `;;&`).
+fn parse_and_or(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    let first = parse_command_then_pipeline(iter)?;
+    let mut rest: Vec<(Connector, Command)> = Vec::new();
+    let mut background = false;
+
+    loop {
+        match iter.peek_kind()? {
+            // EOF — end of list.
+            None => break,
+            // Case-clause terminators (`;;` / `;&` / `;;&`) — break without
+            // consuming; at the flat top level these become stray tokens caught
+            // by `parse_sequence`.
+            Some(TokenKind::Op(
+                Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+            )) => break,
+            _ => {}
+        }
+
+        // Consume the connector token.
+        let token = iter.next_kind()?.unwrap();
+        match token {
+            // ── `&` — background / Amp separator ────────────────────────────
+            TokenKind::Op(Operator::Background) => {
+                // Skip any newlines emitted after heredoc bodies (mirrors oracle).
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
+                    // Nothing follows → trailing `&`: background the whole sequence.
+                    None => {
+                        background = true;
+                        break;
+                    }
+                    // A case-clause terminator → trailing `&` for the last group.
+                    Some(TokenKind::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => {
+                        background = true;
+                        break;
+                    }
+                    // Another `&` with no preceding command → `cmd & &` is invalid.
+                    Some(TokenKind::Op(Operator::Background)) => {
+                        return Err(ParseError::UnexpectedBackground);
+                    }
+                    // A command follows → `&` is a separator; background the
+                    // preceding group and continue the list.
+                    Some(_) => {
+                        rest.push((Connector::Amp, parse_command_then_pipeline(iter)?));
+                    }
+                }
+            }
+
+            // ── `;` or newline — semi-like connector ─────────────────────────
+            // `stop_at_top_newline = false`: top-level newline is a Semi
+            // connector (`a\nb` = one Sequence), not a unit terminator.
+            TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
+                skip_newlines(iter)?;
+                match iter.peek_kind()? {
+                    None => break,
+                    Some(TokenKind::Op(
+                        Operator::DoubleSemi | Operator::SemiAmp | Operator::DoubleSemiAmp,
+                    )) => break,
+                    Some(_) => {}
+                }
+                rest.push((Connector::Semi, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── `&&` — and connector ─────────────────────────────────────────
+            TokenKind::Op(Operator::And) => {
+                skip_newlines(iter)?;
+                rest.push((Connector::And, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── `||` — or connector ──────────────────────────────────────────
+            TokenKind::Op(Operator::Or) => {
+                skip_newlines(iter)?;
+                rest.push((Connector::Or, parse_command_then_pipeline(iter)?));
+            }
+
+            // ── anything else (e.g. stray word / `|` after a closed block) ──
+            _ => {
+                return Err(ParseError::UnexpectedToken);
+            }
+        }
+    }
+
+    Ok(Sequence { first, rest, background })
+}
+
+/// Entry point for the new flat command-list parser.  Mirrors `parse` /
+/// `parse_cursor` in `command.rs`.
+///
+/// Returns `Ok(None)` on empty input (newlines only or EOF).
+pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    // Skip leading newlines (mirrors `parse_cursor` → `skip_newlines`).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    if iter.peek_kind()?.is_none() {
+        return Ok(None);
+    }
+    let seq = parse_and_or(iter)?;
+    // Mirror `parse_cursor`: a stray terminator (`;;`/`;&`/`;;&`) left after
+    // the top-level sequence → `UnexpectedToken`.
+    if iter.peek_kind()?.is_some() {
+        return Err(ParseError::UnexpectedToken);
+    }
+    Ok(Some(seq))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +1045,144 @@ mod tests {
                 "expected UnsupportedExpansion for {s}"
             );
         }
+    }
+
+    // ── v242 differential harness ────────────────────────────────────────────
+
+    fn old_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        crate::command::parse(&mut Lexer::from_tokens(toks))
+    }
+    fn new_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        parse_sequence(&mut Lexer::from_tokens(toks))
+    }
+    /// In-scope: the new parser must produce the SAME AST as command.rs (the oracle).
+    fn diff_cmd(s: &str) {
+        assert_eq!(new_seq(s).unwrap(), old_seq(s).unwrap(), "command AST mismatch for {s:?}");
+    }
+    /// Deferred: the new parser must return UnsupportedCommand.
+    fn diff_unsupported(s: &str) {
+        assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
+    }
+    // T2 tests
+
+    #[test]
+    fn cmd_single_simple() {
+        diff_cmd("echo");
+        diff_cmd("echo a");
+        diff_cmd("echo a b c");
+        diff_cmd("echo \"$x\" 'y' z");
+        assert_eq!(new_seq("").unwrap(), None);       // empty input
+        assert_eq!(new_seq("\n\n").unwrap(), None);   // only newlines
+    }
+
+    #[test]
+    fn cmd_deferred_boundary() {
+        for s in ["( a )", "(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
+                  "for i in a; do x; done", "case x in y) z;; esac", "{ a; }",
+                  "[[ -n x ]]", "f() { x; }", "coproc x"] {
+            diff_unsupported(s);
+        }
+    }
+
+    // T3 tests
+
+    #[test]
+    fn cmd_assignments() {
+        diff_cmd("A=1 cmd");
+        diff_cmd("A=1 B=2 cmd x y");
+        diff_cmd("A=1");                 // bare assign -> SimpleCommand::Assign
+        diff_cmd("A=1 B=2");             // bare multi-assign
+        diff_cmd("A=$x cmd");
+        diff_cmd("A+=v cmd");            // append
+        diff_cmd("arr[0]=v cmd");        // subscripted (AssignPrefix)
+        diff_cmd("PATH=/x:/y cmd");
+    }
+
+    // tests added in later tasks
+
+    #[test]
+    fn v242_scaffolding_exists() {
+        let _ = crate::command::ParseError::UnsupportedCommand;
+        // harness compiles + the entry is callable
+        let _ = old_seq("echo a");
+    }
+
+    // T4 tests
+
+    #[test]
+    fn cmd_redirects() {
+        diff_cmd("cmd >out");
+        diff_cmd("cmd >>out");
+        diff_cmd("cmd <in");
+        diff_cmd("cmd 2>err");
+        diff_cmd("cmd >out 2>&1");
+        diff_cmd("cmd 2>&1 >out");       // order matters
+        diff_cmd(">out cmd");            // leading redirect
+        diff_cmd("cmd a >o b <i c");     // interleaved
+        diff_cmd("3>f cmd");             // RedirFd prefix
+        diff_cmd("cmd >|f");             // clobber
+        diff_cmd("cmd <>f");             // read-write
+        diff_cmd("cmd <&3");             // dup-in
+        diff_cmd("cmd &>f");             // and-redirect
+        diff_cmd("cmd >&2");             // dup-out to stderr
+        diff_cmd("cmd 2>&-");            // close fd 2
+    }
+
+    #[test]
+    fn cmd_heredoc_deferred() {
+        diff_unsupported("cat <<<word");
+        // (heredoc body cases need a newline; keep to here-string for the dispatch test)
+    }
+
+    // T5 tests
+
+    #[test]
+    fn cmd_pipelines() {
+        diff_cmd("a | b");
+        diff_cmd("a | b | c");
+        diff_cmd("! a");
+        diff_cmd("! a | b");
+        diff_cmd("echo x | grep y | wc -l");
+        diff_cmd("A=1 cmd | other");
+        diff_cmd("cmd >o | other");
+        diff_cmd("! ! a");                 // double-bang cancels (negate=false)
+        diff_cmd("!\ncmd");                // newline after `!` is skipped (M1: parse_command top skip_newlines)
+    }
+
+
+    // T6 tests
+
+    #[test]
+    fn cmd_and_or_lists() {
+        diff_cmd("a; b");
+        diff_cmd("a; b; c");
+        diff_cmd("x && y");
+        diff_cmd("x || y");
+        diff_cmd("x && y || z");
+        diff_cmd("a | b && c | d");
+        diff_cmd("p &");                  // trailing background
+        diff_cmd("p & q");                // & as separator (Connector::Amp)
+        diff_cmd("a\nb");                 // newline as connector (parse contract)
+        diff_cmd("a; b &");
+        diff_cmd("! a | b && c");
+    }
+
+    #[test]
+    fn cmd_invalid_double_background() {
+        // `cmd & &` → command.rs returns UnexpectedBackground; match it exactly.
+        assert_eq!(new_seq("cmd & &"), old_seq("cmd & &"));
+    }
+
+    #[test]
+    fn cmd_time_is_plain_command() {
+        // `command.rs` has NO special `time` handling — it parses `time …` as a
+        // plain command named `time`. The new parser MUST match the oracle (not
+        // defer), so these are diff_cmd. (When huck later adds a `Timed` AST node,
+        // both parsers change together; until then `time` is just a command word.)
+        diff_cmd("time cmd");
+        diff_cmd("time -p cmd");
     }
 }
