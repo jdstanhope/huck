@@ -6,6 +6,7 @@
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
+    ForClause, SelectClause,
 };
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
@@ -719,6 +720,8 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
             Some(Keyword::LBrace) => return parse_brace_group(iter),
             Some(Keyword::If)     => return parse_if(iter),
             Some(Keyword::While) | Some(Keyword::Until) => return parse_while(iter),
+            Some(Keyword::For)    => return parse_for(iter),
+            Some(Keyword::Select) => return parse_select(iter),
             Some(_) => return Err(ParseError::UnsupportedCommand),
             None => {}
         }
@@ -1040,6 +1043,127 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
     let clause = IfClause { condition, then_body, elif_branches, else_body };
     maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
+}
+
+/// Validates a `for`/`select` loop variable name token.  Mirrors
+/// `for_variable_name` in `command.rs`: must be an unquoted single-literal Word.
+fn for_variable_name(token: &TokenKind) -> Option<String> {
+    let TokenKind::Word(w) = token else { return None };
+    if w.0.len() != 1 { return None; }
+    let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
+    if text.is_empty() { return None; }
+    Some(text.clone())
+}
+
+/// Skips `;`/newline separators before `do`, then consumes `do`, the loop body,
+/// and `done`.  Returns the parsed body `Sequence`.  Shared by `parse_for` and
+/// `parse_select`.  Mirrors `parse_do_body_done` (~1522) in `command.rs`.
+fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
+    while matches!(
+        iter.peek_kind()?,
+        Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
+    ) {
+        iter.next_kind()?;
+    }
+    expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
+    let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
+    expect_keyword(iter, Keyword::Done, ParseError::UnterminatedLoop)?;
+    Ok(body)
+}
+
+/// Parses `for NAME [in WORD...]; do LIST; done`.  Mirrors
+/// `parse_for_command`/`parse_for_after_keyword` (~1487/1537) in `command.rs`.
+/// C-style `for ((...))` (ArithFor) is deferred → `UnsupportedCommand`.
+fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
+    expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
+
+    // Skip newlines so `for\n((...))` is recognized the same as `for ((...))`.
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+
+    // C-style ArithFor deferred.
+    if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
+        return Err(ParseError::UnsupportedCommand);
+    }
+
+    // Read the loop variable name.
+    let var = match iter.next_kind()? {
+        None => return Err(ParseError::UnterminatedLoop),
+        Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
+    };
+
+    // POSIX allows a linebreak between the variable and `in`.
+    skip_newlines(iter)?;
+
+    // Optional `in` plus the word list.
+    let mut words: Vec<Word> = Vec::new();
+    let has_in = if iter.peek_kind()?.and_then(|t| keyword_kind(t)) == Some(Keyword::In) {
+        iter.next_kind()?; // consume `in`
+        loop {
+            // Peek to decide whether to stop or consume.
+            let stop = match iter.peek_kind()? {
+                None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => true,
+                Some(tok) if keyword_kind(tok) == Some(Keyword::Do) => true,
+                _ => false,
+            };
+            if stop { break; }
+            match iter.next_kind()? {
+                Some(TokenKind::Word(w)) => words.push(w),
+                Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+                _ => unreachable!("peek already ruled out Newline/Semi/None/Do here"),
+            }
+        }
+        true
+    } else {
+        false
+    };
+
+    let body = parse_do_body_done(iter)?;
+    maybe_wrap_redirects(Command::For(Box::new(ForClause { var, words, has_in, body })), iter)
+}
+
+/// Parses `select NAME [in WORD...]; do LIST; done`.  Mirrors
+/// `parse_select_command` (~1583) in `command.rs`.  Like `parse_for` but uses
+/// `words: Option<Vec<Word>>` to distinguish the no-`in` form (`None`) from an
+/// explicit `in` clause (`Some`, possibly empty).
+fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
+    expect_keyword(iter, Keyword::Select, ParseError::UnterminatedLoop)?;
+
+    // Read the loop variable name.
+    let var = match iter.next_kind()? {
+        None => return Err(ParseError::UnterminatedLoop),
+        Some(tok) => for_variable_name(&tok).ok_or(ParseError::ForVariable)?,
+    };
+
+    // POSIX allows a linebreak between the variable and `in`.
+    skip_newlines(iter)?;
+
+    // Optional `in` plus the word list.
+    let words: Option<Vec<Word>> =
+        if iter.peek_kind()?.and_then(|t| keyword_kind(t)) == Some(Keyword::In) {
+            iter.next_kind()?; // consume `in`
+            let mut list: Vec<Word> = Vec::new();
+            loop {
+                let stop = match iter.peek_kind()? {
+                    None | Some(TokenKind::Newline) | Some(TokenKind::Op(Operator::Semi)) => true,
+                    Some(tok) if keyword_kind(tok) == Some(Keyword::Do) => true,
+                    _ => false,
+                };
+                if stop { break; }
+                match iter.next_kind()? {
+                    Some(TokenKind::Word(w)) => list.push(w),
+                    Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
+                    _ => unreachable!("peek already ruled out Newline/Semi/None/Do here"),
+                }
+            }
+            Some(list)
+        } else {
+            None
+        };
+
+    let body = parse_do_body_done(iter)?;
+    maybe_wrap_redirects(Command::Select(Box::new(SelectClause { var, words, body })), iter)
 }
 
 /// Parses `while LIST; do LIST; done` or `until LIST; do LIST; done`.
@@ -1441,6 +1565,24 @@ mod tests {
         diff_err("if x; then y");                                       // UnterminatedIf parity
     }
 
+    // v243 T5 tests
+
+    #[test]
+    fn cmd_for_select() {
+        diff_cmd("for i in a b c; do echo $i; done");
+        diff_cmd("for i; do x; done");               // no-`in`
+        diff_cmd("for i in; do x; done");            // empty in-list
+        diff_cmd("for i in a; do for j in b; do x; done; done");   // nested
+        diff_cmd("for i in a b; do if x; then y; fi; done");
+        diff_cmd("for i in a; do x; done | cat");    // as pipeline stage
+        diff_cmd("for i in a; do x; done 2>&1");     // trailing redirect
+        diff_cmd("select x in a b; do y; done");
+        diff_cmd("select x; do y; done");            // no-`in`
+        diff_cmd("select x in a b c; do echo $x; break; done");
+        diff_unsupported("for ((i=0;i<3;i++)); do x; done");   // ArithFor deferred
+        diff_err("for i in a; do x");                // unterminated parity
+    }
+
     // v243 T4 tests
 
     #[test]
@@ -1474,8 +1616,9 @@ mod tests {
         // `{ a; }` removed: brace groups are now in-scope (Task 1).
         // `( a )` removed: subshells are now in-scope (Task 2).
         // `while x; do y; done` removed: while/until are now in-scope (Task 4).
+        // `for i in a; do x; done` removed: for/select are now in-scope (Task 5).
         for s in ["(( 1+2 ))",
-                  "for i in a; do x; done", "case x in y) z;; esac",
+                  "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
         }
