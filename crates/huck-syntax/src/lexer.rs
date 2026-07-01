@@ -1182,11 +1182,24 @@ impl<'a> Lexer<'a> {
                             self.cursor.next(); // `{`
                             self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
                         }
-                        // `$(` — emit DeferredExpansion; v241 stops at the opener.
+                        // `$(` — v244 T4: distinguish `$(cmd)` from `$((`.
+                        // `probe` is cloned past `$`; peek() is at the first `(`.
+                        // Probe one more to detect `$((` (arithmetic, still deferred).
                         Some('(') => {
-                            self.cursor.next(); // `$`
-                            self.cursor.next(); // `(`
-                            self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                            let mut probe2 = probe.clone();
+                            probe2.next(); // skip first `(`
+                            if probe2.peek() == Some(&'(') {
+                                // `$((` — arithmetic expansion; still deferred.
+                                self.cursor.next(); // `$`
+                                self.cursor.next(); // `(`
+                                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                            } else {
+                                // `$(cmd)` — emit CmdSubOpen SIGNAL without consuming `$(`.
+                                // Cursor stays at `$` so parse_command_sub (which pushes
+                                // Mode::CommandSub) can own consuming `$(` via
+                                // scan_step_command_sub(false).
+                                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                            }
                         }
                         // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
@@ -9767,7 +9780,12 @@ mod tests {
         lx.push_mode(mode);
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
-            let stop = matches!(t.kind, TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep);
+            // CmdSubOpen is a parser hand-off signal: without the parser pushing
+            // Mode::CommandSub, further scanning would spin on the same `$(`.
+            // Stop here just like we stop at boundary atoms.
+            let stop = matches!(t.kind,
+                TokenKind::ParamClose | TokenKind::RBracket | TokenKind::ParamSep
+                    | TokenKind::CmdSubOpen);
             out.push(t.kind);
             if stop { break; }
         }
@@ -9822,8 +9840,14 @@ mod tests {
 
     #[test]
     fn operand_deferred_cmdsub() {
+        // v244 T4: unquoted `$(cmd)` in an operand now emits CmdSubOpen (signal to
+        // parse_command_sub); `$((` and backtick still emit DeferredExpansion.
         let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
-        assert_eq!(a[0], TokenKind::DeferredExpansion);
+        assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
+
+        // `$((` is still deferred — must still emit DeferredExpansion.
+        let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
+        assert_eq!(b[0], TokenKind::DeferredExpansion, "$((…)) must remain DeferredExpansion");
     }
 
     #[test]

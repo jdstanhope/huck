@@ -68,8 +68,15 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 };
                 parts.push(part);
             }
+            TokenKind::CmdSubOpen => {
+                // v244 T4: `$(cmd)` signal from scan_step_param_operand.
+                // The cursor is at `$(` — parse_command_sub pushes Mode::CommandSub
+                // and scan_step_command_sub(false) owns consuming `$(`.
+                let cs = parse_command_sub(iter, quoted)?;
+                parts.push(cs);
+            }
             TokenKind::DeferredExpansion => {
-                // `$(…)` / `$((…))` / backtick inside an operand — v241 boundary.
+                // `$((…))` / backtick inside an operand — still deferred.
                 return Err(ParseError::UnsupportedExpansion);
             }
             _ => {
@@ -1701,9 +1708,11 @@ mod tests {
     #[test]
     fn diff_deferred_returns_unsupported() {
         use crate::lexer::{Lexer, LexerOptions};
-        // $(…)/arith/backtick remain deferred even INSIDE a double-quoted operand.
+        // `$((…))` / backtick remain deferred; `$(…)` inside `"…"` in an operand
+        // is deferred too (only the unquoted-operand `$(` path is wired in v244 T4).
+        // `${x:-$(cmd)}` (unquoted operand) is now in-scope — moved to cs_in_param_operand.
         for s in [
-            "${x:-$(cmd)}", "${x:-$((1+1))}", "${x:-`cmd`}", "${x:-\"$(cmd)\"}",
+            "${x:-$((1+1))}", "${x:-`cmd`}", "${x:-\"$(cmd)\"}",
         ] {
             let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
             assert!(
@@ -2097,5 +2106,17 @@ mod tests {
         diff_cs("$(<file)");                       // body is a bare redirect
         diff_cs("$(cat < in > out)");
         diff_cs("$(echo hi\n)");                   // trailing newline in body
+    }
+
+    // ── v244 T4 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cs_in_param_operand() {
+        diff_ok("${x:-$(echo d)}");
+        diff_ok("${x:+$(cmd)}");
+        diff_ok("${x=$(a b)}");
+        diff_ok("${x:-a$(b)c}");                    // comsub between literals in an operand
+        diff_ok("${x/$(a)/$(b)}");                  // pattern + replacement operands
+        diff_ok("${x:-$(echo $(date))}");            // nested comsub inside an operand
     }
 }
