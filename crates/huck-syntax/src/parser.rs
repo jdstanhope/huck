@@ -5,7 +5,7 @@
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
-    Redirection, RedirFd, RedirOp, FileMode, word_literal_text,
+    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch,
 };
 use crate::lexer::{
     CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
@@ -717,6 +717,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if let Some(tok) = iter.peek_kind()? {
         match keyword_kind(tok) {
             Some(Keyword::LBrace) => return parse_brace_group(iter),
+            Some(Keyword::If)     => return parse_if(iter),
             Some(_) => return Err(ParseError::UnsupportedCommand),
             None => {}
         }
@@ -995,6 +996,49 @@ fn parse_brace_group(iter: &mut Lexer) -> Result<Command, ParseError> {
         parse_compound_section(iter, &[Keyword::RBrace], ParseError::UnterminatedBrace)?;
     expect_keyword(iter, Keyword::RBrace, ParseError::UnterminatedBrace)?;
     maybe_wrap_redirects(Command::BraceGroup(Box::new(body)), iter)
+}
+
+/// Parses `if COND then BODY [elif COND then BODY]* [else BODY] fi`.
+/// Mirrors `parse_if` (~1282) in `command.rs`:
+/// - `expect` `if`; condition stops at `then`; `expect` `then`.
+/// - then_body stops at `elif`/`else`/`fi`.
+/// - loop while next keyword is `elif`: condition stops at `then`; `expect` `then`; body stops at `elif`/`else`/`fi`.
+/// - optional `else`: body stops at `fi`.
+/// - `expect` `fi`.  Trailing redirects handled by `maybe_wrap_redirects`.
+fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
+    expect_keyword(iter, Keyword::If, ParseError::UnterminatedIf)?;
+    let condition = parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
+    expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
+    let then_body = parse_compound_section(
+        iter,
+        &[Keyword::Elif, Keyword::Else, Keyword::Fi],
+        ParseError::UnterminatedIf,
+    )?;
+
+    let mut elif_branches = Vec::new();
+    while iter.peek_kind()?.and_then(|t| keyword_kind(t)) == Some(Keyword::Elif) {
+        iter.next_kind()?; // consume `elif`
+        let condition =
+            parse_compound_section(iter, &[Keyword::Then], ParseError::UnterminatedIf)?;
+        expect_keyword(iter, Keyword::Then, ParseError::UnterminatedIf)?;
+        let body = parse_compound_section(
+            iter,
+            &[Keyword::Elif, Keyword::Else, Keyword::Fi],
+            ParseError::UnterminatedIf,
+        )?;
+        elif_branches.push(ElifBranch { condition, body });
+    }
+
+    let else_body = if iter.peek_kind()?.and_then(|t| keyword_kind(t)) == Some(Keyword::Else) {
+        iter.next_kind()?; // consume `else`
+        Some(parse_compound_section(iter, &[Keyword::Fi], ParseError::UnterminatedIf)?)
+    } else {
+        None
+    };
+
+    expect_keyword(iter, Keyword::Fi, ParseError::UnterminatedIf)?;
+    let clause = IfClause { condition, then_body, elif_branches, else_body };
+    maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
 }
 
 /// Parses a `( LIST )` subshell.  Mirrors `parse_subshell` (~1780) in
@@ -1362,6 +1406,23 @@ mod tests {
         diff_err("( a");                   // unterminated parity
     }
 
+    // v243 T3 tests
+
+    #[test]
+    fn cmd_if() {
+        diff_cmd("if x; then y; fi");
+        diff_cmd("if x; then y; else z; fi");
+        diff_cmd("if a; then b; elif c; then d; fi");
+        diff_cmd("if a; then b; elif c; then d; else e; fi");
+        diff_cmd("if a; then b; elif c; then d; elif e; then f; fi");   // multi-elif
+        diff_cmd("if x; then if y; then z; fi; fi");                    // nested if
+        diff_cmd("if x; then a; b; c; fi");                             // multi-command body
+        diff_cmd("if x | y; then z; fi");                               // pipeline condition
+        diff_cmd("if x; then y; fi | cat");                             // if as pipeline stage
+        diff_cmd("if x; then y; fi >f");                               // trailing redirect
+        diff_err("if x; then y");                                       // UnterminatedIf parity
+    }
+
     // v242 T2 tests
 
     #[test]
@@ -1378,7 +1439,7 @@ mod tests {
     fn cmd_deferred_boundary() {
         // `{ a; }` removed: brace groups are now in-scope (Task 1).
         // `( a )` removed: subshells are now in-scope (Task 2).
-        for s in ["(( 1+2 ))", "if true; then x; fi", "while x; do y; done",
+        for s in ["(( 1+2 ))", "while x; do y; done",
                   "for i in a; do x; done", "case x in y) z;; esac",
                   "[[ -n x ]]", "f() { x; }", "coproc x"] {
             diff_unsupported(s);
