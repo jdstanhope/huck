@@ -10,9 +10,31 @@ memory `huck-frontend-parser-driven-direction`; prior: v242 (flat command parser
 ## Goal
 
 Replace v242's compound-deferral seams (`parse_command` returning
-`UnsupportedCommand` for keyword/`(`/`ArithBlock` openers) with real parsers for the
+`UnsupportedCommand` for keyword and bare-`(` openers) with real parsers for the
 control-flow compounds, producing the SAME `Command` AST `command.rs` produces —
 verified by a differential corpus. `command.rs` is the oracle and stays untouched.
+The `ArithBlock` opener (`(( … ))`) stays deferred (see §Architectural alignment).
+
+## Architectural alignment (the committed direction)
+
+Per `huck-frontend-parser-driven-direction`: **the lexer emits only small tokens and
+NEVER scans ahead for a matching delimiter; the PARSER assembles words and structure
+from the flat token stream.** v243's compounds honor this — the lexer emits `(`, `)`,
+`{`, `}`, `if`/`then`/`fi`/`do`/`done`/`esac`/…, `;;`, `|` as INDIVIDUAL tokens and
+never scans ahead for the matching close; the parser matches the delimiters, recurses,
+and assembles the clause AST. No lexer scan-ahead is added or relied on.
+
+The `Word`s inside compound bodies still arrive lexer-built and pass through opaquely —
+that is the v242 interim, NOT new fat-lexer work. Inverting word-building into
+parser-assembled atoms is v241's separate track (`${…}` done; the rest via the future
+Command-mode-emits-atoms rewrite), deliberately not entangled here.
+
+**Why the arith command is deferred (NOT done via `arith_string_to_word`):** `(( … ))`
+is a double violation of the rule — the production lexer already scans ahead to `))`
+and emits a fat `ArithBlock(raw-string)` token, and turning that string into a body
+`Word` means calling a lexer routine that scans the string AGAIN. The correct design is
+an `Arith` lexer mode emitting the body as small atoms for the parser to assemble, which
+needs the Command-mode-emits-atoms rewrite — out of v243's scope. So it is deferred.
 
 ## Scope (in)
 
@@ -46,18 +68,16 @@ The recursion enabler + these compounds (each mirrors a `command.rs` function):
 - **`case WORD in … esac`** → `Command::Case(CaseClause{subject, items})` — bespoke
   pattern-list sub-grammar (optional `(`, `pat (| pat)*`, `)`, optional body via
   `parse_and_or(&[Esac])`, terminator `;;`/`;&`/`;;&` → `CaseTerminator`).
-- **Arith command `(( … ))`** → `Command::Arith(Word)` — consume the `ArithBlock(text,
-  opts)` token and call **`crate::lexer::arith_string_to_word(&text, opts)`** (the SAME
-  function `command.rs` uses). The body is a `Word` of literal runs + `Var`/
-  `ParamExpansion`/`CommandSub`/`Arith` parts — a double-quote-like expandable string
-  (`(( x + $y ))`, `(( $(cmd) + 1 ))`), expanded at runtime then evaluated by `arith.rs`.
-  Reusing `arith_string_to_word` makes the body `Word` match the oracle by construction.
 
 All reuse the existing AST verbatim (`IfClause`/`WhileClause`/`ForClause`/`CaseClause`/
 `SelectClause`/`Command::*`) — NO AST change, engine untouched.
 
 ## Non-goals (deferred → `ParseError::UnsupportedCommand`)
 
+- **Arith command `(( … ))`** (`Command::Arith`) — deferred: it depends on the
+  scan-ahead `ArithBlock` token + a second scan-ahead re-lex (`arith_string_to_word`),
+  which violate the lexer-never-scans-ahead rule. Needs the `Arith` lexer mode
+  (emits body atoms) via the Command-mode-emits-atoms rewrite. See §Architectural alignment.
 - **`[[ … ]]`** double-bracket test — a whole 4-level Pratt test-expression grammar
   (36 operators, `TestExpr` AST). Its own iteration (v244).
 - **Function definition** `NAME() compound` / `function NAME` — cheap follow-on once
@@ -99,13 +119,12 @@ Same differential harness as v242 (`old_seq` = `command::parse` = ORACLE, `new_s
 `case $x in a) 1;; b|c) 2;; *) 3;; esac`, `case x in a) ;; esac` (empty body),
 nested/recursive (`if x; then for i in a; do y; done; fi`, `{ ( a ); }`,
 `while x; do case $y in z) w;; esac; done`), pipelines with compound stages
-(`if x; then y; fi | cat`, `a | { b; }`), trailing redirects
-(`{ a; } >f`, `while x; do y; done <f`, `for i in a; do x; done 2>&1`),
-and **arith commands** (`(( 1+2 ))`, `(( x + $y ))`, `(( ${n} * 2 ))`, `(( $(cmd)+1 ))`,
-`(( a )) && echo`, arith as a pipeline-stage/redirected form).
+(`if x; then y; fi | cat`, `a | { b; }`), and trailing redirects
+(`{ a; } >f`, `while x; do y; done <f`, `for i in a; do x; done 2>&1`).
 
-**Deferred corpus** (`diff_unsupported`): `[[ -n x ]]`, `f() { x; }`, `function f { x; }`,
-`coproc x`, `for ((i=0;i<3;i++)); do x; done`, `cat <<<w`.
+**Deferred corpus** (`diff_unsupported`): the arith command (`(( 1+2 ))`, `(( x + $y ))`,
+`(( a )) && echo`), `[[ -n x ]]`, `f() { x; }`, `function f { x; }`, `coproc x`,
+`for ((i=0;i<3;i++)); do x; done`, `cat <<<w`.
 
 ## Open / edges (resolve in the plan)
 
