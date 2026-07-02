@@ -3503,6 +3503,19 @@ mod tests {
         diff_cmd("a=(foo\\ bar)");                   // backslash-escaped space stays one element
     }
 
+    // ── v252 merge-gate fix: `\<NL>` line continuation is GLUE, not a
+    // separator, when it abuts element text with no surrounding whitespace.
+    #[test]
+    fn atoms_array_literal_line_continuation() {
+        diff_cmd("a=(1\\\n2)");           // glued: one element `12`
+        diff_cmd("a=(1 \\\n2)");          // space then continuation
+        diff_cmd("a=(1\\\n 2)");          // continuation then space
+        diff_cmd("a=(\\\n1)");            // leading continuation
+        diff_cmd("a=(1\\\n2\\\n3)");      // multiple glued continuations
+        diff_cmd("a=([0]=a\\\nb)");       // glued continuation inside a subscripted value
+        diff_cmd("a=(a\\\nb c)");         // glued then a real (space) separator
+    }
+
     #[test]
     fn atoms_array_literal_positional() {
         diff_cmd("a=(1 2 3)");

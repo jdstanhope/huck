@@ -3861,12 +3861,18 @@ impl<'a> Lexer<'a> {
                 self.history.push(Token::new(TokenKind::ArrayClose, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
-            // Inter-element separators: whitespace / newline / `\<NL>` / `#`-comment.
+            // Inter-element separators: whitespace / newline / `#`-comment.
             // Coalesce a maximal run into ONE Blank atom (a comment consumes to EOL,
             // its body — incl. any `)` — never read as elements; matches
             // skip_array_literal_separators). Never emit content for a separator.
-            Some(ch) if ch.is_whitespace() || ch == '#'
-                || (ch == '\\' && { let mut p = self.cursor.clone(); p.next(); p.peek() == Some(&'\n') }) => {
+            //
+            // NOTE: a bare `\<NL>` line continuation is NOT a separator — it is
+            // GLUE (bash deletes it), so it must fall through to the value
+            // scanner below when it abuts element text with no surrounding
+            // whitespace (`1\<NL>2` -> one element `12`). It is still handled
+            // INSIDE the coalescing loop below so a continuation that follows
+            // real whitespace (`1 \<NL>2`) is absorbed into that separator run.
+            Some(ch) if ch.is_whitespace() || ch == '#' => {
                 loop {
                     match self.cursor.peek().copied() {
                         Some(w) if w.is_whitespace() => { self.cursor.next(); }
