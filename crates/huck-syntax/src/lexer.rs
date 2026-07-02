@@ -458,8 +458,14 @@ pub enum TokenKind {
     /// `parse_dquote`, which then pops the mode.
     EndDquote,
     /// v250: opens one heredoc body's part atoms (atom path); parser assembles
-    /// until `HeredocBodyEnd`.
-    HeredocBodyBegin,
+    /// until `HeredocBodyEnd`. `expand` mirrors the heredoc's `expand` flag
+    /// (unquoted/interpolated delimiter): the parser needs it to pick the LITERAL
+    /// batch-split assembly (`expand:false`, one `Lit{quoted:true}` spanning the
+    /// whole body) vs the EXPANDING per-atom assembly (`expand:true`, a stream of
+    /// literal runs + expansion parts + `"\n"` separators), which produce DIFFERENT
+    /// part lists for the SAME token bytes (e.g. a single blank line: literal keeps
+    /// an empty `Literal`, expanding drops it).
+    HeredocBodyBegin { expand: bool },
     /// v250: closes one heredoc body's part atoms.
     HeredocBodyEnd,
     /// v247 T4: an assignment-prefix atom for the STRUCTURED assignment lvalues
@@ -663,6 +669,11 @@ pub(crate) struct Mark {
 #[derive(Debug, Clone)]
 struct HeredocEmit {
     began: bool,
+    /// v250 T4: true at a LOGICAL body-line start (used only by the EXPANDING
+    /// per-atom path). At a logical line start the emitter strips `<<-` tabs and
+    /// runs the close-delimiter check before emitting body atoms; a `\<NL>` line
+    /// continuation joins physical lines WITHOUT resetting this to true.
+    at_line_start: bool,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -2750,7 +2761,7 @@ impl<'a> Lexer<'a> {
                 // newline. Flip on the lexer-internal emission state; the next
                 // scan_step calls emit the body groups (see the top-of-fn check).
                 if !self.atom_pending_heredocs.is_empty() {
-                    self.emitting_heredoc = Some(HeredocEmit { began: false });
+                    self.emitting_heredoc = Some(HeredocEmit { began: false, at_line_start: true });
                 }
                 Ok(Step::Produced)
             }
@@ -2787,16 +2798,28 @@ impl<'a> Lexer<'a> {
         let Some(state) = self.emitting_heredoc.as_mut() else {
             return self.scan_step_command_atoms(); // no-op guard
         };
-        // Emit the Begin bracket for the current heredoc.
+        let ph = self.atom_pending_heredocs.front().expect("emitting implies a pending entry").clone();
+        // Emit the Begin bracket for the current heredoc (carries `expand` so the
+        // parser picks the literal vs expanding assembly).
         if !state.began {
             state.began = true;
             let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-            self.history.push(Token::new(TokenKind::HeredocBodyBegin, Span::new(off, l, c)));
+            self.history.push(Token::new(TokenKind::HeredocBodyBegin { expand: ph.expand }, Span::new(off, l, c)));
             return Ok(Step::Produced);
         }
-        let ph = self.atom_pending_heredocs.front().expect("emitting implies a pending entry").clone();
-        // LITERAL body (Task 2): accumulate raw lines until the delimiter line.
-        // Task 4 branches here on `ph.expand` to emit expansion atoms instead.
+        if ph.expand {
+            self.scan_step_heredoc_body_expanding(&ph)
+        } else {
+            self.scan_step_heredoc_body_literal(&ph)
+        }
+    }
+
+    /// v250 T2/T3: LITERAL heredoc body — accumulate every content line verbatim
+    /// (with per-line `\n`) into ONE `Lit{quoted:true}` atom, emitted with the
+    /// closing `HeredocBodyEnd` when the close-delimiter line is reached. The
+    /// PARSER (`push_heredoc_literal_lines`) splits that merged text back into the
+    /// oracle's per-line `(content, "\n")` `Literal` pairs. No expansions.
+    fn scan_step_heredoc_body_literal(&mut self, ph: &PendingHeredoc) -> Result<Step, LexError> {
         let mut body = String::new();
         loop {
             let mut line = String::new();
@@ -2812,13 +2835,7 @@ impl<'a> Lexer<'a> {
                 if !body.is_empty() {
                     self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
                 }
-                self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
-                self.atom_pending_heredocs.pop_front();
-                self.emitting_heredoc = if self.atom_pending_heredocs.is_empty() {
-                    None
-                } else {
-                    Some(HeredocEmit { began: false })
-                };
+                self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
             }
             if !got_nl {
@@ -2827,6 +2844,210 @@ impl<'a> Lexer<'a> {
             let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
             body.push_str(&body_line);
             body.push('\n');
+        }
+    }
+
+    /// v250 T4: EXPANDING heredoc body — emit ONE body-part atom per call,
+    /// cursor-driven, so the PARSER can push a sub-mode (CommandSub/Arith/Backtick/
+    /// ParamExpansion) that scans the nested structure FROM THE CURSOR (the
+    /// expansion openers are zero-width signals). Mirrors `scan_expanding_body_line`
+    /// (the oracle) EXACTLY: heredoc backslash rules (`\` special only before
+    /// `$`/`` ` ``/`\`), `\<NL>` line continuation, `"`/`'` literal in the body,
+    /// literal runs are `quoted:false` while escaped chars + the per-line `"\n"`
+    /// separator are `quoted:true`. Detects the close-delimiter line at each
+    /// LOGICAL line start (a bounded peek of the current physical/continued line,
+    /// never a scan for a matching delimiter across the whole body).
+    fn scan_step_heredoc_body_expanding(&mut self, ph: &PendingHeredoc) -> Result<Step, LexError> {
+        // At a logical line start: strip `<<-` leading tabs, then the delimiter check.
+        if self.emitting_heredoc.as_ref().expect("emitting").at_line_start {
+            if ph.strip_tabs {
+                while self.cursor.peek() == Some(&'\t') { self.cursor.next(); }
+            }
+            if self.heredoc_at_delim_line(ph) {
+                // Consume the (single) physical delimiter line + its newline, then
+                // emit End and pop. A delimiter line never carries a trailing
+                // continuation backslash (that would join and stop it matching), so
+                // one physical line covers it.
+                while let Some(ch) = self.cursor.next() {
+                    if ch == '\n' { break; }
+                }
+                self.emit_heredoc_body_end();
+                return Ok(Step::Produced);
+            }
+            self.emitting_heredoc.as_mut().expect("emitting").at_line_start = false;
+            // Fall through to emit the first atom of this body line.
+        }
+        let off = self.cursor.offset();
+        let l = self.cursor.line();
+        let c = self.cursor.column();
+        match self.cursor.peek().copied() {
+            // EOF mid-body without a matching close-delimiter line — error (matches
+            // the oracle's `!got_newline` guard).
+            None => Err(LexError::UnterminatedHeredoc),
+            // End of a body line: emit the `\n` separator (quoted:true) and re-arm
+            // the line-start delimiter check for the next line.
+            Some('\n') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
+                self.emitting_heredoc.as_mut().expect("emitting").at_line_start = true;
+                Ok(Step::Produced)
+            }
+            // Backslash — special ONLY before `$`/`` ` ``/`\` (the escaped char
+            // becomes a quoted:true Literal); `\<NL>` is line continuation (both
+            // deleted, stay mid-line); every other `\` is a literal backslash
+            // (quoted:false, coalesced into the surrounding run by the parser).
+            Some('\\') => {
+                self.cursor.next(); // consume `\`
+                match self.cursor.peek().copied() {
+                    Some(e @ ('$' | '`' | '\\')) => {
+                        self.cursor.next();
+                        self.history.push(Token::new(TokenKind::Lit { text: e.to_string(), quoted: true }, Span::new(off, l, c)));
+                        Ok(Step::Produced)
+                    }
+                    Some('\n') => {
+                        self.cursor.next(); // line continuation: delete `\` + NL, join
+                        // Emit no atom, but a scan_step must produce one: the cursor
+                        // advanced (progress), so recurse to emit the next atom of
+                        // the joined logical line (at_line_start stays false).
+                        self.scan_step_heredoc_body_expanding(ph)
+                    }
+                    _ => {
+                        self.history.push(Token::new(TokenKind::Lit { text: "\\".into(), quoted: false }, Span::new(off, l, c)));
+                        Ok(Step::Produced)
+                    }
+                }
+            }
+            // Backtick command substitution — zero-width BeginBacktick signal.
+            Some('`') => {
+                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // `$`-expansion — same classification/emission as a `"…"` operand
+            // (`scan_expanding_body_line` reuses `scan_dollar_expansion` with
+            // quoted:true, exactly like the dquote scanner).
+            Some('$') => {
+                self.emit_dquote_dollar_atom(off, l, c);
+                Ok(Step::Produced)
+            }
+            // Literal run — stop at `\n`/`$`/`` ` ``/`\`. `"`/`'` are LITERAL in a
+            // heredoc body (NOT quote delimiters), so they are ordinary run chars.
+            // quoted:false (matches the oracle's `current`-buffer flush).
+            Some(_) => {
+                let mut text = String::new();
+                while let Some(&ch) = self.cursor.peek() {
+                    if matches!(ch, '\n' | '$' | '`' | '\\') { break; }
+                    text.push(ch);
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v250 T4: emit `HeredocBodyEnd`, pop the front pending heredoc, and re-arm
+    /// (or clear) `emitting_heredoc` for the next queued body. Shared by the
+    /// literal and expanding body emitters.
+    fn emit_heredoc_body_end(&mut self) {
+        let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+        self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
+        self.atom_pending_heredocs.pop_front();
+        self.emitting_heredoc = if self.atom_pending_heredocs.is_empty() {
+            None
+        } else {
+            Some(HeredocEmit { began: false, at_line_start: true })
+        };
+    }
+
+    /// v250 T4: does the logical body line the cursor sits at (leading `<<-` tabs
+    /// already stripped) equal the close delimiter? Bounded, non-consuming: clones
+    /// the cursor and reads ONE logical line (applying `\<NL>` continuation joins,
+    /// mirroring `collect_one_heredoc_body`) to compare against `ph.delim`. This is
+    /// line-oriented delimiter matching, NOT a forward scan for a matching
+    /// delimiter across the body.
+    fn heredoc_at_delim_line(&self, ph: &PendingHeredoc) -> bool {
+        let mut probe = self.cursor.clone();
+        let mut line = String::new();
+        let mut got_nl = false;
+        loop {
+            match probe.next() {
+                Some('\n') => { got_nl = true; break; }
+                Some(ch) => line.push(ch),
+                None => break,
+            }
+        }
+        // Expanding-body line continuation: a physical line ending in an odd run of
+        // backslashes joins the next line (both `\` and NL deleted) BEFORE the
+        // delimiter comparison — so a would-be delimiter with a trailing `\` never
+        // matches.
+        while got_nl && ends_with_continuation_backslash(&line) && probe.peek().is_some() {
+            line.pop();
+            got_nl = false;
+            loop {
+                match probe.next() {
+                    Some('\n') => { got_nl = true; break; }
+                    Some(ch) => line.push(ch),
+                    None => break,
+                }
+            }
+        }
+        // Leading `<<-` tabs are already stripped on the real cursor; `trim` here is
+        // a harmless no-op that also matches the oracle's whole-line strip.
+        let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
+        check == ph.delim
+    }
+
+    /// v250 T4: emit ONE atom for a `$`-expansion in a QUOTED operand context —
+    /// shared by the dquote body (`scan_step_dquote`) and the expanding-heredoc
+    /// body (`scan_step_heredoc_body_expanding`), which classify `$` identically
+    /// (both mirror the oracle `scan_dollar_expansion(.., quoted=true)`). Cursor is
+    /// at `$`. `${…}` consumes `${` and emits `ParamOpen`; `$(`/`$((`/`` ` `` are
+    /// zero-width signals (cursor left at `$`) so the parser scans the nested
+    /// structure from the cursor; `$name`/specials/`$N` consume and emit
+    /// `DollarName`; `$[` is the still-deferred legacy-arith signal; a lone `$`
+    /// emits `DollarLit`.
+    fn emit_dquote_dollar_atom(&mut self, off: usize, l: u32, c: u32) {
+        let mut probe = self.cursor.clone();
+        probe.next(); // skip `$`
+        match probe.peek().copied() {
+            Some('{') => {
+                self.cursor.next(); // `$`
+                self.cursor.next(); // `{`
+                self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
+            }
+            Some('(') => {
+                let mut probe2 = probe.clone();
+                probe2.next(); // skip first `(`
+                if probe2.peek() == Some(&'(') {
+                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                } else {
+                    self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                }
+            }
+            Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                self.cursor.next(); // `$`
+                self.cursor.next(); // special char
+                self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
+            }
+            Some(d) if d.is_ascii_digit() => {
+                self.cursor.next(); // `$`
+                let digit = self.cursor.next().unwrap();
+                self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
+            }
+            Some(nc) if is_name_start(nc) => {
+                self.cursor.next(); // `$`
+                let name = scan_var_name(&mut self.cursor);
+                self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
+            }
+            // `$[expr]` legacy arith — DEFERRED to Stage 2 (zero-width signal →
+            // `parse_dquote`/`parse_heredoc_body` defer cleanly).
+            Some('[') => {
+                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+            }
+            _ => {
+                self.cursor.next(); // lone `$`
+                self.history.push(Token::new(TokenKind::DollarLit { quoted: true }, Span::new(off, l, c)));
+            }
         }
     }
 
@@ -3428,54 +3649,10 @@ impl<'a> Lexer<'a> {
             }
 
             // `$` expansion inside `"…"` — mirrors the command-position `$` arm
-            // but with quoted:true.
+            // but with quoted:true. Shared with the expanding-heredoc body via
+            // `emit_dquote_dollar_atom` (identical classification).
             Some('$') => {
-                let mut probe = self.cursor.clone();
-                probe.next(); // skip `$`
-                match probe.peek().copied() {
-                    Some('{') => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // `{`
-                        self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
-                    }
-                    Some('(') => {
-                        let mut probe2 = probe.clone();
-                        probe2.next(); // skip first `(`
-                        if probe2.peek() == Some(&'(') {
-                            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
-                        } else {
-                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
-                        }
-                    }
-                    Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // special char
-                        self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
-                    }
-                    Some(d) if d.is_ascii_digit() => {
-                        self.cursor.next(); // `$`
-                        let digit = self.cursor.next().unwrap();
-                        self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
-                    }
-                    Some(nc) if is_name_start(nc) => {
-                        self.cursor.next(); // `$`
-                        let name = scan_var_name(&mut self.cursor);
-                        self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
-                    }
-                    // `$[expr]` inside `"…"` — legacy arith, DEFERRED to Stage 2.
-                    // Zero-width `DeferredExpansion` signal → `parse_dquote` defers
-                    // cleanly (UnsupportedExpansion) rather than mis-lexing it.
-                    Some('[') => {
-                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                    }
-                    _ => {
-                        self.cursor.next(); // lone `$`
-                        self.history.push(Token::new(
-                            TokenKind::DollarLit { quoted: true },
-                            Span::new(off, l, c),
-                        ));
-                    }
-                }
+                self.emit_dquote_dollar_atom(off, l, c);
                 Ok(Step::Produced)
             }
 
@@ -11358,7 +11535,7 @@ mod tests {
         // Quoted delimiter → literal body: Newline, then Begin, one raw Lit, End.
         let toks = command_atoms_of("cat <<'EOF'\nhello $x\nEOF\n");
         // Find the body bracket.
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
         assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello $x\n"),
             "literal body is one raw Lit (no expansion of $x): {toks:?}");
         assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
@@ -11368,7 +11545,7 @@ mod tests {
     fn heredoc_literal_body_atoms_dash_strips_tabs() {
         // `<<-` strips leading TABS (only) from each body line AND the delimiter check.
         let toks = command_atoms_of("cat <<-'EOF'\n\t\thello\n\tEOF\n");
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
         assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello\n"),
             "<<- strips leading tabs from body lines: {toks:?}");
         assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
@@ -11378,7 +11555,7 @@ mod tests {
     fn heredoc_literal_body_atoms_empty_body() {
         // Empty body → no Lit emitted, just Begin then End.
         let toks = command_atoms_of("cat <<'EOF'\nEOF\n");
-        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin { .. })).expect("Begin");
         assert!(matches!(&toks[begin + 1], TokenKind::HeredocBodyEnd),
             "empty body emits no Lit: {toks:?}");
     }
