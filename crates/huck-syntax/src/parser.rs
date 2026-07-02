@@ -1246,7 +1246,7 @@ fn keyword_of_tok(token: &TokenKind) -> bool {
 /// operator + target word) from `iter`.  Mirrors one iteration of
 /// `parse_trailing_redirects` in `command.rs`.
 ///
-/// Returns `UnsupportedCommand` for heredocs and here-strings (deferred).
+/// Returns `UnsupportedCommand` for heredocs (deferred).
 fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> {
     // Optional explicit fd-prefix (`3>`, `{fd}>`).
     let fd_prefix = if let Some(TokenKind::RedirFd(_)) = iter.peek_kind()? {
@@ -1266,10 +1266,6 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
         Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
             let op = *op;
             iter.next_kind()?; // consume the redirect operator
-            // HereString (`<<<`) — deferred.
-            if matches!(op, Operator::HereString) {
-                return Err(ParseError::UnsupportedCommand);
-            }
             // Process substitution `<(…)` / `>(…)` is a distinct construct
             // DEFERRED in v247. The atom scanner emits `RedirIn`/`RedirOut`
             // immediately followed by `LParen` with NO intervening `Blank` when
@@ -1325,8 +1321,8 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
 /// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
 ///
 /// Redirects are parsed in source order and interleaved with words — a
-/// redirect may appear before, between, or after words.  Heredocs and
-/// here-strings return `UnsupportedCommand` (deferred).
+/// redirect may appear before, between, or after words.  Heredocs return
+/// `UnsupportedCommand` (deferred); here-strings (`<<<`) are handled.
 ///
 /// Leading `NAME=value` words (and `NAME+=value` / `NAME[i]=value` forms)
 /// become `inline_assignments`.  A line of ONLY assignments with NO redirects
@@ -1549,11 +1545,11 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         return parse_subshell(iter);
     }
-    // Heredoc / `<<<` at command position.
-    if matches!(
-        iter.peek_kind()?,
-        Some(TokenKind::Heredoc { .. }) | Some(TokenKind::Op(Operator::HereString))
-    ) {
+    // Heredoc at command position — deferred (heredoc BODIES are future work).
+    // `<<<` (here-string) is NOT deferred: it flows to parse_simple as a leading
+    // redirect (an empty-words command reading stdin from the here-string),
+    // matching the oracle (which falls through to parse_pipeline → parse_simple_stage).
+    if matches!(iter.peek_kind()?, Some(TokenKind::Heredoc { .. })) {
         return Err(ParseError::UnsupportedCommand);
     }
     // Reserved word (keyword): dispatch to compound parsers; unknown → defer.
@@ -2919,7 +2915,7 @@ mod tests {
         // `name()` funcdef form (see `atoms_function_paren_form`).
         for s in [
             "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
-            "cat <<EOF\nx\nEOF", "cat <<<word", "coproc x { :; }",
+            "cat <<EOF\nx\nEOF", "coproc x { :; }",
             "a=(1 2 3)",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
@@ -3030,6 +3026,68 @@ mod tests {
             "atom path defers `a=b () {{...}}`, got {:?}", new_seq("a=b () { :; }"));
         assert!(old_seq("a=b () { :; }").is_ok(),
             "oracle accepts `a=b () {{...}}` (documents the divergence)");
+    }
+
+    // ── v249: here-strings (`<<<`) on the atom path ──────────────────────────
+    #[test]
+    fn atoms_here_string_redirect() {
+        diff_cmd("cat <<< hello");
+        diff_cmd("wc -l <<<foo");                 // glued, no space
+        diff_cmd("cat <<< \"$x\"");                // quoted expansion target
+        diff_cmd("cat <<< 'lit'");
+        diff_cmd("cat <<< $'a\\tb'");              // ANSI-C target
+        diff_cmd("cat <<< $var");
+        diff_cmd("cat <<< a b");                    // target is `a`; `b` is an arg
+        diff_cmd("cmd <<< x > out");                // here-string + file redirect, source order
+        diff_cmd("cmd 2>&1 <<< x");                 // fd-dup + here-string
+        diff_cmd("cmd <<< a <<< b");                // two here-strings, ordered list
+        diff_cmd("{ cat; } <<< x");                 // brace-group trailing here-string
+        diff_cmd("if true; then :; fi <<< x");       // if-compound trailing here-string
+    }
+
+    #[test]
+    fn atoms_here_string_leading() {
+        diff_cmd("<<< word");
+        diff_cmd("<<<foo");                         // glued
+        diff_cmd("<<< \"$x\"");
+        diff_cmd("<<< word > out");                 // leading here-string + file redirect
+        diff_cmd("<<< x | cat");                    // here-string stage in a pipeline
+        // Determined by observation: the oracle accepts a leading `<<<` as the
+        // first pipeline stage (falls through to parse_pipeline → parse_simple_stage
+        // exactly like the atom path), so this is `diff_cmd` parity, not a divergence.
+    }
+
+    #[test]
+    fn atoms_here_string_fd_prefix() {
+        // Determined by observation: `3<<<` lexes fine on the oracle's batch
+        // tokenizer (no lexer-level panic) and both paths produce the identical
+        // AST, so this is ordinary `diff_cmd` parity.
+        diff_cmd("3<<< word");                      // fd-prefixed here-string
+    }
+
+    #[test]
+    fn atoms_here_string_errors() {
+        // Determined by observation: none of these inputs panic `old_seq` at the
+        // lexer level (the oracle lexes all of them successfully and rejects at
+        // parse time), so every one is a plain error-parity comparison — no
+        // atom-path-only bucket needed (contrast `atoms_error_parity`'s
+        // `echo $(`/`echo ${` split, which DOES need one).
+        for s in ["cat <<<", "<<<", "cat <<< |", "cat <<< <", "cat <<< ;"] {
+            assert_eq!(
+                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                "here-string error parity for {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn atoms_here_string_heredoc_still_deferred() {
+        // Heredocs remain deferred on the atom path (v249 lifts ONLY `<<<`).
+        assert!(matches!(new_seq("cat <<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
+            "trailing heredoc must stay deferred, got {:?}", new_seq("cat <<EOF\nx\nEOF"));
+        assert!(matches!(new_seq("<<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
+            "leading heredoc must stay deferred, got {:?}", new_seq("<<EOF\nx\nEOF"));
     }
 
     // v243 T2 tests
@@ -3190,8 +3248,9 @@ mod tests {
 
     #[test]
     fn cmd_heredoc_deferred() {
-        diff_unsupported("cat <<<word");
-        // (heredoc body cases need a newline; keep to here-string for the dispatch test)
+        // Here-string (`<<<`) is NO LONGER deferred (v249 T1); heredoc (`<<`)
+        // still is — it needs a newline-delimited body, unlike `<<<`.
+        diff_unsupported("cat <<EOF\nx\nEOF");
     }
 
     // T5 tests
@@ -3273,7 +3332,7 @@ mod tests {
         // `f() { x; }` (function def, `name()`) removed: now in-scope, v248 T2.
         diff_unsupported("coproc x");
         diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
-        diff_unsupported("cat <<<w");                               // here-string
+        // `cat <<<w` (here-string) removed: now in-scope, v249 T1.
     }
 
     #[test]
