@@ -11159,6 +11159,42 @@ mod tests {
         assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
     }
 
+    // ── v247 T7: Command-mode atom-stream shape ──────────────────────────────
+
+    /// Drive a `command_atoms` lexer's FLAT stream and collect the raw atoms.
+    /// Stops at the parser hand-off signals (`CmdSubOpen`/`BeginBacktick`/
+    /// `ArithOpen`/`ParamOpen`) exactly like `operand_atoms`, so a raw drive
+    /// with no parser mode-push cannot spin on the same zero-width opener.
+    fn command_atoms_of(s: &str) -> Vec<TokenKind> {
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        let mut out = Vec::new();
+        while let Some(t) = lx.next_token().unwrap() {
+            let stop = matches!(t.kind,
+                TokenKind::CmdSubOpen | TokenKind::BeginBacktick
+                    | TokenKind::ArithOpen | TokenKind::ParamOpen { .. });
+            out.push(t.kind);
+            if stop { break; }
+        }
+        out
+    }
+
+    #[test]
+    fn command_atoms_stream_shape() {
+        // `Blank` splits words; literals carry `quoted:false`.
+        assert_eq!(
+            command_atoms_of("echo hi"),
+            vec![
+                TokenKind::Lit { text: "echo".into(), quoted: false },
+                TokenKind::Blank,
+                TokenKind::Lit { text: "hi".into(), quoted: false },
+            ],
+        );
+        // `Blank` NEVER appears in the Word-mode (production) stream.
+        let words = tokenize_with_opts("echo hi", LexerOptions::default()).unwrap();
+        assert!(words.iter().all(|t| !matches!(t.kind, TokenKind::Blank)),
+            "Blank must never appear in the Word-mode stream");
+    }
+
     #[test]
     fn operand_subscript_close() {
         assert_eq!(

@@ -2728,6 +2728,59 @@ mod tests {
         diff_cmd("echo \"\\$lit \\\" \\\\ end\"");
     }
 
+    // ── v247 T7: broadened differential corpus + deferred/error parity ──────────
+
+    #[test]
+    fn atoms_adversarial() {
+        // Adversarial word-splitting / gluing across quotes, expansions, and
+        // operators — the atom-assembled Word must match the oracle byte-for-byte.
+        for s in [
+            "a\"b\"$c", "a\\ b", "x=$y\"z\"", "$a$b$c", "'a'\"b\"c$d",
+            "  a   b  ", "a>b", "a>>b<c", "echo \"$(echo $x)\"", "echo ${a[$i]}",
+        ] { diff_cmd(s); }
+    }
+
+    #[test]
+    fn atoms_error_parity() {
+        // Parser-level malformed input (the oracle LEXES successfully): the atom
+        // path must return the SAME error as the oracle. (Normalize Ok/Err to
+        // unit + error-debug so a divergent error PAYLOAD — not just variant —
+        // is still caught.)
+        for s in ["if true", "for", "case x in", "( a"] {
+            assert_eq!(
+                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                "error parity for {s:?}",
+            );
+        }
+        // `echo $(` / `echo ${` are LEXER-level rejects on the oracle: the
+        // production batch `tokenize_with_opts` errors on the unterminated opener
+        // (`UnterminatedSubstitution`) BEFORE parsing, so `old_seq` cannot yield a
+        // Result to compare. The atom path (incremental live lexer) rejects the
+        // same inputs at PARSE time. Both REJECT — assert parity of rejection, not
+        // of the error stage.
+        for s in ["echo $(", "echo ${"] {
+            assert!(new_seq(s).is_err(),
+                "atom path must reject {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
+    #[test]
+    fn atoms_deferred_unsupported() {
+        // Every deferred construct defers CLEANLY on the atom path (proving the
+        // deferral is deliberate, not an accidental parse). The oracle may parse
+        // some of these — the point is only that the atom path returns
+        // UnsupportedCommand rather than a wrong AST.
+        for s in [
+            "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
+            "cat <<EOF\nx\nEOF", "cat <<<word", "f() { :; }", "coproc x { :; }",
+            "a=(1 2 3)",
+        ] {
+            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand on atom path for {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
     // v243 T2 tests
 
     #[test]
