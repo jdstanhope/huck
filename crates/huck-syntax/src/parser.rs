@@ -1533,6 +1533,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         Some(Keyword::For)    => return parse_for(iter),
         Some(Keyword::Select) => return parse_select(iter),
         Some(Keyword::Case)   => return parse_case(iter),
+        Some(Keyword::Function) => return parse_function_keyword_def(iter),
         Some(_) => return Err(ParseError::UnsupportedCommand),
         None => {}
     }
@@ -2309,6 +2310,47 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     Ok(Sequence { first, rest, background: false })
 }
 
+/// Shared tail of both funcdef forms (mirrors `command.rs`'s
+/// `finish_function_body`): skip newlines, require a body, parse it via the
+/// atom-path `parse_command`, and validate its shape. A body that is itself a
+/// still-deferred construct makes `parse_command` return `UnsupportedCommand`,
+/// which propagates — the funcdef defers cleanly (pinned case).
+fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, ParseError> {
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::UnterminatedFunction);
+    }
+    let body = parse_command(iter)?;
+    if !crate::command::is_function_body_shape(&body) {
+        return Err(ParseError::FunctionBody);
+    }
+    Ok(Command::FunctionDef { name, body: Box::new(body) })
+}
+
+/// `function NAME [()] compound` (mirrors `command.rs`'s
+/// `parse_function_keyword_def`). Caller confirmed the leading keyword is
+/// `function` via `peek_leading_keyword`. Skips the atom-stream `Blank`s the
+/// Word-lexer never emitted.
+fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
+    consume_command_word(iter)?; // consume the `function` keyword word
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    // Name: a single valid identifier word.
+    let name_word = consume_command_word(iter)?;
+    let name = crate::command::valid_function_name_text(&name_word)
+        .ok_or(ParseError::FunctionName)?;
+    // Optional `()` (blanks may sit between name/`(`/`)` in the atom stream).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?; // `(`
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        match iter.next_kind()? {
+            Some(TokenKind::Op(Operator::RParen)) => {}
+            _ => return Err(ParseError::FunctionBody),
+        }
+    }
+    finish_function_body(name, iter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2826,6 +2868,16 @@ mod tests {
         }
     }
 
+    // ── v248: function definitions on the atom path ──────────────────────────
+    #[test]
+    fn atoms_function_keyword_form() {
+        diff_cmd("function f { :; }");
+        diff_cmd("function f() { :; }");
+        diff_cmd("function f ()  { :; }");        // spaced ()
+        diff_cmd("function greet { echo hi; }");
+        diff_cmd("function f\n{ :; }");           // newline before body
+    }
+
     // v243 T2 tests
 
     #[test]
@@ -3063,8 +3115,7 @@ mod tests {
         diff_unsupported("(( 1+2 ))");                              // arith command (ArithBlock seam)
         diff_unsupported("(( x + $y ))");
         diff_unsupported("[[ -n x ]]");                             // test grammar
-        diff_unsupported("f() { x; }");                             // function def (name())
-        diff_unsupported("function f { x; }");                      // function def (keyword)
+        diff_unsupported("f() { x; }");                             // function def (name()) — v249
         diff_unsupported("coproc x");
         diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
         diff_unsupported("cat <<<w");                               // here-string
