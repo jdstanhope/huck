@@ -128,6 +128,14 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             None
             | Some(TokenKind::Blank)
             | Some(TokenKind::Newline)
+            // v252 T3 (BUG-2 fix): break WITHOUT consuming on `ArrayClose` too, so
+            // an EMPTY subscripted value immediately before `)` (`a=([0]=)`) yields
+            // `Word([])` (normalized to an empty literal by the caller) instead of
+            // consuming the `)` and erroring `UnexpectedToken`. `ArrayClose` is
+            // emitted ONLY inside `Mode::ArrayLiteral`, so no other caller is
+            // affected, and the enclosing `parse_array_literal` loop consumes the
+            // `ArrayClose` on its next iteration.
+            | Some(TokenKind::ArrayClose)
             | Some(TokenKind::Op(_)) => break,
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
@@ -885,7 +893,7 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
 /// elements (single value, NO brace expansion). Owns the full push/pop
 /// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false });
+    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
         match iter.peek_kind()? {
@@ -3478,6 +3486,20 @@ mod tests {
         diff_cmd("a=([0]= [1]=y)");              // empty subscripted value
         diff_cmd("a=([$i]=v [x]=$y)");           // expansion in subscript and value
         diff_cmd("a=([0]=x[1]y)");               // `[` MID-value stays literal
+    }
+
+    #[test]
+    fn atoms_array_literal_subscript_regressions() {
+        // BUG 1 (regression of T1/T2): a `[` MID-value, AFTER a non-literal atom
+        // that ended its own scan_step, must stay LITERAL — not open a subscript.
+        diff_cmd("a=($x[0])");                   // positional value $x[0]
+        diff_cmd("a=(pre$x[0]post)");            // positional, glued around `$x`
+        diff_cmd("a=([0]=$y[1]z)");              // subscripted value $y[1]z
+        diff_cmd("a=([0]=\"x\"[1]z)");           // subscripted value "x"[1]z (after a quote)
+        // BUG 2: a subscripted EMPTY value immediately before `)` → empty element,
+        // not an UnexpectedToken error.
+        diff_cmd("a=([0]=)");                    // sole empty subscripted value
+        diff_cmd("a=([2]=two [0]=)");            // empty value as the LAST element
     }
 
     #[test]
