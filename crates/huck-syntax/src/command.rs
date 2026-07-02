@@ -1145,7 +1145,7 @@ fn parse_command_inner(
 /// True if `body` is one of the compound-command shapes that's
 /// allowed as a function body in both POSIX `name() body` form and
 /// the bash `function NAME body` form.
-fn is_function_body_shape(body: &Command) -> bool {
+pub(crate) fn is_function_body_shape(body: &Command) -> bool {
     // A redirected compound (`{ … } >file`) is a valid function body — the
     // redirect attaches to the definition and is applied (with call-time
     // filename expansion) on every call. The Redirected body is stored and
@@ -1351,7 +1351,7 @@ fn valid_identifier_text(word: &Word) -> Option<String> {
 /// single `Literal` has no metacharacters or whitespace, so the trailing `()`
 /// (or the `function` keyword) — not the name's spelling — is what makes it a
 /// definition. The keyword guard keeps `if() { :; }` a syntax error like bash.
-fn valid_function_name_text(word: &Word) -> Option<String> {
+pub(crate) fn valid_function_name_text(word: &Word) -> Option<String> {
     if word.0.len() != 1 {
         return None;
     }

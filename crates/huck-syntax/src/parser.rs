@@ -1335,8 +1335,42 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
 /// (mirrors `finalize_stage`'s empty-remaining + redirects branch).
 fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     let line = iter.current_line()?;
+    parse_simple_with_leading_word(iter, line, None)
+}
+
+/// `parse_simple`, optionally seeded with an ALREADY-CONSUMED leading word
+/// (used by the `name()` funcdef lookahead in `parse_command`: it must consume
+/// the leading word to see whether `(` follows, and — when it does NOT —
+/// needs to hand that already-consumed word to the ordinary simple-command
+/// path rather than re-lexing it. Re-lexing would require a `mark`/`rewind`
+/// spanning tokens already buffered by `parse_command`'s earlier peeks
+/// (`ArithBlock`/`LParen`/heredoc/keyword checks all peek the same leading
+/// token first), and `rewind` truncates history back to the mark's `pos` —
+/// discarding that pre-existing lookahead and forcing a genuine re-scan under
+/// whatever scanner flags (e.g. `cmd_at_word_start`) happen to hold at
+/// rewind time, which are the POST-word-production flags, not the ones that
+/// were live when the word was first scanned. For most words that merely
+/// reproduces the same tokens, but the `name[...]`-non-assignment literal
+/// fallback (v247 T4) sets `cmd_at_word_start = false` as it swallows the
+/// bracket region, so a rewind-and-re-scan of e.g. `arr[$i]` loses the
+/// swallow and re-lexes it as separate atoms — an oracle-parity regression.
+/// Seeding this function with the already-consumed word sidesteps that
+/// hazard entirely: the word is assembled exactly once, matching the
+/// oracle's own one-pass "consume word, then check for `(`" shape.
+///
+/// `line` must be the line captured BEFORE `leading_word` was consumed (the
+/// oracle's `ExecCommand::line` is the command's start line, not wherever the
+/// cursor sits after the leading word has already been eaten).
+fn parse_simple_with_leading_word(
+    iter: &mut Lexer,
+    line: u32,
+    leading_word: Option<Word>,
+) -> Result<Command, ParseError> {
     let mut all_words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirection> = Vec::new();
+    if let Some(w) = leading_word {
+        all_words.push(w);
+    }
 
     loop {
         let Some(token) = iter.peek_kind()? else { break };
@@ -1533,19 +1567,52 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         Some(Keyword::For)    => return parse_for(iter),
         Some(Keyword::Select) => return parse_select(iter),
         Some(Keyword::Case)   => return parse_case(iter),
+        Some(Keyword::Function) => return parse_function_keyword_def(iter),
         Some(_) => return Err(ParseError::UnsupportedCommand),
         None => {}
     }
-    // Function definition `name() compound` — two-token lookahead (deferred).
-    // Atom path: `f()` is `Lit("f")` glued to `Op(LParen)`; the Word path uses a
-    // `Word` token.  A SPACED `f ()` keeps a `Blank`, so it is not matched here
-    // and falls through to `parse_simple` (which defers on the `(`).
+    // Function definition `name() compound` (POSIX form). The oracle consumes
+    // the leading word then checks for `(`; the Word-lexer ate any space, so
+    // `f()` and `f ()` both reach it with `(` next. The atom stream keeps the
+    // `Blank` explicit, so mirror the oracle via consume-name/skip-Blank/
+    // check-`(`. Only a bare word (`Lit`/legacy `Word`) can start a name.
+    //
+    // NOT a `mark`/`rewind` speculation: by the time we get here, the earlier
+    // `ArithBlock`/`LParen`/heredoc/keyword peeks in this same function have
+    // already scanned (and buffered) this leading token, mutating scanner
+    // state (`cmd_at_word_start`) as a side effect of producing it. A
+    // `rewind` back to a mark taken here would truncate that pre-existing
+    // buffered lookahead and force a genuine re-scan under the CURRENT
+    // (post-production) flags rather than the ones live when the token was
+    // first produced — for the `name[...]`-non-assignment literal fallback
+    // (v247 T4) that flips `cmd_at_word_start` to `false`, so a rewind-driven
+    // re-scan of e.g. `arr[$i]` would re-lex it as separate atoms instead of
+    // the swallowed single literal (oracle-parity regression). So: commit to
+    // consuming the word exactly once, and when it is NOT a funcdef, hand the
+    // already-assembled word straight to `parse_simple_with_leading_word`
+    // instead of rewinding and re-parsing it.
     if matches!(
         iter.peek_kind()?,
         Some(TokenKind::Word(_)) | Some(TokenKind::Lit { quoted: false, .. })
-    ) && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
-    {
-        return Err(ParseError::UnsupportedCommand);
+    ) {
+        let line = iter.current_line()?;
+        let name_word = consume_command_word(iter)?;
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        // An assignment-shaped leading word (`name=`/`name=value`) is never a
+        // function name — a `(` glued right after it is the START of an
+        // array-literal VALUE (`a=(1 2 3)`), which the oracle's word-lexer
+        // absorbs into the assignment word itself (never surfacing a
+        // standalone `LParen` next to the word at all). The atom path defers
+        // array literals at command position (still `UnsupportedCommand`,
+        // unchanged from before this task) — excluding assignment-shaped
+        // words here keeps that deferral instead of misrouting into
+        // `parse_function_def` (which would wrongly error `FunctionBody`).
+        if !crate::command::is_assignment_word(&name_word)
+            && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
+        {
+            return parse_function_def(name_word, iter);
+        }
+        return parse_simple_with_leading_word(iter, line, Some(name_word));
     }
     // Simple command: parse and return BARE.  `parse_pipeline` wraps it.
     parse_simple(iter)
@@ -2309,6 +2376,62 @@ fn parse_subshell_sequence(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     Ok(Sequence { first, rest, background: false })
 }
 
+/// Shared tail of both funcdef forms (mirrors `command.rs`'s
+/// `finish_function_body`): skip newlines, require a body, parse it via the
+/// atom-path `parse_command`, and validate its shape. A body that is itself a
+/// still-deferred construct makes `parse_command` return `UnsupportedCommand`,
+/// which propagates — the funcdef defers cleanly (pinned case).
+fn finish_function_body(name: String, iter: &mut Lexer) -> Result<Command, ParseError> {
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::UnterminatedFunction);
+    }
+    let body = parse_command(iter)?;
+    if !crate::command::is_function_body_shape(&body) {
+        return Err(ParseError::FunctionBody);
+    }
+    Ok(Command::FunctionDef { name, body: Box::new(body) })
+}
+
+/// `function NAME [()] compound` (mirrors `command.rs`'s
+/// `parse_function_keyword_def`). Caller confirmed the leading keyword is
+/// `function` via `peek_leading_keyword`. Skips the atom-stream `Blank`s the
+/// Word-lexer never emitted.
+fn parse_function_keyword_def(iter: &mut Lexer) -> Result<Command, ParseError> {
+    consume_command_word(iter)?; // consume the `function` keyword word
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    // Name: a single valid identifier word.
+    let name_word = consume_command_word(iter)?;
+    let name = crate::command::valid_function_name_text(&name_word)
+        .ok_or(ParseError::FunctionName)?;
+    // Optional `()` (blanks may sit between name/`(`/`)` in the atom stream).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?; // `(`
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        match iter.next_kind()? {
+            Some(TokenKind::Op(Operator::RParen)) => {}
+            _ => return Err(ParseError::FunctionBody),
+        }
+    }
+    finish_function_body(name, iter)
+}
+
+/// `name() compound` (mirrors `command.rs`'s `parse_function_def`). The caller
+/// consumed the name (`name_word`) and confirmed the next non-`Blank` token is
+/// `Op(LParen)`. Skips atom-stream `Blank`s inside `( )`.
+fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, ParseError> {
+    let name = crate::command::valid_function_name_text(&name_word)
+        .ok_or(ParseError::FunctionName)?;
+    iter.next_kind()?; // `(`
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    match iter.next_kind()? {
+        Some(TokenKind::Op(Operator::RParen)) => {}
+        _ => return Err(ParseError::FunctionBody),
+    }
+    finish_function_body(name, iter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2712,8 +2835,10 @@ mod tests {
     }
     #[test]
     fn atoms_compounds_deferred() {
-        // still deferred on the atom path (T7 will also assert these)
-        for s in ["(( 1+2 ))", "for ((i=0;i<2;i++)); do :; done", "[[ a == b ]]", "f() { :; }", "coproc c { :; }"] {
+        // still deferred on the atom path (T7 will also assert these).
+        // `f() { :; }` is NO LONGER deferred — v248 T2 implements the POSIX
+        // `name()` funcdef form (see `atoms_function_paren_form`).
+        for s in ["(( 1+2 ))", "for ((i=0;i<2;i++)); do :; done", "[[ a == b ]]", "coproc c { :; }"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
         }
@@ -2790,9 +2915,11 @@ mod tests {
         // deferral is deliberate, not an accidental parse). The oracle may parse
         // some of these — the point is only that the atom path returns
         // UnsupportedCommand rather than a wrong AST.
+        // `f() { :; }` is NO LONGER deferred — v248 T2 implements the POSIX
+        // `name()` funcdef form (see `atoms_function_paren_form`).
         for s in [
             "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
-            "cat <<EOF\nx\nEOF", "cat <<<word", "f() { :; }", "coproc x { :; }",
+            "cat <<EOF\nx\nEOF", "cat <<<word", "coproc x { :; }",
             "a=(1 2 3)",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
@@ -2824,6 +2951,85 @@ mod tests {
             assert!(new_seq(s).is_err(),
                 "atom path must reject (not hang on) {s:?}, got {:?}", new_seq(s));
         }
+    }
+
+    // ── v248: function definitions on the atom path ──────────────────────────
+    #[test]
+    fn atoms_function_keyword_form() {
+        diff_cmd("function f { :; }");
+        diff_cmd("function f() { :; }");
+        diff_cmd("function f ()  { :; }");        // spaced ()
+        diff_cmd("function greet { echo hi; }");
+        diff_cmd("function f\n{ :; }");           // newline before body
+        diff_cmd("function 1 { :; }");            // numeric name is valid (AST parity, not just Ok/Ok)
+    }
+
+    #[test]
+    fn atoms_function_paren_form() {
+        diff_cmd("f(){ :; }");
+        diff_cmd("f() { :; }");
+        diff_cmd("f ()  { :; }");                 // spaced name/()
+        diff_cmd("f() ( a; b )");                  // subshell body
+        diff_cmd("f() if x; then y; fi");          // if body
+        diff_cmd("f() while x; do y; done");       // while body
+        diff_cmd("f() for i in a b; do echo $i; done");
+        diff_cmd("f() case $x in a) echo a;; esac");
+        diff_cmd("f() select x in a b; do echo $x; break; done");
+        diff_cmd("f() until x; do y; done");        // until body
+        diff_cmd("f() { :; } >log");               // redirected body
+        diff_cmd("f() { :; } 2>&1");
+        diff_cmd("f() { g() { :; }; }");           // nested funcdef
+        diff_cmd("if true; then f() { :; }; fi");  // funcdef inside a compound
+        diff_cmd("f() { :; } | cat");               // funcdef as a pipeline stage
+        diff_cmd("f() { :; }; g() { :; }");          // two funcdefs, ; separated
+        diff_cmd("true && f() { :; }");              // funcdef after a connector
+    }
+    #[test]
+    fn atoms_function_not_a_def() {
+        diff_cmd("f");                             // bare word = plain command
+        diff_cmd("echo function");                 // `function` mid-command = arg
+        diff_cmd("func --opt");                    // prefix of `function` = plain command (mark/rewind restores)
+    }
+
+    #[test]
+    fn atoms_function_defs_errors() {
+        for s in [
+            "f() echo",          // non-compound body → FunctionBody
+            "function",          // no name → FunctionName
+            "function if { :; }", // reserved word as name → FunctionName
+            "f(",                // unterminated
+            "f()",               // `()` then EOF → UnterminatedFunction/FunctionBody
+            "f ( a )",           // `(` not followed by `)` → FunctionBody (NOT a command)
+        ] {
+            assert_eq!(
+                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                "funcdef error parity for {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn atoms_function_defs_deferred() {
+        // Body is itself deferred → whole funcdef defers (lifts when [[ ]]/arith land).
+        for s in ["f() [[ x ]]", "f() (( 1 ))", "f() for ((i=0;i<2;i++)); do :; done"] {
+            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
+    #[test]
+    fn atoms_function_assignment_name_divergence() {
+        // KNOWN divergence (v248): the oracle accepts `a=b () {...}` as
+        // FunctionDef{name:"a=b"} because command.rs checks `(` before the
+        // assignment check; the atom path's is_assignment_word guard defers it.
+        // bash itself rejects this as a syntax error, so the atom path (defer) is
+        // arguably more correct. Pinned so the Stage-2 live-flip differential gate
+        // knows about it. (If a future iteration reconciles this, update here.)
+        assert!(matches!(new_seq("a=b () { :; }"), Err(ParseError::UnsupportedCommand)),
+            "atom path defers `a=b () {{...}}`, got {:?}", new_seq("a=b () { :; }"));
+        assert!(old_seq("a=b () { :; }").is_ok(),
+            "oracle accepts `a=b () {{...}}` (documents the divergence)");
     }
 
     // v243 T2 tests
@@ -2914,8 +3120,9 @@ mod tests {
         // `while x; do y; done` removed: while/until are now in-scope (Task 4).
         // `for i in a; do x; done` removed: for/select are now in-scope (Task 5).
         // `case x in …; esac` removed: case is now in-scope (Task 6).
+        // `f() { x; }` removed: function-def (`name()`) is now in-scope (v248 T2).
         for s in ["(( 1+2 ))",
-                  "[[ -n x ]]", "f() { x; }", "coproc x"] {
+                  "[[ -n x ]]", "coproc x"] {
             diff_unsupported(s);
         }
     }
@@ -3063,8 +3270,7 @@ mod tests {
         diff_unsupported("(( 1+2 ))");                              // arith command (ArithBlock seam)
         diff_unsupported("(( x + $y ))");
         diff_unsupported("[[ -n x ]]");                             // test grammar
-        diff_unsupported("f() { x; }");                             // function def (name())
-        diff_unsupported("function f { x; }");                      // function def (keyword)
+        // `f() { x; }` (function def, `name()`) removed: now in-scope, v248 T2.
         diff_unsupported("coproc x");
         diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
         diff_unsupported("cat <<<w");                               // here-string
@@ -3171,6 +3377,7 @@ mod tests {
         diff_cs("$(case $z in a) b;; esac)");
         diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
         diff_cs("$({ echo x; })");                  // comsub of a brace group
+        diff_cs("$(f() { x; })");                   // function-def body (v248 T2)
     }
 
     // v244 T3 tests
@@ -3206,7 +3413,8 @@ mod tests {
         diff_cs_deferred("$(( a + b ))");
         diff_cs_deferred("`echo hi`");              // backtick (own iteration)
         diff_cs_deferred("$([[ -n x ]])");          // body defers ([[ ]])
-        diff_cs_deferred("$(f() { x; })");          // body defers (function-def)
+        // `$(f() { x; })` removed: function-def body now parses (v248 T2);
+        // see `cs_body_grammar`'s `diff_cs("$(f() { x; })")`.
         diff_cs_deferred("$(coproc x)");            // body defers (coproc)
     }
 
@@ -3596,4 +3804,3 @@ mod tests {
         );
     }
 }
-
