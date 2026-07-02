@@ -2961,6 +2961,7 @@ mod tests {
         diff_cmd("function f ()  { :; }");        // spaced ()
         diff_cmd("function greet { echo hi; }");
         diff_cmd("function f\n{ :; }");           // newline before body
+        diff_cmd("function 1 { :; }");            // numeric name is valid (AST parity, not just Ok/Ok)
     }
 
     #[test]
@@ -2992,7 +2993,7 @@ mod tests {
         for s in [
             "f() echo",          // non-compound body → FunctionBody
             "function",          // no name → FunctionName
-            "function 1 { :; }", // invalid name → FunctionName
+            "function if { :; }", // reserved word as name → FunctionName
             "f(",                // unterminated
             "f()",               // `()` then EOF → UnterminatedFunction/FunctionBody
             "f ( a )",           // `(` not followed by `)` → FunctionBody (NOT a command)
