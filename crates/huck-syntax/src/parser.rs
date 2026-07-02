@@ -1952,9 +1952,24 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // consuming the word exactly once, and when it is NOT a funcdef, hand the
     // already-assembled word straight to `parse_simple_with_leading_word`
     // instead of rewinding and re-parsing it.
+    // v252 T4: an ASSIGNMENT-PREFIX leading atom (`a+=`/`a[i]=`/`a[i]+=`, emitted
+    // by the lexer as a zero-width `AssignPrefix` atom, unlike the plain `a=`
+    // form which is a `Lit("a=")`) must ALSO reach this funcdef-lookahead path,
+    // NOT fall through to `parse_simple`. Otherwise `a+=(1)(2)` / `a[0]=(1)(2)`
+    // (a CLOSED array literal glued before a second `(`) would reach
+    // `parse_simple`'s trailing-`Op(LParen)` arm → `UnsupportedCommand`, while
+    // the oracle attempts `parse_function_def` on the whole assembled word and
+    // gets `FunctionName` (a multi-part / non-Literal word is not a valid
+    // function name). Admitting `AssignPrefix` here routes those through the
+    // SAME `consume_command_word` + funcdef-attempt logic below for parity. This
+    // does NOT affect ordinary array/scalar assignments (`a+=(1 2)`, `a[0]=(1 2)`,
+    // `a[i]=x`) — they have no following second `(`, so the funcdef attempt is
+    // never entered and they fall through to `parse_simple_with_leading_word`.
     if matches!(
         iter.peek_kind()?,
-        Some(TokenKind::Word(_)) | Some(TokenKind::Lit { quoted: false, .. })
+        Some(TokenKind::Word(_))
+            | Some(TokenKind::Lit { quoted: false, .. })
+            | Some(TokenKind::AssignPrefix { .. })
     ) {
         let line = iter.current_line()?;
         let name_word = consume_command_word(iter)?;
@@ -1968,33 +1983,41 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         //
         // What DOES reach this point with `peek_kind() == Op(LParen)` is a
         // standalone `(` that is NOT array-literal glue: either (a) a `(`
-        // after a CLOSED array literal (`a=(one)(two)`) or a subshell after
-        // an empty/plain scalar value (`a= (subshell)`, `a=b (subshell)`), or
-        // (b) the funcdef form `name ()`. The oracle (command.rs) attempts
+        // after a CLOSED array literal (`a=(one)(two)`, `a+=(1)(2)`,
+        // `a[0]=(1)(2)`) or a subshell after an empty/plain scalar value
+        // (`a= (subshell)`, `a=b (subshell)`, `a+= (subshell)`), or (b) the
+        // funcdef form `name ()`. The oracle (command.rs) attempts
         // `parse_function_def` UNCONDITIONALLY whenever the leading word is
-        // followed by `(` — its own `valid_function_name_text` is what
-        // rejects non-funcdef shapes, and it rejects a word ONLY when it is
-        // NOT a single unquoted `Literal` (`word.0.len() != 1`). That is
-        // exactly the multi-part shape a CLOSED array-literal word has
-        // (`[Literal("a="), ArrayLiteral(...)]`), so attempting
-        // `parse_function_def` for those is always SAFE and CORRECT (it
-        // converges on the oracle's `FunctionName` error) — v252 T4 tightens
-        // the guard to allow that attempt.
+        // followed by `(` — its own `valid_function_name_text` is what rejects
+        // non-funcdef shapes, and it accepts a word ONLY when it is a SINGLE
+        // unquoted `Literal` that is not a keyword. So for EVERY other assembled
+        // word — a multi-part word (`[Literal("a="), ArrayLiteral(..)]`,
+        // `[AssignPrefix, ArrayLiteral(..)]`) OR a single-part `AssignPrefix`
+        // word (`[AssignPrefix]`, which is NOT a `Literal`) — the oracle's
+        // `parse_function_def` correctly falls through to `FunctionName`, so
+        // attempting it on the atom path is SAFE and CORRECT (converges on the
+        // same `FunctionName` error).
         //
         // The ONE shape that must still be diverted away from
-        // `parse_function_def` is a single-part scalar assignment word
-        // (`a=b`, `a=`): `valid_function_name_text` does NOT special-case the
-        // spelling, so the oracle actually ACCEPTS `a=b () {…}` as
-        // `FunctionDef{name:"a=b"}` — a KNOWN, PINNED v248 divergence (see
-        // `atoms_function_assignment_name_divergence`): the atom path
-        // deliberately keeps deferring that one case (bash itself rejects it
-        // as a syntax error, so the divergence is judged closer to bash).
-        // Gating on `name_word.0.len() == 1` (in addition to
-        // `is_assignment_word`) reproduces exactly that one exception without
-        // reintroducing it for the array/subscript multi-part shapes.
-        // `parse_simple_with_leading_word` below is what actually assembles
-        // `a=(1 2 3)` (via `parse_word_command`'s `ArrayOpen` arm).
-        if !(crate::command::is_assignment_word(&name_word) && name_word.0.len() == 1)
+        // `parse_function_def` is a single-part unquoted-`Literal` assignment
+        // word (`a=b`, `a=`): `valid_function_name_text` accepts it as a name
+        // (it does NOT special-case the `=`-containing spelling), so the oracle
+        // actually ACCEPTS `a=b () {…}` as `FunctionDef{name:"a=b"}` — a KNOWN,
+        // PINNED v248 divergence (see `atoms_function_assignment_name_divergence`):
+        // the atom path deliberately keeps deferring that one case (bash itself
+        // rejects it as a syntax error, so the divergence is judged closer to
+        // bash). The skip condition is therefore precisely "an assignment word
+        // the oracle WOULD accept as a function name" =
+        // `is_assignment_word(&w) && valid_function_name_text(&w).is_some()`,
+        // which is true ONLY for the single-Literal assignment shape and false
+        // for the array/subscript (`ArrayLiteral`) and `AssignPrefix` shapes —
+        // so those correctly reach the funcdef attempt and get `FunctionName`
+        // parity. `parse_simple_with_leading_word` below is what actually
+        // assembles ordinary assignments (`a=(1 2 3)`, `a+=(1 2)`, `a[i]=x`),
+        // which have no following `(` and never enter the funcdef attempt.
+        let oracle_accepts_as_name = crate::command::is_assignment_word(&name_word)
+            && crate::command::valid_function_name_text(&name_word).is_some();
+        if !oracle_accepts_as_name
             && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
         {
             return parse_function_def(name_word, iter);
@@ -3535,6 +3558,42 @@ mod tests {
         assert!(tokenize_with_opts("a=(1 2", LexerOptions::default()).is_err());
         assert!(new_seq("a=(").is_err());
         assert!(tokenize_with_opts("a=(", LexerOptions::default()).is_err());
+    }
+
+    #[test]
+    fn atoms_array_literal_append_subscript_funcdef_parity() {
+        // v252 T4 review follow-up: `AssignPrefix`-prefixed leading words
+        // (`a+=…`/`a[i]=…`/`a[i]+=…`) are lexed with a leading zero-width
+        // `AssignPrefix` atom (unlike plain `a=…`, a `Lit("a=")`), so before
+        // this fix they SKIPPED the funcdef-lookahead dispatch entirely and
+        // fell to `parse_simple` → the trailing-`Op(LParen)` arm →
+        // `UnsupportedCommand`, diverging from the oracle's `FunctionName`.
+        // The outer dispatch gate now admits a leading `AssignPrefix`, so a
+        // CLOSED array literal glued before a second `(` reaches the same
+        // funcdef attempt and gets `FunctionName` parity (a multi-part /
+        // non-Literal word is not a valid function name). Error-parity (both
+        // sides `Err(FunctionName)`), not `diff_cmd` (which requires `Ok`).
+        assert_eq!(new_seq("a+=(1)(2)"), old_seq("a+=(1)(2)"), "error parity for \"a+=(1)(2)\"");
+        assert_eq!(new_seq("a[0]=(1)(2)"), old_seq("a[0]=(1)(2)"), "error parity for \"a[0]=(1)(2)\"");
+        assert!(matches!(new_seq("a+=(1)(2)"), Err(ParseError::FunctionName)),
+            "a+=(1)(2) → FunctionName, got {:?}", new_seq("a+=(1)(2)"));
+        assert!(matches!(new_seq("a[0]=(1)(2)"), Err(ParseError::FunctionName)),
+            "a[0]=(1)(2) → FunctionName, got {:?}", new_seq("a[0]=(1)(2)"));
+        // Bonus reconciliation (same root cause): a single-part `AssignPrefix`
+        // word (empty value) followed by `(` is NOT a valid function name on
+        // the oracle either (`AssignPrefix` is not a `Literal`), so both give
+        // `FunctionName` — unlike the v248-pinned single-`Literal` `a=b ()`
+        // shape, which the oracle accepts as `FunctionDef` (still deferred).
+        assert_eq!(new_seq("a+= (echo hi)"), old_seq("a+= (echo hi)"), "error parity for \"a+= (echo hi)\"");
+
+        // REGRESSION GUARD: ordinary append/subscript assignments (no following
+        // second `(`) must still parse as normal assignment simple-commands —
+        // the funcdef attempt must never be entered for these.
+        diff_cmd("a+=(1 2)");     // append array literal
+        diff_cmd("a+=(1)");       // append single-element array literal
+        diff_cmd("a[0]=(1 2)");   // subscripted array literal
+        diff_cmd("a[i]=x");       // subscripted SCALAR assignment
+        diff_cmd("a=(1 2)");      // plain (Literal-prefixed) array literal, unchanged
     }
 
     #[test]
