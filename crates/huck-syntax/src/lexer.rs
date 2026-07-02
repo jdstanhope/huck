@@ -2965,6 +2965,15 @@ impl<'a> Lexer<'a> {
                         let name = scan_var_name(&mut self.cursor);
                         self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
                     }
+                    // `$[expr]` — legacy arithmetic expansion. DEFERRED to Stage 2
+                    // (no atom-mode for it yet). Emit the zero-width
+                    // `DeferredExpansion` signal (cursor stays on `$`) so the parser
+                    // defers cleanly (`parse_simple` → UnsupportedCommand) instead of
+                    // mis-lexing `$` + `[expr]` as two literals (the production
+                    // `scan_dollar_expansion` builds a `WordPart::Arith` here).
+                    Some('[') => {
+                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    }
                     _ => {
                         self.cursor.next(); // lone `$`
                         self.history.push(Token::new(
@@ -3331,6 +3340,12 @@ impl<'a> Lexer<'a> {
                         self.cursor.next(); // `$`
                         let name = scan_var_name(&mut self.cursor);
                         self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
+                    }
+                    // `$[expr]` inside `"…"` — legacy arith, DEFERRED to Stage 2.
+                    // Zero-width `DeferredExpansion` signal → `parse_dquote` defers
+                    // cleanly (UnsupportedExpansion) rather than mis-lexing it.
+                    Some('[') => {
+                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
                     }
                     _ => {
                         self.cursor.next(); // lone `$`

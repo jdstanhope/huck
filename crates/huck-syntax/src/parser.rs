@@ -222,7 +222,26 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 }
                 break;
             }
-            _ => break,
+            _ => {
+                // A non-word-part atom (`RedirFd`/`Heredoc`/`ArithBlock`/…). If we
+                // have already assembled part of a word, this is a trailing
+                // boundary — stop and let the caller handle the token. But if we
+                // have accumulated NOTHING, the caller entered here on a token that
+                // is not a word start (e.g. a redirect/heredoc atom sitting in a
+                // for/select `in`-list or a case pattern position). Breaking would
+                // return an EMPTY Word WITHOUT consuming, and the caller's loop —
+                // which pushes `parse_word_command(..)?` for any non-`Op` token —
+                // would re-peek the identical token and spin forever. Consume it and
+                // error instead. (The oracle hits an analogous `unreachable!()` /
+                // UnexpectedToken on the same malformed input, but always consumes
+                // first, so it panics rather than hangs — a clean error is strictly
+                // better.)
+                if parts.is_empty() && acc.is_none() {
+                    iter.next_kind()?;
+                    return Err(ParseError::UnexpectedToken);
+                }
+                break;
+            }
         }
     }
     flush_lit(&mut acc, &mut parts);
@@ -2775,9 +2794,35 @@ mod tests {
             "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
             "cat <<EOF\nx\nEOF", "cat <<<word", "f() { :; }", "coproc x { :; }",
             "a=(1 2 3)",
+            // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
+            // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
+            "echo $[1+2]", "echo pre$[1+2]post",
         ] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand on atom path for {s:?}, got {:?}", new_seq(s));
+        }
+        // `$[expr]` inside `"…"` defers via `parse_dquote` → UnsupportedExpansion.
+        for s in ["echo \"$[1+2]\"", "echo \"pre$[1+2]\""] {
+            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedExpansion)),
+                "expected UnsupportedExpansion on atom path for {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
+    #[test]
+    fn atoms_no_hang_on_redirect_in_word_list() {
+        // Regression: a `RedirFd`/`Heredoc` atom where a word is expected (for/
+        // select `in`-list, case pattern) must ERROR, not spin. The oracle hits an
+        // `unreachable!()`/UnexpectedToken on the same malformed input (it consumes
+        // first, so it panics rather than hangs); the atom path must terminate with
+        // an Err. (No `diff_*` here — `old_seq` would panic.)
+        for s in [
+            "for i in <<a; do :; done",
+            "for i in 3>f; do :; done",
+            "select i in <<a; do :; done",
+            "case x in <<a) ;; esac",
+        ] {
+            assert!(new_seq(s).is_err(),
+                "atom path must reject (not hang on) {s:?}, got {:?}", new_seq(s));
         }
     }
 
