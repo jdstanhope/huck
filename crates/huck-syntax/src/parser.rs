@@ -2980,6 +2980,9 @@ mod tests {
         diff_cmd("f() { :; } 2>&1");
         diff_cmd("f() { g() { :; }; }");           // nested funcdef
         diff_cmd("if true; then f() { :; }; fi");  // funcdef inside a compound
+        diff_cmd("f() { :; } | cat");               // funcdef as a pipeline stage
+        diff_cmd("f() { :; }; g() { :; }");          // two funcdefs, ; separated
+        diff_cmd("true && f() { :; }");              // funcdef after a connector
     }
     #[test]
     fn atoms_function_not_a_def() {
@@ -3013,6 +3016,20 @@ mod tests {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
         }
+    }
+
+    #[test]
+    fn atoms_function_assignment_name_divergence() {
+        // KNOWN divergence (v248): the oracle accepts `a=b () {...}` as
+        // FunctionDef{name:"a=b"} because command.rs checks `(` before the
+        // assignment check; the atom path's is_assignment_word guard defers it.
+        // bash itself rejects this as a syntax error, so the atom path (defer) is
+        // arguably more correct. Pinned so the Stage-2 live-flip differential gate
+        // knows about it. (If a future iteration reconciles this, update here.)
+        assert!(matches!(new_seq("a=b () { :; }"), Err(ParseError::UnsupportedCommand)),
+            "atom path defers `a=b () {{...}}`, got {:?}", new_seq("a=b () { :; }"));
+        assert!(old_seq("a=b () { :; }").is_ok(),
+            "oracle accepts `a=b () {{...}}` (documents the divergence)");
     }
 
     // v243 T2 tests
