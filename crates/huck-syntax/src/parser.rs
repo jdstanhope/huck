@@ -1545,11 +1545,11 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         return parse_subshell(iter);
     }
-    // Heredoc / `<<<` at command position.
-    if matches!(
-        iter.peek_kind()?,
-        Some(TokenKind::Heredoc { .. }) | Some(TokenKind::Op(Operator::HereString))
-    ) {
+    // Heredoc at command position — deferred (heredoc BODIES are future work).
+    // `<<<` (here-string) is NOT deferred: it flows to parse_simple as a leading
+    // redirect (an empty-words command reading stdin from the here-string),
+    // matching the oracle (which falls through to parse_pipeline → parse_simple_stage).
+    if matches!(iter.peek_kind()?, Some(TokenKind::Heredoc { .. })) {
         return Err(ParseError::UnsupportedCommand);
     }
     // Reserved word (keyword): dispatch to compound parsers; unknown → defer.
@@ -3041,6 +3041,51 @@ mod tests {
         diff_cmd("cmd <<< x > out");                // here-string + file redirect, source order
         diff_cmd("cmd 2>&1 <<< x");                 // fd-dup + here-string
         diff_cmd("cmd <<< a <<< b");                // two here-strings, ordered list
+    }
+
+    #[test]
+    fn atoms_here_string_leading() {
+        diff_cmd("<<< word");
+        diff_cmd("<<<foo");                         // glued
+        diff_cmd("<<< \"$x\"");
+        diff_cmd("<<< word > out");                 // leading here-string + file redirect
+        diff_cmd("<<< x | cat");                    // here-string stage in a pipeline
+        // Determined by observation: the oracle accepts a leading `<<<` as the
+        // first pipeline stage (falls through to parse_pipeline → parse_simple_stage
+        // exactly like the atom path), so this is `diff_cmd` parity, not a divergence.
+    }
+
+    #[test]
+    fn atoms_here_string_fd_prefix() {
+        // Determined by observation: `3<<<` lexes fine on the oracle's batch
+        // tokenizer (no lexer-level panic) and both paths produce the identical
+        // AST, so this is ordinary `diff_cmd` parity.
+        diff_cmd("3<<< word");                      // fd-prefixed here-string
+    }
+
+    #[test]
+    fn atoms_here_string_errors() {
+        // Determined by observation: none of these inputs panic `old_seq` at the
+        // lexer level (the oracle lexes all of them successfully and rejects at
+        // parse time), so every one is a plain error-parity comparison — no
+        // atom-path-only bucket needed (contrast `atoms_error_parity`'s
+        // `echo $(`/`echo ${` split, which DOES need one).
+        for s in ["cat <<<", "<<<", "cat <<< |", "cat <<< <", "cat <<< ;"] {
+            assert_eq!(
+                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                "here-string error parity for {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn atoms_here_string_heredoc_still_deferred() {
+        // Heredocs remain deferred on the atom path (v249 lifts ONLY `<<<`).
+        assert!(matches!(new_seq("cat <<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
+            "trailing heredoc must stay deferred, got {:?}", new_seq("cat <<EOF\nx\nEOF"));
+        assert!(matches!(new_seq("<<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
+            "leading heredoc must stay deferred, got {:?}", new_seq("<<EOF\nx\nEOF"));
     }
 
     // v243 T2 tests
