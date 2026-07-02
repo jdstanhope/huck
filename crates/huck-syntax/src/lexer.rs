@@ -457,6 +457,11 @@ pub enum TokenKind {
     /// `scan_step_dquote` when the closing quote is reached; consumed by
     /// `parse_dquote`, which then pops the mode.
     EndDquote,
+    /// v250: opens one heredoc body's part atoms (atom path); parser assembles
+    /// until `HeredocBodyEnd`.
+    HeredocBodyBegin,
+    /// v250: closes one heredoc body's part atoms.
+    HeredocBodyEnd,
     /// v247 T4: an assignment-prefix atom for the STRUCTURED assignment lvalues
     /// `name+=` / `name[sub]=` / `name[sub]+=`. Emitted by `scan_command_word_atom`
     /// at word start when an identifier prefix is followed by `+=`, or by a
@@ -649,6 +654,17 @@ pub(crate) struct Mark {
     assign_val_tilde_ok: bool,
 }
 
+/// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
+/// `began` tracks whether `HeredocBodyBegin` was already emitted for the FRONT
+/// entry of `atom_pending_heredocs`. Self-started at the newline; cleared when
+/// the queue drains. The lexer detects the close-delimiter line itself — it
+/// never consults the parser.
+#[derive(Debug, Clone)]
+struct HeredocEmit {
+    #[allow(dead_code)] // read by body-emission logic; dormant until that task lands (v250 T1)
+    began: bool,
+}
+
 /// Incremental tokenizer state (v238 Phase A). Holds what were
 /// `tokenize_partial_inner`'s locals so the scan logic can be reused; the public
 /// `tokenize*` APIs still drain it into a `Vec<Token>`. Phase A.T1 keeps the loop
@@ -673,6 +689,12 @@ pub struct Lexer<'a> {
     dbracket_depth: u32,
     expect_regex: bool,
     pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
+    /// v250: atom-path heredoc queue — SEPARATE from `pending_heredocs` so the
+    /// production `fill_to`/`backfill_pending_at` never gate the atom opener.
+    atom_pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
+    /// v250: Some while emitting heredoc body atoms after a line's newline.
+    #[allow(dead_code)] // read by body-emission logic; dormant until that task lands (v250 T1)
+    emitting_heredoc: Option<HeredocEmit>,
     aliases: std::collections::HashMap<String, String>,
     active: std::collections::HashSet<String>,
     /// Carries bash's trailing-blank rule across one expansion: a body ending in
@@ -730,6 +752,8 @@ impl<'a> Lexer<'a> {
             dbracket_depth: 0,
             expect_regex: false,
             pending_heredocs: std::collections::VecDeque::new(),
+            atom_pending_heredocs: std::collections::VecDeque::new(),
+            emitting_heredoc: None,
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
@@ -2787,13 +2811,22 @@ impl<'a> Lexer<'a> {
                         self.cursor.next(); // third `<` — here-string
                         push!(TokenKind::Op(Operator::HereString));
                     } else {
-                        // Heredoc opener. DEFERRED: emit a placeholder token (the
-                        // parser returns UnsupportedCommand on any `Heredoc`); do
-                        // NOT parse the delimiter or collect a body.
+                        // v250: heredoc opener. Parse the delimiter (so `expand`
+                        // is correct) and record a pending record in the ATOM
+                        // queue. The body is emitted as atoms after the line's
+                        // `\n` (a later task). Reuses TokenKind::Heredoc as the
+                        // opener (empty placeholder body; the parser fills the
+                        // AST from the body atoms once that's wired up) so
+                        // next_is_redirect recognizes it unchanged. The parser
+                        // still defers on any `Heredoc` token, so this is dormant.
                         let strip_tabs = if self.cursor.peek() == Some(&'-') {
                             self.cursor.next(); true
                         } else { false };
-                        push!(TokenKind::Heredoc { body: Word(Vec::new()), expand: true, strip_tabs });
+                        let (delim, expand) = parse_heredoc_delim(&mut self.cursor)?;
+                        push!(TokenKind::Heredoc { body: Word(Vec::new()), expand, strip_tabs });
+                        self.atom_pending_heredocs.push_back(PendingHeredoc {
+                            delim, expand, strip_tabs, token_idx: 0, // token_idx unused on the atom path
+                        });
                     }
                 }
                 Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupIn)); }
@@ -3448,6 +3481,8 @@ impl<'a> Lexer<'a> {
             dbracket_depth: 0,
             expect_regex: false,
             pending_heredocs: std::collections::VecDeque::new(),
+            atom_pending_heredocs: std::collections::VecDeque::new(),
+            emitting_heredoc: None,
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
@@ -11208,6 +11243,25 @@ mod tests {
         let words = tokenize_with_opts("echo hi", LexerOptions::default()).unwrap();
         assert!(words.iter().all(|t| !matches!(t.kind, TokenKind::Blank)),
             "Blank must never appear in the Word-mode stream");
+    }
+
+    // ── v250 T1: heredoc opener atom (dormant; body emission is a later task) ──
+
+    #[test]
+    fn heredoc_opener_atom_parses_delim() {
+        // The atom `<<` opener consumes the delimiter and carries the correct
+        // `expand`/`strip_tabs`; the delimiter is NOT left as a following word.
+        let toks = command_atoms_of("cat <<EOF");
+        assert!(matches!(toks.last(), Some(TokenKind::Heredoc { expand: true, strip_tabs: false, .. })),
+            "unquoted delim → expanding; got {toks:?}");
+        // No trailing Lit("EOF") — the delimiter was consumed by the opener.
+        assert!(!toks.iter().any(|t| matches!(t, TokenKind::Lit { text, .. } if text == "EOF")),
+            "delimiter must be consumed, not emitted as a word: {toks:?}");
+        // Quoted delimiter → literal (expand:false); `<<-` → strip_tabs.
+        let q = command_atoms_of("cat <<'EOF'");
+        assert!(matches!(q.last(), Some(TokenKind::Heredoc { expand: false, .. })), "quoted delim → literal: {q:?}");
+        let dash = command_atoms_of("cat <<-EOF");
+        assert!(matches!(dash.last(), Some(TokenKind::Heredoc { strip_tabs: true, expand: true, .. })), "<<- → strip_tabs: {dash:?}");
     }
 
     #[test]
