@@ -431,7 +431,7 @@ pub enum TokenKind {
     /// (T2 scope: literal-only body, no embedded expansions), a single
     /// backslash escape `\c`, or a `$'…'` ANSI-C run (already escape-decoded).
     /// The parser wraps this in `WordPart::Quoted { style, parts: vec![Literal
-    /// { text, quoted: true }] } }` — mirrors the oracle's `scan_step_command`
+    /// { text, quoted: true }] }` — mirrors the oracle's `scan_step_command`
     /// quoting, which always wraps a quote run (never leaves it as a bare
     /// `Literal`). Kept separate from `Lit` (which is for UNQUOTED literal runs,
     /// glued Word assembly) so the oracle's `QuoteStyle` survives atom-ization.
@@ -2695,7 +2695,7 @@ impl<'a> Lexer<'a> {
                 match self.cursor.next() {
                     None => {
                         self.history.push(Token::new(
-                            TokenKind::QuoteRun { style: QuoteStyle::Backslash, text: "\\".to_string() },
+                            TokenKind::Lit { text: "\\".to_string(), quoted: false },
                             Span::new(off, l, c),
                         ));
                         Ok(Step::Produced)

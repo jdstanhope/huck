@@ -112,7 +112,7 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
 /// command-position word in T2; later tasks may thread a non-`false` value in
 /// through nested contexts). Each `Lit { quoted: atom_q }` atom's flag is
 /// OR-ed with `quoted`, mirroring `parse_word`. `QuoteRun` atoms wrap into
-/// `WordPart::Quoted { style, parts: vec![Literal { quoted: true }] } }` —
+/// `WordPart::Quoted { style, parts: vec![Literal { quoted: true }] }` —
 /// reproducing the oracle's `scan_step_command` quote-wrapping (see the
 /// `QuoteRun` doc comment in lexer.rs for why a flat `Literal` can't do this).
 fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError> {
@@ -140,7 +140,24 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             _ => break,
         }
     }
-    Ok(Word(parts))
+    // Coalesce adjacent Literal parts with the same `quoted` flag into one,
+    // matching the oracle's single-buffer literal accumulation. Needed for
+    // e.g. a trailing unescaped `\` at EOF, which the lexer emits as its own
+    // unquoted `Lit` atom (see `scan_command_word_atom`'s `Some('\\')` arm,
+    // `None` case) but the oracle folds into the surrounding literal buffer.
+    let mut coalesced: Vec<WordPart> = Vec::with_capacity(parts.len());
+    for part in parts {
+        if let WordPart::Literal { text, quoted } = &part {
+            if let Some(WordPart::Literal { text: pt, quoted: pq }) = coalesced.last_mut() {
+                if *pq == *quoted {
+                    pt.push_str(text);
+                    continue;
+                }
+            }
+        }
+        coalesced.push(part);
+    }
+    Ok(Word(coalesced))
 }
 
 /// Convert the subscript word assembled by `parse_word` into a `SubscriptKind`.
@@ -2110,6 +2127,15 @@ mod tests {
         diff_cmd("echo a'b'c\"d\"");        // glued quotes = one word
         diff_cmd("echo a\\ b");             // escaped space = one word
         diff_cmd("echo $'x\\ty'");          // $'…' ANSI-C
+    }
+
+    #[test]
+    fn atoms_trailing_backslash() {
+        diff_cmd("echo a\\");
+        diff_cmd("echo \\");
+        diff_cmd("echo ab\\");
+        diff_cmd("echo a\\ b");   // escaped space mid-word stays Quoted{Backslash} — must still match
+        diff_cmd("echo a b\\");
     }
 
     // v243 T2 tests
