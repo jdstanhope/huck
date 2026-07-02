@@ -103,6 +103,46 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
     Ok(Word(parts))
 }
 
+/// Assemble a `Word` (Vec<WordPart>) from atoms in `Mode::Command` under the
+/// v247 atom-command scanner (`scan_step_command_atoms`), stopping at a
+/// boundary atom (`Blank` / `Newline` / `Op(_)` / EOF) WITHOUT consuming it —
+/// callers (`parse_simple` et al.) own blank-skipping and the boundary token.
+///
+/// `quoted` is the enclosing quoted context (always `false` for a bare
+/// command-position word in T2; later tasks may thread a non-`false` value in
+/// through nested contexts). Each `Lit { quoted: atom_q }` atom's flag is
+/// OR-ed with `quoted`, mirroring `parse_word`. `QuoteRun` atoms wrap into
+/// `WordPart::Quoted { style, parts: vec![Literal { quoted: true }] } }` —
+/// reproducing the oracle's `scan_step_command` quote-wrapping (see the
+/// `QuoteRun` doc comment in lexer.rs for why a flat `Literal` can't do this).
+fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError> {
+    let mut parts = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            None
+            | Some(TokenKind::Blank)
+            | Some(TokenKind::Newline)
+            | Some(TokenKind::Op(_)) => break,
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
+                    parts.push(WordPart::Literal { text, quoted: q || quoted });
+                }
+            }
+            Some(TokenKind::QuoteRun { .. }) => {
+                if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
+                    parts.push(WordPart::Quoted {
+                        style,
+                        parts: vec![WordPart::Literal { text, quoted: true }],
+                    });
+                }
+            }
+            // T3 adds DollarName / ParamOpen / CmdSubOpen / BeginBacktick / ArithOpen arms here.
+            _ => break,
+        }
+    }
+    Ok(Word(parts))
+}
+
 /// Convert the subscript word assembled by `parse_word` into a `SubscriptKind`.
 /// A bare unquoted `@` or `*` literal maps to `All` / `Star` respectively;
 /// anything else becomes `Index(word)`.  Mirrors `scan_param_subscript` in the
@@ -1019,9 +1059,25 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
             redirects.extend(parse_one_redirect(iter)?);
             continue;
         }
+        // Skip inter-word blanks in the atom stream (v247 T2: the atom-command
+        // scanner emits `Blank` for whitespace instead of folding it into word
+        // boundaries the way the legacy fat Word-Lexer does).
+        if matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+            continue;
+        }
+        // A command word begins here — assemble it from atoms (v247 T2: plain/
+        // quoted/glued literal words only; T3+ add expansion-opener peeks).
+        if matches!(iter.peek_kind()?, Some(TokenKind::Lit { .. } | TokenKind::QuoteRun { .. })) {
+            all_words.push(parse_word_command(iter, false)?);
+            continue;
+        }
         // Consume the token.
         let kind = iter.next_kind()?.unwrap();
         match kind {
+            // Legacy Word token (Word-mode path, still used by non-atom
+            // callers — `old_seq`/production do NOT reach this arm via
+            // `parse_sequence`, but it keeps `parse_simple` total).
             TokenKind::Word(word) => all_words.push(word),
             _ => return Err(ParseError::UnsupportedCommand),
         }
@@ -2041,6 +2097,21 @@ mod tests {
     fn diff_err(s: &str) {
         assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
     }
+
+    // v247 T2 tests
+
+    #[test]
+    fn atoms_plain_words() {
+        diff_cmd("echo");
+        diff_cmd("echo hi");
+        diff_cmd("echo   hi    there");     // multiple blanks collapse
+        diff_cmd("  echo hi  ");            // leading/trailing blanks
+        diff_cmd("echo 'a b' \"c d\" e");   // quoted runs stay one word
+        diff_cmd("echo a'b'c\"d\"");        // glued quotes = one word
+        diff_cmd("echo a\\ b");             // escaped space = one word
+        diff_cmd("echo $'x\\ty'");          // $'…' ANSI-C
+    }
+
     // v243 T2 tests
 
     #[test]

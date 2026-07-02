@@ -427,6 +427,15 @@ pub enum TokenKind {
     ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
     // --- Phase C v247: atom-emitting Command-mode scaffolding (dormant). ---
     Blank,   // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
+    /// v247 T2: ONE complete quoted run in command-word context — `'…'`, `"…"`
+    /// (T2 scope: literal-only body, no embedded expansions), a single
+    /// backslash escape `\c`, or a `$'…'` ANSI-C run (already escape-decoded).
+    /// The parser wraps this in `WordPart::Quoted { style, parts: vec![Literal
+    /// { text, quoted: true }] } }` — mirrors the oracle's `scan_step_command`
+    /// quoting, which always wraps a quote run (never leaves it as a bare
+    /// `Literal`). Kept separate from `Lit` (which is for UNQUOTED literal runs,
+    /// glued Word assembly) so the oracle's `QuoteStyle` survives atom-ization.
+    QuoteRun { style: QuoteStyle, text: String },
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -2594,10 +2603,146 @@ impl<'a> Lexer<'a> {
     /// Atom-native: at `$(`/`${`/`` ` ``/`$((` it emits the opener SIGNAL and the
     /// parser pushes the sub-mode — it never calls the fat scanners.
     fn scan_step_command_atoms(&mut self) -> Result<Step, LexError> {
-        // T1 skeleton: only EOF handled; any real input errors loudly until T2.
-        match self.cursor.peek() {
+        // Skip a run of unquoted blanks → emit one Blank boundary token.
+        if matches!(self.cursor.peek(), Some(' ') | Some('\t')) {
+            let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
+            while matches!(self.cursor.peek(), Some(' ') | Some('\t')) { self.cursor.next(); }
+            self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+        match self.cursor.peek().copied() {
             None => self.finish(),
-            Some(_) => Err(LexError::UnterminatedQuote),
+            // Quoting + literal word text — one atom per call (`Lit` for a
+            // maximal unquoted run, `QuoteRun` for one complete quoted run),
+            // stopping at a blank / EOF / (T5) operator without consuming it.
+            Some(_) => self.scan_command_word_atom(),
+        }
+    }
+
+    /// v247 T2: emit ONE atom's worth of command-word text per call — either a
+    /// maximal unquoted-literal run (`Lit { quoted: false }`) or one complete
+    /// quote run (`QuoteRun`: `'…'` / `"…"` / a single `\c` escape / `$'…'`
+    /// ANSI-C). Mirrors the oracle's `scan_step_command` quoting byte-for-byte
+    /// (that fat char-based scanner wraps every quote run in `WordPart::Quoted
+    /// { style, .. }` — see its `'`/`"`/`\\` arms — so `QuoteRun` carries the
+    /// `QuoteStyle` the parser needs to reproduce that wrapper; a flat `Lit`
+    /// atom cannot, since `Lit` only carries a `quoted: bool`).
+    ///
+    /// T2 scope: no operators, no `$name`/`${…}`/`$(…)`/backtick expansions
+    /// (`$'…'` is ANSI-C QUOTING, not an expansion, so it IS handled here —
+    /// decoded via the shared `scan_ansi_c_quoted` leaf helper, never the fat
+    /// `scan_dollar_expansion` dispatcher). A bare `$` not followed by `'`, or
+    /// a backtick, is swallowed into the surrounding literal run — wrong in
+    /// general, but the T2 corpus never exercises it; T3 breaks these out into
+    /// their own atoms.
+    fn scan_command_word_atom(&mut self) -> Result<Step, LexError> {
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+        match self.cursor.peek().copied() {
+            None => self.finish(),
+
+            // `'…'` — single-quoted run: fully literal, no escapes recognized.
+            Some('\'') => {
+                self.cursor.next(); // consume opening `'`
+                let mut text = String::new();
+                loop {
+                    match self.cursor.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('\'') => break,
+                        Some(ch) => text.push(ch),
+                    }
+                }
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun { style: QuoteStyle::Single, text },
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+
+            // `"…"` — double-quoted run. T2 scope: literal body only, with
+            // POSIX double-quote backslash rules (`\$ \` \" \\` unescape;
+            // `\<NL>` is line continuation; any other `\c` keeps the `\`).
+            // Embedded `$`/`` ` `` expansions are T3's job.
+            Some('"') => {
+                self.cursor.next(); // consume opening `"`
+                let mut text = String::new();
+                loop {
+                    match self.cursor.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('"') => break,
+                        Some('\\') => match self.cursor.next() {
+                            Some(e @ ('"' | '\\' | '$' | '`')) => text.push(e),
+                            Some('\n') => {} // line continuation: both chars deleted
+                            Some(other) => { text.push('\\'); text.push(other); }
+                            None => return Err(LexError::UnterminatedQuote),
+                        },
+                        Some(ch) => text.push(ch),
+                    }
+                }
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun { style: QuoteStyle::Double, text },
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+
+            // `\c` — backslash escape outside quotes: the next char is always
+            // literal (one-char QuoteRun). `\<NL>` is line continuation — both
+            // chars deleted, no atom emitted (cursor still advanced: safe).
+            Some('\\') => {
+                self.cursor.next(); // consume `\`
+                match self.cursor.next() {
+                    None => {
+                        self.history.push(Token::new(
+                            TokenKind::QuoteRun { style: QuoteStyle::Backslash, text: "\\".to_string() },
+                            Span::new(off, l, c),
+                        ));
+                        Ok(Step::Produced)
+                    }
+                    Some('\n') => Ok(Step::Produced), // deleted — no atom this call
+                    Some(ch) => {
+                        self.history.push(Token::new(
+                            TokenKind::QuoteRun { style: QuoteStyle::Backslash, text: ch.to_string() },
+                            Span::new(off, l, c),
+                        ));
+                        Ok(Step::Produced)
+                    }
+                }
+            }
+
+            // `$'…'` — ANSI-C quoting (the only `$` form recognized in T2
+            // scope; general `$name`/`${…}`/`$(…)` expansions are T3's job).
+            Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
+                self.cursor.next(); // `$`
+                self.cursor.next(); // `'`
+                let text = scan_ansi_c_quoted(&mut self.cursor)?;
+                self.history.push(Token::new(
+                    TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text },
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+
+            // Unquoted literal run: accumulate until the next quote opener,
+            // backslash, `$'` (ANSI-C opener), blank, or EOF.
+            Some(_) => {
+                let mut text = String::new();
+                while let Some(&ch) = self.cursor.peek() {
+                    if matches!(ch, ' ' | '\t' | '\'' | '"' | '\\') { break; }
+                    if ch == '$' && self.cursor.peek_nth(1) == Some('\'') { break; }
+                    text.push(ch);
+                    self.cursor.next();
+                }
+                // `text` is non-empty: none of the break conditions can fire on
+                // the FIRST char of this arm (the outer match already routed
+                // `'`/`"`/`\\`/`$'` away), so the loop consumes at least one char.
+                self.history.push(Token::new(
+                    TokenKind::Lit { text, quoted: false },
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
         }
     }
 
