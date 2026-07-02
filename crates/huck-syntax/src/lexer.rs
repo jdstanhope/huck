@@ -659,6 +659,9 @@ pub(crate) struct Mark {
     retokenize_arith_as_cmdsub: bool,
     cmd_at_word_start: bool,
     assign_val_tilde_ok: bool,
+    /// v250 T6: see `Lexer::heredoc_gen`. Captured so `rewind` can assert the
+    /// mark did not span an atom-path heredoc-state change.
+    heredoc_gen: u64,
 }
 
 /// v250: lexer-internal state while emitting a heredoc body as atoms (atom path).
@@ -751,6 +754,14 @@ pub struct Lexer<'a> {
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
     assign_val_tilde_ok: bool,
+    /// v250 T6: monotonic counter bumped on every atom-path heredoc-state
+    /// change (`atom_pending_heredocs` push at the atom `<<` opener site,
+    /// `emitting_heredoc` set at the newline trigger, and each
+    /// pop_front/re-arm in `emit_heredoc_body_end`). Captured in `Mark` and
+    /// checked in `rewind` (`debug_assert_eq!`) so a mark/rewind that spans
+    /// heredoc-body emission is caught loudly (debug builds) instead of
+    /// silently desyncing `atom_pending_heredocs`/`emitting_heredoc`.
+    heredoc_gen: u64,
 }
 
 impl<'a> Lexer<'a> {
@@ -783,6 +794,7 @@ impl<'a> Lexer<'a> {
             command_atoms: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
+            heredoc_gen: 0,
         }
     }
 
@@ -858,6 +870,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
             cmd_at_word_start: self.cmd_at_word_start,
             assign_val_tilde_ok: self.assign_val_tilde_ok,
+            heredoc_gen: self.heredoc_gen,
         }
     }
 
@@ -891,6 +904,10 @@ impl<'a> Lexer<'a> {
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
         self.cmd_at_word_start = m.cmd_at_word_start;
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
+        debug_assert_eq!(
+            self.heredoc_gen, m.heredoc_gen,
+            "mark/rewind must not span heredoc-body emission (v250)"
+        );
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -2762,6 +2779,7 @@ impl<'a> Lexer<'a> {
                 // scan_step calls emit the body groups (see the top-of-fn check).
                 if !self.atom_pending_heredocs.is_empty() {
                     self.emitting_heredoc = Some(HeredocEmit { began: false, at_line_start: true });
+                    self.heredoc_gen += 1; // v250 T6: emitting_heredoc changed (newline trigger)
                 }
                 Ok(Step::Produced)
             }
@@ -2955,6 +2973,7 @@ impl<'a> Lexer<'a> {
         let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
         self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
         self.atom_pending_heredocs.pop_front();
+        self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs/emitting_heredoc changed
         self.emitting_heredoc = if self.atom_pending_heredocs.is_empty() {
             None
         } else {
@@ -3145,6 +3164,7 @@ impl<'a> Lexer<'a> {
                         self.atom_pending_heredocs.push_back(PendingHeredoc {
                             delim, expand, strip_tabs, token_idx: 0, // token_idx unused on the atom path
                         });
+                        self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs changed
                     }
                 }
                 Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupIn)); }
@@ -3766,6 +3786,7 @@ impl<'a> Lexer<'a> {
             command_atoms: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
+            heredoc_gen: 0,
         }
     }
 

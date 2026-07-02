@@ -3541,6 +3541,48 @@ mod tests {
         diff_cmd("cat 3<<EOF\nx\nEOF\n");
     }
 
+    // v250 T6: mark/rewind heredoc-state generation guard + error parity + adversarial corpus
+
+    #[test]
+    fn atoms_heredoc_marks_dont_span_bodies() {
+        // Leading word triggers funcdef mark/rewind (`peek_leading_keyword`/
+        // funcdef-shape detection marks before the leading word, rewinds once it
+        // sees this isn't a funcdef); that mark/rewind is fully resolved BEFORE
+        // the line's newline, so it never spans the heredoc body-emission state
+        // change (bumped at the newline trigger / body-end). If a future change
+        // widened the speculative window across the newline, `Lexer::rewind`'s
+        // `debug_assert_eq!(self.heredoc_gen, m.heredoc_gen, ...)` would panic
+        // under a debug test build — these cases exercise exactly that path.
+        diff_cmd("cat <<EOF\nx\nEOF\n");         // `cat` starts funcdef detection, rewinds pre-newline
+        diff_cmd("f() { cat <<EOF\nx\nEOF\n}\n"); // funcdef whose body has a heredoc
+    }
+
+    #[test]
+    fn atoms_heredoc_errors() {
+        // Determined by observation (see v250 T6 report): all three inputs are
+        // LEXER-level rejects on the oracle — `tokenize_with_opts` returns
+        // `Err(LexError::UnterminatedHeredoc)` before parsing even starts, so
+        // `old_seq`'s `.expect("lex")` would panic on them (mirrors
+        // `atoms_error_parity`'s `echo $(`/`echo ${` split). Assert only that the
+        // atom path rejects too, not error-payload equality.
+        for s in ["cat <<EOF\nno close\n", "cat <<", "cat <<-\n"] {
+            assert!(new_seq(s).is_err(),
+                "atom path must reject unterminated/malformed heredoc {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
+    #[test]
+    fn atoms_heredoc_adversarial() {
+        for s in [
+            "cat <<EOF\nEOFX not a close\nEOF\n",         // delimiter as substring
+            "cat <<EOF\n  EOF\nEOF\n",                     // indented non-close (no <<-)
+            "cat <<-EOF\n\t\tEOF\n",                       // <<- tabbed close
+            "cat <<'E'\n$x `no` ${expand}\nE\n",           // literal: nothing expands
+            "cat <<EOF\n$1 $@ $? $#\nEOF\n",               // special params in expanding body
+            "cat <<EOF\n\\EOF\nEOF\n",                     // escaped-looking body line
+        ] { diff_cmd(s); }
+    }
+
     // v243 T2 tests
 
     #[test]
