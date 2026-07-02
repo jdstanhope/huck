@@ -418,6 +418,7 @@ pub enum TokenKind {
     DollarName { name: String, quoted: bool },
     DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
+    ProcSubOpen { dir: ProcDir },  // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
@@ -1684,35 +1685,45 @@ impl<'a> Lexer<'a> {
             let off = self.cursor.offset();
             let l   = self.cursor.line();
             let c   = self.cursor.column();
-            // If cursor is not on `$` (e.g. a backtick `` ` `` — its own iteration),
-            // emit DeferredExpansion rather than panicking.  This keeps the dormant
-            // CommandSub mode robust when tests call parse_command_sub with non-`$(` input.
-            if self.cursor.peek() != Some(&'$') {
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                return Ok(Step::Produced);
-            }
-            self.cursor.next(); // consume `$`
-            // If the char after `$` is not `(`, also defer gracefully.
-            if self.cursor.peek() != Some(&'(') {
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                return Ok(Step::Produced);
-            }
-            self.cursor.next(); // consume `(`
-            if self.cursor.peek() == Some(&'(') && !self.retokenize_arith_as_cmdsub {
-                // `$((` — arithmetic expansion; defer to runtime.
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-            } else {
-                // Either a real `$(cmd)`, OR the v246 wrinkle retry: treat `$((` as
-                // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
-                // stays unconsumed (cursor is on it) and lexes as the subshell
-                // opener in the body.
-                self.retokenize_arith_as_cmdsub = false;
-                // Flip the top-of-stack frame to body_started: true.
-                if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
-                    *body_started = true;
+            match self.cursor.peek().copied() {
+                Some('$') => {
+                    self.cursor.next(); // consume `$`
+                    // If the char after `$` is not `(`, defer gracefully.
+                    if self.cursor.peek() != Some(&'(') {
+                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    self.cursor.next(); // consume `(`
+                    if self.cursor.peek() == Some(&'(') && !self.retokenize_arith_as_cmdsub {
+                        // `$((` — arithmetic expansion; defer to runtime.
+                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    // Either a real `$(cmd)`, OR the v246 wrinkle retry: treat `$((` as
+                    // `$(` + a subshell `(`. Clear the one-shot flag; the second `(`
+                    // stays unconsumed (cursor is on it) and lexes as the subshell
+                    // opener in the body.
+                    self.retokenize_arith_as_cmdsub = false;
                 }
-                self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                Some('(') => {
+                    // v251: process-substitution opener. The `<`/`>` was already
+                    // consumed by scan_command_operator_atom; consume the `(`.
+                    self.cursor.next();
+                }
+                _ => {
+                    // Cursor is not on `$` or `(` (e.g. a backtick `` ` `` — its own
+                    // iteration), emit DeferredExpansion rather than panicking. This
+                    // keeps the dormant CommandSub mode robust when tests call
+                    // parse_command_sub with non-`$(`/non-`(` input.
+                    self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
             }
+            // Flip the top-of-stack frame to body_started: true.
+            if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
             Ok(Step::Produced)
         } else {
             // Body is Command-mode tokens; the parser owns the terminating `)`.
@@ -3152,6 +3163,15 @@ impl<'a> Lexer<'a> {
             '(' => push!(TokenKind::Op(Operator::LParen)),
             ')' => push!(TokenKind::Op(Operator::RParen)),
             '<' => match self.cursor.peek().copied() {
+                Some('(') => {
+                    // v251: `<(` process substitution. Zero-width word-part
+                    // signal; DON'T consume `(` (Mode::CommandSub consumes it).
+                    // Word continuation, so no boundary_reset: mark that a word
+                    // has started (mirrors scan_command_word_atom emitting a Lit).
+                    self.history.push(Token::new(TokenKind::ProcSubOpen { dir: ProcDir::In }, Span::new(off, l, c)));
+                    self.cmd_at_word_start = false;
+                    return Ok(Step::Produced);
+                }
                 Some('<') => {
                     self.cursor.next(); // second `<`
                     if self.cursor.peek() == Some(&'<') {
@@ -3182,6 +3202,12 @@ impl<'a> Lexer<'a> {
                 _ => push!(TokenKind::Op(Operator::RedirIn)),
             },
             '>' => match self.cursor.peek().copied() {
+                Some('(') => {
+                    // v251: `>(` process substitution — see the `<(` arm above.
+                    self.history.push(Token::new(TokenKind::ProcSubOpen { dir: ProcDir::Out }, Span::new(off, l, c)));
+                    self.cmd_at_word_start = false;
+                    return Ok(Step::Produced);
+                }
                 Some('>') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirAppend)); }
                 Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupOut)); }
                 Some('|') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirClobber)); }
@@ -11568,6 +11594,26 @@ mod tests {
         assert!(matches!(q.last(), Some(TokenKind::Heredoc { expand: false, .. })), "quoted delim → literal: {q:?}");
         let dash = command_atoms_of("cat <<-EOF");
         assert!(matches!(dash.last(), Some(TokenKind::Heredoc { strip_tabs: true, expand: true, .. })), "<<- → strip_tabs: {dash:?}");
+    }
+
+    // ── v251 T1: ProcSubOpen atom (dormant; parser assembly is a later task) ──
+
+    #[test]
+    fn procsub_open_atoms_disambiguate() {
+        // `<(`/`>(` → ProcSubOpen signal (NOT a redirect op); the `(` is NOT consumed.
+        let a = command_atoms_of("cat <(echo hi)");
+        assert!(a.iter().any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::In })),
+            "expected ProcSubOpen In, got {a:?}");
+        assert!(!a.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))),
+            "`<(` must NOT emit RedirIn: {a:?}");
+        let b = command_atoms_of("tee >(cat)");
+        assert!(b.iter().any(|t| matches!(t, TokenKind::ProcSubOpen { dir: ProcDir::Out })),
+            "expected ProcSubOpen Out, got {b:?}");
+        // Non-`(` `<`/`>` are unaffected.
+        let r = command_atoms_of("cat < f");
+        assert!(r.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))), "plain `<` still RedirIn: {r:?}");
+        let rr = command_atoms_of("echo >> f");
+        assert!(rr.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirAppend))), "`>>` still RedirAppend: {rr:?}");
     }
 
     #[test]
