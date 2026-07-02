@@ -2378,6 +2378,28 @@ mod tests {
     }
 
     #[test]
+    fn atoms_bracket_not_assignment() {
+        // name[...] NOT followed by =/+= : whole bracket region is literal (oracle parity)
+        diff_cmd("arr[$i]");
+        diff_cmd("a[$x]");
+        diff_cmd("a['x']");
+        diff_cmd("a[\"x\"]");
+        diff_cmd("a[`c`]");
+        diff_cmd("a[a\\b]");
+        diff_cmd("a[${y}]");
+        diff_cmd("a[$x]y");
+        diff_cmd("pre a[$i] post");
+        diff_cmd("a[$x");            // unclosed
+        diff_cmd("ls [abc]*");        // standalone glob (no identifier) — still literal
+        diff_cmd("echo a[b]");
+        // real assignments must STILL work
+        diff_cmd("a[0]=v");
+        diff_cmd("a[$i]=v");
+        diff_cmd("a[i]+=v");
+        diff_cmd("a[b[c]]=v");
+    }
+
+    #[test]
     fn atoms_dquote_nested() {
         diff_cmd("echo \"$(echo hi)\"");
         diff_cmd("echo \"$(echo $x)\"");

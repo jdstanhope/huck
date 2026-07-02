@@ -2996,33 +2996,63 @@ impl<'a> Lexer<'a> {
                         raw.push(ch);
                     } else { raw.push(ch); bracket.next(); }
                 }
-                if !closed { return Ok(None); }
-                // Peek for `=` or `+=` after the closing `]`.
-                let append = match bracket.peek().copied() {
-                    Some('=') => { bracket.next(); false }
-                    Some('+') => {
-                        let mut p2 = bracket.clone();
-                        p2.next();
-                        if p2.peek() == Some(&'=') { bracket.next(); bracket.next(); true }
-                        else { return Ok(None); }
+                // Decide: an indexed assignment only if the bracket CLOSED and
+                // `=`/`+=` follows the `]`. Otherwise (unclosed bracket, or no
+                // `=`/`+=`) this is NOT an assignment.
+                let append: Option<bool> = if closed {
+                    match bracket.peek().copied() {
+                        Some('=') => { bracket.next(); Some(false) }
+                        Some('+') => {
+                            let mut p2 = bracket.clone();
+                            p2.next();
+                            if p2.peek() == Some(&'=') { bracket.next(); bracket.next(); Some(true) }
+                            else { None }
+                        }
+                        _ => None,
                     }
-                    _ => return Ok(None),
+                } else {
+                    None
                 };
-                // Confirmed indexed assignment. Parse the subscript (leaf helper),
-                // then advance the real cursor to where `bracket` now sits.
-                let subscript = parse_subscript_body(&raw, self.opts)?;
-                self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
-                self.cmd_at_word_start = false;
-                self.in_assignment_value = true;
-                self.assign_val_tilde_ok = false; // buffer empty after the prefix
-                self.history.push(Token::new(
-                    TokenKind::AssignPrefix {
-                        target: crate::command::AssignTarget::Indexed { name, subscript },
-                        append,
-                    },
-                    Span::new(off, l, c),
-                ));
-                Ok(Some(Step::Produced))
+                match append {
+                    Some(append) => {
+                        // Confirmed indexed assignment. Parse the subscript (leaf
+                        // helper), then advance the real cursor to where `bracket` sits.
+                        let subscript = parse_subscript_body(&raw, self.opts)?;
+                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        self.cmd_at_word_start = false;
+                        self.in_assignment_value = true;
+                        self.assign_val_tilde_ok = false; // buffer empty after the prefix
+                        self.history.push(Token::new(
+                            TokenKind::AssignPrefix {
+                                target: crate::command::AssignTarget::Indexed { name, subscript },
+                                append,
+                            },
+                            Span::new(off, l, c),
+                        ));
+                        Ok(Some(Step::Produced))
+                    }
+                    None => {
+                        // NOT an indexed assignment (unclosed bracket, or no
+                        // `=`/`+=` after `]`). Mirror the oracle's literal-swallow
+                        // fallback (`scan_step_command`'s `None =>` arm): the WHOLE
+                        // `name[…]` region becomes ONE raw literal atom — `$`,
+                        // backtick, and quotes inside stay LITERAL (never re-lexed).
+                        // Advance the real cursor past `name` + `[` + raw + `]?` so
+                        // scanning resumes just after the region; downstream literal
+                        // coalescing merges any following literal run.
+                        let mut text = name;
+                        text.push('[');
+                        text.push_str(&raw);
+                        if closed { text.push(']'); }
+                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        self.cmd_at_word_start = false;
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text, quoted: false },
+                            Span::new(off, l, c),
+                        ));
+                        Ok(Some(Step::Produced))
+                    }
+                }
             }
             _ => Ok(None),
         }
