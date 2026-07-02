@@ -3434,6 +3434,48 @@ mod tests {
         diff_cmd("cat <<EOF\na\\zb\nEOF\n");                          // lone backslash (ordinary) stays literal
     }
 
+    #[test]
+    fn atoms_heredoc_expanding_continuation_delimiter() {
+        // v250 T4 fix (F1): a close delimiter FORMED across a `\<NL>` continuation
+        // spans multiple physical lines. `heredoc_at_delim_line` reads the whole
+        // joined logical line to match, so the consumption must advance the real
+        // cursor by that whole span — consuming only one physical line would leak
+        // the remainder as a spurious command. bash: `EO\<NL>F` joins to `EOF` =
+        // the delimiter, body empty, then runs `echo after`.
+        diff_cmd("cat <<EOF\nEO\\\nF\necho after\n");        // `EO\<NL>F` == EOF (empty body)
+        diff_cmd("cat <<-EOF\n\tEO\\\nF\necho after\n");     // <<- variant: `\tEO\<NL>F` strips to EOF
+        // Guard the other direction (no over-consumption): a continuation-joined
+        // BODY line that is NOT the delimiter must stay a body line, with the real
+        // `EOF` line still closing it and `echo after` following.
+        diff_cmd("cat <<EOF\nab\\\ncd\nEOF\necho after\n");  // `ab\<NL>cd` == abcd (body, not delim)
+    }
+
+    #[test]
+    fn atoms_heredoc_multiline_cmdsub_divergence() {
+        // v250 T4 KNOWN divergence (F2, INTENTIONAL — atom path is the target/bash
+        // behavior): a multi-line `$(…)` inside an expanding heredoc body whose `)`
+        // is on a LATER line than its `$(`. bash ALLOWS this (verified:
+        //   cat <<EOF
+        //   $(echo hi
+        //   echo bye)
+        //   EOF
+        // prints hi then bye). The atom path pushes a CommandSub sub-mode that scans
+        // the nested command across newlines from the cursor, so it parses fine. The
+        // command.rs ORACLE scans each heredoc body line with a LINE-LOCAL cursor, so
+        // an unclosed `$(` on its own line is an error there. This is an accepted
+        // atom-vs-oracle divergence; the atom path is correct. Do NOT use `diff_cmd`.
+        let s = "cat <<EOF\n$(echo hi\necho bye)\nEOF\n";
+        assert!(new_seq(s).is_ok(),
+            "atom path must parse multi-line $() in heredoc (matches bash): {:?}", new_seq(s));
+        // The oracle diverges at the LEXER level: its line-local heredoc-body scan
+        // hits an unclosed `$(` on the first body line and errors before parsing
+        // (observed `Err(LexError::UnterminatedSubstitution)`). `old_seq` would
+        // `.expect("lex")`-panic on it, so probe the fallible lexer directly.
+        assert!(
+            tokenize_with_opts(s, LexerOptions::default()).is_err(),
+            "oracle lexer is expected to diverge (line-bounded heredoc scan errors on the split $())");
+    }
+
     // v250 T3 tests: literal heredocs (quoted/escaped delimiter) end-to-end
 
     #[test]

@@ -2863,13 +2863,16 @@ impl<'a> Lexer<'a> {
             if ph.strip_tabs {
                 while self.cursor.peek() == Some(&'\t') { self.cursor.next(); }
             }
-            if self.heredoc_at_delim_line(ph) {
-                // Consume the (single) physical delimiter line + its newline, then
-                // emit End and pop. A delimiter line never carries a trailing
-                // continuation backslash (that would join and stop it matching), so
-                // one physical line covers it.
-                while let Some(ch) = self.cursor.next() {
-                    if ch == '\n' { break; }
+            if let Some(consume) = self.heredoc_at_delim_line(ph) {
+                // Consume EXACTLY the physical span `heredoc_at_delim_line` read on
+                // its probe (the full continuation-joined logical line — every joined
+                // physical line + the final newline). A delimiter formed across a
+                // `\<NL>` continuation spans multiple physical lines, so consuming a
+                // single physical line would leak the remainder as a spurious command
+                // (mirrors the oracle `collect_one_heredoc_body`, which advances its
+                // real cursor by the whole joined line before returning).
+                for _ in 0..consume {
+                    self.cursor.next();
                 }
                 self.emit_heredoc_body_end();
                 return Ok(Step::Produced);
@@ -2964,29 +2967,35 @@ impl<'a> Lexer<'a> {
     /// the cursor and reads ONE logical line (applying `\<NL>` continuation joins,
     /// mirroring `collect_one_heredoc_body`) to compare against `ph.delim`. This is
     /// line-oriented delimiter matching, NOT a forward scan for a matching
-    /// delimiter across the body.
-    fn heredoc_at_delim_line(&self, ph: &PendingHeredoc) -> bool {
+    /// delimiter across the body. Returns `Some(n)` on a match, where `n` is the
+    /// exact number of chars the probe consumed to form the logical line (every
+    /// joined physical line + its terminating newline) — the caller advances the
+    /// REAL cursor by `n` so a continuation-formed delimiter is fully consumed and
+    /// nothing leaks; `None` on no match.
+    fn heredoc_at_delim_line(&self, ph: &PendingHeredoc) -> Option<usize> {
         let mut probe = self.cursor.clone();
         let mut line = String::new();
         let mut got_nl = false;
+        let mut consumed = 0usize;
         loop {
             match probe.next() {
-                Some('\n') => { got_nl = true; break; }
-                Some(ch) => line.push(ch),
+                Some('\n') => { consumed += 1; got_nl = true; break; }
+                Some(ch) => { consumed += 1; line.push(ch); }
                 None => break,
             }
         }
         // Expanding-body line continuation: a physical line ending in an odd run of
         // backslashes joins the next line (both `\` and NL deleted) BEFORE the
         // delimiter comparison — so a would-be delimiter with a trailing `\` never
-        // matches.
+        // matches. Every char read here still counts toward `consumed` (the joined
+        // `\` and NL are physically consumed on the real cursor).
         while got_nl && ends_with_continuation_backslash(&line) && probe.peek().is_some() {
             line.pop();
             got_nl = false;
             loop {
                 match probe.next() {
-                    Some('\n') => { got_nl = true; break; }
-                    Some(ch) => line.push(ch),
+                    Some('\n') => { consumed += 1; got_nl = true; break; }
+                    Some(ch) => { consumed += 1; line.push(ch); }
                     None => break,
                 }
             }
@@ -2994,7 +3003,7 @@ impl<'a> Lexer<'a> {
         // Leading `<<-` tabs are already stripped on the real cursor; `trim` here is
         // a harmless no-op that also matches the oracle's whole-line strip.
         let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
-        check == ph.delim
+        if check == ph.delim { Some(consumed) } else { None }
     }
 
     /// v250 T4: emit ONE atom for a `$`-expansion in a QUOTED operand context —
