@@ -634,7 +634,7 @@ pub(crate) enum Mode {
     // ever needs to distinguish a quoted-bit).
     Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral { body_started: bool },   // a=( … ) — v252
+    ArrayLiteral { body_started: bool, expect_subscript_eq: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
     HeredocBody,    // <<EOF …
@@ -937,7 +937,8 @@ impl<'a> Lexer<'a> {
             Mode::Arith { paren_depth, in_dquote, body_started } =>
                 self.scan_step_arith(paren_depth, in_dquote, body_started),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
-            Mode::ArrayLiteral { body_started } => self.scan_step_array_literal(body_started),
+            Mode::ArrayLiteral { body_started, expect_subscript_eq } =>
+                self.scan_step_array_literal(body_started, expect_subscript_eq),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -3668,6 +3669,16 @@ impl<'a> Lexer<'a> {
                             },
                             Span::new(off, l, c),
                         ));
+                        // v252: compound array RHS `name[sub]=(...)` / `name[sub]+=(...)`.
+                        // A `\<NL>` may sit between the prefix and `(` (bash deletes it).
+                        // Mirror the scalar `=`/`+=` arms' inline `(` probe: emit a
+                        // zero-width ArrayOpen so the parser pushes Mode::ArrayLiteral.
+                        // Cursor is LEFT on `(`.
+                        skip_line_continuations(&mut self.cursor);
+                        if self.cursor.peek() == Some(&'(') {
+                            let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                            self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                        }
                         Ok(Some(Step::Produced))
                     }
                     None => {
@@ -3808,11 +3819,11 @@ impl<'a> Lexer<'a> {
     /// Bracketed subscripts (`[i]=value`) are NOT wired here (Task 3 widens
     /// this). Mirrors `scan_array_literal`/`scan_array_element_word`'s
     /// separator/value grammar.
-    fn scan_step_array_literal(&mut self, body_started: bool) -> Result<Step, LexError> {
+    fn scan_step_array_literal(&mut self, body_started: bool, expect_subscript_eq: bool) -> Result<Step, LexError> {
         if !body_started {
             debug_assert_eq!(self.cursor.peek(), Some(&'('), "array-literal entry: expected '('");
             self.cursor.next(); // consume opening '('
-            if let Some(Mode::ArrayLiteral { body_started }) = self.modes.last_mut() {
+            if let Some(Mode::ArrayLiteral { body_started, .. }) = self.modes.last_mut() {
                 *body_started = true;
             }
             // Each value is scanned as a FRESH word (mirrors the oracle
@@ -3823,6 +3834,23 @@ impl<'a> Lexer<'a> {
             self.in_assignment_value = false;
             self.assign_val_tilde_ok = false;
             // fall through to scan the first atom
+        }
+        // v252 T3: control has returned from the parser's `[expr]` subscript scan
+        // (the cursor sits just past `]`). The oracle (`scan_array_literal`)
+        // requires a `=` here — consume it, clear the flag, and scan the value's
+        // first atom in this same call (so the following `[` is a LITERAL value
+        // char, not another subscript). If `=` is absent → ArrayLiteralMissingEquals.
+        let mut scanning_subscript_value = false;
+        if expect_subscript_eq {
+            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, .. }) = self.modes.last_mut() {
+                *e = false;
+            }
+            if self.cursor.peek() == Some(&'=') {
+                self.cursor.next(); // consume the required '='
+                scanning_subscript_value = true;
+            } else {
+                return Err(LexError::ArrayLiteralMissingEquals);
+            }
         }
         let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
         match self.cursor.peek().copied() {
@@ -3855,6 +3883,22 @@ impl<'a> Lexer<'a> {
                 self.cmd_at_word_start = true;
                 self.in_assignment_value = false;
                 self.assign_val_tilde_ok = false;
+                Ok(Step::Produced)
+            }
+            // v252 T3: a `[` AT ELEMENT START begins an explicit `[expr]=value`
+            // subscript (mirrors the oracle's leading-`[` sniff in
+            // `scan_array_literal`). Emit a zero-width `LBracket`; the parser
+            // pushes `Mode::ParamSubscriptOperand`, assembles the subscript Word,
+            // consumes `RBracket`, pops — then the required `=` is consumed by the
+            // `expect_subscript_eq` block above on the next `scan_step`. A `[`
+            // just past a subscript's `=` (scanning_subscript_value) or MID-value
+            // is NOT a subscript — it falls through to the literal-run arm.
+            Some('[') if !scanning_subscript_value => {
+                self.cursor.next(); // consume '['
+                if let Some(Mode::ArrayLiteral { expect_subscript_eq, .. }) = self.modes.last_mut() {
+                    *expect_subscript_eq = true;
+                }
+                self.history.push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
             // Value content — shares `scan_command_word_atom`'s full atom

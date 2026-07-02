@@ -880,17 +880,53 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
 /// v252 T1: assemble `WordPart::ArrayLiteral` from atoms under
 /// `Mode::ArrayLiteral`. The caller (`parse_word_command`'s `ArrayOpen` arm)
 /// has already discarded the zero-width `ArrayOpen` signal; the cursor is on
-/// `(`. T1 scope: POSITIONAL values only (bare elements, brace-expanded via
-/// `brace_expand_parts`) — subscripted elements (`[i]=value`) arrive in a
-/// later task. Owns the full push/pop lifecycle of its `ArrayLiteral` frame;
-/// pops on every exit path.
+/// `(`. Positional values (bare elements, brace-expanded via
+/// `brace_expand_parts`) and — v252 T3 — explicit `[expr]=value` subscripted
+/// elements (single value, NO brace expansion). Owns the full push/pop
+/// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
 pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::ArrayLiteral { body_started: false });
+    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false });
     let mut elements: Vec<ArrayLiteralElement> = Vec::new();
     loop {
         match iter.peek_kind()? {
             Some(TokenKind::Blank) | Some(TokenKind::Newline) => { iter.next_kind()?; }
             Some(TokenKind::ArrayClose) => { iter.next_kind()?; break; }
+            // v252 T3: an explicit `[expr]=value` element. The lexer emitted a
+            // zero-width `LBracket` at element start; assemble the subscript Word
+            // under `Mode::ParamSubscriptOperand` (identical to the `${a[i]}`
+            // reader at parse_param_expansion), then the lexer consumes the
+            // required `=` (or errors `ArrayLiteralMissingEquals`) as we scan the
+            // value. Subscripted values keep single-value semantics — NO brace
+            // expansion (matches `scan_array_literal`).
+            Some(TokenKind::LBracket) => {
+                iter.next_kind()?; // consume LBracket
+                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+                let sub_word = match parse_word(iter, false) {
+                    Ok(w) => w,
+                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                };
+                match iter.next_kind() {
+                    Ok(Some(TokenKind::RBracket)) => {}
+                    Ok(_) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
+                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
+                }
+                iter.pop_mode(); // ParamSubscriptOperand
+                // The lexer consumes the required `=` (or errors
+                // ArrayLiteralMissingEquals) as `parse_word_command` scans on.
+                let value = match parse_word_command(iter, false) {
+                    Ok(v) => v,
+                    Err(e) => { iter.pop_mode(); return Err(e); }
+                };
+                // An empty value (`[i]= ` / `[i]=)`) re-tokenizes to a single
+                // empty literal in the oracle (`scan_array_element_word`'s
+                // `words.is_empty()` fallback), NOT an empty Word.
+                let value = if value.0.is_empty() {
+                    Word(vec![WordPart::Literal { text: String::new(), quoted: false }])
+                } else {
+                    value
+                };
+                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value });
+            }
             Some(_) => {
                 // A positional value: parse_word_command stops at the next
                 // Blank/Newline/ArrayClose (its catch-all arm breaks WITHOUT
@@ -3429,6 +3465,36 @@ mod tests {
         diff_cmd("a=({1..3})");           // brace-expanded bare element -> 1 2 3
         diff_cmd("a=(x{a,b}y)");          // brace expansion with prefix/suffix
         diff_cmd("pre a=(1 2) post");     // assignment mid-command still one word
+    }
+
+    #[test]
+    fn atoms_array_literal_subscripts() {
+        diff_cmd("a=([0]=x [1]=y)");             // explicit subscripts
+        diff_cmd("a=([2]=two 1 [0]=zero)");      // mixed positional + subscripted
+        diff_cmd("a=([i+1]=v)");                 // arithmetic subscript expr
+        diff_cmd("a=([k]={a,b})");               // subscripted: brace stays LITERAL (no expansion)
+        diff_cmd("m[k]=(1 2)");                  // name[sub]=(…) prefix form
+        diff_cmd("m[k]+=(3)");                   // name[sub]+=(…) prefix form
+        diff_cmd("a=([0]= [1]=y)");              // empty subscripted value
+        diff_cmd("a=([$i]=v [x]=$y)");           // expansion in subscript and value
+        diff_cmd("a=([0]=x[1]y)");               // `[` MID-value stays literal
+    }
+
+    #[test]
+    fn atoms_array_literal_error_parity() {
+        // `[i]` without `=` → ArrayLiteralMissingEquals on BOTH paths (lexer-level).
+        // The oracle's `old_seq` panics on a lex error (`tokenize_with_opts(..).expect`),
+        // so compare against the fallible `tokenize_with_opts` directly.
+        assert!(new_seq("a=([0])").is_err());
+        assert!(tokenize_with_opts("a=([0])", LexerOptions::default()).is_err());
+        // Leading `[…]` with no `=` after `]` (the T2-deferred `[ab]c` case).
+        assert!(new_seq("a=([ab]c)").is_err());
+        assert!(tokenize_with_opts("a=([ab]c)", LexerOptions::default()).is_err());
+        // EOF before `)` → UnterminatedArrayLiteral on both.
+        assert!(new_seq("a=(1 2").is_err());
+        assert!(tokenize_with_opts("a=(1 2", LexerOptions::default()).is_err());
+        assert!(new_seq("a=(").is_err());
+        assert!(tokenize_with_opts("a=(", LexerOptions::default()).is_err());
     }
 
     #[test]
