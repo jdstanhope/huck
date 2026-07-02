@@ -2018,9 +2018,16 @@ mod tests {
         crate::command::parse(&mut Lexer::from_tokens(toks))
     }
     fn new_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
-        parse_sequence(&mut Lexer::from_tokens(toks))
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        parse_sequence(&mut lx)
     }
+    #[test]
+    fn atoms_scaffolding_exists() {
+        // The atom lexer + repointed harness wire up. Empty input parses to None
+        // on both paths (EOF handled by the skeleton).
+        assert_eq!(new_seq("").unwrap(), old_seq("").unwrap());
+    }
+
     /// In-scope: the new parser must produce the SAME AST as command.rs (the oracle).
     fn diff_cmd(s: &str) {
         assert_eq!(new_seq(s).unwrap(), old_seq(s).unwrap(), "command AST mismatch for {s:?}");

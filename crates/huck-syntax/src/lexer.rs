@@ -425,6 +425,8 @@ pub enum TokenKind {
     ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
     ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
     ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
+    // --- Phase C v247: atom-emitting Command-mode scaffolding (dormant). ---
+    Blank,   // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -633,6 +635,11 @@ pub struct Lexer<'a> {
     /// `Mark`/restored by `rewind` so a rewind that spans setting it stays
     /// consistent.
     retokenize_arith_as_cmdsub: bool,
+    /// v247: when true, `Mode::Command` scans via `scan_step_command_atoms`
+    /// (emits word-atoms + `Blank` + structural tokens) instead of the
+    /// Word-emitting `scan_step_command`. Default false (production). Set only by
+    /// the dormant atom path (differential harness + the eventual live flip).
+    command_atoms: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -659,6 +666,7 @@ impl<'a> Lexer<'a> {
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
+            command_atoms: false,
         }
     }
 
@@ -757,6 +765,7 @@ impl<'a> Lexer<'a> {
     /// forward declarations (never pushed in production).
     fn scan_step(&mut self) -> Result<Step, LexError> {
         match self.current_mode() {
+            Mode::Command if self.command_atoms => self.scan_step_command_atoms(),
             Mode::Command => self.scan_step_command(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
             Mode::ParamWordOperand            { in_dquote } => self.scan_step_param_operand(None,      '}', in_dquote),
@@ -2579,6 +2588,19 @@ impl<'a> Lexer<'a> {
         Ok(Step::Produced)
     }
 
+    /// v247 atom-emitting Command scanner (dormant). Built up across T2–T6:
+    /// word-atoms + `Blank` splitting (T2), command-position expansions (T3),
+    /// assignments (T4), redirects/operators/comments (T5), compounds (T6).
+    /// Atom-native: at `$(`/`${`/`` ` ``/`$((` it emits the opener SIGNAL and the
+    /// parser pushes the sub-mode — it never calls the fat scanners.
+    fn scan_step_command_atoms(&mut self) -> Result<Step, LexError> {
+        // T1 skeleton: only EOF handled; any real input errors loudly until T2.
+        match self.cursor.peek() {
+            None => self.finish(),
+            Some(_) => Err(LexError::UnterminatedQuote),
+        }
+    }
+
     /// End-of-input epilogue, run incrementally: flush a pending final word
     /// (once), then report any unterminated heredoc, else EOF. Flushing the
     /// final word returns Produced so next_token() drains it before EOF.
@@ -2657,6 +2679,7 @@ impl<'a> Lexer<'a> {
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
+            command_atoms: false,
         }
     }
 
@@ -2781,6 +2804,17 @@ impl<'a> Lexer<'a> {
     pub fn new_live(input: &'a str, aliases: &std::collections::HashMap<String, String>, opts: LexerOptions) -> Lexer<'a> {
         let mut lx = Lexer::new(input, opts, true);
         lx.aliases = aliases.clone();
+        lx
+    }
+
+    /// v247: a live lexer whose `Mode::Command` emits atoms (dormant atom path).
+    pub fn new_live_atoms(
+        input: &'a str,
+        aliases: &std::collections::HashMap<String, String>,
+        opts: LexerOptions,
+    ) -> Lexer<'a> {
+        let mut lx = Lexer::new_live(input, aliases, opts);
+        lx.command_atoms = true;
         lx
     }
 }
