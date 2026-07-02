@@ -457,6 +457,15 @@ pub enum TokenKind {
     /// `scan_step_dquote` when the closing quote is reached; consumed by
     /// `parse_dquote`, which then pops the mode.
     EndDquote,
+    /// v247 T4: an assignment-prefix atom for the STRUCTURED assignment lvalues
+    /// `name+=` / `name[sub]=` / `name[sub]+=`. Emitted by `scan_command_word_atom`
+    /// at word start when an identifier prefix is followed by `+=`, or by a
+    /// bracketed subscript immediately followed by `=`/`+=`. The parser turns it
+    /// into the leading `WordPart::AssignPrefix { target, append }` of the word,
+    /// which `try_split_assignment` consumes. Plain `name=value` gets NO
+    /// AssignPrefix — the `name=` flows into the literal run and the splitter
+    /// breaks on the first unquoted `=` (mirrors the oracle's `scan_step_command`).
+    AssignPrefix { target: crate::command::AssignTarget, append: bool },
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -624,6 +633,7 @@ pub(crate) struct Mark {
     modes: Vec<Mode>,
     retokenize_arith_as_cmdsub: bool,
     cmd_at_word_start: bool,
+    assign_val_tilde_ok: bool,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -678,6 +688,14 @@ pub struct Lexer<'a> {
     /// (`a~b`, `$x~`) it is literal. Reset to true after a `Blank`, cleared
     /// after any word-content atom. Only meaningful under `command_atoms`.
     cmd_at_word_start: bool,
+    /// v247 T4: true when a `~` scanned next would be a tilde CONSTRUCT because
+    /// we are inside an assignment value AND positioned right after a `=`/`:`
+    /// (mirrors the oracle's `tilde_eligible_in_assignment`, which checks that
+    /// the accumulated literal buffer ends in `=` or `:`). Set after the plain
+    /// `name=` prefix and after an unquoted `=`/`:` in the value literal run;
+    /// cleared whenever a non-literal part is emitted (which flushes the
+    /// oracle's buffer). Only meaningful under `command_atoms`.
+    assign_val_tilde_ok: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -706,6 +724,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: false,
             command_atoms: false,
             cmd_at_word_start: true,
+            assign_val_tilde_ok: false,
         }
     }
 
@@ -767,6 +786,7 @@ impl<'a> Lexer<'a> {
             modes: self.modes.clone(),
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
             cmd_at_word_start: self.cmd_at_word_start,
+            assign_val_tilde_ok: self.assign_val_tilde_ok,
         }
     }
 
@@ -799,6 +819,7 @@ impl<'a> Lexer<'a> {
         self.modes = m.modes.clone();
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
         self.cmd_at_word_start = m.cmd_at_word_start;
+        self.assign_val_tilde_ok = m.assign_val_tilde_ok;
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -2642,6 +2663,10 @@ impl<'a> Lexer<'a> {
             while matches!(self.cursor.peek(), Some(' ') | Some('\t')) { self.cursor.next(); }
             self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
             self.cmd_at_word_start = true; // next word-content atom begins a fresh word
+            // A blank ends the word — leave assignment-value context (mirrors the
+            // oracle's whitespace arm clearing `in_assignment_value`). v247 T4.
+            self.in_assignment_value = false;
+            self.assign_val_tilde_ok = false;
             return Ok(Step::Produced);
         }
         match self.cursor.peek().copied() {
@@ -2676,6 +2701,21 @@ impl<'a> Lexer<'a> {
         // A `~` is tilde-special only at word start (mirrors the oracle's
         // `!has_token` guard); capture the flag before it's cleared below.
         let at_word_start = self.cmd_at_word_start;
+        // v247 T4: at word start, try to peel a structured assignment prefix
+        // (`name+=`, `name[sub]=`, `name[sub]+=`) or a plain scalar `name=`.
+        if at_word_start {
+            if let Some(step) = self.try_scan_assign_prefix(off, l, c)? {
+                return Ok(step);
+            }
+        }
+        // v247 T4: value-position tilde eligibility. `assign_val_tilde_ok` is true
+        // when the previous unquoted literal char was `=`/`:` inside an assignment
+        // value (mirrors the oracle's `tilde_eligible_in_assignment`). Capture it,
+        // then DEFAULT-CLEAR: every atom kind resets it EXCEPT the literal-run arm,
+        // which re-sets it based on its final char (a non-literal part flushes the
+        // oracle's buffer, so a following `~` is no longer value-eligible).
+        let tilde_ok = self.assign_val_tilde_ok;
+        self.assign_val_tilde_ok = false;
         match self.cursor.peek().copied() {
             None => self.finish(),
 
@@ -2811,13 +2851,16 @@ impl<'a> Lexer<'a> {
                 Ok(Step::Produced)
             }
 
-            // `~…` at WORD START — tilde construct (mirrors the oracle's
-            // `!has_token` guard). Mid-word `~` (e.g. `a~b`, `$x~`) is NOT
-            // word-start, so it is swallowed into the literal run below.
-            Some('~') if at_word_start => {
+            // `~…` — tilde construct at WORD START (mirrors the oracle's
+            // `!has_token` guard) OR in ASSIGNMENT-VALUE position right after an
+            // unquoted `=`/`:` (v247 T4; mirrors `tilde_eligible_in_assignment`).
+            // Mid-word `~` elsewhere (`a~b`, `$x~`) is swallowed into the literal
+            // run below. In value context `:` is a tilde TERMINATOR, so
+            // `try_parse_tilde` is told the assignment-value flag.
+            Some('~') if at_word_start || (self.in_assignment_value && tilde_ok) => {
                 self.cmd_at_word_start = false;
                 self.cursor.next(); // consume `~`
-                match try_parse_tilde(&mut self.cursor, false) {
+                match try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
                     Some(spec) => {
                         self.history.push(Token::new(TokenKind::Tilde(spec), Span::new(off, l, c)));
                     }
@@ -2835,24 +2878,153 @@ impl<'a> Lexer<'a> {
 
             // Unquoted literal run: accumulate until the next quote opener,
             // backslash, expansion opener (`$`/`` ` ``), blank, or EOF. `~` is
-            // NOT a stop char — mid-word it is literal.
+            // NOT a stop char — mid-word it is literal — EXCEPT in assignment-value
+            // position right after a `=`/`:`, where it opens a tilde construct
+            // (v247 T4): break so the `~` arm fires on the next call.
             Some(_) => {
                 self.cmd_at_word_start = false;
                 let mut text = String::new();
+                // Track the oracle's tilde eligibility per char: true iff we're in
+                // an assignment value and the last char accumulated is `=`/`:`.
+                let mut boundary = self.in_assignment_value && tilde_ok;
                 while let Some(&ch) = self.cursor.peek() {
                     if matches!(ch, ' ' | '\t' | '\'' | '"' | '\\' | '$' | '`') { break; }
+                    if boundary && ch == '~' { break; }
                     text.push(ch);
                     self.cursor.next();
+                    boundary = self.in_assignment_value && matches!(ch, '=' | ':');
                 }
+                // Carry the eligibility to the next atom: true when the run ended on
+                // an unquoted `=`/`:` (or broke right before a value-tilde `~`).
+                self.assign_val_tilde_ok = boundary;
                 // `text` is non-empty: none of the break conditions can fire on
                 // the FIRST char of this arm (the outer match already routed
-                // `'`/`"`/`\\`/`$`/`` ` `` away), so the loop consumes ≥1 char.
+                // `'`/`"`/`\\`/`$`/`` ` `` away; a value-tilde `~` at the very
+                // start is routed to the `~` arm above), so the loop consumes ≥1 char.
                 self.history.push(Token::new(
                     TokenKind::Lit { text, quoted: false },
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
             }
+        }
+    }
+
+    /// v247 T4: at word start, try to recognize and consume an assignment prefix.
+    /// Mirrors the oracle's `=`/`+=`/`[…]` arms, which fire only when the word so
+    /// far is identifier-shaped and the value has not yet started:
+    ///
+    ///   - `name=`         → PLAIN scalar assignment. Emits a single `Lit`
+    ///                        `"name="` (NO `AssignPrefix`); the value flows into
+    ///                        the literal run and `try_split_assignment` splits on
+    ///                        the first unquoted `=` — byte-identical to the oracle.
+    ///   - `name+=`        → `AssignPrefix { Bare(name), append: true }`.
+    ///   - `name[sub]=` / `name[sub]+=`
+    ///                     → `AssignPrefix { Indexed { name, subscript }, append }`,
+    ///                        `subscript` parsed by the `parse_subscript_body` leaf.
+    ///
+    /// The bracket form is speculative: if the `[…]` is not closed, or is not
+    /// followed by `=`/`+=` (e.g. glob `a[abc]*`), NOTHING is consumed and `None`
+    /// is returned so the caller falls back to ordinary word scanning (the oracle's
+    /// fallback treats the `[` and its body as literal). Sets `in_assignment_value`
+    /// and seeds `assign_val_tilde_ok` (true only after the bare `name=`, whose
+    /// buffer ends in `=`; false after `+=`/`[sub]=`, whose buffer is empty).
+    ///
+    /// ARRAY LITERALS (`name=(…)`, `name+=(…)`, `name[i]=(…)`) are DEFERRED: the
+    /// compound `(` RHS is left unconsumed for a later task (do NOT scan it here).
+    fn try_scan_assign_prefix(&mut self, off: usize, l: u32, c: u32) -> Result<Option<Step>, LexError> {
+        // The prefix must begin with an identifier: [A-Za-z_][A-Za-z0-9_]*.
+        let Some(first) = self.cursor.peek().copied() else { return Ok(None) };
+        if !is_name_start(first) { return Ok(None); }
+        // Scan the maximal identifier on a probe (nothing is consumed yet).
+        let mut probe = self.cursor.clone();
+        let mut name = String::new();
+        while let Some(&ch) = probe.peek() {
+            if is_name_cont(ch) { name.push(ch); probe.next(); } else { break; }
+        }
+        // Identifier chars are ASCII, so `name.len()` (bytes) == the char count.
+        match probe.peek().copied() {
+            // `name=` — plain scalar: emit `Lit { "name=" }`, no AssignPrefix.
+            Some('=') => {
+                for _ in 0..name.len() { self.cursor.next(); }
+                self.cursor.next(); // `=`
+                name.push('=');
+                self.cmd_at_word_start = false;
+                self.in_assignment_value = true;
+                self.assign_val_tilde_ok = true; // buffer now ends in `=`
+                self.history.push(Token::new(
+                    TokenKind::Lit { text: name, quoted: false },
+                    Span::new(off, l, c),
+                ));
+                Ok(Some(Step::Produced))
+            }
+            // `name+=` — scalar/array append. `name+x` (no `=`) is NOT an
+            // assignment: leave everything for ordinary word scanning.
+            Some('+') => {
+                let mut p2 = probe.clone();
+                p2.next(); // `+`
+                if p2.peek() != Some(&'=') { return Ok(None); }
+                for _ in 0..name.len() { self.cursor.next(); }
+                self.cursor.next(); // `+`
+                self.cursor.next(); // `=`
+                self.cmd_at_word_start = false;
+                self.in_assignment_value = true;
+                self.assign_val_tilde_ok = false; // buffer empty after the prefix
+                self.history.push(Token::new(
+                    TokenKind::AssignPrefix {
+                        target: crate::command::AssignTarget::Bare(name),
+                        append: true,
+                    },
+                    Span::new(off, l, c),
+                ));
+                Ok(Some(Step::Produced))
+            }
+            // `name[sub]=` / `name[sub]+=` — subscripted lvalue. Speculatively scan
+            // the bounded `[…]`; only an assignment if `=`/`+=` follows.
+            Some('[') => {
+                let mut bracket = probe.clone();
+                bracket.next(); // consume `[`
+                let mut raw = String::new();
+                let mut depth: usize = 1;
+                let mut closed = false;
+                while let Some(&ch) = bracket.peek() {
+                    if ch == '[' { depth += 1; raw.push(ch); bracket.next(); }
+                    else if ch == ']' {
+                        bracket.next();
+                        depth -= 1;
+                        if depth == 0 { closed = true; break; }
+                        raw.push(ch);
+                    } else { raw.push(ch); bracket.next(); }
+                }
+                if !closed { return Ok(None); }
+                // Peek for `=` or `+=` after the closing `]`.
+                let append = match bracket.peek().copied() {
+                    Some('=') => { bracket.next(); false }
+                    Some('+') => {
+                        let mut p2 = bracket.clone();
+                        p2.next();
+                        if p2.peek() == Some(&'=') { bracket.next(); bracket.next(); true }
+                        else { return Ok(None); }
+                    }
+                    _ => return Ok(None),
+                };
+                // Confirmed indexed assignment. Parse the subscript (leaf helper),
+                // then advance the real cursor to where `bracket` now sits.
+                let subscript = parse_subscript_body(&raw, self.opts)?;
+                self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                self.cmd_at_word_start = false;
+                self.in_assignment_value = true;
+                self.assign_val_tilde_ok = false; // buffer empty after the prefix
+                self.history.push(Token::new(
+                    TokenKind::AssignPrefix {
+                        target: crate::command::AssignTarget::Indexed { name, subscript },
+                        append,
+                    },
+                    Span::new(off, l, c),
+                ));
+                Ok(Some(Step::Produced))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -3068,6 +3240,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: false,
             command_atoms: false,
             cmd_at_word_start: true,
+            assign_val_tilde_ok: false,
         }
     }
 

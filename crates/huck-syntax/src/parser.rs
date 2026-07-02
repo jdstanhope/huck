@@ -191,6 +191,15 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                     parts.push(WordPart::Tilde(spec));
                 }
             }
+            // v247 T4: an assignment-prefix atom (`name+=` / `name[sub]=` /
+            // `name[sub]+=`). Carried into the Word unchanged as the leading
+            // `WordPart::AssignPrefix`; `try_split_assignment` consumes it later.
+            Some(TokenKind::AssignPrefix { .. }) => {
+                if let Some(TokenKind::AssignPrefix { target, append }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(WordPart::AssignPrefix { target, append });
+                }
+            }
             // `"…"` — parser-driven double-quote mode. `parse_dquote` consumes the
             // zero-width `BeginDquote` signal, pushes `Mode::DoubleQuote`, collects
             // the inner parts, and pops.
@@ -1260,6 +1269,7 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
                     | TokenKind::ArithOpen
                     | TokenKind::Tilde(_)
                     | TokenKind::BeginDquote
+                    | TokenKind::AssignPrefix { .. }
             )
         ) {
             all_words.push(parse_word_command(iter, false)?);
@@ -2346,6 +2356,25 @@ mod tests {
         diff_cmd("echo a\\");        // trailing backslash folds into preceding literal
         diff_cmd("echo ab\\");
         diff_cmd("echo a b\\");
+    }
+
+    // v247 T4 tests
+
+    #[test]
+    fn atoms_assignments() {
+        diff_cmd("x=1");
+        diff_cmd("x=1 y=2 cmd");
+        diff_cmd("x+=abc");
+        diff_cmd("a[0]=v");
+        diff_cmd("a[$i]=v");
+        diff_cmd("x=$y\"z\"");
+        diff_cmd("PATH=/bin:/usr/bin cmd arg");
+        diff_cmd("x=");                  // empty value
+        diff_cmd("a[i]+=v");             // subscript append
+        diff_cmd("x=~/foo");             // assignment-value tilde
+        diff_cmd("x=a:~/b:~/c");         // tilde after unquoted ':'
+        diff_cmd("PATH=~/bin:/usr/bin"); // value-start tilde + literal
+        diff_cmd("cmd x=1 arg");         // prefix assignment before argv
     }
 
     #[test]
