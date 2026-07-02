@@ -1040,6 +1040,10 @@ fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
 fn is_bang_word(tok: &TokenKind) -> bool {
     match tok {
         TokenKind::Word(w) => word_literal_text(w) == Some("!"),
+        // v247 T5: under the atom command scanner a standalone `!` is a single
+        // unquoted `Lit` atom (`! cmd` → `Lit "!"`, then a `Blank`). A glued
+        // `!foo` is `Lit "!foo"` (text != "!") — correctly NOT a bang.
+        TokenKind::Lit { text, quoted: false } => text == "!",
         _ => false,
     }
 }
@@ -1153,15 +1157,26 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             if matches!(op, Operator::HereString) {
                 return Err(ParseError::UnsupportedCommand);
             }
-            let target = match iter.next_kind()? {
-                Some(TokenKind::Word(word)) => word,
+            // The redirect target may be separated from the operator by an
+            // inter-token `Blank` in the atom stream (`> out`); skip it. Then
+            // ASSEMBLE the target from word atoms via `parse_word_command` (the
+            // atom scanner emits `Lit`/quote/expansion atoms, never a single
+            // `Word` token). A legacy `Word` token is still accepted for the
+            // Word-mode path. Non-word tokens are the same errors as the oracle.
+            if matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+                iter.next_kind()?;
+            }
+            let target = match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::Newline) | None => return Err(ParseError::MissingRedirectTarget),
                 Some(TokenKind::Heredoc { .. }) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::RedirFd(_)) => return Err(ParseError::RedirectTargetIsOperator),
                 Some(TokenKind::ArithBlock(..)) => return Err(ParseError::RedirectTargetIsOperator),
-                // Phase C atom variants (dormant — never emitted in Command mode)
-                Some(_) => return Err(ParseError::RedirectTargetIsOperator),
+                Some(TokenKind::Word(_)) => match iter.next_kind()? {
+                    Some(TokenKind::Word(word)) => word,
+                    _ => unreachable!("peek confirmed Word"),
+                },
+                Some(_) => parse_word_command(iter, false)?,
             };
             Ok(crate::command::build_redirections(op, target, fd_prefix))
         }
@@ -1408,11 +1423,16 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
 ///   when `!` negate applies (oracle: `parse_command_then_pipeline` returns raw).
 /// - Any command with `|`: all stages collected into `Command::Pipeline(…)`.
 fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
-    // Count leading `!` words (each one flips the negate flag).
+    // Count leading `!` words (each one flips the negate flag). Under the atom
+    // scanner successive bangs are separated by `Blank` atoms (`! ! a`), so skip
+    // any inter-token blanks after each bang before checking for the next one.
     let mut bangs = 0usize;
     while iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
         iter.next_kind()?; // consume `!`
         bangs += 1;
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
     }
     let negate = bangs % 2 == 1;
 
@@ -1504,8 +1524,17 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
         match token {
             // ── `&` — background / Amp separator ────────────────────────────
             TokenKind::Op(Operator::Background) => {
-                // Skip any newlines emitted after heredoc bodies (mirrors oracle).
-                skip_newlines(iter)?;
+                // Skip any newlines emitted after heredoc bodies (mirrors oracle),
+                // plus inter-token `Blank`s (v247 T5: the atom scanner emits a
+                // `Blank` between `&` and what follows — `cmd & &`, `p & q` — where
+                // the oracle's Word lexer had none). Skipping both lets the
+                // trailing-`&` / `& &` / `& cmd` decision below see the real token.
+                loop {
+                    match iter.peek_kind()? {
+                        Some(TokenKind::Blank) | Some(TokenKind::Newline) => { iter.next_kind()?; }
+                        _ => break,
+                    }
+                }
                 match iter.peek_kind()? {
                     // Nothing follows → trailing `&`: background the whole sequence.
                     None => {
@@ -2397,6 +2426,34 @@ mod tests {
         diff_cmd("a[$i]=v");
         diff_cmd("a[i]+=v");
         diff_cmd("a[b[c]]=v");
+    }
+
+    // v247 T5 tests: redirects / operators / separators / comments / continuations
+    #[test]
+    fn atoms_structure() {
+        for s in [
+            // pipelines / and-or / separators
+            "a | b | c", "a && b || c", "a; b; c", "a &", "a&&b", "a||b", "a|b",
+            // redirects
+            "echo hi > out", "echo hi >> out 2>&1", "cat < in", "cat <> f",
+            "3< in 4> out cmd", "{fd}> out cmd", "cmd 2>&1 >file", "cmd >&2",
+            "echo a >| f", "echo a &> f", "echo a &>> f", "ls</dev/null",
+            // comments
+            "echo a  # trailing comment", "# whole line comment", "a#b",
+            // line continuations
+            "echo a \\\n  b", "a\\\n&&\\\nb",
+            // separators glued / spaced
+            "echo a;", "echo a ;b", "a| b |c",
+            // adversarial extensions
+            "3>out", "{fd}>out cmd", "2>&1", "1>&2", "cmd 3>&1 4>&2",
+            "a>b", "x=2>out", "a3>out", "echo>out",           // fd-prefix boundaries
+            "cmd</in>out", "echo hi>>log 2>>err",             // glued redirects
+            "a  ;  b  &&  c", "a|&b",                          // spaced ops + |& desugar
+            "echo '|' \"&&\" \\;",                             // quoted/escaped metachars stay literal
+            "x=1 y=2 cmd >o", ">o", "<i >o",                   // assignments + bare redirects
+            "echo a# still one word", "a#b>c",                 // mid-word # then redirect
+            "echo\ta\tb", "a\r b",                             // tab / CR whitespace
+        ] { diff_cmd(s); }
     }
 
     #[test]

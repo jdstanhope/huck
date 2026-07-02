@@ -576,6 +576,19 @@ fn fd_prefix_of(token: Option<&TokenKind>) -> Option<crate::command::RedirFd> {
     }
 }
 
+/// v247 T5: fd-prefix classification for the atom command scanner. Mirrors the
+/// oracle's `take_fd_prefix` look-back (which operates on an already-emitted
+/// `TokenKind::Word`), but takes the RAW literal text of an atom word-run —
+/// under the atom scanner a fd-prefix like `3`/`{fd}` is a plain `Lit` run, not
+/// a `Word`. Reuses `fd_prefix_of` verbatim by wrapping the text in a throwaway
+/// single-literal Word, so the digit-run / `{ident}` classification cannot drift.
+fn fd_prefix_of_text(text: &str) -> Option<crate::command::RedirFd> {
+    fd_prefix_of(Some(&TokenKind::Word(Word(vec![WordPart::Literal {
+        text: text.to_string(),
+        quoted: false,
+    }]))))
+}
+
 /// One scan_step outcome: `Produced` = made progress (more input remains,
 /// call again), `Eof` = end of input reached.
 enum Step {
@@ -2657,25 +2670,146 @@ impl<'a> Lexer<'a> {
     /// Atom-native: at `$(`/`${`/`` ` ``/`$((` it emits the opener SIGNAL and the
     /// parser pushes the sub-mode — it never calls the fat scanners.
     fn scan_step_command_atoms(&mut self) -> Result<Step, LexError> {
-        // Skip a run of unquoted blanks → emit one Blank boundary token.
-        if matches!(self.cursor.peek(), Some(' ') | Some('\t')) {
+        // Skip a run of inter-word blanks → emit one Blank boundary token. The
+        // oracle flushes the word on ANY `char::is_whitespace()` (lexer.rs:2076),
+        // handling only `\n` specially (a `Newline` token); every other
+        // whitespace char is a mere word boundary. So the atom `Blank` covers all
+        // whitespace EXCEPT `\n`, which is its own `TokenKind::Newline` below.
+        if matches!(self.cursor.peek(), Some(w) if w.is_whitespace() && *w != '\n') {
             let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
-            while matches!(self.cursor.peek(), Some(' ') | Some('\t')) { self.cursor.next(); }
+            while matches!(self.cursor.peek(), Some(w) if w.is_whitespace() && *w != '\n') { self.cursor.next(); }
             self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
-            self.cmd_at_word_start = true; // next word-content atom begins a fresh word
-            // A blank ends the word — leave assignment-value context (mirrors the
-            // oracle's whitespace arm clearing `in_assignment_value`). v247 T4.
-            self.in_assignment_value = false;
-            self.assign_val_tilde_ok = false;
+            self.boundary_reset();
             return Ok(Step::Produced);
         }
+        let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
         match self.cursor.peek().copied() {
             None => self.finish(),
+
+            // Newline — its own boundary token (mirrors the oracle's `c == '\n'`
+            // arm). Heredoc bodies are DEFERRED (v247): no `collect_heredoc_bodies`.
+            Some('\n') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::Newline, Span::new(off, l, c)));
+                self.boundary_reset();
+                Ok(Step::Produced)
+            }
+
+            // Comment: an unquoted `#` that BEGINS a word (mirrors the oracle's
+            // `'#' if !self.has_token`, i.e. at a word boundary) runs to end of
+            // line. `#` mid-word is literal — handled by the word-run arm, which
+            // does not treat `#` as a stop char. No token is emitted.
+            Some('#') if self.cmd_at_word_start => {
+                skip_line_comment(&mut self.cursor);
+                Ok(Step::Produced)
+            }
+
+            // Operators / separators / redirects — emit the SAME structural token
+            // the oracle emits (lexer.rs ~2245-2509). fd-prefixes (`3>`, `{fd}<`)
+            // are handled in the word-run arm (which emits `RedirFd` in place of
+            // the digit/`{ident}` `Lit`), so these arms never look back.
+            Some('|') | Some('&') | Some(';') | Some('(') | Some(')')
+            | Some('<') | Some('>') => self.scan_command_operator_atom(off, l, c),
+
             // Quoting + literal word text — one atom per call (`Lit` for a
             // maximal unquoted run, `QuoteRun` for one complete quoted run),
-            // stopping at a blank / EOF / (T5) operator without consuming it.
+            // stopping at a blank / EOF / operator / metachar without consuming it.
             Some(_) => self.scan_command_word_atom(),
         }
+    }
+
+    /// v247 T5: reset the word/assignment boundary flags after emitting a Blank,
+    /// Newline, or operator — the next word-content atom begins a fresh word and
+    /// is no longer in assignment-value context (mirrors the oracle's whitespace
+    /// and operator arms clearing `has_token` / `in_assignment_value`).
+    fn boundary_reset(&mut self) {
+        self.cmd_at_word_start = true;
+        self.in_assignment_value = false;
+        self.assign_val_tilde_ok = false;
+    }
+
+    /// v247 T5: emit ONE structural operator/redirect token per call. The cursor
+    /// sits on the operator's first char (`| & ; ( ) < >`). Mirrors
+    /// `scan_step_command`'s operator arms char-for-char (multi-char recognition
+    /// order matters). Heredoc / here-string openers emit the opener token but do
+    /// NOT scan a body (deferred — the parser returns `UnsupportedCommand`).
+    fn scan_command_operator_atom(&mut self, off: usize, l: u32, c: u32) -> Result<Step, LexError> {
+        let first = self.cursor.next().expect("caller peeked an operator char");
+        macro_rules! push { ($k:expr) => {{ self.history.push(Token::new($k, Span::new(off, l, c))) }} }
+        match first {
+            '|' => {
+                match self.cursor.peek().copied() {
+                    Some('|') => { self.cursor.next(); push!(TokenKind::Op(Operator::Or)); }
+                    Some('&') => {
+                        // `|&` desugars to `2>&1 |` (mirrors the oracle ~2254-2266).
+                        // The `1` is emitted as a `Lit` atom (not a `Word`) so the
+                        // atom redirect-target assembler consumes it uniformly.
+                        self.cursor.next();
+                        push!(TokenKind::RedirFd(crate::command::RedirFd::Number(2)));
+                        push!(TokenKind::Op(Operator::DupOut));
+                        push!(TokenKind::Lit { text: "1".to_string(), quoted: false });
+                        push!(TokenKind::Op(Operator::Pipe));
+                    }
+                    _ => push!(TokenKind::Op(Operator::Pipe)),
+                }
+            }
+            '&' => match self.cursor.peek().copied() {
+                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::And)); }
+                Some('>') => {
+                    self.cursor.next();
+                    if self.cursor.peek() == Some(&'>') {
+                        self.cursor.next();
+                        push!(TokenKind::Op(Operator::AndRedirAppend));
+                    } else {
+                        push!(TokenKind::Op(Operator::AndRedirOut));
+                    }
+                }
+                _ => push!(TokenKind::Op(Operator::Background)),
+            },
+            ';' => {
+                let op = if self.cursor.peek() == Some(&';') {
+                    self.cursor.next();
+                    if self.cursor.peek() == Some(&'&') { self.cursor.next(); Operator::DoubleSemiAmp }
+                    else { Operator::DoubleSemi }
+                } else if self.cursor.peek() == Some(&'&') {
+                    self.cursor.next(); Operator::SemiAmp
+                } else {
+                    Operator::Semi
+                };
+                push!(TokenKind::Op(op));
+            }
+            '(' => push!(TokenKind::Op(Operator::LParen)),
+            ')' => push!(TokenKind::Op(Operator::RParen)),
+            '<' => match self.cursor.peek().copied() {
+                Some('<') => {
+                    self.cursor.next(); // second `<`
+                    if self.cursor.peek() == Some(&'<') {
+                        self.cursor.next(); // third `<` — here-string
+                        push!(TokenKind::Op(Operator::HereString));
+                    } else {
+                        // Heredoc opener. DEFERRED: emit a placeholder token (the
+                        // parser returns UnsupportedCommand on any `Heredoc`); do
+                        // NOT parse the delimiter or collect a body.
+                        let strip_tabs = if self.cursor.peek() == Some(&'-') {
+                            self.cursor.next(); true
+                        } else { false };
+                        push!(TokenKind::Heredoc { body: Word(Vec::new()), expand: true, strip_tabs });
+                    }
+                }
+                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupIn)); }
+                Some('>') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirReadWrite)); }
+                _ => push!(TokenKind::Op(Operator::RedirIn)),
+            },
+            '>' => match self.cursor.peek().copied() {
+                Some('>') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirAppend)); }
+                Some('&') => { self.cursor.next(); push!(TokenKind::Op(Operator::DupOut)); }
+                Some('|') => { self.cursor.next(); push!(TokenKind::Op(Operator::RedirClobber)); }
+                _ => push!(TokenKind::Op(Operator::RedirOut)),
+            },
+            _ => unreachable!("scan_command_operator_atom called on non-operator char"),
+        }
+        self.boundary_reset();
+        Ok(Step::Produced)
     }
 
     /// v247 T2: emit ONE atom's worth of command-word text per call — either a
@@ -2888,19 +3022,55 @@ impl<'a> Lexer<'a> {
                 // an assignment value and the last char accumulated is `=`/`:`.
                 let mut boundary = self.in_assignment_value && tilde_ok;
                 while let Some(&ch) = self.cursor.peek() {
-                    if matches!(ch, ' ' | '\t' | '\'' | '"' | '\\' | '$' | '`') { break; }
+                    // Stop at whitespace, quote openers, expansion openers, and
+                    // (v247 T5) the command metacharacters `; | & < > ( )` — the
+                    // top-level scanner emits their structural token on the next
+                    // call. `#` is NOT a stop char: mid-word it is literal (`a#b`);
+                    // a word-start `#` is a comment, handled before this arm runs.
+                    if ch.is_whitespace() { break; }
+                    if matches!(ch, '\'' | '"' | '\\' | '$' | '`'
+                                    | ';' | '|' | '&' | '<' | '>' | '(' | ')') { break; }
                     if boundary && ch == '~' { break; }
                     text.push(ch);
                     self.cursor.next();
                     boundary = self.in_assignment_value && matches!(ch, '=' | ':');
+                }
+                // v247 T5 fd-prefix: a WHOLE-word pure digit-run or `{ident}` (this
+                // run began at word start) glued directly to a redirect operator
+                // (`3>out`, `{fd}<in`) is an fd-prefix — emit `RedirFd` in place of
+                // the `Lit`, mirroring the oracle's `take_fd_prefix` look-back. The
+                // `at_word_start` guard is the atom analogue of the oracle
+                // classifying the ENTIRE flushed word: a run after earlier glued
+                // content (`x=2>`, `a3>`) is never a whole-word digit-run.
+                if at_word_start && matches!(self.cursor.peek(), Some('<') | Some('>')) {
+                    // Oracle special-case: a bare `1` glued to `>` (`1>`, `1>>`,
+                    // `1>&2`, `1>|`) is a plain STDOUT redirect with the DEFAULT
+                    // fd — NOT `RedirFd(1)` (`scan_step_command`'s `'1' if peek=='>'`
+                    // arm, lexer.rs ~2476, emits the op with no fd prefix →
+                    // `plain_fd()` = `Default`). Drop the `1` (emit no token); the
+                    // top-level scanner emits the `>`-family op next with its
+                    // default fd. (`2>` needs NO such case: `RedirFd(2)` + the
+                    // stdout op builds the SAME AST as the oracle's stderr op, whose
+                    // `err_fd()` also defaults to `Number(2)`. `1<` is a genuine
+                    // `RedirFd(1)` — the special arm is `>`-only — so it falls
+                    // through.)
+                    if text == "1" && self.cursor.peek() == Some(&'>') {
+                        return Ok(Step::Produced);
+                    }
+                    if let Some(fd) = fd_prefix_of_text(&text) {
+                        self.assign_val_tilde_ok = false;
+                        self.history.push(Token::new(TokenKind::RedirFd(fd), Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
                 }
                 // Carry the eligibility to the next atom: true when the run ended on
                 // an unquoted `=`/`:` (or broke right before a value-tilde `~`).
                 self.assign_val_tilde_ok = boundary;
                 // `text` is non-empty: none of the break conditions can fire on
                 // the FIRST char of this arm (the outer match already routed
-                // `'`/`"`/`\\`/`$`/`` ` `` away; a value-tilde `~` at the very
-                // start is routed to the `~` arm above), so the loop consumes ≥1 char.
+                // `'`/`"`/`\\`/`$`/`` ` `` away, and metacharacters are handled by
+                // the top-level scanner; a value-tilde `~` at the very start is
+                // routed to the `~` arm above), so the loop consumes ≥1 char.
                 self.history.push(Token::new(
                     TokenKind::Lit { text, quoted: false },
                     Span::new(off, l, c),
