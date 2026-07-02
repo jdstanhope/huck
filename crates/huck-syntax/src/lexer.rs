@@ -662,7 +662,6 @@ pub(crate) struct Mark {
 /// never consults the parser.
 #[derive(Debug, Clone)]
 struct HeredocEmit {
-    #[allow(dead_code)] // read by body-emission logic; dormant until that task lands (v250 T1)
     began: bool,
 }
 
@@ -694,8 +693,17 @@ pub struct Lexer<'a> {
     /// production `fill_to`/`backfill_pending_at` never gate the atom opener.
     atom_pending_heredocs: std::collections::VecDeque<PendingHeredoc>,
     /// v250: Some while emitting heredoc body atoms after a line's newline.
-    #[allow(dead_code)] // read by body-emission logic; dormant until that task lands (v250 T1)
     emitting_heredoc: Option<HeredocEmit>,
+    /// v250 T3: heredoc body `Word`s the atom-command PARSER has assembled so
+    /// far, in source order. `skip_newlines` (the atom path's single
+    /// newline-consumption choke point) drains each `HeredocBodyBegin`…`End`
+    /// group it encounters into here; `parse_sequence` takes the whole vec via
+    /// `take_heredoc_bodies` once the top-level sequence is fully parsed and
+    /// zips it (source order == emission order) into the still-empty
+    /// `RedirOp::Heredoc { body }` placeholders via `attach_heredoc_bodies`.
+    /// Lexer-owned (rather than threaded through the ~24 `skip_newlines`
+    /// call-sites as a parameter) so no caller signature changes.
+    parsed_heredoc_bodies: Vec<Word>,
     aliases: std::collections::HashMap<String, String>,
     active: std::collections::HashSet<String>,
     /// Carries bash's trailing-blank rule across one expansion: a body ending in
@@ -755,6 +763,7 @@ impl<'a> Lexer<'a> {
             pending_heredocs: std::collections::VecDeque::new(),
             atom_pending_heredocs: std::collections::VecDeque::new(),
             emitting_heredoc: None,
+            parsed_heredoc_bodies: Vec::new(),
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
@@ -768,6 +777,19 @@ impl<'a> Lexer<'a> {
 
     pub(crate) fn current_mode(&self) -> Mode {
         *self.modes.last().expect("mode stack is never empty (Command is the floor)")
+    }
+
+    /// v250 T3: record one assembled heredoc body `Word` (parser-owned
+    /// assembly of a `HeredocBodyBegin`…`End` atom group) in source order.
+    pub(crate) fn push_heredoc_body(&mut self, w: Word) {
+        self.parsed_heredoc_bodies.push(w);
+    }
+
+    /// v250 T3: drain all heredoc body `Word`s collected so far, in source
+    /// order. Called once by `parse_sequence` after the top-level sequence is
+    /// fully parsed, to feed `attach_heredoc_bodies`.
+    pub(crate) fn take_heredoc_bodies(&mut self) -> Vec<Word> {
+        std::mem::take(&mut self.parsed_heredoc_bodies)
     }
 
     #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
@@ -3549,6 +3571,7 @@ impl<'a> Lexer<'a> {
             pending_heredocs: std::collections::VecDeque::new(),
             atom_pending_heredocs: std::collections::VecDeque::new(),
             emitting_heredoc: None,
+            parsed_heredoc_bodies: Vec::new(),
             aliases: std::collections::HashMap::new(),
             active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,

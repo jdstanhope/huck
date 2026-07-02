@@ -67,6 +67,9 @@ pub(crate) fn parse_error_message_impl(error: &ParseError) -> String {
         }
         ParseError::UnsupportedExpansion => "unsupported expansion".to_string(),
         ParseError::UnsupportedCommand => "unsupported command".to_string(),
+        ParseError::UnterminatedHeredoc => {
+            "unterminated here-document (expected the delimiter line)".to_string()
+        }
     }
 }
 

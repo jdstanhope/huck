@@ -1066,11 +1066,106 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 /// This makes every command-boundary caller (`&&`/`||`/`;`/newline connectors,
 /// pipe stages, `parse_command` entry, and all compound-body boundaries) skip
 /// the atom-path `Blank`s the oracle never sees.
+///
+/// v250 T3: this is ALSO the single lowest choke point for consuming a
+/// `Newline` on the atom path (every caller either loops here directly, or
+/// consumes one `Newline` itself as a connector token and then calls this
+/// immediately after — see `parse_and_or`/`parse_backtick_body_sequence`/
+/// `parse_subshell_sequence`). The lexer emits any pending heredoc-body groups
+/// (`HeredocBodyBegin`…`End`) as atoms immediately following the line's
+/// `Newline`, so this loop also drains those groups (via
+/// `iter.push_heredoc_body`) wherever they appear interleaved with
+/// `Newline`/`Blank` — otherwise the next `peek_kind`/`next_kind` call would
+/// try to parse a stray `HeredocBodyBegin` as a command and error (or, worse,
+/// spin if some caller loops on a non-progressing match).
 fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
-    while matches!(iter.peek_kind()?, Some(TokenKind::Newline | TokenKind::Blank)) {
-        iter.next_kind()?;
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::Newline | TokenKind::Blank) => { iter.next_kind()?; }
+            Some(TokenKind::HeredocBodyBegin) => {
+                let body = parse_heredoc_body(iter)?;
+                iter.push_heredoc_body(body);
+            }
+            _ => break,
+        }
     }
     Ok(())
+}
+
+/// v250 T3: after consuming a `Newline` OUTSIDE of `skip_newlines` (a few
+/// call-sites consume their own connector token directly), drain any heredoc
+/// body groups the lexer emitted for that line. Thin wrapper so those
+/// call-sites read the same as the ones that go through `skip_newlines`.
+/// (Most direct-`Newline`-consuming call-sites call `skip_newlines` themselves
+/// immediately afterward, which already drains via the loop above; this
+/// exists for the couple of sites that don't.)
+fn collect_heredoc_bodies_after_newline(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::HeredocBodyBegin)) {
+        let body = parse_heredoc_body(iter)?;
+        iter.push_heredoc_body(body);
+    }
+    Ok(())
+}
+
+/// v250 T3: assemble one heredoc body atom group (`HeredocBodyBegin` … each
+/// body Lit … `HeredocBodyEnd`) into a body `Word`. Task 3 handles LITERAL
+/// bodies (the lexer emits a single already-merged `Lit{quoted:true}` atom
+/// spanning every content line, or none at all for an empty body); Task 4
+/// adds the expansion atom arms (`DollarName`/`ParamOpen`/`CmdSubOpen`/
+/// `BeginBacktick`/`ArithOpen`) for expanding heredoc bodies.
+///
+/// IMPORTANT divergence from the brief's straw-man (verified against
+/// `old_seq`, the oracle): the oracle's `collect_one_heredoc_body` does NOT
+/// coalesce a literal heredoc body into one `Literal` — it pushes ONE
+/// `Literal{line_content, quoted:true}` PLUS a SEPARATE
+/// `Literal{"\n", quoted:true}` per content line (even when a line's content
+/// is empty), so a 2-line body is a 4-element `Word`, not a 1-element one.
+/// The atom lexer instead emits the WHOLE multi-line body as a single merged
+/// `Lit` token (one Rust `String` with embedded `\n`s). So instead of
+/// `push_lit`/`flush_lit` coalescing (which would collapse everything back
+/// into one `Literal` and mismatch the oracle), `push_heredoc_literal_lines`
+/// SPLITS that merged text back into the oracle's per-line
+/// (content, "\n") `Literal` pairs.
+fn parse_heredoc_body(iter: &mut Lexer) -> Result<Word, ParseError> {
+    iter.next_kind()?; // consume HeredocBodyBegin
+    let mut parts: Vec<WordPart> = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::HeredocBodyEnd) => { iter.next_kind()?; break; }
+            None => return Err(ParseError::UnterminatedHeredoc),
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
+                    push_heredoc_literal_lines(&mut parts, &text, quoted);
+                }
+            }
+            // Task 4 adds DollarName / ParamOpen / CmdSubOpen / BeginBacktick /
+            // ArithOpen arms here for expanding heredoc bodies.
+            _ => return Err(ParseError::UnterminatedHeredoc),
+        }
+    }
+    Ok(Word(parts))
+}
+
+/// v250 T3: split one accumulated heredoc-body `Lit` atom's text on embedded
+/// `\n` into the oracle's per-line `Literal` PAIR shape: the line's content
+/// (pushed even when empty) followed by a separate `"\n"` literal — mirroring
+/// `collect_one_heredoc_body`'s two unconditional pushes per content line
+/// (lexer.rs). These are deliberately NOT coalesced (the oracle never merges
+/// them), so this must NOT reuse `push_lit`/`flush_lit`.
+fn push_heredoc_literal_lines(parts: &mut Vec<WordPart>, text: &str, quoted: bool) {
+    let mut rest = text;
+    while let Some(idx) = rest.find('\n') {
+        let (line, tail) = rest.split_at(idx);
+        parts.push(WordPart::Literal { text: line.to_string(), quoted });
+        parts.push(WordPart::Literal { text: "\n".to_string(), quoted });
+        rest = &tail[1..];
+    }
+    // A trailing fragment with no newline shouldn't occur for a literal
+    // heredoc body (the lexer always appends '\n' after every content line),
+    // but guard defensively rather than silently drop trailing text.
+    if !rest.is_empty() {
+        parts.push(WordPart::Literal { text: rest.to_string(), quoted });
+    }
 }
 
 /// Returns `true` if the token is a standalone `!` word (pipeline negation).
@@ -1259,9 +1354,28 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
     };
 
     match iter.peek_kind()? {
+        // An EXPANDING heredoc (unquoted/interpolated delimiter, `expand: true`)
+        // is Task 4's scope — the lexer's body-atom emitter today accumulates
+        // the SAME raw literal text regardless of `expand` (`quoted: true`
+        // unconditionally), which would mismatch the oracle's expanding-body
+        // scanner (whose literal runs are `quoted: false`; only the per-line
+        // `"\n"` separator is `quoted: true`) even for a body with no actual
+        // `$`/backtick. So defer cleanly rather than assemble a wrong body.
+        Some(TokenKind::Heredoc { expand: true, .. }) => Err(ParseError::UnsupportedCommand),
         Some(TokenKind::Heredoc { .. }) => {
-            // Heredoc — deferred to a future task.
-            Err(ParseError::UnsupportedCommand)
+            // v250 T3: LITERAL heredoc (`expand: false` — quoted/escaped
+            // delimiter). Consume the opener; the body arrives as atoms after
+            // the line's newline and is attached in source order by the final
+            // `attach_heredoc_bodies` walk (`parse_sequence`). Build a
+            // provisional empty-body redirect now.
+            let (expand, strip_tabs) = match iter.next_kind()? {
+                Some(TokenKind::Heredoc { expand, strip_tabs, .. }) => (expand, strip_tabs),
+                _ => unreachable!("peek confirmed Heredoc"),
+            };
+            Ok(vec![Redirection {
+                fd: fd_prefix.unwrap_or(crate::command::RedirFd::Number(0)),
+                op: crate::command::RedirOp::Heredoc { body: Word(vec![]), expand, strip_tabs },
+            }])
         }
         Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
             let op = *op;
@@ -1545,13 +1659,11 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         return parse_subshell(iter);
     }
-    // Heredoc at command position — deferred (heredoc BODIES are future work).
-    // `<<<` (here-string) is NOT deferred: it flows to parse_simple as a leading
-    // redirect (an empty-words command reading stdin from the here-string),
-    // matching the oracle (which falls through to parse_pipeline → parse_simple_stage).
-    if matches!(iter.peek_kind()?, Some(TokenKind::Heredoc { .. })) {
-        return Err(ParseError::UnsupportedCommand);
-    }
+    // A leading heredoc (`<<EOF`/`<<'EOF'`/`<<-EOF`) at command position is NOT
+    // deferred (v250 T3): like `<<<` (v249), it flows to `parse_simple` as a
+    // leading redirect on an empty-words command reading stdin from the
+    // heredoc body, matching the oracle (which falls through to
+    // `parse_pipeline` → `parse_simple_stage`).
     // Reserved word (keyword): dispatch to compound parsers; unknown → defer.
     // Atom-aware: the leading command word is a SEQUENCE OF ATOMS
     // (`Lit("if")` + boundary), never a single `Word` token, so recognition
@@ -1747,12 +1859,9 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
                 // `Blank` between `&` and what follows — `cmd & &`, `p & q` — where
                 // the oracle's Word lexer had none). Skipping both lets the
                 // trailing-`&` / `& &` / `& cmd` decision below see the real token.
-                loop {
-                    match iter.peek_kind()? {
-                        Some(TokenKind::Blank) | Some(TokenKind::Newline) => { iter.next_kind()?; }
-                        _ => break,
-                    }
-                }
+                // `skip_newlines` (v250 T3) also drains any heredoc-body atom
+                // groups the lexer emitted after a `Newline` consumed here.
+                skip_newlines(iter)?;
                 // ── Stop check 2: stop_at keyword after `&` (~917) ────────
                 // Atom-aware: compute before the borrow-holding match below.
                 let stop_kw =
@@ -1827,6 +1936,110 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
     Ok(Sequence { first, rest, background })
 }
 
+/// v250 T3: fill every still-empty `RedirOp::Heredoc { body }` in `redirects`
+/// (in source order) from `bodies`. A body is "still empty" (`Word(vec![])`)
+/// exactly when `parse_one_redirect` built it as a provisional placeholder;
+/// an ALREADY-filled one (can't happen on the atom path today, but keeps this
+/// idempotent) is left alone.
+fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item = Word>) {
+    for r in redirects.iter_mut() {
+        if let RedirOp::Heredoc { body, .. } = &mut r.op {
+            if body.0.is_empty() {
+                if let Some(next) = bodies.next() {
+                    *body = next;
+                }
+            }
+        }
+    }
+}
+
+/// v250 T3: fill every still-empty heredoc body reachable from `cmd`, in a
+/// left-to-right pre-order that matches the lexer's emission order (each
+/// heredoc's body atoms are emitted right after the `Newline` ending the line
+/// its opener appeared on, and commands/redirects are parsed in that same
+/// source order). EXHAUSTIVE over every `Command` variant — no `_ =>`
+/// wildcard, so a future variant can't silently drop a body.
+fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
+    match cmd {
+        Command::Simple(SimpleCommand::Assign(_, _)) => {
+            // No redirects possible on a bare-assignment stage (parse_simple's
+            // `Assign` arm is only reached when `redirects.is_empty()`).
+        }
+        Command::Simple(SimpleCommand::Exec(exec)) => {
+            fill_redirects(&mut exec.redirects, bodies);
+        }
+        Command::Pipeline(pipeline) => {
+            for stage in pipeline.commands.iter_mut() {
+                fill_command(stage, bodies);
+            }
+        }
+        Command::If(clause) => {
+            fill_sequence(&mut clause.condition, bodies);
+            fill_sequence(&mut clause.then_body, bodies);
+            for elif in clause.elif_branches.iter_mut() {
+                fill_sequence(&mut elif.condition, bodies);
+                fill_sequence(&mut elif.body, bodies);
+            }
+            if let Some(else_body) = clause.else_body.as_mut() {
+                fill_sequence(else_body, bodies);
+            }
+        }
+        Command::While(clause) => {
+            fill_sequence(&mut clause.condition, bodies);
+            fill_sequence(&mut clause.body, bodies);
+        }
+        Command::For(clause) => {
+            fill_sequence(&mut clause.body, bodies);
+        }
+        Command::Case(clause) => {
+            for item in clause.items.iter_mut() {
+                if let Some(body) = item.body.as_mut() {
+                    fill_sequence(body, bodies);
+                }
+            }
+        }
+        Command::BraceGroup(seq) => fill_sequence(seq, bodies),
+        Command::Subshell { body } => fill_sequence(body, bodies),
+        Command::FunctionDef { body, .. } => fill_command(body, bodies),
+        // `[[ … ]]` carries no nested `Sequence`/redirect list of its own —
+        // any trailing redirects on it are on the enclosing `Redirected`
+        // wrapper, handled there. Not reachable from the atom parser today
+        // (still deferred), but exhaustiveness must not skip it.
+        Command::DoubleBracket { .. } => {}
+        // `((expr))` is a bare arithmetic `Word`, no redirect list of its own.
+        // Not reachable from the atom parser today (still deferred).
+        Command::Arith(_) => {}
+        // C-style `for ((init;cond;step))`: only `body` is a `Sequence`; the
+        // header sections are bare `Word`s, not redirect-bearing. Not
+        // reachable from the atom parser today (still deferred).
+        Command::ArithFor(clause) => {
+            fill_sequence(&mut clause.body, bodies);
+        }
+        Command::Select(clause) => {
+            fill_sequence(&mut clause.body, bodies);
+        }
+        Command::Redirected { inner, redirects } => {
+            // Source order: the wrapped command's own (possibly nested)
+            // heredocs appear before the compound's OWN trailing redirects
+            // (`{ …<<A…; } <<B` — A's body precedes B's in the source).
+            fill_command(inner, bodies);
+            fill_redirects(redirects, bodies);
+        }
+        // `coproc [NAME] command`: recurse into the wrapped command. Not
+        // reachable from the atom parser today (still deferred).
+        Command::Coproc { body, .. } => fill_command(body, bodies),
+    }
+}
+
+/// v250 T3: `fill_command` over every command in a `Sequence` (the first
+/// pipeline/command plus each connector-joined one), in source order.
+fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
+    fill_command(&mut seq.first, bodies);
+    for (_, cmd) in seq.rest.iter_mut() {
+        fill_command(cmd, bodies);
+    }
+}
+
 /// Entry point for the new flat command-list parser.  Mirrors `parse` /
 /// `parse_cursor` in `command.rs`.
 ///
@@ -1840,7 +2053,7 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
-    let seq = parse_and_or(iter, &[])?;
+    let mut seq = parse_and_or(iter, &[])?;
     // A leftover trailing `Blank` (atom path only — e.g. `"a; "`) is NOT content;
     // skip it so the stray-terminator check below matches the oracle.
     while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
@@ -1851,6 +2064,10 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     if iter.peek_kind()?.is_some() {
         return Err(ParseError::UnexpectedToken);
     }
+    // v250 T3: attach every heredoc body collected along the way (in source
+    // order == emission order) to its still-empty placeholder.
+    let mut bodies = iter.take_heredoc_bodies().into_iter();
+    fill_sequence(&mut seq, &mut bodies);
     Ok(Some(seq))
 }
 
@@ -1983,11 +2200,19 @@ fn for_variable_name(token: &TokenKind) -> Option<String> {
 /// and `done`.  Returns the parsed body `Sequence`.  Shared by `parse_for` and
 /// `parse_select`.  Mirrors `parse_do_body_done` (~1522) in `command.rs`.
 fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
-    while matches!(
-        iter.peek_kind()?,
-        Some(TokenKind::Op(Operator::Semi)) | Some(TokenKind::Newline)
-    ) {
-        iter.next_kind()?;
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::Op(Operator::Semi)) => { iter.next_kind()?; }
+            // v250 T3: a `Newline` consumed here may be immediately followed
+            // by a heredoc-body atom group the lexer emitted for the line —
+            // drain it before continuing, or the next `peek_kind` would see a
+            // stray `HeredocBodyBegin`.
+            Some(TokenKind::Newline) => {
+                iter.next_kind()?;
+                collect_heredoc_bodies_after_newline(iter)?;
+            }
+            _ => break,
+        }
     }
     expect_keyword(iter, Keyword::Do, ParseError::UnterminatedLoop)?;
     let body = parse_compound_section(iter, &[Keyword::Done], ParseError::UnterminatedLoop)?;
@@ -2003,9 +2228,8 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     // Skip inter-token blanks + newlines so `for ((...))` / `for\n((...))` are
     // recognized identically (the atom scanner emits a `Blank` after `for`).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Newline) | Some(TokenKind::Blank)) {
-        iter.next_kind()?;
-    }
+    // `skip_newlines` (v250 T3) also drains any heredoc-body atom groups.
+    skip_newlines(iter)?;
 
     // C-style ArithFor `for ((...))` is DEFERRED.  The Word-lexer emits a single
     // `ArithBlock` for a COMPLETE header (→ oracle `ArithFor`); the atom scanner
@@ -3082,12 +3306,41 @@ mod tests {
     }
 
     #[test]
-    fn atoms_here_string_heredoc_still_deferred() {
-        // Heredocs remain deferred on the atom path (v249 lifts ONLY `<<<`).
+    fn atoms_here_string_heredoc_expanding_still_deferred() {
+        // v250 T3 lifts only LITERAL heredocs (quoted/escaped delimiter,
+        // `expand: false`). An EXPANDING heredoc (bare/unquoted delimiter,
+        // `expand: true`) is Task 4's scope and stays deferred — see the gate
+        // in `parse_one_redirect`'s `Heredoc { expand: true, .. }` arm.
         assert!(matches!(new_seq("cat <<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
-            "trailing heredoc must stay deferred, got {:?}", new_seq("cat <<EOF\nx\nEOF"));
+            "trailing expanding heredoc must stay deferred, got {:?}", new_seq("cat <<EOF\nx\nEOF"));
         assert!(matches!(new_seq("<<EOF\nx\nEOF"), Err(ParseError::UnsupportedCommand)),
-            "leading heredoc must stay deferred, got {:?}", new_seq("<<EOF\nx\nEOF"));
+            "leading expanding heredoc must stay deferred, got {:?}", new_seq("<<EOF\nx\nEOF"));
+    }
+
+    // v250 T3 tests: literal heredocs (quoted/escaped delimiter) end-to-end
+
+    #[test]
+    fn atoms_heredoc_literal() {
+        diff_cmd("cat <<'EOF'\nhello $x\nEOF\n");
+        diff_cmd("cat <<'EOF'\nEOF\n");                 // empty body
+        diff_cmd("cat <<-'EOF'\n\ttabbed\n\tEOF\n");     // <<- strip
+        diff_cmd("cat <<\"EOF\"\nline1\nline2\nEOF\n");  // double-quoted delim = literal
+        diff_cmd("<<'EOF'\nx\nEOF\n");                    // leading heredoc (empty-words cmd)
+    }
+
+    #[test]
+    fn atoms_heredoc_literal_sequence_continuation() {
+        // A newline-consumption site that fails to drain the heredoc-body atom
+        // group after the delimiter line would make the parser choke on (or
+        // hang trying to parse) whatever follows — guard every shape that
+        // keeps parsing PAST a literal heredoc's body.
+        diff_cmd("cat <<'EOF'\nx\nEOF\necho done\n");         // ; -like newline connector
+        diff_cmd("cat <<'EOF'\nx\nEOF\necho a; echo b\n");    // more of the sequence after
+        diff_cmd("cat <<'EOF' && echo ok\nx\nEOF\n");         // && after a heredoc-bearing stage
+        diff_cmd("cat <<'EOF' | wc -l\nx\nEOF\n");            // heredoc stage in a pipeline
+        diff_cmd("cat <<'A' <<'B'\nfirst\nA\nsecond\nB\n");   // two heredocs, ordered bodies
+        diff_cmd("if cat <<'EOF'; then echo y; fi\nx\nEOF\n"); // heredoc in a compound's condition
+        diff_cmd("for i in 1; do cat <<'EOF'; done\nx\nEOF\n"); // heredoc inside a loop body
     }
 
     // v243 T2 tests
@@ -3248,8 +3501,10 @@ mod tests {
 
     #[test]
     fn cmd_heredoc_deferred() {
-        // Here-string (`<<<`) is NO LONGER deferred (v249 T1); heredoc (`<<`)
-        // still is — it needs a newline-delimited body, unlike `<<<`.
+        // Here-string (`<<<`) is NO LONGER deferred (v249 T1). A LITERAL
+        // heredoc (`<<'EOF'`/`<<"EOF"`) is also no longer deferred (v250 T3 —
+        // see `atoms_heredoc_literal`); an EXPANDING heredoc (bare/unquoted
+        // delimiter, as here) still is — Task 4's scope.
         diff_unsupported("cat <<EOF\nx\nEOF");
     }
 

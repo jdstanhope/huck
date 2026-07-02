@@ -763,6 +763,10 @@ pub enum ParseError {
     /// A command-level construct the parser-driven flat command parser does not
     /// model yet (subshell, arith command, compound command, heredoc, …). v242 boundary.
     UnsupportedCommand,
+    /// NEW (v250): the atom-command parser hit EOF while assembling a heredoc
+    /// body group (`HeredocBodyBegin`…`HeredocBodyEnd`) — mirrors the lexer's
+    /// `LexError::UnterminatedHeredoc` at the parser layer.
+    UnterminatedHeredoc,
 }
 
 impl std::fmt::Display for ParseError {
