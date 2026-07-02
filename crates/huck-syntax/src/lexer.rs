@@ -419,6 +419,8 @@ pub enum TokenKind {
     DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     ProcSubOpen { dir: ProcDir },  // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
+    ArrayOpen,   // v252: zero-width signal that a compound array RHS `(…)` follows an assignment prefix; cursor left on `(`. Parser pushes Mode::ArrayLiteral.
+    ArrayClose,  // v252: the `)` closing an array literal, emitted by Mode::ArrayLiteral.
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
@@ -632,7 +634,7 @@ pub(crate) enum Mode {
     // ever needs to distinguish a quoted-bit).
     Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral,   // a=( … )
+    ArrayLiteral { body_started: bool },   // a=( … ) — v252
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
     HeredocBody,    // <<EOF …
@@ -935,6 +937,7 @@ impl<'a> Lexer<'a> {
             Mode::Arith { paren_depth, in_dquote, body_started } =>
                 self.scan_step_arith(paren_depth, in_dquote, body_started),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
+            Mode::ArrayLiteral { body_started } => self.scan_step_array_literal(body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -3542,6 +3545,15 @@ impl<'a> Lexer<'a> {
                     TokenKind::Lit { text: name, quoted: false },
                     Span::new(off, l, c),
                 ));
+                // v252: compound array RHS `name=(...)`. A `\<NL>` may sit between
+                // the prefix and `(` (bash deletes it). Mirror the production `=`
+                // arm's inline `(` probe: emit a zero-width ArrayOpen so the parser
+                // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
+                skip_line_continuations(&mut self.cursor);
+                if self.cursor.peek() == Some(&'(') {
+                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                }
                 Ok(Some(Step::Produced))
             }
             // `name+=` — scalar/array append. `name+x` (no `=`) is NOT an
@@ -3563,6 +3575,15 @@ impl<'a> Lexer<'a> {
                     },
                     Span::new(off, l, c),
                 ));
+                // v252: compound array RHS `name+=(...)`. A `\<NL>` may sit between
+                // the prefix and `(` (bash deletes it). Mirror the production `=`
+                // arm's inline `(` probe: emit a zero-width ArrayOpen so the parser
+                // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
+                skip_line_continuations(&mut self.cursor);
+                if self.cursor.peek() == Some(&'(') {
+                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                }
                 Ok(Some(Step::Produced))
             }
             // `name[sub]=` / `name[sub]+=` — subscripted lvalue. Speculatively scan
@@ -3733,6 +3754,70 @@ impl<'a> Lexer<'a> {
                     TokenKind::Lit { text, quoted: true },
                     Span::new(off, l, c),
                 ));
+                Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v252 T1: `Mode::ArrayLiteral { body_started }` scanner — emits the inner
+    /// atoms of a `name=(...)`/`name+=(...)` compound array RHS. On entry
+    /// (`body_started == false`) the cursor sits on the opening `(` (the parser
+    /// consumed the zero-width `ArrayOpen` signal but not the `(` itself);
+    /// consume it, flip the frame, and scan the first inner atom in the same
+    /// call. T1 scope: POSITIONAL values only — a bare literal run that stops at
+    /// whitespace/`)` (so `|;&<>` stay literal); quote/`$`/backtick openers and
+    /// bracketed subscripts are NOT wired here (Task 2/3 widen this). Mirrors
+    /// `scan_array_literal`/`scan_array_element_word`'s separator/value grammar.
+    fn scan_step_array_literal(&mut self, body_started: bool) -> Result<Step, LexError> {
+        if !body_started {
+            debug_assert_eq!(self.cursor.peek(), Some(&'('), "array-literal entry: expected '('");
+            self.cursor.next(); // consume opening '('
+            if let Some(Mode::ArrayLiteral { body_started }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            // fall through to scan the first atom
+        }
+        let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+        match self.cursor.peek().copied() {
+            None => Err(LexError::UnterminatedArrayLiteral),
+            Some(')') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::ArrayClose, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Inter-element separators: whitespace / newline / `\<NL>` / `#`-comment.
+            // Coalesce a maximal run into ONE Blank atom (a comment consumes to EOL,
+            // its body — incl. any `)` — never read as elements; matches
+            // skip_array_literal_separators). Never emit content for a separator.
+            Some(ch) if ch.is_whitespace() || ch == '#'
+                || (ch == '\\' && { let mut p = self.cursor.clone(); p.next(); p.peek() == Some(&'\n') }) => {
+                loop {
+                    match self.cursor.peek().copied() {
+                        Some(w) if w.is_whitespace() => { self.cursor.next(); }
+                        Some('#') => { while let Some(&x) = self.cursor.peek() { if x == '\n' { break; } self.cursor.next(); } }
+                        Some('\\') => {
+                            let mut p = self.cursor.clone(); p.next();
+                            if p.peek() == Some(&'\n') { self.cursor.next(); self.cursor.next(); } else { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Value content — a literal run stopping ONLY at whitespace / `)` (so
+            // `|;&<>` stay literal). Quotes/`$`/backtick delegate to the shared
+            // openers (Task 2 widens this); for Task 1, emit a plain literal run and
+            // let Task 2 add the expansion arms.
+            _ => {
+                let mut text = String::new();
+                while let Some(&ch) = self.cursor.peek() {
+                    if ch.is_whitespace() || ch == ')' { break; }
+                    // Task 2 will break here on quote/`$`/backtick to emit openers.
+                    text.push(ch);
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
         }
@@ -4326,7 +4411,7 @@ fn emit_word_with_braces(
 /// parts (expansions, quoted runs) are sentinel-protected so only literal
 /// source braces expand. Shared by `emit_word_with_braces` (command words)
 /// and `scan_array_literal` (bare array elements).
-fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
+pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
     if !word_contains_unquoted_brace(&parts) {
         return Ok(vec![parts]);
     }
