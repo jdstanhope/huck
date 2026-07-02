@@ -1026,10 +1026,15 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     }
 }
 
-/// Skip over any `Newline` tokens without consuming anything else.
-/// Mirrors `skip_newlines` in `command.rs`.
+/// Skip over any `Newline` or `Blank` tokens without consuming anything else.
+/// Mirrors `skip_newlines` in `command.rs`. The oracle's Word lexer never emits
+/// `Blank`, so also skipping `Blank` here only affects the atom path — where a
+/// `Blank` is exactly the inter-word/boundary whitespace the oracle folds away.
+/// This makes every command-boundary caller (`&&`/`||`/`;`/newline connectors,
+/// pipe stages, `parse_command` entry, and all compound-body boundaries) skip
+/// the atom-path `Blank`s the oracle never sees.
 fn skip_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
-    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Newline | TokenKind::Blank)) {
         iter.next_kind()?;
     }
     Ok(())
@@ -1155,6 +1160,18 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
             iter.next_kind()?; // consume the redirect operator
             // HereString (`<<<`) — deferred.
             if matches!(op, Operator::HereString) {
+                return Err(ParseError::UnsupportedCommand);
+            }
+            // Process substitution `<(…)` / `>(…)` is a distinct construct
+            // DEFERRED in v247. The atom scanner emits `RedirIn`/`RedirOut`
+            // immediately followed by `LParen` with NO intervening `Blank` when
+            // the operator and `(` are GLUED (`<(`); return a clean
+            // `UnsupportedCommand` so T7 can assert the deferral. A SPACED
+            // `< (` keeps a `Blank` between them and falls through to the
+            // ordinary redirect-target-is-operator error, matching the oracle.
+            if matches!(op, Operator::RedirIn | Operator::RedirOut)
+                && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
+            {
                 return Err(ParseError::UnsupportedCommand);
             }
             // The redirect target may be separated from the operator by an
@@ -1502,6 +1519,13 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
     let mut background = false;
 
     loop {
+        // Inter-token `Blank` (atom path) sitting between a command and its
+        // connector/terminator is not content — skip it so the stop checks and
+        // connector dispatch below see the real token (the oracle's Word lexer
+        // never emits a `Blank` here).
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+            iter.next_kind()?;
+        }
         // ── Stop check 1: before consuming any connector (mirrors ~890) ──────
         match iter.peek_kind()? {
             // EOF — end of list.
@@ -1616,14 +1640,20 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
 pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
-    // Skip leading newlines (mirrors `parse_cursor` → `skip_newlines`).
-    while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
-        iter.next_kind()?;
-    }
+    // Skip leading newlines AND inter-token blanks (mirrors `parse_cursor` →
+    // `skip_newlines`). The atom scanner emits a `Blank` where the oracle folds
+    // whitespace, so a blank-only / blank+comment line must reduce to `Ok(None)`
+    // exactly as the oracle does (which never sees a `Blank`).
+    skip_newlines(iter)?;
     if iter.peek_kind()?.is_none() {
         return Ok(None);
     }
     let seq = parse_and_or(iter, &[])?;
+    // A leftover trailing `Blank` (atom path only — e.g. `"a; "`) is NOT content;
+    // skip it so the stray-terminator check below matches the oracle.
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     // Mirror `parse_cursor`: a stray terminator (`;;`/`;&`/`;;&`) left after
     // the top-level sequence → `UnexpectedToken`.
     if iter.peek_kind()?.is_some() {
@@ -2454,6 +2484,24 @@ mod tests {
             "echo a# still one word", "a#b>c",                 // mid-word # then redirect
             "echo\ta\tb", "a\r b",                             // tab / CR whitespace
         ] { diff_cmd(s); }
+    }
+
+    #[test]
+    fn atoms_blank_boundaries() {
+        // C1: bang after connectors
+        for s in ["foo && ! bar", "a && ! b", "a || ! b", "a; ! b", "foo &&   ! bar", "! a", "!a", "a && b"] { diff_cmd(s); }
+        // C2: leading/trailing/only blanks + blank/comment lines at boundaries
+        for s in ["   ", "\t", " ", "  \n  ", "   # indented", " #c", "a; ", "echo hi;  ", "a; #c", "", "\n", "  \n\n  "] {
+            assert_eq!(new_seq(s).map_err(|e| format!("{e:?}")), old_seq(s).map_err(|e| format!("{e:?}")), "boundary case {s:?}");
+        }
+    }
+    #[test]
+    fn atoms_procsub_deferred() {
+        // process substitution is deferred: atom path returns UnsupportedCommand (clean)
+        for s in ["cat <(echo hi)", "tee >(cat)", "echo <(a) >(b)"] {
+            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
+        }
     }
 
     #[test]
