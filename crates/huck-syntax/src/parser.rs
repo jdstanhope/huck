@@ -2987,6 +2987,33 @@ mod tests {
         diff_cmd("func --opt");                    // prefix of `function` = plain command (mark/rewind restores)
     }
 
+    #[test]
+    fn atoms_function_defs_errors() {
+        for s in [
+            "f() echo",          // non-compound body → FunctionBody
+            "function",          // no name → FunctionName
+            "function 1 { :; }", // invalid name → FunctionName
+            "f(",                // unterminated
+            "f()",               // `()` then EOF → UnterminatedFunction/FunctionBody
+            "f ( a )",           // `(` not followed by `)` → FunctionBody (NOT a command)
+        ] {
+            assert_eq!(
+                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
+                "funcdef error parity for {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn atoms_function_defs_deferred() {
+        // Body is itself deferred → whole funcdef defers (lifts when [[ ]]/arith land).
+        for s in ["f() [[ x ]]", "f() (( 1 ))", "f() for ((i=0;i<2;i++)); do :; done"] {
+            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
+                "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
+        }
+    }
+
     // v243 T2 tests
 
     #[test]
