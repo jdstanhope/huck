@@ -9,8 +9,8 @@ use crate::command::{
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
 };
 use crate::lexer::{
-    CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, SubstAnchor, SubstKind,
-    SubscriptKind, TokenKind, TransformOp, Word, WordPart,
+    CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, ProcDir, SubstAnchor,
+    SubstKind, SubscriptKind, TokenKind, TransformOp, Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -162,6 +162,22 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 iter.next_kind()?;
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_command_sub(iter, quoted)?);
+            }
+            // `<`/`>` are POSIX operator characters — unlike `$(`/`` ` ``, a
+            // `<(`/`>(` process substitution ALWAYS ends any word already in
+            // progress (oracle: `x<(y)` is TWO words, program "x" + arg
+            // "<(y)", not one glued word). Only dispatch here when this atom
+            // is a fresh word start (nothing accumulated yet); otherwise
+            // break WITHOUT consuming so the caller's word-start dispatch
+            // re-enters for a standalone procsub word. A procsub CAN still
+            // have trailing content glued after its close (`<(y)z`), since
+            // once inside this word there is no more `<`/`>` in the way —
+            // that's why the loop continues rather than breaking below.
+            Some(TokenKind::ProcSubOpen { .. }) if !(parts.is_empty() && acc.is_none()) => break,
+            Some(TokenKind::ProcSubOpen { dir }) => {
+                let dir = dir.clone();
+                iter.next_kind()?;            // discard the signal (cursor stays on `(`)
+                parts.push(parse_process_sub(iter, dir)?);
             }
             Some(TokenKind::BeginBacktick) => {
                 iter.next_kind()?;
@@ -816,6 +832,41 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
     // 3. Pop the CommandSub frame.
     iter.pop_mode();
     Ok(WordPart::CommandSub { sequence, quoted })
+}
+
+/// v251: assemble a `WordPart::ProcessSub` for a `<(…)`/`>(…)` process
+/// substitution. Mirrors `parse_command_sub`: the body is a paren-delimited
+/// command sequence lexed under `Mode::CommandSub` (the lexer's bare-`(` opener
+/// path; the word-mode `ProcSubOpen` signal was already consumed by the caller).
+/// `dir` comes from that signal.
+pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::CommandSub { body_started: false });
+    match iter.next_kind()? {
+        Some(TokenKind::CmdSubOpen) => {} // the real opener, scanned under CommandSub mode
+        _ => { iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
+    }
+    let sequence = if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::RParen))) {
+        iter.next_kind()?; // consume `)`
+        Sequence {
+            first: Command::Pipeline(Pipeline { negate: false, commands: Vec::new() }),
+            rest: Vec::new(),
+            background: false,
+        }
+    } else {
+        match parse_subshell_sequence(iter) {
+            Ok(mut seq) => { zero_lines_in_sequence(&mut seq); seq }
+            Err(e) => {
+                iter.pop_mode();
+                let mapped = match e {
+                    ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
+                    other => other,
+                };
+                return Err(mapped);
+            }
+        }
+    };
+    iter.pop_mode();
+    Ok(WordPart::ProcessSub { sequence, dir })
 }
 
 /// Parse the body of a backtick substitution: a `Sequence` of commands
@@ -1626,6 +1677,7 @@ fn parse_simple_with_leading_word(
                     | TokenKind::DollarName { .. }
                     | TokenKind::ParamOpen { .. }
                     | TokenKind::CmdSubOpen
+                    | TokenKind::ProcSubOpen { .. }
                     | TokenKind::BeginBacktick
                     | TokenKind::ArithOpen
                     | TokenKind::Tilde(_)
@@ -3151,11 +3203,21 @@ mod tests {
         }
     }
     #[test]
-    fn atoms_procsub_deferred() {
-        // process substitution is deferred: atom path returns UnsupportedCommand (clean)
+    fn atoms_procsub_core() {
+        diff_cmd("cat <(echo hi)");
+        diff_cmd("tee >(cat)");
+        diff_cmd("echo <(a) >(b)");        // multiple, both dirs
+        diff_cmd("diff <(sort x) <(sort y)");
+        diff_cmd("x<(y)");                  // glued to leading literal
+        diff_cmd("wc < <(sort f)");         // procsub as a redirect TARGET
+        diff_cmd("sort > >(uniq)");
+    }
+
+    #[test]
+    fn atoms_procsub_supported() {
+        // process substitution now parses on the atom path, byte-identical to the oracle.
         for s in ["cat <(echo hi)", "tee >(cat)", "echo <(a) >(b)"] {
-            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
+            diff_cmd(s);
         }
     }
 
