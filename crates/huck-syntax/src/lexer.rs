@@ -436,6 +436,10 @@ pub enum TokenKind {
     /// `Literal`). Kept separate from `Lit` (which is for UNQUOTED literal runs,
     /// glued Word assembly) so the oracle's `QuoteStyle` survives atom-ization.
     QuoteRun { style: QuoteStyle, text: String },
+    /// v247: a literal `$` that is not an expansion opener; a standalone Literal
+    /// that must NOT coalesce with neighbors — mirrors the oracle flushing its
+    /// buffer and pushing `$` alone.
+    DollarLit { quoted: bool },
     // --- Phase C v247 T3: command-position expansions + parser-driven double quotes. ---
     /// v247 T3: a command-position tilde construct (`~`, `~user`, `~+`, `~-`,
     /// `~/…`). Emitted by `scan_command_word_atom` ONLY at word start (mirrors
@@ -2790,7 +2794,7 @@ impl<'a> Lexer<'a> {
                     _ => {
                         self.cursor.next(); // lone `$`
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: "$".into(), quoted: false },
+                            TokenKind::DollarLit { quoted: false },
                             Span::new(off, l, c),
                         ));
                     }
@@ -2959,7 +2963,7 @@ impl<'a> Lexer<'a> {
                     _ => {
                         self.cursor.next(); // lone `$`
                         self.history.push(Token::new(
-                            TokenKind::Lit { text: "$".into(), quoted: true },
+                            TokenKind::DollarLit { quoted: true },
                             Span::new(off, l, c),
                         ));
                     }

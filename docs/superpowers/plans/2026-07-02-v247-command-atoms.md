@@ -266,7 +266,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `lexer.rs` (`scan_command_word_atom`: emit expansion-opener atoms), `parser.rs` (`parse_word_command`: recurse into sub-parsers).
 
-**Interfaces:** Consumes T2's `parse_word_command` + `scan_command_word_atom`. Produces command-position `$x`/`${…}`/`$(…)`/`` `…` ``/`$((…))`/`~` assembly.
+**Interfaces:** Consumes T2's `parse_word_command` + `scan_command_word_atom` + the `TokenKind::QuoteRun { style, text }` atom. Produces command-position `$x`/`${…}`/`$(…)`/`` `…` ``/`$((…))`/`~` assembly AND expansions **inside** double quotes.
+
+**IMPORTANT — T2's double-quote handling is a placeholder you must replace.** T2 emits the whole `"…"` body as a single-shot `QuoteRun { style: Double, text: String }` (a flat string, correct only for pure-literal bodies). That cannot represent `"$x"` / `"${b}"` / `"$(c)"` (the oracle produces `WordPart::Quoted { style: Double, parts: [Var(x), …] }` with NESTED parts), and single-shot scanning of a `"…"` containing a command-sub/backtick/arith would forward-scan a matching delimiter — the core rule forbids that. So in T3 convert the double-quote arm to a **parser-driven mode**: the scanner, on `"`, emits an open signal and thereafter emits INNER atoms (literal chunks + the same expansion-opener atoms as at top level) until the closing `"`, at which point it emits a close signal; `parse_word_command` (or a `parse_dquote` helper) collects those inner parts and wraps them in `WordPart::Quoted { style: Double, parts }`. This is atom-native (the parser owns recursion into nested `$(…)`/`` `…` ``/`$((…))` inside the quotes). Match the oracle's exact `Quoted{Double, parts}` shape via `diff_cmd` (use `scan_step_command`/the operand scanner as references, but the oracle is the source of truth — dump `old_seq` for `"$a ${b}"` to see the target). T2's `QuoteRun{Single}`/`{Backslash}`/`{AnsiC}` stay single-shot (no expansions possible there) — do NOT change them.
 
 - [ ] **Step 1: Failing tests.**
 

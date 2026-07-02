@@ -117,6 +117,11 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
 /// `QuoteRun` doc comment in lexer.rs for why a flat `Literal` can't do this).
 fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError> {
     let mut parts = Vec::new();
+    // Pending coalescible literal chunk (adjacent `Lit` atoms with the SAME
+    // `quoted` flag merge into one, mirroring the oracle's single literal
+    // buffer). A `DollarLit` is a BARRIER: it flushes this and pushes `$`
+    // standalone, matching the oracle flushing its buffer and starting fresh.
+    let mut acc: Option<(String, bool)> = None;
     loop {
         match iter.peek_kind()? {
             None
@@ -125,11 +130,18 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             | Some(TokenKind::Op(_)) => break,
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
-                    parts.push(WordPart::Literal { text, quoted: q || quoted });
+                    push_lit(&mut acc, &mut parts, text, q || quoted);
+                }
+            }
+            Some(TokenKind::DollarLit { .. }) => {
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(WordPart::Literal { text: "$".into(), quoted: q || quoted });
                 }
             }
             Some(TokenKind::QuoteRun { .. }) => {
                 if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(WordPart::Quoted {
                         style,
                         parts: vec![WordPart::Literal { text, quoted: true }],
@@ -140,6 +152,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             // `parse_param_expansion` owns its push/pop and consumes the buffered
             // `ParamOpen`, so it is dispatched on a PEEK (not consumed here first).
             Some(TokenKind::ParamOpen { .. }) => {
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_param_expansion(iter, quoted)?);
             }
             // The zero-width `CmdSubOpen`/`BeginBacktick`/`ArithOpen` signals must
@@ -147,19 +160,23 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             // own pushed mode re-scans the real opener (mirrors `parse_word`).
             Some(TokenKind::CmdSubOpen) => {
                 iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_command_sub(iter, quoted)?);
             }
             Some(TokenKind::BeginBacktick) => {
                 iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_backtick_sub(iter, quoted)?);
             }
             Some(TokenKind::ArithOpen) => {
                 iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_arith_expansion(iter, quoted)?);
             }
             Some(TokenKind::DollarName { .. }) => {
                 if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
                     let eff = q || quoted;
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(match name.as_str() {
                         "@" => WordPart::AllArgs { quoted: eff, joined: false },
                         "*" => WordPart::AllArgs { quoted: eff, joined: true },
@@ -170,6 +187,7 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             }
             Some(TokenKind::Tilde(_)) => {
                 if let Some(TokenKind::Tilde(spec)) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(WordPart::Tilde(spec));
                 }
             }
@@ -178,33 +196,41 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             // the inner parts, and pops.
             Some(TokenKind::BeginDquote) => {
                 iter.next_kind()?; // discard the zero-width open signal
+                flush_lit(&mut acc, &mut parts);
                 parts.push(parse_dquote(iter, quoted)?);
             }
             _ => break,
         }
     }
-    Ok(Word(coalesce_literals(parts)))
+    flush_lit(&mut acc, &mut parts);
+    Ok(Word(parts))
 }
 
-/// Coalesce adjacent `Literal` parts with the SAME `quoted` flag into one,
-/// matching the oracle's single-buffer literal accumulation (`flush_literal`).
-/// Needed e.g. for a trailing unescaped `\` at EOF (its own `Lit` atom, folded
-/// into the surrounding literal by the oracle) and for a `"…"` body of mixed
-/// backslash-escapes + plain text (the oracle accumulates one `qbuf`).
-fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
-    let mut coalesced: Vec<WordPart> = Vec::with_capacity(parts.len());
-    for part in parts {
-        if let WordPart::Literal { text, quoted } = &part {
-            if let Some(WordPart::Literal { text: pt, quoted: pq }) = coalesced.last_mut() {
-                if *pq == *quoted {
-                    pt.push_str(text);
-                    continue;
-                }
-            }
+/// Append a `Lit` atom into the pending coalescible chunk `acc`, matching the
+/// oracle's single-buffer literal accumulation (`flush_literal`): adjacent
+/// literals with the SAME `quoted` flag merge into one. Needed e.g. for a
+/// trailing unescaped `\` at EOF (its own `Lit` atom, folded into the
+/// surrounding literal by the oracle), a failed-tilde `~` continuing its run,
+/// and a `"…"` body of mixed backslash-escapes + plain text (one `qbuf`).
+fn push_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>, text: String, quoted: bool) {
+    match acc {
+        Some((buf, aq)) if *aq == quoted => buf.push_str(&text),
+        _ => {
+            flush_lit(acc, out);
+            *acc = Some((text, quoted));
         }
-        coalesced.push(part);
     }
-    coalesced
+}
+
+/// Flush the pending coalescible literal chunk into `out`, then clear it.
+/// Pushes a single `WordPart::Literal` only if the chunk is non-empty — the
+/// oracle never emits an empty `Literal`, so an empty chunk is dropped.
+fn flush_lit(acc: &mut Option<(String, bool)>, out: &mut Vec<WordPart>) {
+    if let Some((text, quoted)) = acc.take() {
+        if !text.is_empty() {
+            out.push(WordPart::Literal { text, quoted });
+        }
+    }
 }
 
 /// v247 T3: assemble a `WordPart::Quoted { style: Double, parts }` for a `"…"`
@@ -219,6 +245,9 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
     iter.push_mode(Mode::DoubleQuote { body_started: false });
     let result = (|| -> Result<Vec<WordPart>, ParseError> {
         let mut parts: Vec<WordPart> = Vec::new();
+        // Pending coalescible literal chunk (see `push_lit`/`flush_lit`); a
+        // `DollarLit` is a barrier that flushes it and pushes `$` standalone.
+        let mut acc: Option<(String, bool)> = None;
         loop {
             match iter.peek_kind()? {
                 // Closing `"` — consume and finish.
@@ -227,22 +256,27 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
                 // whose fat dquote scanner errors on EOF).
                 None => return Err(ParseError::UnterminatedSubshell),
                 Some(TokenKind::ParamOpen { .. }) => {
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(parse_param_expansion(iter, true)?);
                 }
                 Some(TokenKind::CmdSubOpen) => {
                     iter.next_kind()?;
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(parse_command_sub(iter, true)?);
                 }
                 Some(TokenKind::BeginBacktick) => {
                     iter.next_kind()?;
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(parse_backtick_sub(iter, true)?);
                 }
                 Some(TokenKind::ArithOpen) => {
                     iter.next_kind()?;
+                    flush_lit(&mut acc, &mut parts);
                     parts.push(parse_arith_expansion(iter, true)?);
                 }
                 Some(TokenKind::DollarName { .. }) => {
                     if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
+                        flush_lit(&mut acc, &mut parts);
                         parts.push(match name.as_str() {
                             "@" => WordPart::AllArgs { quoted: true, joined: false },
                             "*" => WordPart::AllArgs { quoted: true, joined: true },
@@ -251,18 +285,25 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
                         });
                     }
                 }
+                Some(TokenKind::DollarLit { .. }) => {
+                    if let Some(TokenKind::DollarLit { quoted: _ }) = iter.next_kind()? {
+                        flush_lit(&mut acc, &mut parts);
+                        parts.push(WordPart::Literal { text: "$".into(), quoted: true });
+                    }
+                }
                 Some(TokenKind::Lit { .. }) => {
                     if let Some(TokenKind::Lit { text, quoted: _ }) = iter.next_kind()? {
-                        parts.push(WordPart::Literal { text, quoted: true });
+                        push_lit(&mut acc, &mut parts, text, true);
                     }
                 }
                 _ => return Err(ParseError::UnsupportedExpansion),
             }
         }
+        flush_lit(&mut acc, &mut parts);
         Ok(parts)
     })();
     iter.pop_mode();
-    let mut parts = coalesce_literals(result?);
+    let mut parts = result?;
     if parts.is_empty() {
         // Empty `""` — preserve the empty-token contract (matches the oracle).
         parts.push(WordPart::Literal { text: String::new(), quoted: true });
@@ -1210,6 +1251,7 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
             iter.peek_kind()?,
             Some(
                 TokenKind::Lit { .. }
+                    | TokenKind::DollarLit { .. }
                     | TokenKind::QuoteRun { .. }
                     | TokenKind::DollarName { .. }
                     | TokenKind::ParamOpen { .. }
@@ -2284,6 +2326,26 @@ mod tests {
         diff_cmd("echo $x$y \"$a ${b}\" pre$(c)post");
         diff_cmd("echo ~ ~root ~/x");
         diff_cmd("echo $? $@ $1");
+    }
+
+    #[test]
+    fn atoms_lone_dollar() {
+        // lone `$` is a standalone Literal, never merged (top level)
+        diff_cmd("echo a$");
+        diff_cmd("echo a$.");
+        diff_cmd("echo a$ b");
+        diff_cmd("echo $");
+        diff_cmd("echo $x$");
+        // lone `$` inside double quotes
+        diff_cmd("echo \"$ x\"");
+        diff_cmd("echo \"foo $ bar\"");
+        diff_cmd("echo \"$.\"");
+        diff_cmd("echo \"a$\"");
+        diff_cmd("echo \"$'x'\"");
+        // merges that MUST still work (regression guard for the accumulator)
+        diff_cmd("echo a\\");        // trailing backslash folds into preceding literal
+        diff_cmd("echo ab\\");
+        diff_cmd("echo a b\\");
     }
 
     #[test]
