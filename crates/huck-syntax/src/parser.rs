@@ -3476,6 +3476,66 @@ mod tests {
             "oracle lexer is expected to diverge (line-bounded heredoc scan errors on the split $())");
     }
 
+    #[test]
+    fn atoms_heredoc_in_cmdsub_body_drop_divergence() {
+        // v250 KNOWN DEFERRED divergence (NOT intentional-correct like
+        // `atoms_heredoc_multiline_cmdsub_divergence` above — this one is a real gap,
+        // tracked as a `[deferred]` entry in docs/bash-divergences.md): a heredoc
+        // opened INSIDE a command substitution has its body DROPPED on the atom
+        // path. Root cause: `fill_command`/`fill_sequence` in this file only walk
+        // the top-level command tree to attach collected heredoc bodies to their
+        // `Heredoc` redirection atoms — they don't descend into the nested
+        // `Sequence` carried by `WordPart::CommandSub` (backticks lower to the
+        // same variant) or `WordPart::Arith` word parts, so a heredoc whose
+        // `<<X` appears inside a `$(…)` or `` `…` `` never gets its body
+        // attached and is left as `Word([])`. The
+        // oracle (command.rs) is correct here. This is OUT of v250's declared scope
+        // (§4 covers cmdsub-INSIDE-a-heredoc-body, the reverse nesting, which
+        // works) and is dormant (`command_atoms` stays false).
+        //
+        // This test PINS the current (wrong) atom-path behavior. It must be
+        // updated (and likely replaced with a `diff_cmd`) when the gap is fixed.
+        fn inner_heredoc_body(seq: &Sequence) -> &Word {
+            // Unwrap: Sequence -> Pipeline -> Simple(Exec) "echo" -> args[0] Word
+            // -> CommandSub part (backticks lower to the same WordPart::CommandSub)
+            // -> inner Sequence -> Pipeline -> Simple(Exec) "cat" -> redirects[0]
+            // -> Heredoc.body
+            let Command::Pipeline(p) = &seq.first else { panic!("expected pipeline") };
+            let Command::Simple(SimpleCommand::Exec(outer)) = &p.commands[0] else {
+                panic!("expected exec")
+            };
+            let arg = &outer.args[0];
+            let WordPart::CommandSub { sequence: inner_seq, .. } = &arg.0[0] else {
+                panic!("expected CommandSub part, got {:?}", arg.0[0])
+            };
+            let Command::Pipeline(ip) = &inner_seq.first else { panic!("expected inner pipeline") };
+            let Command::Simple(SimpleCommand::Exec(inner)) = &ip.commands[0] else {
+                panic!("expected inner exec")
+            };
+            let RedirOp::Heredoc { body, .. } = &inner.redirects[0].op else {
+                panic!("expected heredoc redirect")
+            };
+            body
+        }
+
+        for s in [
+            "echo $(cat <<X\nhi\nX\n)\n",   // $(...) command substitution
+            "echo `cat <<X\nhi\nX\n`\n",    // backtick command substitution
+        ] {
+            let new = new_seq(s).unwrap().expect("new_seq parses");
+            let old = old_seq(s).unwrap().expect("old_seq parses");
+            // The two ASTs differ overall (this is the divergence) ...
+            assert_ne!(new, old, "expected atom path to diverge from oracle for {s:?}");
+            // ... specifically at the inner heredoc body: atom path drops it, the
+            // oracle keeps it. If this ever becomes equal, the gap has been fixed —
+            // update/replace this test (e.g. with diff_cmd).
+            assert_eq!(inner_heredoc_body(&new), &Word(vec![]),
+                "atom path expected to have DROPPED the inner heredoc body for {s:?}: {new:#?}");
+            assert_ne!(inner_heredoc_body(&old), &Word(vec![]),
+                "oracle expected to have a NON-EMPTY inner heredoc body for {s:?}: {old:#?}");
+        }
+    }
+
     // v250 T3 tests: literal heredocs (quoted/escaped delimiter) end-to-end
 
     #[test]
