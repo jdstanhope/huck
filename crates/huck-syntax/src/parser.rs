@@ -3545,16 +3545,35 @@ mod tests {
 
     #[test]
     fn atoms_heredoc_marks_dont_span_bodies() {
-        // Leading word triggers funcdef mark/rewind (`peek_leading_keyword`/
-        // funcdef-shape detection marks before the leading word, rewinds once it
-        // sees this isn't a funcdef); that mark/rewind is fully resolved BEFORE
-        // the line's newline, so it never spans the heredoc body-emission state
-        // change (bumped at the newline trigger / body-end). If a future change
-        // widened the speculative window across the newline, `Lexer::rewind`'s
-        // `debug_assert_eq!(self.heredoc_gen, m.heredoc_gen, ...)` would panic
-        // under a debug test build — these cases exercise exactly that path.
-        diff_cmd("cat <<EOF\nx\nEOF\n");         // `cat` starts funcdef detection, rewinds pre-newline
-        diff_cmd("f() { cat <<EOF\nx\nEOF\n}\n"); // funcdef whose body has a heredoc
+        // NOTE (fix pass, corrects a prior comment error): funcdef detection on
+        // the atom path does NOT use `mark`/`rewind` — it seeds the already-
+        // consumed leading word instead (v248's seed-not-rewind approach), so it
+        // never calls `Lexer::rewind` at all. The ONLY live `mark`/`rewind` pair
+        // reachable on the atom command path is the arith `$((`-bail wrinkle in
+        // `parse_arith_expansion` (see `arith_wrinkle_falls_back_to_cmdsub`): a
+        // depth-0 `)` not followed by `)` bails the arith scan, and the parser
+        // rewinds to the `$((` start to re-drive it as `$(` + a subshell `(`.
+        //
+        // These two plain cases (no `$((` anywhere) never call `rewind` at all,
+        // so `heredoc_gen`'s `debug_assert_eq!` is not exercised by them — they
+        // only prove the heredoc plumbing itself is fine.
+        diff_cmd("cat <<EOF\nx\nEOF\n");
+        diff_cmd("f() { cat <<EOF\nx\nEOF\n}\n");
+
+        // This case DOES drive `rewind` while a heredoc body is actively being
+        // emitted (`emitting_heredoc.is_some()`): the expanding body line
+        // `$((cat) )` opens an arith expansion whose body bails (mirrors
+        // `arith_wrinkle_falls_back_to_cmdsub`'s `"$((cat) )"`), so
+        // `parse_arith_expansion` rewinds back to the `$((` start and re-drives
+        // it as a command substitution containing a subshell — all while the
+        // heredoc body atom stream is mid-emission. If a future change widened
+        // the mark/rewind window to cross a heredoc-state mutation (the `began`
+        // flip, an `at_line_start` toggle, the newline trigger, or body-end),
+        // `Lexer::rewind`'s `debug_assert_eq!(self.heredoc_gen, m.heredoc_gen,
+        // ...)` would panic under a debug test build. Verified (fix pass) via a
+        // temporary `eprintln!` in `rewind` that this input actually reaches
+        // `rewind` with `emitting_heredoc` still `Some`.
+        diff_cmd("cat <<EOF\n$((cat) )\nEOF\n");
     }
 
     #[test]

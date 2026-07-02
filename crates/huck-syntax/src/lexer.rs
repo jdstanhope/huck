@@ -754,13 +754,20 @@ pub struct Lexer<'a> {
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
     assign_val_tilde_ok: bool,
-    /// v250 T6: monotonic counter bumped on every atom-path heredoc-state
-    /// change (`atom_pending_heredocs` push at the atom `<<` opener site,
-    /// `emitting_heredoc` set at the newline trigger, and each
-    /// pop_front/re-arm in `emit_heredoc_body_end`). Captured in `Mark` and
-    /// checked in `rewind` (`debug_assert_eq!`) so a mark/rewind that spans
-    /// heredoc-body emission is caught loudly (debug builds) instead of
-    /// silently desyncing `atom_pending_heredocs`/`emitting_heredoc`.
+    /// v250 T6 (+ fix pass): monotonic counter bumped on EVERY mutation of
+    /// `atom_pending_heredocs`/`emitting_heredoc`: the push at the atom `<<`
+    /// opener site, `emitting_heredoc` set at the newline trigger, the
+    /// `HeredocEmit.began` false→true flip (first body atom of an entry), each
+    /// `at_line_start` set/clear in `scan_step_heredoc_body_expanding`, and the
+    /// pop_front/re-arm in `emit_heredoc_body_end`. Captured in `Mark` and
+    /// checked in `rewind` (`debug_assert_eq!`) so a mark/rewind that spans ANY
+    /// heredoc-state change is caught loudly (debug builds) instead of
+    /// silently desyncing `atom_pending_heredocs`/`emitting_heredoc` (`rewind`
+    /// does not restore either field). The only live mark/rewind pair reachable
+    /// on the atom command path is the arith `$((`-bail rewind in
+    /// `parse_arith_expansion` — funcdef detection uses seed-not-rewind (v248),
+    /// not mark/rewind. See `atoms_heredoc_marks_dont_span_bodies` for a case
+    /// that drives that rewind while a heredoc body is actively emitting.
     heredoc_gen: u64,
 }
 
@@ -2821,6 +2828,7 @@ impl<'a> Lexer<'a> {
         // parser picks the literal vs expanding assembly).
         if !state.began {
             state.began = true;
+            self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.began flip is a state change
             let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
             self.history.push(Token::new(TokenKind::HeredocBodyBegin { expand: ph.expand }, Span::new(off, l, c)));
             return Ok(Step::Produced);
@@ -2896,6 +2904,7 @@ impl<'a> Lexer<'a> {
                 return Ok(Step::Produced);
             }
             self.emitting_heredoc.as_mut().expect("emitting").at_line_start = false;
+            self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
             // Fall through to emit the first atom of this body line.
         }
         let off = self.cursor.offset();
@@ -2911,6 +2920,7 @@ impl<'a> Lexer<'a> {
                 self.cursor.next();
                 self.history.push(Token::new(TokenKind::Lit { text: "\n".into(), quoted: true }, Span::new(off, l, c)));
                 self.emitting_heredoc.as_mut().expect("emitting").at_line_start = true;
+                self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.at_line_start flip is a state change
                 Ok(Step::Produced)
             }
             // Backslash — special ONLY before `$`/`` ` ``/`\` (the escaped char
