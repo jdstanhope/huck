@@ -3621,12 +3621,14 @@ mod tests {
         // assignment word (`[Literal("a="), ArrayLiteral(..)]`, not a single
         // Literal) with `FunctionName`. v252 T4 tightened the
         // `parse_command_or_pipeline` guard (was: any `is_assignment_word`
-        // word never attempts funcdef) to only skip the funcdef attempt for a
-        // single-part scalar assignment word (`name_word.0.len() == 1`,
-        // preserving the v248-pinned `a=b () {…}` divergence — see
+        // word never attempts funcdef) to skip the funcdef attempt ONLY when
+        // the oracle would accept the word as a function name
+        // (`is_assignment_word(&w) && valid_function_name_text(&w).is_some()` —
+        // exactly the single unquoted-`Literal` shape like `a=b`), preserving
+        // the v248-pinned `a=b () {…}` divergence (see
         // `atoms_function_assignment_name_divergence`), so a closed array
-        // literal now falls through to the SAME `FunctionName` error as the
-        // oracle.
+        // literal (and the `AssignPrefix`-led `a+=(..)`/`a[i]=(..)` shapes) now
+        // falls through to the SAME `FunctionName` error as the oracle.
         assert_eq!(new_seq("a=(one)(two)"), old_seq("a=(one)(two)"), "error parity for \"a=(one)(two)\"");
         diff_cmd("a=(a)b");                          // text glued after the close paren
         diff_cmd("cmd a=(1 2) b=(3 4)");             // two array assignments in one command
