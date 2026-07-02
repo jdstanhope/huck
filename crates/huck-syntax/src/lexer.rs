@@ -509,6 +509,7 @@ impl PartialEq<Token> for TokenKind {
 }
 
 /// State for a heredoc whose body hasn't been collected yet.
+#[derive(Clone)]
 struct PendingHeredoc {
     delim: String,
     expand: bool,
@@ -2694,6 +2695,13 @@ impl<'a> Lexer<'a> {
     /// Atom-native: at `$(`/`${`/`` ` ``/`$((` it emits the opener SIGNAL and the
     /// parser pushes the sub-mode — it never calls the fat scanners.
     fn scan_step_command_atoms(&mut self) -> Result<Step, LexError> {
+        // v250: while emitting heredoc bodies, the lexer drives body-atom output
+        // from its own state (never the parser). Only in plain Command scanning;
+        // a pushed sub-mode (CommandSub/Arith/etc., used by expanding bodies in
+        // T4) is handled by scan_step's mode dispatch before we get here.
+        if self.emitting_heredoc.is_some() {
+            return self.scan_step_heredoc_body();
+        }
         // Skip a run of inter-word blanks → emit one Blank boundary token. The
         // oracle flushes the word on ANY `char::is_whitespace()` (lexer.rs:2076),
         // handling only `\n` specially (a `Newline` token); every other
@@ -2716,6 +2724,12 @@ impl<'a> Lexer<'a> {
                 self.cursor.next();
                 self.history.push(Token::new(TokenKind::Newline, Span::new(off, l, c)));
                 self.boundary_reset();
+                // v250: pending heredoc bodies are emitted as atoms after this
+                // newline. Flip on the lexer-internal emission state; the next
+                // scan_step calls emit the body groups (see the top-of-fn check).
+                if !self.atom_pending_heredocs.is_empty() {
+                    self.emitting_heredoc = Some(HeredocEmit { began: false });
+                }
                 Ok(Step::Produced)
             }
 
@@ -2739,6 +2753,58 @@ impl<'a> Lexer<'a> {
             // maximal unquoted run, `QuoteRun` for one complete quoted run),
             // stopping at a blank / EOF / operator / metachar without consuming it.
             Some(_) => self.scan_command_word_atom(),
+        }
+    }
+
+    /// v250: emit atoms for the FRONT `atom_pending_heredocs` body. One
+    /// `scan_step` call: first emits `HeredocBodyBegin`, next emits the body +
+    /// `HeredocBodyEnd` and pops the entry; when the queue drains, clears
+    /// `emitting_heredoc`. Task 2 handles LITERAL bodies (one raw `Lit`); Task 4
+    /// extends this for expanding bodies. Detects the close-delimiter line itself.
+    fn scan_step_heredoc_body(&mut self) -> Result<Step, LexError> {
+        let Some(state) = self.emitting_heredoc.as_mut() else {
+            return self.scan_step_command_atoms(); // no-op guard
+        };
+        // Emit the Begin bracket for the current heredoc.
+        if !state.began {
+            state.began = true;
+            let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+            self.history.push(Token::new(TokenKind::HeredocBodyBegin, Span::new(off, l, c)));
+            return Ok(Step::Produced);
+        }
+        let ph = self.atom_pending_heredocs.front().expect("emitting implies a pending entry").clone();
+        // LITERAL body (Task 2): accumulate raw lines until the delimiter line.
+        // Task 4 branches here on `ph.expand` to emit expansion atoms instead.
+        let mut body = String::new();
+        loop {
+            let mut line = String::new();
+            let mut got_nl = false;
+            while let Some(ch) = self.cursor.next() {
+                if ch == '\n' { got_nl = true; break; }
+                line.push(ch);
+            }
+            let check = if ph.strip_tabs { line.trim_start_matches('\t') } else { &line[..] };
+            if check == ph.delim {
+                // Close delimiter reached — emit the accumulated Lit + End, pop.
+                let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                if !body.is_empty() {
+                    self.history.push(Token::new(TokenKind::Lit { text: body, quoted: true }, Span::new(off, l, c)));
+                }
+                self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
+                self.atom_pending_heredocs.pop_front();
+                self.emitting_heredoc = if self.atom_pending_heredocs.is_empty() {
+                    None
+                } else {
+                    Some(HeredocEmit { began: false })
+                };
+                return Ok(Step::Produced);
+            }
+            if !got_nl {
+                return Err(LexError::UnterminatedHeredoc);
+            }
+            let body_line = if ph.strip_tabs { line.trim_start_matches('\t').to_string() } else { line };
+            body.push_str(&body_line);
+            body.push('\n');
         }
     }
 
@@ -11262,6 +11328,36 @@ mod tests {
         assert!(matches!(q.last(), Some(TokenKind::Heredoc { expand: false, .. })), "quoted delim → literal: {q:?}");
         let dash = command_atoms_of("cat <<-EOF");
         assert!(matches!(dash.last(), Some(TokenKind::Heredoc { strip_tabs: true, expand: true, .. })), "<<- → strip_tabs: {dash:?}");
+    }
+
+    #[test]
+    fn heredoc_literal_body_atoms() {
+        // Quoted delimiter → literal body: Newline, then Begin, one raw Lit, End.
+        let toks = command_atoms_of("cat <<'EOF'\nhello $x\nEOF\n");
+        // Find the body bracket.
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello $x\n"),
+            "literal body is one raw Lit (no expansion of $x): {toks:?}");
+        assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
+    }
+
+    #[test]
+    fn heredoc_literal_body_atoms_dash_strips_tabs() {
+        // `<<-` strips leading TABS (only) from each body line AND the delimiter check.
+        let toks = command_atoms_of("cat <<-'EOF'\n\t\thello\n\tEOF\n");
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        assert!(matches!(&toks[begin + 1], TokenKind::Lit { text, quoted: true } if text == "hello\n"),
+            "<<- strips leading tabs from body lines: {toks:?}");
+        assert!(matches!(&toks[begin + 2], TokenKind::HeredocBodyEnd), "End after body: {toks:?}");
+    }
+
+    #[test]
+    fn heredoc_literal_body_atoms_empty_body() {
+        // Empty body → no Lit emitted, just Begin then End.
+        let toks = command_atoms_of("cat <<'EOF'\nEOF\n");
+        let begin = toks.iter().position(|t| matches!(t, TokenKind::HeredocBodyBegin)).expect("Begin");
+        assert!(matches!(&toks[begin + 1], TokenKind::HeredocBodyEnd),
+            "empty body emits no Lit: {toks:?}");
     }
 
     #[test]
