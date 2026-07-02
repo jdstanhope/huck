@@ -1508,18 +1508,16 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
         Some(TokenKind::Op(op)) if crate::command::is_redirect_op(op) => {
             let op = *op;
             iter.next_kind()?; // consume the redirect operator
-            // Process substitution `<(…)` / `>(…)` is a distinct construct
-            // DEFERRED in v247. The atom scanner emits `RedirIn`/`RedirOut`
-            // immediately followed by `LParen` with NO intervening `Blank` when
-            // the operator and `(` are GLUED (`<(`); return a clean
-            // `UnsupportedCommand` so T7 can assert the deferral. A SPACED
-            // `< (` keeps a `Blank` between them and falls through to the
-            // ordinary redirect-target-is-operator error, matching the oracle.
-            if matches!(op, Operator::RedirIn | Operator::RedirOut)
-                && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
-            {
-                return Err(ParseError::UnsupportedCommand);
-            }
+            // NOTE (v251 T3): a `<(`/`>(` procsub-defer guard used to live here
+            // (pre-v251 T1, when a glued `<(`/`>(` still surfaced as
+            // `Op(RedirIn|RedirOut)` immediately followed by `Op(LParen)`).
+            // Since v251 T1 the lexer emits a dedicated `ProcSubOpen` atom for
+            // a glued `<(`/`>(` and NEVER produces `Op(RedirIn|RedirOut)` when
+            // the very next source char is `(` (see `scan_command_operator_atom`'s
+            // `<`/`>` arms) — so that sequence is now unreachable here; removed
+            // (confirmed via a temporary panic probe run across the full
+            // `huck-syntax --lib` suite: never hit).
+            //
             // The redirect target may be separated from the operator by an
             // inter-token `Blank` in the atom stream (`> out`); skip it. Then
             // ASSEMBLE the target from word atoms via `parse_word_command` (the
@@ -1695,6 +1693,28 @@ fn parse_simple_with_leading_word(
             // callers — `old_seq`/production do NOT reach this arm via
             // `parse_sequence`, but it keeps `parse_simple` total).
             TokenKind::Word(word) => all_words.push(word),
+            // v251 T3: a stray `Op(LParen)` reaching a word-expected position
+            // (e.g. `echo \<(x)` — the backslash escapes `<` to a plain
+            // literal, so the following `(` is never folded into a
+            // `ProcSubOpen`/redirect target and surfaces bare here) is the
+            // oracle's own generic "unexpected token where a word was
+            // expected" outcome, NOT a deferred construct — the production
+            // parser returns `UnexpectedToken` for a bare trailing `LParen`
+            // after words (command.rs, e.g. `parse(vec![w_tok("echo"),
+            // w_tok("hi"), Op(LParen)])` asserts `Err(UnexpectedToken)`).
+            // Match it for parity instead of the generic deferral below —
+            // UNLESS the last word is assignment-shaped (`name=`/`name+=`),
+            // in which case this `(` is instead an ARRAY-LITERAL value
+            // opener (`a=(1 2 3)`) — a deliberately DEFERRED atom-path
+            // construct (see `atoms_deferred_unsupported` /
+            // `atoms_function_assignment_name_divergence`), so keep the
+            // pre-existing `UnsupportedCommand` deferral for that case.
+            TokenKind::Op(Operator::LParen) => {
+                if all_words.last().is_some_and(crate::command::is_assignment_word) {
+                    return Err(ParseError::UnsupportedCommand);
+                }
+                return Err(ParseError::UnexpectedToken);
+            }
             _ => return Err(ParseError::UnsupportedCommand),
         }
     }
@@ -3219,6 +3239,87 @@ mod tests {
         for s in ["cat <(echo hi)", "tee >(cat)", "echo <(a) >(b)"] {
             diff_cmd(s);
         }
+    }
+
+    // ── v251 T3: full process-substitution corpus ──────────────────────────
+    #[test]
+    fn atoms_procsub_corpus() {
+        // nested
+        diff_cmd("cat <( cat <(echo x) )");
+        diff_cmd("echo >( tee >(cat) )");
+        // bodies: pipelines / expansions / compounds inside
+        diff_cmd("cat <(echo $x | sort)");
+        diff_cmd("cat <(echo ${y:-d})");
+        diff_cmd("cat <(if true; then echo a; fi)");
+        diff_cmd("cat <(a && b || c)");
+        // funcdef body inside a procsub — v248 funcdef support extends into
+        // `parse_subshell_sequence`, so this is NOT deferred (observed: byte-
+        // identical to the oracle, unlike `[[ … ]]`/`(( … ))` bodies below).
+        diff_cmd("cat <( f() { :; } )");
+        // adjacency with other word parts
+        diff_cmd("echo pre$(c)<(d)post");
+        diff_cmd("cat <(a)<(b)");            // two procsubs glued into one word
+        // empty body
+        diff_cmd("cat <()");
+        diff_cmd("tee >()");
+    }
+
+    #[test]
+    fn atoms_procsub_quoted_literal() {
+        // inside quotes `<(`/`>(` are LITERAL — no procsub (matches the oracle).
+        diff_cmd("echo \"<(x)\"");
+        diff_cmd("echo '<(x)'");
+        // Escaped `<` (`\<`): the backslash strips `<`'s special meaning, so
+        // `(x)` never becomes a `ProcSubOpen` target — a bare `(` then
+        // surfaces in argument position. Observed: the ORACLE itself does not
+        // treat this as a literal glued word either — it errors
+        // `UnexpectedToken` (command.rs's generic "stray `(` where a word was
+        // expected" outcome; see e.g. the `w_tok("hi"), Op(LParen)` case at
+        // command.rs ~4556). So this is error-parity, not a `diff_cmd` case.
+        assert_eq!(
+            new_seq("echo \\<(x)").map(|_| ()).map_err(|e| format!("{e:?}")),
+            old_seq("echo \\<(x)").map(|_| ()).map_err(|e| format!("{e:?}")),
+            "escaped `<(` error parity",
+        );
+    }
+
+    #[test]
+    fn atoms_procsub_for_case_positions() {
+        // for-list / case-pattern positions: the `<(` atom is `ProcSubOpen`,
+        // never an `Op`, so these loops' `Some(TokenKind::Op(_)) =>
+        // UnexpectedToken` guards don't intercept it — it falls to the
+        // `parse_word_command` dispatch same as any other word-start atom,
+        // which already special-cases a fresh `ProcSubOpen`. Observed: the
+        // oracle parses all three identically, no dispatch-set extension
+        // needed.
+        diff_cmd("for x in <(a); do :; done");
+        diff_cmd("case <(a) in x) echo y;; esac");
+        diff_cmd("case x in <(a)) echo y;; esac");
+    }
+
+    #[test]
+    fn atoms_procsub_errors() {
+        // Malformed at EOF (`cat <(` with no closer): the oracle's BATCH lexer
+        // rejects this at LEX time (`UnterminatedSubstitution`, before parsing
+        // even starts), so `old_seq` cannot yield a `Result` to compare — the
+        // atom path (incremental live lexer) rejects the same input at PARSE
+        // time. Both REJECT; assert parity of rejection (mirrors
+        // `atoms_error_parity`'s `echo $(`/`echo ${` treatment).
+        assert!(new_seq("cat <(").is_err(), "atom path must reject unterminated `cat <(`");
+
+        // Body-deferred construct inside a procsub (`[[ … ]]`): the atom path
+        // defers `[[ … ]]` EVERYWHERE (see `atoms_compounds_deferred`), so a
+        // procsub body containing one also defers — `parse_process_sub` maps
+        // the inner `UnsupportedCommand` to `UnsupportedExpansion`, the same
+        // posture as a `$(…)` body containing `[[ … ]]`
+        // (`diff_cs_deferred("$([[ -n x ]])")`). The oracle itself DOES parse
+        // this fully (production supports `[[ ]]` everywhere) — that's an
+        // intentional, already-accepted scope gap, not a parity bug.
+        assert!(
+            matches!(new_seq("cat <( [[ x ]] )"), Err(ParseError::UnsupportedExpansion)),
+            "expected UnsupportedExpansion for a `[[ ]]` procsub body, got {:?}",
+            new_seq("cat <( [[ x ]] )"),
+        );
     }
 
     #[test]
