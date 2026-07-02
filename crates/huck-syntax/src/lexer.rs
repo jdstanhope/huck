@@ -436,6 +436,23 @@ pub enum TokenKind {
     /// `Literal`). Kept separate from `Lit` (which is for UNQUOTED literal runs,
     /// glued Word assembly) so the oracle's `QuoteStyle` survives atom-ization.
     QuoteRun { style: QuoteStyle, text: String },
+    // --- Phase C v247 T3: command-position expansions + parser-driven double quotes. ---
+    /// v247 T3: a command-position tilde construct (`~`, `~user`, `~+`, `~-`,
+    /// `~/…`). Emitted by `scan_command_word_atom` ONLY at word start (mirrors
+    /// the oracle's `!has_token` guard); the parser turns it into
+    /// `WordPart::Tilde(spec)`.
+    Tilde(TildeSpec),
+    /// v247 T3: zero-width opener signal for a `"…"` double-quoted span in
+    /// command-word context. The lexer does NOT consume the `"`; the parser
+    /// (`parse_dquote`) pushes `Mode::DoubleQuote`, whose first scan consumes the
+    /// opening `"`. Mirrors the `CmdSubOpen`/`ArithOpen` zero-width signal
+    /// pattern so a `"…"` body containing `$(…)`/`` `…` ``/`$((…))` is parsed
+    /// recursively (the parser owns delimiter-matching), never flat-scanned.
+    BeginDquote,
+    /// v247 T3: closing `"` of a `Mode::DoubleQuote` span — emitted by
+    /// `scan_step_dquote` when the closing quote is reached; consumed by
+    /// `parse_dquote`, which then pops the mode.
+    EndDquote,
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -575,6 +592,7 @@ pub(crate) enum Mode {
     // Kept for now rather than removed; may carry a future signal (e.g. if arith
     // ever needs to distinguish a quoted-bit).
     Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
+    DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral,   // a=( … )
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
@@ -601,6 +619,7 @@ pub(crate) struct Mark {
     alias_trailing_eligible: bool,
     modes: Vec<Mode>,
     retokenize_arith_as_cmdsub: bool,
+    cmd_at_word_start: bool,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -649,6 +668,12 @@ pub struct Lexer<'a> {
     /// Word-emitting `scan_step_command`. Default false (production). Set only by
     /// the dormant atom path (differential harness + the eventual live flip).
     command_atoms: bool,
+    /// v247 T3: true when the next command-word atom begins a fresh word (i.e.
+    /// the previous atom was a `Blank`/start-of-input). Mirrors the oracle's
+    /// `!has_token` guard: a `~` is tilde-special only at word start; mid-word
+    /// (`a~b`, `$x~`) it is literal. Reset to true after a `Blank`, cleared
+    /// after any word-content atom. Only meaningful under `command_atoms`.
+    cmd_at_word_start: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -676,6 +701,7 @@ impl<'a> Lexer<'a> {
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
             command_atoms: false,
+            cmd_at_word_start: true,
         }
     }
 
@@ -736,6 +762,7 @@ impl<'a> Lexer<'a> {
             alias_trailing_eligible: self.alias_trailing_eligible,
             modes: self.modes.clone(),
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
+            cmd_at_word_start: self.cmd_at_word_start,
         }
     }
 
@@ -767,6 +794,7 @@ impl<'a> Lexer<'a> {
         self.alias_trailing_eligible = m.alias_trailing_eligible;
         self.modes = m.modes.clone();
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
+        self.cmd_at_word_start = m.cmd_at_word_start;
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -785,6 +813,7 @@ impl<'a> Lexer<'a> {
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
             Mode::Arith { paren_depth, in_dquote, body_started } =>
                 self.scan_step_arith(paren_depth, in_dquote, body_started),
+            Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -2608,6 +2637,7 @@ impl<'a> Lexer<'a> {
             let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
             while matches!(self.cursor.peek(), Some(' ') | Some('\t')) { self.cursor.next(); }
             self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+            self.cmd_at_word_start = true; // next word-content atom begins a fresh word
             return Ok(Step::Produced);
         }
         match self.cursor.peek().copied() {
@@ -2639,11 +2669,15 @@ impl<'a> Lexer<'a> {
         let off = self.cursor.offset();
         let l   = self.cursor.line();
         let c   = self.cursor.column();
+        // A `~` is tilde-special only at word start (mirrors the oracle's
+        // `!has_token` guard); capture the flag before it's cleared below.
+        let at_word_start = self.cmd_at_word_start;
         match self.cursor.peek().copied() {
             None => self.finish(),
 
             // `'…'` — single-quoted run: fully literal, no escapes recognized.
             Some('\'') => {
+                self.cmd_at_word_start = false;
                 self.cursor.next(); // consume opening `'`
                 let mut text = String::new();
                 loop {
@@ -2660,48 +2694,36 @@ impl<'a> Lexer<'a> {
                 Ok(Step::Produced)
             }
 
-            // `"…"` — double-quoted run. T2 scope: literal body only, with
-            // POSIX double-quote backslash rules (`\$ \` \" \\` unescape;
-            // `\<NL>` is line continuation; any other `\c` keeps the `\`).
-            // Embedded `$`/`` ` `` expansions are T3's job.
+            // `"…"` — double-quoted span. v247 T3: emit a ZERO-WIDTH BeginDquote
+            // signal (cursor stays on `"`); the parser (`parse_dquote`) pushes
+            // `Mode::DoubleQuote`, whose first scan consumes the opening `"` and
+            // thereafter emits inner atoms (literals + expansion openers). This is
+            // atom-native — the parser owns recursion into nested `$(…)`/`` `…`
+            // ``/`$((…))` — instead of the T2 flat single-shot body scan.
             Some('"') => {
-                self.cursor.next(); // consume opening `"`
-                let mut text = String::new();
-                loop {
-                    match self.cursor.next() {
-                        None => return Err(LexError::UnterminatedQuote),
-                        Some('"') => break,
-                        Some('\\') => match self.cursor.next() {
-                            Some(e @ ('"' | '\\' | '$' | '`')) => text.push(e),
-                            Some('\n') => {} // line continuation: both chars deleted
-                            Some(other) => { text.push('\\'); text.push(other); }
-                            None => return Err(LexError::UnterminatedQuote),
-                        },
-                        Some(ch) => text.push(ch),
-                    }
-                }
-                self.history.push(Token::new(
-                    TokenKind::QuoteRun { style: QuoteStyle::Double, text },
-                    Span::new(off, l, c),
-                ));
+                self.cmd_at_word_start = false;
+                self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
 
             // `\c` — backslash escape outside quotes: the next char is always
             // literal (one-char QuoteRun). `\<NL>` is line continuation — both
-            // chars deleted, no atom emitted (cursor still advanced: safe).
+            // chars deleted, no atom emitted (cursor still advanced: safe, and
+            // `cmd_at_word_start` is preserved so `\<NL>~` stays word-start tilde).
             Some('\\') => {
                 self.cursor.next(); // consume `\`
                 match self.cursor.next() {
                     None => {
+                        self.cmd_at_word_start = false;
                         self.history.push(Token::new(
                             TokenKind::Lit { text: "\\".to_string(), quoted: false },
                             Span::new(off, l, c),
                         ));
                         Ok(Step::Produced)
                     }
-                    Some('\n') => Ok(Step::Produced), // deleted — no atom this call
+                    Some('\n') => Ok(Step::Produced), // deleted — no atom, word-start preserved
                     Some(ch) => {
+                        self.cmd_at_word_start = false;
                         self.history.push(Token::new(
                             TokenKind::QuoteRun { style: QuoteStyle::Backslash, text: ch.to_string() },
                             Span::new(off, l, c),
@@ -2711,9 +2733,9 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            // `$'…'` — ANSI-C quoting (the only `$` form recognized in T2
-            // scope; general `$name`/`${…}`/`$(…)` expansions are T3's job).
+            // `$'…'` — ANSI-C quoting (must precede the general `$` arm below).
             Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
+                self.cmd_at_word_start = false;
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `'`
                 let text = scan_ansi_c_quoted(&mut self.cursor)?;
@@ -2724,21 +2746,237 @@ impl<'a> Lexer<'a> {
                 Ok(Step::Produced)
             }
 
+            // `$` — command-position expansion. Mirrors `scan_step_param_operand`'s
+            // unquoted `$`-classification (v247 T3), quoted:false: `${`→ParamOpen,
+            // `$((`→ArithOpen (zero-width), `$(`→CmdSubOpen (zero-width), specials/
+            // digit/name→DollarName, lone `$`→Lit. Reuses the v246 `$((`-vs-`$(`
+            // bounded peek.
+            Some('$') => {
+                self.cmd_at_word_start = false;
+                let mut probe = self.cursor.clone();
+                probe.next(); // skip `$`
+                match probe.peek().copied() {
+                    Some('{') => {
+                        self.cursor.next(); // `$`
+                        self.cursor.next(); // `{`
+                        self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
+                    }
+                    Some('(') => {
+                        let mut probe2 = probe.clone();
+                        probe2.next(); // skip first `(`
+                        if probe2.peek() == Some(&'(') {
+                            // `$((` — zero-width ArithOpen signal (cursor stays on `$`).
+                            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                        } else {
+                            // `$(cmd)` — zero-width CmdSubOpen signal (cursor stays on `$`).
+                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                        }
+                    }
+                    Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                        self.cursor.next(); // `$`
+                        self.cursor.next(); // special char
+                        self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
+                    }
+                    Some(d) if d.is_ascii_digit() => {
+                        self.cursor.next(); // `$`
+                        let digit = self.cursor.next().unwrap();
+                        self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
+                    }
+                    Some(nc) if is_name_start(nc) => {
+                        self.cursor.next(); // `$`
+                        let name = scan_var_name(&mut self.cursor);
+                        self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
+                    }
+                    _ => {
+                        self.cursor.next(); // lone `$`
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text: "$".into(), quoted: false },
+                            Span::new(off, l, c),
+                        ));
+                    }
+                }
+                Ok(Step::Produced)
+            }
+
+            // Backtick command substitution — zero-width BeginBacktick signal
+            // (cursor stays on `` ` ``; the parser's `parse_backtick_sub` pushes
+            // `Mode::Backtick`, whose depth-0 scan consumes the opening `` ` ``).
+            Some('`') => {
+                self.cmd_at_word_start = false;
+                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `~…` at WORD START — tilde construct (mirrors the oracle's
+            // `!has_token` guard). Mid-word `~` (e.g. `a~b`, `$x~`) is NOT
+            // word-start, so it is swallowed into the literal run below.
+            Some('~') if at_word_start => {
+                self.cmd_at_word_start = false;
+                self.cursor.next(); // consume `~`
+                match try_parse_tilde(&mut self.cursor, false) {
+                    Some(spec) => {
+                        self.history.push(Token::new(TokenKind::Tilde(spec), Span::new(off, l, c)));
+                    }
+                    None => {
+                        // Not a tilde construct — `~` is a literal (coalesced with
+                        // any following literal run by the parser).
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text: "~".into(), quoted: false },
+                            Span::new(off, l, c),
+                        ));
+                    }
+                }
+                Ok(Step::Produced)
+            }
+
             // Unquoted literal run: accumulate until the next quote opener,
-            // backslash, `$'` (ANSI-C opener), blank, or EOF.
+            // backslash, expansion opener (`$`/`` ` ``), blank, or EOF. `~` is
+            // NOT a stop char — mid-word it is literal.
             Some(_) => {
+                self.cmd_at_word_start = false;
                 let mut text = String::new();
                 while let Some(&ch) = self.cursor.peek() {
-                    if matches!(ch, ' ' | '\t' | '\'' | '"' | '\\') { break; }
-                    if ch == '$' && self.cursor.peek_nth(1) == Some('\'') { break; }
+                    if matches!(ch, ' ' | '\t' | '\'' | '"' | '\\' | '$' | '`') { break; }
                     text.push(ch);
                     self.cursor.next();
                 }
                 // `text` is non-empty: none of the break conditions can fire on
                 // the FIRST char of this arm (the outer match already routed
-                // `'`/`"`/`\\`/`$'` away), so the loop consumes at least one char.
+                // `'`/`"`/`\\`/`$`/`` ` `` away), so the loop consumes ≥1 char.
                 self.history.push(Token::new(
                     TokenKind::Lit { text, quoted: false },
+                    Span::new(off, l, c),
+                ));
+                Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v247 T3: `Mode::DoubleQuote { body_started }` scanner — emits the inner
+    /// atoms of a `"…"` command-word span. On entry (`body_started == false`) the
+    /// cursor sits just before the opening `"` (the parser consumed the zero-width
+    /// `BeginDquote` signal but not the `"` itself); consume the `"`, flip the
+    /// frame to `body_started`, and scan the first inner atom in the same call.
+    ///
+    /// Inner atoms (all `quoted: true`): literal chunks with POSIX double-quote
+    /// backslash rules (`\$ \` \" \\` unescape; `\<NL>` line continuation; other
+    /// `\c` keeps the `\`), and the SAME expansion openers as command position
+    /// (`ParamOpen`/`ArithOpen`/`CmdSubOpen`/`BeginBacktick`/`DollarName`). On the
+    /// closing `"`, emit `EndDquote` (the parser pops the mode). Mirrors
+    /// `scan_step_param_operand`'s `in_dquote` branch but wires `$(`/`$((` (which
+    /// the operand path still defers) since the parser owns the recursion.
+    fn scan_step_dquote(&mut self, body_started: bool) -> Result<Step, LexError> {
+        if !body_started {
+            // Consume the opening `"` and flip the frame to the body phase.
+            debug_assert_eq!(self.cursor.peek(), Some(&'"'), "scan_step_dquote entry: expected opening \"");
+            self.cursor.next(); // consume opening `"`
+            if let Some(Mode::DoubleQuote { body_started }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            // Fall through to scan the first inner atom.
+        }
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+        match self.cursor.peek().copied() {
+            None => Err(LexError::UnterminatedQuote),
+
+            // Closing `"` — emit EndDquote; the parser pops the DoubleQuote frame.
+            Some('"') => {
+                self.cursor.next(); // consume closing `"`
+                self.history.push(Token::new(TokenKind::EndDquote, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // Backslash: special only before `$`, `` ` ``, `"`, `\` inside `"…"`;
+            // `\<NL>` is line continuation (both deleted); other `\c` keeps `\`.
+            Some('\\') => {
+                self.cursor.next(); // consume `\`
+                match self.cursor.peek().copied() {
+                    Some(e @ ('$' | '`' | '"' | '\\')) => {
+                        self.cursor.next();
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text: e.to_string(), quoted: true },
+                            Span::new(off, l, c),
+                        ));
+                    }
+                    Some('\n') => {
+                        self.cursor.next(); // line continuation — both chars deleted, no atom
+                    }
+                    _ => {
+                        let mut s = String::from("\\");
+                        if let Some(ch) = self.cursor.next() { s.push(ch); }
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text: s, quoted: true },
+                            Span::new(off, l, c),
+                        ));
+                    }
+                }
+                Ok(Step::Produced)
+            }
+
+            // Backtick command substitution — zero-width BeginBacktick signal.
+            Some('`') => {
+                self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
+            // `$` expansion inside `"…"` — mirrors the command-position `$` arm
+            // but with quoted:true.
+            Some('$') => {
+                let mut probe = self.cursor.clone();
+                probe.next(); // skip `$`
+                match probe.peek().copied() {
+                    Some('{') => {
+                        self.cursor.next(); // `$`
+                        self.cursor.next(); // `{`
+                        self.history.push(Token::new(TokenKind::ParamOpen { quoted: true }, Span::new(off, l, c)));
+                    }
+                    Some('(') => {
+                        let mut probe2 = probe.clone();
+                        probe2.next(); // skip first `(`
+                        if probe2.peek() == Some(&'(') {
+                            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                        } else {
+                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                        }
+                    }
+                    Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                        self.cursor.next(); // `$`
+                        self.cursor.next(); // special char
+                        self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: true }, Span::new(off, l, c)));
+                    }
+                    Some(d) if d.is_ascii_digit() => {
+                        self.cursor.next(); // `$`
+                        let digit = self.cursor.next().unwrap();
+                        self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: true }, Span::new(off, l, c)));
+                    }
+                    Some(nc) if is_name_start(nc) => {
+                        self.cursor.next(); // `$`
+                        let name = scan_var_name(&mut self.cursor);
+                        self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
+                    }
+                    _ => {
+                        self.cursor.next(); // lone `$`
+                        self.history.push(Token::new(
+                            TokenKind::Lit { text: "$".into(), quoted: true },
+                            Span::new(off, l, c),
+                        ));
+                    }
+                }
+                Ok(Step::Produced)
+            }
+
+            // Literal run inside `"…"`: stop at `"`, `$`, `` ` ``, or `\`.
+            Some(_) => {
+                let mut text = String::new();
+                while let Some(&ch) = self.cursor.peek() {
+                    if matches!(ch, '"' | '$' | '`' | '\\') { break; }
+                    text.push(ch);
+                    self.cursor.next();
+                }
+                self.history.push(Token::new(
+                    TokenKind::Lit { text, quoted: true },
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
@@ -2825,6 +3063,7 @@ impl<'a> Lexer<'a> {
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
             command_atoms: false,
+            cmd_at_word_start: true,
         }
     }
 

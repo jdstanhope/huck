@@ -136,15 +136,62 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                     });
                 }
             }
-            // T3 adds DollarName / ParamOpen / CmdSubOpen / BeginBacktick / ArithOpen arms here.
+            // ── v247 T3: command-position expansions ──────────────────────────
+            // `parse_param_expansion` owns its push/pop and consumes the buffered
+            // `ParamOpen`, so it is dispatched on a PEEK (not consumed here first).
+            Some(TokenKind::ParamOpen { .. }) => {
+                parts.push(parse_param_expansion(iter, quoted)?);
+            }
+            // The zero-width `CmdSubOpen`/`BeginBacktick`/`ArithOpen` signals must
+            // be discarded via `next_kind()` BEFORE dispatching, so the sub-parser's
+            // own pushed mode re-scans the real opener (mirrors `parse_word`).
+            Some(TokenKind::CmdSubOpen) => {
+                iter.next_kind()?;
+                parts.push(parse_command_sub(iter, quoted)?);
+            }
+            Some(TokenKind::BeginBacktick) => {
+                iter.next_kind()?;
+                parts.push(parse_backtick_sub(iter, quoted)?);
+            }
+            Some(TokenKind::ArithOpen) => {
+                iter.next_kind()?;
+                parts.push(parse_arith_expansion(iter, quoted)?);
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
+                    let eff = q || quoted;
+                    parts.push(match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted: eff, joined: false },
+                        "*" => WordPart::AllArgs { quoted: eff, joined: true },
+                        "?" => WordPart::LastStatus { quoted: eff },
+                        _   => WordPart::Var { name, quoted: eff },
+                    });
+                }
+            }
+            Some(TokenKind::Tilde(_)) => {
+                if let Some(TokenKind::Tilde(spec)) = iter.next_kind()? {
+                    parts.push(WordPart::Tilde(spec));
+                }
+            }
+            // `"…"` — parser-driven double-quote mode. `parse_dquote` consumes the
+            // zero-width `BeginDquote` signal, pushes `Mode::DoubleQuote`, collects
+            // the inner parts, and pops.
+            Some(TokenKind::BeginDquote) => {
+                iter.next_kind()?; // discard the zero-width open signal
+                parts.push(parse_dquote(iter, quoted)?);
+            }
             _ => break,
         }
     }
-    // Coalesce adjacent Literal parts with the same `quoted` flag into one,
-    // matching the oracle's single-buffer literal accumulation. Needed for
-    // e.g. a trailing unescaped `\` at EOF, which the lexer emits as its own
-    // unquoted `Lit` atom (see `scan_command_word_atom`'s `Some('\\')` arm,
-    // `None` case) but the oracle folds into the surrounding literal buffer.
+    Ok(Word(coalesce_literals(parts)))
+}
+
+/// Coalesce adjacent `Literal` parts with the SAME `quoted` flag into one,
+/// matching the oracle's single-buffer literal accumulation (`flush_literal`).
+/// Needed e.g. for a trailing unescaped `\` at EOF (its own `Lit` atom, folded
+/// into the surrounding literal by the oracle) and for a `"…"` body of mixed
+/// backslash-escapes + plain text (the oracle accumulates one `qbuf`).
+fn coalesce_literals(parts: Vec<WordPart>) -> Vec<WordPart> {
     let mut coalesced: Vec<WordPart> = Vec::with_capacity(parts.len());
     for part in parts {
         if let WordPart::Literal { text, quoted } = &part {
@@ -157,7 +204,70 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
         }
         coalesced.push(part);
     }
-    Ok(Word(coalesced))
+    coalesced
+}
+
+/// v247 T3: assemble a `WordPart::Quoted { style: Double, parts }` for a `"…"`
+/// span. The caller has already consumed the zero-width `BeginDquote` signal;
+/// this pushes `Mode::DoubleQuote` (whose first scan consumes the opening `"`),
+/// collects the inner parts until `EndDquote`, pops the mode, and coalesces
+/// adjacent literals. Every inner part is `quoted: true`; nested `$(…)`/`` `…`
+/// ``/`$((…))` recurse through their own sub-parsers (parser-owned recursion).
+/// Owns the full push/pop lifecycle of its `DoubleQuote` frame; pops on ALL
+/// exit paths.
+fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::DoubleQuote { body_started: false });
+    let result = (|| -> Result<Vec<WordPart>, ParseError> {
+        let mut parts: Vec<WordPart> = Vec::new();
+        loop {
+            match iter.peek_kind()? {
+                // Closing `"` — consume and finish.
+                Some(TokenKind::EndDquote) => { iter.next_kind()?; break; }
+                // EOF before the closing `"` — unterminated (matches the oracle,
+                // whose fat dquote scanner errors on EOF).
+                None => return Err(ParseError::UnterminatedSubshell),
+                Some(TokenKind::ParamOpen { .. }) => {
+                    parts.push(parse_param_expansion(iter, true)?);
+                }
+                Some(TokenKind::CmdSubOpen) => {
+                    iter.next_kind()?;
+                    parts.push(parse_command_sub(iter, true)?);
+                }
+                Some(TokenKind::BeginBacktick) => {
+                    iter.next_kind()?;
+                    parts.push(parse_backtick_sub(iter, true)?);
+                }
+                Some(TokenKind::ArithOpen) => {
+                    iter.next_kind()?;
+                    parts.push(parse_arith_expansion(iter, true)?);
+                }
+                Some(TokenKind::DollarName { .. }) => {
+                    if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
+                        parts.push(match name.as_str() {
+                            "@" => WordPart::AllArgs { quoted: true, joined: false },
+                            "*" => WordPart::AllArgs { quoted: true, joined: true },
+                            "?" => WordPart::LastStatus { quoted: true },
+                            _   => WordPart::Var { name, quoted: true },
+                        });
+                    }
+                }
+                Some(TokenKind::Lit { .. }) => {
+                    if let Some(TokenKind::Lit { text, quoted: _ }) = iter.next_kind()? {
+                        parts.push(WordPart::Literal { text, quoted: true });
+                    }
+                }
+                _ => return Err(ParseError::UnsupportedExpansion),
+            }
+        }
+        Ok(parts)
+    })();
+    iter.pop_mode();
+    let mut parts = coalesce_literals(result?);
+    if parts.is_empty() {
+        // Empty `""` — preserve the empty-token contract (matches the oracle).
+        parts.push(WordPart::Literal { text: String::new(), quoted: true });
+    }
+    Ok(WordPart::Quoted { style: crate::lexer::QuoteStyle::Double, parts })
 }
 
 /// Convert the subscript word assembled by `parse_word` into a `SubscriptKind`.
@@ -1059,12 +1169,20 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
         ) {
             break;
         }
-        // Nested `` \` `` backtick child inside a backtick body — the lexer has
-        // emitted a `BeginBacktick` (single-frame depth already incremented).
-        // Recurse to assemble a standalone Word carrying its `WordPart::CommandSub`.
+        // Nested `` \` `` backtick child inside a backtick BODY — the lexer has
+        // emitted a REAL `BeginBacktick` child-open token (single-frame depth
+        // already incremented), cursor already past the `` ` ``. Recurse to
+        // assemble a standalone Word carrying its `WordPart::CommandSub`.
         // (Glued adjacency `` a\`b\`c `` — one word with literal + CommandSub parts
         // — is not yet handled; deferred, untested at this level.)
-        if matches!(token, TokenKind::BeginBacktick) {
+        //
+        // Guarded to `Mode::Backtick`: at TOP LEVEL (Command/DoubleQuote mode) a
+        // leading `` ` `` is instead a ZERO-WIDTH signal (v247 T3), handled by
+        // `parse_word_command`'s BeginBacktick arm below (which pre-consumes the
+        // signal so `parse_backtick_sub` re-scans the real opening `` ` ``).
+        if matches!(token, TokenKind::BeginBacktick)
+            && matches!(iter.current_mode(), Mode::Backtick { .. })
+        {
             let part = parse_backtick_sub(iter, false)?;
             all_words.push(Word(vec![part]));
             continue;
@@ -1083,9 +1201,25 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
             iter.next_kind()?;
             continue;
         }
-        // A command word begins here — assemble it from atoms (v247 T2: plain/
-        // quoted/glued literal words only; T3+ add expansion-opener peeks).
-        if matches!(iter.peek_kind()?, Some(TokenKind::Lit { .. } | TokenKind::QuoteRun { .. })) {
+        // A command word begins here — assemble it from atoms (v247 T3: plain/
+        // quoted/glued literals + command-position expansions `$x`/`${…}`/`$(…)`/
+        // `$((…))`/`~`/`"…"`). A LEADING `` ` `` is handled by the BeginBacktick
+        // arm above (standalone word); `parse_word_command`'s BeginBacktick arm
+        // handles only backticks glued after earlier word content.
+        if matches!(
+            iter.peek_kind()?,
+            Some(
+                TokenKind::Lit { .. }
+                    | TokenKind::QuoteRun { .. }
+                    | TokenKind::DollarName { .. }
+                    | TokenKind::ParamOpen { .. }
+                    | TokenKind::CmdSubOpen
+                    | TokenKind::BeginBacktick
+                    | TokenKind::ArithOpen
+                    | TokenKind::Tilde(_)
+                    | TokenKind::BeginDquote
+            )
+        ) {
             all_words.push(parse_word_command(iter, false)?);
             continue;
         }
@@ -2136,6 +2270,30 @@ mod tests {
         diff_cmd("echo ab\\");
         diff_cmd("echo a\\ b");   // escaped space mid-word stays Quoted{Backslash} — must still match
         diff_cmd("echo a b\\");
+    }
+
+    // v247 T3 tests
+
+    #[test]
+    fn atoms_expansions() {
+        diff_cmd("echo $x");
+        diff_cmd("echo ${x:-d}");
+        diff_cmd("echo $(echo hi)");
+        diff_cmd("echo `echo hi`");
+        diff_cmd("echo $((1+2))");
+        diff_cmd("echo $x$y \"$a ${b}\" pre$(c)post");
+        diff_cmd("echo ~ ~root ~/x");
+        diff_cmd("echo $? $@ $1");
+    }
+
+    #[test]
+    fn atoms_dquote_nested() {
+        diff_cmd("echo \"$(echo hi)\"");
+        diff_cmd("echo \"$(echo $x)\"");
+        diff_cmd("echo \"a${b}c\"");
+        diff_cmd("echo \"$a $b\"");
+        diff_cmd("echo \"pre$(c)$((1+2))post\"");
+        diff_cmd("echo \"\\$lit \\\" \\\\ end\"");
     }
 
     // v243 T2 tests
