@@ -1321,8 +1321,8 @@ fn parse_one_redirect(iter: &mut Lexer) -> Result<Vec<Redirection>, ParseError> 
 /// `|`, `;`, `&&`, `||`, `&`, `)`, `;;`, `;&`, `;;&`, newline, or EOF.
 ///
 /// Redirects are parsed in source order and interleaved with words — a
-/// redirect may appear before, between, or after words.  Heredocs and
-/// here-strings return `UnsupportedCommand` (deferred).
+/// redirect may appear before, between, or after words.  Heredocs return
+/// `UnsupportedCommand` (deferred); here-strings (`<<<`) are handled.
 ///
 /// Leading `NAME=value` words (and `NAME+=value` / `NAME[i]=value` forms)
 /// become `inline_assignments`.  A line of ONLY assignments with NO redirects
@@ -3041,6 +3041,8 @@ mod tests {
         diff_cmd("cmd <<< x > out");                // here-string + file redirect, source order
         diff_cmd("cmd 2>&1 <<< x");                 // fd-dup + here-string
         diff_cmd("cmd <<< a <<< b");                // two here-strings, ordered list
+        diff_cmd("{ cat; } <<< x");                 // brace-group trailing here-string
+        diff_cmd("if true; then :; fi <<< x");       // if-compound trailing here-string
     }
 
     #[test]
