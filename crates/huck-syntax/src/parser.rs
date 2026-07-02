@@ -3502,6 +3502,45 @@ mod tests {
         diff_cmd("for i in 1; do cat <<'EOF'; done\nx\nEOF\n"); // heredoc inside a loop body
     }
 
+    // v250 T5 tests: systematic positional coverage (every command position)
+
+    #[test]
+    fn atoms_heredoc_positions() {
+        diff_cmd("cat <<A <<B\nbodyA\nA\nbodyB\nB\n");            // stacked, order A then B
+        diff_cmd("a <<X | b <<Y\nx\nX\ny\nY\n");                   // across a pipeline
+        diff_cmd("{ cat <<EOF\nx\nEOF\n}\n");                      // heredoc in a brace group
+        diff_cmd("if true; then cat <<EOF\nx\nEOF\nfi\n");         // heredoc in an if body
+        diff_cmd("cat <<EOF >out arg\nx\nEOF\n");                  // interleaved with redirect + word
+        diff_cmd("cat <<A; echo hi\nbodyA\nA\n");                  // heredoc then `;` then command
+    }
+
+    #[test]
+    fn atoms_heredoc_positions_compound_bodies() {
+        diff_cmd("while false; do cat <<EOF; done\nx\nEOF\n");     // heredoc in a while body
+        diff_cmd("for i in 1; do cat <<EOF; done\nx\nEOF\n");      // heredoc in a for body (expanding)
+        diff_cmd("case x in a) cat <<EOF;; esac\nx\nEOF\n");       // heredoc in a case body
+        diff_cmd("( cat <<EOF\nx\nEOF\n)\n");                      // heredoc in a subshell
+    }
+
+    #[test]
+    fn atoms_heredoc_positions_trailing_compound_redirect() {
+        // Redirected{inner, redirects}: the wrapped command's own heredoc body
+        // must be collected BEFORE the compound's own trailing heredoc body.
+        diff_cmd("{ cat; } <<EOF\nx\nEOF\n");
+        diff_cmd("if true; then cat; fi <<EOF\nx\nEOF\n");
+    }
+
+    #[test]
+    fn atoms_heredoc_positions_misc() {
+        diff_cmd("cat 2>&1 <<EOF\nx\nEOF\n");                      // heredoc after another redirect
+        // Mixed literal + expanding, stacked: proves the per-heredoc expand
+        // flag routes through the attach walk to the RIGHT redirect.
+        diff_cmd("cat <<'A' <<B\n$lit\nA\n$exp\nB\n");
+        // FD-prefixed heredoc: the `3` is a `RedirFd` atom emitted ahead of
+        // the `<<` opener by the word-run arm.
+        diff_cmd("cat 3<<EOF\nx\nEOF\n");
+    }
+
     // v243 T2 tests
 
     #[test]
