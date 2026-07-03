@@ -5619,6 +5619,29 @@ mod tests {
         diff_cmd("[[ a =~ >b ]]");
     }
 
+    /// v254 T2: systematic quoting/escapes/continuations/terminator-edges
+    /// corpus for the `=~` regex operand.
+    #[test]
+    fn atoms_regex_quoting_escapes_terminators() {
+        // Quoting
+        diff_cmd("[[ $x =~ \"a b\" ]]");         // dquote keeps the space, quoted part
+        diff_cmd("[[ $x =~ 'a.b' ]]");           // squote literal
+        diff_cmd("[[ $x =~ x\"$y\"z ]]");        // literal + dquoted expansion + literal
+        diff_cmd("[[ $x =~ \"$p\"* ]]");         // dquoted var then literal `*`
+        // Escapes — backslash KEPT in the plain literal (NOT a Backslash QuoteRun)
+        diff_cmd("[[ $x =~ \\. ]]");             // `\.` → literal `\.`
+        diff_cmd("[[ $x =~ a\\.b ]]");           // `a\.b` one literal
+        diff_cmd("[[ $x =~ a\\ b ]]");           // escaped space does NOT terminate
+        diff_cmd("[[ $x =~ \\$lit ]]");          // escaped `$` → literal `$lit`
+        // Line continuations
+        diff_cmd("[[ $x =~ a\\\nb ]]");          // mid-pattern `\<NL>` → `ab`
+        diff_cmd("[[ $x =~ \\\n  foo ]]");       // leading `\<NL>` + indent skipped → `foo`
+        // Terminator edges
+        diff_err("[[ $x =~ ]]");                 // pattern `]]`, then no `]]` → Unterminated
+        diff_err("[[ $x =~ foo");                // EOF → Unterminated
+        diff_cmd("[[ $x =~ a]] ]]");             // pattern `a]]`, then space, then `]]` closes
+    }
+
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
     // T1 cascade — see `parse_test_or`/`parse_test_and`/`parse_test_not`).
     #[test]
