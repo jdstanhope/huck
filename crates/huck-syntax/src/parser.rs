@@ -5333,4 +5333,21 @@ mod tests {
         diff_unsupported("[[ $x =~ ^[0-9]+$ ]]");
         diff_unsupported("[[ -f a && $x =~ y ]]"); // deferral inside a logical expr
     }
+
+    // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
+    // T1 cascade — see `parse_test_or`/`parse_test_and`/`parse_test_not`).
+    #[test]
+    fn atoms_double_bracket_precedence() {
+        diff_cmd("[[ a && b && c ]]");            // left-assoc &&
+        diff_cmd("[[ a || b || c ]]");             // left-assoc ||
+        diff_cmd("[[ a && b || c && d ]]");        // && binds tighter than ||
+        diff_cmd("[[ ! a && b ]]");                // ! binds tighter than &&
+        diff_cmd("[[ ! ! a ]]");                   // right-assoc double negation
+        diff_cmd("[[ ( a || b ) && c ]]");         // grouping overrides precedence
+        diff_cmd("[[ ( ( a ) ) ]]");                // nested grouping
+        diff_cmd("[[ -n a && ( -z b || -f c ) ]]");
+        diff_cmd("[[ a\n&&\nb ]]");                // newlines around &&
+        diff_cmd("[[\n  a == b\n]]");               // newlines after [[ and before ]]
+        diff_cmd("[[ a ||\n b ]]");                 // newline after ||
+    }
 }
