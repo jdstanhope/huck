@@ -4958,6 +4958,18 @@ mod tests {
     }
 
     #[test]
+    fn atoms_arith_command_composition() {
+        diff_cmd("(( 1 )) && echo hi");   // in an && list
+        diff_cmd("(( 1 )) || echo no");   // in an || list
+        diff_cmd("(( 1 )); echo done");   // in a `;` list
+        diff_cmd("(( 1+2 )) >out");       // trailing redirect → Redirected{ inner: Arith }
+        diff_cmd("(( 1 )) | cat");        // pipeline stage
+        diff_cmd("if (( x > 0 )); then y; fi");        // arith as an if-condition
+        diff_cmd("while (( i < 3 )); do x; done");     // arith as a while-condition
+        diff_cmd("for i in a; do (( n++ )); done");    // arith in a for body
+    }
+
+    #[test]
     fn cmd_deep_nesting() {
         diff_cmd("if x; then while y; do case $z in a) ( b );; esac; done; fi");
         diff_cmd("{ for i in a b; do if $i; then echo $i; fi; done; }");
