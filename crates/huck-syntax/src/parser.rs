@@ -325,13 +325,21 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
             // The oracle inlines the `"…"` body parts FLAT (each quoted:true) — it
             // calls `scan_dquote_expansion_body`, which pushes directly into the
-            // operand's part list, NOT a `Quoted{Double,…}` wrapper. Unwrap
-            // `parse_dquote`'s wrapper and extend with its (already-coalesced) inner
-            // parts.
+            // operand's part list, NOT a `Quoted{Double,…}` wrapper, and whose
+            // `flush_literal` pushes NOTHING for an EMPTY body. Unwrap
+            // `parse_dquote`'s wrapper; but DROP the injected empty-`""` marker
+            // (`[Literal{"",true}]`) so an empty `""` contributes no part — that is
+            // what leaves the operand "unstarted" (via `set_regex_body_started`
+            // below) and reproduces the oracle's `Err(UnterminatedDoubleBracket)`
+            // for `[[ $x =~ "" ]]`, and drops the middle part in `a""b`.
             Some(TokenKind::BeginDquote) => {
                 iter.next_kind()?; flush_lit(&mut acc, &mut parts);
                 match parse_dquote(iter, false)? {
-                    WordPart::Quoted { parts: inner, .. } => parts.extend(inner),
+                    WordPart::Quoted { parts: inner, .. } => {
+                        let is_empty_marker = inner.len() == 1
+                            && matches!(&inner[0], WordPart::Literal { text, quoted: true } if text.is_empty());
+                        if !is_empty_marker { parts.extend(inner); }
+                    }
                     other => parts.push(other),
                 }
             }
@@ -350,6 +358,13 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
             other => return Err(ParseError::TestExprBadOperator(format!("regex operand: {other:?}"))),
         }
+        // v254 T1 fix: after every NON-`RegexEnd` atom, tell the lexer whether the
+        // operand has produced any content yet — `Mode::Regex.body_started` then
+        // mirrors the oracle's `!(lit.is_empty() && parts.is_empty())`, so an empty
+        // `""` (which added no part) keeps the operand "unstarted" and the lexer's
+        // leading-ws skip swallows the trailing space (→ oracle's Err). Skipped on
+        // `RegexEnd` (the `break` above), where the lexer has already popped the mode.
+        iter.set_regex_body_started(!(parts.is_empty() && acc.is_none()));
     }
     flush_lit(&mut acc, &mut parts);
     Ok(Word(parts))
@@ -3340,7 +3355,20 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
             match op_text.as_str() {
                 "==" | "=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
                 "!=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
-                "=~" => { let pattern = parse_regex_operand(iter)?; Ok(TestExpr::Regex { lhs, pattern }) }
+                "=~" => {
+                    let pattern = parse_regex_operand(iter)?;
+                    // The oracle lexes the regex operand EAGERLY as one Word, then
+                    // `next_test_word` rejects it if that Word is the `]]` close
+                    // keyword: an empty `""` operand swallows the trailing `]]` into
+                    // the pattern text (the leading-ws skip in `scan_regex_operand`),
+                    // so `next_test_word` sees a `]]`-keyword Word →
+                    // `TestExprMissingOperand`. Mirror that guard here (the atom path
+                    // assembles the same `]]` pattern via `Mode::Regex`).
+                    if word_literal_text(&pattern) == Some("]]") {
+                        return Err(ParseError::TestExprMissingOperand);
+                    }
+                    Ok(TestExpr::Regex { lhs, pattern })
+                }
                 "<" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
                 ">" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
                 "-eq" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntEq, lhs, rhs }) }
@@ -5551,6 +5579,43 @@ mod tests {
         diff_cmd("[[ $x =~ $? ]]");       // $?
         diff_cmd("[[ $x =~ a$ ]]");       // trailing lone $
         diff_cmd("[[ $x =~ .* ]]");       // metachars
+    }
+
+    /// v254 T1 review fix: the oracle treats empty `''` and `""` DIFFERENTLY in a
+    /// regex operand. `''` pushes a real `Literal{"",true}` (content → the space
+    /// terminates → `Ok`), but `""` pushes NOTHING (operand stays "unstarted" → the
+    /// space is skipped as still-leading → `]]` swallowed → `Err`). The atom path
+    /// makes `body_started` parser-managed + drops the injected empty-`""` marker.
+    #[test]
+    fn atoms_regex_empty_quotes() {
+        diff_err("[[ $x =~ \"\" ]]");   // empty dquote → both Err(Unterminated) (space skipped, ]] swallowed)
+        diff_cmd("[[ $x =~ '' ]]");     // empty squote → both Ok, pattern [Literal "" q:true], space terminates
+        diff_cmd("[[ $x =~ a\"\"b ]]"); // → both [Lit "a", Lit "b"] (empty dquote adds nothing)
+        diff_cmd("[[ $x =~ a''b ]]");   // → both [Lit "a", Lit "" q:true, Lit "b"] (empty squote kept)
+        diff_cmd("[[ $x =~ \"x\" ]]");  // non-empty dquote unaffected: pattern [Lit "x" q:true]
+        diff_cmd("[[ $x =~ abc ]]");    // no regression to the started/terminator logic
+        diff_cmd("[[ $x =~ (a b) ]]");  // paren-depth space still kept, terminator still fires
+    }
+
+    /// v254 T1 review MINOR — glued `=~<b`/`=~>b` live-flip carry-forward. With no
+    /// space, `<`/`>` is lexed as `Op(RedirIn/RedirOut)` in command mode and
+    /// buffered by `next_is_test_binary_operator_atom`'s peek2, so
+    /// `parse_regex_operand`'s first atom is that `Op` → `TestExprBadOperator`,
+    /// whereas the oracle scans `<b` INTO the regex operand. This is a known
+    /// divergence to reconcile BEFORE flipping `command_atoms` live; pin the
+    /// CURRENT behavior of both paths (they disagree: atom Err, oracle Ok).
+    #[test]
+    fn atoms_regex_glued_redir_carryforward() {
+        // Both paths ERROR (different kinds: atom `TestExprBadOperator` because the
+        // buffered `Op(RedirIn/RedirOut)` is the first regex atom; oracle
+        // `TestExprMissingOperand`). Pin the AGREEMENT that both reject; the exact
+        // error kind is a v254 live-flip carry-forward to reconcile before the
+        // `command_atoms` flip.
+        assert_eq!(new_seq("[[ a =~<b ]]").is_err(), old_seq("[[ a =~<b ]]").is_err());
+        assert_eq!(new_seq("[[ a =~>b ]]").is_err(), old_seq("[[ a =~>b ]]").is_err());
+        // SPACED forms (the supported v254 shape) fully agree on the AST:
+        diff_cmd("[[ a =~ <b ]]");  // spaced: `<b` is the operand on both
+        diff_cmd("[[ a =~ >b ]]");
     }
 
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the

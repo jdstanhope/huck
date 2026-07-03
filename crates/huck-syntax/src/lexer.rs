@@ -846,6 +846,18 @@ impl<'a> Lexer<'a> {
         self.modes.pop().expect("pop_mode on an empty mode stack")
     }
 
+    /// v254 T1 fix: set the current `Mode::Regex { body_started }` flag from the
+    /// parser (mirrors the `paren_depth` write-back in `scan_step_regex`). The
+    /// parser calls this after each assembled pattern atom with "has any content
+    /// been produced," so `body_started` tracks the oracle's
+    /// `!(lit.is_empty() && parts.is_empty())` — an empty `""` leaves it false. A
+    /// no-op if the top of the mode stack is not `Mode::Regex` (defensive).
+    pub(crate) fn set_regex_body_started(&mut self, v: bool) {
+        if let Some(Mode::Regex { body_started, .. }) = self.modes.last_mut() {
+            *body_started = v;
+        }
+    }
+
     /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
     /// sees is tokenized as `$(` + a subshell `(` rather than deferred as arith.
     /// Cleared the moment `scan_step_command_sub` consumes that `$(`.
@@ -3861,10 +3873,14 @@ impl<'a> Lexer<'a> {
             _ => {}
         }
 
-        // Mark the operand started (persist on the mode) for every non-terminator step.
-        if !body_started {
-            if let Some(Mode::Regex { body_started: b, .. }) = self.modes.last_mut() { *b = true; }
-        }
+        // `body_started` is PARSER-MANAGED (v254 T1 fix): the lexer only READS it
+        // (for the leading-ws/`\<NL>` skip above) and never self-sets it. The
+        // parser calls `set_regex_body_started(!(parts.is_empty()&&acc.is_none()))`
+        // after each atom, so `body_started` reflects the oracle's
+        // `!(lit.is_empty() && parts.is_empty())` — an EMPTY `""` produces NO part,
+        // leaving the operand "unstarted" so the following space is still treated as
+        // leading (skipped) and the oracle's `Err(UnterminatedDoubleBracket)` is
+        // reproduced. This scan still writes back `paren_depth` in the literal arm.
 
         match self.cursor.peek().copied() {
             // Unreachable: the terminator match above already returned on EOF.
