@@ -419,6 +419,8 @@ pub enum TokenKind {
     DeferredExpansion,   // $(...) inside a nested "..." operand span (both the continuing-dquote site and the first-char-of-a-newly-opened-dquote site) — still deferred: unquoted-operand $(cmd) handled by CmdSubOpen in v244; unquoted+continuing-dquote-operand backtick handled by BeginBacktick in v245 T6; unquoted-operand $(( handled by ArithOpen in v246 T6 (the in-dquote sites for $(cmd)/$(( stay deferred — see the ArithOpen wiring note at the continuing-dquote `$(` site)
     CmdSubOpen,          // $( opener atom — dual role: signal in an operand mode (v244 wiring), real opener in CommandSub mode
     ProcSubOpen { dir: ProcDir },  // v251: `<(`/`>(` word-part signal (unquoted); parser assembles WordPart::ProcessSub via Mode::CommandSub. Cursor is left on `(`.
+    ArrayOpen,   // v252: zero-width signal that a compound array RHS `(…)` follows an assignment prefix; cursor left on `(`. Parser pushes Mode::ArrayLiteral.
+    ArrayClose,  // v252: the `)` closing an array literal, emitted by Mode::ArrayLiteral.
     // --- Phase C v245: backtick command-substitution atoms (dormant until Task 2). ---
     BeginBacktick,       // opening ` — dual role: signal in an operand mode (v245 T6 wiring), real opener in Backtick mode
     EndBacktick,         // closing ` — emitted by scan_step_backtick when depth unwinds
@@ -632,7 +634,7 @@ pub(crate) enum Mode {
     // ever needs to distinguish a quoted-bit).
     Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
-    ArrayLiteral,   // a=( … )
+    ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
     Regex,          // RHS of =~
     HeredocBody,    // <<EOF …
@@ -935,6 +937,8 @@ impl<'a> Lexer<'a> {
             Mode::Arith { paren_depth, in_dquote, body_started } =>
                 self.scan_step_arith(paren_depth, in_dquote, body_started),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
+            Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
+                self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -2332,7 +2336,7 @@ impl<'a> Lexer<'a> {
                 skip_line_comment(&mut self.cursor);
             }
             '~' if !self.has_token || tilde_eligible_in_assignment(self.in_assignment_value, &self.current) => {
-                if let Some(spec) = try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
+                if let Some(spec) = try_parse_tilde(&mut self.cursor, self.in_assignment_value, false) {
                     flush_literal(&mut self.parts, &mut self.current, false);
                     self.has_token = true;
                     self.parts.push(WordPart::Tilde(spec));
@@ -2821,7 +2825,7 @@ impl<'a> Lexer<'a> {
             // Quoting + literal word text — one atom per call (`Lit` for a
             // maximal unquoted run, `QuoteRun` for one complete quoted run),
             // stopping at a blank / EOF / operator / metachar without consuming it.
-            Some(_) => self.scan_command_word_atom(),
+            Some(_) => self.scan_command_word_atom(false),
         }
     }
 
@@ -3235,7 +3239,21 @@ impl<'a> Lexer<'a> {
     /// a backtick, is swallowed into the surrounding literal run — wrong in
     /// general, but the T2 corpus never exercises it; T3 breaks these out into
     /// their own atoms.
-    fn scan_command_word_atom(&mut self) -> Result<Step, LexError> {
+    /// `in_array_value`: v252 T2 — when true, this is scanning a positional
+    /// value INSIDE `Mode::ArrayLiteral` rather than a top-level command word.
+    /// Every arm is shared verbatim (assignment-prefix, quotes, `$`/backtick
+    /// openers, tilde) — the ONLY difference is the plain-literal-run stop-set:
+    /// command position stops at the metacharacters `;|&<>()` (the top-level
+    /// scanner emits their own `Op` atom next call), but an array value has no
+    /// such operators — `|;&<>` and a bare `(` all stay literal, so the run
+    /// stops only at whitespace / a quote-or-`$`-or-backtick opener / the
+    /// array-closing `)` (mirrors the oracle's `scan_array_element_word`,
+    /// whose raw-buffer collector only special-cases those same chars before
+    /// re-tokenizing the whole element as a standalone word). The redirect-fd
+    /// look-back (`3>`, `{fd}<`) is command-position-only and skipped here —
+    /// with `<`/`>` no longer stop chars, the run never stops with the cursor
+    /// sitting on one, so that block would be dead code anyway.
+    fn scan_command_word_atom(&mut self, in_array_value: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
         let l   = self.cursor.line();
         let c   = self.cursor.column();
@@ -3406,11 +3424,17 @@ impl<'a> Lexer<'a> {
             // unquoted `=`/`:` (v247 T4; mirrors `tilde_eligible_in_assignment`).
             // Mid-word `~` elsewhere (`a~b`, `$x~`) is swallowed into the literal
             // run below. In value context `:` is a tilde TERMINATOR, so
-            // `try_parse_tilde` is told the assignment-value flag.
+            // `try_parse_tilde` is told the assignment-value flag. In an ARRAY
+            // VALUE (v252 T2), the closing `)` must ALSO count as a terminator
+            // (equivalently: end-of-word): the oracle collects each element into
+            // a BOUNDED raw buffer that never includes the closing `)`, then
+            // re-tokenizes that buffer standalone, so a trailing `~` there sees
+            // EOF, not `)` — our live-cursor scan sees the real `)` unless told
+            // to treat it as a boundary too.
             Some('~') if at_word_start || (self.in_assignment_value && tilde_ok) => {
                 self.cmd_at_word_start = false;
                 self.cursor.next(); // consume `~`
-                match try_parse_tilde(&mut self.cursor, self.in_assignment_value) {
+                match try_parse_tilde(&mut self.cursor, self.in_assignment_value, in_array_value) {
                     Some(spec) => {
                         self.history.push(Token::new(TokenKind::Tilde(spec), Span::new(off, l, c)));
                     }
@@ -3438,13 +3462,21 @@ impl<'a> Lexer<'a> {
                 // an assignment value and the last char accumulated is `=`/`:`.
                 let mut boundary = self.in_assignment_value && tilde_ok;
                 while let Some(&ch) = self.cursor.peek() {
-                    // Stop at whitespace, quote openers, expansion openers, and
-                    // (v247 T5) the command metacharacters `; | & < > ( )` — the
-                    // top-level scanner emits their structural token on the next
-                    // call. `#` is NOT a stop char: mid-word it is literal (`a#b`);
-                    // a word-start `#` is a comment, handled before this arm runs.
+                    // Stop at whitespace, quote openers, and expansion openers
+                    // always. At COMMAND position (v247 T5) also stop at the
+                    // metacharacters `; | & < > ( )` — the top-level scanner
+                    // emits their structural token on the next call. Inside an
+                    // ARRAY VALUE (v252 T2) there are no such operators — those
+                    // chars stay literal, so the run stops only at the closing
+                    // `)` (the array literal's own boundary), not at `(` (kept
+                    // literal — mirrors the oracle, which never nests `(`/`)`
+                    // tracking for a plain unquoted `(` in a value). `#` is NOT
+                    // a stop char either way: mid-word it is literal (`a#b`); a
+                    // word-start `#` is a comment, handled before this arm runs.
                     if ch.is_whitespace() { break; }
-                    if matches!(ch, '\'' | '"' | '\\' | '$' | '`'
+                    if in_array_value {
+                        if ch == ')' || matches!(ch, '\'' | '"' | '\\' | '$' | '`') { break; }
+                    } else if matches!(ch, '\'' | '"' | '\\' | '$' | '`'
                                     | ';' | '|' | '&' | '<' | '>' | '(' | ')') { break; }
                     if boundary && ch == '~' { break; }
                     text.push(ch);
@@ -3458,7 +3490,11 @@ impl<'a> Lexer<'a> {
                 // `at_word_start` guard is the atom analogue of the oracle
                 // classifying the ENTIRE flushed word: a run after earlier glued
                 // content (`x=2>`, `a3>`) is never a whole-word digit-run.
-                if at_word_start && matches!(self.cursor.peek(), Some('<') | Some('>')) {
+                // COMMAND-POSITION ONLY (v252 T2): with `<`/`>` no longer stop
+                // chars in an array value, the run never stops with the cursor
+                // sitting on one, so this block would never fire there anyway —
+                // `in_array_value` just documents that explicitly.
+                if !in_array_value && at_word_start && matches!(self.cursor.peek(), Some('<') | Some('>')) {
                     // Oracle special-case: a bare `1` glued to `>` (`1>`, `1>>`,
                     // `1>&2`, `1>|`) is a plain STDOUT redirect with the DEFAULT
                     // fd — NOT `RedirFd(1)` (`scan_step_command`'s `'1' if peek=='>'`
@@ -3542,6 +3578,15 @@ impl<'a> Lexer<'a> {
                     TokenKind::Lit { text: name, quoted: false },
                     Span::new(off, l, c),
                 ));
+                // v252: compound array RHS `name=(...)`. A `\<NL>` may sit between
+                // the prefix and `(` (bash deletes it). Mirror the production `=`
+                // arm's inline `(` probe: emit a zero-width ArrayOpen so the parser
+                // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
+                skip_line_continuations(&mut self.cursor);
+                if self.cursor.peek() == Some(&'(') {
+                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                }
                 Ok(Some(Step::Produced))
             }
             // `name+=` — scalar/array append. `name+x` (no `=`) is NOT an
@@ -3563,6 +3608,15 @@ impl<'a> Lexer<'a> {
                     },
                     Span::new(off, l, c),
                 ));
+                // v252: compound array RHS `name+=(...)`. A `\<NL>` may sit between
+                // the prefix and `(` (bash deletes it). Mirror the production `=`
+                // arm's inline `(` probe: emit a zero-width ArrayOpen so the parser
+                // pushes Mode::ArrayLiteral. Cursor is LEFT on `(`.
+                skip_line_continuations(&mut self.cursor);
+                if self.cursor.peek() == Some(&'(') {
+                    let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                    self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                }
                 Ok(Some(Step::Produced))
             }
             // `name[sub]=` / `name[sub]+=` — subscripted lvalue. Speculatively scan
@@ -3615,6 +3669,16 @@ impl<'a> Lexer<'a> {
                             },
                             Span::new(off, l, c),
                         ));
+                        // v252: compound array RHS `name[sub]=(...)` / `name[sub]+=(...)`.
+                        // A `\<NL>` may sit between the prefix and `(` (bash deletes it).
+                        // Mirror the scalar `=`/`+=` arms' inline `(` probe: emit a
+                        // zero-width ArrayOpen so the parser pushes Mode::ArrayLiteral.
+                        // Cursor is LEFT on `(`.
+                        skip_line_continuations(&mut self.cursor);
+                        if self.cursor.peek() == Some(&'(') {
+                            let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                            self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
+                        }
                         Ok(Some(Step::Produced))
                     }
                     None => {
@@ -3734,6 +3798,139 @@ impl<'a> Lexer<'a> {
                     Span::new(off, l, c),
                 ));
                 Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v252 T1/T2: `Mode::ArrayLiteral { body_started }` scanner — emits the
+    /// inner atoms of a `name=(...)`/`name+=(...)` compound array RHS. On entry
+    /// (`body_started == false`) the cursor sits on the opening `(` (the parser
+    /// consumed the zero-width `ArrayOpen` signal but not the `(` itself);
+    /// consume it, flip the frame, and scan the first inner atom in the same
+    /// call. T1 scope was POSITIONAL values as a bare literal run stopping at
+    /// whitespace/`)`. T2 widens the value content itself: each value is
+    /// scanned exactly like a fresh command word (quote/`$`/backtick openers,
+    /// tilde, assignment-prefix recognition — ALL shared with
+    /// `scan_command_word_atom`) via its `in_array_value` stop-set, mirroring
+    /// the oracle's `scan_array_element_word`, which collects the element's raw
+    /// text (preserving nested quote/expansion bodies verbatim) and then
+    /// RE-TOKENIZES it as a standalone word — so e.g. `a=(a=~)`'s element gets
+    /// the SAME assignment-prefix + value-tilde treatment a fresh word would.
+    /// Bracketed subscripts (`[i]=value`) are NOT wired here (Task 3 widens
+    /// this). Mirrors `scan_array_literal`/`scan_array_element_word`'s
+    /// separator/value grammar.
+    fn scan_step_array_literal(&mut self, body_started: bool, expect_subscript_eq: bool, at_element_start: bool) -> Result<Step, LexError> {
+        if !body_started {
+            debug_assert_eq!(self.cursor.peek(), Some(&'('), "array-literal entry: expected '('");
+            self.cursor.next(); // consume opening '('
+            if let Some(Mode::ArrayLiteral { body_started, .. }) = self.modes.last_mut() {
+                *body_started = true;
+            }
+            // Each value is scanned as a FRESH word (mirrors the oracle
+            // re-tokenizing the collected element text from scratch): reset the
+            // word-start/assignment-value state so `try_scan_assign_prefix` and
+            // value-tilde eligibility see a clean slate for the first value.
+            self.cmd_at_word_start = true;
+            self.in_assignment_value = false;
+            self.assign_val_tilde_ok = false;
+            // fall through to scan the first atom (at_element_start is already
+            // true from the push, so a leading `[` opens a subscript).
+        }
+        // v252 T3: control has returned from the parser's `[expr]` subscript scan
+        // (the cursor sits just past `]`). The oracle (`scan_array_literal`)
+        // requires a `=` here — consume it, clear the flag, and scan the value's
+        // first atom in this same call. `at_element_start` is already false (it was
+        // cleared when the `LBracket` was emitted), so the value's leading char —
+        // even a `[` — is treated as literal, not another subscript. If `=` is
+        // absent → ArrayLiteralMissingEquals.
+        if expect_subscript_eq {
+            if let Some(Mode::ArrayLiteral { expect_subscript_eq: e, .. }) = self.modes.last_mut() {
+                *e = false;
+            }
+            if self.cursor.peek() == Some(&'=') {
+                self.cursor.next(); // consume the required '='
+            } else {
+                return Err(LexError::ArrayLiteralMissingEquals);
+            }
+        }
+        let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+        match self.cursor.peek().copied() {
+            None => Err(LexError::UnterminatedArrayLiteral),
+            Some(')') => {
+                self.cursor.next();
+                self.history.push(Token::new(TokenKind::ArrayClose, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Inter-element separators: whitespace / newline / `#`-comment.
+            // Coalesce a maximal run into ONE Blank atom (a comment consumes to EOL,
+            // its body — incl. any `)` — never read as elements; matches
+            // skip_array_literal_separators). Never emit content for a separator.
+            //
+            // NOTE: a bare `\<NL>` line continuation is NOT a separator — it is
+            // GLUE (bash deletes it), so it must fall through to the value
+            // scanner below when it abuts element text with no surrounding
+            // whitespace (`1\<NL>2` -> one element `12`). It is still handled
+            // INSIDE the coalescing loop below so a continuation that follows
+            // real whitespace (`1 \<NL>2`) is absorbed into that separator run.
+            Some(ch) if ch.is_whitespace() || ch == '#' => {
+                loop {
+                    match self.cursor.peek().copied() {
+                        Some(w) if w.is_whitespace() => { self.cursor.next(); }
+                        Some('#') => { while let Some(&x) = self.cursor.peek() { if x == '\n' { break; } self.cursor.next(); } }
+                        Some('\\') => {
+                            let mut p = self.cursor.clone(); p.next();
+                            if p.peek() == Some(&'\n') { self.cursor.next(); self.cursor.next(); } else { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                self.history.push(Token::new(TokenKind::Blank, Span::new(off, l, c)));
+                // The NEXT value (if any) starts a fresh word — same reset as
+                // the entry bootstrap above. A separator opens a NEW element, so
+                // the persistent `at_element_start` flips back to true (a `[`
+                // right after this separator is a subscript, not a literal).
+                self.cmd_at_word_start = true;
+                self.in_assignment_value = false;
+                self.assign_val_tilde_ok = false;
+                if let Some(Mode::ArrayLiteral { at_element_start, .. }) = self.modes.last_mut() {
+                    *at_element_start = true;
+                }
+                Ok(Step::Produced)
+            }
+            // v252 T3: a `[` AT ELEMENT START begins an explicit `[expr]=value`
+            // subscript (mirrors the oracle's leading-`[` sniff in
+            // `scan_array_literal`). Emit a zero-width `LBracket`; the parser
+            // pushes `Mode::ParamSubscriptOperand`, assembles the subscript Word,
+            // consumes `RBracket`, pops — then the required `=` is consumed by the
+            // `expect_subscript_eq` block above on the next `scan_step`. The guard
+            // uses the PERSISTENT `at_element_start` (true only right after `(` or a
+            // separator, before ANY value atom of this element): a `[` mid-value —
+            // e.g. after a `$x`/quote atom that ended a prior scan_step, or in the
+            // same run — stays literal (BUG-1 fix). Clear it here: emitting the
+            // subscript ends the element's start.
+            Some('[') if at_element_start => {
+                self.cursor.next(); // consume '['
+                if let Some(Mode::ArrayLiteral { expect_subscript_eq, at_element_start, .. }) = self.modes.last_mut() {
+                    *expect_subscript_eq = true;
+                    *at_element_start = false;
+                }
+                self.history.push(Token::new(TokenKind::LBracket, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Value content — shares `scan_command_word_atom`'s full atom
+            // classification (quotes/`$`/backtick/tilde/assignment-prefix),
+            // just with the array-value stop-set (`in_array_value = true`):
+            // the plain-literal run stops ONLY at whitespace / `)` / a quote
+            // or `$`/backtick opener — `|;&<>` and a bare `(` all stay literal.
+            // Emitting a value atom ends the element's start, so subsequent
+            // scan_step re-entries (for the next atom of THIS same value — a
+            // quote/`$`/backtick/tilde that ended its own call) see
+            // `at_element_start == false` and keep a mid-value `[` literal.
+            _ => {
+                if let Some(Mode::ArrayLiteral { at_element_start, .. }) = self.modes.last_mut() {
+                    *at_element_start = false;
+                }
+                self.scan_command_word_atom(true)
             }
         }
     }
@@ -4326,7 +4523,7 @@ fn emit_word_with_braces(
 /// parts (expansions, quoted runs) are sentinel-protected so only literal
 /// source braces expand. Shared by `emit_word_with_braces` (command words)
 /// and `scan_array_literal` (bare array elements).
-fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
+pub(crate) fn brace_expand_parts(parts: Vec<WordPart>) -> Result<Vec<Vec<WordPart>>, LexError> {
     if !word_contains_unquoted_brace(&parts) {
         return Ok(vec![parts]);
     }
@@ -6817,11 +7014,21 @@ fn is_name_cont(c: char) -> bool {
 /// On success, returns the `TildeSpec` (consuming any extra chars, e.g.
 /// the `+` in `~+`). On failure, leaves the iterator untouched and
 /// returns `None` (the caller treats `~` as a literal).
+///
+/// `in_array_value` (v252 T2): true when scanning an ATOM-path array-literal
+/// value. The oracle (`scan_array_element_word`) collects each element into a
+/// bounded raw buffer that never includes the element's closing `)`, then
+/// re-tokenizes that buffer standalone — so a trailing `~` there sees EOF, not
+/// `)`. Our atom scanner runs directly against the live source cursor (no
+/// bounded buffer), so it must be told to treat the array's closing `)` as an
+/// end-of-word terminator too, or a value-final `~` (`a=(a=~)`) would see the
+/// real `)` and wrongly fail to recognize the tilde.
 fn try_parse_tilde(
     chars: &mut CharCursor<'_>,
     in_assignment_value: bool,
+    in_array_value: bool,
 ) -> Option<TildeSpec> {
-    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':');
+    let term = |c: char| is_tilde_terminator(c) || (in_assignment_value && c == ':') || (in_array_value && c == ')');
     match chars.peek().copied() {
         // Bare ~ at end of word.
         None => Some(TildeSpec::Home),

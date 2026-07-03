@@ -9,8 +9,9 @@ use crate::command::{
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
 };
 use crate::lexer::{
-    CaseDirection, Lexer, Mode, Operator, ParamModifier, ParamOpKind, ProcDir, SubstAnchor,
-    SubstKind, SubscriptKind, TokenKind, TransformOp, Word, WordPart,
+    brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
+    ParamOpKind, ProcDir, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
+    WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -127,6 +128,14 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
             None
             | Some(TokenKind::Blank)
             | Some(TokenKind::Newline)
+            // v252 T3 (BUG-2 fix): break WITHOUT consuming on `ArrayClose` too, so
+            // an EMPTY subscripted value immediately before `)` (`a=([0]=)`) yields
+            // `Word([])` (normalized to an empty literal by the caller) instead of
+            // consuming the `)` and erroring `UnexpectedToken`. `ArrayClose` is
+            // emitted ONLY inside `Mode::ArrayLiteral`, so no other caller is
+            // affected, and the enclosing `parse_array_literal` loop consumes the
+            // `ArrayClose` on its next iteration.
+            | Some(TokenKind::ArrayClose)
             | Some(TokenKind::Op(_)) => break,
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? {
@@ -162,6 +171,13 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 iter.next_kind()?;
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_command_sub(iter, quoted)?);
+            }
+            // v252: compound array RHS. The prefix part (Literal "name=" or
+            // AssignPrefix) is already accumulated; glue the ArrayLiteral after it.
+            Some(TokenKind::ArrayOpen) => {
+                iter.next_kind()?;            // discard the signal (cursor on `(`)
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_array_literal(iter)?);
             }
             // `<`/`>` are POSIX operator characters — unlike `$(`/`` ` ``, a
             // `<(`/`>(` process substitution ALWAYS ends any word already in
@@ -867,6 +883,85 @@ pub(crate) fn parse_process_sub(iter: &mut Lexer, dir: ProcDir) -> Result<WordPa
     };
     iter.pop_mode();
     Ok(WordPart::ProcessSub { sequence, dir })
+}
+
+/// v252 T1: assemble `WordPart::ArrayLiteral` from atoms under
+/// `Mode::ArrayLiteral`. The caller (`parse_word_command`'s `ArrayOpen` arm)
+/// has already discarded the zero-width `ArrayOpen` signal; the cursor is on
+/// `(`. Positional values (bare elements, brace-expanded via
+/// `brace_expand_parts`) and — v252 T3 — explicit `[expr]=value` subscripted
+/// elements (single value, NO brace expansion). Owns the full push/pop
+/// lifecycle of its `ArrayLiteral` frame; pops on every exit path.
+pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::ArrayLiteral { body_started: false, expect_subscript_eq: false, at_element_start: true });
+    let mut elements: Vec<ArrayLiteralElement> = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::Blank) | Some(TokenKind::Newline) => { iter.next_kind()?; }
+            Some(TokenKind::ArrayClose) => { iter.next_kind()?; break; }
+            // v252 T3: an explicit `[expr]=value` element. The lexer emitted a
+            // zero-width `LBracket` at element start; assemble the subscript Word
+            // under `Mode::ParamSubscriptOperand` (identical to the `${a[i]}`
+            // reader at parse_param_expansion), then the lexer consumes the
+            // required `=` (or errors `ArrayLiteralMissingEquals`) as we scan the
+            // value. Subscripted values keep single-value semantics — NO brace
+            // expansion (matches `scan_array_literal`).
+            Some(TokenKind::LBracket) => {
+                iter.next_kind()?; // consume LBracket
+                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+                let sub_word = match parse_word(iter, false) {
+                    Ok(w) => w,
+                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
+                };
+                match iter.next_kind() {
+                    Ok(Some(TokenKind::RBracket)) => {}
+                    Ok(_) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::UnsupportedExpansion); }
+                    Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
+                }
+                iter.pop_mode(); // ParamSubscriptOperand
+                // The lexer consumes the required `=` (or errors
+                // ArrayLiteralMissingEquals) as `parse_word_command` scans on.
+                let value = match parse_word_command(iter, false) {
+                    Ok(v) => v,
+                    Err(e) => { iter.pop_mode(); return Err(e); }
+                };
+                // An empty value (`[i]= ` / `[i]=)`) re-tokenizes to a single
+                // empty literal in the oracle (`scan_array_element_word`'s
+                // `words.is_empty()` fallback), NOT an empty Word.
+                let value = if value.0.is_empty() {
+                    Word(vec![WordPart::Literal { text: String::new(), quoted: false }])
+                } else {
+                    value
+                };
+                elements.push(ArrayLiteralElement { subscript: Some(sub_word), value });
+            }
+            Some(_) => {
+                // A positional value: parse_word_command stops at the next
+                // Blank/Newline/ArrayClose (its catch-all arm breaks WITHOUT
+                // consuming once something has been accumulated — see its doc
+                // comment). Then brace-expand (bare elements only).
+                let value = match parse_word_command(iter, false) {
+                    Ok(v) => v,
+                    Err(e) => { iter.pop_mode(); return Err(e); }
+                };
+                match brace_expand_parts(value.0) {
+                    Ok(expansions) => {
+                        for p in expansions {
+                            elements.push(ArrayLiteralElement { subscript: None, value: Word(p) });
+                        }
+                    }
+                    Err(e) => { iter.pop_mode(); return Err(ParseError::Lex(Box::new(e))); }
+                }
+            }
+            // Unreachable: `scan_step_array_literal` errors with
+            // `LexError::UnterminatedArrayLiteral` on EOF before ever handing
+            // back a bare `None` token, so `peek_kind()` surfaces that as an
+            // `Err` (caught by the `?` above) rather than `Ok(None)`.
+            None => unreachable!("Mode::ArrayLiteral never yields None; EOF errors first"),
+        }
+    }
+    iter.pop_mode();
+    Ok(WordPart::ArrayLiteral(elements))
 }
 
 /// Parse the body of a backtick substitution: a `Sequence` of commands
@@ -1703,12 +1798,21 @@ fn parse_simple_with_leading_word(
             // after words (command.rs, e.g. `parse(vec![w_tok("echo"),
             // w_tok("hi"), Op(LParen)])` asserts `Err(UnexpectedToken)`).
             // Match it for parity instead of the generic deferral below —
-            // UNLESS the last word is assignment-shaped (`name=`/`name+=`),
-            // in which case this `(` is instead an ARRAY-LITERAL value
-            // opener (`a=(1 2 3)`) — a deliberately DEFERRED atom-path
-            // construct (see `atoms_deferred_unsupported` /
-            // `atoms_function_assignment_name_divergence`), so keep the
-            // pre-existing `UnsupportedCommand` deferral for that case.
+            // UNLESS the last word is assignment-shaped (`name=`/`name+=`).
+            // NOTE (v252 T1): a `(` glued RIGHT AFTER `name=`/`name+=` (the
+            // real array-literal case, `a=(1 2 3)`) never reaches this arm at
+            // all any more — the assignment-prefix scan already emits the
+            // zero-width `ArrayOpen` signal there, which `parse_word_command`
+            // glues into the SAME word (see its `ArrayOpen` arm and
+            // `parse_array_literal`), so it never surfaces as a standalone
+            // `Op(LParen)` token here. What DOES still reach this branch is a
+            // bare `(` separated by whitespace/boundary from an
+            // assignment-shaped word — e.g. `a=b () { :; }` (see
+            // `atoms_function_assignment_name_divergence`) — which stays a
+            // deliberate `UnsupportedCommand` deferral (unrelated to array
+            // literals; the oracle's `(` funcdef-name check fires before its
+            // assignment check for `a=b`, a shape the atom path doesn't
+            // reconcile).
             TokenKind::Op(Operator::LParen) => {
                 if all_words.last().is_some_and(crate::command::is_assignment_word) {
                     return Err(ParseError::UnsupportedCommand);
@@ -1848,23 +1952,72 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // consuming the word exactly once, and when it is NOT a funcdef, hand the
     // already-assembled word straight to `parse_simple_with_leading_word`
     // instead of rewinding and re-parsing it.
+    // v252 T4: an ASSIGNMENT-PREFIX leading atom (`a+=`/`a[i]=`/`a[i]+=`, emitted
+    // by the lexer as a zero-width `AssignPrefix` atom, unlike the plain `a=`
+    // form which is a `Lit("a=")`) must ALSO reach this funcdef-lookahead path,
+    // NOT fall through to `parse_simple`. Otherwise `a+=(1)(2)` / `a[0]=(1)(2)`
+    // (a CLOSED array literal glued before a second `(`) would reach
+    // `parse_simple`'s trailing-`Op(LParen)` arm → `UnsupportedCommand`, while
+    // the oracle attempts `parse_function_def` on the whole assembled word and
+    // gets `FunctionName` (a multi-part / non-Literal word is not a valid
+    // function name). Admitting `AssignPrefix` here routes those through the
+    // SAME `consume_command_word` + funcdef-attempt logic below for parity. This
+    // does NOT affect ordinary array/scalar assignments (`a+=(1 2)`, `a[0]=(1 2)`,
+    // `a[i]=x`) — they have no following second `(`, so the funcdef attempt is
+    // never entered and they fall through to `parse_simple_with_leading_word`.
     if matches!(
         iter.peek_kind()?,
-        Some(TokenKind::Word(_)) | Some(TokenKind::Lit { quoted: false, .. })
+        Some(TokenKind::Word(_))
+            | Some(TokenKind::Lit { quoted: false, .. })
+            | Some(TokenKind::AssignPrefix { .. })
     ) {
         let line = iter.current_line()?;
         let name_word = consume_command_word(iter)?;
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
-        // An assignment-shaped leading word (`name=`/`name=value`) is never a
-        // function name — a `(` glued right after it is the START of an
-        // array-literal VALUE (`a=(1 2 3)`), which the oracle's word-lexer
-        // absorbs into the assignment word itself (never surfacing a
-        // standalone `LParen` next to the word at all). The atom path defers
-        // array literals at command position (still `UnsupportedCommand`,
-        // unchanged from before this task) — excluding assignment-shaped
-        // words here keeps that deferral instead of misrouting into
-        // `parse_function_def` (which would wrongly error `FunctionBody`).
-        if !crate::command::is_assignment_word(&name_word)
+        // A `(` glued right after `name=`/`name+=` (the real array-literal
+        // case, `a=(1 2 3)`) never reaches this check at all — the
+        // assignment-prefix scan already emitted the zero-width `ArrayOpen`
+        // signal there, which `parse_word_command` glues into the SAME word
+        // (see its `ArrayOpen` arm and `parse_array_literal`), so `peek_kind()`
+        // sees `ArrayOpen`, not `Op(LParen)`, here regardless of any guard.
+        //
+        // What DOES reach this point with `peek_kind() == Op(LParen)` is a
+        // standalone `(` that is NOT array-literal glue: either (a) a `(`
+        // after a CLOSED array literal (`a=(one)(two)`, `a+=(1)(2)`,
+        // `a[0]=(1)(2)`) or a subshell after an empty/plain scalar value
+        // (`a= (subshell)`, `a=b (subshell)`, `a+= (subshell)`), or (b) the
+        // funcdef form `name ()`. The oracle (command.rs) attempts
+        // `parse_function_def` UNCONDITIONALLY whenever the leading word is
+        // followed by `(` — its own `valid_function_name_text` is what rejects
+        // non-funcdef shapes, and it accepts a word ONLY when it is a SINGLE
+        // unquoted `Literal` that is not a keyword. So for EVERY other assembled
+        // word — a multi-part word (`[Literal("a="), ArrayLiteral(..)]`,
+        // `[AssignPrefix, ArrayLiteral(..)]`) OR a single-part `AssignPrefix`
+        // word (`[AssignPrefix]`, which is NOT a `Literal`) — the oracle's
+        // `parse_function_def` correctly falls through to `FunctionName`, so
+        // attempting it on the atom path is SAFE and CORRECT (converges on the
+        // same `FunctionName` error).
+        //
+        // The ONE shape that must still be diverted away from
+        // `parse_function_def` is a single-part unquoted-`Literal` assignment
+        // word (`a=b`, `a=`): `valid_function_name_text` accepts it as a name
+        // (it does NOT special-case the `=`-containing spelling), so the oracle
+        // actually ACCEPTS `a=b () {…}` as `FunctionDef{name:"a=b"}` — a KNOWN,
+        // PINNED v248 divergence (see `atoms_function_assignment_name_divergence`):
+        // the atom path deliberately keeps deferring that one case (bash itself
+        // rejects it as a syntax error, so the divergence is judged closer to
+        // bash). The skip condition is therefore precisely "an assignment word
+        // the oracle WOULD accept as a function name" =
+        // `is_assignment_word(&w) && valid_function_name_text(&w).is_some()`,
+        // which is true ONLY for the single-Literal assignment shape and false
+        // for the array/subscript (`ArrayLiteral`) and `AssignPrefix` shapes —
+        // so those correctly reach the funcdef attempt and get `FunctionName`
+        // parity. `parse_simple_with_leading_word` below is what actually
+        // assembles ordinary assignments (`a=(1 2 3)`, `a+=(1 2)`, `a[i]=x`),
+        // which have no following `(` and never enter the funcdef attempt.
+        let oracle_accepts_as_name = crate::command::is_assignment_word(&name_word)
+            && crate::command::valid_function_name_text(&name_word).is_some();
+        if !oracle_accepts_as_name
             && matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
         {
             return parse_function_def(name_word, iter);
@@ -3322,6 +3475,223 @@ mod tests {
         );
     }
 
+    // ── v252 T1: positional array literals ───────────────────────────────────
+
+    #[test]
+    fn atoms_array_literal_rich_values() {
+        diff_cmd("a=(\"x y\" 'z' bare)");            // double/single/bare
+        diff_cmd("a=($x ${y} ${z:-d})");             // param expansions
+        diff_cmd("a=($(echo hi) `echo bye`)");       // command subs
+        diff_cmd("a=($((1 + 2)) end)");              // arith
+        diff_cmd("a=(~ ~/x a=~)");                   // tilde eligibility
+        // NOTE: the brief's literal case was `[ab]c` (a bracket AT the START
+        // of a value) — that collides with the ORACLE's pre-existing (T1-era,
+        // out-of-scope-for-T2) array-literal subscript sniff: ANY value
+        // beginning with `[` unconditionally attempts `[expr]=` subscript
+        // parsing (`scan_array_literal`), and `[ab]c` has no `=` after `]`, so
+        // the oracle itself errors (`ArrayLiteralMissingEquals`) — even the
+        // LEX stage fails (`old_seq`'s `tokenize_with_opts(...).expect("lex")`
+        // panics), so no diff/err helper can express it. That leading-`[`
+        // sniff is Task 3's territory ("do NOT touch subscripts"), so this
+        // uses a mid-value bracket instead — still proves globs/brackets stay
+        // literal in a value, without hitting the deferred subscript sniff.
+        diff_cmd("a=(*.txt foo?bar pre[ab]c)");      // globs (patterns kept literal in AST)
+        diff_cmd("a=(pre$xpost \"$mix\"tail)");      // adjacency/glue within a value
+        diff_cmd("a=(\n  one\n  two\n)");            // newline separators
+        diff_cmd("a=(one # comment\n two)");         // comment separator
+        diff_cmd("arr=\\\n(1 2)");                   // `\<NL>` between prefix and `(`
+        diff_cmd("a=(foo\\ bar)");                   // backslash-escaped space stays one element
+    }
+
+    // ── v252 merge-gate fix: `\<NL>` line continuation is GLUE, not a
+    // separator, when it abuts element text with no surrounding whitespace.
+    #[test]
+    fn atoms_array_literal_line_continuation() {
+        diff_cmd("a=(1\\\n2)");           // glued: one element `12`
+        diff_cmd("a=(1 \\\n2)");          // space then continuation
+        diff_cmd("a=(1\\\n 2)");          // continuation then space
+        diff_cmd("a=(\\\n1)");            // leading continuation
+        diff_cmd("a=(1\\\n2\\\n3)");      // multiple glued continuations
+        diff_cmd("a=([0]=a\\\nb)");       // glued continuation inside a subscripted value
+        diff_cmd("a=(a\\\nb c)");         // glued then a real (space) separator
+    }
+
+    #[test]
+    fn atoms_array_literal_positional() {
+        diff_cmd("a=(1 2 3)");
+        diff_cmd("a=()");                 // empty
+        diff_cmd("a=(x)");                // single
+        diff_cmd("a=(  1   2  )");        // extra spaces
+        diff_cmd("arr+=(4 5)");           // append form
+        diff_cmd("a=(a|b c;d e<f)");      // |;&<> literal inside values
+        diff_cmd("a=({1..3})");           // brace-expanded bare element -> 1 2 3
+        diff_cmd("a=(x{a,b}y)");          // brace expansion with prefix/suffix
+        diff_cmd("pre a=(1 2) post");     // assignment mid-command still one word
+    }
+
+    #[test]
+    fn atoms_array_literal_subscripts() {
+        diff_cmd("a=([0]=x [1]=y)");             // explicit subscripts
+        diff_cmd("a=([2]=two 1 [0]=zero)");      // mixed positional + subscripted
+        diff_cmd("a=([i+1]=v)");                 // arithmetic subscript expr
+        diff_cmd("a=([k]={a,b})");               // subscripted: brace stays LITERAL (no expansion)
+        diff_cmd("m[k]=(1 2)");                  // name[sub]=(…) prefix form
+        diff_cmd("m[k]+=(3)");                   // name[sub]+=(…) prefix form
+        diff_cmd("a=([0]= [1]=y)");              // empty subscripted value
+        diff_cmd("a=([$i]=v [x]=$y)");           // expansion in subscript and value
+        diff_cmd("a=([0]=x[1]y)");               // `[` MID-value stays literal
+    }
+
+    #[test]
+    fn atoms_array_literal_subscript_regressions() {
+        // BUG 1 (regression of T1/T2): a `[` MID-value, AFTER a non-literal atom
+        // that ended its own scan_step, must stay LITERAL — not open a subscript.
+        diff_cmd("a=($x[0])");                   // positional value $x[0]
+        diff_cmd("a=(pre$x[0]post)");            // positional, glued around `$x`
+        diff_cmd("a=([0]=$y[1]z)");              // subscripted value $y[1]z
+        diff_cmd("a=([0]=\"x\"[1]z)");           // subscripted value "x"[1]z (after a quote)
+        // BUG 2: a subscripted EMPTY value immediately before `)` → empty element,
+        // not an UnexpectedToken error.
+        diff_cmd("a=([0]=)");                    // sole empty subscripted value
+        diff_cmd("a=([2]=two [0]=)");            // empty value as the LAST element
+    }
+
+    #[test]
+    fn atoms_array_literal_error_parity() {
+        // `[i]` without `=` → ArrayLiteralMissingEquals on BOTH paths (lexer-level).
+        // The oracle's `old_seq` panics on a lex error (`tokenize_with_opts(..).expect`),
+        // so compare against the fallible `tokenize_with_opts` directly.
+        assert!(new_seq("a=([0])").is_err());
+        assert!(tokenize_with_opts("a=([0])", LexerOptions::default()).is_err());
+        // Leading `[…]` with no `=` after `]` (the T2-deferred `[ab]c` case).
+        assert!(new_seq("a=([ab]c)").is_err());
+        assert!(tokenize_with_opts("a=([ab]c)", LexerOptions::default()).is_err());
+        // EOF before `)` → UnterminatedArrayLiteral on both.
+        assert!(new_seq("a=(1 2").is_err());
+        assert!(tokenize_with_opts("a=(1 2", LexerOptions::default()).is_err());
+        assert!(new_seq("a=(").is_err());
+        assert!(tokenize_with_opts("a=(", LexerOptions::default()).is_err());
+    }
+
+    #[test]
+    fn atoms_array_literal_append_subscript_funcdef_parity() {
+        // v252 T4 review follow-up: `AssignPrefix`-prefixed leading words
+        // (`a+=…`/`a[i]=…`/`a[i]+=…`) are lexed with a leading zero-width
+        // `AssignPrefix` atom (unlike plain `a=…`, a `Lit("a=")`), so before
+        // this fix they SKIPPED the funcdef-lookahead dispatch entirely and
+        // fell to `parse_simple` → the trailing-`Op(LParen)` arm →
+        // `UnsupportedCommand`, diverging from the oracle's `FunctionName`.
+        // The outer dispatch gate now admits a leading `AssignPrefix`, so a
+        // CLOSED array literal glued before a second `(` reaches the same
+        // funcdef attempt and gets `FunctionName` parity (a multi-part /
+        // non-Literal word is not a valid function name). Error-parity (both
+        // sides `Err(FunctionName)`), not `diff_cmd` (which requires `Ok`).
+        assert_eq!(new_seq("a+=(1)(2)"), old_seq("a+=(1)(2)"), "error parity for \"a+=(1)(2)\"");
+        assert_eq!(new_seq("a[0]=(1)(2)"), old_seq("a[0]=(1)(2)"), "error parity for \"a[0]=(1)(2)\"");
+        assert!(matches!(new_seq("a+=(1)(2)"), Err(ParseError::FunctionName)),
+            "a+=(1)(2) → FunctionName, got {:?}", new_seq("a+=(1)(2)"));
+        assert!(matches!(new_seq("a[0]=(1)(2)"), Err(ParseError::FunctionName)),
+            "a[0]=(1)(2) → FunctionName, got {:?}", new_seq("a[0]=(1)(2)"));
+        // Bonus reconciliation (same root cause): a single-part `AssignPrefix`
+        // word (empty value) followed by `(` is NOT a valid function name on
+        // the oracle either (`AssignPrefix` is not a `Literal`), so both give
+        // `FunctionName` — unlike the v248-pinned single-`Literal` `a=b ()`
+        // shape, which the oracle accepts as `FunctionDef` (still deferred).
+        assert_eq!(new_seq("a+= (echo hi)"), old_seq("a+= (echo hi)"), "error parity for \"a+= (echo hi)\"");
+
+        // REGRESSION GUARD: ordinary append/subscript assignments (no following
+        // second `(`) must still parse as normal assignment simple-commands —
+        // the funcdef attempt must never be entered for these.
+        diff_cmd("a+=(1 2)");     // append array literal
+        diff_cmd("a+=(1)");       // append single-element array literal
+        diff_cmd("a[0]=(1 2)");   // subscripted array literal
+        diff_cmd("a[i]=x");       // subscripted SCALAR assignment
+        diff_cmd("a=(1 2)");      // plain (Literal-prefixed) array literal, unchanged
+    }
+
+    #[test]
+    fn atoms_array_literal_declare_routing() {
+        // If declare/local args route through the command-word path, these are
+        // diff_cmd. If they route through DeclArg (different path), replace each
+        // with the observed-actual behavior and leave a NOTE comment documenting
+        // the deferral (per spec: declare is deferred ONLY if it routes differently).
+        diff_cmd("declare -a x=(1 2)");
+        diff_cmd("local a=(1 2)");
+        diff_cmd("export e=(1)");
+        diff_cmd("readonly r=(1)");
+    }
+
+    #[test]
+    fn atoms_array_literal_corpus() {
+        diff_cmd("a=(${arr[@]} ${arr[*]})");        // array expansions as values
+        diff_cmd("a=(x=y z=w)");                     // `=`-containing values (NOT subscripts)
+        diff_cmd("a=(=leading)");                    // value starting with `=`
+        // `)(` — a `(` glued right after a CLOSED array literal is NOT array
+        // glue (that only happens for the FIRST `(` immediately after `name=`/
+        // `name+=`, captured as the zero-width `ArrayOpen` atom). The oracle
+        // attempts a function-definition parse for ANY leading word followed
+        // by `(`; `valid_function_name_text` then rejects the multi-part
+        // assignment word (`[Literal("a="), ArrayLiteral(..)]`, not a single
+        // Literal) with `FunctionName`. v252 T4 tightened the
+        // `parse_command_or_pipeline` guard (was: any `is_assignment_word`
+        // word never attempts funcdef) to skip the funcdef attempt ONLY when
+        // the oracle would accept the word as a function name
+        // (`is_assignment_word(&w) && valid_function_name_text(&w).is_some()` —
+        // exactly the single unquoted-`Literal` shape like `a=b`), preserving
+        // the v248-pinned `a=b () {…}` divergence (see
+        // `atoms_function_assignment_name_divergence`), so a closed array
+        // literal (and the `AssignPrefix`-led `a+=(..)`/`a[i]=(..)` shapes) now
+        // falls through to the SAME `FunctionName` error as the oracle.
+        assert_eq!(new_seq("a=(one)(two)"), old_seq("a=(one)(two)"), "error parity for \"a=(one)(two)\"");
+        diff_cmd("a=(a)b");                          // text glued after the close paren
+        diff_cmd("cmd a=(1 2) b=(3 4)");             // two array assignments in one command
+        diff_cmd("a=(   )");                         // whitespace-only body == empty
+        diff_cmd("a=(\n)");                          // newline-only body == empty
+        // "nots a =(1 2)" — space before `=` means `a` and `=(1` are SEPARATE
+        // words (`=(1` is not assignment-shaped, so no array literal is even
+        // attempted); both paths reject the same way, but neither actually
+        // returns `Ok` (bash: `a` is a bare word, `=(1` and `2)` are literal
+        // args to `nots`, which IS valid... but on both paths here the `(`/`)`
+        // inside `=(1` and `2)` are lexed as bare `Op(LParen)`/`Op(RParen)`
+        // operator tokens at word-start, which is unexpected in argument
+        // position) — use error-PARITY, not `diff_cmd` (which requires `Ok`
+        // on both sides).
+        assert_eq!(new_seq("nots a =(1 2)"), old_seq("nots a =(1 2)"), "error parity for \"nots a =(1 2)\"");
+
+        // T2 carry-forward: `a=(x=(1 2) y)` — a NESTED array literal AS AN
+        // ELEMENT VALUE. NOT a `diff_cmd`: the oracle's `scan_array_element_word`
+        // scans an element's raw text up to the first unescaped whitespace/`)`
+        // WITHOUT tracking `(` nesting at all, then re-tokenizes that (possibly
+        // truncated) substring. For this input the raw text is cut at the space
+        // inside "x=(1 2)" (giving "x=(1"), and re-tokenizing "x=(1" recurses into
+        // `scan_array_literal` for the embedded `=(` with no closing `)` in the
+        // truncated slice — so the ORACLE ITSELF fails to lex this input
+        // (`UnterminatedArrayLiteral`), confirmed against real bash 5.2 (`bash -c
+        // 'a=(x=(1 2) y)'` → "syntax error near unexpected token `('" — bash
+        // doesn't support this construct either). The atom path's `ArrayOpen`
+        // recursion in `parse_word_command` is more general than the oracle's
+        // element scanner: it happily recurses into a nested `Mode::ArrayLiteral`
+        // and parses the inner array correctly, so it currently ACCEPTS input the
+        // oracle (and bash) reject. Bit-for-bit reproducing the oracle's
+        // incidental truncate-then-retokenize failure is disproportionate for a
+        // construct with no real bash meaning — documented here as a narrow,
+        // low-severity, atom-more-permissive gap (candidate follow-on `[deferred]`
+        // divergence for the whole-branch review), not pinned or forced to pass.
+        assert!(tokenize_with_opts("a=(x=(1 2) y)", LexerOptions::default()).is_err());
+        assert!(new_seq("a=(x=(1 2) y)").is_ok());
+
+        // `a=($(cat <<X\nhi\nX\n))` (heredoc-in-cmdsub as an array element) is
+        // DELIBERATELY OMITTED here: it hits the documented v250 gap where a
+        // heredoc's body is dropped when the heredoc sits inside a `$(…)`/`` `…` ``
+        // body (the parser's redirect-attach walk doesn't recurse into
+        // `WordPart::CommandSub`/`Backtick`/`Arith` sequences) — a known,
+        // pre-existing carry-forward, not an array-literal bug. Confirmed by
+        // direct comparison: `old_seq` fills the heredoc `body` with
+        // `[Literal("hi"), Literal("\n", quoted:true)]`; `new_seq` gives
+        // `body: Word([])`. Per the brief: drop the line, rely on the existing
+        // carry-forward note, do not pin new.
+    }
+
     #[test]
     fn atoms_dquote_nested() {
         diff_cmd("echo \"$(echo hi)\"");
@@ -3379,10 +3749,12 @@ mod tests {
         // `name()` funcdef form (see `atoms_function_paren_form`).
         // NOTE: `cat <<EOF\nx\nEOF` (expanding heredoc) is NO LONGER deferred —
         // v250 T4 implements expanding-heredoc bodies (see `atoms_heredoc_expanding`).
+        // NOTE: `a=(1 2 3)` (positional array literal) is NO LONGER deferred —
+        // v252 T1 implements `name=(…)`/`name+=(…)` via `Mode::ArrayLiteral`
+        // (see `atoms_array_literal_positional`).
         for s in [
             "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
             "coproc x { :; }",
-            "a=(1 2 3)",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
             "echo $[1+2]", "echo pre$[1+2]post",
