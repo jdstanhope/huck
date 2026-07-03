@@ -5642,6 +5642,41 @@ mod tests {
         diff_cmd("[[ $x =~ a]] ]]");             // pattern `a]]`, then space, then `]]` closes
     }
 
+    /// v254 T3: regex as a PRIMARY in the `[[ ]]` cascade — composed with
+    /// `&&`/`||`, grouping `( … )`, negation `!`, a following normal binary,
+    /// and under a leading inline assignment. Exercises `parse_test_and`/
+    /// `parse_test_or`/`parse_test_not`/`parse_test_primary` around
+    /// `TestExpr::Regex` byte-identically to the oracle.
+    #[test]
+    fn atoms_regex_composition() {
+        diff_cmd("[[ -f a && $x =~ b|c ]]");     // regex after &&
+        diff_cmd("[[ $x =~ a || $y =~ b ]]");    // regex on both sides of ||
+        diff_cmd("[[ ( $x =~ b ) ]]");           // grouped regex
+        diff_cmd("[[ ! $x =~ b ]]");             // negated regex
+        diff_cmd("[[ $x =~ a && $y == b ]]");    // regex then a normal binary
+        diff_cmd("FOO=hi [[ $FOO =~ h.* ]]");    // regex under an inline assignment
+    }
+
+    /// v254 T3: adversarial corpus — POSIX classes, alternation groups, escaped
+    /// metachars, param-default/backtick/cmdsub expansions, mixed quoting, and
+    /// the two UNBALANCED-PAREN cases that keep `paren_depth > 0` so the
+    /// trailing ` ]]` is swallowed as literal whitespace/text inside the still-
+    /// open group, running the operand to EOF → `Err(UnterminatedDoubleBracket)`
+    /// on both paths.
+    #[test]
+    fn atoms_regex_corpus() {
+        diff_cmd("[[ $x =~ a*b? ]]");                 // glob-like quantifiers (literal in ERE)
+        diff_cmd("[[ $x =~ [[:alpha:]]+ ]]");         // POSIX class (nested [] and :)
+        diff_cmd("[[ $x =~ (foo|bar)+baz ]]");        // alternation inside a group
+        diff_cmd("[[ $x =~ a\\|b ]]");                // escaped pipe → literal `\|`
+        diff_cmd("[[ $x =~ ${a:-def} ]]");            // param default inside pattern
+        diff_cmd("[[ $x =~ `echo re` ]]");            // backtick command-sub
+        diff_cmd("[[ $x =~ \"a b\"c'd e' ]]");        // dquote + literal + squote (spaces via quotes)
+        diff_cmd("[[ $x =~ pre$(cmd)post ]]");        // cmdsub glued between literals
+        diff_err("[[ $x =~ a(b ]]");                  // unbalanced `(` → depth stays >0, ` ]]` swallowed literal → EOF → Unterminated
+        diff_err("[[ $x =~ (a b ]]");                 // unbalanced open group swallows ` ]]` (depth>0 ws literal) → Unterminated
+    }
+
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
     // T1 cascade — see `parse_test_or`/`parse_test_and`/`parse_test_not`).
     #[test]
