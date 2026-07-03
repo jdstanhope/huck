@@ -2445,7 +2445,7 @@ fn is_test_expr_stop(iter: &mut Lexer) -> Result<bool, ParseError> {
 /// `parse_test_atom` below. `<` / `>` arrive as `Op(RedirIn)` / `Op(RedirOut)`;
 /// every other operator arrives as a `Word` because the lexer has no dedicated
 /// token for it.
-fn next_is_test_binary_operator(
+pub(crate) fn next_is_test_binary_operator(
     iter: &mut Lexer,
 ) -> Result<bool, ParseError> {
     Ok(match iter.peek_kind()? {
@@ -2461,7 +2461,7 @@ fn next_is_test_binary_operator(
 
 /// Skips zero or more `TokenKind::Newline` tokens inside a `[[ … ]]` expression.
 /// Bash treats newlines as whitespace anywhere inside `[[ ]]`.
-fn skip_test_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
+pub(crate) fn skip_test_newlines(iter: &mut Lexer) -> Result<(), ParseError> {
     while matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
         iter.next_kind()?;
     }
@@ -2483,7 +2483,7 @@ pub fn word_literal_text(w: &Word) -> Option<&str> {
 /// Try to parse a unary test operator from a Word token.  Returns `Some(op)`
 /// if the word is a single unquoted literal matching one of the file/string
 /// test flags, otherwise `None`.
-fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
+pub(crate) fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
     match word_literal_text(w)? {
         "-e" => Some(TestUnaryOp::FileExists),
         "-f" => Some(TestUnaryOp::IsRegFile),
@@ -2514,7 +2514,7 @@ fn try_unary_op(w: &Word) -> Option<TestUnaryOp> {
 
 
 /// Returns true if `w` is the literal word `!` (unquoted).
-fn is_bang_word(tok: &TokenKind) -> bool {
+pub(crate) fn is_bang_word(tok: &TokenKind) -> bool {
     match tok {
         TokenKind::Word(w) => word_literal_text(w) == Some("!"),
         _ => false,
