@@ -1757,6 +1757,33 @@ fn parse_simple_with_leading_word(
             iter.next_kind()?;
             continue;
         }
+        // v253 T3: an inline-assignment PREFIX immediately followed by `[[`
+        // (`FOO=1 [[ … ]]`, `A=1 B=2 [[ … ]]`) routes to `Command::DoubleBracket`
+        // with the peeled assignments as `inline_assignments`, mirroring the
+        // oracle's assignment-peel → `parse_double_bracket_with_assigns`
+        // dispatch (command.rs `parse_command_inner`). Forward-only and
+        // rewind-free: `peek_leading_keyword` skips blanks and PEEKS the `[[`
+        // keyword (consuming nothing), so on a match we dispatch straight into
+        // `parse_double_bracket`, which re-reads the still-pending `[[` — we
+        // never rewind over the already-assembled assignment words (heeding the
+        // mark-after-peek hazard). Guarded to a PURE assignment prefix with no
+        // redirects collected yet: the oracle only peels consecutive assignment
+        // WORDS, so a redirect (or a non-assignment word) before `[[` breaks the
+        // peel and this command falls through to the ordinary simple path.
+        if !all_words.is_empty()
+            && redirects.is_empty()
+            && all_words.iter().all(crate::command::is_assignment_word)
+            && peek_leading_keyword(iter)? == Some(Keyword::DoubleBracketOpen)
+        {
+            let mut assigns: Vec<Assignment> = Vec::new();
+            for w in all_words {
+                match crate::command::try_split_assignment(w) {
+                    Ok(a) => assigns.push(a),
+                    Err(_) => unreachable!("is_assignment_word confirmed assignment shape"),
+                }
+            }
+            return parse_double_bracket(iter, assigns);
+        }
         // A command word begins here — assemble it from atoms (v247 T3: plain/
         // quoted/glued literals + command-position expansions `$x`/`${…}`/`$(…)`/
         // `$((…))`/`~`/`"…"`). A LEADING `` ` `` is handled by the BeginBacktick
@@ -5284,41 +5311,37 @@ mod tests {
         diff_unsupported("[[ a =~ $x ]]"); // SPACED =~ IS recognized → hits the deferral (UnsupportedCommand)
     }
 
-    /// KNOWN divergence (discovered during v253 T1): the oracle special-cases
-    /// an inline-assignment PREFIX immediately followed by `[[` (`FOO=1 [[ … ]]`)
-    /// — it speculatively peels leading assignment words and, if `[[` follows,
-    /// attaches them as `Command::DoubleBracket`'s `inline_assignments` (see
-    /// command.rs's `parse_command_inner`, the `Some(Keyword::DoubleBracketOpen)`
-    /// check at the end of the assignment-peeling loop). The atom path's `[[`
-    /// dispatch (`parse_command`'s `Some(Keyword::DoubleBracketOpen)` arm) only
-    /// fires when `[[` is the FIRST atom of the command — an assignment prefix
-    /// routes through the ordinary funcdef-lookahead → `parse_simple_with_leading_word`
-    /// path instead, which has no `[[`-awareness, so `[[`/`-f`/`a`/`]]` end up as
-    /// four ordinary command WORDS (`SimpleCommand` with `program: "[["`) rather
-    /// than a `DoubleBracket`. This is a TEMPORARY T1-state marker, NOT a
-    /// permanent pin: v253 Task 3
-    /// (docs/superpowers/plans/2026-07-03-v253-double-bracket.md, Task 3 Step 2)
-    /// is scoped to CLOSE it by threading the peeled inline-assignments into the
-    /// `DoubleBracket` dispatch, at which point this test flips to a `diff_cmd`.
-    /// (Unlike the v248 `a=b () {...}` pin, which is a genuine intentional
-    /// divergence — bash itself rejects that form.)
+    /// v253 T3: an inline-assignment PREFIX immediately followed by `[[`
+    /// (`FOO=1 [[ … ]]`) routes to `Command::DoubleBracket` with the peeled
+    /// assignments attached as `inline_assignments`, byte-identical to the
+    /// oracle (command.rs's `parse_command_inner`, the assignment-peeling loop
+    /// that dispatches to `parse_double_bracket_with_assigns` when `[[` follows).
+    /// This closes the T1-state `atoms_double_bracket_assign_prefix_divergence`
+    /// pin. The atom-path interception lives in
+    /// `parse_simple_with_leading_word`'s word-assembly loop: BEFORE assembling
+    /// the next word, if every word collected so far is an assignment word AND
+    /// `[[` follows, the collected words are peeled into `Vec<Assignment>` and
+    /// dispatched to `parse_double_bracket(iter, assigns)` — forward-only
+    /// (peek the keyword, then dispatch), no `mark`/`rewind`.
     #[test]
-    fn atoms_double_bracket_assign_prefix_divergence() {
-        assert!(
-            matches!(
-                new_seq("x=1 [[ -f a ]]"),
-                Ok(Some(Sequence { first: Command::Pipeline(_), .. }))
-            ),
-            "atom path treats `x=1 [[ -f a ]]` as an ordinary pipeline, got {:?}",
-            new_seq("x=1 [[ -f a ]]"),
-        );
-        assert!(
-            matches!(
-                old_seq("x=1 [[ -f a ]]"),
-                Ok(Some(Sequence { first: Command::DoubleBracket { .. }, .. }))
-            ),
-            "oracle attaches the assignment prefix to DoubleBracket (documents the divergence)",
-        );
+    fn atoms_double_bracket_inline_assignments() {
+        diff_cmd("FOO=hi [[ -n $FOO ]]");
+        diff_cmd("A=1 B=2 [[ $A == 1 ]]");        // multiple leading assignments
+        diff_cmd("x=y [[ $x == y && -n $x ]]");
+        diff_cmd("x=1 [[ -f a ]]");                // the former T1 pin case
+    }
+
+    /// v253 T3 (OBSERVATION): `[[ ]]` used as a pipeline / logical / negated /
+    /// sequence stage or as an `if` condition. The T1 `[[` dispatch fires
+    /// wherever a command is parsed, so the compound-stage wiring already
+    /// covers these (as it does for `if`/`while`).
+    #[test]
+    fn atoms_double_bracket_as_stage() {
+        diff_cmd("[[ -f a ]] && echo yes");        // as && stage
+        diff_cmd("[[ -f a ]] || echo no");         // as || stage
+        diff_cmd("! [[ -f a ]]");                  // negated command
+        diff_cmd("[[ -f a ]]; echo done");         // in a sequence
+        diff_cmd("if [[ -n $x ]]; then echo y; fi"); // as an if condition
     }
 
     /// `=~` is DEFERRED (v254): `parse_test_atom` must bail with
@@ -5332,6 +5355,12 @@ mod tests {
         diff_unsupported("[[ a =~ b* ]]");
         diff_unsupported("[[ $x =~ ^[0-9]+$ ]]");
         diff_unsupported("[[ -f a && $x =~ y ]]"); // deferral inside a logical expr
+        // v254 will make these diff_cmd. For v253 the atom path defers on `=~`
+        // BEFORE reading the regex RHS; the oracle parses TestExpr::Regex.
+        assert!(matches!(new_seq("[[ x =~ ^a.*b$ ]]"), Err(ParseError::UnsupportedCommand)));
+        assert!(matches!(new_seq("[[ $s =~ [0-9]+ ]]"), Err(ParseError::UnsupportedCommand)));
+        // And the oracle DOES support them (sanity — different result, hence not diff_cmd):
+        assert!(old_seq("[[ x =~ ^a.*b$ ]]").is_ok());
     }
 
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
