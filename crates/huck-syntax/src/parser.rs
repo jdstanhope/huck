@@ -5589,7 +5589,7 @@ mod tests {
     /// makes `body_started` parser-managed + drops the injected empty-`""` marker.
     #[test]
     fn atoms_regex_empty_quotes() {
-        diff_err("[[ $x =~ \"\" ]]");   // empty dquote → both Err(Unterminated) (space skipped, ]] swallowed)
+        diff_err("[[ $x =~ \"\" ]]");   // empty dquote → both Err(TestExprMissingOperand) (space skipped, pattern becomes `]]`, rejected as operand)
         diff_cmd("[[ $x =~ '' ]]");     // empty squote → both Ok, pattern [Literal "" q:true], space terminates
         diff_cmd("[[ $x =~ a\"\"b ]]"); // → both [Lit "a", Lit "b"] (empty dquote adds nothing)
         diff_cmd("[[ $x =~ a''b ]]");   // → both [Lit "a", Lit "" q:true, Lit "b"] (empty squote kept)
@@ -5617,6 +5617,25 @@ mod tests {
         // SPACED forms (the supported v254 shape) fully agree on the AST:
         diff_cmd("[[ a =~ <b ]]");  // spaced: `<b` is the operand on both
         diff_cmd("[[ a =~ >b ]]");
+    }
+
+    /// v254 live-flip carry-forward (PRE-EXISTING, inherited): `$"…"` locale
+    /// quoting. The oracle's `scan_dollar_expansion` drops the `$` for `$"`
+    /// (locale-translation = identity), yielding pattern `[Literal "abc"
+    /// quoted:true]`, but the shared `emit_unquoted_dollar_atom` classifier has
+    /// no `$"` arm, so the atom path emits `DollarLit` + `BeginDquote` →
+    /// pattern `[Literal "$", Literal "abc" quoted:true]`. This gap is NOT
+    /// introduced by v254 — it affects command position too (`echo $"hi"`
+    /// diverges the same way) — so it is pinned here, not fixed: reconcile in
+    /// the shared `$`-classifier before flipping `command_atoms` live.
+    #[test]
+    fn atoms_regex_dollar_dquote_carryforward() {
+        let s = "[[ $x =~ $\"abc\" ]]";
+        let n = new_seq(s);
+        let o = old_seq(s);
+        assert!(n.is_ok(), "expected atom path Ok for {s:?}, got {n:?}");
+        assert!(o.is_ok(), "expected oracle Ok for {s:?}, got {o:?}");
+        assert_ne!(n.unwrap(), o.unwrap(), "expected a KNOWN AST divergence for {s:?}");
     }
 
     /// v254 T2: systematic quoting/escapes/continuations/terminator-edges
