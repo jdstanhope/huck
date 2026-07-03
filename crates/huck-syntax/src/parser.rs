@@ -1311,6 +1311,17 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 /// `Mode::Arith { body_started: true }`, makes the next pull enter
 /// `scan_step_arith`'s body loop directly — the `$((`-opener branch (and its
 /// `$`-assert) is never reached.
+///
+/// `mark()` is taken here, AFTER `parse_command`'s `peek_kind`/`peek2_kind` `((`
+/// lookahead — unlike the v248 mark-after-peek hazard (which involved
+/// non-idempotent word-content scanning that could leave scanner flags mutated
+/// from prior state), this is safe: the two peeked atoms are always
+/// `Op(LParen)`, whose operator scan unconditionally ends in `boundary_reset()`
+/// (`cmd_at_word_start = true`, etc.) regardless of what came before, and
+/// `parse_command` is only ever entered at a genuine command-word boundary. So
+/// the scanner flags that this `mark()` snapshots are identical to what a
+/// fresh scan at the pre-`((` position would produce, and the `ArithBail`
+/// `rewind` below re-scans correctly.
 fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
