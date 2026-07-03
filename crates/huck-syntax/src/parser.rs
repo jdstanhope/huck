@@ -3016,6 +3016,19 @@ fn skip_test_ws(iter: &mut Lexer) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Skips ONLY inter-atom `Blank` tokens (never `Newline`) inside `[[ … ]]`.
+/// Used at the operand/operator BOUNDARY positions where the oracle skips
+/// NOTHING (a `Blank` is invisible to the oracle's Word-lexer, but a `Newline`
+/// is significant there — it must reach the operand check and trip
+/// `TestExprMissingOperand`/`UnterminatedDoubleBracket`, matching the oracle).
+/// Contrast `skip_test_ws` (Blank+Newline), used ONLY at the four positions
+/// where the oracle calls `skip_test_newlines` (after `[[`, the `||`/`&&`
+/// loops, before `]]`).
+fn skip_test_blanks(iter: &mut Lexer) -> Result<(), ParseError> {
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+    Ok(())
+}
+
 /// v253: atom-native `[[ … ]]`. Mirrors command.rs's
 /// `parse_double_bracket_with_assigns`, but reads operands via
 /// `parse_word_command` (the atom stream has `Lit` atoms, not pre-lexed `Word`
@@ -3070,14 +3083,16 @@ fn parse_test_and(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 /// Next precedence: `!` (right-associative). Reuses parser.rs's own
 /// atom-aware `is_bang_word` (defined above for pipeline negation) rather than
 /// the oracle's `Word`-only version, since the atom stream's `!` arrives as a
-/// bare unquoted `Lit` atom. Leads with `skip_test_ws`: this is the single
-/// chokepoint EVERY "start of an operand expression" funnels through (initial
-/// operand, rhs of `&&`/`||`, recursive `!` operand, and — since
-/// `parse_test_primary`/`parse_test_atom` consume nothing before reaching
-/// here — the grouping-open and plain-atom cases too), so skipping here alone
-/// establishes the "no pending Blank" invariant the rest of the cascade relies on.
+/// bare unquoted `Lit` atom. Leads with `skip_test_blanks` (NOT `skip_test_ws`):
+/// this is the "start of an operand expression" position, where the oracle
+/// skips NOTHING. A pending `Blank` must be dropped (it's invisible to the
+/// oracle), but a pending `Newline` must NOT be — for the grouping first
+/// operand (`[[ (\na ) ]]`) and the post-`!` operand (`[[ !\nx ]]`), the
+/// oracle leaves the newline in place so it reaches `parse_test_atom` and
+/// errors `TestExprMissingOperand`. Skipping it here would wrongly accept
+/// those inputs (the T1-review CRITICAL bug).
 fn parse_test_not(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
-    skip_test_ws(iter)?;
+    skip_test_blanks(iter)?;
     if iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
         iter.next_kind()?;
         let inner = parse_test_not(iter)?;
@@ -3091,10 +3106,14 @@ fn parse_test_primary(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
         iter.next_kind()?;
         let inner = parse_test_or(iter)?;
-        // A Blank can sit right before `)` (`( a == b )`); skip_test_ws is a
-        // no-op when the cascade above already drained it (the common case),
-        // so this is a safety net, not a duplicate consumer.
-        skip_test_ws(iter)?;
+        // The oracle does NOT skip newlines before `)` in parse_test_primary —
+        // any newline before `)` was already consumed by `parse_test_or`'s
+        // trailing `skip_test_newlines` (mirrored by our `parse_test_or`'s
+        // trailing `skip_test_ws`), which always runs before returning here. So
+        // only a stray `Blank` could remain; drop it with `skip_test_blanks`
+        // (Blank-only), NOT `skip_test_ws` — this is not an oracle
+        // `skip_test_newlines` site.
+        skip_test_blanks(iter)?;
         match iter.next_kind()? {
             Some(TokenKind::Op(Operator::RParen)) => {}
             None => return Err(ParseError::UnterminatedDoubleBracket),
@@ -3106,16 +3125,29 @@ fn parse_test_primary(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 }
 
 /// Reads one operand `Word` inside `[[ ]]`. EOF → `UnterminatedDoubleBracket`;
-/// a `]]`/`)`/operator where an operand was expected → `TestExprMissingOperand`.
-/// Leading `skip_test_ws`: this is called right after a unary op word or a
-/// binary op word, either of which can be followed by a pending `Blank`.
+/// a `]]`/`)`/operator/`Newline` where an operand was expected →
+/// `TestExprMissingOperand`. Leading `skip_test_blanks` (NOT `skip_test_ws`):
+/// this is called right after a unary or binary operator, exactly where the
+/// oracle's `next_test_word` (command.rs) skips NOTHING. A pending `Blank`
+/// (invisible to the oracle) is dropped, but a pending `Newline` is
+/// significant — it means "no operand on this line", so it must fall through
+/// to the guard below and yield `TestExprMissingOperand` (e.g. `[[ -f\nx ]]`,
+/// `[[ a ==\nb ]]`), matching the oracle. `RedirFd`/`Heredoc` (non-word-start
+/// atoms that would otherwise be handed to `parse_word_command` → the wrong
+/// `UnexpectedToken` variant) are likewise rejected here as missing operands.
 fn next_test_word_atom(iter: &mut Lexer) -> Result<Word, ParseError> {
-    skip_test_ws(iter)?;
+    skip_test_blanks(iter)?;
     match iter.peek_kind()? {
         None => return Err(ParseError::UnterminatedDoubleBracket),
         Some(tok) => {
             if keyword_of_consumed(tok) == Some(Keyword::DoubleBracketClose)
-                || matches!(tok, TokenKind::Op(_))
+                || matches!(
+                    tok,
+                    TokenKind::Op(_)
+                        | TokenKind::Newline
+                        | TokenKind::RedirFd(_)
+                        | TokenKind::Heredoc { .. }
+                )
             {
                 return Err(ParseError::TestExprMissingOperand);
             }
@@ -3182,9 +3214,22 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
         }
         _ => {}
     }
-    // A leading operator (not `(`, already handled by parse_test_primary) where
-    // an operand was expected.
-    if matches!(iter.peek_kind()?, Some(TokenKind::Op(_))) {
+    // A leading non-operand atom where an operand was expected: an operator
+    // (not `(`, already handled by parse_test_primary), a `Newline` (the oracle
+    // leaves a newline at the first-operand position — e.g. `[[ (\na ) ]]`,
+    // `[[ !\nx ]]` — where its `parse_test_atom` matches only a `Word` and
+    // returns `TestExprMissingOperand` for anything else), or a non-word-start
+    // `RedirFd`/`Heredoc`. All → `TestExprMissingOperand`, matching the oracle's
+    // `_ => Err(TestExprMissingOperand)` first-word match.
+    if matches!(
+        iter.peek_kind()?,
+        Some(
+            TokenKind::Op(_)
+                | TokenKind::Newline
+                | TokenKind::RedirFd(_)
+                | TokenKind::Heredoc { .. }
+        )
+    ) {
         return Err(ParseError::TestExprMissingOperand);
     }
 
@@ -3196,9 +3241,14 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
     }
 
     let lhs = first;
-    // A Blank sits between the operand and the operator/terminator that
-    // follows it (`parse_word_command` stops at `Blank` without consuming it).
-    skip_test_ws(iter)?;
+    // A Blank sits between the operand and the operator/terminator that follows
+    // it (`parse_word_command` stops at `Blank` without consuming it). Use
+    // `skip_test_blanks` (NOT `skip_test_ws`): the oracle checks the operator
+    // IMMEDIATELY after the lhs with no newline-skip, so a `Newline` here must
+    // stay to make `next_is_test_binary_operator_atom` see it (→ lone-word,
+    // leaving whatever follows for the `]]`-consume to trip on). Skipping it
+    // would wrongly glue an operator on the next line (`[[ a\n== b ]]`).
+    skip_test_blanks(iter)?;
     if !next_is_test_binary_operator_atom(iter)? {
         return Ok(TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, operand: lhs });
     }
@@ -5408,23 +5458,42 @@ mod tests {
         diff_cmd("[[ a ||\n b ]]");                 // newline after ||
     }
 
+    /// T1-review CRITICAL regression: a `Newline` at an operand/operator
+    /// BOUNDARY (where the oracle skips nothing) must NOT be skipped — the atom
+    /// path previously used `skip_test_ws` (Blank+Newline) at three such sites
+    /// and wrongly ACCEPTED multi-line inputs the oracle REJECTS. `skip_test_ws`
+    /// is now confined to the four oracle `skip_test_newlines` sites; the
+    /// boundary sites use `skip_test_blanks` (Blank-only), and the newline
+    /// reaches the operand check → the same error the oracle raises.
+    #[test]
+    fn atoms_double_bracket_newline_boundaries() {
+        diff_err("[[ -f\nx ]]");    // unary operand on next line → TestExprMissingOperand (both)
+        diff_err("[[ a ==\nb ]]");  // binary rhs on next line → TestExprMissingOperand (both)
+        diff_err("[[ a\n== b ]]");  // operator on next line → lone-word then leftover → UnterminatedDoubleBracket (both)
+        diff_err("[[ (\na ) ]]");   // newline after `(` (grouping first operand) → TestExprMissingOperand (both)
+        diff_err("[[ !\nx ]]");     // newline after `!` (post-negation operand) → TestExprMissingOperand (both)
+        // The LEGIT multi-line cases (newline breaks only at the four oracle
+        // skip sites) still parse identically — see also
+        // `atoms_double_bracket_precedence`.
+        diff_cmd("[[\n  a == b\n]]");
+        diff_cmd("[[ a\n&&\nb ]]");
+        diff_cmd("[[ a ||\n b ]]");
+    }
+
     // v253 T4: error-parity hardening (Empty/Unterminated/MissingOperand plus
     // unary/binary operand-missing variants). `TestExprBadOperator` is
     // defensively unreachable on both paths (see `atoms_double_bracket_extra`'s
     // `[[ a ~~ b ]]` note) so it is not exercised here as a distinct variant.
     #[test]
     fn atoms_double_bracket_errors() {
-        // Both paths error the same way (parser-level).
-        assert_eq!(new_seq("[[ ]]").is_err(), old_seq("[[ ]]").is_err());          // EmptyDoubleBracket
-        assert_eq!(new_seq("[[ a == b").is_err(), old_seq("[[ a == b").is_err());  // UnterminatedDoubleBracket (EOF)
-        assert_eq!(new_seq("[[ < b ]]").is_err(), old_seq("[[ < b ]]").is_err());   // MissingOperand (leading Op)
-        assert_eq!(new_seq("[[ == b ]]").is_err(), old_seq("[[ == b ]]").is_err()); // `==` is a Word → lone-word then leftover `b` → Unterminated
-        assert_eq!(new_seq("[[ -f ]]").is_err(), old_seq("[[ -f ]]").is_err());     // unary missing operand
-        assert_eq!(new_seq("[[ a == ]]").is_err(), old_seq("[[ a == ]]").is_err()); // binary missing rhs
-        // Same ERROR VARIANT where both are parser-level:
-        assert_eq!(new_seq("[[ ]]"), old_seq("[[ ]]"));
-        assert_eq!(new_seq("[[ a == b"), old_seq("[[ a == b"));
-        assert_eq!(new_seq("[[ -f ]]"), old_seq("[[ -f ]]"));
+        // Same ERROR VARIANT on both paths (full `Result` equality, not just
+        // is_err()==is_err()).
+        diff_err("[[ ]]");          // EmptyDoubleBracket
+        diff_err("[[ a == b");      // UnterminatedDoubleBracket (EOF)
+        diff_err("[[ < b ]]");      // MissingOperand (leading Op)
+        diff_err("[[ == b ]]");     // `==` is a Word → lone-word then leftover `b` → Unterminated
+        diff_err("[[ -f ]]");       // unary missing operand
+        diff_err("[[ a == ]]");     // binary missing rhs
     }
 
     // v253 T4: adversarial corpus (expansions/quotes/globs/tokenization edges).
