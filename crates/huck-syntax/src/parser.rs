@@ -330,8 +330,9 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             // `parse_dquote`'s wrapper; but DROP the injected empty-`""` marker
             // (`[Literal{"",true}]`) so an empty `""` contributes no part — that is
             // what leaves the operand "unstarted" (via `set_regex_body_started`
-            // below) and reproduces the oracle's `Err(UnterminatedDoubleBracket)`
-            // for `[[ $x =~ "" ]]`, and drops the middle part in `a""b`.
+            // below) so the pattern becomes the literal `]]` → the `=~` arm guard
+            // reproduces the oracle's `Err(TestExprMissingOperand)` for
+            // `[[ $x =~ "" ]]`, and drops the middle part in `a""b`.
             Some(TokenKind::BeginDquote) => {
                 iter.next_kind()?; flush_lit(&mut acc, &mut parts);
                 match parse_dquote(iter, false)? {

@@ -3879,8 +3879,9 @@ impl<'a> Lexer<'a> {
         // after each atom, so `body_started` reflects the oracle's
         // `!(lit.is_empty() && parts.is_empty())` — an EMPTY `""` produces NO part,
         // leaving the operand "unstarted" so the following space is still treated as
-        // leading (skipped) and the oracle's `Err(UnterminatedDoubleBracket)` is
-        // reproduced. This scan still writes back `paren_depth` in the literal arm.
+        // leading (skipped); the pattern then becomes the literal `]]`, which the
+        // oracle's `next_test_word` rejects as `Err(TestExprMissingOperand)` (see the
+        // `=~` arm guard). This scan still writes back `paren_depth` in the literal arm.
 
         match self.cursor.peek().copied() {
             // Unreachable: the terminator match above already returned on EOF.
