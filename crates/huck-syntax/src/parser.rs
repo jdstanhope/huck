@@ -5407,4 +5407,39 @@ mod tests {
         diff_cmd("[[\n  a == b\n]]");               // newlines after [[ and before ]]
         diff_cmd("[[ a ||\n b ]]");                 // newline after ||
     }
+
+    // v253 T4: error-parity hardening (Empty/Unterminated/MissingOperand plus
+    // unary/binary operand-missing variants). `TestExprBadOperator` is
+    // defensively unreachable on both paths (see `atoms_double_bracket_extra`'s
+    // `[[ a ~~ b ]]` note) so it is not exercised here as a distinct variant.
+    #[test]
+    fn atoms_double_bracket_errors() {
+        // Both paths error the same way (parser-level).
+        assert_eq!(new_seq("[[ ]]").is_err(), old_seq("[[ ]]").is_err());          // EmptyDoubleBracket
+        assert_eq!(new_seq("[[ a == b").is_err(), old_seq("[[ a == b").is_err());  // UnterminatedDoubleBracket (EOF)
+        assert_eq!(new_seq("[[ < b ]]").is_err(), old_seq("[[ < b ]]").is_err());   // MissingOperand (leading Op)
+        assert_eq!(new_seq("[[ == b ]]").is_err(), old_seq("[[ == b ]]").is_err()); // `==` is a Word → lone-word then leftover `b` → Unterminated
+        assert_eq!(new_seq("[[ -f ]]").is_err(), old_seq("[[ -f ]]").is_err());     // unary missing operand
+        assert_eq!(new_seq("[[ a == ]]").is_err(), old_seq("[[ a == ]]").is_err()); // binary missing rhs
+        // Same ERROR VARIANT where both are parser-level:
+        assert_eq!(new_seq("[[ ]]"), old_seq("[[ ]]"));
+        assert_eq!(new_seq("[[ a == b"), old_seq("[[ a == b"));
+        assert_eq!(new_seq("[[ -f ]]"), old_seq("[[ -f ]]"));
+    }
+
+    // v253 T4: adversarial corpus (expansions/quotes/globs/tokenization edges).
+    #[test]
+    fn atoms_double_bracket_corpus() {
+        diff_cmd("[[ \"$x\" == \"$y\" ]]");          // quoted operands
+        diff_cmd("[[ ${a[0]} -gt 0 ]]");             // subscript expansion operand
+        diff_cmd("[[ $(cmd) == out ]]");             // command-sub operand
+        diff_cmd("[[ a=b ]]");                       // `a=b` is ONE word (lone-word -n), NOT an assignment
+        diff_cmd("[[ -n a=b ]]");
+        diff_cmd("[[ x != y* ]]");                   // glob pattern RHS of !=
+        diff_cmd("[[ -f 'a b' ]]");                  // quoted operand w/ space
+        diff_cmd("[[ a\\ b == c ]]");                // escaped space in operand
+        diff_cmd("[[ ! ( a == b ) || c ]]");         // ! before a group
+        diff_cmd("[[ -e / ]]");
+        diff_cmd("[[ -o errexit ]]");                // -o shell-option unary
+    }
 }
