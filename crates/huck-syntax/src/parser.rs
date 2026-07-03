@@ -3089,14 +3089,40 @@ fn next_test_word_atom(iter: &mut Lexer) -> Result<Word, ParseError> {
 /// `Op(RedirIn)`/`Op(RedirOut)`; every other operator is a single unquoted
 /// `Lit` atom (the lexer has no dedicated token for it). KEEP IN SYNC with
 /// the operator match arms in `parse_test_atom`.
+///
+/// The `Lit` arm requires BOTH (a) the text is in the operator set AND (b) the
+/// operator word ENDS right there — the atom AFTER it is a WORD BOUNDARY
+/// (`Blank`/`Newline`/`Op`/EOF), NOT a glued word-continuation atom. This
+/// mirrors the oracle's `next_is_test_binary_operator`, which peeks the
+/// FULLY-ASSEMBLED `Word` token: `==$x` (operator glued to an expansion with no
+/// intervening space) is assembled by the oracle as ONE `Word([Literal("=="),
+/// Var("x")])`, which is NOT in its operator set → the oracle takes the
+/// "not a binary operator" branch (lone-word `-n a`, leaving `==$x`
+/// unconsumed → the `]]`-consume then trips → `UnterminatedDoubleBracket`).
+/// The atom stream splits `==$x` into `Lit("==")` + `DollarName{...}` (no
+/// `Blank`), so without the peek2 boundary check the `Lit("==")` alone would
+/// look like an operator and mis-classify the glued form. See
+/// `atoms_double_bracket_glued_operator`.
 fn next_is_test_binary_operator_atom(iter: &mut Lexer) -> Result<bool, ParseError> {
     Ok(match iter.peek_kind()? {
         Some(TokenKind::Op(Operator::RedirIn)) | Some(TokenKind::Op(Operator::RedirOut)) => true,
-        Some(TokenKind::Lit { text, quoted: false }) => matches!(
-            text.as_str(),
-            "==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
-                | "-le" | "-ge" | "-nt" | "-ot" | "-ef"
-        ),
+        Some(TokenKind::Lit { text, quoted: false }) => {
+            let in_set = matches!(
+                text.as_str(),
+                "==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
+                    | "-le" | "-ge" | "-nt" | "-ot" | "-ef"
+            );
+            // (b) the operator word must END here: the next atom is a word
+            // boundary, not a glued continuation (`Lit`/`DollarName`/`Var`/
+            // `ParamOpen`/`QuoteRun`/… with no intervening `Blank`).
+            in_set
+                && matches!(
+                    iter.peek2_kind()?,
+                    None | Some(TokenKind::Blank)
+                        | Some(TokenKind::Newline)
+                        | Some(TokenKind::Op(_))
+                )
+        }
         _ => false,
     })
 }
@@ -5221,12 +5247,41 @@ mod tests {
         diff_err("[[");                                 // UnterminatedDoubleBracket
         diff_err("[[ -f");                               // unary op, no operand → UnterminatedDoubleBracket
         diff_err("[[ a == ]]");                          // binary op, no rhs → TestExprMissingOperand
-        diff_err("[[ a ~~ b ]]");                        // unrecognized operator → TestExprBadOperator
+        // `~~` is NOT in the operator set, so BOTH paths take the lone-word
+        // branch on `a` (≡ `-n a`), leave `~~` unconsumed, and trip the
+        // `]]`-consume → `UnterminatedDoubleBracket` (not `TestExprBadOperator`).
+        // The test passes because both agree. `TestExprBadOperator` is in fact
+        // defensively UNREACHABLE on both the atom AND oracle paths — the
+        // `next_is_binary` recognition set and the operator match-arm set are
+        // identical, so any word that reaches the match is already known to be
+        // in the set. There is therefore no genuine `TestExprBadOperator`-parity
+        // case to test; that's expected and matches the oracle.
+        diff_err("[[ a ~~ b ]]");                        // unrecognized op → both lone-word → UnterminatedDoubleBracket
         diff_err("[[ && a ]]");                          // leading operator → TestExprMissingOperand
         diff_cmd("if [[ -f a ]]; then echo y; fi");      // `[[ ]]` as an if-condition
         diff_cmd("while [[ -n $x ]]; do echo y; done");  // `[[ ]]` as a while-condition
         diff_cmd("[[\n  -f a\n  && -f b\n]]");            // Blank/Newline interleaving (skip_test_ws)
         diff_cmd("[[ ! ( -f a && -f b ) ]]");             // negated grouping
+    }
+
+    /// Operator GLUED to an expansion with no intervening space (`==$x`,
+    /// `-eq$n`, `=~$x`): the atom stream splits this into `Lit("==")` +
+    /// `DollarName{...}` (no `Blank`), while the oracle assembles the whole
+    /// thing as ONE `Word([Literal("=="), Var("x")])`. The oracle's
+    /// `next_is_test_binary_operator` peeks that assembled multi-part word,
+    /// which is NOT in its operator set → lone-word `-n a`, leaving `==$x`
+    /// unconsumed → the `]]`-consume trips → `UnterminatedDoubleBracket`. The
+    /// atom path's `next_is_test_binary_operator_atom` matches this ONLY by
+    /// requiring the operator `Lit` to END at a word boundary (peek2 is
+    /// `Blank`/`Newline`/`Op`/EOF), so a glued continuation classifies as
+    /// NOT-an-operator too. Regression for the T1-review bug.
+    #[test]
+    fn atoms_double_bracket_glued_operator() {
+        diff_err("[[ a ==$x ]]");   // string-eq glued → UnterminatedDoubleBracket on both
+        diff_err("[[ a -eq$n ]]");  // int-eq glued → same
+        diff_err("[[ a =~$x ]]");   // regex glued → same (NOT the =~ deferral: not recognized as an op)
+        diff_cmd("[[ a == $x ]]");  // SPACED == is a NORMAL StringEq binary (rhs $x) — must NOT regress
+        diff_unsupported("[[ a =~ $x ]]"); // SPACED =~ IS recognized → hits the deferral (UnsupportedCommand)
     }
 
     /// KNOWN divergence (discovered during v253 T1): the oracle special-cases
@@ -5240,9 +5295,13 @@ mod tests {
     /// routes through the ordinary funcdef-lookahead → `parse_simple_with_leading_word`
     /// path instead, which has no `[[`-awareness, so `[[`/`-f`/`a`/`]]` end up as
     /// four ordinary command WORDS (`SimpleCommand` with `program: "[["`) rather
-    /// than a `DoubleBracket`. Deferred — NOT in scope for T1 (mirrors the
-    /// `a=b () {...}` pin from v248); pinned so the Stage-2 live-flip
-    /// differential gate knows about it.
+    /// than a `DoubleBracket`. This is a TEMPORARY T1-state marker, NOT a
+    /// permanent pin: v253 Task 3
+    /// (docs/superpowers/plans/2026-07-03-v253-double-bracket.md, Task 3 Step 2)
+    /// is scoped to CLOSE it by threading the peeled inline-assignments into the
+    /// `DoubleBracket` dispatch, at which point this test flips to a `diff_cmd`.
+    /// (Unlike the v248 `a=b () {...}` pin, which is a genuine intentional
+    /// divergence — bash itself rejects that form.)
     #[test]
     fn atoms_double_bracket_assign_prefix_divergence() {
         assert!(
