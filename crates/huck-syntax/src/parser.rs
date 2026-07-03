@@ -7,6 +7,7 @@ use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
+    TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines,
 };
 use crate::lexer::{
     brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
@@ -1929,6 +1930,7 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         Some(Keyword::Select) => return parse_select(iter),
         Some(Keyword::Case)   => return parse_case(iter),
         Some(Keyword::Function) => return parse_function_keyword_def(iter),
+        Some(Keyword::DoubleBracketOpen) => return parse_double_bracket(iter, Vec::new()),
         Some(_) => return Err(ParseError::UnsupportedCommand),
         None => {}
     }
@@ -2954,6 +2956,219 @@ fn parse_function_def(name_word: Word, iter: &mut Lexer) -> Result<Command, Pars
     finish_function_body(name, iter)
 }
 
+/// Skips inter-atom whitespace inside `[[ … ]]`: BOTH `Blank` (atom-stream
+/// word-boundary tokens, which the oracle's Word-lexer never surfaces as a
+/// token at all — it folds them silently into token boundaries) AND
+/// `Newline` (delegated to the oracle's own `skip_test_newlines`, which the
+/// atom stream also emits explicitly). Loops to a fixpoint so any
+/// Blank/Newline interleaving (`[[\n  -f a ]]`) fully drains. Every peek
+/// decision in the cascade below that follows a word/operator/`(`/`)` needs
+/// this first, since (unlike the oracle) a `Blank` atom can sit at exactly
+/// that position without being consumed by anything else.
+fn skip_test_ws(iter: &mut Lexer) -> Result<(), ParseError> {
+    loop {
+        while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) { iter.next_kind()?; }
+        if matches!(iter.peek_kind()?, Some(TokenKind::Newline)) {
+            skip_test_newlines(iter)?;
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// v253: atom-native `[[ … ]]`. Mirrors command.rs's
+/// `parse_double_bracket_with_assigns`, but reads operands via
+/// `parse_word_command` (the atom stream has `Lit` atoms, not pre-lexed `Word`
+/// tokens). `=~` is DEFERRED to a later iteration (returns `UnsupportedCommand`
+/// without pulling the regex RHS — see `parse_test_atom` below).
+fn parse_double_bracket(iter: &mut Lexer, inline_assignments: Vec<Assignment>) -> Result<Command, ParseError> {
+    iter.next_kind()?; // consume `[[`
+    skip_test_ws(iter)?;
+    if iter.peek_kind()?.and_then(keyword_of_consumed) == Some(Keyword::DoubleBracketClose) {
+        return Err(ParseError::EmptyDoubleBracket);
+    }
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::UnterminatedDoubleBracket);
+    }
+    let expr = parse_test_or(iter)?;
+    skip_test_ws(iter)?;
+    match iter.next_kind()? {
+        Some(tok) if keyword_of_consumed(&tok) == Some(Keyword::DoubleBracketClose) => {}
+        _ => return Err(ParseError::UnterminatedDoubleBracket),
+    }
+    Ok(Command::DoubleBracket { expr: Box::new(expr), inline_assignments })
+}
+
+/// Lowest precedence: `||`.
+fn parse_test_or(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
+    let mut lhs = parse_test_and(iter)?;
+    skip_test_ws(iter)?;
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Or))) {
+        iter.next_kind()?;
+        skip_test_ws(iter)?;
+        let rhs = parse_test_and(iter)?;
+        lhs = TestExpr::Or(Box::new(lhs), Box::new(rhs));
+        skip_test_ws(iter)?;
+    }
+    Ok(lhs)
+}
+
+/// Next precedence: `&&`.
+fn parse_test_and(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
+    let mut lhs = parse_test_not(iter)?;
+    skip_test_ws(iter)?;
+    while matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::And))) {
+        iter.next_kind()?;
+        skip_test_ws(iter)?;
+        let rhs = parse_test_not(iter)?;
+        lhs = TestExpr::And(Box::new(lhs), Box::new(rhs));
+        skip_test_ws(iter)?;
+    }
+    Ok(lhs)
+}
+
+/// Next precedence: `!` (right-associative). Reuses parser.rs's own
+/// atom-aware `is_bang_word` (defined above for pipeline negation) rather than
+/// the oracle's `Word`-only version, since the atom stream's `!` arrives as a
+/// bare unquoted `Lit` atom. Leads with `skip_test_ws`: this is the single
+/// chokepoint EVERY "start of an operand expression" funnels through (initial
+/// operand, rhs of `&&`/`||`, recursive `!` operand, and — since
+/// `parse_test_primary`/`parse_test_atom` consume nothing before reaching
+/// here — the grouping-open and plain-atom cases too), so skipping here alone
+/// establishes the "no pending Blank" invariant the rest of the cascade relies on.
+fn parse_test_not(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
+    skip_test_ws(iter)?;
+    if iter.peek_kind()?.map(is_bang_word).unwrap_or(false) {
+        iter.next_kind()?;
+        let inner = parse_test_not(iter)?;
+        return Ok(TestExpr::Not(Box::new(inner)));
+    }
+    parse_test_primary(iter)
+}
+
+/// Highest precedence: `( expr )` grouping or a single test atom.
+fn parse_test_primary(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
+        iter.next_kind()?;
+        let inner = parse_test_or(iter)?;
+        // A Blank can sit right before `)` (`( a == b )`); skip_test_ws is a
+        // no-op when the cascade above already drained it (the common case),
+        // so this is a safety net, not a duplicate consumer.
+        skip_test_ws(iter)?;
+        match iter.next_kind()? {
+            Some(TokenKind::Op(Operator::RParen)) => {}
+            None => return Err(ParseError::UnterminatedDoubleBracket),
+            _ => return Err(ParseError::TestExprMissingOperand),
+        }
+        return Ok(inner);
+    }
+    parse_test_atom(iter)
+}
+
+/// Reads one operand `Word` inside `[[ ]]`. EOF → `UnterminatedDoubleBracket`;
+/// a `]]`/`)`/operator where an operand was expected → `TestExprMissingOperand`.
+/// Leading `skip_test_ws`: this is called right after a unary op word or a
+/// binary op word, either of which can be followed by a pending `Blank`.
+fn next_test_word_atom(iter: &mut Lexer) -> Result<Word, ParseError> {
+    skip_test_ws(iter)?;
+    match iter.peek_kind()? {
+        None => return Err(ParseError::UnterminatedDoubleBracket),
+        Some(tok) => {
+            if keyword_of_consumed(tok) == Some(Keyword::DoubleBracketClose)
+                || matches!(tok, TokenKind::Op(_))
+            {
+                return Err(ParseError::TestExprMissingOperand);
+            }
+        }
+    }
+    parse_word_command(iter, false)
+}
+
+/// True if the next atom is a `[[ ]]` binary operator. `<`/`>` arrive as
+/// `Op(RedirIn)`/`Op(RedirOut)`; every other operator is a single unquoted
+/// `Lit` atom (the lexer has no dedicated token for it). KEEP IN SYNC with
+/// the operator match arms in `parse_test_atom`.
+fn next_is_test_binary_operator_atom(iter: &mut Lexer) -> Result<bool, ParseError> {
+    Ok(match iter.peek_kind()? {
+        Some(TokenKind::Op(Operator::RedirIn)) | Some(TokenKind::Op(Operator::RedirOut)) => true,
+        Some(TokenKind::Lit { text, quoted: false }) => matches!(
+            text.as_str(),
+            "==" | "=" | "!=" | "=~" | "-eq" | "-ne" | "-lt" | "-gt"
+                | "-le" | "-ge" | "-nt" | "-ot" | "-ef"
+        ),
+        _ => false,
+    })
+}
+
+/// Parses a single test — either a unary test (`-f path`) or a binary/lone-word
+/// test (`lhs op rhs` / bare `word` ≡ `-n word`). Mirrors command.rs's
+/// `parse_test_atom`, reading operands via `parse_word_command` since the atom
+/// stream has no pre-lexed `Word` tokens.
+fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
+    if iter.peek_kind()?.is_none() {
+        return Err(ParseError::UnterminatedDoubleBracket);
+    }
+    // Present terminator with nothing before it → empty body.
+    match iter.peek_kind()? {
+        Some(tok) if keyword_of_consumed(tok) == Some(Keyword::DoubleBracketClose)
+            || matches!(tok, TokenKind::Op(Operator::RParen)) => {
+            return Err(ParseError::EmptyDoubleBracket);
+        }
+        _ => {}
+    }
+    // A leading operator (not `(`, already handled by parse_test_primary) where
+    // an operand was expected.
+    if matches!(iter.peek_kind()?, Some(TokenKind::Op(_))) {
+        return Err(ParseError::TestExprMissingOperand);
+    }
+
+    let first = parse_word_command(iter, false)?;
+
+    if let Some(op) = try_unary_op(&first) {
+        let operand = next_test_word_atom(iter)?;
+        return Ok(TestExpr::Unary { op, operand });
+    }
+
+    let lhs = first;
+    // A Blank sits between the operand and the operator/terminator that
+    // follows it (`parse_word_command` stops at `Blank` without consuming it).
+    skip_test_ws(iter)?;
+    if !next_is_test_binary_operator_atom(iter)? {
+        return Ok(TestExpr::Unary { op: TestUnaryOp::StringNonEmpty, operand: lhs });
+    }
+
+    // Consume the operator.
+    match iter.peek_kind()? {
+        Some(TokenKind::Op(Operator::RedirIn)) => { iter.next_kind()?; let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
+        Some(TokenKind::Op(Operator::RedirOut)) => { iter.next_kind()?; let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
+        _ => {
+            let op_word = parse_word_command(iter, false)?;
+            let op_text = match word_literal_text(&op_word) {
+                Some(t) => t.to_string(),
+                None => return Err(ParseError::TestExprBadOperator(format!("{op_word:?}"))),
+            };
+            match op_text.as_str() {
+                "==" | "=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
+                "!=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
+                "=~" => Err(ParseError::UnsupportedCommand), // deferred — DO NOT read the pattern
+                "<" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
+                ">" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
+                "-eq" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntEq, lhs, rhs }) }
+                "-ne" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntNe, lhs, rhs }) }
+                "-lt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntLt, lhs, rhs }) }
+                "-gt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntGt, lhs, rhs }) }
+                "-le" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntLe, lhs, rhs }) }
+                "-ge" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntGe, lhs, rhs }) }
+                "-nt" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::NewerThan, lhs, rhs }) }
+                "-ot" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::OlderThan, lhs, rhs }) }
+                "-ef" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::SameFile, lhs, rhs }) }
+                other => Err(ParseError::TestExprBadOperator(other.to_string())),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3360,7 +3575,9 @@ mod tests {
         // still deferred on the atom path (T7 will also assert these).
         // `f() { :; }` is NO LONGER deferred — v248 T2 implements the POSIX
         // `name()` funcdef form (see `atoms_function_paren_form`).
-        for s in ["(( 1+2 ))", "for ((i=0;i<2;i++)); do :; done", "[[ a == b ]]", "coproc c { :; }"] {
+        // `[[ a == b ]]` is NO LONGER deferred — v253 T1 implements `[[ … ]]`
+        // (see `atoms_double_bracket_core`).
+        for s in ["(( 1+2 ))", "for ((i=0;i<2;i++)); do :; done", "coproc c { :; }"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
         }
@@ -3460,19 +3677,10 @@ mod tests {
         // `atoms_error_parity`'s `echo $(`/`echo ${` treatment).
         assert!(new_seq("cat <(").is_err(), "atom path must reject unterminated `cat <(`");
 
-        // Body-deferred construct inside a procsub (`[[ … ]]`): the atom path
-        // defers `[[ … ]]` EVERYWHERE (see `atoms_compounds_deferred`), so a
-        // procsub body containing one also defers — `parse_process_sub` maps
-        // the inner `UnsupportedCommand` to `UnsupportedExpansion`, the same
-        // posture as a `$(…)` body containing `[[ … ]]`
-        // (`diff_cs_deferred("$([[ -n x ]])")`). The oracle itself DOES parse
-        // this fully (production supports `[[ ]]` everywhere) — that's an
-        // intentional, already-accepted scope gap, not a parity bug.
-        assert!(
-            matches!(new_seq("cat <( [[ x ]] )"), Err(ParseError::UnsupportedExpansion)),
-            "expected UnsupportedExpansion for a `[[ ]]` procsub body, got {:?}",
-            new_seq("cat <( [[ x ]] )"),
-        );
+        // `[[ … ]]` inside a procsub body is NO LONGER deferred — v253 T1
+        // implements `[[ … ]]` everywhere `parse_command` is reached, including
+        // inside `parse_process_sub`'s body sequence.
+        diff_cmd("cat <( [[ x ]] )");
     }
 
     // ── v252 T1: positional array literals ───────────────────────────────────
@@ -3752,8 +3960,10 @@ mod tests {
         // NOTE: `a=(1 2 3)` (positional array literal) is NO LONGER deferred —
         // v252 T1 implements `name=(…)`/`name+=(…)` via `Mode::ArrayLiteral`
         // (see `atoms_array_literal_positional`).
+        // NOTE: `[[ a == b ]]` is NO LONGER deferred — v253 T1 implements
+        // `[[ … ]]` (see `atoms_double_bracket_core`).
         for s in [
-            "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done", "[[ a == b ]]",
+            "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done",
             "coproc x { :; }",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
@@ -3846,10 +4056,18 @@ mod tests {
     #[test]
     fn atoms_function_defs_deferred() {
         // Body is itself deferred → whole funcdef defers (lifts when [[ ]]/arith land).
-        for s in ["f() [[ x ]]", "f() (( 1 ))", "f() for ((i=0;i<2;i++)); do :; done"] {
+        // `f() [[ x ]]` is NO LONGER deferred — v253 T1 implements `[[ … ]]`
+        // (see `atoms_function_double_bracket_body`).
+        for s in ["f() (( 1 ))", "f() for ((i=0;i<2;i++)); do :; done"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
         }
+    }
+
+    #[test]
+    fn atoms_function_double_bracket_body() {
+        diff_cmd("f() [[ x ]]");
+        diff_cmd("f() [[ -f a && -f b ]]");
     }
 
     #[test]
@@ -4286,8 +4504,8 @@ mod tests {
         // `for i in a; do x; done` removed: for/select are now in-scope (Task 5).
         // `case x in …; esac` removed: case is now in-scope (Task 6).
         // `f() { x; }` removed: function-def (`name()`) is now in-scope (v248 T2).
-        for s in ["(( 1+2 ))",
-                  "[[ -n x ]]", "coproc x"] {
+        // `[[ -n x ]]` removed: `[[ … ]]` is now in-scope (v253 T1).
+        for s in ["(( 1+2 ))", "coproc x"] {
             diff_unsupported(s);
         }
     }
@@ -4436,7 +4654,7 @@ mod tests {
     fn cmd_compound_deferred_still() {
         diff_unsupported("(( 1+2 ))");                              // arith command (ArithBlock seam)
         diff_unsupported("(( x + $y ))");
-        diff_unsupported("[[ -n x ]]");                             // test grammar
+        // `[[ -n x ]]` (test grammar) removed: now in-scope, v253 T1.
         // `f() { x; }` (function def, `name()`) removed: now in-scope, v248 T2.
         diff_unsupported("coproc x");
         diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
@@ -4545,6 +4763,7 @@ mod tests {
         diff_cs("$( (echo x) )");                   // comsub of a subshell (SPACED)
         diff_cs("$({ echo x; })");                  // comsub of a brace group
         diff_cs("$(f() { x; })");                   // function-def body (v248 T2)
+        diff_cs("$([[ -n x ]])");                   // `[[ ]]` body (v253 T1)
     }
 
     // v244 T3 tests
@@ -4579,9 +4798,10 @@ mod tests {
         diff_cs_deferred("$((1+2))");               // arith expansion (WordPart::Arith, not comsub)
         diff_cs_deferred("$(( a + b ))");
         diff_cs_deferred("`echo hi`");              // backtick (own iteration)
-        diff_cs_deferred("$([[ -n x ]])");          // body defers ([[ ]])
         // `$(f() { x; })` removed: function-def body now parses (v248 T2);
         // see `cs_body_grammar`'s `diff_cs("$(f() { x; })")`.
+        // `$([[ -n x ]])` removed: `[[ ]]` body now parses (v253 T1); see
+        // `cs_body_grammar`'s `diff_cs("$([[ -n x ]])")`.
         diff_cs_deferred("$(coproc x)");            // body defers (coproc)
     }
 
@@ -4969,5 +5189,89 @@ mod tests {
             tokenize_with_opts("$(( $((a)b) ))", LexerOptions::default()).is_err(),
             "production errors on $(( $((a)b) )) too"
         );
+    }
+
+    // v253 T1 tests: `[[ … ]]` grammar core
+
+    #[test]
+    fn atoms_double_bracket_core() {
+        diff_cmd("[[ -f /etc/passwd ]]");     // unary file test
+        diff_cmd("[[ -z $x ]]");              // unary string test w/ expansion
+        diff_cmd("[[ hello ]]");              // lone word ≡ -n hello
+        diff_cmd("[[ $x ]]");                 // lone word w/ expansion
+        diff_cmd("[[ a == b ]]");             // string eq
+        diff_cmd("[[ a = b ]]");              // string eq (single =)
+        diff_cmd("[[ a != b ]]");             // string ne
+        diff_cmd("[[ $x == a* ]]");           // glob RHS stays a pattern word
+        diff_cmd("[[ 3 -eq 3 ]]");            // int eq
+        diff_cmd("[[ 3 -lt 5 ]]");            // int lt
+        diff_cmd("[[ a < b ]]");              // string lt via Op(RedirIn)
+        diff_cmd("[[ a > b ]]");              // string gt via Op(RedirOut)
+        diff_cmd("[[ f1 -nt f2 ]]");          // file newer-than
+        diff_cmd("[[ -f a && -f b ]]");       // logical and
+        diff_cmd("[[ -f a || -f b ]]");       // logical or
+        diff_cmd("[[ ! -d c ]]");             // negation
+        diff_cmd("[[ ( a == b ) ]]");         // grouping
+        diff_cmd("[[ -f a && -f b || ! -d c ]]"); // precedence
+    }
+
+    #[test]
+    fn atoms_double_bracket_extra() {
+        diff_err("[[ ]]");                              // EmptyDoubleBracket
+        diff_err("[[");                                 // UnterminatedDoubleBracket
+        diff_err("[[ -f");                               // unary op, no operand → UnterminatedDoubleBracket
+        diff_err("[[ a == ]]");                          // binary op, no rhs → TestExprMissingOperand
+        diff_err("[[ a ~~ b ]]");                        // unrecognized operator → TestExprBadOperator
+        diff_err("[[ && a ]]");                          // leading operator → TestExprMissingOperand
+        diff_cmd("if [[ -f a ]]; then echo y; fi");      // `[[ ]]` as an if-condition
+        diff_cmd("while [[ -n $x ]]; do echo y; done");  // `[[ ]]` as a while-condition
+        diff_cmd("[[\n  -f a\n  && -f b\n]]");            // Blank/Newline interleaving (skip_test_ws)
+        diff_cmd("[[ ! ( -f a && -f b ) ]]");             // negated grouping
+    }
+
+    /// KNOWN divergence (discovered during v253 T1): the oracle special-cases
+    /// an inline-assignment PREFIX immediately followed by `[[` (`FOO=1 [[ … ]]`)
+    /// — it speculatively peels leading assignment words and, if `[[` follows,
+    /// attaches them as `Command::DoubleBracket`'s `inline_assignments` (see
+    /// command.rs's `parse_command_inner`, the `Some(Keyword::DoubleBracketOpen)`
+    /// check at the end of the assignment-peeling loop). The atom path's `[[`
+    /// dispatch (`parse_command`'s `Some(Keyword::DoubleBracketOpen)` arm) only
+    /// fires when `[[` is the FIRST atom of the command — an assignment prefix
+    /// routes through the ordinary funcdef-lookahead → `parse_simple_with_leading_word`
+    /// path instead, which has no `[[`-awareness, so `[[`/`-f`/`a`/`]]` end up as
+    /// four ordinary command WORDS (`SimpleCommand` with `program: "[["`) rather
+    /// than a `DoubleBracket`. Deferred — NOT in scope for T1 (mirrors the
+    /// `a=b () {...}` pin from v248); pinned so the Stage-2 live-flip
+    /// differential gate knows about it.
+    #[test]
+    fn atoms_double_bracket_assign_prefix_divergence() {
+        assert!(
+            matches!(
+                new_seq("x=1 [[ -f a ]]"),
+                Ok(Some(Sequence { first: Command::Pipeline(_), .. }))
+            ),
+            "atom path treats `x=1 [[ -f a ]]` as an ordinary pipeline, got {:?}",
+            new_seq("x=1 [[ -f a ]]"),
+        );
+        assert!(
+            matches!(
+                old_seq("x=1 [[ -f a ]]"),
+                Ok(Some(Sequence { first: Command::DoubleBracket { .. }, .. }))
+            ),
+            "oracle attaches the assignment prefix to DoubleBracket (documents the divergence)",
+        );
+    }
+
+    /// `=~` is DEFERRED (v254): `parse_test_atom` must bail with
+    /// `UnsupportedCommand` WITHOUT pulling the regex-pattern RHS off the atom
+    /// stream (the regex RHS has its own, not-yet-ported, tokenization rules —
+    /// pulling it here via `next_test_word_atom`/`parse_word_command` would
+    /// mis-lex a glob-like pattern as a plain word). No hang, no panic.
+    #[test]
+    fn atoms_double_bracket_regex_deferred() {
+        diff_unsupported("[[ a =~ b ]]");
+        diff_unsupported("[[ a =~ b* ]]");
+        diff_unsupported("[[ $x =~ ^[0-9]+$ ]]");
+        diff_unsupported("[[ -f a && $x =~ y ]]"); // deferral inside a logical expr
     }
 }
