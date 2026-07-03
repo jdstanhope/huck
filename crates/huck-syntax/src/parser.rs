@@ -1296,6 +1296,37 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     }
 }
 
+/// v255: assemble a standalone `(( expr ))` arithmetic command at command
+/// position. The atom scanner emits glued `((` as two `Op(LParen)` atoms and the
+/// caller (`parse_command`) has already peeked both. Speculatively delimit the
+/// body as arith (reusing v246's `Mode::Arith` + `parse_arith_body`): on the
+/// matching `))` (`ArithClose`) build `Command::Arith(body)` and wrap trailing
+/// redirects; on `ArithBail` (a depth-0 `)` not followed by `)`, e.g. `((cmd);
+/// c2)`) rewind to before `((` and reparse as a nested subshell `( (…) )`
+/// (matching bash's arith-command backoff). Mirrors `parse_arith_expansion`'s
+/// mark/push/pop lifecycle; the `mark` is taken BEFORE consuming/pushing so a
+/// bail rewind returns to the pre-`((` position with the pre-push mode stack.
+///
+/// No lexer change: consuming the two buffered `Op(LParen)` first, then pushing
+/// `Mode::Arith { body_started: true }`, makes the next pull enter
+/// `scan_step_arith`'s body loop directly — the `$((`-opener branch (and its
+/// `$`-assert) is never reached.
+fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
+    let mark = iter.mark();
+    iter.next_kind()?; // consume first `(` (buffered Op(LParen))
+    iter.next_kind()?; // consume second `(`
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true });
+    let result = parse_arith_body(iter, false);
+    iter.pop_mode();
+    match result? {
+        ArithBodyOutcome::Closed(body) => maybe_wrap_redirects(Command::Arith(body), iter),
+        ArithBodyOutcome::Bail => {
+            iter.rewind(&mark);
+            parse_subshell(iter)
+        }
+    }
+}
+
 /// Skip over any `Newline` or `Blank` tokens without consuming anything else.
 /// Mirrors `skip_newlines` in `command.rs`. The oracle's Word lexer never emits
 /// `Blank`, so also skipping `Blank` here only affects the atom path — where a
@@ -2015,16 +2046,17 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     }
     // `(( expr ))` at command position.  The Word-lexer emits a single
     // `ArithBlock`; the atom scanner instead emits two GLUED `Op(LParen)` atoms
-    // (no `Blank` between).  Either way an arith command is DEFERRED (out of
-    // scope) → `UnsupportedCommand`.  A SPACED `( (` keeps a `Blank` between the
-    // two `(`, so it is a nested subshell (handled by the `LParen` arm below).
+    // (no `Blank` between) — v255 handles those via `parse_arith_command`
+    // (speculative arith with an `ArithBail`→nested-subshell backoff).  A SPACED
+    // `( (` keeps a `Blank` between the two `(`, so it never matches here and
+    // flows to the single-`(` subshell arm below (never arith).
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
         return Err(ParseError::UnsupportedCommand);
     }
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
         && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
     {
-        return Err(ParseError::UnsupportedCommand);
+        return parse_arith_command(iter);
     }
     // Bare `(` → subshell.
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen))) {
@@ -3795,7 +3827,9 @@ mod tests {
         // `name()` funcdef form (see `atoms_function_paren_form`).
         // `[[ a == b ]]` is NO LONGER deferred — v253 T1 implements `[[ … ]]`
         // (see `atoms_double_bracket_core`).
-        for s in ["(( 1+2 ))", "for ((i=0;i<2;i++)); do :; done", "coproc c { :; }"] {
+        // `(( 1+2 ))` (standalone arith command) is NO LONGER deferred —
+        // v255 T1 implements it (see `atoms_arith_command`).
+        for s in ["for ((i=0;i<2;i++)); do :; done", "coproc c { :; }"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
         }
@@ -4180,8 +4214,10 @@ mod tests {
         // (see `atoms_array_literal_positional`).
         // NOTE: `[[ a == b ]]` is NO LONGER deferred — v253 T1 implements
         // `[[ … ]]` (see `atoms_double_bracket_core`).
+        // NOTE: `(( 1+2 ))` (standalone arith command) is NO LONGER deferred —
+        // v255 T1 implements it (see `atoms_arith_command`).
         for s in [
-            "(( 1+2 ))", "for ((i=0;i<3;i++)); do :; done",
+            "for ((i=0;i<3;i++)); do :; done",
             "coproc x { :; }",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
@@ -4276,7 +4312,10 @@ mod tests {
         // Body is itself deferred → whole funcdef defers (lifts when [[ ]]/arith land).
         // `f() [[ x ]]` is NO LONGER deferred — v253 T1 implements `[[ … ]]`
         // (see `atoms_function_double_bracket_body`).
-        for s in ["f() (( 1 ))", "f() for ((i=0;i<2;i++)); do :; done"] {
+        // `f() (( 1 ))` is NO LONGER deferred — v255 T1 implements the standalone
+        // arith command, and funcdef bodies dispatch through `parse_command`.
+        diff_cmd("f() (( 1 ))");
+        for s in ["f() for ((i=0;i<2;i++)); do :; done"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
         }
@@ -4723,7 +4762,8 @@ mod tests {
         // `case x in …; esac` removed: case is now in-scope (Task 6).
         // `f() { x; }` removed: function-def (`name()`) is now in-scope (v248 T2).
         // `[[ -n x ]]` removed: `[[ … ]]` is now in-scope (v253 T1).
-        for s in ["(( 1+2 ))", "coproc x"] {
+        // `(( 1+2 ))` removed: standalone arith command is now in-scope (v255 T1).
+        for s in ["coproc x"] {
             diff_unsupported(s);
         }
     }
@@ -4870,13 +4910,31 @@ mod tests {
 
     #[test]
     fn cmd_compound_deferred_still() {
-        diff_unsupported("(( 1+2 ))");                              // arith command (ArithBlock seam)
-        diff_unsupported("(( x + $y ))");
         // `[[ -n x ]]` (test grammar) removed: now in-scope, v253 T1.
         // `f() { x; }` (function def, `name()`) removed: now in-scope, v248 T2.
+        // `(( 1+2 ))` / `(( x + $y ))` (standalone arith command) removed: now
+        // in-scope, v255 T1 (see `atoms_arith_command`).
         diff_unsupported("coproc x");
         diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
         // `cat <<<w` (here-string) removed: now in-scope, v249 T1.
+    }
+
+    // v255: standalone arith command `(( … ))`
+    #[test]
+    fn atoms_arith_command() {
+        // Glued `((` that closes on the matching `))` → Command::Arith (byte-identical).
+        diff_cmd("(( 1 + 2 ))");
+        diff_cmd("((1+2))");
+        diff_cmd("(( x = 5 ))");
+        diff_cmd("(( x++ ))");
+        diff_cmd("(( $x + 1 ))");        // embedded expansion — wires parse_arith_body
+        // Primary bail → nested subshell backoff (depth-0 `)` not followed by `)`).
+        diff_cmd("((cmd); c2)");
+        // Spaced `( (` is NEVER arith — regression guard for the existing subshell path.
+        diff_cmd("( ( 3 * 4 ) )");
+        // Unterminated glued `((` (no matching `))`): both paths bail → subshell → same
+        // parse error (oracle falls back to `( (1+2)` → UnterminatedSubshell; no lex panic).
+        diff_err("((1+2)");
     }
 
     #[test]
