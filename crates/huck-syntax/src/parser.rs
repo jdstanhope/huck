@@ -11,8 +11,8 @@ use crate::command::{
 };
 use crate::lexer::{
     brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
-    ParamOpKind, ProcDir, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
-    WordPart,
+    ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp,
+    Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -275,6 +275,80 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 }
                 break;
             }
+        }
+    }
+    flush_lit(&mut acc, &mut parts);
+    Ok(Word(parts))
+}
+
+/// v254: assemble the `=~` regex pattern operand. The parser has just consumed
+/// the `=~` operator word; push `Mode::Regex` and pull pattern atoms until the
+/// zero-width `RegexEnd` (the lexer pops the mode when it emits `RegexEnd`).
+/// Mirrors `parse_word_command`'s part-assembly arms — the lexer emitted the
+/// regex metacharacters as `Lit` (not `Op`), so the same arms apply.
+fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
+    iter.push_mode(Mode::Regex { paren_depth: 0, body_started: false });
+    // Drop any already-buffered leading Blank/Newline (the `next_is_test_binary_
+    // operator_atom` peek2 buffered exactly one boundary atom after `=~`). The
+    // lexer's own leading-skip handles the rest (spaces after a newline, `\<NL>`).
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank) | Some(TokenKind::Newline)) {
+        iter.next_kind()?;
+    }
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut acc: Option<(String, bool)> = None;
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::RegexEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? { push_lit(&mut acc, &mut parts, text, q); }
+            }
+            Some(TokenKind::DollarLit { .. }) => {
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? { flush_lit(&mut acc, &mut parts); parts.push(WordPart::Literal { text: "$".into(), quoted: q }); }
+            }
+            Some(TokenKind::QuoteRun { .. }) => {
+                if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    // The oracle (`scan_regex_operand`) inlines a SINGLE-quoted run
+                    // as a bare `Literal{quoted:true}` (no `Quoted` wrapper), but a
+                    // `$'…'` ANSI-C run keeps its `Quoted{AnsiC,…}` wrapper (via
+                    // `scan_dollar_expansion`'s `$'` arm). Backslash/Double never
+                    // reach here (handled in the lexer's literal run / BeginDquote).
+                    match style {
+                        QuoteStyle::Single => parts.push(WordPart::Literal { text, quoted: true }),
+                        _ => parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] }),
+                    }
+                }
+            }
+            Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
+            Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
+            Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
+            Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
+            // The oracle inlines the `"…"` body parts FLAT (each quoted:true) — it
+            // calls `scan_dquote_expansion_body`, which pushes directly into the
+            // operand's part list, NOT a `Quoted{Double,…}` wrapper. Unwrap
+            // `parse_dquote`'s wrapper and extend with its (already-coalesced) inner
+            // parts.
+            Some(TokenKind::BeginDquote) => {
+                iter.next_kind()?; flush_lit(&mut acc, &mut parts);
+                match parse_dquote(iter, false)? {
+                    WordPart::Quoted { parts: inner, .. } => parts.extend(inner),
+                    other => parts.push(other),
+                }
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted: q, joined: false },
+                        "*" => WordPart::AllArgs { quoted: q, joined: true },
+                        "?" => WordPart::LastStatus { quoted: q },
+                        _   => WordPart::Var { name, quoted: q },
+                    });
+                }
+            }
+            // `$[expr]` inside a regex defers everywhere on the atom path (v247).
+            Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
+            other => return Err(ParseError::TestExprBadOperator(format!("regex operand: {other:?}"))),
         }
     }
     flush_lit(&mut acc, &mut parts);
@@ -3266,7 +3340,7 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
             match op_text.as_str() {
                 "==" | "=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringEq, lhs, rhs }) }
                 "!=" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringNe, lhs, rhs }) }
-                "=~" => Err(ParseError::UnsupportedCommand), // deferred — DO NOT read the pattern
+                "=~" => { let pattern = parse_regex_operand(iter)?; Ok(TestExpr::Regex { lhs, pattern }) }
                 "<" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringLt, lhs, rhs }) }
                 ">" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::StringGt, lhs, rhs }) }
                 "-eq" => { let rhs = next_test_word_atom(iter)?; Ok(TestExpr::Binary { op: TestBinaryOp::IntEq, lhs, rhs }) }
@@ -5370,7 +5444,7 @@ mod tests {
         diff_err("[[ a -eq$n ]]");  // int-eq glued → same
         diff_err("[[ a =~$x ]]");   // regex glued → same (NOT the =~ deferral: not recognized as an op)
         diff_cmd("[[ a == $x ]]");  // SPACED == is a NORMAL StringEq binary (rhs $x) — must NOT regress
-        diff_unsupported("[[ a =~ $x ]]"); // SPACED =~ IS recognized → hits the deferral (UnsupportedCommand)
+        diff_cmd("[[ a =~ $x ]]"); // SPACED =~ IS recognized → v254 ports the regex RHS (TestExpr::Regex)
     }
 
     /// v253 T3: an inline-assignment PREFIX immediately followed by `[[`
@@ -5422,23 +5496,61 @@ mod tests {
         diff_err("FOO=hi [[ -f a ]] >out");        // inline-assign site UNWRAPPED → both Err(UnexpectedToken)
     }
 
-    /// `=~` is DEFERRED (v254): `parse_test_atom` must bail with
-    /// `UnsupportedCommand` WITHOUT pulling the regex-pattern RHS off the atom
-    /// stream (the regex RHS has its own, not-yet-ported, tokenization rules —
-    /// pulling it here via `next_test_word_atom`/`parse_word_command` would
-    /// mis-lex a glob-like pattern as a plain word). No hang, no panic.
+    /// `=~` is PORTED (v254): the atom path assembles the regex-pattern RHS via
+    /// `Mode::Regex`/`parse_regex_operand` and produces `TestExpr::Regex`
+    /// byte-identically to the oracle (previously deferred with
+    /// `UnsupportedCommand`).
     #[test]
-    fn atoms_double_bracket_regex_deferred() {
-        diff_unsupported("[[ a =~ b ]]");
-        diff_unsupported("[[ a =~ b* ]]");
-        diff_unsupported("[[ $x =~ ^[0-9]+$ ]]");
-        diff_unsupported("[[ -f a && $x =~ y ]]"); // deferral inside a logical expr
-        // v254 will make these diff_cmd. For v253 the atom path defers on `=~`
-        // BEFORE reading the regex RHS; the oracle parses TestExpr::Regex.
-        assert!(matches!(new_seq("[[ x =~ ^a.*b$ ]]"), Err(ParseError::UnsupportedCommand)));
-        assert!(matches!(new_seq("[[ $s =~ [0-9]+ ]]"), Err(ParseError::UnsupportedCommand)));
-        // And the oracle DOES support them (sanity — different result, hence not diff_cmd):
-        assert!(old_seq("[[ x =~ ^a.*b$ ]]").is_ok());
+    fn atoms_double_bracket_regex_ported() {
+        diff_cmd("[[ a =~ b ]]");
+        diff_cmd("[[ a =~ b* ]]");
+        diff_cmd("[[ $x =~ ^[0-9]+$ ]]");
+        diff_cmd("[[ -f a && $x =~ y ]]"); // regex inside a logical expr
+        diff_cmd("[[ x =~ ^a.*b$ ]]");
+        diff_cmd("[[ $s =~ [0-9]+ ]]");
+    }
+
+    #[test]
+    fn atoms_regex_core() {
+        diff_cmd("[[ $x =~ abc ]]");            // plain literal
+        diff_cmd("[[ $x =~ ^a.c$ ]]");          // anchors + metachar `.`
+        diff_cmd("[[ $x =~ [0-9]+ ]]");         // bracket class + quantifier
+        diff_cmd("[[ $x =~ a|b ]]");            // `|` literal
+        diff_cmd("[[ $x =~ a<b>c ]]");          // `<` `>` literal
+        diff_cmd("[[ $x =~ a;b ]]");            // `;` literal
+        diff_cmd("[[ $x =~ a&b ]]");            // `&` literal
+        diff_cmd("[[ $x =~ (a b) ]]");          // paren-depth: space kept inside ( )
+        diff_cmd("[[ $x =~ ((a) (b))+ ]]");     // nested groups
+        diff_cmd("[[ $x =~ (a b)c ]]");         // group then trailing literal
+        diff_cmd("[[ $x =~ $p ]]");             // Var
+        diff_cmd("[[ $x =~ ${p}x ]]");          // ${…} then literal
+        diff_cmd("[[ $x =~ ${a[0]} ]]");        // subscript expansion
+        diff_cmd("[[ $x =~ $(cmd) ]]");         // command-sub
+        diff_cmd("[[ $x =~ $((1+1)) ]]");       // arith
+        diff_cmd("[[ $x =~ a$b|c$(d) ]]");      // mixed literal + expansions
+    }
+
+    /// v254 T1 hardening: the `\x`/quote/expansion traps of `scan_regex_operand`.
+    /// The oracle keeps `\x` as an UNQUOTED literal `\x` (backslash kept), inlines
+    /// single-quoted + double-quoted bodies FLAT, and wraps only `$'…'` ANSI-C.
+    #[test]
+    fn atoms_regex_traps() {
+        diff_cmd("[[ $x =~ a\\.b ]]");    // THE #1 TRAP: \x kept as unquoted literal `a\.b`
+        diff_cmd("[[ $x =~ a\\ b ]]");    // escaped space kept literal
+        diff_cmd("[[ $x =~ \\) ]]");      // escaped paren
+        diff_cmd("[[ $x =~ a\\\\b ]]");   // escaped backslash
+        diff_cmd("[[ $x =~ 'a b' ]]");    // single-quoted run
+        diff_cmd("[[ $x =~ \"a b\" ]]");  // double-quoted span
+        diff_cmd("[[ $x =~ $'x\\ny' ]]"); // ansi-c
+        diff_cmd("[[ $x =~ ${p:-d} ]]");  // param op
+        diff_cmd("[[ $x =~ `echo a` ]]"); // backtick
+        diff_cmd("[[ $x =~ pre$(c)post ]]"); // glued cmdsub
+        diff_cmd("[[ $x =~ (a\\ b)c ]]"); // escaped space inside group + trailing
+        diff_cmd("[[ $x =~ $@ ]]");       // $@
+        diff_cmd("[[ $x =~ $* ]]");       // $*
+        diff_cmd("[[ $x =~ $? ]]");       // $?
+        diff_cmd("[[ $x =~ a$ ]]");       // trailing lone $
+        diff_cmd("[[ $x =~ .* ]]");       // metachars
     }
 
     // v253 T2: adversarial precedence/grouping/newlines corpus (hardens the
