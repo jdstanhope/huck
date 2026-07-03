@@ -1957,7 +1957,19 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
         Some(Keyword::Select) => return parse_select(iter),
         Some(Keyword::Case)   => return parse_case(iter),
         Some(Keyword::Function) => return parse_function_keyword_def(iter),
-        Some(Keyword::DoubleBracketOpen) => return parse_double_bracket(iter, Vec::new()),
+        // v253 T3-fix: wrap a trailing redirect on a command-position
+        // `[[ … ]]` (`[[ -f a ]] >out` → `Redirected{DoubleBracket, [>out]}`),
+        // exactly like every other atom-path compound (brace/if/while/for/
+        // select/case/subshell) and the oracle (command.rs:1050-1053:
+        // `let cmd = parse_double_bracket(iter)?; maybe_wrap_redirects(cmd, iter)`).
+        // NOTE: the wrap lives HERE, not inside `parse_double_bracket`, because
+        // the inline-assignment dispatch site (`FOO=hi [[ … ]]` in
+        // `parse_simple_with_leading_word`) must stay UNWRAPPED to match the
+        // oracle's unwrapped `parse_double_bracket_with_assigns` (command.rs:1111).
+        Some(Keyword::DoubleBracketOpen) => {
+            let cmd = parse_double_bracket(iter, Vec::new())?;
+            return maybe_wrap_redirects(cmd, iter);
+        }
         Some(_) => return Err(ParseError::UnsupportedCommand),
         None => {}
     }
@@ -5342,6 +5354,22 @@ mod tests {
         diff_cmd("! [[ -f a ]]");                  // negated command
         diff_cmd("[[ -f a ]]; echo done");         // in a sequence
         diff_cmd("if [[ -n $x ]]; then echo y; fi"); // as an if condition
+    }
+
+    /// v253 T3-fix: a trailing redirect on a command-position `[[ … ]]` wraps
+    /// in `Redirected` (the dispatch site now calls `maybe_wrap_redirects`, like
+    /// every other atom-path compound + the oracle command.rs:1050-1053).
+    /// The inline-assignment site stays UNWRAPPED — `FOO=hi [[ … ]] >out` leaves
+    /// `>out` pending on BOTH the atom path and the oracle
+    /// (command.rs:1111 returns `parse_double_bracket_with_assigns` unwrapped),
+    /// so both error identically (`diff_err` proves the site is left unwrapped —
+    /// wrapping it would make the atom path return `Ok(Redirected)` and diverge).
+    #[test]
+    fn atoms_double_bracket_trailing_redirect() {
+        diff_cmd("[[ -f a ]] >out");               // fixed case → Redirected
+        diff_cmd("[[ -f a ]] 2>&1");               // fd-dup redirect
+        diff_cmd("[[ -n $x ]] >f 2>&1");           // multi-redirect
+        diff_err("FOO=hi [[ -f a ]] >out");        // inline-assign site UNWRAPPED → both Err(UnexpectedToken)
     }
 
     /// `=~` is DEFERRED (v254): `parse_test_atom` must bail with
