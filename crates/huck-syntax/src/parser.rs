@@ -4938,6 +4938,26 @@ mod tests {
     }
 
     #[test]
+    fn atoms_arith_command_disambiguation() {
+        // ── Close cleanly → Command::Arith ──────────────────────────────────
+        diff_cmd("(())");                // empty body → Arith(Word([]))
+        diff_cmd("(( ))");               // single-space body → Arith([Literal " "])
+        diff_cmd("(( (1+2) * 3 ))");     // inner grouping parens: depth-tracked, NOT a bail
+        diff_cmd("(( a[0] + 1 ))");      // subscript brackets are plain body text
+        diff_cmd("(( a + $b + ${c} ))"); // multiple embedded expansions
+        diff_cmd("(( 1+2 ))");           // exact string freed from the old deferral tests
+        diff_cmd("(( x + $y ))");        // exact string freed from the old deferral tests
+        // ── Bail → nested subshell (depth-0 `)` not followed by `)`) ─────────
+        diff_cmd("((echo hi) )");        // glued open, inner closes with a single `)`
+        diff_cmd("(( 3*4 ) )");          // glued open, SPACED close
+        diff_cmd("((a) && (b))");        // `)` after `a` at depth 0 not followed by `)`
+        diff_cmd("((a); (b))");
+        // ── Spaced `( (` → subshell (existing path; regression guards) ───────
+        diff_cmd("( (echo hi) )");
+        diff_cmd("( ( a ) )");
+    }
+
+    #[test]
     fn cmd_deep_nesting() {
         diff_cmd("if x; then while y; do case $z in a) ( b );; esac; done; fi");
         diff_cmd("{ for i in a b; do if $i; then echo $i; fi; done; }");
