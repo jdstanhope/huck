@@ -480,6 +480,13 @@ pub enum TokenKind {
     /// AssignPrefix — the `name=` flows into the literal run and the splitter
     /// breaks on the first unquoted `=` (mirrors the oracle's `scan_step_command`).
     AssignPrefix { target: crate::command::AssignTarget, append: bool },
+    /// v254: zero-width terminator of a `Mode::Regex` pattern operand — emitted
+    /// (and the mode popped) at the depth-0 whitespace or EOF that ends the `=~`
+    /// operand. The parser's `parse_regex_operand` assembles pattern atoms until
+    /// this, then consumes it. Cursor is left ON the terminating whitespace (so
+    /// command mode re-consumes it as a `Blank`/`Newline`); at EOF the cursor is
+    /// at end.
+    RegexEnd,
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -636,7 +643,7 @@ pub(crate) enum Mode {
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
-    Regex,          // RHS of =~
+    Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
     HeredocBody,    // <<EOF …
 }
 
@@ -839,6 +846,18 @@ impl<'a> Lexer<'a> {
         self.modes.pop().expect("pop_mode on an empty mode stack")
     }
 
+    /// v254 T1 fix: set the current `Mode::Regex { body_started }` flag from the
+    /// parser (mirrors the `paren_depth` write-back in `scan_step_regex`). The
+    /// parser calls this after each assembled pattern atom with "has any content
+    /// been produced," so `body_started` tracks the oracle's
+    /// `!(lit.is_empty() && parts.is_empty())` — an empty `""` leaves it false. A
+    /// no-op if the top of the mode stack is not `Mode::Regex` (defensive).
+    pub(crate) fn set_regex_body_started(&mut self, v: bool) {
+        if let Some(Mode::Regex { body_started, .. }) = self.modes.last_mut() {
+            *body_started = v;
+        }
+    }
+
     /// Arm the one-shot v246 wrinkle flag: the next `$((` the CommandSub scanner
     /// sees is tokenized as `$(` + a subshell `(` rather than deferred as arith.
     /// Cleared the moment `scan_step_command_sub` consumes that `$(`.
@@ -939,6 +958,7 @@ impl<'a> Lexer<'a> {
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
             Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
+            Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -3356,57 +3376,7 @@ impl<'a> Lexer<'a> {
             // bounded peek.
             Some('$') => {
                 self.cmd_at_word_start = false;
-                let mut probe = self.cursor.clone();
-                probe.next(); // skip `$`
-                match probe.peek().copied() {
-                    Some('{') => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // `{`
-                        self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
-                    }
-                    Some('(') => {
-                        let mut probe2 = probe.clone();
-                        probe2.next(); // skip first `(`
-                        if probe2.peek() == Some(&'(') {
-                            // `$((` — zero-width ArithOpen signal (cursor stays on `$`).
-                            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
-                        } else {
-                            // `$(cmd)` — zero-width CmdSubOpen signal (cursor stays on `$`).
-                            self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
-                        }
-                    }
-                    Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
-                        self.cursor.next(); // `$`
-                        self.cursor.next(); // special char
-                        self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
-                    }
-                    Some(d) if d.is_ascii_digit() => {
-                        self.cursor.next(); // `$`
-                        let digit = self.cursor.next().unwrap();
-                        self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
-                    }
-                    Some(nc) if is_name_start(nc) => {
-                        self.cursor.next(); // `$`
-                        let name = scan_var_name(&mut self.cursor);
-                        self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
-                    }
-                    // `$[expr]` — legacy arithmetic expansion. DEFERRED to Stage 2
-                    // (no atom-mode for it yet). Emit the zero-width
-                    // `DeferredExpansion` signal (cursor stays on `$`) so the parser
-                    // defers cleanly (`parse_simple` → UnsupportedCommand) instead of
-                    // mis-lexing `$` + `[expr]` as two literals (the production
-                    // `scan_dollar_expansion` builds a `WordPart::Arith` here).
-                    Some('[') => {
-                        self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
-                    }
-                    _ => {
-                        self.cursor.next(); // lone `$`
-                        self.history.push(Token::new(
-                            TokenKind::DollarLit { quoted: false },
-                            Span::new(off, l, c),
-                        ));
-                    }
-                }
+                self.emit_unquoted_dollar_atom(off, l, c);
                 Ok(Step::Produced)
             }
 
@@ -3797,6 +3767,184 @@ impl<'a> Lexer<'a> {
                     TokenKind::Lit { text, quoted: true },
                     Span::new(off, l, c),
                 ));
+                Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v254: emit the atom for an unquoted `$…` at the cursor (cursor on `$`).
+    /// `${`→ParamOpen{false}, `$((`→ArithOpen, `$(`→CmdSubOpen, specials/digit/
+    /// name→DollarName{false}, `$[`→DeferredExpansion, lone `$`→DollarLit{false}.
+    /// Extracted verbatim from scan_command_word_atom's `$` arm — called from
+    /// BOTH the command scanner and `scan_step_regex` (the whole command-position
+    /// `$`-test suite is the regression gate).
+    fn emit_unquoted_dollar_atom(&mut self, off: usize, l: u32, c: u32) {
+        let mut probe = self.cursor.clone();
+        probe.next(); // skip `$`
+        match probe.peek().copied() {
+            Some('{') => {
+                self.cursor.next(); // `$`
+                self.cursor.next(); // `{`
+                self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
+            }
+            Some('(') => {
+                let mut probe2 = probe.clone();
+                probe2.next(); // skip first `(`
+                if probe2.peek() == Some(&'(') {
+                    // `$((` — zero-width ArithOpen signal (cursor stays on `$`).
+                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                } else {
+                    // `$(cmd)` — zero-width CmdSubOpen signal (cursor stays on `$`).
+                    self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
+                }
+            }
+            Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
+                self.cursor.next(); // `$`
+                self.cursor.next(); // special char
+                self.history.push(Token::new(TokenKind::DollarName { name: sp.to_string(), quoted: false }, Span::new(off, l, c)));
+            }
+            Some(d) if d.is_ascii_digit() => {
+                self.cursor.next(); // `$`
+                let digit = self.cursor.next().unwrap();
+                self.history.push(Token::new(TokenKind::DollarName { name: digit.to_string(), quoted: false }, Span::new(off, l, c)));
+            }
+            Some(nc) if is_name_start(nc) => {
+                self.cursor.next(); // `$`
+                let name = scan_var_name(&mut self.cursor);
+                self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
+            }
+            // `$[expr]` — legacy arithmetic expansion. DEFERRED to Stage 2
+            // (no atom-mode for it yet). Emit the zero-width
+            // `DeferredExpansion` signal (cursor stays on `$`) so the parser
+            // defers cleanly (`parse_simple` → UnsupportedCommand) instead of
+            // mis-lexing `$` + `[expr]` as two literals (the production
+            // `scan_dollar_expansion` builds a `WordPart::Arith` here).
+            Some('[') => {
+                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+            }
+            _ => {
+                self.cursor.next(); // lone `$`
+                self.history.push(Token::new(
+                    TokenKind::DollarLit { quoted: false },
+                    Span::new(off, l, c),
+                ));
+            }
+        }
+    }
+
+    /// v254: `Mode::Regex { paren_depth, body_started }` scanner — emits the atoms
+    /// of the `=~` pattern operand inside `[[ … ]]`. Mirrors `scan_regex_operand`
+    /// (see the production fn) atom-natively:
+    ///  - literal runs (incl. the regex metacharacters `| < > ; &` and depth-tracked
+    ///    `( )`) → `Lit { quoted: false }`;
+    ///  - `$`/`` ` ``/`"`/`'`/`$'` → the SAME expansion-opener signals the command
+    ///    scanner emits (`ParamOpen`/`CmdSubOpen`/`ArithOpen`/`DollarName`/`DollarLit`/
+    ///    `BeginBacktick`/`BeginDquote`/`QuoteRun`), so the parser recurses via the
+    ///    existing sub-modes;
+    ///  - `\<NL>` → line-continuation (deleted); `\x` → literal `\x` (backslash KEPT,
+    ///    UNQUOTED — unlike the command word's `QuoteRun{Backslash}`); `\`-EOF → `\`;
+    ///  - depth-0 whitespace or EOF → pop the mode + emit zero-width `RegexEnd`
+    ///    (leading whitespace while `!body_started` is skipped, not a terminator).
+    fn scan_step_regex(&mut self, paren_depth: u32, body_started: bool) -> Result<Step, LexError> {
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+
+        // Leading-whitespace / continuation skip while the operand is still empty.
+        if !body_started {
+            loop {
+                match self.cursor.peek().copied() {
+                    Some(ch) if ch.is_whitespace() => { self.cursor.next(); }
+                    // `\<NL>` continuation before any operand content.
+                    Some('\\') if self.cursor.peek_nth(1) == Some('\n') => { self.cursor.next(); self.cursor.next(); }
+                    _ => break,
+                }
+            }
+        }
+
+        // Terminator: EOF or depth-0 whitespace ends the operand.
+        match self.cursor.peek().copied() {
+            None => { self.pop_mode(); self.history.push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c))); return Ok(Step::Produced); }
+            Some(ch) if ch.is_whitespace() && paren_depth == 0 => {
+                self.pop_mode();
+                self.history.push(Token::new(TokenKind::RegexEnd, Span::new(off, l, c)));
+                return Ok(Step::Produced);
+            }
+            _ => {}
+        }
+
+        // `body_started` is PARSER-MANAGED (v254 T1 fix): the lexer only READS it
+        // (for the leading-ws/`\<NL>` skip above) and never self-sets it. The
+        // parser calls `set_regex_body_started(!(parts.is_empty()&&acc.is_none()))`
+        // after each atom, so `body_started` reflects the oracle's
+        // `!(lit.is_empty() && parts.is_empty())` — an EMPTY `""` produces NO part,
+        // leaving the operand "unstarted" so the following space is still treated as
+        // leading (skipped); the pattern then becomes the literal `]]`, which the
+        // oracle's `next_test_word` rejects as `Err(TestExprMissingOperand)` (see the
+        // `=~` arm guard). This scan still writes back `paren_depth` in the literal arm.
+
+        match self.cursor.peek().copied() {
+            // Unreachable: the terminator match above already returned on EOF.
+            None => unreachable!("regex EOF handled by the terminator match"),
+            // Single-quoted run → QuoteRun{Single} (reuse the command-scanner shape).
+            Some('\'') => {
+                self.cursor.next();
+                let mut text = String::new();
+                loop {
+                    match self.cursor.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('\'') => break,
+                        Some(ch) => text.push(ch),
+                    }
+                }
+                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::Single, text }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Double-quoted span → zero-width BeginDquote (parser pushes Mode::DoubleQuote).
+            Some('"') => { self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c))); Ok(Step::Produced) }
+            // `$'…'` ANSI-C (must precede the general `$` arm).
+            Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
+                self.cursor.next(); self.cursor.next();
+                let text = scan_ansi_c_quoted(&mut self.cursor)?;
+                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // `$…` — same unquoted classification the command scanner uses.
+            Some('$') => { self.emit_unquoted_dollar_atom(off, l, c); Ok(Step::Produced) }
+            // Backtick command-sub → zero-width BeginBacktick.
+            Some('`') => { self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c))); Ok(Step::Produced) }
+            // Literal run (incl. `| < > ; &`, depth-tracked `( )`, `\`-escapes,
+            // and depth>0 whitespace). Stops at an expansion/quote opener, at
+            // depth-0 whitespace, or EOF (the outer match re-enters).
+            Some(_) => {
+                let mut text = String::new();
+                let mut depth = paren_depth;
+                while let Some(&ch) = self.cursor.peek() {
+                    match ch {
+                        '\'' | '"' | '`' => break,           // quote/backtick openers
+                        '$' => break,                        // expansion opener
+                        c2 if c2.is_whitespace() && depth == 0 => break, // terminator
+                        '\\' => {
+                            self.cursor.next();              // consume `\`
+                            match self.cursor.next() {
+                                Some('\n') => {}             // line continuation: delete both
+                                Some(next) => { text.push('\\'); text.push(next); }
+                                None => text.push('\\'),
+                            }
+                        }
+                        '(' => { text.push('('); depth += 1; self.cursor.next(); }
+                        ')' => { text.push(')'); depth = depth.saturating_sub(1); self.cursor.next(); }
+                        _   => { text.push(ch); self.cursor.next(); } // incl. | < > ; & and depth>0 ws
+                    }
+                }
+                // Persist the running paren depth on the mode for the next step.
+                if let Some(Mode::Regex { paren_depth: p, .. }) = self.modes.last_mut() { *p = depth; }
+                if text.is_empty() {
+                    // Only reachable if the first char was `\<NL>` at operand start
+                    // (already handled) — re-enter to hit the terminator/opener.
+                    return self.scan_step_regex(depth, true);
+                }
+                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
                 Ok(Step::Produced)
             }
         }
