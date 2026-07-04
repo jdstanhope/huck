@@ -10,9 +10,9 @@ use crate::command::{
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
 use crate::lexer::{
-    brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
-    ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp,
-    Word, WordPart,
+    brace_expand_parts, ArithDelim, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator,
+    ParamModifier, ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind,
+    TokenKind, TransformOp, Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -1274,7 +1274,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
     // pull-boundary assert holds.
     let mark = iter.mark();
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
@@ -1327,7 +1327,7 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
@@ -2915,7 +2915,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
     let result = parse_arith_for_body(iter);
     iter.pop_mode();
     let sections = match result {
