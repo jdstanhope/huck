@@ -5,7 +5,7 @@
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
-    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, IfClause, ElifBranch, WhileClause,
+    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines,
 };
@@ -2229,7 +2229,17 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     // Parse the first stage command (may be simple or compound).
     let first = parse_command(iter)?;
+    finish_pipeline(iter, first, negate)
+}
 
+/// Given an already-parsed first stage, finish a pipeline: consume any `|`-joined
+/// stages and apply the oracle's wrapping rule. Split out of `parse_pipeline` so
+/// the coproc body parser can reuse the `|`-loop for a simple first stage (v257).
+fn finish_pipeline(
+    iter: &mut Lexer,
+    first: Command,
+    negate: bool,
+) -> Result<Command, ParseError> {
     // A trailing inter-token `Blank` may sit between a compound command's
     // terminator (e.g. `fi`, `}`, `)`) and a following `|` (the atom scanner
     // emits it; simple commands already swallow it in `parse_simple`).

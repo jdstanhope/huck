@@ -4224,6 +4224,14 @@ impl<'a> Lexer<'a> {
         self.fill_to(self.pos + 1)?;
         Ok(self.history.get(self.pos + 1).map(|t| &t.kind))
     }
+    /// Peek the token `n` positions ahead of the cursor WITHOUT consuming
+    /// (n=0 == `peek_kind`, n=1 == `peek2_kind`).  Fills the lookahead buffer
+    /// as needed; reads already-buffered tokens only — no forward scan for a
+    /// delimiter.
+    pub fn peek_nth_kind(&mut self, n: usize) -> Result<Option<&TokenKind>, LexError> {
+        self.fill_to(self.pos + n)?;
+        Ok(self.history.get(self.pos + n).map(|t| &t.kind))
+    }
     pub fn next_kind(&mut self) -> Result<Option<TokenKind>, LexError> {
         Ok(self.next()?.map(|t| t.kind))
     }

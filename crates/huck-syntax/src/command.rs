@@ -1318,7 +1318,7 @@ fn parse_if(
 /// Returns the text of `word` if it is a single, unquoted `Literal` whose
 /// text is a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) and is not a
 /// reserved keyword. Used by `for`-loop variable names and function names.
-fn valid_identifier_text(word: &Word) -> Option<String> {
+pub(crate) fn valid_identifier_text(word: &Word) -> Option<String> {
     if word.0.len() != 1 {
         return None;
     }
