@@ -2696,9 +2696,93 @@ fn parse_do_body_done(iter: &mut Lexer) -> Result<Sequence, ParseError> {
     Ok(body)
 }
 
+/// Trim a for-header section `Word` to match the oracle's `s.trim()` + empty-⇒-`None`.
+/// Trims leading whitespace from the first `Literal` part and trailing whitespace from
+/// the last `Literal` part (dropping parts that become empty). No parts ⇒ `None`.
+fn trim_section(word: &Word) -> Option<Word> {
+    let mut parts: Vec<WordPart> = word.0.clone();
+    // Trim the leading Literal.
+    if let Some(WordPart::Literal { text, quoted }) = parts.first().cloned() {
+        let trimmed = text.trim_start().to_string();
+        if trimmed.is_empty() { parts.remove(0); } else { parts[0] = WordPart::Literal { text: trimmed, quoted }; }
+    }
+    // Trim the trailing Literal.
+    if let Some(WordPart::Literal { text, quoted }) = parts.last().cloned() {
+        let trimmed = text.trim_end().to_string();
+        let last = parts.len() - 1;
+        if trimmed.is_empty() { parts.pop(); } else { parts[last] = WordPart::Literal { text: trimmed, quoted }; }
+    }
+    if parts.is_empty() { None } else { Some(Word(parts)) }
+}
+
+/// Assemble the for-header sections by pulling atoms until `ArithClose`, splitting on
+/// `ArithSemi`. Mirrors `parse_arith_body`'s part arms (all `quoted:true`). Returns the
+/// section `Word`s (≥1). `ArithBail` (a depth-0 `)` not followed by `)`) ⇒ the header
+/// never closed ⇒ `UnterminatedLoop` (matching the oracle's `for ((` fallback).
+fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
+    let mut sections: Vec<Word> = Vec::new();
+    let mut cur: Vec<WordPart> = Vec::new();
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::ArithClose) => { iter.next_kind()?; sections.push(Word(cur)); return Ok(sections); }
+            Some(TokenKind::ArithSemi)  => { iter.next_kind()?; sections.push(Word(std::mem::take(&mut cur))); }
+            Some(TokenKind::ArithBail)  => { return Err(ParseError::UnterminatedLoop); }
+            Some(TokenKind::ParamOpen { .. }) => { cur.push(parse_param_expansion(iter, true)?); }
+            Some(TokenKind::CmdSubOpen)       => { iter.next_kind()?; cur.push(parse_command_sub(iter, true)?); }
+            Some(TokenKind::BeginBacktick)    => { iter.next_kind()?; cur.push(parse_backtick_sub(iter, true)?); }
+            Some(TokenKind::ArithOpen)        => { iter.next_kind()?; cur.push(parse_arith_expansion(iter, true)?); }
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
+                    cur.push(WordPart::Literal { text, quoted });
+                }
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted }) = iter.next_kind()? {
+                    let part = match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted, joined: false },
+                        "*" => WordPart::AllArgs { quoted, joined: true },
+                        "?" => WordPart::LastStatus { quoted },
+                        _   => WordPart::Var { name, quoted },
+                    };
+                    cur.push(part);
+                }
+            }
+            _ => return Err(ParseError::UnsupportedExpansion),
+        }
+    }
+}
+
+/// Parse a C-style `for (( init; cond; step )); do … done`. The caller (`parse_for`)
+/// has verified two glued `Op(LParen)`. Delimits the header via `Mode::Arith`
+/// (`for_header: true`, reusing v255/v246), splits into three sections, and reuses
+/// `parse_do_body_done` for the body. A non-closing header surfaces as the
+/// `Mode::Arith` unterminated-arith lex error (EOF before `))`) ⇒ `UnterminatedLoop`,
+/// matching the oracle's `for ((` fallback.
+fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
+    iter.next_kind()?; // first `(`
+    iter.next_kind()?; // second `(`
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+    let result = parse_arith_for_body(iter);
+    iter.pop_mode();
+    let sections = match result {
+        Ok(s) => s,
+        Err(ParseError::Lex(_)) => return Err(ParseError::UnterminatedLoop),
+        Err(e) => return Err(e),
+    };
+    if sections.len() != 3 {
+        return Err(ParseError::ArithForHeader(format!(
+            "expected 3 sections separated by `;`, got {}", sections.len())));
+    }
+    let init = trim_section(&sections[0]);
+    let cond = trim_section(&sections[1]);
+    let step = trim_section(&sections[2]);
+    let body = parse_do_body_done(iter)?;
+    Ok(Command::ArithFor(Box::new(ArithForClause { init, cond, step, body })))
+}
+
 /// Parses `for NAME [in WORD...]; do LIST; done`.  Mirrors
 /// `parse_for_command`/`parse_for_after_keyword` (~1487/1537) in `command.rs`.
-/// C-style `for ((...))` (ArithFor) is deferred → `UnsupportedCommand`.
+/// C-style `for ((...))` (ArithFor) is parsed via `parse_arith_for_clause`.
 fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     expect_keyword(iter, Keyword::For, ParseError::UnterminatedLoop)?;
 
@@ -2707,35 +2791,19 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
     // `skip_newlines` (v250 T3) also drains any heredoc-body atom groups.
     skip_newlines(iter)?;
 
-    // C-style ArithFor `for ((...))` is DEFERRED.  The Word-lexer emits a single
-    // `ArithBlock` for a COMPLETE header (→ oracle `ArithFor`); the atom scanner
-    // has no `ArithBlock` — a COMPLETE `for ((...))` and an UNTERMINATED `for ((`
-    // BOTH begin with two glued `Op(LParen)` atoms.  Distinguish them by paren
-    // depth over the token stream: a COMPLETE header closes with `))` → deferred
-    // `UnsupportedCommand` (matches the oracle deferring `ArithFor`); one that
-    // never closes → `UnterminatedLoop` (matches the oracle's two-LParen fallback).
+    // v255 carry: the Word-lexer emits a single `ArithBlock` for a COMPLETE
+    // legacy-mode header; the atom scanner never produces `ArithBlock` (kept
+    // for parity with any pre-atoms fixture that might still route here).
     if matches!(iter.peek_kind()?, Some(TokenKind::ArithBlock(..))) {
         return Err(ParseError::UnsupportedCommand);
     }
+    // v256: C-style `for ((init;cond;step)); do … done`. The atom scanner emits the
+    // glued `((` as two `Op(LParen)`; a spaced `( (` after `for` is not valid, so
+    // (like the oracle) two glued `(` here is always an arith-for header.
     if matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::LParen)))
         && matches!(iter.peek2_kind()?, Some(TokenKind::Op(Operator::LParen)))
     {
-        iter.next_kind()?; // first `(`
-        iter.next_kind()?; // second `(`
-        let mut depth = 2i32;
-        loop {
-            match iter.next_kind()? {
-                None => return Err(ParseError::UnterminatedLoop),
-                Some(TokenKind::Op(Operator::LParen)) => depth += 1,
-                Some(TokenKind::Op(Operator::RParen)) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Err(ParseError::UnsupportedCommand);
-                    }
-                }
-                _ => {}
-            }
-        }
+        return parse_arith_for_clause(iter);
     }
 
     // Read the loop variable name (assembled from atoms).
@@ -3840,7 +3908,10 @@ mod tests {
         // (see `atoms_double_bracket_core`).
         // `(( 1+2 ))` (standalone arith command) is NO LONGER deferred —
         // v255 T1 implements it (see `atoms_arith_command`).
-        for s in ["for ((i=0;i<2;i++)); do :; done", "coproc c { :; }"] {
+        // `for ((i=0;i<2;i++)); do :; done` is NO LONGER deferred — v256 T2
+        // implements C-style `for (( … ))` (see `atoms_arith_for`).
+        diff_cmd("for ((i=0;i<2;i++)); do :; done");
+        for s in ["coproc c { :; }"] {
             assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
         }
@@ -4227,8 +4298,10 @@ mod tests {
         // `[[ … ]]` (see `atoms_double_bracket_core`).
         // NOTE: `(( 1+2 ))` (standalone arith command) is NO LONGER deferred —
         // v255 T1 implements it (see `atoms_arith_command`).
+        // NOTE: `for ((i=0;i<3;i++)); do :; done` (C-style ArithFor) is NO LONGER
+        // deferred — v256 T2 implements it (see `atoms_arith_for`).
+        diff_cmd("for ((i=0;i<3;i++)); do :; done");
         for s in [
-            "for ((i=0;i<3;i++)); do :; done",
             "coproc x { :; }",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
@@ -4326,10 +4399,10 @@ mod tests {
         // `f() (( 1 ))` is NO LONGER deferred — v255 T1 implements the standalone
         // arith command, and funcdef bodies dispatch through `parse_command`.
         diff_cmd("f() (( 1 ))");
-        for s in ["f() for ((i=0;i<2;i++)); do :; done"] {
-            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand (deferred body) for {s:?}, got {:?}", new_seq(s));
-        }
+        // `f() for ((i=0;i<2;i++)); do :; done` is NO LONGER deferred — v256 T2
+        // implements C-style `for (( … ))`, and `Command::ArithFor` is in the
+        // oracle's `is_function_body_shape` allow-list (command.rs:1168).
+        diff_cmd("f() for ((i=0;i<2;i++)); do :; done");
     }
 
     #[test]
@@ -4732,7 +4805,9 @@ mod tests {
         diff_cmd("select x in a b; do y; done");
         diff_cmd("select x; do y; done");            // no-`in`
         diff_cmd("select x in a b c; do echo $x; break; done");
-        diff_unsupported("for ((i=0;i<3;i++)); do x; done");   // ArithFor deferred
+        // `for ((…)) …` (ArithFor) is NO LONGER deferred — v256 T2 implements it
+        // (see `atoms_arith_for`).
+        diff_cmd("for ((i=0;i<3;i++)); do x; done");
         diff_err("for i in a; do x");                // unterminated parity
     }
 
@@ -4925,8 +5000,9 @@ mod tests {
         // `f() { x; }` (function def, `name()`) removed: now in-scope, v248 T2.
         // `(( 1+2 ))` / `(( x + $y ))` (standalone arith command) removed: now
         // in-scope, v255 T1 (see `atoms_arith_command`).
+        // `for ((…)) …` (ArithFor) removed: now in-scope, v256 T2 (see
+        // `atoms_arith_for`).
         diff_unsupported("coproc x");
-        diff_unsupported("for ((i=0;i<3;i++)); do x; done");        // ArithFor
         // `cat <<<w` (here-string) removed: now in-scope, v249 T1.
     }
 
@@ -4978,6 +5054,23 @@ mod tests {
         diff_cmd("if (( x > 0 )); then y; fi");        // arith as an if-condition
         diff_cmd("while (( i < 3 )); do x; done");     // arith as a while-condition
         diff_cmd("for i in a; do (( n++ )); done");    // arith in a for body
+    }
+
+    // v256: C-style for (( … ))
+    #[test]
+    fn atoms_arith_for() {
+        // Well-formed → Command::ArithFor (byte-identical to the oracle).
+        diff_cmd("for ((i=0;i<3;i++)); do echo $i; done");
+        diff_cmd("for ((;;)) do :; done");                 // all sections empty → None
+        diff_cmd("for (( i = 0 ; i < n ; i++ )); do x; done"); // sections trimmed
+        diff_cmd("for ((i=0,j=0; i<3; i++,j++)); do :; done");  // comma is literal
+        diff_cmd("for ((i=$x; i<${n}; i++)); do :; done");  // embedded expansions
+        diff_cmd("for ((i=(1+2); i<9; i++)); do :; done");  // inner grouping parens
+        diff_cmd("for ((;;)); do break; done");
+        // Section-count errors (both paths ArithForHeader with identical message).
+        diff_err("for ((a;b;c;d)); do :; done");            // got 4
+        diff_err("for ((a)); do :; done");                  // got 1
+        diff_err("for ((a; b)); do :; done");               // got 2
     }
 
     #[test]
