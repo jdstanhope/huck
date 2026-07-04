@@ -5101,7 +5101,45 @@ mod tests {
         // `"a;b"` is NOT protected on the atom path either: it also splits into
         // 4 sections. Both paths therefore agree — this is NOT a live divergence,
         // and diff_err (not a manual is_ok/is_err pin) is the right assertion.
+        // Quotes are the ONLY sub-grammar that's fine, though: backtick and
+        // `${…}` sub-expansions DO carry a real divergence here — see
+        // `atoms_arith_for_header_semi_in_subexpansion_carryforward` below.
         diff_err("for (( \"a;b\"; ; )); do :; done");
+    }
+
+    /// v256 live-flip carry-forward: a depth-0 `;` inside a backtick or `${…}`
+    /// sub-expansion in a `for (( … ))` header. The oracle's
+    /// `split_top_level_semi` (command.rs) counts ONLY `(`/`)` nesting when
+    /// finding header-section separators — it has no idea backticks or
+    /// `${…}` exist, so a `;` inside `` `a;b` `` or `${x;y}` is just another
+    /// depth-0 separator and the header splits into 4 sections →
+    /// `ArithForHeader` ("got 4"). The atom path tokenizes the header via
+    /// `Mode::Arith`, where a backtick opener hands off to the
+    /// `BeginBacktick` sub-parse and `${` hands off to the `ParamOpen`
+    /// sub-parse — so the `;` inside either sub-expansion is consumed by
+    /// that sub-parser and never reaches the arith `;`-classifier at all.
+    /// The header is seen as only 2 sections (init; the rest empty) and
+    /// parses clean. Pin the REAL observed disagreement (oracle `Err`, atom
+    /// `Ok`) so the differential gate tracks it; reconcile before flipping
+    /// `command_atoms` live.
+    ///
+    /// NOTE this is narrower than it looks: quotes do NOT diverge (see
+    /// `atoms_arith_for_edges` above — `Mode::Arith` has no dquote sub-mode,
+    /// so `"` is just a literal char and both paths split identically), and
+    /// `$(…)` does NOT diverge either (its parens raise the SAME paren depth
+    /// the oracle counts, so a `;` inside `$(a;b)` is protected on both
+    /// paths). Only backtick and `${…}` sub-expansions carry their own
+    /// separate delimiter grammar that the oracle's naive paren-counter
+    /// can't see.
+    #[test]
+    fn atoms_arith_for_header_semi_in_subexpansion_carryforward() {
+        for s in [
+            "for (( `a;b`; ; )); do :; done",
+            "for (( ${x;y}; ; )); do :; done",
+        ] {
+            assert!(old_seq(s).is_err(), "expected oracle Err for {s:?}, got {:?}", old_seq(s));
+            assert!(new_seq(s).is_ok(), "expected atom-path Ok for {s:?}, got {:?}", new_seq(s));
+        }
     }
 
     #[test]
