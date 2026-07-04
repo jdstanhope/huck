@@ -5442,6 +5442,79 @@ mod tests {
     }
 
     #[test]
+    fn atoms_legacy_arith_carryforward_sites() {
+        // Heredoc body (v250 carry-forward) → Arith{quoted:true} + "\n"
+        diff_cmd("cat <<E\n$[1+2]\nE\n");
+        // Regex operand inside [[ … ]] (v254 carry-forward)
+        diff_cmd("[[ x =~ $[1+2] ]]");
+        // Array-literal value
+        diff_cmd("a=($[1+2])");
+        // case subject
+        diff_cmd("case $[1+2] in a) :;; esac");
+    }
+
+    #[test]
+    fn atoms_legacy_arith_quote_backslash_carryforward() {
+        // v258 LIVE-FLIP CARRY-FORWARD: the atom Mode::Arith{Bracket} treats quotes
+        // and `\` as LITERAL chars (no sub-mode, exactly like `$((`), so a `]`
+        // inside `"…"` or after `\` closes the `$[ … ]` EARLY. The oracle's
+        // scan_legacy_arith_body protects those spans (`Arith{body:" ] "}` /
+        // `Arith{body:" \\] "}` respectively). `$((` shows no such divergence only
+        // because its early depth-0 `)` ArithBails to a command-sub-of-subshell on
+        // BOTH paths; `$[` has no bail. Pathological (quotes/backslash-escaped
+        // brackets in a legacy arith); dormant.
+        //
+        // `echo $[ "]" ]`: the atom body closes at the FIRST unprotected `]`
+        // (right after the opening `"`), leaving a lone unmatched `"` in the rest
+        // of the command line (`" ]`) — that dangling quote never closes before
+        // EOF, so the atom path errors UnterminatedQuote (the oracle parses fine).
+        assert!(
+            matches!(
+                new_seq("echo $[ \"]\" ]"),
+                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
+            ),
+            "expected UnterminatedQuote for echo $[ \"]\" ], got {:?}",
+            new_seq("echo $[ \"]\" ]")
+        );
+
+        // `echo $[ \] ]`: `\` is a literal body char (no escaping), so the `]`
+        // immediately after it closes the bracket early (body = " \\"); the
+        // trailing ` ]` becomes a SECOND, separate argument word.
+        assert_eq!(
+            new_seq("echo $[ \\] ]").unwrap(),
+            Some(Sequence {
+                first: Command::Pipeline(Pipeline {
+                    negate: false,
+                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
+                        inline_assignments: vec![],
+                        program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
+                        args: vec![
+                            Word(vec![WordPart::Arith {
+                                body: Word(vec![WordPart::Literal { text: " \\".into(), quoted: true }]),
+                                quoted: false,
+                            }]),
+                            Word(vec![WordPart::Literal { text: "]".into(), quoted: false }]),
+                        ],
+                        redirects: vec![],
+                        line: 1,
+                    }))],
+                }),
+                rest: vec![],
+                background: false,
+            })
+        );
+    }
+
+    #[test]
+    fn atoms_legacy_arith_unterminated() {
+        // `$[1+2` (no closing `]`) → lex error on both paths. `old_seq` panics
+        // (`.expect("lex")`), so this is asserted on the atom side only: the atom
+        // emits UnterminatedArith (the oracle emits UnterminatedLegacyArith — both
+        // ParseError::Lex; dormant, error-kind difference only).
+        assert!(new_seq("echo $[1+2").is_err(), "unterminated $[ must error");
+    }
+
+    #[test]
     fn cmd_deep_nesting() {
         diff_cmd("if x; then while y; do case $z in a) ( b );; esac; done; fi");
         diff_cmd("{ for i in a b; do if $i; then echo $i; fi; done; }");
