@@ -1650,7 +1650,7 @@ fn parse_coproc_command(iter: &mut Lexer) -> Result<Command, ParseError> {
 
 /// True if `tok` is the first token of a compound command
 /// (`{`, `(`, if/while/until/for/case/select, `[[`, `((`).
-fn is_compound_opener(tok: Option<&TokenKind>) -> bool {
+pub(crate) fn is_compound_opener(tok: Option<&TokenKind>) -> bool {
     match tok {
         Some(TokenKind::Op(Operator::LParen)) => true,
         Some(TokenKind::ArithBlock(..)) => true,

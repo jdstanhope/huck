@@ -7,7 +7,7 @@ use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
-    TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines,
+    TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
 use crate::lexer::{
     brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
@@ -2260,8 +2260,19 @@ fn is_word_boundary_tok(t: Option<&TokenKind>) -> bool {
 /// compound command. Bounded lookahead (peek 0..3); consumes nothing. The caller
 /// has already consumed `coproc` and skipped blanks.
 fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
-    // word1 must be a bare valid-identifier Lit.
+    // word1 must be a bare valid-identifier Lit (atom path) or a legacy Word
+    // token (fat-lexer path, e.g. inside $(...)/backticks).
     let text = match iter.peek_kind()? {
+        // Legacy fat-lexer path: the NAME arrives as a single `Word` token
+        // with no `Blank` before the opener. Mirror the oracle's
+        // `parse_coproc_command` exactly.
+        Some(TokenKind::Word(w)) => {
+            let named = valid_identifier_text(w).is_some();
+            if !named {
+                return Ok(false);
+            }
+            return Ok(is_compound_opener(iter.peek2_kind()?));
+        }
         Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
         _ => return Ok(false),
     };
@@ -5346,6 +5357,20 @@ mod tests {
         diff_cmd("coproc D [[ -n x ]]");
         // negation of a whole coproc pipeline (outer `!`)
         diff_cmd("! coproc cat");
+    }
+
+    #[test]
+    fn atoms_coproc_named_in_cmdsub() {
+        // v257 whole-branch fix: named coproc inside $(…)/backticks — the NAME
+        // arrives as a legacy Word token, not an atom Lit.
+        diff_cmd("$(coproc M { :; })");
+        diff_cmd("$(coproc M (echo))");
+        diff_cmd("$(coproc M if x; then y; fi)");
+        diff_cmd("$(coproc M while false; do :; done)");
+        diff_cmd("`coproc M { :; }`");
+        // anonymous in cmdsub still works (regression guard)
+        diff_cmd("$(coproc { :; })");
+        diff_cmd("$(coproc cat)");
     }
 
     #[test]
