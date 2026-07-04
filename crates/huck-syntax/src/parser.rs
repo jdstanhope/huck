@@ -2777,7 +2777,7 @@ fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     let cond = trim_section(&sections[1]);
     let step = trim_section(&sections[2]);
     let body = parse_do_body_done(iter)?;
-    Ok(Command::ArithFor(Box::new(ArithForClause { init, cond, step, body })))
+    maybe_wrap_redirects(Command::ArithFor(Box::new(ArithForClause { init, cond, step, body })), iter)
 }
 
 /// Parses `for NAME [in WORD...]; do LIST; done`.  Mirrors
@@ -5071,6 +5071,37 @@ mod tests {
         diff_err("for ((a;b;c;d)); do :; done");            // got 4
         diff_err("for ((a)); do :; done");                  // got 1
         diff_err("for ((a; b)); do :; done");               // got 2
+    }
+
+    #[test]
+    fn atoms_arith_for_composition() {
+        diff_cmd("for ((;;)); do break; done | cat");         // pipeline stage
+        diff_cmd("for ((;;)); do :; done && echo hi");        // && list
+        diff_cmd("for ((;;)); do :; done >out");              // trailing redirect (Redirected{inner:ArithFor})
+        diff_cmd("for\n((;;)); do :; done");                  // newline before header
+        diff_cmd("for (($x;;)); do :; done");                 // expansion in init only
+        diff_cmd("if x; then for ((i=0;i<2;i++)); do y; done; fi"); // nested in a compound body
+        diff_cmd("for ((i=0;i<2;i++)); do for ((j=0;j<2;j++)); do :; done; done"); // nested arith-for
+    }
+
+    #[test]
+    fn atoms_arith_for_edges() {
+        // Unterminated / malformed headers → UnterminatedLoop on both paths.
+        diff_err("for ((i=0;i<3;i++)");            // single close, EOF
+        diff_err("for ((i=0;i<3;i++); do x; done"); // single close before `;` → bail
+        diff_err("for ((;;)) done");                // missing `do`
+        diff_err("for ((;;)); do :");               // missing `done`
+        // Suspected divergence (per the plan): a `;` inside a quote in the header.
+        // The oracle's `split_top_level_semi` ignores quotes and splits inside
+        // the quoted run. Observed atom-path behavior (this test) shows the
+        // Mode::Arith for-header scanner (`scan_step_arith`, lexer.rs) has NO
+        // dquote sub-mode at all in arith bodies — `"` is just accumulated as a
+        // literal char, and the `;` classification only checks `for_header &&
+        // depth == 0` (paren depth, not quote state). So the inner `;` in
+        // `"a;b"` is NOT protected on the atom path either: it also splits into
+        // 4 sections. Both paths therefore agree — this is NOT a live divergence,
+        // and diff_err (not a manual is_ok/is_err pin) is the right assertion.
+        diff_err("for (( \"a;b\"; ; )); do :; done");
     }
 
     #[test]
