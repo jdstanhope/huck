@@ -923,9 +923,10 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
             }
             Err(e) => {
                 // Pop the CommandSub frame before propagating.  Map UnsupportedCommand
-                // (body-deferred constructs: `[[`, function-def, coproc, …) to
-                // UnsupportedExpansion so parse_command_sub has a consistent return
-                // type for all deferrals.
+                // (body-deferred constructs still remaining, e.g. legacy `$[expr]`
+                // arith) to UnsupportedExpansion so parse_command_sub has a
+                // consistent return type for all deferrals. (`[[`, function-def, and
+                // coproc bodies are no longer deferred — v253/v248/v257.)
                 iter.pop_mode();
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
@@ -2103,6 +2104,10 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
             let cmd = parse_double_bracket(iter, Vec::new())?;
             return maybe_wrap_redirects(cmd, iter);
         }
+        Some(Keyword::Coproc) => {
+            let cmd = parse_coproc(iter)?;
+            return maybe_wrap_redirects(cmd, iter);
+        }
         Some(_) => return Err(ParseError::UnsupportedCommand),
         None => {}
     }
@@ -2202,6 +2207,118 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     parse_simple(iter)
 }
 
+/// A `Word` consisting of a single unquoted `Literal` — used to run
+/// `valid_identifier_text` against a peeked bare `Lit` atom without consuming it.
+fn single_lit_word(text: &str) -> Word {
+    Word(vec![WordPart::Literal { text: text.to_string(), quoted: false }])
+}
+
+/// True if `k` is a compound-command opener keyword (the keyword half of the
+/// oracle's `is_compound_opener`: `{`, if/while/until/for/case/select, `[[`).
+/// `(`/`((` are `Op(LParen)` and are checked separately by the caller.
+fn is_compound_opener_kw(k: Keyword) -> bool {
+    matches!(
+        k,
+        Keyword::LBrace
+            | Keyword::If
+            | Keyword::While
+            | Keyword::Until
+            | Keyword::For
+            | Keyword::Case
+            | Keyword::Select
+            | Keyword::DoubleBracketOpen
+    )
+}
+
+/// Word-boundary set used by `peek_leading_keyword` (a following non-boundary
+/// atom means the previous `Lit` has more parts and is not a bare keyword).
+fn is_word_boundary_tok(t: Option<&TokenKind>) -> bool {
+    matches!(
+        t,
+        None | Some(TokenKind::Blank)
+            | Some(TokenKind::Newline)
+            | Some(TokenKind::Op(_))
+            | Some(TokenKind::RedirFd(_))
+            | Some(TokenKind::Heredoc { .. })
+    )
+}
+
+/// Non-consuming decision for `coproc NAME <compound>` (the oracle's
+/// `peek(Word valid_ident) && is_compound_opener(peek2)`): the leading word is a
+/// bare valid-identifier `Lit` AND the token immediately after it starts a
+/// compound command. Bounded lookahead (peek 0..3); consumes nothing. The caller
+/// has already consumed `coproc` and skipped blanks.
+fn peek_coproc_named(iter: &mut Lexer) -> Result<bool, ParseError> {
+    // word1 must be a bare valid-identifier Lit.
+    let text = match iter.peek_kind()? {
+        Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
+        _ => return Ok(false),
+    };
+    if valid_identifier_text(&single_lit_word(&text)).is_none() {
+        return Ok(false);
+    }
+    // Examine the token AFTER word1.
+    match iter.peek2_kind()? {
+        // Glued compound opener: `MYP(...)`.
+        Some(TokenKind::Op(Operator::LParen)) => Ok(true),
+        // Space, then a compound opener at peek(2).
+        Some(TokenKind::Blank) => {
+            // peek_nth_kind(2): `(`/`((` or a compound keyword.
+            let two = match iter.peek_nth_kind(2)? {
+                Some(TokenKind::Op(Operator::LParen)) => return Ok(true),
+                Some(TokenKind::Lit { text, quoted: false }) => text.clone(),
+                _ => return Ok(false),
+            };
+            match keyword_from_str(&two) {
+                Some(k) if is_compound_opener_kw(k) => {
+                    // Boundary after the keyword (mirrors peek_leading_keyword).
+                    Ok(is_word_boundary_tok(iter.peek_nth_kind(3)?))
+                }
+                _ => Ok(false),
+            }
+        }
+        // A word-continuation (multi-part word) or a non-opener boundary → anonymous.
+        _ => Ok(false),
+    }
+}
+
+/// Parse a coproc body, reproducing the oracle's `parse_command_inner`: a simple
+/// command is extended into a pipeline (`|` consumed, wrapped in `Pipeline`); a
+/// compound command is returned alone (a trailing `|` is left to the OUTER
+/// pipeline, so `coproc { a; } | cat` becomes `Pipeline[Coproc{..}, cat]`); a
+/// leading `!` is the program name, not negation (`parse_command` does not strip
+/// it).
+fn parse_coproc_body(iter: &mut Lexer) -> Result<Command, ParseError> {
+    skip_newlines(iter)?;
+    let first = parse_command(iter)?;
+    if matches!(first, Command::Simple(_)) {
+        finish_pipeline(iter, first, false)
+    } else {
+        Ok(first)
+    }
+}
+
+/// Parse a `coproc [NAME] command`. The caller (the compound-keyword dispatch)
+/// has NOT consumed `coproc`. Returns the bare `Command::Coproc`; the dispatch
+/// wraps trailing redirects. Named form = a valid-identifier word followed by a
+/// compound opener (non-consuming `peek_coproc_named`); otherwise anonymous
+/// (name = "COPROC"), body parsed from the untouched stream.
+fn parse_coproc(iter: &mut Lexer) -> Result<Command, ParseError> {
+    consume_command_word(iter)?; // `coproc`
+    skip_test_blanks(iter)?; // blanks only — a NEWLINE after `coproc` makes it anonymous
+    if peek_coproc_named(iter)? {
+        let name_word = consume_command_word(iter)?;
+        let name = valid_identifier_text(&name_word)
+            .expect("peek_coproc_named verified a valid identifier");
+        skip_test_blanks(iter)?;
+        let body = parse_coproc_body(iter)?;
+        Ok(Command::Coproc { name, body: Box::new(body) })
+    } else {
+        let body = parse_coproc_body(iter)?;
+        Ok(Command::Coproc { name: "COPROC".to_string(), body: Box::new(body) })
+    }
+}
+
 /// Parses a pipeline: an optional leading run of `!` words (odd count →
 /// negate), then command stages joined by `|`.  Mirrors
 /// `parse_command` (bang handling) + `parse_command_then_pipeline` +
@@ -2265,6 +2382,11 @@ fn finish_pipeline(
     skip_newlines(iter)?;
 
     loop {
+        // A `coproc` is invalid as a non-first pipeline stage (mirrors the
+        // oracle's `parse_next_stage`, command.rs:2344).
+        if peek_leading_keyword(iter)? == Some(Keyword::Coproc) {
+            return Err(ParseError::UnexpectedKeyword("coproc".to_string()));
+        }
         stages.push(parse_command(iter)?);
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
@@ -2511,8 +2633,8 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
             fill_command(inner, bodies);
             fill_redirects(redirects, bodies);
         }
-        // `coproc [NAME] command`: recurse into the wrapped command. Not
-        // reachable from the atom parser today (still deferred).
+        // `coproc [NAME] command`: recurse into the wrapped command. Reachable
+        // since v257 T2 (coproc is no longer deferred on the atom path).
         Command::Coproc { body, .. } => fill_command(body, bodies),
     }
 }
@@ -3921,10 +4043,8 @@ mod tests {
         // `for ((i=0;i<2;i++)); do :; done` is NO LONGER deferred — v256 T2
         // implements C-style `for (( … ))` (see `atoms_arith_for`).
         diff_cmd("for ((i=0;i<2;i++)); do :; done");
-        for s in ["coproc c { :; }"] {
-            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
-        }
+        // v257 T2: coproc is NO LONGER deferred (see `atoms_coproc_named_and_anonymous`).
+        diff_cmd("coproc c { :; }");
     }
 
     #[test]
@@ -4311,8 +4431,9 @@ mod tests {
         // NOTE: `for ((i=0;i<3;i++)); do :; done` (C-style ArithFor) is NO LONGER
         // deferred — v256 T2 implements it (see `atoms_arith_for`).
         diff_cmd("for ((i=0;i<3;i++)); do :; done");
+        // v257 T2: coproc is NO LONGER deferred (see `atoms_coproc_named_and_anonymous`).
+        diff_cmd("coproc x { :; }");
         for s in [
-            "coproc x { :; }",
             // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
             // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
             "echo $[1+2]", "echo pre$[1+2]post",
@@ -4859,9 +4980,8 @@ mod tests {
         // `f() { x; }` removed: function-def (`name()`) is now in-scope (v248 T2).
         // `[[ -n x ]]` removed: `[[ … ]]` is now in-scope (v253 T1).
         // `(( 1+2 ))` removed: standalone arith command is now in-scope (v255 T1).
-        for s in ["coproc x"] {
-            diff_unsupported(s);
-        }
+        // v257 T2: coproc is NO LONGER deferred (see `atoms_coproc_named_and_anonymous`).
+        diff_cmd("coproc x");
     }
 
     // T1 tests
@@ -5012,7 +5132,9 @@ mod tests {
         // in-scope, v255 T1 (see `atoms_arith_command`).
         // `for ((…)) …` (ArithFor) removed: now in-scope, v256 T2 (see
         // `atoms_arith_for`).
-        diff_unsupported("coproc x");
+        // `coproc x` removed: now in-scope, v257 T2 (see
+        // `atoms_coproc_named_and_anonymous`).
+        diff_cmd("coproc x");
         // `cat <<<w` (here-string) removed: now in-scope, v249 T1.
     }
 
@@ -5152,6 +5274,42 @@ mod tests {
         }
     }
 
+    // ── v257 T2: coproc ────────────────────────────────────────────────────
+    #[test]
+    fn atoms_coproc_named_and_anonymous() {
+        // Anonymous simple → Coproc{COPROC, Pipeline[..]}
+        diff_cmd("coproc awk prog");
+        diff_cmd("coproc foo bar");
+        diff_cmd("coproc cat");
+        diff_cmd("coproc\ncat");          // newline after coproc → anonymous; body skips it
+        diff_cmd("coproc ! cat");         // `!` is the program name, NOT negation
+        // Named compound
+        diff_cmd("coproc MYP { read l; }");
+        diff_cmd("coproc M (echo hi)");   // spaced subshell body
+        diff_cmd("coproc M(echo hi)");    // glued subshell body
+        diff_cmd("coproc M if x; then y; fi");
+        // Anonymous compound
+        diff_cmd("coproc { read l; }");
+        diff_cmd("coproc (echo hi)");
+        diff_cmd("coproc if x; then y; fi");
+    }
+
+    #[test]
+    fn atoms_coproc_body_pipeline_semantics() {
+        // simple body CONSUMES the pipe → body = Pipeline[cat, grep x]
+        diff_cmd("coproc cat | grep x");
+        // compound body does NOT consume the pipe → Pipeline[Coproc{BraceGroup}, cat]
+        diff_cmd("coproc { a; } | cat");
+        diff_cmd("coproc M { :; } | cat");
+        // body stops at `&&`
+        diff_cmd("coproc cat && echo y");
+        // redirects
+        diff_cmd("coproc cat >out");
+        diff_cmd("coproc M { :; } >out");
+        // rest-stage coproc is rejected (guard)
+        diff_err("echo x | coproc cat");
+    }
+
     #[test]
     fn cmd_deep_nesting() {
         diff_cmd("if x; then while y; do case $z in a) ( b );; esac; done; fi");
@@ -5255,6 +5413,7 @@ mod tests {
         diff_cs("$({ echo x; })");                  // comsub of a brace group
         diff_cs("$(f() { x; })");                   // function-def body (v248 T2)
         diff_cs("$([[ -n x ]])");                   // `[[ ]]` body (v253 T1)
+        diff_cs("$(coproc x)");                     // coproc body (v257 T2)
     }
 
     // v244 T3 tests
@@ -5293,7 +5452,8 @@ mod tests {
         // see `cs_body_grammar`'s `diff_cs("$(f() { x; })")`.
         // `$([[ -n x ]])` removed: `[[ ]]` body now parses (v253 T1); see
         // `cs_body_grammar`'s `diff_cs("$([[ -n x ]])")`.
-        diff_cs_deferred("$(coproc x)");            // body defers (coproc)
+        // `$(coproc x)` removed: coproc body now parses (v257 T2); see
+        // `cs_body_grammar`'s `diff_cs("$(coproc x)")`.
     }
 
     #[test]
