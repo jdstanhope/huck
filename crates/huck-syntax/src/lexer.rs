@@ -429,6 +429,7 @@ pub enum TokenKind {
     ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
     ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
     ArithSemi,   // v256: a `;` at paren_depth 0 inside a for-header — section separator
+    LegacyArithOpen,  // v258: opening `$[` of a legacy `$[ … ]` arith expansion — dual role like ArithOpen (zero-width operand signal + real opener in Arith{delim:Bracket})
     // --- Phase C v247: atom-emitting Command-mode scaffolding (dormant). ---
     Blank,   // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
     /// v247 T2: ONE complete quoted run in command-word context — `'…'`, `"…"`
@@ -619,6 +620,12 @@ enum Step {
     Eof,
 }
 
+/// v258: which bracket delimits an arith body. `Paren` = `$(( … ))` / `(( … ))`
+/// (paren-depth, closes on `))`); `Bracket` = `$[ … ]` legacy arith (bracket-depth,
+/// closes on a single `]`, parens are literal body chars).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArithDelim { Paren, Bracket }
+
 /// The lexing-rule context the lexer scans under. v240 implements only
 /// `Command`; the other variants are forward declarations for later Phase C
 /// iterations and are never the active mode in production yet.
@@ -640,7 +647,7 @@ pub(crate) enum Mode {
     // are never word-split), so there is no quoted/unquoted branch to select.
     // Kept for now rather than removed; may carry a future signal (e.g. if arith
     // ever needs to distinguish a quoted-bit).
-    Arith { paren_depth: u32, in_dquote: bool, body_started: bool, for_header: bool }, // $(( … )) / (( … )) / for (( … ))
+    Arith { paren_depth: u32, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
@@ -954,8 +961,8 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
-            Mode::Arith { paren_depth, in_dquote, body_started, for_header } =>
-                self.scan_step_arith(paren_depth, in_dquote, body_started, for_header),
+            Mode::Arith { paren_depth, in_dquote, body_started, for_header, delim } =>
+                self.scan_step_arith(paren_depth, in_dquote, body_started, for_header, delim),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
             Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
@@ -1459,6 +1466,13 @@ impl<'a> Lexer<'a> {
                                 self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                             }
                         }
+                        // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen`
+                        // signal (cursor stays on `$`); mirrors the `$((` ArithOpen arm
+                        // above. parse_legacy_arith_expansion (which pushes
+                        // Mode::Arith{delim:Bracket}) owns consuming `$[`.
+                        Some('[') => {
+                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                        }
                         // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
@@ -1954,22 +1968,31 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// `Mode::Arith { paren_depth, in_dquote, body_started, for_header }` scanner — v246.
+    /// `Mode::Arith { paren_depth, in_dquote, body_started, for_header, delim }` scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
     /// `for_header` (v256) additionally emits `ArithSemi` at a depth-0 `;`.
-    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool, for_header: bool) -> Result<Step, LexError> {
+    /// `delim` (v258) selects `$((`/ArithClose(`))`) vs `$[`/LegacyArithOpen/ArithClose(`]`).
+    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim) -> Result<Step, LexError> {
         if !body_started {
             let off = self.cursor.offset();
             let l = self.cursor.line();
             let c = self.cursor.column();
-            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "scan_step_arith entry: expected `$` of `$((`");
-            self.cursor.next(); // `$`
-            self.cursor.next(); // `(`
-            self.cursor.next(); // `(`
-            if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() {
-                *body_started = true;
+            debug_assert_eq!(self.cursor.peek(), Some(&'$'), "scan_step_arith entry: expected `$` of `$((`/`$[`");
+            match delim {
+                ArithDelim::Paren => {
+                    self.cursor.next(); // `$`
+                    self.cursor.next(); // `(`
+                    self.cursor.next(); // `(`
+                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() { *body_started = true; }
+                    self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
+                }
+                ArithDelim::Bracket => {
+                    self.cursor.next(); // `$`
+                    self.cursor.next(); // `[`
+                    if let Some(Mode::Arith { body_started, .. }) = self.modes.last_mut() { *body_started = true; }
+                    self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                }
             }
-            self.history.push(Token::new(TokenKind::ArithOpen, Span::new(off, l, c)));
             return Ok(Step::Produced);
         }
 
@@ -1985,6 +2008,10 @@ impl<'a> Lexer<'a> {
         macro_rules! sync_depth { () => {
             if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() { *paren_depth = depth; }
         }; }
+        let (open_char, close_char) = match delim {
+            ArithDelim::Paren => ('(', ')'),
+            ArithDelim::Bracket => ('[', ']'),
+        };
         loop {
             match self.cursor.peek().copied() {
                 None => {
@@ -1995,17 +2022,17 @@ impl<'a> Lexer<'a> {
                     }
                     return Err(LexError::UnterminatedArith);
                 }
-                Some('(') => {
+                Some(oc) if oc == open_char => {
                     self.cursor.next();
-                    text.push('(');
+                    text.push(oc);
                     depth += 1;
                 }
-                Some(')') if depth > 0 => {
+                Some(cc) if cc == close_char && depth > 0 => {
                     self.cursor.next();
-                    text.push(')');
+                    text.push(cc);
                     depth -= 1;
                 }
-                Some(')') => {
+                Some(cc) if cc == close_char => {
                     // depth == 0: flush any pending literal FIRST (emit the
                     // terminator/bail on the NEXT call), else classify now.
                     if !text.is_empty() {
@@ -2016,14 +2043,24 @@ impl<'a> Lexer<'a> {
                     let poff = self.cursor.offset();
                     let pl = self.cursor.line();
                     let pc = self.cursor.column();
-                    if self.cursor.peek_nth(1) == Some(')') {
-                        self.cursor.next(); // first `)`
-                        self.cursor.next(); // second `)`
-                        self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
-                    } else {
-                        // NOT a `))` close — the `$( (…) )` wrinkle.  Do NOT consume;
-                        // the parser rewinds.  (Task 5 consumes ArithBail.)
-                        self.history.push(Token::new(TokenKind::ArithBail, Span::new(poff, pl, pc)));
+                    match delim {
+                        ArithDelim::Paren => {
+                            if self.cursor.peek_nth(1) == Some(')') {
+                                self.cursor.next(); // first `)`
+                                self.cursor.next(); // second `)`
+                                self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                            } else {
+                                // NOT a `))` close — the `$( (…) )` wrinkle.  Do NOT
+                                // consume; the parser rewinds via ArithBail.
+                                self.history.push(Token::new(TokenKind::ArithBail, Span::new(poff, pl, pc)));
+                            }
+                        }
+                        ArithDelim::Bracket => {
+                            // `$[ … ]` closes on a single depth-0 `]` (no `]]` check,
+                            // no bail — `$[` has no `$( (` wrinkle).
+                            self.cursor.next(); // `]`
+                            self.history.push(Token::new(TokenKind::ArithClose, Span::new(poff, pl, pc)));
+                        }
                     }
                     return Ok(Step::Produced);
                 }
@@ -2079,6 +2116,25 @@ impl<'a> Lexer<'a> {
                                 // `$(` cmdsub — emit a zero-width CmdSubOpen signal.
                                 self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(so, sl, sc)));
                             }
+                            return Ok(Step::Produced);
+                        }
+                        Some('[') => {
+                            // v258 T2 fix: `$[` nested legacy arith inside an arith
+                            // body (e.g. `$[$[1+2]+3]`) — unlike `$((` there's no
+                            // ambiguity to disambiguate (no second-char lookahead
+                            // needed), so emit the zero-width LegacyArithOpen signal
+                            // directly. Do NOT consume; cursor stays at `$` (mirrors
+                            // the `$((`/`$(` signals above — the recursive
+                            // `parse_legacy_arith_expansion` pushes a fresh
+                            // `Mode::Arith{delim:Bracket}` frame whose own
+                            // `!body_started` branch consumes the real `$[`).
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(so, sl, sc)));
                             return Ok(Step::Produced);
                         }
                         Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {
@@ -3128,10 +3184,11 @@ impl<'a> Lexer<'a> {
                 let name = scan_var_name(&mut self.cursor);
                 self.history.push(Token::new(TokenKind::DollarName { name, quoted: true }, Span::new(off, l, c)));
             }
-            // `$[expr]` legacy arith — DEFERRED to Stage 2 (zero-width signal →
-            // `parse_dquote`/`parse_heredoc_body` defer cleanly).
+            // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
+            // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},
+            // whose first scan consumes `$[` and emits the real LegacyArithOpen.
             Some('[') => {
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
             }
             _ => {
                 self.cursor.next(); // lone `$`
@@ -3790,7 +3847,7 @@ impl<'a> Lexer<'a> {
 
     /// v254: emit the atom for an unquoted `$…` at the cursor (cursor on `$`).
     /// `${`→ParamOpen{false}, `$((`→ArithOpen, `$(`→CmdSubOpen, specials/digit/
-    /// name→DollarName{false}, `$[`→DeferredExpansion, lone `$`→DollarLit{false}.
+    /// name→DollarName{false}, `$[`→LegacyArithOpen, lone `$`→DollarLit{false}.
     /// Extracted verbatim from scan_command_word_atom's `$` arm — called from
     /// BOTH the command scanner and `scan_step_regex` (the whole command-position
     /// `$`-test suite is the regression gate).
@@ -3829,14 +3886,11 @@ impl<'a> Lexer<'a> {
                 let name = scan_var_name(&mut self.cursor);
                 self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
             }
-            // `$[expr]` — legacy arithmetic expansion. DEFERRED to Stage 2
-            // (no atom-mode for it yet). Emit the zero-width
-            // `DeferredExpansion` signal (cursor stays on `$`) so the parser
-            // defers cleanly (`parse_simple` → UnsupportedCommand) instead of
-            // mis-lexing `$` + `[expr]` as two literals (the production
-            // `scan_dollar_expansion` builds a `WordPart::Arith` here).
+            // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
+            // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},
+            // whose first scan consumes `$[` and emits the real LegacyArithOpen.
             Some('[') => {
-                self.history.push(Token::new(TokenKind::DeferredExpansion, Span::new(off, l, c)));
+                self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
             }
             _ => {
                 self.cursor.next(); // lone `$`
@@ -7768,12 +7822,12 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -7783,7 +7837,7 @@ mod tests {
         // prefix — body_started=true starts at the body loop). Top-level `;`
         // must emit ArithSemi; a `;` nested in `()` stays literal.
         let mut lx = Lexer::new_live_atoms("i=0;i<3;i++))", &Default::default(), LexerOptions::default());
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
         let mut kinds = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
@@ -7803,7 +7857,7 @@ mod tests {
 
         // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
         let mut lx2 = Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
-        lx2.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+        lx2.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
         let mut kinds2 = Vec::new();
         loop {
             match lx2.next_kind().expect("lex") {
@@ -7816,6 +7870,26 @@ mod tests {
             TokenKind::Lit { text: "(a;b)".into(), quoted: true },
             TokenKind::ArithClose,
         ]);
+    }
+
+    #[test]
+    fn arith_bracket_mode_scans_legacy_arith() {
+        // A Mode::Arith{delim:Bracket} body: `$[a[0]+1]` → LegacyArithOpen, the
+        // body Lit "a[0]+1" (inner [0] bracket-nested), then ArithClose.
+        let mut lx = Lexer::new_live_atoms("$[a[0]+1]", &Default::default(), LexerOptions::default());
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+        let mut kinds = Vec::new();
+        loop {
+            match lx.next_kind().expect("lex") {
+                Some(TokenKind::ArithClose) => { kinds.push(TokenKind::ArithClose); break; }
+                Some(k) => kinds.push(k),
+                None => break,
+            }
+        }
+        assert_eq!(kinds.first(), Some(&TokenKind::LegacyArithOpen));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Lit { text, .. } if text == "a[0]+1")),
+            "expected body Lit \"a[0]+1\", got {kinds:?}");
+        assert_eq!(kinds.last(), Some(&TokenKind::ArithClose));
     }
 
     #[test]
@@ -12983,13 +13057,13 @@ mod array_parse_tests {
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         let m = lx.mark();
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 

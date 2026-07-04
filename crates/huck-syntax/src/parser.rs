@@ -10,9 +10,9 @@ use crate::command::{
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
 use crate::lexer::{
-    brace_expand_parts, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator, ParamModifier,
-    ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp,
-    Word, WordPart,
+    brace_expand_parts, ArithDelim, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator,
+    ParamModifier, ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind,
+    TokenKind, TransformOp, Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -89,6 +89,10 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // Cursor is at `$((` — parse_arith_expansion pushes Mode::Arith
                 // whose first scan consumes `$((`.
                 let a = parse_arith_expansion(iter, quoted)?;
+                parts.push(a);
+            }
+            TokenKind::LegacyArithOpen => {
+                let a = parse_legacy_arith_expansion(iter, quoted)?;
                 parts.push(a);
             }
             TokenKind::DeferredExpansion => {
@@ -206,6 +210,11 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_arith_expansion(iter, quoted)?);
             }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_legacy_arith_expansion(iter, quoted)?);
+            }
             Some(TokenKind::DollarName { .. }) => {
                 if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
                     let eff = q || quoted;
@@ -322,6 +331,7 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
             Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
             Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
             Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
+            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_legacy_arith_expansion(iter, false)?); }
             Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
             // The oracle inlines the `"…"` body parts FLAT (each quoted:true) — it
             // calls `scan_dquote_expansion_body`, which pushes directly into the
@@ -355,7 +365,9 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
                     });
                 }
             }
-            // `$[expr]` inside a regex defers everywhere on the atom path (v247).
+            // v258: `$[expr]` inside a regex is handled by the `LegacyArithOpen`
+            // arm above, not this catch-all. Other still-deferred constructs
+            // inside a regex operand fall through here (v247).
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
             other => return Err(ParseError::TestExprBadOperator(format!("regex operand: {other:?}"))),
         }
@@ -438,6 +450,11 @@ fn parse_dquote(iter: &mut Lexer, _outer_quoted: bool) -> Result<WordPart, Parse
                     iter.next_kind()?;
                     flush_lit(&mut acc, &mut parts);
                     parts.push(parse_arith_expansion(iter, true)?);
+                }
+                Some(TokenKind::LegacyArithOpen) => {
+                    iter.next_kind()?;
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(parse_legacy_arith_expansion(iter, true)?);
                 }
                 Some(TokenKind::DollarName { .. }) => {
                     if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
@@ -923,10 +940,11 @@ pub(crate) fn parse_command_sub(iter: &mut Lexer, quoted: bool) -> Result<WordPa
             }
             Err(e) => {
                 // Pop the CommandSub frame before propagating.  Map UnsupportedCommand
-                // (body-deferred constructs still remaining, e.g. legacy `$[expr]`
-                // arith) to UnsupportedExpansion so parse_command_sub has a
-                // consistent return type for all deferrals. (`[[`, function-def, and
-                // coproc bodies are no longer deferred — v253/v248/v257.)
+                // (body-deferred constructs still remaining, e.g. C-style
+                // arith-for headers with unsupported shapes) to UnsupportedExpansion
+                // so parse_command_sub has a consistent return type for all
+                // deferrals. (`[[`, function-def, coproc bodies, and legacy `$[expr]`
+                // arith are no longer deferred — v253/v248/v257/v258.)
                 iter.pop_mode();
                 let mapped = match e {
                     ParseError::UnsupportedCommand => ParseError::UnsupportedExpansion,
@@ -1190,7 +1208,7 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 
 /// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
 ///
-/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false }`;
+/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
 /// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
 /// parser assembles the body `Word` (literal runs + embedded expansions), stops on
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
@@ -1246,6 +1264,7 @@ fn parse_arith_body(iter: &mut Lexer, _in_dquote: bool) -> Result<ArithBodyOutco
             // doc comment above this function; matches the production oracle
             // `arith_string_to_word`/`scan_dollar_expansion`, which hardcodes `true`).
             Some(TokenKind::ArithOpen)         => { iter.next_kind()?; parts.push(parse_arith_expansion(iter, true)?); }
+            Some(TokenKind::LegacyArithOpen)   => { iter.next_kind()?; parts.push(parse_legacy_arith_expansion(iter, true)?); }
             Some(TokenKind::Lit { .. })        => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     parts.push(WordPart::Literal { text, quoted });
@@ -1274,7 +1293,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
     // pull-boundary assert holds.
     let mark = iter.mark();
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
@@ -1294,6 +1313,32 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             iter.set_retokenize_arith_as_cmdsub();
             parse_command_sub(iter, quoted)
         }
+    }
+}
+
+/// v258: assemble a `WordPart::Arith` for a `$[ … ]` legacy arithmetic expansion
+/// (bash treats `$[ expr ]` as exactly `$(( expr ))`). Mirrors
+/// `parse_arith_expansion` but with `delim: Bracket` and WITHOUT the bail path:
+/// `$[` closes on a single depth-0 `]` (`ArithClose`) — there is no `$( (` wrinkle,
+/// so no `mark`/`rewind`. The mode's first scan consumes `$[` and emits
+/// `LegacyArithOpen`; `parse_arith_body` assembles the body and returns `Closed` on
+/// `ArithClose`.
+pub(crate) fn parse_legacy_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+    let result = (|| -> Result<ArithBodyOutcome, ParseError> {
+        match iter.next_kind()? {
+            Some(TokenKind::LegacyArithOpen) => {}
+            _ => return Err(ParseError::UnsupportedExpansion),
+        }
+        parse_arith_body(iter, quoted)
+    })();
+    iter.pop_mode();
+    match result? {
+        ArithBodyOutcome::Closed(body) => Ok(WordPart::Arith { body, quoted }),
+        // `$[` has no bail path (single-`]` close, no `$( (` wrinkle); a Bail here
+        // would mean the lexer emitted an ArithBail in Bracket mode, which it never
+        // does. Treat defensively as an unsupported expansion.
+        ArithBodyOutcome::Bail => Err(ParseError::UnsupportedExpansion),
     }
 }
 
@@ -1327,7 +1372,7 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
@@ -1485,6 +1530,11 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_arith_expansion(iter, true)?);
             }
+            Some(TokenKind::LegacyArithOpen) => {
+                iter.next_kind()?;
+                flush_lit(&mut acc, &mut parts);
+                parts.push(parse_legacy_arith_expansion(iter, true)?);
+            }
             Some(TokenKind::DollarName { .. }) => {
                 if let Some(TokenKind::DollarName { name, quoted: _ }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
@@ -1501,8 +1551,9 @@ fn parse_heredoc_body_expanding(iter: &mut Lexer) -> Result<Word, ParseError> {
                 flush_lit(&mut acc, &mut parts);
                 parts.push(WordPart::Literal { text: "$".into(), quoted: true });
             }
-            // `$[expr]` legacy arith inside the body — still deferred (Stage 2),
-            // matching the dquote path's `DeferredExpansion` deferral.
+            // v258: `$[expr]` legacy arith inside the body is handled by the
+            // `LegacyArithOpen` arm above, not this catch-all. Other still-deferred
+            // constructs inside an expanding heredoc body fall through here.
             Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedExpansion),
             _ => unreachable!("lexer emits only body-part atoms between HeredocBodyBegin and HeredocBodyEnd"),
         }
@@ -1934,6 +1985,7 @@ fn parse_simple_with_leading_word(
                     | TokenKind::ProcSubOpen { .. }
                     | TokenKind::BeginBacktick
                     | TokenKind::ArithOpen
+                    | TokenKind::LegacyArithOpen
                     | TokenKind::Tilde(_)
                     | TokenKind::BeginDquote
                     | TokenKind::AssignPrefix { .. }
@@ -2885,6 +2937,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
             Some(TokenKind::CmdSubOpen)       => { iter.next_kind()?; cur.push(parse_command_sub(iter, true)?); }
             Some(TokenKind::BeginBacktick)    => { iter.next_kind()?; cur.push(parse_backtick_sub(iter, true)?); }
             Some(TokenKind::ArithOpen)        => { iter.next_kind()?; cur.push(parse_arith_expansion(iter, true)?); }
+            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; cur.push(parse_legacy_arith_expansion(iter, true)?); }
             Some(TokenKind::Lit { .. }) => {
                 if let Some(TokenKind::Lit { text, quoted }) = iter.next_kind()? {
                     cur.push(WordPart::Literal { text, quoted });
@@ -2915,7 +2968,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
     let result = parse_arith_for_body(iter);
     iter.pop_mode();
     let sections = match result {
@@ -4455,19 +4508,12 @@ mod tests {
         diff_cmd("for ((i=0;i<3;i++)); do :; done");
         // v257 T2: coproc is NO LONGER deferred (see `atoms_coproc_named_and_anonymous`).
         diff_cmd("coproc x { :; }");
-        for s in [
-            // `$[expr]` legacy arith (deferred to Stage 2): defers cleanly rather
-            // than mis-lexing `$` + `[expr]` as two literals. Word-start and glued.
-            "echo $[1+2]", "echo pre$[1+2]post",
-        ] {
-            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand on atom path for {s:?}, got {:?}", new_seq(s));
-        }
-        // `$[expr]` inside `"…"` defers via `parse_dquote` → UnsupportedExpansion.
-        for s in ["echo \"$[1+2]\"", "echo \"pre$[1+2]\""] {
-            assert!(matches!(new_seq(s), Err(ParseError::UnsupportedExpansion)),
-                "expected UnsupportedExpansion on atom path for {s:?}, got {:?}", new_seq(s));
-        }
+        // v258 T2: `$[expr]` legacy arith is NO LONGER deferred (see
+        // `atoms_legacy_arith_base`/`atoms_legacy_arith_embedded`).
+        diff_cmd("echo $[1+2]");
+        diff_cmd("echo pre$[1+2]post");
+        diff_cmd("echo \"$[1+2]\"");
+        diff_cmd("echo \"pre$[1+2]\"");
     }
 
     #[test]
@@ -5371,6 +5417,131 @@ mod tests {
         // anonymous in cmdsub still works (regression guard)
         diff_cmd("$(coproc { :; })");
         diff_cmd("$(coproc cat)");
+    }
+
+    #[test]
+    fn atoms_legacy_arith_base() {
+        diff_cmd("echo $[1+2]");          // == $((1+2))
+        diff_cmd("echo pre$[1+2]post");
+        diff_cmd("echo $[ x + 1 ]");
+        diff_cmd("echo $[a[0]]");         // inner [0] bracket-nested → body "a[0]"
+        diff_cmd("echo $[(1+2)*3]");      // parens are literal body chars
+        diff_cmd("x=$[1+2]");             // assignment value
+    }
+
+    #[test]
+    fn atoms_legacy_arith_embedded() {
+        diff_cmd("echo $[$x+1]");
+        diff_cmd("echo $[${a}+1]");
+        diff_cmd("echo $[$(echo 1)+2]");
+        diff_cmd("echo $[`echo 1`+2]");
+        diff_cmd("echo $[$((1+2))+3]");   // nested $((
+        diff_cmd("echo $[$[1+2]+3]");     // nested $[
+        diff_cmd("echo \"$[1+2]\"");      // inside dquote → Quoted{Double,[Arith]}
+        diff_cmd("echo \"pre$[1+2]post\"");
+    }
+
+    #[test]
+    fn atoms_legacy_arith_carryforward_sites() {
+        // Heredoc body (v250 carry-forward) → Arith{quoted:true} + "\n"
+        diff_cmd("cat <<E\n$[1+2]\nE\n");
+        // Regex operand inside [[ … ]] (v254 carry-forward)
+        diff_cmd("[[ x =~ $[1+2] ]]");
+        // Array-literal value
+        diff_cmd("a=($[1+2])");
+        // case subject
+        diff_cmd("case $[1+2] in a) :;; esac");
+    }
+
+    #[test]
+    fn atoms_legacy_arith_quote_backslash_carryforward() {
+        // v258 LIVE-FLIP CARRY-FORWARD: the atom Mode::Arith{Bracket} treats quotes
+        // (single AND double) and `\` as LITERAL chars (no sub-mode, exactly like
+        // `$((`), so ANY `]` inside a quoted span (`'…'` or `"…"`) or immediately
+        // after a `\` closes the `$[ … ]` EARLY — the atom scanner has no concept
+        // of "inside a quote" while scanning a legacy-arith body, so it can't tell
+        // a quoted `]` from a real terminator. The oracle's scan_legacy_arith_body
+        // protects those spans (`Arith{body:" ] "}` / `Arith{body:" \\] "}` /
+        // equivalent single-quoted forms). `$((` shows no such divergence only
+        // because its early depth-0 `)` ArithBails to a command-sub-of-subshell on
+        // BOTH paths; `$[` has no bail. General class: quotes are literal in the
+        // bracket body, so any `]` inside a quoted span (single OR double) closes
+        // early. Pathological (quotes/backslash-escaped brackets in a legacy
+        // arith); dormant. Two probed shapes below (double-quoted, backslash);
+        // the same reasoning applies uniformly to `$[']']`, `$[ ']' ]`,
+        // `$['x]y']`, `$["x]y"]`, etc.
+        //
+        // `echo $[ "]" ]`: the atom body closes at the FIRST unprotected `]`
+        // (right after the opening `"`), leaving a lone unmatched `"` in the rest
+        // of the command line (`" ]`) — that dangling quote never closes before
+        // EOF, so the atom path errors UnterminatedQuote (the oracle parses fine).
+        assert!(
+            matches!(
+                new_seq("echo $[ \"]\" ]"),
+                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
+            ),
+            "expected UnterminatedQuote for echo $[ \"]\" ], got {:?}",
+            new_seq("echo $[ \"]\" ]")
+        );
+
+        // `echo $[ \] ]`: `\` is a literal body char (no escaping), so the `]`
+        // immediately after it closes the bracket early (body = " \\"); the
+        // trailing ` ]` becomes a SECOND, separate argument word.
+        assert_eq!(
+            new_seq("echo $[ \\] ]").unwrap(),
+            Some(Sequence {
+                first: Command::Pipeline(Pipeline {
+                    negate: false,
+                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
+                        inline_assignments: vec![],
+                        program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
+                        args: vec![
+                            Word(vec![WordPart::Arith {
+                                body: Word(vec![WordPart::Literal { text: " \\".into(), quoted: true }]),
+                                quoted: false,
+                            }]),
+                            Word(vec![WordPart::Literal { text: "]".into(), quoted: false }]),
+                        ],
+                        redirects: vec![],
+                        line: 1,
+                    }))],
+                }),
+                rest: vec![],
+                background: false,
+            })
+        );
+
+        // `echo $[']']`: same class as the double-quoted case above, but with a
+        // single-quoted span — confirms the divergence is quote-KIND-agnostic
+        // (single AND double). The atom body closes at the first `]` (inside the
+        // `'…'`), leaving a dangling unmatched `'` before EOF → UnterminatedQuote
+        // (the oracle parses fine: `Arith{body:"]"}`, probed via new_seq/old_seq).
+        assert!(
+            matches!(
+                new_seq("echo $[']']"),
+                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
+            ),
+            "expected UnterminatedQuote for echo $[']'], got {:?}",
+            new_seq("echo $[']']")
+        );
+    }
+
+    #[test]
+    fn atoms_legacy_arith_in_param_operand() {
+        // v258 whole-branch fix: `$[` inside an unquoted ${…} operand.
+        diff_cmd("echo ${a:-$[1+2]}");
+        diff_cmd("echo ${a[$[1]]}");
+        diff_cmd("echo ${a#$[1]}");
+        diff_cmd("echo ${a:$[1]:$[2]}");
+    }
+
+    #[test]
+    fn atoms_legacy_arith_unterminated() {
+        // `$[1+2` (no closing `]`) → lex error on both paths. `old_seq` panics
+        // (`.expect("lex")`), so this is asserted on the atom side only: the atom
+        // emits UnterminatedArith (the oracle emits UnterminatedLegacyArith — both
+        // ParseError::Lex; dormant, error-kind difference only).
+        assert!(new_seq("echo $[1+2").is_err(), "unterminated $[ must error");
     }
 
     #[test]
