@@ -428,6 +428,7 @@ pub enum TokenKind {
     ArithOpen,   // opening `$((` — dual role: zero-width signal in an operand mode, real opener in Arith mode
     ArithClose,  // closing `))` — emitted by scan_step_arith at paren_depth 0
     ArithBail,   // a `)` at paren_depth 0 NOT followed by `)` — parser rewinds and retries as `$( (…) )`
+    ArithSemi,   // v256: a `;` at paren_depth 0 inside a for-header — section separator
     // --- Phase C v247: atom-emitting Command-mode scaffolding (dormant). ---
     Blank,   // v247: a run of unquoted inter-word whitespace in the atom-command stream (word boundary)
     /// v247 T2: ONE complete quoted run in command-word context — `'…'`, `"…"`
@@ -639,7 +640,7 @@ pub(crate) enum Mode {
     // are never word-split), so there is no quoted/unquoted branch to select.
     // Kept for now rather than removed; may carry a future signal (e.g. if arith
     // ever needs to distinguish a quoted-bit).
-    Arith { paren_depth: u32, in_dquote: bool, body_started: bool }, // $(( … )) — v246
+    Arith { paren_depth: u32, in_dquote: bool, body_started: bool, for_header: bool }, // $(( … )) / (( … )) / for (( … ))
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
@@ -953,8 +954,8 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
-            Mode::Arith { paren_depth, in_dquote, body_started } =>
-                self.scan_step_arith(paren_depth, in_dquote, body_started),
+            Mode::Arith { paren_depth, in_dquote, body_started, for_header } =>
+                self.scan_step_arith(paren_depth, in_dquote, body_started, for_header),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
             Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
@@ -1953,9 +1954,10 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// `Mode::Arith { paren_depth, in_dquote, body_started }` scanner — v246.
+    /// `Mode::Arith { paren_depth, in_dquote, body_started, for_header }` scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
-    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool) -> Result<Step, LexError> {
+    /// `for_header` (v256) additionally emits `ArithSemi` at a depth-0 `;`.
+    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool, for_header: bool) -> Result<Step, LexError> {
         if !body_started {
             let off = self.cursor.offset();
             let l = self.cursor.line();
@@ -2139,6 +2141,20 @@ impl<'a> Lexer<'a> {
                             text.push('$');
                         }
                     }
+                }
+                Some(';') if for_header && depth == 0 => {
+                    // v256: a top-level `;` in a for-header separates init/cond/step.
+                    // Flush any pending literal FIRST (emit the separator on the NEXT
+                    // call), exactly like the depth-0 `)` arm above.
+                    if !text.is_empty() {
+                        sync_depth!();
+                        self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
+                    let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                    self.cursor.next(); // consume `;`
+                    self.history.push(Token::new(TokenKind::ArithSemi, Span::new(so, sl, sc)));
+                    return Ok(Step::Produced);
                 }
                 Some(ch) => {
                     self.cursor.next();
@@ -7744,13 +7760,54 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
         assert_eq!(lx.current_mode(), Mode::Command);
+    }
+
+    #[test]
+    fn arith_for_header_emits_arith_semi() {
+        // Drive Mode::Arith with for_header=true over a for-header body (no `((`
+        // prefix — body_started=true starts at the body loop). Top-level `;`
+        // must emit ArithSemi; a `;` nested in `()` stays literal.
+        let mut lx = Lexer::new_live_atoms("i=0;i<3;i++))", &Default::default(), LexerOptions::default());
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+        let mut kinds = Vec::new();
+        loop {
+            match lx.next_kind().expect("lex") {
+                Some(TokenKind::ArithClose) => { kinds.push(TokenKind::ArithClose); break; }
+                Some(k) => kinds.push(k),
+                None => break,
+            }
+        }
+        assert_eq!(kinds, vec![
+            TokenKind::Lit { text: "i=0".into(), quoted: true },
+            TokenKind::ArithSemi,
+            TokenKind::Lit { text: "i<3".into(), quoted: true },
+            TokenKind::ArithSemi,
+            TokenKind::Lit { text: "i++".into(), quoted: true },
+            TokenKind::ArithClose,
+        ]);
+
+        // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
+        let mut lx2 = Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
+        lx2.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true });
+        let mut kinds2 = Vec::new();
+        loop {
+            match lx2.next_kind().expect("lex") {
+                Some(TokenKind::ArithClose) => { kinds2.push(TokenKind::ArithClose); break; }
+                Some(k) => kinds2.push(k),
+                None => break,
+            }
+        }
+        assert_eq!(kinds2, vec![
+            TokenKind::Lit { text: "(a;b)".into(), quoted: true },
+            TokenKind::ArithClose,
+        ]);
     }
 
     #[test]
@@ -12918,13 +12975,13 @@ mod array_parse_tests {
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
         let m = lx.mark();
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
