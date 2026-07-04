@@ -2048,7 +2048,8 @@ fn parse_simple_with_leading_word(
 ///   `{` → `parse_brace_group` (Task 1), `(` → `parse_subshell` (Task 2),
 ///   `if` (Task 3), `while`/`until` (Task 4), `for`/`select` (Task 5),
 ///   `case` (Task 6).
-/// All other compound-opening keywords → `UnsupportedCommand`.
+/// All other keywords are terminators/closers that can never start a
+/// command → `UnexpectedKeyword` (v257 T3 fix; see the match arm below).
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
     skip_newlines(iter)?;
@@ -2108,7 +2109,17 @@ fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
             let cmd = parse_coproc(iter)?;
             return maybe_wrap_redirects(cmd, iter);
         }
-        Some(_) => return Err(ParseError::UnsupportedCommand),
+        // Every `Keyword` variant is either dispatched above or is a bare
+        // terminator/closer that can never legally start a command (`then`,
+        // `elif`, `else`, `fi`, `do`, `done`, `in`, `esac`, `}`, `]]`) — the
+        // oracle's fallthrough arm (`command.rs` `parse_command_inner`,
+        // `Some(other) => Err(UnexpectedKeyword(other.name()))`) raises the
+        // SAME error for all of them, not a generic deferral. v257 T3 found
+        // this returning `UnsupportedCommand` instead (discovered via
+        // `coproc 123 { :; }`: `123` fails `valid_identifier_text` so the
+        // body is anonymous, `parse_command` reads the stray `123 {` as a
+        // simple command up to `;`, then hits the unmatched `}`).
+        Some(other) => return Err(ParseError::UnexpectedKeyword(other.name().to_string())),
         None => {}
     }
     // Function definition `name() compound` (POSIX form). The oracle consumes
@@ -5308,6 +5319,33 @@ mod tests {
         diff_cmd("coproc M { :; } >out");
         // rest-stage coproc is rejected (guard)
         diff_err("echo x | coproc cat");
+    }
+
+    #[test]
+    fn atoms_coproc_errors() {
+        diff_err("coproc 123 { :; }");     // 123 invalid ident → anonymous → UnexpectedKeyword("}")
+        diff_err("coproc");                // MissingCommand
+        diff_err("coproc |cat");           // MissingCommand
+        diff_err("coproc a | coproc b");   // 2nd-stage coproc → UnexpectedKeyword("coproc")
+    }
+
+    #[test]
+    fn atoms_coproc_adversarial() {
+        // coproc inside compound bodies (allowed — parse_command_inner everywhere)
+        diff_cmd("{ coproc cat; }");
+        diff_cmd("if x; then coproc cat; fi");
+        diff_cmd("(coproc cat)");
+        // and-or / list boundaries after a coproc
+        diff_cmd("coproc cat || echo no");
+        diff_cmd("coproc cat; echo done");
+        diff_cmd("coproc cat &");
+        // named with each compound opener
+        diff_cmd("coproc W while false; do :; done");
+        diff_cmd("coproc C case x in a) :;; esac");
+        diff_cmd("coproc S select v in a b; do :; done");
+        diff_cmd("coproc D [[ -n x ]]");
+        // negation of a whole coproc pipeline (outer `!`)
+        diff_cmd("! coproc cat");
     }
 
     #[test]
