@@ -2111,6 +2111,25 @@ impl<'a> Lexer<'a> {
                             }
                             return Ok(Step::Produced);
                         }
+                        Some('[') => {
+                            // v258 T2 fix: `$[` nested legacy arith inside an arith
+                            // body (e.g. `$[$[1+2]+3]`) — unlike `$((` there's no
+                            // ambiguity to disambiguate (no second-char lookahead
+                            // needed), so emit the zero-width LegacyArithOpen signal
+                            // directly. Do NOT consume; cursor stays at `$` (mirrors
+                            // the `$((`/`$(` signals above — the recursive
+                            // `parse_legacy_arith_expansion` pushes a fresh
+                            // `Mode::Arith{delim:Bracket}` frame whose own
+                            // `!body_started` branch consumes the real `$[`).
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
                         Some(nc) if nc.is_ascii_alphabetic() || nc == '_' => {
                             // `$name` variable — consume `$` + name run, emit DollarName.
                             if !text.is_empty() {
