@@ -1466,6 +1466,13 @@ impl<'a> Lexer<'a> {
                                 self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
                             }
                         }
+                        // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen`
+                        // signal (cursor stays on `$`); mirrors the `$((` ArithOpen arm
+                        // above. parse_legacy_arith_expansion (which pushes
+                        // Mode::Arith{delim:Bracket}) owns consuming `$[`.
+                        Some('[') => {
+                            self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                        }
                         // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`

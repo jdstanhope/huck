@@ -5456,13 +5456,20 @@ mod tests {
     #[test]
     fn atoms_legacy_arith_quote_backslash_carryforward() {
         // v258 LIVE-FLIP CARRY-FORWARD: the atom Mode::Arith{Bracket} treats quotes
-        // and `\` as LITERAL chars (no sub-mode, exactly like `$((`), so a `]`
-        // inside `"…"` or after `\` closes the `$[ … ]` EARLY. The oracle's
-        // scan_legacy_arith_body protects those spans (`Arith{body:" ] "}` /
-        // `Arith{body:" \\] "}` respectively). `$((` shows no such divergence only
+        // (single AND double) and `\` as LITERAL chars (no sub-mode, exactly like
+        // `$((`), so ANY `]` inside a quoted span (`'…'` or `"…"`) or immediately
+        // after a `\` closes the `$[ … ]` EARLY — the atom scanner has no concept
+        // of "inside a quote" while scanning a legacy-arith body, so it can't tell
+        // a quoted `]` from a real terminator. The oracle's scan_legacy_arith_body
+        // protects those spans (`Arith{body:" ] "}` / `Arith{body:" \\] "}` /
+        // equivalent single-quoted forms). `$((` shows no such divergence only
         // because its early depth-0 `)` ArithBails to a command-sub-of-subshell on
-        // BOTH paths; `$[` has no bail. Pathological (quotes/backslash-escaped
-        // brackets in a legacy arith); dormant.
+        // BOTH paths; `$[` has no bail. General class: quotes are literal in the
+        // bracket body, so any `]` inside a quoted span (single OR double) closes
+        // early. Pathological (quotes/backslash-escaped brackets in a legacy
+        // arith); dormant. Two probed shapes below (double-quoted, backslash);
+        // the same reasoning applies uniformly to `$[']']`, `$[ ']' ]`,
+        // `$['x]y']`, `$["x]y"]`, etc.
         //
         // `echo $[ "]" ]`: the atom body closes at the FIRST unprotected `]`
         // (right after the opening `"`), leaving a lone unmatched `"` in the rest
@@ -5503,6 +5510,29 @@ mod tests {
                 background: false,
             })
         );
+
+        // `echo $[']']`: same class as the double-quoted case above, but with a
+        // single-quoted span — confirms the divergence is quote-KIND-agnostic
+        // (single AND double). The atom body closes at the first `]` (inside the
+        // `'…'`), leaving a dangling unmatched `'` before EOF → UnterminatedQuote
+        // (the oracle parses fine: `Arith{body:"]"}`, probed via new_seq/old_seq).
+        assert!(
+            matches!(
+                new_seq("echo $[']']"),
+                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
+            ),
+            "expected UnterminatedQuote for echo $[']'], got {:?}",
+            new_seq("echo $[']']")
+        );
+    }
+
+    #[test]
+    fn atoms_legacy_arith_in_param_operand() {
+        // v258 whole-branch fix: `$[` inside an unquoted ${…} operand.
+        diff_cmd("echo ${a:-$[1+2]}");
+        diff_cmd("echo ${a[$[1]]}");
+        diff_cmd("echo ${a#$[1]}");
+        diff_cmd("echo ${a:$[1]:$[2]}");
     }
 
     #[test]
