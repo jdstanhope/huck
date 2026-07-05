@@ -2727,6 +2727,11 @@ fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
 pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    // v259 CF2: discard any heredoc bodies leaked by a prior parse that errored
+    // after pushing them (take_heredoc_bodies drains only on this fn's success
+    // path). Safe: the atom parse_sequence is the single non-reentrant top-level
+    // entry, so nothing legitimately carries a body into a fresh call.
+    let _ = iter.take_heredoc_bodies();
     // Skip leading newlines AND inter-token blanks (mirrors `parse_cursor` →
     // `skip_newlines`). The atom scanner emits a `Blank` where the oracle folds
     // whitespace, so a blank-only / blank+comment line must reduce to `Ok(None)`
@@ -4953,6 +4958,22 @@ mod tests {
             "cat <<EOF\n$1 $@ $? $#\nEOF\n",               // special params in expanding body
             "cat <<EOF\n\\EOF\nEOF\n",                     // escaped-looking body line
         ] { diff_cmd(s); }
+    }
+
+    #[test]
+    fn atoms_cf2_heredoc_queue_reset() {
+        // A parse that collects a heredoc body then errors on a stray `;;`
+        // leaves the body in the Lexer-owned queue (early-Err path does not
+        // drain). A subsequent parse_sequence on the SAME Lexer must discard
+        // that leaked body at entry, so the queue is empty afterward.
+        let mut lx = Lexer::new_live_atoms("cat <<E\nx\nE\n;;", &Default::default(), LexerOptions::default());
+        let first = parse_sequence(&mut lx); // collects the heredoc body, then `;;` → Err
+        assert!(first.is_err(), "expected UnexpectedToken on the `;;`, got {first:?}");
+        let _ = parse_sequence(&mut lx);     // entry-reset must drain the leaked body
+        assert!(
+            lx.take_heredoc_bodies().is_empty(),
+            "parse_sequence entry-reset should have drained the leaked heredoc body"
+        );
     }
 
     // v243 T2 tests
