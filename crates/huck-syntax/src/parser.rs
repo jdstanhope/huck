@@ -2664,19 +2664,30 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
     Ok(Sequence { first, rest, background })
 }
 
-/// v250 T3: fill every still-empty `RedirOp::Heredoc { body }` in `redirects`
-/// (in source order) from `bodies`. A body is "still empty" (`Word(vec![])`)
-/// exactly when `parse_one_redirect` built it as a provisional placeholder;
-/// an ALREADY-filled one (can't happen on the atom path today, but keeps this
-/// idempotent) is left alone.
+/// v250 T3 + v260 CF1: walk every redirect in `redirects` (in source order),
+/// filling (a) any still-empty `RedirOp::Heredoc { body }` placeholder from
+/// `bodies`, and (b) any heredoc nested INSIDE another redirect's own `Word`
+/// (a here-string, a file/dup target — `cat <<<$(a <<X)`, `echo >$(f <<X)`,
+/// `echo >&$(f <<X)`) via `fill_word`. A heredoc body is "still empty"
+/// (`Word(vec![])`) exactly when `parse_one_redirect` built it as a
+/// provisional placeholder; an ALREADY-filled one (can't happen on the atom
+/// path today, but keeps this idempotent) is left alone. EXHAUSTIVE over
+/// `RedirOp` — no `_ =>` wildcard, so a future variant can't silently drop a
+/// nested body.
 fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item = Word>) {
     for r in redirects.iter_mut() {
-        if let RedirOp::Heredoc { body, .. } = &mut r.op {
-            if body.0.is_empty() {
-                if let Some(next) = bodies.next() {
-                    *body = next;
+        match &mut r.op {
+            RedirOp::File { target, .. } => fill_word(target, bodies),
+            RedirOp::Dup { source, .. } => fill_word(source, bodies),
+            RedirOp::Close => {}
+            RedirOp::Heredoc { body, .. } => {
+                if body.0.is_empty() {
+                    if let Some(next) = bodies.next() {
+                        *body = next;
+                    }
                 }
             }
+            RedirOp::HereString(word) => fill_word(word, bodies),
         }
     }
 }
@@ -2754,6 +2765,29 @@ fn fill_param_modifier(modifier: &mut ParamModifier, bodies: &mut impl Iterator<
     }
 }
 
+/// v260 CF1: fill heredoc bodies nested in a `[[ … ]]` test expression's
+/// operand `Word`s, in source order. EXHAUSTIVE over `TestExpr` — no `_ =>`
+/// wildcard (there is no parenthesized-grouping variant: `(…)` inside a test
+/// expression is resolved at parse time, not represented in the AST).
+fn fill_test_expr(expr: &mut TestExpr, bodies: &mut impl Iterator<Item = Word>) {
+    match expr {
+        TestExpr::Unary { operand, .. } => fill_word(operand, bodies),
+        TestExpr::Binary { lhs, rhs, .. } => {
+            fill_word(lhs, bodies);
+            fill_word(rhs, bodies);
+        }
+        TestExpr::Regex { lhs, pattern } => {
+            fill_word(lhs, bodies);
+            fill_word(pattern, bodies);
+        }
+        TestExpr::Not(inner) => fill_test_expr(inner, bodies),
+        TestExpr::And(lhs, rhs) | TestExpr::Or(lhs, rhs) => {
+            fill_test_expr(lhs, bodies);
+            fill_test_expr(rhs, bodies);
+        }
+    }
+}
+
 /// v250 T3: fill every still-empty heredoc body reachable from `cmd`, in a
 /// left-to-right pre-order that matches the lexer's emission order (each
 /// heredoc's body atoms are emitted right after the `Newline` ending the line
@@ -2809,10 +2843,20 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
             fill_sequence(&mut clause.body, bodies);
         }
         Command::For(clause) => {
+            // v260 CF1: the `in WORDS` list precedes the body in source order.
+            for w in clause.words.iter_mut() {
+                fill_word(w, bodies);
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Case(clause) => {
+            // v260 CF1: subject, then each item's `|`-separated patterns
+            // (before its body), in source order.
+            fill_word(&mut clause.subject, bodies);
             for item in clause.items.iter_mut() {
+                for pat in item.patterns.iter_mut() {
+                    fill_word(pat, bodies);
+                }
                 if let Some(body) = item.body.as_mut() {
                     fill_sequence(body, bodies);
                 }
@@ -2823,19 +2867,41 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
         Command::FunctionDef { body, .. } => fill_command(body, bodies),
         // `[[ … ]]` carries no nested `Sequence`/redirect list of its own —
         // any trailing redirects on it are on the enclosing `Redirected`
-        // wrapper, handled there. Not reachable from the atom parser today
-        // (still deferred), but exhaustiveness must not skip it.
-        Command::DoubleBracket { .. } => {}
+        // wrapper, handled there. v260 CF1: any inline assignment prefixes
+        // (`FOO=hi [[ … ]]`) precede the test expression itself.
+        Command::DoubleBracket { expr, inline_assignments } => {
+            for a in inline_assignments.iter_mut() {
+                if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
+                    fill_word(subscript, bodies);
+                }
+                fill_word(&mut a.value, bodies);
+            }
+            fill_test_expr(expr, bodies);
+        }
         // `((expr))` is a bare arithmetic `Word`, no redirect list of its own.
-        // Not reachable from the atom parser today (still deferred).
-        Command::Arith(_) => {}
-        // C-style `for ((init;cond;step))`: only `body` is a `Sequence`; the
-        // header sections are bare `Word`s, not redirect-bearing. Not
-        // reachable from the atom parser today (still deferred).
+        Command::Arith(body) => fill_word(body, bodies),
+        // C-style `for ((init;cond;step))`: the header sections are bare
+        // `Word`s (no redirect list of their own); v260 CF1 fills them, in
+        // source order, before the `Sequence` body.
         Command::ArithFor(clause) => {
+            if let Some(init) = clause.init.as_mut() {
+                fill_word(init, bodies);
+            }
+            if let Some(cond) = clause.cond.as_mut() {
+                fill_word(cond, bodies);
+            }
+            if let Some(step) = clause.step.as_mut() {
+                fill_word(step, bodies);
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Select(clause) => {
+            // v260 CF1: the `in WORDS` list (when present) precedes the body.
+            if let Some(words) = clause.words.as_mut() {
+                for w in words.iter_mut() {
+                    fill_word(w, bodies);
+                }
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Redirected { inner, redirects } => {
@@ -4933,6 +4999,49 @@ mod tests {
         diff_cmd("echo \"$(cat <<X\nhi\nX\n)\"");             // inside a quoted span
         diff_cmd("echo $(a <<X\nxx\nX\n)$(b <<Y\nyy\nY\n)");  // two Word-nested (queue order)
         diff_cmd("FOO=$(cat <<X\nhi\nX\n) echo hi");          // inline assignment value
+    }
+
+    #[test]
+    fn atoms_heredoc_in_clause_and_redirect_target_fill() {
+        // v260 whole-branch fix: heredoc bodies in for/select/case clause Words,
+        // case patterns, here-string words, and redirect-target/dup Words.
+        diff_cmd("for i in $(t <<X\nx\nX\n); do :; done");
+        diff_cmd("select i in $(t <<X\nx\nX\n); do :; done");
+        diff_cmd("case $(t <<X\nx\nX\n) in a) :;; esac");
+        diff_cmd("case x in $(p <<X\nx\nX\n)) :;; esac");
+        diff_cmd("cat <<<$(a <<X\nxx\nX\n)");
+        diff_cmd("echo >$(f <<X\nxx\nX\n)");
+        diff_cmd("echo <$(f <<X\nxx\nX\n)");
+        // plus audited positions found to ALSO drop (fixed): dup-target, `[[ ]]`
+        // operands, standalone arith command, C-style arith-for header.
+        diff_cmd("echo >&$(f <<X\n1\nX\n)");
+        diff_cmd("[[ -f $(cat <<X\nx\nX\n) ]]");
+        diff_cmd("[[ $(a <<X\nx\nX\n) == b ]]");
+        diff_cmd("[[ x =~ $(a <<X\nx\nX\n) ]]");
+        diff_cmd("(( $(x <<X\n1\nX\n) ))");
+        diff_cmd("for (( $(a <<X\n1\nX\n) ; ; )); do :; done");
+        // interleaving: an arg Word's heredoc before the redirect-target Word's
+        // heredoc is byte-identical (fill_command fills args before redirects,
+        // matching source order here).
+        diff_cmd("echo $(a <<X\nxx\nX\n) >$(f <<Y\nyy\nY\n)");
+    }
+
+    #[test]
+    fn atoms_heredoc_redirect_target_before_arg_pin() {
+        // PINNED divergence (documented, not fixed): fill_command always fills
+        // an Exec's args BEFORE its redirects, regardless of source order. When
+        // a redirect-TARGET Word's heredoc appears in source BEFORE an arg
+        // Word's heredoc (`echo >$(f <<Y) $(a <<X)` — Y precedes X in the
+        // source, so the FIFO body queue is [Y, X]), the fixed args-then-
+        // redirects fill order consumes Y's body for X's placeholder and vice
+        // versa, swapping the two bodies. Same class as the pre-existing
+        // redirect-list source-ordering limitation noted on `fill_redirects`/
+        // `Redirection` (the AST has no source positions to sort by across the
+        // args/redirects split) — not worth contorting the fill walk for a rare
+        // multi-heredoc redirect-target-before-arg interleaving.
+        let s = "echo >$(f <<Y\nyy\nY\n) $(a <<X\nxx\nX\n)";
+        assert_ne!(new_seq(s).unwrap(), old_seq(s).unwrap(),
+            "expected the documented args-vs-redirects fill-order divergence for {s:?}");
     }
 
     #[test]
