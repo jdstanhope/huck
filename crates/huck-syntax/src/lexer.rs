@@ -1473,6 +1473,21 @@ impl<'a> Lexer<'a> {
                         Some('[') => {
                             self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
                         }
+                        // `$"…"` locale quoting (identity) — drop the `$`, emit the
+                        // zero-width BeginDquote (cursor left on `"`); mirrors the
+                        // CF4 emit_unquoted_dollar_atom arm and the oracle's
+                        // scan_dollar_expansion `Some('"') if !quoted => {}`. UNLIKE
+                        // a BARE `"…"` in this same operand scanner (which this
+                        // function's own "outside dquote" `Some('"')` arm below
+                        // inlines flat, no BeginDquote signal, no Mode::DoubleQuote),
+                        // `$"…"` goes through the general BeginDquote/parse_dquote
+                        // path — `parse_word`'s new BeginDquote arm then decides
+                        // flat-vs-wrapped per the enclosing operand mode (v259 F3).
+                        // Only outside an enclosing double quote (in_dquote guard).
+                        Some('"') if !in_dquote => {
+                            self.cursor.next(); // consume `$` only, leave `"`
+                            self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                        }
                         // Special single-char params: `$?` `$@` `$*` `$#` `$$` `$!` `$-`.
                         Some(sp @ ('?' | '@' | '*' | '#' | '$' | '!' | '-')) => {
                             self.cursor.next(); // `$`
@@ -3885,6 +3900,15 @@ impl<'a> Lexer<'a> {
                 self.cursor.next(); // `$`
                 let name = scan_var_name(&mut self.cursor);
                 self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
+            }
+            // `$"…"` — bash locale quoting; huck's translation is the identity,
+            // so `$"…" ≡ "…"`. Drop the `$` and emit the zero-width BeginDquote
+            // (cursor left on `"`), exactly mirroring a bare `"`; the parser's
+            // Mode::DoubleQuote then consumes the `"` and scans the body. (Oracle:
+            // scan_dollar_expansion's `Some('"') if !quoted => {}`.)
+            Some('"') => {
+                self.cursor.next(); // consume `$` only, leave `"`
+                self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
             }
             // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
             // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},

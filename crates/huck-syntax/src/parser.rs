@@ -100,6 +100,35 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // deferred (see the `DeferredExpansion` doc comment).
                 return Err(ParseError::UnsupportedExpansion);
             }
+            // v259 F3: `$"…"` locale quoting in a param-expansion operand context
+            // (`scan_step_param_operand` drops the `$` and emits a zero-width
+            // `BeginDquote`, leaving the `"` for the normal double-quote
+            // assembler). A bare `"…"` never reaches here — this operand
+            // scanner's OWN "outside dquote" arm inlines it flat directly, with
+            // no `BeginDquote` signal — so this arm only ever fires for `$"…"`.
+            //
+            // The oracle's representation for `$"…"` differs by which operand
+            // this is: VALUE-family operands (`scan_braced_param_expansion`'s
+            // `${x:-…}`/`${x/…/…}`/`${x:o:l}` bodies) inline the span FLAT (no
+            // `Quoted` wrapper — mirrors the flat inlining `parse_regex_operand`
+            // already does for the same oracle scanner shape). Subscript
+            // operands (`${a[i]}` / array-literal `[i]=`) instead re-tokenize
+            // via `scan_subscript`/`parse_subscript_body` — the general
+            // tokenizer — which DOES keep the `Quoted{Double,…}` wrapper.
+            // Distinguish via the enclosing mode (captured before `parse_dquote`
+            // pushes its own `Mode::DoubleQuote` frame).
+            TokenKind::BeginDquote => {
+                let in_subscript = matches!(iter.current_mode(), Mode::ParamSubscriptOperand { .. });
+                let dq = parse_dquote(iter, quoted)?;
+                if in_subscript {
+                    parts.push(dq);
+                } else {
+                    match dq {
+                        WordPart::Quoted { parts: inner, .. } => parts.extend(inner),
+                        other => parts.push(other),
+                    }
+                }
+            }
             _ => {
                 // Unexpected atom in operand context.
                 return Err(ParseError::UnsupportedExpansion);
@@ -2366,7 +2395,7 @@ fn parse_coproc_body(iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_newlines(iter)?;
     let first = parse_command(iter)?;
     if matches!(first, Command::Simple(_)) {
-        finish_pipeline(iter, first, false)
+        finish_pipeline(iter, first, false, false)
     } else {
         Ok(first)
     }
@@ -2420,16 +2449,21 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     // Parse the first stage command (may be simple or compound).
     let first = parse_command(iter)?;
-    finish_pipeline(iter, first, negate)
+    finish_pipeline(iter, first, negate, bangs > 0)
 }
 
 /// Given an already-parsed first stage, finish a pipeline: consume any `|`-joined
 /// stages and apply the oracle's wrapping rule. Split out of `parse_pipeline` so
 /// the coproc body parser can reuse the `|`-loop for a simple first stage (v257).
+/// `had_bangs` (v259 CF3) tracks whether ANY leading `!` preceded the first
+/// stage, regardless of parity: the oracle wraps a compound first-stage in
+/// `Pipeline{negate,[cmd]}` whenever there was at least one leading `!`, even
+/// an EVEN count (`negate` false) — `negate` alone under-wraps `! ! { a; }`.
 fn finish_pipeline(
     iter: &mut Lexer,
     first: Command,
     negate: bool,
+    had_bangs: bool,
 ) -> Result<Command, ParseError> {
     // A trailing inter-token `Blank` may sit between a compound command's
     // terminator (e.g. `fi`, `}`, `)`) and a following `|` (the atom scanner
@@ -2439,19 +2473,30 @@ fn finish_pipeline(
     }
 
     // No `|` follows — wrapping decision mirrors the oracle:
-    //   simple  → always wrap in Pipeline (oracle: parse_pipeline_with_first)
-    //   compound, no negate → return as-is (oracle: parse_command_then_pipeline)
-    //   compound, negate    → wrap so the Pipeline carries the negate flag
+    //   simple                    → always wrap in Pipeline (oracle: parse_pipeline_with_first)
+    //   compound, no leading `!`  → return as-is (oracle: parse_command_then_pipeline)
+    //   compound, any leading `!` → wrap (negate may be false on an even count, v259 CF3)
     if !matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
         return Ok(match first {
-            Command::Simple(_) => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
-            cmd if negate      => Command::Pipeline(Pipeline { negate: true, commands: vec![cmd] }),
-            cmd                => cmd,
+            Command::Simple(_)         => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
+            cmd if negate || had_bangs => Command::Pipeline(Pipeline { negate, commands: vec![cmd] }),
+            cmd                        => cmd,
         });
     }
 
     // A `|` follows — collect all stages into a Pipeline.
-    let mut stages = vec![first];
+    // v259 F1: mirror the oracle's parse_command_then_pipeline hoist
+    // (command.rs:833). An even-bang (>=2) compound first stage is wrapped
+    // Pipeline{negate:false,[cmd]} by the oracle and does NOT hoist (guard is
+    // p.negate && len==1), so the inner 1-elem pipeline survives nested as the
+    // first stage. Odd-bang hoists (negate is the outer flag here, `first` is
+    // raw) → stays flat; zero-bang / simple → unchanged.
+    let first_stage = match first {
+        Command::Simple(_)          => first,
+        cmd if had_bangs && !negate => Command::Pipeline(Pipeline { negate: false, commands: vec![cmd] }),
+        other                       => other,
+    };
+    let mut stages = vec![first_stage];
     iter.next_kind()?; // consume `|`
     skip_newlines(iter)?;
 
@@ -2727,6 +2772,11 @@ fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
 pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    // v259 CF2: discard any heredoc bodies leaked by a prior parse that errored
+    // after pushing them (take_heredoc_bodies drains only on this fn's success
+    // path). Safe: the atom parse_sequence is the single non-reentrant top-level
+    // entry, so nothing legitimately carries a body into a fresh call.
+    let _ = iter.take_heredoc_bodies();
     // Skip leading newlines AND inter-token blanks (mirrors `parse_cursor` →
     // `skip_newlines`). The atom scanner emits a `Blank` where the oracle folds
     // whitespace, so a blank-only / blank+comment line must reduce to `Ok(None)`
@@ -4955,6 +5005,22 @@ mod tests {
         ] { diff_cmd(s); }
     }
 
+    #[test]
+    fn atoms_cf2_heredoc_queue_reset() {
+        // A parse that collects a heredoc body then errors on a stray `;;`
+        // leaves the body in the Lexer-owned queue (early-Err path does not
+        // drain). A subsequent parse_sequence on the SAME Lexer must discard
+        // that leaked body at entry, so the queue is empty afterward.
+        let mut lx = Lexer::new_live_atoms("cat <<E\nx\nE\n;;", &Default::default(), LexerOptions::default());
+        let first = parse_sequence(&mut lx); // collects the heredoc body, then `;;` → Err
+        assert!(first.is_err(), "expected UnexpectedToken on the `;;`, got {first:?}");
+        let _ = parse_sequence(&mut lx);     // entry-reset must drain the leaked body
+        assert!(
+            lx.take_heredoc_bodies().is_empty(),
+            "parse_sequence entry-reset should have drained the leaked heredoc body"
+        );
+    }
+
     // v243 T2 tests
 
     #[test]
@@ -6286,23 +6352,16 @@ mod tests {
         diff_cmd("[[ a =~ >b ]]");
     }
 
-    /// v254 live-flip carry-forward (PRE-EXISTING, inherited): `$"…"` locale
-    /// quoting. The oracle's `scan_dollar_expansion` drops the `$` for `$"`
-    /// (locale-translation = identity), yielding pattern `[Literal "abc"
-    /// quoted:true]`, but the shared `emit_unquoted_dollar_atom` classifier has
-    /// no `$"` arm, so the atom path emits `DollarLit` + `BeginDquote` →
-    /// pattern `[Literal "$", Literal "abc" quoted:true]`. This gap is NOT
-    /// introduced by v254 — it affects command position too (`echo $"hi"`
-    /// diverges the same way) — so it is pinned here, not fixed: reconcile in
-    /// the shared `$`-classifier before flipping `command_atoms` live.
+    /// v254 live-flip carry-forward (PRE-EXISTING, inherited), RESOLVED by v259
+    /// CF4: `$"…"` locale quoting. The oracle's `scan_dollar_expansion` drops
+    /// the `$` for `$"` (locale-translation = identity), yielding pattern
+    /// `[Literal "abc" quoted:true]`. The shared `emit_unquoted_dollar_atom`
+    /// classifier now has a `$"` arm (v259 CF4) that does the same, so this is
+    /// no longer a divergence — kept as a `diff_cmd` regression guard (see also
+    /// `atoms_cf4_locale_dquote`, the dedicated v259 CF4 test).
     #[test]
     fn atoms_regex_dollar_dquote_carryforward() {
-        let s = "[[ $x =~ $\"abc\" ]]";
-        let n = new_seq(s);
-        let o = old_seq(s);
-        assert!(n.is_ok(), "expected atom path Ok for {s:?}, got {n:?}");
-        assert!(o.is_ok(), "expected oracle Ok for {s:?}, got {o:?}");
-        assert_ne!(n.unwrap(), o.unwrap(), "expected a KNOWN AST divergence for {s:?}");
+        diff_cmd("[[ $x =~ $\"abc\" ]]");
     }
 
     /// v254 T2: systematic quoting/escapes/continuations/terminator-edges
@@ -6432,5 +6491,73 @@ mod tests {
         diff_cmd("[[ ! ( a == b ) || c ]]");         // ! before a group
         diff_cmd("[[ -e / ]]");
         diff_cmd("[[ -o errexit ]]");                // -o shell-option unary
+    }
+
+    /// v259 CF3 live-flip carry-forward fix: `finish_pipeline` only wrapped a
+    /// compound first-stage in `Pipeline{negate:true,[cmd]}` when `negate` was
+    /// true, so an EVEN leading-bang count (`! !`) — which computes
+    /// `negate = bangs % 2 == 1 = false` — fell through to the bare-compound
+    /// arm instead of the oracle's `Pipeline{negate:false,[compound]}`. Covers
+    /// every compound family plus the odd-bang/zero-bang/simple regressions.
+    #[test]
+    fn atoms_cf3_even_bang_compound() {
+        // Even (>=2) bang count before a compound: oracle wraps
+        // Pipeline{negate:false,[compound]}; the atom path used to return the
+        // bare compound. Covers every compound family.
+        diff_cmd("! ! { a; }");
+        diff_cmd("! ! (a)");
+        diff_cmd("! ! if x; then y; fi");
+        diff_cmd("! ! while x; do y; done");
+        diff_cmd("! ! for i in a; do y; done");
+        diff_cmd("! ! case x in a) :; esac");
+        diff_cmd("! ! [[ x ]]");
+        diff_cmd("! ! (( 1 ))");
+        diff_cmd("! ! coproc cat");
+        // Regressions (must still match): odd-bang wraps negate:true, zero-bang
+        // stays bare, simple always wraps.
+        diff_cmd("! { a; }");
+        diff_cmd("{ a; }");
+        diff_cmd("! ! a");
+    }
+
+    /// v259 CF4 live-flip carry-forward fix: `emit_unquoted_dollar_atom` had no
+    /// `Some('"')` arm, so `$"` hit the catch-all and kept a stray `Literal "$"`
+    /// before the dquote span. `$"…"` is bash locale quoting; huck's translation
+    /// is the identity, so the oracle drops the `$` (`$"…" ≡ "…"`). Covers both
+    /// command position and the `=~` regex operand (shared classifier); the
+    /// inside-double-quote `$"` regression must stay unchanged.
+    #[test]
+    fn atoms_cf4_locale_dquote() {
+        // $"…" is locale quoting == "…"; the oracle drops the `$`. The atom path
+        // used to keep a stray Literal "$".
+        diff_cmd("echo $\"hi\"");
+        diff_cmd("echo $\"a\"$\"b\"");        // multiple, all drop the `$`
+        diff_cmd("[[ $x =~ $\"abc\" ]]");      // regex operand (shared classifier)
+        // Regression: a $" INSIDE a double-quoted span stays a literal `$` on
+        // both paths — must remain unchanged.
+        diff_cmd("echo \"a$\"b\"c\"");
+    }
+
+    #[test]
+    fn atoms_cf3_even_bang_piped_compound() {
+        // v259 F1: even-bang compound in a multi-stage pipeline stays nested.
+        diff_cmd("! ! { a; } | b");
+        diff_cmd("! ! { a; } | b | c");
+        diff_cmd("! ! (a) | b");
+        diff_cmd("! ! if x; then y; fi | z");
+        // Regressions (already matched, must stay): odd-bang hoists flat, zero-bang flat.
+        diff_cmd("! { a; } | b");
+        diff_cmd("{ a; } | b");
+        diff_cmd("! ! a | b");
+    }
+
+    #[test]
+    fn atoms_cf4_locale_dquote_param_operand() {
+        // v259 F3: $"…" drops the $ in param-expansion operands + array-literal subscripts.
+        diff_cmd("echo ${x:-$\"hi\"}");
+        diff_cmd("echo ${x:+$\"y\"}");
+        diff_cmd("a=([$\"k\"]=v)");
+        // Regression: bare assignment-target subscript already matched, stays green.
+        diff_cmd("a[$\"k\"]=v");
     }
 }
