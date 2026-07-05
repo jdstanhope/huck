@@ -5028,20 +5028,31 @@ mod tests {
 
     #[test]
     fn atoms_heredoc_redirect_target_before_arg_pin() {
-        // PINNED divergence (documented, not fixed): fill_command always fills
-        // an Exec's args BEFORE its redirects, regardless of source order. When
-        // a redirect-TARGET Word's heredoc appears in source BEFORE an arg
-        // Word's heredoc (`echo >$(f <<Y) $(a <<X)` — Y precedes X in the
-        // source, so the FIFO body queue is [Y, X]), the fixed args-then-
-        // redirects fill order consumes Y's body for X's placeholder and vice
-        // versa, swapping the two bodies. Same class as the pre-existing
-        // redirect-list source-ordering limitation noted on `fill_redirects`/
-        // `Redirection` (the AST has no source positions to sort by across the
-        // args/redirects split) — not worth contorting the fill walk for a rare
-        // multi-heredoc redirect-target-before-arg interleaving.
+        // PINNED divergence (documented, not fixed): the fill walk visits the
+        // AST in a fixed structural order, but the heredoc-body FIFO is in
+        // lexer emission order (nested-Word bodies emit at their inner newline,
+        // BEFORE an outer direct heredoc-body redirect). When those two orders
+        // disagree, the bodies swap. The AST carries no source positions to
+        // reconcile them (that is the rejected Scope B), and these are rare,
+        // exotic multi-heredoc constructs, so they are pinned rather than fixed.
+        //
+        // Case 1 — a redirect-TARGET Word's heredoc precedes an arg Word's
+        // heredoc in source (`echo >$(f <<Y) $(a <<X)`: Y precedes X, queue is
+        // [Y, X]); fill_command fills args before redirects, so X's placeholder
+        // takes Y's body and vice versa.
         let s = "echo >$(f <<Y\nyy\nY\n) $(a <<X\nxx\nX\n)";
         assert_ne!(new_seq(s).unwrap(), old_seq(s).unwrap(),
             "expected the documented args-vs-redirects fill-order divergence for {s:?}");
+        // Case 2 — an outer command's own heredoc redirect (`<<A`) combined with
+        // a heredoc nested in a LATER redirect-TARGET word (`>$(f <<Y)`): the
+        // nested Y emits first (inner-newline), but fill_redirects walks the
+        // redirect list in structural order, filling the `<<A` heredoc (list
+        // position 0) first — so `<<A` takes Y's body and Y takes A's. Same
+        // class, but entirely within fill_redirects (not the args/redirects
+        // split of case 1).
+        let s2 = "echo <<A $(:) >$(f <<Y\nyy\nY\n)\naa\nA\n";
+        assert_ne!(new_seq(s2).unwrap(), old_seq(s2).unwrap(),
+            "expected the documented redirect-list fill-order divergence for {s2:?}");
     }
 
     #[test]
