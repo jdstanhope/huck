@@ -2456,7 +2456,18 @@ fn finish_pipeline(
     }
 
     // A `|` follows — collect all stages into a Pipeline.
-    let mut stages = vec![first];
+    // v259 F1: mirror the oracle's parse_command_then_pipeline hoist
+    // (command.rs:833). An even-bang (>=2) compound first stage is wrapped
+    // Pipeline{negate:false,[cmd]} by the oracle and does NOT hoist (guard is
+    // p.negate && len==1), so the inner 1-elem pipeline survives nested as the
+    // first stage. Odd-bang hoists (negate is the outer flag here, `first` is
+    // raw) → stays flat; zero-bang / simple → unchanged.
+    let first_stage = match first {
+        Command::Simple(_)          => first,
+        cmd if had_bangs && !negate => Command::Pipeline(Pipeline { negate: false, commands: vec![cmd] }),
+        other                       => other,
+    };
+    let mut stages = vec![first_stage];
     iter.next_kind()?; // consume `|`
     skip_newlines(iter)?;
 
@@ -6496,5 +6507,18 @@ mod tests {
         // Regression: a $" INSIDE a double-quoted span stays a literal `$` on
         // both paths — must remain unchanged.
         diff_cmd("echo \"a$\"b\"c\"");
+    }
+
+    #[test]
+    fn atoms_cf3_even_bang_piped_compound() {
+        // v259 F1: even-bang compound in a multi-stage pipeline stays nested.
+        diff_cmd("! ! { a; } | b");
+        diff_cmd("! ! { a; } | b | c");
+        diff_cmd("! ! (a) | b");
+        diff_cmd("! ! if x; then y; fi | z");
+        // Regressions (already matched, must stay): odd-bang hoists flat, zero-bang flat.
+        diff_cmd("! { a; } | b");
+        diff_cmd("{ a; } | b");
+        diff_cmd("! ! a | b");
     }
 }
