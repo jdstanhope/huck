@@ -2312,7 +2312,7 @@ impl<'a> Lexer<'a> {
                 // If there are pending heredocs, collect their bodies now
                 // before emitting the Newline token.
                 if !self.pending_heredocs.is_empty() {
-                    collect_heredoc_bodies(&mut self.cursor, &mut self.pending_heredocs, &mut self.history, self.opts)?;
+                    collect_heredoc_bodies(&mut self.cursor, &mut self.pending_heredocs, &mut self.history, self.opts, &mut self.parsed_heredoc_bodies, self.command_atoms)?;
                 }
                 self.history.push(Token::new(TokenKind::Newline, Span::new(c_off, c_line, c_col)));
             }
@@ -4853,20 +4853,50 @@ fn parse_heredoc_delim(
 /// Collects bodies for all pending heredocs in queue order.
 /// After each heredoc's body is collected, it is patched back into the
 /// placeholder `TokenKind::Heredoc` at `token_idx`.
+///
+/// v260 CF1 bridge: under `command_atoms` ONLY, ALSO pushes each resolved body
+/// onto `parsed_heredoc_bodies` (the same Lexer-owned FIFO the
+/// atom-command-parser's `parsed_heredoc_bodies` queue uses — see
+/// `push_heredoc_body`/`take_heredoc_bodies`) instead of patching the token
+/// body directly. This function (via `scan_step_command`) is the ONLY
+/// heredoc-resolution path reachable from a nested-command context
+/// (`Mode::CommandSub`/`Mode::Backtick` body scanning always delegates to
+/// `scan_step_command`, regardless of the top-level `command_atoms` flag —
+/// v244's dormant CommandSub-body reuse). The atom-command-parser's
+/// `parse_one_redirect` always builds a placeholder `Word(vec![])` for a
+/// `TokenKind::Heredoc` and discards whatever `body` the consumed token
+/// carries (correct for a TRUE atom-scanned heredoc, whose body arrives later
+/// as `HeredocBodyBegin`…`End` atoms) — but a nested heredoc resolved HERE
+/// never emits those atoms, so without this bridge its body is never queued
+/// and the placeholder is left empty forever. The batch-tokenizing oracle
+/// (`command.rs`'s `parse`) never drains this queue and reads the token body
+/// directly, so under `command_atoms == false` the body is moved straight
+/// into the token slot with no bridge push (no wasted clone).
 fn collect_heredoc_bodies(
     chars: &mut CharCursor<'_>,
     pending: &mut std::collections::VecDeque<PendingHeredoc>,
     tokens: &mut [Token],
     opts: LexerOptions,
+    parsed_heredoc_bodies: &mut Vec<Word>,
+    command_atoms: bool,
 ) -> Result<(), LexError> {
     while let Some(ph) = pending.pop_front() {
         let body = collect_one_heredoc_body(chars, &ph, opts)?;
         if let Some(TokenKind::Heredoc { body: slot, expand, strip_tabs }) =
             tokens.get_mut(ph.token_idx).map(|t| &mut t.kind)
         {
-            *slot = body;
             *expand = ph.expand;
             *strip_tabs = ph.strip_tabs;
+            if command_atoms {
+                // Atom path: parse_one_redirect discards the token body and
+                // builds an empty placeholder, filling it later from this FIFO.
+                *slot = Word(vec![]);
+                parsed_heredoc_bodies.push(body); // move, no clone
+            } else {
+                // Oracle/production: command.rs reads the token body directly and
+                // never drains parsed_heredoc_bodies. Move the body in; no push.
+                *slot = body;
+            }
         } else {
             unreachable!("placeholder token at index was not TokenKind::Heredoc");
         }

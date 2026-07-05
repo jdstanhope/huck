@@ -5,6 +5,7 @@
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
+    AssignTarget,
     Redirection, RedirFd, RedirOp, FileMode, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
@@ -2663,19 +2664,126 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
     Ok(Sequence { first, rest, background })
 }
 
-/// v250 T3: fill every still-empty `RedirOp::Heredoc { body }` in `redirects`
-/// (in source order) from `bodies`. A body is "still empty" (`Word(vec![])`)
-/// exactly when `parse_one_redirect` built it as a provisional placeholder;
-/// an ALREADY-filled one (can't happen on the atom path today, but keeps this
-/// idempotent) is left alone.
+/// v250 T3 + v260 CF1: walk every redirect in `redirects` (in source order),
+/// filling (a) any still-empty `RedirOp::Heredoc { body }` placeholder from
+/// `bodies`, and (b) any heredoc nested INSIDE another redirect's own `Word`
+/// (a here-string, a file/dup target — `cat <<<$(a <<X)`, `echo >$(f <<X)`,
+/// `echo >&$(f <<X)`) via `fill_word`. A heredoc body is "still empty"
+/// (`Word(vec![])`) exactly when `parse_one_redirect` built it as a
+/// provisional placeholder; an ALREADY-filled one (can't happen on the atom
+/// path today, but keeps this idempotent) is left alone. EXHAUSTIVE over
+/// `RedirOp` — no `_ =>` wildcard, so a future variant can't silently drop a
+/// nested body.
 fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item = Word>) {
     for r in redirects.iter_mut() {
-        if let RedirOp::Heredoc { body, .. } = &mut r.op {
-            if body.0.is_empty() {
-                if let Some(next) = bodies.next() {
-                    *body = next;
+        match &mut r.op {
+            RedirOp::File { target, .. } => fill_word(target, bodies),
+            RedirOp::Dup { source, .. } => fill_word(source, bodies),
+            RedirOp::Close => {}
+            RedirOp::Heredoc { body, .. } => {
+                if body.0.is_empty() {
+                    if let Some(next) = bodies.next() {
+                        *body = next;
+                    }
                 }
             }
+            RedirOp::HereString(word) => fill_word(word, bodies),
+        }
+    }
+}
+
+/// v260 CF1: fill heredoc bodies whose openers sit inside a `Word`. Recurses
+/// into every nested `Sequence`/`Word` a `WordPart` can carry, in source order,
+/// so the shared FIFO body queue attaches each body to its placeholder.
+/// EXHAUSTIVE over `WordPart` — no `_ =>` wildcard.
+fn fill_word(word: &mut Word, bodies: &mut impl Iterator<Item = Word>) {
+    fill_word_parts(&mut word.0, bodies);
+}
+
+fn fill_word_parts(parts: &mut [WordPart], bodies: &mut impl Iterator<Item = Word>) {
+    for part in parts.iter_mut() {
+        match part {
+            WordPart::CommandSub { sequence, .. } => fill_sequence(sequence, bodies),
+            WordPart::ProcessSub { sequence, .. } => fill_sequence(sequence, bodies),
+            WordPart::Arith { body, .. } => fill_word(body, bodies),
+            WordPart::Quoted { parts, .. } => fill_word_parts(parts, bodies),
+            WordPart::ParamExpansion { subscript, modifier, .. } => {
+                // Source order: `${a[i]:-word}` — subscript before the modifier.
+                if let Some(SubscriptKind::Index(w)) = subscript {
+                    fill_word(w, bodies);
+                }
+                fill_param_modifier(modifier, bodies);
+            }
+            WordPart::ArrayLiteral(elems) => {
+                for el in elems.iter_mut() {
+                    if let Some(sub) = el.subscript.as_mut() {
+                        fill_word(sub, bodies); // `[idx]=val` — subscript before value
+                    }
+                    fill_word(&mut el.value, bodies);
+                }
+            }
+            // No nested Word — nothing to fill.
+            WordPart::Literal { .. }
+            | WordPart::Tilde(_)
+            | WordPart::Var { .. }
+            | WordPart::LastStatus { .. }
+            | WordPart::AllArgs { .. }
+            | WordPart::AssignPrefix { .. } => {}
+        }
+    }
+}
+
+/// EXHAUSTIVE over `ParamModifier`; recurses into each variant's Word(s) in
+/// source order.
+fn fill_param_modifier(modifier: &mut ParamModifier, bodies: &mut impl Iterator<Item = Word>) {
+    match modifier {
+        ParamModifier::UseDefault { word, .. }
+        | ParamModifier::AssignDefault { word, .. }
+        | ParamModifier::ErrorIfUnset { word, .. }
+        | ParamModifier::UseAlternate { word, .. } => fill_word(word, bodies),
+        ParamModifier::RemovePrefix { pattern, .. }
+        | ParamModifier::RemoveSuffix { pattern, .. } => fill_word(pattern, bodies),
+        ParamModifier::Substitute { pattern, replacement, .. } => {
+            fill_word(pattern, bodies);      // `${x/pat/rep}` — pattern before replacement
+            fill_word(replacement, bodies);
+        }
+        ParamModifier::Substring { offset, length } => {
+            fill_word(offset, bodies);       // `${x:off:len}` — offset before length
+            if let Some(l) = length.as_mut() {
+                fill_word(l, bodies);
+            }
+        }
+        ParamModifier::Case { pattern: Some(p), .. } => fill_word(p, bodies),
+        // No Word to fill.
+        ParamModifier::Case { pattern: None, .. }
+        | ParamModifier::None
+        | ParamModifier::Length
+        | ParamModifier::IndirectKeys
+        | ParamModifier::PrefixNames { .. }
+        | ParamModifier::Transform { .. }
+        | ParamModifier::BadSubst { .. } => {}
+    }
+}
+
+/// v260 CF1: fill heredoc bodies nested in a `[[ … ]]` test expression's
+/// operand `Word`s, in source order. EXHAUSTIVE over `TestExpr` — no `_ =>`
+/// wildcard (there is no parenthesized-grouping variant: `(…)` inside a test
+/// expression is resolved at parse time, not represented in the AST).
+fn fill_test_expr(expr: &mut TestExpr, bodies: &mut impl Iterator<Item = Word>) {
+    match expr {
+        TestExpr::Unary { operand, .. } => fill_word(operand, bodies),
+        TestExpr::Binary { lhs, rhs, .. } => {
+            fill_word(lhs, bodies);
+            fill_word(rhs, bodies);
+        }
+        TestExpr::Regex { lhs, pattern } => {
+            fill_word(lhs, bodies);
+            fill_word(pattern, bodies);
+        }
+        TestExpr::Not(inner) => fill_test_expr(inner, bodies),
+        TestExpr::And(lhs, rhs) | TestExpr::Or(lhs, rhs) => {
+            fill_test_expr(lhs, bodies);
+            fill_test_expr(rhs, bodies);
         }
     }
 }
@@ -2688,11 +2796,30 @@ fn fill_redirects(redirects: &mut [Redirection], bodies: &mut impl Iterator<Item
 /// wildcard, so a future variant can't silently drop a body.
 fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
     match cmd {
-        Command::Simple(SimpleCommand::Assign(_, _)) => {
-            // No redirects possible on a bare-assignment stage (parse_simple's
-            // `Assign` arm is only reached when `redirects.is_empty()`).
+        Command::Simple(SimpleCommand::Assign(items, _)) => {
+            // v260 CF1: a bare assignment carries no redirects, but its value
+            // Words can nest heredocs (`x=$(cat <<X)`, `a=($(cat <<X))`).
+            for a in items.iter_mut() {
+                if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
+                    fill_word(subscript, bodies);
+                }
+                fill_word(&mut a.value, bodies);
+            }
         }
         Command::Simple(SimpleCommand::Exec(exec)) => {
+            // v260 CF1: walk the command's own Words, then its redirects, in
+            // source order (words-then-redirects). Inline assignments precede the
+            // program, which precedes the args, which precede trailing redirects.
+            for a in exec.inline_assignments.iter_mut() {
+                if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
+                    fill_word(subscript, bodies);
+                }
+                fill_word(&mut a.value, bodies);
+            }
+            fill_word(&mut exec.program, bodies);
+            for arg in exec.args.iter_mut() {
+                fill_word(arg, bodies);
+            }
             fill_redirects(&mut exec.redirects, bodies);
         }
         Command::Pipeline(pipeline) => {
@@ -2716,10 +2843,20 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
             fill_sequence(&mut clause.body, bodies);
         }
         Command::For(clause) => {
+            // v260 CF1: the `in WORDS` list precedes the body in source order.
+            for w in clause.words.iter_mut() {
+                fill_word(w, bodies);
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Case(clause) => {
+            // v260 CF1: subject, then each item's `|`-separated patterns
+            // (before its body), in source order.
+            fill_word(&mut clause.subject, bodies);
             for item in clause.items.iter_mut() {
+                for pat in item.patterns.iter_mut() {
+                    fill_word(pat, bodies);
+                }
                 if let Some(body) = item.body.as_mut() {
                     fill_sequence(body, bodies);
                 }
@@ -2730,19 +2867,41 @@ fn fill_command(cmd: &mut Command, bodies: &mut impl Iterator<Item = Word>) {
         Command::FunctionDef { body, .. } => fill_command(body, bodies),
         // `[[ … ]]` carries no nested `Sequence`/redirect list of its own —
         // any trailing redirects on it are on the enclosing `Redirected`
-        // wrapper, handled there. Not reachable from the atom parser today
-        // (still deferred), but exhaustiveness must not skip it.
-        Command::DoubleBracket { .. } => {}
+        // wrapper, handled there. v260 CF1: any inline assignment prefixes
+        // (`FOO=hi [[ … ]]`) precede the test expression itself.
+        Command::DoubleBracket { expr, inline_assignments } => {
+            for a in inline_assignments.iter_mut() {
+                if let AssignTarget::Indexed { subscript, .. } = &mut a.target {
+                    fill_word(subscript, bodies);
+                }
+                fill_word(&mut a.value, bodies);
+            }
+            fill_test_expr(expr, bodies);
+        }
         // `((expr))` is a bare arithmetic `Word`, no redirect list of its own.
-        // Not reachable from the atom parser today (still deferred).
-        Command::Arith(_) => {}
-        // C-style `for ((init;cond;step))`: only `body` is a `Sequence`; the
-        // header sections are bare `Word`s, not redirect-bearing. Not
-        // reachable from the atom parser today (still deferred).
+        Command::Arith(body) => fill_word(body, bodies),
+        // C-style `for ((init;cond;step))`: the header sections are bare
+        // `Word`s (no redirect list of their own); v260 CF1 fills them, in
+        // source order, before the `Sequence` body.
         Command::ArithFor(clause) => {
+            if let Some(init) = clause.init.as_mut() {
+                fill_word(init, bodies);
+            }
+            if let Some(cond) = clause.cond.as_mut() {
+                fill_word(cond, bodies);
+            }
+            if let Some(step) = clause.step.as_mut() {
+                fill_word(step, bodies);
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Select(clause) => {
+            // v260 CF1: the `in WORDS` list (when present) precedes the body.
+            if let Some(words) = clause.words.as_mut() {
+                for w in words.iter_mut() {
+                    fill_word(w, bodies);
+                }
+            }
             fill_sequence(&mut clause.body, bodies);
         }
         Command::Redirected { inner, redirects } => {
@@ -4821,62 +4980,96 @@ mod tests {
 
     #[test]
     fn atoms_heredoc_in_cmdsub_body_drop_divergence() {
-        // v250 KNOWN DEFERRED divergence (NOT intentional-correct like
-        // `atoms_heredoc_multiline_cmdsub_divergence` above — this one is a real gap,
-        // tracked as a `[deferred]` entry in docs/bash-divergences.md): a heredoc
-        // opened INSIDE a command substitution has its body DROPPED on the atom
-        // path. Root cause: `fill_command`/`fill_sequence` in this file only walk
-        // the top-level command tree to attach collected heredoc bodies to their
-        // `Heredoc` redirection atoms — they don't descend into the nested
-        // `Sequence` carried by `WordPart::CommandSub` (backticks lower to the
-        // same variant) or `WordPart::Arith` word parts, so a heredoc whose
-        // `<<X` appears inside a `$(…)` or `` `…` `` never gets its body
-        // attached and is left as `Word([])`. The
-        // oracle (command.rs) is correct here. This is OUT of v250's declared scope
-        // (§4 covers cmdsub-INSIDE-a-heredoc-body, the reverse nesting, which
-        // works) and is dormant (`command_atoms` stays false).
-        //
-        // This test PINS the current (wrong) atom-path behavior. It must be
-        // updated (and likely replaced with a `diff_cmd`) when the gap is fixed.
-        fn inner_heredoc_body(seq: &Sequence) -> &Word {
-            // Unwrap: Sequence -> Pipeline -> Simple(Exec) "echo" -> args[0] Word
-            // -> CommandSub part (backticks lower to the same WordPart::CommandSub)
-            // -> inner Sequence -> Pipeline -> Simple(Exec) "cat" -> redirects[0]
-            // -> Heredoc.body
-            let Command::Pipeline(p) = &seq.first else { panic!("expected pipeline") };
-            let Command::Simple(SimpleCommand::Exec(outer)) = &p.commands[0] else {
-                panic!("expected exec")
-            };
-            let arg = &outer.args[0];
-            let WordPart::CommandSub { sequence: inner_seq, .. } = &arg.0[0] else {
-                panic!("expected CommandSub part, got {:?}", arg.0[0])
-            };
-            let Command::Pipeline(ip) = &inner_seq.first else { panic!("expected inner pipeline") };
-            let Command::Simple(SimpleCommand::Exec(inner)) = &ip.commands[0] else {
-                panic!("expected inner exec")
-            };
-            let RedirOp::Heredoc { body, .. } = &inner.redirects[0].op else {
-                panic!("expected heredoc redirect")
-            };
-            body
-        }
+        // v250 pinned a KNOWN gap (heredoc inside `$(…)`/`` `…` `` dropped its
+        // body); v260 CF1 RESOLVED it via the fill_word recursion + the lexer
+        // bridge. Now a resolved-divergence regression guard: byte-identical.
+        diff_cmd("echo $(cat <<X\nhi\nX\n)");
+        diff_cmd("echo `cat <<X\nhi\nX\n`");
+    }
 
-        for s in [
-            "echo $(cat <<X\nhi\nX\n)\n",   // $(...) command substitution
-            "echo `cat <<X\nhi\nX\n`\n",    // backtick command substitution
-        ] {
-            let new = new_seq(s).unwrap().expect("new_seq parses");
-            let old = old_seq(s).unwrap().expect("old_seq parses");
-            // The two ASTs differ overall (this is the divergence) ...
-            assert_ne!(new, old, "expected atom path to diverge from oracle for {s:?}");
-            // ... specifically at the inner heredoc body: atom path drops it, the
-            // oracle keeps it. If this ever becomes equal, the gap has been fixed —
-            // update/replace this test (e.g. with diff_cmd).
-            assert_eq!(inner_heredoc_body(&new), &Word(vec![]),
-                "atom path expected to have DROPPED the inner heredoc body for {s:?}: {new:#?}");
-            assert_ne!(inner_heredoc_body(&old), &Word(vec![]),
-                "oracle expected to have a NON-EMPTY inner heredoc body for {s:?}: {old:#?}");
-        }
+    #[test]
+    fn atoms_heredoc_in_word_fill() {
+        // v260 CF1: a heredoc nested inside a Word is filled, not dropped.
+        diff_cmd("echo $(cat <<X\nhi\nX\n)");                 // arg command-sub
+        diff_cmd("x=$(cat <<X\nhi\nX\n)");                    // assignment RHS
+        diff_cmd("a=($(cat <<X\nhi\nX\n))");                  // array-literal element value
+        diff_cmd("echo ${y:-$(cat <<X\nhi\nX\n)}");           // param-expansion operand
+        diff_cmd("echo $(( $(cat <<X\n1\nX\n) + 2 ))");       // arith body
+        diff_cmd("echo `cat <<X\nhi\nX\n`");                  // backtick (→ CommandSub)
+        diff_cmd("echo \"$(cat <<X\nhi\nX\n)\"");             // inside a quoted span
+        diff_cmd("echo $(a <<X\nxx\nX\n)$(b <<Y\nyy\nY\n)");  // two Word-nested (queue order)
+        diff_cmd("FOO=$(cat <<X\nhi\nX\n) echo hi");          // inline assignment value
+    }
+
+    #[test]
+    fn atoms_heredoc_in_clause_and_redirect_target_fill() {
+        // v260 whole-branch fix: heredoc bodies in for/select/case clause Words,
+        // case patterns, here-string words, and redirect-target/dup Words.
+        diff_cmd("for i in $(t <<X\nx\nX\n); do :; done");
+        diff_cmd("select i in $(t <<X\nx\nX\n); do :; done");
+        diff_cmd("case $(t <<X\nx\nX\n) in a) :;; esac");
+        diff_cmd("case x in $(p <<X\nx\nX\n)) :;; esac");
+        diff_cmd("cat <<<$(a <<X\nxx\nX\n)");
+        diff_cmd("echo >$(f <<X\nxx\nX\n)");
+        diff_cmd("echo <$(f <<X\nxx\nX\n)");
+        // plus audited positions found to ALSO drop (fixed): dup-target, `[[ ]]`
+        // operands, standalone arith command, C-style arith-for header.
+        diff_cmd("echo >&$(f <<X\n1\nX\n)");
+        diff_cmd("[[ -f $(cat <<X\nx\nX\n) ]]");
+        diff_cmd("[[ $(a <<X\nx\nX\n) == b ]]");
+        diff_cmd("[[ x =~ $(a <<X\nx\nX\n) ]]");
+        diff_cmd("(( $(x <<X\n1\nX\n) ))");
+        diff_cmd("for (( $(a <<X\n1\nX\n) ; ; )); do :; done");
+        // interleaving: an arg Word's heredoc before the redirect-target Word's
+        // heredoc is byte-identical (fill_command fills args before redirects,
+        // matching source order here).
+        diff_cmd("echo $(a <<X\nxx\nX\n) >$(f <<Y\nyy\nY\n)");
+    }
+
+    #[test]
+    fn atoms_heredoc_redirect_target_before_arg_pin() {
+        // PINNED divergence (documented, not fixed): the fill walk visits the
+        // AST in a fixed structural order, but the heredoc-body FIFO is in
+        // lexer emission order (nested-Word bodies emit at their inner newline,
+        // BEFORE an outer direct heredoc-body redirect). When those two orders
+        // disagree, the bodies swap. The AST carries no source positions to
+        // reconcile them (that is the rejected Scope B), and these are rare,
+        // exotic multi-heredoc constructs, so they are pinned rather than fixed.
+        //
+        // Case 1 — a redirect-TARGET Word's heredoc precedes an arg Word's
+        // heredoc in source (`echo >$(f <<Y) $(a <<X)`: Y precedes X, queue is
+        // [Y, X]); fill_command fills args before redirects, so X's placeholder
+        // takes Y's body and vice versa.
+        let s = "echo >$(f <<Y\nyy\nY\n) $(a <<X\nxx\nX\n)";
+        assert_ne!(new_seq(s).unwrap(), old_seq(s).unwrap(),
+            "expected the documented args-vs-redirects fill-order divergence for {s:?}");
+        // Case 2 — an outer command's own heredoc redirect (`<<A`) combined with
+        // a heredoc nested in a LATER redirect-TARGET word (`>$(f <<Y)`): the
+        // nested Y emits first (inner-newline), but fill_redirects walks the
+        // redirect list in structural order, filling the `<<A` heredoc (list
+        // position 0) first — so `<<A` takes Y's body and Y takes A's. Same
+        // class, but entirely within fill_redirects (not the args/redirects
+        // split of case 1).
+        let s2 = "echo <<A $(:) >$(f <<Y\nyy\nY\n)\naa\nA\n";
+        assert_ne!(new_seq(s2).unwrap(), old_seq(s2).unwrap(),
+            "expected the documented redirect-list fill-order divergence for {s2:?}");
+    }
+
+    #[test]
+    fn atoms_heredoc_word_redirect_order() {
+        // v260 CF1: heredoc-bearing Word + the command's own redirect heredoc,
+        // both interleavings, fill in correct source order (byte-identical to
+        // the oracle — no pin needed; the lexer bridge collects nested-Word
+        // bodies at the inner newline, before the outer line's redirect bodies).
+        diff_cmd("cat $(sh <<B\nbb\nB\n) <<A\naa\nA\n");            // Word then trailing redirect
+        diff_cmd("cat <<A $(sh <<B\nbb\nB\n)\naa\nA\n");            // redirect then Word (ex-"pin")
+        diff_cmd("cat <<A $(sh <<B\nbb\nB\n) <<C\naa\nA\ncc\nC\n"); // redirect, Word, redirect
+        diff_cmd("echo $(cat <<X\nxx\nX\n) <<A\naa\nA\n");          // Word then redirect (echo)
+        diff_cmd("cat <<A $(a <<B\nbb\nB\n)$(c <<D\ndd\nD\n)\naa\nA\n"); // redirect then two Words
+        // Regressions: plain / multiple outer-redirect heredocs still fill in order.
+        diff_cmd("cat <<A\naa\nA\n");
+        diff_cmd("cat <<A <<B\naa\nA\nbb\nB\n");
+        diff_cmd("cat <<A\naa\nA\ncat <<B\nbb\nB\n");
     }
 
     // v250 T3 tests: literal heredocs (quoted/escaped delimiter) end-to-end
