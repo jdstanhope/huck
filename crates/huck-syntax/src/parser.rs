@@ -100,6 +100,35 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // deferred (see the `DeferredExpansion` doc comment).
                 return Err(ParseError::UnsupportedExpansion);
             }
+            // v259 F3: `$"…"` locale quoting in a param-expansion operand context
+            // (`scan_step_param_operand` drops the `$` and emits a zero-width
+            // `BeginDquote`, leaving the `"` for the normal double-quote
+            // assembler). A bare `"…"` never reaches here — this operand
+            // scanner's OWN "outside dquote" arm inlines it flat directly, with
+            // no `BeginDquote` signal — so this arm only ever fires for `$"…"`.
+            //
+            // The oracle's representation for `$"…"` differs by which operand
+            // this is: VALUE-family operands (`scan_braced_param_expansion`'s
+            // `${x:-…}`/`${x/…/…}`/`${x:o:l}` bodies) inline the span FLAT (no
+            // `Quoted` wrapper — mirrors the flat inlining `parse_regex_operand`
+            // already does for the same oracle scanner shape). Subscript
+            // operands (`${a[i]}` / array-literal `[i]=`) instead re-tokenize
+            // via `scan_subscript`/`parse_subscript_body` — the general
+            // tokenizer — which DOES keep the `Quoted{Double,…}` wrapper.
+            // Distinguish via the enclosing mode (captured before `parse_dquote`
+            // pushes its own `Mode::DoubleQuote` frame).
+            TokenKind::BeginDquote => {
+                let in_subscript = matches!(iter.current_mode(), Mode::ParamSubscriptOperand { .. });
+                let dq = parse_dquote(iter, quoted)?;
+                if in_subscript {
+                    parts.push(dq);
+                } else {
+                    match dq {
+                        WordPart::Quoted { parts: inner, .. } => parts.extend(inner),
+                        other => parts.push(other),
+                    }
+                }
+            }
             _ => {
                 // Unexpected atom in operand context.
                 return Err(ParseError::UnsupportedExpansion);
@@ -6520,5 +6549,15 @@ mod tests {
         diff_cmd("! { a; } | b");
         diff_cmd("{ a; } | b");
         diff_cmd("! ! a | b");
+    }
+
+    #[test]
+    fn atoms_cf4_locale_dquote_param_operand() {
+        // v259 F3: $"…" drops the $ in param-expansion operands + array-literal subscripts.
+        diff_cmd("echo ${x:-$\"hi\"}");
+        diff_cmd("echo ${x:+$\"y\"}");
+        diff_cmd("a=([$\"k\"]=v)");
+        // Regression: bare assignment-target subscript already matched, stays green.
+        diff_cmd("a[$\"k\"]=v");
     }
 }
