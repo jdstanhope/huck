@@ -4913,64 +4913,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // v260 T2: flip to diff_cmd (CF1's fill_word recursion now fills this body)
     fn atoms_heredoc_in_cmdsub_body_drop_divergence() {
-        // v250 KNOWN DEFERRED divergence (NOT intentional-correct like
-        // `atoms_heredoc_multiline_cmdsub_divergence` above — this one is a real gap,
-        // tracked as a `[deferred]` entry in docs/bash-divergences.md): a heredoc
-        // opened INSIDE a command substitution has its body DROPPED on the atom
-        // path. Root cause: `fill_command`/`fill_sequence` in this file only walk
-        // the top-level command tree to attach collected heredoc bodies to their
-        // `Heredoc` redirection atoms — they don't descend into the nested
-        // `Sequence` carried by `WordPart::CommandSub` (backticks lower to the
-        // same variant) or `WordPart::Arith` word parts, so a heredoc whose
-        // `<<X` appears inside a `$(…)` or `` `…` `` never gets its body
-        // attached and is left as `Word([])`. The
-        // oracle (command.rs) is correct here. This is OUT of v250's declared scope
-        // (§4 covers cmdsub-INSIDE-a-heredoc-body, the reverse nesting, which
-        // works) and is dormant (`command_atoms` stays false).
-        //
-        // This test PINS the current (wrong) atom-path behavior. It must be
-        // updated (and likely replaced with a `diff_cmd`) when the gap is fixed.
-        fn inner_heredoc_body(seq: &Sequence) -> &Word {
-            // Unwrap: Sequence -> Pipeline -> Simple(Exec) "echo" -> args[0] Word
-            // -> CommandSub part (backticks lower to the same WordPart::CommandSub)
-            // -> inner Sequence -> Pipeline -> Simple(Exec) "cat" -> redirects[0]
-            // -> Heredoc.body
-            let Command::Pipeline(p) = &seq.first else { panic!("expected pipeline") };
-            let Command::Simple(SimpleCommand::Exec(outer)) = &p.commands[0] else {
-                panic!("expected exec")
-            };
-            let arg = &outer.args[0];
-            let WordPart::CommandSub { sequence: inner_seq, .. } = &arg.0[0] else {
-                panic!("expected CommandSub part, got {:?}", arg.0[0])
-            };
-            let Command::Pipeline(ip) = &inner_seq.first else { panic!("expected inner pipeline") };
-            let Command::Simple(SimpleCommand::Exec(inner)) = &ip.commands[0] else {
-                panic!("expected inner exec")
-            };
-            let RedirOp::Heredoc { body, .. } = &inner.redirects[0].op else {
-                panic!("expected heredoc redirect")
-            };
-            body
-        }
-
-        for s in [
-            "echo $(cat <<X\nhi\nX\n)\n",   // $(...) command substitution
-            "echo `cat <<X\nhi\nX\n`\n",    // backtick command substitution
-        ] {
-            let new = new_seq(s).unwrap().expect("new_seq parses");
-            let old = old_seq(s).unwrap().expect("old_seq parses");
-            // The two ASTs differ overall (this is the divergence) ...
-            assert_ne!(new, old, "expected atom path to diverge from oracle for {s:?}");
-            // ... specifically at the inner heredoc body: atom path drops it, the
-            // oracle keeps it. If this ever becomes equal, the gap has been fixed —
-            // update/replace this test (e.g. with diff_cmd).
-            assert_eq!(inner_heredoc_body(&new), &Word(vec![]),
-                "atom path expected to have DROPPED the inner heredoc body for {s:?}: {new:#?}");
-            assert_ne!(inner_heredoc_body(&old), &Word(vec![]),
-                "oracle expected to have a NON-EMPTY inner heredoc body for {s:?}: {old:#?}");
-        }
+        // v250 pinned a KNOWN gap (heredoc inside `$(…)`/`` `…` `` dropped its
+        // body); v260 CF1 RESOLVED it via the fill_word recursion + the lexer
+        // bridge. Now a resolved-divergence regression guard: byte-identical.
+        diff_cmd("echo $(cat <<X\nhi\nX\n)");
+        diff_cmd("echo `cat <<X\nhi\nX\n`");
     }
 
     #[test]
@@ -4985,6 +4933,23 @@ mod tests {
         diff_cmd("echo \"$(cat <<X\nhi\nX\n)\"");             // inside a quoted span
         diff_cmd("echo $(a <<X\nxx\nX\n)$(b <<Y\nyy\nY\n)");  // two Word-nested (queue order)
         diff_cmd("FOO=$(cat <<X\nhi\nX\n) echo hi");          // inline assignment value
+    }
+
+    #[test]
+    fn atoms_heredoc_word_redirect_order() {
+        // v260 CF1: heredoc-bearing Word + the command's own redirect heredoc,
+        // both interleavings, fill in correct source order (byte-identical to
+        // the oracle — no pin needed; the lexer bridge collects nested-Word
+        // bodies at the inner newline, before the outer line's redirect bodies).
+        diff_cmd("cat $(sh <<B\nbb\nB\n) <<A\naa\nA\n");            // Word then trailing redirect
+        diff_cmd("cat <<A $(sh <<B\nbb\nB\n)\naa\nA\n");            // redirect then Word (ex-"pin")
+        diff_cmd("cat <<A $(sh <<B\nbb\nB\n) <<C\naa\nA\ncc\nC\n"); // redirect, Word, redirect
+        diff_cmd("echo $(cat <<X\nxx\nX\n) <<A\naa\nA\n");          // Word then redirect (echo)
+        diff_cmd("cat <<A $(a <<B\nbb\nB\n)$(c <<D\ndd\nD\n)\naa\nA\n"); // redirect then two Words
+        // Regressions: plain / multiple outer-redirect heredocs still fill in order.
+        diff_cmd("cat <<A\naa\nA\n");
+        diff_cmd("cat <<A <<B\naa\nA\nbb\nB\n");
+        diff_cmd("cat <<A\naa\nA\ncat <<B\nbb\nB\n");
     }
 
     // v250 T3 tests: literal heredocs (quoted/escaped delimiter) end-to-end
