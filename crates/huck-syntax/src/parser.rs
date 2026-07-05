@@ -6312,23 +6312,16 @@ mod tests {
         diff_cmd("[[ a =~ >b ]]");
     }
 
-    /// v254 live-flip carry-forward (PRE-EXISTING, inherited): `$"…"` locale
-    /// quoting. The oracle's `scan_dollar_expansion` drops the `$` for `$"`
-    /// (locale-translation = identity), yielding pattern `[Literal "abc"
-    /// quoted:true]`, but the shared `emit_unquoted_dollar_atom` classifier has
-    /// no `$"` arm, so the atom path emits `DollarLit` + `BeginDquote` →
-    /// pattern `[Literal "$", Literal "abc" quoted:true]`. This gap is NOT
-    /// introduced by v254 — it affects command position too (`echo $"hi"`
-    /// diverges the same way) — so it is pinned here, not fixed: reconcile in
-    /// the shared `$`-classifier before flipping `command_atoms` live.
+    /// v254 live-flip carry-forward (PRE-EXISTING, inherited), RESOLVED by v259
+    /// CF4: `$"…"` locale quoting. The oracle's `scan_dollar_expansion` drops
+    /// the `$` for `$"` (locale-translation = identity), yielding pattern
+    /// `[Literal "abc" quoted:true]`. The shared `emit_unquoted_dollar_atom`
+    /// classifier now has a `$"` arm (v259 CF4) that does the same, so this is
+    /// no longer a divergence — kept as a `diff_cmd` regression guard (see also
+    /// `atoms_cf4_locale_dquote`, the dedicated v259 CF4 test).
     #[test]
     fn atoms_regex_dollar_dquote_carryforward() {
-        let s = "[[ $x =~ $\"abc\" ]]";
-        let n = new_seq(s);
-        let o = old_seq(s);
-        assert!(n.is_ok(), "expected atom path Ok for {s:?}, got {n:?}");
-        assert!(o.is_ok(), "expected oracle Ok for {s:?}, got {o:?}");
-        assert_ne!(n.unwrap(), o.unwrap(), "expected a KNOWN AST divergence for {s:?}");
+        diff_cmd("[[ $x =~ $\"abc\" ]]");
     }
 
     /// v254 T2: systematic quoting/escapes/continuations/terminator-edges
@@ -6485,5 +6478,23 @@ mod tests {
         diff_cmd("! { a; }");
         diff_cmd("{ a; }");
         diff_cmd("! ! a");
+    }
+
+    /// v259 CF4 live-flip carry-forward fix: `emit_unquoted_dollar_atom` had no
+    /// `Some('"')` arm, so `$"` hit the catch-all and kept a stray `Literal "$"`
+    /// before the dquote span. `$"…"` is bash locale quoting; huck's translation
+    /// is the identity, so the oracle drops the `$` (`$"…" ≡ "…"`). Covers both
+    /// command position and the `=~` regex operand (shared classifier); the
+    /// inside-double-quote `$"` regression must stay unchanged.
+    #[test]
+    fn atoms_cf4_locale_dquote() {
+        // $"…" is locale quoting == "…"; the oracle drops the `$`. The atom path
+        // used to keep a stray Literal "$".
+        diff_cmd("echo $\"hi\"");
+        diff_cmd("echo $\"a\"$\"b\"");        // multiple, all drop the `$`
+        diff_cmd("[[ $x =~ $\"abc\" ]]");      // regex operand (shared classifier)
+        // Regression: a $" INSIDE a double-quoted span stays a literal `$` on
+        // both paths — must remain unchanged.
+        diff_cmd("echo \"a$\"b\"c\"");
     }
 }

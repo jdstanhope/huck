@@ -3886,6 +3886,15 @@ impl<'a> Lexer<'a> {
                 let name = scan_var_name(&mut self.cursor);
                 self.history.push(Token::new(TokenKind::DollarName { name, quoted: false }, Span::new(off, l, c)));
             }
+            // `$"…"` — bash locale quoting; huck's translation is the identity,
+            // so `$"…" ≡ "…"`. Drop the `$` and emit the zero-width BeginDquote
+            // (cursor left on `"`), exactly mirroring a bare `"`; the parser's
+            // Mode::DoubleQuote then consumes the `"` and scans the body. (Oracle:
+            // scan_dollar_expansion's `Some('"') if !quoted => {}`.)
+            Some('"') => {
+                self.cursor.next(); // consume `$` only, leave `"`
+                self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+            }
             // `$[expr]` legacy arith (v258) — zero-width `LegacyArithOpen` signal
             // (cursor stays on `$`); the parser pushes Mode::Arith{delim:Bracket},
             // whose first scan consumes `$[` and emits the real LegacyArithOpen.
