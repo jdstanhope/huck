@@ -2366,7 +2366,7 @@ fn parse_coproc_body(iter: &mut Lexer) -> Result<Command, ParseError> {
     skip_newlines(iter)?;
     let first = parse_command(iter)?;
     if matches!(first, Command::Simple(_)) {
-        finish_pipeline(iter, first, false)
+        finish_pipeline(iter, first, false, false)
     } else {
         Ok(first)
     }
@@ -2420,16 +2420,21 @@ fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
 
     // Parse the first stage command (may be simple or compound).
     let first = parse_command(iter)?;
-    finish_pipeline(iter, first, negate)
+    finish_pipeline(iter, first, negate, bangs > 0)
 }
 
 /// Given an already-parsed first stage, finish a pipeline: consume any `|`-joined
 /// stages and apply the oracle's wrapping rule. Split out of `parse_pipeline` so
 /// the coproc body parser can reuse the `|`-loop for a simple first stage (v257).
+/// `had_bangs` (v259 CF3) tracks whether ANY leading `!` preceded the first
+/// stage, regardless of parity: the oracle wraps a compound first-stage in
+/// `Pipeline{negate,[cmd]}` whenever there was at least one leading `!`, even
+/// an EVEN count (`negate` false) — `negate` alone under-wraps `! ! { a; }`.
 fn finish_pipeline(
     iter: &mut Lexer,
     first: Command,
     negate: bool,
+    had_bangs: bool,
 ) -> Result<Command, ParseError> {
     // A trailing inter-token `Blank` may sit between a compound command's
     // terminator (e.g. `fi`, `}`, `)`) and a following `|` (the atom scanner
@@ -2439,14 +2444,14 @@ fn finish_pipeline(
     }
 
     // No `|` follows — wrapping decision mirrors the oracle:
-    //   simple  → always wrap in Pipeline (oracle: parse_pipeline_with_first)
-    //   compound, no negate → return as-is (oracle: parse_command_then_pipeline)
-    //   compound, negate    → wrap so the Pipeline carries the negate flag
+    //   simple                    → always wrap in Pipeline (oracle: parse_pipeline_with_first)
+    //   compound, no leading `!`  → return as-is (oracle: parse_command_then_pipeline)
+    //   compound, any leading `!` → wrap (negate may be false on an even count, v259 CF3)
     if !matches!(iter.peek_kind()?, Some(TokenKind::Op(Operator::Pipe))) {
         return Ok(match first {
-            Command::Simple(_) => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
-            cmd if negate      => Command::Pipeline(Pipeline { negate: true, commands: vec![cmd] }),
-            cmd                => cmd,
+            Command::Simple(_)         => Command::Pipeline(Pipeline { negate, commands: vec![first] }),
+            cmd if negate || had_bangs => Command::Pipeline(Pipeline { negate, commands: vec![cmd] }),
+            cmd                        => cmd,
         });
     }
 
@@ -6453,5 +6458,32 @@ mod tests {
         diff_cmd("[[ ! ( a == b ) || c ]]");         // ! before a group
         diff_cmd("[[ -e / ]]");
         diff_cmd("[[ -o errexit ]]");                // -o shell-option unary
+    }
+
+    /// v259 CF3 live-flip carry-forward fix: `finish_pipeline` only wrapped a
+    /// compound first-stage in `Pipeline{negate:true,[cmd]}` when `negate` was
+    /// true, so an EVEN leading-bang count (`! !`) — which computes
+    /// `negate = bangs % 2 == 1 = false` — fell through to the bare-compound
+    /// arm instead of the oracle's `Pipeline{negate:false,[compound]}`. Covers
+    /// every compound family plus the odd-bang/zero-bang/simple regressions.
+    #[test]
+    fn atoms_cf3_even_bang_compound() {
+        // Even (>=2) bang count before a compound: oracle wraps
+        // Pipeline{negate:false,[compound]}; the atom path used to return the
+        // bare compound. Covers every compound family.
+        diff_cmd("! ! { a; }");
+        diff_cmd("! ! (a)");
+        diff_cmd("! ! if x; then y; fi");
+        diff_cmd("! ! while x; do y; done");
+        diff_cmd("! ! for i in a; do y; done");
+        diff_cmd("! ! case x in a) :; esac");
+        diff_cmd("! ! [[ x ]]");
+        diff_cmd("! ! (( 1 ))");
+        diff_cmd("! ! coproc cat");
+        // Regressions (must still match): odd-bang wraps negate:true, zero-bang
+        // stays bare, simple always wraps.
+        diff_cmd("! { a; }");
+        diff_cmd("{ a; }");
+        diff_cmd("! ! a");
     }
 }
