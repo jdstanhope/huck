@@ -643,10 +643,34 @@ fn subscript_kind_from(w: Word) -> SubscriptKind {
 /// the `ParamOpen` token at entry.
 pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     // 1. Push the mode and consume the `ParamOpen` (`${`) token.
-    iter.push_mode(Mode::ParamExpansion { seen_name: false });
+    iter.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+
+    // v264 (M-156): seed the head scanner's extquote double-quote gate. The
+    // oracle gates a `$'…'`-decoded NAME on `quoted || opts.in_dquote`; fold our
+    // `quoted` arg into `opts.in_dquote` for the duration of this expansion so the
+    // lexer resolves the gate. `saved_dq` restores the inherited value on exit;
+    // the pattern-family operands (`#`/`%`/`/`/`^`/`,`) keep the elevated value so
+    // a NESTED `${…}` inside them sees the enclosing dquote (mirrors the oracle's
+    // `opts.with_in_dquote(quoted || opts.in_dquote)`), while value/error/substring
+    // operands are lowered back to `saved_dq` (oracle passes `opts` unchanged).
+    let saved_dq = iter.in_dquote();
+    let m156_dq = quoted || saved_dq;
+    iter.set_in_dquote(m156_dq);
+
+    // Restore-on-exit helper for the M-156 gate flag.
+    macro_rules! restore_dq {
+        () => { iter.set_in_dquote(saved_dq); };
+    }
+
     match iter.next_kind()? {
-        Some(TokenKind::ParamOpen { .. }) => {}
+        Some(TokenKind::ParamOpen { .. }) => {
+            // Record the `${`'s `$` offset for bad-subst raw reconstruction. In
+            // production the enclosing scanner consumes `${` (2 ASCII bytes) and
+            // the cursor now sits just past it, so `$` is at `cursor - 2`.
+            iter.set_param_start_off_from_cursor();
+        }
         _ => {
+            restore_dq!();
             iter.pop_mode();
             return Err(ParseError::UnsupportedExpansion);
         }
@@ -663,14 +687,36 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
         indirect = true;
     }
 
-    // 3. The parameter name (always present; may be "" for bad-subst).
+    // 3. The parameter name (always present; may be "" for bad-subst). A
+    // `$'…'`-decoded name (`ParamNameDecoded`) sets `name_decoded` so the bare
+    // form is promoted to `ParamExpansion{None}` (matching the oracle's `declare
+    // -f` round-trip). A `ParamBadSubst` here is a name-position bad substitution.
+    let mut name_decoded = false;
     let name = match iter.next_kind()? {
         Some(TokenKind::ParamName(n)) => n,
+        Some(TokenKind::ParamNameDecoded(n)) => { name_decoded = true; n }
+        Some(TokenKind::ParamBadSubst { raw }) => {
+            restore_dq!();
+            iter.pop_mode();
+            return Ok(WordPart::ParamExpansion {
+                name: String::new(),
+                modifier: ParamModifier::BadSubst { raw },
+                quoted,
+                subscript: None,
+                indirect: false,
+            });
+        }
         _ => {
+            restore_dq!();
             iter.pop_mode();
             return Err(ParseError::UnsupportedExpansion);
         }
     };
+
+    // The NAME's M-156 gate has now fired. Lower the gate to the inherited value
+    // for the subscript and value/error/substring operands (the oracle scans them
+    // with `opts` unchanged); pattern-family operands re-elevate below.
+    iter.set_in_dquote(saved_dq);
 
     // 4. Optional subscript `[…]`.
     let mut subscript: Option<SubscriptKind> = None;
@@ -681,6 +727,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             Ok(w) => w,
             Err(e) => {
                 iter.pop_mode(); // ParamSubscriptOperand
+                restore_dq!();
                 iter.pop_mode(); // ParamExpansion
                 return Err(e);
             }
@@ -689,6 +736,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             Some(TokenKind::RBracket) => {}
             _ => {
                 iter.pop_mode(); // ParamSubscriptOperand
+                restore_dq!();
                 iter.pop_mode(); // ParamExpansion
                 return Err(ParseError::UnsupportedExpansion);
             }
@@ -758,14 +806,58 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     subscript: None,
                     indirect: false,
                 }
+            } else if name_decoded {
+                // `${$'x1'}` / `${a$'b'}` — a `$'…'`-decoded name in bare form.
+                // The oracle promotes the plain `Var` to `ParamExpansion{None}`
+                // so `declare -f` reconstructs the normalised `${x1}` form.
+                WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::None,
+                    quoted,
+                    subscript: None,
+                    indirect: false,
+                }
             } else {
                 // `${name}` — plain variable reference.
                 WordPart::Var { name, quoted }
             }
         }
 
+        // ── Prefix-name expansion: `${!pfx*}` / `${!pfx@}` (indirect:false).
+        Some(TokenKind::ParamPrefixClose { at }) => {
+            WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::PrefixNames { at },
+                quoted,
+                subscript: None,
+                indirect: false,
+            }
+        }
+
+        // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
+        Some(TokenKind::ParamBadSubst { raw }) => {
+            WordPart::ParamExpansion {
+                name: String::new(),
+                modifier: ParamModifier::BadSubst { raw },
+                quoted,
+                subscript: None,
+                indirect: false,
+            }
+        }
+
         // ── Operator: pattern removal, substitute, case, transform, substring
         Some(TokenKind::ParamOp(op_kind)) => {
+            // Pattern-family operands (`#`/`%`/`/`/`^`/`,`) re-elevate the M-156
+            // gate so a NESTED `${…}` in the pattern sees the enclosing dquote
+            // (mirrors the oracle's `opts.with_in_dquote(quoted || opts.in_dquote)`).
+            // Value/error/substring operands keep the inherited value (`saved_dq`,
+            // already restored above).
+            if matches!(op_kind,
+                ParamOpKind::RemovePrefix(_) | ParamOpKind::RemoveSuffix(_)
+                | ParamOpKind::Substitute(_) | ParamOpKind::Case(_, _))
+            {
+                iter.set_in_dquote(m156_dq);
+            }
             // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
             // NOTE: macros are scoped to this function.
             macro_rules! word_in_mode {
@@ -958,12 +1050,14 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
         }
 
         _ => {
+            restore_dq!();
             iter.pop_mode(); // ParamExpansion
             return Err(ParseError::UnsupportedExpansion);
         }
     };
 
-    // 6. Pop the ParamExpansion frame.
+    // 6. Restore the M-156 gate flag and pop the ParamExpansion frame.
+    restore_dq!();
     iter.pop_mode();
     Ok(result)
 }
@@ -4393,6 +4487,36 @@ mod tests {
         diff_al("foo | bar", &[("foo", "echo hi"), ("bar", "cat")]); // pipeline stages both expand
         diff_al("notanalias", &[("foo", "echo")]);                   // non-alias unchanged
         diff_al("foo$x", &[("foo", "echo")]);                        // glued expansion: NOT a bare name → no expand
+    }
+
+    #[test]
+    fn atoms_param_head_matches_oracle() {
+        // (2) extquote in name (dquote context):
+        diff_cmd(r#"x1=not; echo "${$'x1'}""#);
+        diff_cmd(r#"ab=Z; echo "${a$'b'}""#);
+        diff_cmd(r#"x=notOK; x1=not; echo "${x#${$'x1'%$'t'}}""#);
+        diff_cmd(r#"x=foo; echo "${x#$'f'}""#);   // ANSI-C in operand
+        diff_cmd(r#"x=aXb; echo "${x#$'a'}""#);
+        // M-156 gate + invalid names → bad-subst:
+        diff_cmd(r#"echo "${'x1'}""#);
+        diff_cmd(r#"echo "${"x1"}""#);
+        diff_cmd(r#"echo ${$'x1'}"#);             // decoded name UNQUOTED → oracle's call
+        // (3) prefix-name expansion:
+        diff_cmd("echo ${!_Q*}");
+        diff_cmd("echo ${!_Q@}");
+        diff_cmd("echo ${!NOSUCHPFX_ZZ*}");
+        diff_cmd("echo ${!x@Q}");                 // transform on indirect, NOT prefix
+        // (4) bad-subst forms:
+        diff_cmd("echo ${$x}");
+        diff_cmd("echo ${V@}");
+        diff_cmd("echo ${-3}");
+        // regression guards — these must stay UNCHANGED:
+        diff_cmd("echo ${x}");
+        diff_cmd("echo ${#x}");
+        diff_cmd("echo ${!x}");                   // plain indirect
+        diff_cmd("echo ${x@Q}");                  // valid transform
+        diff_cmd("echo ${@}"); diff_cmd("echo ${*}"); diff_cmd("echo ${$}"); diff_cmd("echo ${-}");
+        diff_cmd("echo ${x:-y}");
     }
 
     // v247 T2 tests

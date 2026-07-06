@@ -411,6 +411,21 @@ pub enum TokenKind {
     // ParamExpansion/operand modes, consumed only by parser.rs). ---
     ParamOpen { quoted: bool }, ParamClose, LBracket, RBracket, ParamSep,
     ParamName(String),
+    /// v264: a braced parameter NAME assembled with `extquote` `$'…'` decoding
+    /// (`${a$'b'}` → `ab`). Distinct from `ParamName` so the parser can apply
+    /// the M-156 dquote gate's Var→ParamExpansion{None} promotion (mirrors the
+    /// oracle's `name_decoded` promotion in `scan_braced_param_expansion`).
+    ParamNameDecoded(String),
+    /// v264: a deferred bad-substitution detected by the head scanner (a `$"…"`
+    /// or bare-quote name, a decoded name in the wrong quote context, an invalid
+    /// decoded identifier, or an unrecognised post-name modifier char). Carries
+    /// the full `${…}` verbatim source so the parser can build
+    /// `ParamModifier::BadSubst { raw }` (mirrors the oracle's `recover_bad_subst`).
+    ParamBadSubst { raw: String },
+    /// v264: the `*}` / `@}` tail of a `${!prefix*}` / `${!prefix@}` prefix-name
+    /// expansion (both the sigil and the closing `}` are consumed). `at` is true
+    /// for the `@` form. Mirrors the oracle's `ParamModifier::PrefixNames { at }`.
+    ParamPrefixClose { at: bool },
     ParamLengthPrefix, ParamIndirect,
     #[allow(private_interfaces)] // ParamOpKind is pub(crate); TokenKind is pub — dormant in v241
     ParamOp(ParamOpKind),
@@ -653,7 +668,12 @@ pub(crate) enum Mode {
     Subshell,       // ( … )
     CommandSub { body_started: bool },  // $( … ) / `…`
     Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
-    ParamExpansion { seen_name: bool }, // ${ … }
+    // `seen_name` — set once the NAME atom (or length/indirect prefix's name)
+    // has been emitted. `indirect` — set when the `${!…}` indirect prefix was
+    // emitted (needed by Phase 2 to route `*}`/`@}` to the prefix-name form).
+    // `start_off` — byte offset of the leading `$` of `${` (set by Phase 0's
+    // write-back), used to reconstruct a bad-substitution's verbatim `${…}` raw.
+    ParamExpansion { seen_name: bool, indirect: bool, start_off: usize }, // ${ … }
     // `enclosing_dquote` — the OUTER `"…"` context the `${…}` itself sits in
     // (seeded once at push time from the parser's `quoted` flag), distinct from
     // `in_dquote` which is the operand scanner's INTERNAL `'…'`/`"…"`-span state
@@ -868,6 +888,35 @@ impl<'a> Lexer<'a> {
         std::mem::take(&mut self.parsed_heredoc_bodies)
     }
 
+    /// v264: set the M-156 extquote double-quote context flag (`opts.in_dquote`),
+    /// returning the previous value so the caller can restore it. The braced-param
+    /// head scanner reads this flag to decide whether a `$'…'`-decoded NAME is
+    /// valid (bash: only inside double quotes). `parse_param_expansion` folds its
+    /// `quoted` argument into this flag, mirroring the oracle's `quoted ||
+    /// opts.in_dquote` gate.
+    pub(crate) fn set_in_dquote(&mut self, v: bool) -> bool {
+        let old = self.opts.in_dquote;
+        self.opts.in_dquote = v;
+        old
+    }
+
+    /// v264: read the current M-156 extquote double-quote context flag.
+    pub(crate) fn in_dquote(&self) -> bool {
+        self.opts.in_dquote
+    }
+
+    /// v264: record the `${`'s `$` byte offset in the current ParamExpansion frame,
+    /// computed from the live cursor (which sits just past `${`, 2 ASCII bytes, once
+    /// the ENCLOSING scanner has consumed the opener — in production the head
+    /// scanner's Phase 0 never runs). Used so a deferred bad-substitution can
+    /// reconstruct the verbatim `${…}` raw.
+    pub(crate) fn set_param_start_off_from_cursor(&mut self) {
+        let off = self.cursor.offset().saturating_sub(2);
+        if let Some(Mode::ParamExpansion { start_off, .. }) = self.modes.last_mut() {
+            *start_off = off;
+        }
+    }
+
     #[allow(dead_code)] // called by parser in Phase C iterations; dormant in v240
     pub(crate) fn push_mode(&mut self, m: Mode) {
         self.modes.push(m);
@@ -1022,7 +1071,12 @@ impl<'a> Lexer<'a> {
                 let c   = self.cursor.column();
                 self.cursor.next(); // `$`
                 self.cursor.next(); // `{`
-                // seen_name is already false on the freshly-pushed frame; no reset needed.
+                // seen_name is already false on the freshly-pushed frame; no reset
+                // needed. Record the `$` offset so a later bad-substitution can
+                // reconstruct the verbatim `${…}` raw (mirrors `dollar_start`).
+                if let Some(Mode::ParamExpansion { start_off, .. }) = self.modes.last_mut() {
+                    *start_off = off;
+                }
                 self.history.push(Token::new(TokenKind::ParamOpen { quoted: false }, Span::new(off, l, c)));
                 return Ok(Step::Produced);
             }
@@ -1033,7 +1087,30 @@ impl<'a> Lexer<'a> {
 
         // Copy `seen_name` out of the mode frame so we don't hold a &mut borrow
         // across cursor work.
-        let seen_name = matches!(self.modes.last(), Some(Mode::ParamExpansion { seen_name: true }));
+        let seen_name = matches!(self.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. }));
+
+        // Shared helper: emit a deferred bad-substitution. Consumes the rest of
+        // the `${…}` body through the matching `}` (depth/quote/`$'…'`-aware, via
+        // `scan_braced_operand`), reconstructs the verbatim `${…}` raw from the
+        // recorded `start_off`, marks the frame `seen_name` (so the head mode
+        // terminates), and emits `ParamBadSubst { raw }`. Mirrors the oracle's
+        // `recover_bad_subst`. Usable from both Phase 1 (name) and Phase 2 (op).
+        macro_rules! emit_bad_subst {
+            () => {{
+                let sp = Span::new(self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                let start_off = match self.modes.last() {
+                    Some(Mode::ParamExpansion { start_off, .. }) => *start_off,
+                    _ => 0,
+                };
+                let _ = scan_braced_operand(&mut self.cursor)?;
+                let raw = self.cursor.slice_from(start_off).to_string();
+                if let Some(Mode::ParamExpansion { seen_name, .. }) = self.modes.last_mut() {
+                    *seen_name = true;
+                }
+                self.history.push(Token::new(TokenKind::ParamBadSubst { raw }, sp));
+                return Ok(Step::Produced);
+            }};
+        }
 
         // ── Phase 1: pre-name (emit prefix and/or ParamName) ─────────────────────
         if !seen_name {
@@ -1046,11 +1123,40 @@ impl<'a> Lexer<'a> {
             // comes AFTER all cursor work is done to avoid borrow conflicts.
             macro_rules! emit_param_name {
                 ($tok:expr) => {{
-                    if let Some(Mode::ParamExpansion { seen_name }) = self.modes.last_mut() {
+                    if let Some(Mode::ParamExpansion { seen_name, .. }) = self.modes.last_mut() {
                         *seen_name = true;
                     }
                     self.history.push($tok);
                     return Ok(Step::Produced);
+                }};
+            }
+
+            // Helper macro: assemble a possibly-`$'…'`-decoded name via the shared
+            // `scan_braced_name_ext` leaf, apply the M-156 dquote gate + identifier
+            // validity check (both resolved in the lexer via `opts.in_dquote`,
+            // which `parse_param_expansion` seeds from `quoted`), and emit either
+            // `ParamNameDecoded`/`ParamName` or a bad-subst. Mirrors the oracle's
+            // `scan_braced_name_ext` handling at lexer.rs:6842.
+            macro_rules! emit_ext_name {
+                () => {{
+                    match scan_braced_name_ext(&mut self.cursor)? {
+                        NameScan::BadSubst => emit_bad_subst!(),
+                        NameScan::Name { name, decoded } => {
+                            if decoded {
+                                // A `$'…'`-decoded name is valid ONLY in double-quote
+                                // context and must be a valid identifier.
+                                if !self.opts.in_dquote || !is_valid_param_name(&name) {
+                                    emit_bad_subst!();
+                                }
+                                emit_param_name!(Token::new(TokenKind::ParamNameDecoded(name), Span::new(off, l, c)));
+                            } else if name.is_empty() {
+                                // `${}` / `${'x'}` etc. — no name char → bad subst.
+                                emit_bad_subst!();
+                            } else {
+                                emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
+                            }
+                        }
+                    }
                 }};
             }
 
@@ -1081,15 +1187,39 @@ impl<'a> Lexer<'a> {
                         emit_param_name!(Token::new(TokenKind::ParamName("!".into()), Span::new(off, l, c)));
                     } else {
                         // `${!name…}` — emit indirect prefix; name comes next call.
+                        // Record `indirect` in the frame so Phase 2 can route a
+                        // trailing `*}`/`@}` to the prefix-name form.
                         self.cursor.next();
+                        if let Some(Mode::ParamExpansion { indirect, .. }) = self.modes.last_mut() {
+                            *indirect = true;
+                        }
                         self.history.push(Token::new(TokenKind::ParamIndirect, Span::new(off, l, c)));
                     }
                     return Ok(Step::Produced);
                 }
 
-                // Special single-char names: @ * - ? $
+                // `$` — either the `$` special param (`${$}`, `${$:-x}`), a
+                // `$'…'` extquote NAME (`${$'x1'}`), or `$"…"` (locale) → bad subst.
+                Some('$') => {
+                    let mut probe = self.cursor.clone();
+                    probe.next(); // skip `$`
+                    match probe.peek().copied() {
+                        // `${$'…'}` — decode the ANSI-C run into the name.
+                        Some('\'') => emit_ext_name!(),
+                        // `${$"…"}` — locale quote in name position → bad subst.
+                        Some('"') => emit_bad_subst!(),
+                        // `${$}` / `${$:-x}` / `${$x}` — treat `$` as the name; a
+                        // following non-modifier char is bad-subst'd in Phase 2.
+                        _ => {
+                            self.cursor.next();
+                            emit_param_name!(Token::new(TokenKind::ParamName("$".into()), Span::new(off, l, c)));
+                        }
+                    }
+                }
+
+                // Special single-char names: @ * - ?
                 // These are consumed as the full name.
-                Some(sc @ ('@' | '*' | '-' | '?' | '$')) => {
+                Some(sc @ ('@' | '*' | '-' | '?')) => {
                     self.cursor.next();
                     emit_param_name!(Token::new(TokenKind::ParamName(sc.to_string()), Span::new(off, l, c)));
                 }
@@ -1103,30 +1233,16 @@ impl<'a> Lexer<'a> {
                     emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
                 }
 
-                // Regular identifier name: [_A-Za-z][_A-Za-z0-9]*
-                Some(nc) if nc == '_' || nc.is_ascii_alphabetic() => {
-                    let mut name = String::new();
-                    while let Some(&nc2) = self.cursor.peek() {
-                        if nc2 == '_' || nc2.is_ascii_alphanumeric() {
-                            name.push(nc2);
-                            self.cursor.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    emit_param_name!(Token::new(TokenKind::ParamName(name), Span::new(off, l, c)));
-                }
+                // Regular identifier name: [_A-Za-z][_A-Za-z0-9]*, extended across
+                // any `$'…'` extquote runs (`${a$'b'}` → `ab`).
+                Some(nc) if nc == '_' || nc.is_ascii_alphabetic() => emit_ext_name!(),
 
                 // EOF inside `${` — error.
                 None => return Err(LexError::UnterminatedBrace),
 
-                // Unrecognised char in name position — bad substitution.
-                // Emit an empty ParamName so the parser can detect it, then
-                // the post-name phase will see the closing `}` or unrecognised
-                // char and emit ParamClose (consuming to `}`).
-                Some(_) => {
-                    emit_param_name!(Token::new(TokenKind::ParamName("".into()), Span::new(off, l, c)));
-                }
+                // Unrecognised char in name position (`${'x'}`, `${"x"}`, `${.}`,
+                // …) — bad substitution with the verbatim `${…}` raw.
+                Some(_) => emit_bad_subst!(),
             }
         }
 
@@ -1134,6 +1250,10 @@ impl<'a> Lexer<'a> {
         let off = self.cursor.offset();
         let l   = self.cursor.line();
         let c   = self.cursor.column();
+
+        // Was the `${!…}` indirect prefix emitted? Needed to route a trailing
+        // `*}`/`@}` to the prefix-name form (`${!pfx*}` / `${!pfx@}`).
+        let indirect = matches!(self.modes.last(), Some(Mode::ParamExpansion { indirect: true, .. }));
 
         match self.cursor.peek().copied() {
             // Closing brace → ParamClose (bare name or after subscript/op).
@@ -1224,12 +1344,32 @@ impl<'a> Lexer<'a> {
                 Ok(Step::Produced)
             }
 
-            // `@<letter>` → Transform.
+            // `${!pfx*}` — prefix-name expansion (star form). Only valid after the
+            // `${!…}` indirect prefix and only when `*` is IMMEDIATELY followed by
+            // `}`. Any other `*` after a name is a bad substitution.
+            Some('*') => {
+                let mut probe = self.cursor.clone();
+                probe.next(); // skip `*`
+                if indirect && probe.peek() == Some(&'}') {
+                    self.cursor.next(); // `*`
+                    self.cursor.next(); // `}`
+                    self.history.push(Token::new(TokenKind::ParamPrefixClose { at: false }, Span::new(off, l, c)));
+                    Ok(Step::Produced)
+                } else {
+                    emit_bad_subst!()
+                }
+            }
+
+            // `@…` — `${!pfx@}` prefix-name (at form), `@<letter>` transform, or
+            // (no valid op letter) bad substitution.
             Some('@') => {
                 self.cursor.next(); // consume `@`
-                let op_off = self.cursor.offset();
-                let op_l   = self.cursor.line();
-                let op_c   = self.cursor.column();
+                // `${!pfx@}` — prefix-name expansion (at form).
+                if indirect && self.cursor.peek() == Some(&'}') {
+                    self.cursor.next(); // `}`
+                    self.history.push(Token::new(TokenKind::ParamPrefixClose { at: true }, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
                 let transform_op = match self.cursor.peek().copied() {
                     Some('P') => { self.cursor.next(); Some(TransformOp::PromptExpand) }
                     Some('Q') => { self.cursor.next(); Some(TransformOp::Quote) }
@@ -1246,34 +1386,18 @@ impl<'a> Lexer<'a> {
                 match transform_op {
                     Some(op) => {
                         self.history.push(Token::new(TokenKind::ParamOp(ParamOpKind::Transform(op)), Span::new(off, l, c)));
+                        Ok(Step::Produced)
                     }
-                    None => {
-                        // Unknown/missing op letter — bad substitution.
-                        // Consume to `}` and emit ParamClose so the head mode terminates.
-                        let _ = (op_off, op_l, op_c); // unused in this path
-                        while let Some(ch) = self.cursor.peek().copied() {
-                            if ch == '}' { self.cursor.next(); break; }
-                            self.cursor.next();
-                        }
-                        self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
-                    }
+                    // Unknown/missing op letter (`${V@}`, `${x@Z}`) — bad substitution.
+                    None => emit_bad_subst!(),
                 }
-                Ok(Step::Produced)
             }
 
             // EOF inside the expansion.
             None => Err(LexError::UnterminatedBrace),
 
-            // Unrecognised char after name — bad substitution.
-            // Consume to `}` and emit ParamClose.
-            Some(_) => {
-                while let Some(ch) = self.cursor.peek().copied() {
-                    if ch == '}' { self.cursor.next(); break; }
-                    self.cursor.next();
-                }
-                self.history.push(Token::new(TokenKind::ParamClose, Span::new(off, l, c)));
-                Ok(Step::Produced)
-            }
+            // Unrecognised char after name (`${x!}`, `${-3}`, …) — bad substitution.
+            Some(_) => emit_bad_subst!(),
         }
     }
 
@@ -1512,6 +1636,16 @@ impl<'a> Lexer<'a> {
                         // Mode::Arith{delim:Bracket}) owns consuming `$[`.
                         Some('[') => {
                             self.history.push(Token::new(TokenKind::LegacyArithOpen, Span::new(off, l, c)));
+                        }
+                        // `$'…'` ANSI-C quoting — decode via the shared leaf and emit
+                        // a `QuoteRun{AnsiC}` (parse_word wraps it in Quoted{AnsiC}).
+                        // Mirrors the command scanner's `$'…'` arm (lexer.rs ~3792)
+                        // and the oracle's `scan_dollar_expansion` `Some('\'')` arm.
+                        Some('\'') => {
+                            self.cursor.next(); // `$`
+                            self.cursor.next(); // `'`
+                            let text = scan_ansi_c_quoted(&mut self.cursor)?;
+                            self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
                         }
                         // `$"…"` locale quoting (identity) — drop the `$`, emit the
                         // zero-width BeginDquote (cursor left on `"`); mirrors the
@@ -12274,7 +12408,7 @@ mod tests {
     /// (and including) `ParamClose`.
     fn head_atoms(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamClose);
@@ -12288,7 +12422,7 @@ mod tests {
     /// (operand is a different mode, so we stop at the operator boundary).
     fn head_atoms_until_op(s: &str) -> Vec<TokenKind> {
         let mut lx = Lexer::new(s, LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
         let mut out = Vec::new();
         while let Some(t) = lx.next_token().unwrap() {
             let stop = matches!(t.kind, TokenKind::ParamOp(_));
@@ -12366,7 +12500,7 @@ mod tests {
     fn head_subscript() {
         // ${a[...] emits ParamOpen, ParamName(a), LBracket then yields to subscript mode
         let mut lx = Lexer::new("${a[1]}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::LBracket));
@@ -12386,7 +12520,7 @@ mod tests {
         // inner frame, pull its ParamOpen + ParamName("b"), then pop it.
         // The outer frame's seen_name must still be true afterwards.
         let mut lx = Lexer::new("${a${b}}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
 
         // Outer frame: pull ParamOpen (${ of outer).
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
@@ -12394,12 +12528,12 @@ mod tests {
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamName(ref n) if n == "a"));
         // Outer frame must now be in seen_name=true (post-name phase).
         assert!(
-            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true })),
+            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. })),
             "outer frame should be seen_name=true after pulling its name"
         );
 
         // Simulate parser detecting nested ${b} and pushing a fresh inner frame.
-        lx.push_mode(Mode::ParamExpansion { seen_name: false });
+        lx.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
         // Inner frame: pull ParamOpen (the ${ of ${b}).
         assert!(matches!(lx.next_token().unwrap().unwrap().kind, TokenKind::ParamOpen { .. }));
         // Inner frame: pull ParamName("b") → inner seen_name becomes true.
@@ -12410,7 +12544,7 @@ mod tests {
 
         // The OUTER frame must still be seen_name=true (was corrupted before fix).
         assert!(
-            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true })),
+            matches!(lx.modes.last(), Some(Mode::ParamExpansion { seen_name: true, .. })),
             "outer frame seen_name must survive nested push/pop"
         );
     }
