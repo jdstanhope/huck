@@ -3,8 +3,9 @@
 //! real lexer and parser and classifies the outcome, so it can never
 //! disagree with them.
 
-use crate::command::{self, ParseError};
+use crate::command::ParseError;
 use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, TokenKind};
+use crate::parser;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ContinuationReason {
@@ -47,36 +48,70 @@ pub fn classify(buffer: &str, extglob: bool) -> Completeness {
     if ends_with_continuation_backslash(buffer) {
         return Completeness::Incomplete(ContinuationReason::Backslash);
     }
-    let tokens = match lexer::tokenize_with_opts(buffer, lexer::LexerOptions { extglob, ..Default::default() }) {
-        Ok(tokens) => tokens,
-        Err(LexError::UnterminatedHeredoc) => {
+    let opts = lexer::LexerOptions { extglob, ..Default::default() };
+    let empty = std::collections::HashMap::new();
+    let mut lx = lexer::Lexer::new_live_atoms(buffer, &empty, opts);
+    let parsed = parser::parse_sequence(&mut lx);
+
+    // Lex-level incompleteness short-circuits everything else, mirroring the old
+    // two-pass model where a failed `tokenize` returned BEFORE the parser or the
+    // trailing-connector check ever ran. Under the fused atom path these surface
+    // as `ParseError::Lex`.
+    if let Err(ParseError::Lex(e)) = &parsed {
+        if matches!(**e, LexError::UnterminatedHeredoc) {
             return Completeness::Incomplete(ContinuationReason::Heredoc);
         }
-        Err(e) => {
-            return if is_unterminated_lex(&e) {
-                Completeness::Incomplete(ContinuationReason::OpenQuote)
-            } else {
-                Completeness::Error
-            };
-        }
-    };
-    // Run the parser first so that an unterminated `[[ … ]]` is detected even
-    // when the buffer ends with `&&`/`||` (which would otherwise short-circuit
-    // to `Operator` before the parser can identify the real reason).  The parser
-    // result is cloned away; the trailing-operator check runs on the original
-    // token slice if the parser didn't signal `DoubleBracket`.
-    if let Err(ParseError::UnterminatedDoubleBracket) =
-        command::parse(&mut lexer::Lexer::from_tokens(tokens.clone()))
-    {
+        return if is_unterminated_lex(e) {
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
+        } else {
+            Completeness::Error
+        };
+    }
+
+    // A heredoc redirect whose body was never supplied — the buffer ends on the
+    // redirect LINE (`cat <<EOF` with no following newline). The atom parser
+    // returns Ok for this (a complete empty-body command, matching bash SCRIPT
+    // mode), where the old whole-buffer `tokenize` returned UnterminatedHeredoc.
+    // Interactively the REPL must keep reading the body, so surface it as an
+    // incomplete heredoc — mirroring bash's `>` prompt (see
+    // `Lexer::has_unattached_heredoc`).
+    if lx.has_unattached_heredoc() {
+        return Completeness::Incomplete(ContinuationReason::Heredoc);
+    }
+
+    // An unterminated `[[ … ]]` is detected before the trailing-connector check
+    // so a buffer ending `&&`/`||` INSIDE the brackets is still a double-bracket
+    // continuation, not an operator one (inside `[[ … ]]` the `&&`/`||` are part
+    // of the conditional expression, so the parser — not the connector check —
+    // owns them).
+    if let Err(ParseError::UnterminatedDoubleBracket) = parsed {
         return Completeness::Incomplete(ContinuationReason::DoubleBracket);
     }
+
+    // Trailing `|`/`&&`/`||` → the line continues (old `tokens.last()` check).
+    // Read the connector from the token history the parser ALREADY drove — see
+    // `Lexer::last_significant_kind`. Do NOT re-drive a fresh standalone lexer:
+    // the atom lexer emits zero-width opener signals (`$((`, `$(`, `${`, `` ` ``)
+    // that only the parser consumes, so a parser-less scan spins forever on the
+    // first one (unbounded `history` growth → OOM).
+    //
+    // The connector must be the buffer's genuine LAST token, so also require the
+    // lexer to be at EOF (`peek_kind() == None`). Otherwise a connector followed
+    // by more input that failed to parse — `echo hi | | grep x` — would look
+    // trailing (the parser stops at the second `|`, peeked-but-unconsumed, so it
+    // is `last_significant`) and be misread as a continuation instead of the
+    // genuine syntax Error it is. `peek_kind` here runs at most one `scan_step`
+    // (bounded, no spin): it returns the already-buffered lookahead when the
+    // parser stopped mid-buffer, or `None` at true EOF.
     if matches!(
-        tokens.last().map(|t| &t.kind),
+        lx.last_significant_kind(),
         Some(TokenKind::Op(Operator::Pipe | Operator::And | Operator::Or))
-    ) {
+    ) && matches!(lx.peek_kind(), Ok(None))
+    {
         return Completeness::Incomplete(ContinuationReason::Operator);
     }
-    match command::parse(&mut lexer::Lexer::from_tokens(tokens)) {
+
+    match parsed {
         Ok(_) => Completeness::Complete,
         Err(ParseError::UnterminatedSubshell) => {
             Completeness::Incomplete(ContinuationReason::Subshell)
@@ -154,9 +189,15 @@ mod tests {
 
     #[test]
     fn open_command_substitution_is_incomplete() {
+        // v265: the atom parser drives INTO the `$(` command sub and hits EOF,
+        // reporting the unterminated construct structurally as
+        // `UnterminatedSubshell` → `Subshell`, where the old oracle surfaced a
+        // lexer `UnterminatedSubstitution` → `OpenQuote`. Both are Incomplete and
+        // both use the same "; " continuation joiner (see `joiner_for`), so the
+        // REPL behavior is identical — only the reason variant changed.
         assert_eq!(
             classify("echo $(date", false),
-            Completeness::Incomplete(ContinuationReason::OpenQuote)
+            Completeness::Incomplete(ContinuationReason::Subshell)
         );
     }
 
@@ -190,14 +231,18 @@ mod tests {
 
     #[test]
     fn unterminated_arith_block_requests_more_input() {
-        // `((1+2` — no closing `))`. As of v184, `((` with no matching `))`
-        // falls back to nested subshells `( (`, so this lexes cleanly and the
-        // parser reports an unterminated subshell. Still Incomplete (so the
-        // REPL prompts for continuation), matching bash which prompts `>` for
-        // unclosed parens — just via the Subshell reason now, not arith.
+        // `((1+2` — no closing `))`. v265: the atom parser speculatively parses
+        // the command-position `((` as an arithmetic command (`parse_arith_command`)
+        // and hits EOF INSIDE the arith body — with no depth-0 `)` there is no
+        // `ArithBail`, so the `( (` nested-subshell backoff never fires; the scan
+        // returns `UnterminatedArith` → `OpenQuote`. The old oracle instead
+        // eagerly fell back to `( (` and reported `UnterminatedSubshell` →
+        // `Subshell`. Both are Incomplete and share the same "; " continuation
+        // joiner (see `joiner_for`), so the REPL still prompts `>` for the unclosed
+        // parens — only the reason variant changed.
         assert_eq!(
             classify("((1+2", false),
-            Completeness::Incomplete(ContinuationReason::Subshell)
+            Completeness::Incomplete(ContinuationReason::OpenQuote)
         );
     }
 
@@ -390,6 +435,18 @@ mod tests {
     fn classify_heredoc_unclosed_is_incomplete() {
         assert_eq!(
             classify("cat <<EOF\nhello", false),
+            Completeness::Incomplete(ContinuationReason::Heredoc)
+        );
+    }
+
+    #[test]
+    fn classify_heredoc_bare_first_line_is_incomplete() {
+        // The REPL feeds one physical line at a time, so the FIRST classify call
+        // for `cat <<EOF\n…\nEOF` is on the bare redirect line `cat <<EOF` — no
+        // newline, no body yet. This MUST report Incomplete(Heredoc) or the REPL
+        // executes `cat <<EOF` alone and runs the body lines as commands.
+        assert_eq!(
+            classify("cat <<EOF", false),
             Completeness::Incomplete(ContinuationReason::Heredoc)
         );
     }

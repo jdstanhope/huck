@@ -4961,6 +4961,44 @@ impl<'a> Lexer<'a> {
         self.history.len().saturating_sub(self.pos)
     }
 
+    /// The kind of the last significant token PULLED INTO history (skipping the
+    /// inter-token `Blank`/`Newline` atoms), or `None` if none was pulled.
+    ///
+    /// Reads already-buffered `history` only — it NEVER scans. This is the
+    /// atom-path replacement for the old `tokenize(...).last()` check used by
+    /// REPL continuation classification to detect a trailing `|`/`&&`/`||`
+    /// connector. A fresh standalone lex scan cannot be used for that: the atom
+    /// lexer emits zero-width *opener signals* (`$((`→`ArithOpen`, `$(`→
+    /// `CmdSubOpen`, `${`→`ParamOpen`, backtick→`BeginBacktick`) that the PARSER
+    /// is responsible for consuming and pushing a mode for; driven without a
+    /// parser the cursor never advances past the `$`, so `next()` re-emits the
+    /// same signal forever (unbounded `history` growth). Because the parser has
+    /// already driven mode-pushing while producing `self`, the connector — the
+    /// buffer's last token — is guaranteed to have been pulled (consumed or via
+    /// lookahead), so inspecting `history` here is both correct and bounded.
+    pub fn last_significant_kind(&self) -> Option<&TokenKind> {
+        self.history
+            .iter()
+            .rev()
+            .map(|t| &t.kind)
+            .find(|k| !matches!(k, TokenKind::Blank | TokenKind::Newline))
+    }
+
+    /// True when a heredoc redirect (`<<EOF`) was scanned but its body was never
+    /// supplied — the input ended on the redirect LINE, before any newline could
+    /// trigger body collection, so the heredoc still sits in the atom-path
+    /// pending queue unattached.
+    ///
+    /// Used by REPL continuation classification: in SCRIPT mode a bare `cat
+    /// <<EOF` is a complete (empty-body) command — bash warns and huck's atom
+    /// parser returns `Ok` to match — but INTERACTIVELY bash prompts `>` for the
+    /// body, so the REPL must treat it as incomplete. The old whole-buffer
+    /// `tokenize` reported this as `UnterminatedHeredoc`; the fused atom path
+    /// does not, so classification checks this predicate explicitly.
+    pub fn has_unattached_heredoc(&self) -> bool {
+        !self.atom_pending_heredocs.is_empty()
+    }
+
     pub fn set_aliases(&mut self, aliases: std::collections::HashMap<String, String>) {
         self.aliases = aliases;
     }
@@ -12836,6 +12874,108 @@ mod tests {
         assert!(r.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirIn))), "plain `<` still RedirIn: {r:?}");
         let rr = command_atoms_of("echo >> f");
         assert!(rr.iter().any(|t| matches!(t, TokenKind::Op(Operator::RedirAppend))), "`>>` still RedirAppend: {rr:?}");
+    }
+
+    // ── v265 T6: focused, explicit-expected token-stream tests ───────────────
+    // Exact atom `Vec`s for self-contained command-mode inputs (the mode-pushing
+    // constructs `"…"`/`${…}`/`$(…)`/`$((…))`/backtick are covered by the parser
+    // AST tests instead — driving the lexer alone past their opener signals does
+    // not terminate, since the PARSER owns those bodies).
+
+    #[test]
+    fn t6_atoms_simple_command() {
+        assert_eq!(command_atoms_of("echo hi"), vec![
+            TokenKind::Lit { text: "echo".into(), quoted: false },
+            TokenKind::Blank,
+            TokenKind::Lit { text: "hi".into(), quoted: false },
+        ]);
+    }
+
+    #[test]
+    fn t6_atoms_single_and_ansic_quote() {
+        assert_eq!(command_atoms_of("'a b'"), vec![
+            TokenKind::QuoteRun { style: QuoteStyle::Single, text: "a b".into() },
+        ]);
+        assert_eq!(command_atoms_of("$'a\\tb'"), vec![
+            TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text: "a\tb".into() },
+        ]);
+    }
+
+    #[test]
+    fn t6_atoms_dollar_name_and_param_open_signal() {
+        assert_eq!(command_atoms_of("echo $x"), vec![
+            TokenKind::Lit { text: "echo".into(), quoted: false },
+            TokenKind::Blank,
+            TokenKind::DollarName { name: "x".into(), quoted: false },
+        ]);
+        // `${x}` ends at the zero-width ParamOpen SIGNAL — the parser owns the body.
+        assert!(matches!(
+            command_atoms_of("echo ${x}").last(),
+            Some(TokenKind::ParamOpen { quoted: false })
+        ));
+    }
+
+    #[test]
+    fn t6_atoms_brace_stays_literal() {
+        // Brace expansion is a parser/expansion concern; the lexer keeps `{a,b}`
+        // as one literal word.
+        assert_eq!(command_atoms_of("echo {a,b}"), vec![
+            TokenKind::Lit { text: "echo".into(), quoted: false },
+            TokenKind::Blank,
+            TokenKind::Lit { text: "{a,b}".into(), quoted: false },
+        ]);
+    }
+
+    #[test]
+    fn t6_atoms_redirect_ops() {
+        assert_eq!(command_atoms_of("cat < f"), vec![
+            TokenKind::Lit { text: "cat".into(), quoted: false }, TokenKind::Blank,
+            TokenKind::Op(Operator::RedirIn), TokenKind::Blank,
+            TokenKind::Lit { text: "f".into(), quoted: false },
+        ]);
+        assert_eq!(command_atoms_of("echo >> f"), vec![
+            TokenKind::Lit { text: "echo".into(), quoted: false }, TokenKind::Blank,
+            TokenKind::Op(Operator::RedirAppend), TokenKind::Blank,
+            TokenKind::Lit { text: "f".into(), quoted: false },
+        ]);
+        // here-string operator
+        assert!(command_atoms_of("cat <<< word").iter()
+            .any(|t| matches!(t, TokenKind::Op(Operator::HereString))));
+        // `2>&1`: fd-prefix (RedirFd) then dup-out operator.
+        let d = command_atoms_of("echo 2>&1");
+        assert!(d.iter().any(|t| matches!(t, TokenKind::RedirFd(crate::command::RedirFd::Number(2)))), "fd prefix: {d:?}");
+        assert!(d.iter().any(|t| matches!(t, TokenKind::Op(Operator::DupOut))), "dup-out: {d:?}");
+    }
+
+    #[test]
+    fn t6_atoms_array_literal_and_subscript_assign() {
+        // `a=(1 2)` → `a=` literal, ArrayOpen signal, `(`, elements, `)`.
+        assert_eq!(command_atoms_of("a=(1 2)"), vec![
+            TokenKind::Lit { text: "a=".into(), quoted: false },
+            TokenKind::ArrayOpen,
+            TokenKind::Op(Operator::LParen),
+            TokenKind::Lit { text: "1".into(), quoted: false },
+            TokenKind::Blank,
+            TokenKind::Lit { text: "2".into(), quoted: false },
+            TokenKind::Op(Operator::RParen),
+        ]);
+        // `a[0]=v` → an AssignPrefix atom carrying the parsed subscript.
+        assert!(matches!(
+            command_atoms_of("a[0]=v").first(),
+            Some(TokenKind::AssignPrefix { .. })
+        ), "{:?}", command_atoms_of("a[0]=v"));
+    }
+
+    #[test]
+    fn t6_atoms_extglob_open_signal() {
+        // `@(a|b)` with extglob on → a zero-width ExtglobOpen signal (the parser
+        // assembles the group); the `(` is NOT consumed.
+        let mut lx = Lexer::new_live_atoms(
+            "@(a|b)", &Default::default(),
+            LexerOptions { extglob: true, ..Default::default() },
+        );
+        let first = lx.next_token().unwrap().unwrap();
+        assert!(matches!(first.kind, TokenKind::ExtglobOpen { prefix: '@' }), "{:?}", first.kind);
     }
 
     #[test]

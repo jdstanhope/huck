@@ -1,7 +1,19 @@
 # v265 — Delete the Oracle (Finale Milestone 2)
 
 **Date:** 2026-07-06
-**Status:** Design approved; ready for planning
+**Status:** ⚠️ RE-SCOPED 2026-07-06 — the "delete the oracle" goal was found to be
+UNACHIEVABLE this iteration. Shipped a re-cut milestone ("shrink the oracle to a leaf
+sub-lexer + decouple the harness"): T1–T3 + T6. T4/T5 (the actual deletion) deferred.
+See the RE-SCOPED banner at the top of the plan
+(`docs/superpowers/plans/2026-07-06-v265-delete-oracle.md`) for the full finding.
+
+**Why deletion is blocked:** the atom production path is not self-contained — four leaf
+sub-body lexers (`parse_subscript_body`, `maybe_expand_command_alias`,
+`scan_array_element_word`, `parse_substitution_body`) still delegate to the old
+`tokenize` + `command::parse`, so the oracle is live production code (`a[$(echo 2)]=hi`
+runs it). The real prerequisite — porting those four onto the atom path — is its own
+future milestone; only then does this spec's deletion become possible.
+
 **Depends on:** v264 (THE FLIP — the atom parser is live in production, 461b585)
 
 ## Motivation

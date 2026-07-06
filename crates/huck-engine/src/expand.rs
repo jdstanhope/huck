@@ -3665,8 +3665,7 @@ mod array_expansion_tests {
     /// produces (matters for the lexer-touching `${!a[@]}` shape).
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let tokens = crate::lexer::tokenize(&src).expect("lex");
-        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -3884,8 +3883,7 @@ mod positional_slicing_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let tokens = crate::lexer::tokenize(&src).expect("lex");
-        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),
@@ -3966,8 +3964,7 @@ mod assoc_expansion_tests {
 
     fn first_arg_word(input: &str) -> Word {
         let src = format!("echo {input}");
-        let tokens = crate::lexer::tokenize(&src).expect("lex");
-        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(&src, &Default::default(), crate::lexer::LexerOptions::default())).expect("parse").expect("non-empty");
         let pipeline = match seq.first {
             Command::Pipeline(p) => p,
             other => panic!("expected Pipeline, got {other:?}"),

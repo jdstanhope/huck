@@ -11331,8 +11331,8 @@ mod type_tests {
     #[test]
     fn type_default_function() {
         let mut shell = Shell::new();
-        let seq = crate::command::parse(
-            &mut crate::lexer::Lexer::from_tokens(crate::lexer::tokenize("myfn(){ :; }").unwrap()),
+        let seq = crate::parser::parse_sequence(
+            &mut crate::lexer::Lexer::new_live_atoms("myfn(){ :; }", &Default::default(), crate::lexer::LexerOptions::default()),
         )
         .unwrap()
         .unwrap();
@@ -11348,8 +11348,8 @@ mod type_tests {
     #[test]
     fn type_prints_function_body() {
         let mut shell = Shell::new();
-        let seq = crate::command::parse(
-            &mut crate::lexer::Lexer::from_tokens(crate::lexer::tokenize("tf(){ echo a; }").unwrap()),
+        let seq = crate::parser::parse_sequence(
+            &mut crate::lexer::Lexer::new_live_atoms("tf(){ echo a; }", &Default::default(), crate::lexer::LexerOptions::default()),
         )
         .unwrap()
         .unwrap();
@@ -11862,7 +11862,7 @@ mod declare_tests {
 
     #[cfg(test)]
     fn define_fn(shell: &mut Shell, src: &str) {
-        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(crate::lexer::tokenize(src).unwrap()))
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(src, &Default::default(), crate::lexer::LexerOptions::default()))
             .unwrap()
             .unwrap();
         let crate::command::Command::FunctionDef { name, body } = seq.first else {
