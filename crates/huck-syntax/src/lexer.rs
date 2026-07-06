@@ -891,6 +891,23 @@ impl<'a> Lexer<'a> {
         *self.modes.last().expect("mode stack is never empty (Command is the floor)")
     }
 
+    /// v264 flip-fix (Finding 1): read the brace-expand flag (`set +B` clears it).
+    /// The atom command-assembly loop consults this to gate command-word brace
+    /// expansion, mirroring the oracle's `emit_word_with_braces(self.brace_expand)`.
+    pub(crate) fn brace_expand_enabled(&self) -> bool {
+        self.brace_expand
+    }
+
+    /// v264 flip-fix (Finding 2): force mid-word state after a `$( )`/`<( )`/`>( )`
+    /// close when the surrounding word CONTINUES. The `)` that ends a command/
+    /// process substitution runs `boundary_reset()` (→ `cmd_at_word_start = true`),
+    /// which leaks into the outer word continuation and mis-classifies a glued
+    /// `#`/`~`. Callers invoke this only on the cmdsub/procsub continuation path,
+    /// never for a subshell-close `)`, so `(cmd); next` still arms word-start.
+    pub(crate) fn clear_cmd_at_word_start(&mut self) {
+        self.cmd_at_word_start = false;
+    }
+
     /// v250 T3: record one assembled heredoc body `Word` (parser-owned
     /// assembly of a `HeredocBodyBegin`…`End` atom group) in source order.
     pub(crate) fn push_heredoc_body(&mut self, w: Word) {

@@ -77,6 +77,9 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // and scan_step_command_sub(false) owns consuming `$(`.
                 let cs = parse_command_sub(iter, quoted)?;
                 parts.push(cs);
+                // v264 flip-fix (Finding 2): clear the `)`-boundary_reset leak on
+                // the continuing operand word, mirroring `parse_word_command`.
+                iter.clear_cmd_at_word_start();
             }
             TokenKind::BeginBacktick => {
                 // v245 T6: `` `cmd` `` signal from scan_step_param_operand.
@@ -213,6 +216,13 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 iter.next_kind()?;
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_command_sub(iter, quoted)?);
+                // v264 flip-fix (Finding 2): the `)` closing the cmdsub ran
+                // `boundary_reset()` (→ `cmd_at_word_start = true`), which leaks
+                // into this CONTINUING word and mis-classifies a glued `#`/`~`
+                // (`echo a$(true)#b`, `echo $(echo X)~root`). The word continues,
+                // so force mid-word. A following `Blank`/`Newline` re-arms
+                // word-start, so the spaced `$(…) #c` comment case stays correct.
+                iter.clear_cmd_at_word_start();
             }
             // v252: compound array RHS. The prefix part (Literal "name=" or
             // AssignPrefix) is already accumulated; glue the ArrayLiteral after it.
@@ -249,6 +259,9 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 let dir = dir.clone();
                 iter.next_kind()?;            // discard the signal (cursor stays on `(`)
                 parts.push(parse_process_sub(iter, dir)?);
+                // v264 flip-fix (Finding 2): same `)`-boundary_reset leak as the
+                // cmdsub arm — force mid-word for the continuing word (`<(y)z`).
+                iter.clear_cmd_at_word_start();
             }
             Some(TokenKind::BeginBacktick) => {
                 iter.next_kind()?;
@@ -2085,6 +2098,33 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     parse_simple_with_leading_word(iter, line, None)
 }
 
+/// v264 flip-fix (Finding 1): brace-expand an assembled COMMAND word and push
+/// the 1→N products onto `dest`, gated on the lexer's brace-expand flag
+/// (`set +B` disables it). Mirrors the oracle's `emit_word_with_braces`
+/// (lexer.rs), which brace-expands command words (program + args) and for/select
+/// in-list words at lex time — BEFORE the parser splits program/args or peels
+/// assignments — emitting N `Word` tokens. Quoted/escaped braces (`"{a,b}"`,
+/// `a\{b\}`) and braces inside expansions (`${x:-{a,b}}`) stay literal because
+/// `brace_expand_parts` sentinel-protects non-literal / quoted parts, so this
+/// reuse gets that for free. Applied ONLY at the command-assembly level (here and
+/// the for/select in-list collection), NEVER inside `parse_word_command` — that
+/// helper is SHARED by `[[ … ]]` operands and `case` patterns, which the oracle
+/// scans through paths that do NOT call `emit_word_with_braces`.
+fn push_command_word_brace_expanded(
+    dest: &mut Vec<Word>,
+    word: Word,
+    iter: &Lexer,
+) -> Result<(), ParseError> {
+    if !iter.brace_expand_enabled() {
+        dest.push(word);
+        return Ok(());
+    }
+    for parts in brace_expand_parts(word.0)? {
+        dest.push(Word(parts));
+    }
+    Ok(())
+}
+
 /// `parse_simple`, optionally seeded with an ALREADY-CONSUMED leading word
 /// (used by the `name()` funcdef lookahead in `parse_command`: it must consume
 /// the leading word to see whether `(` follows, and — when it does NOT —
@@ -2116,7 +2156,11 @@ fn parse_simple_with_leading_word(
     let mut all_words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirection> = Vec::new();
     if let Some(w) = leading_word {
-        all_words.push(w);
+        // v264 flip-fix (Finding 1): the program word brace-expands too, matching
+        // the oracle (which emits N Words at lex time BEFORE program/arg split).
+        // The FIRST product becomes the program, the rest leading args — the
+        // program/arg split below reads `all_words[0]`=program, remainder=args.
+        push_command_word_brace_expanded(&mut all_words, w, iter)?;
     }
 
     loop {
@@ -2247,7 +2291,10 @@ fn parse_simple_with_leading_word(
                     | TokenKind::ExtglobOpen { .. }
             )
         ) {
-            all_words.push(parse_word_command(iter, false)?);
+            // v264 flip-fix (Finding 1): argument command words brace-expand
+            // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
+            let w = parse_word_command(iter, false)?;
+            push_command_word_brace_expanded(&mut all_words, w, iter)?;
             continue;
         }
         // Consume the token.
@@ -3545,7 +3592,12 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
             if stop { break; }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
-                _ => words.push(parse_word_command(iter, false)?),
+                // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
+                // (oracle: `emit_word_with_braces` is called for for/select lists).
+                _ => {
+                    let w = parse_word_command(iter, false)?;
+                    push_command_word_brace_expanded(&mut words, w, iter)?;
+                }
             }
         }
         true
@@ -3594,7 +3646,11 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
             if stop { break; }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
-                _ => list.push(parse_word_command(iter, false)?),
+                // v264 flip-fix (Finding 1): select in-list words brace-expand too.
+                _ => {
+                    let w = parse_word_command(iter, false)?;
+                    push_command_word_brace_expanded(&mut list, w, iter)?;
+                }
             }
         }
         Some(list)
@@ -4493,6 +4549,59 @@ mod tests {
         diff_al("foo | bar", &[("foo", "echo hi"), ("bar", "cat")]); // pipeline stages both expand
         diff_al("notanalias", &[("foo", "echo")]);                   // non-alias unchanged
         diff_al("foo$x", &[("foo", "echo")]);                        // glued expansion: NOT a bare name → no expand
+    }
+
+    #[test]
+    fn atoms_command_word_brace_and_wordstart_gaps() {
+        // Finding 1 — command-word brace expansion:
+        diff_cmd("echo {b,c}");
+        diff_cmd("echo a{1,2,3}z");
+        diff_cmd("echo {1..4}");
+        diff_cmd("cp x{,.bak}");
+        diff_cmd("{echo,ls} x");                 // program word expands
+        diff_cmd("for i in {1..3}; do echo $i; done");
+        // must NOT expand / stay literal (oracle parity):
+        diff_cmd("echo \"{a,b}\"");
+        diff_cmd("echo a\\{b\\}");
+        diff_cmd("echo ${x:-{a,b}}");
+        // case-pattern / `[[ ]]`-operand braces: the brief's regression guard
+        // ASSUMED these were oracle==atom parity (its comment: "oracle does NOT
+        // brace-expand"). Empirically that premise is FALSE — the Word-lexer
+        // (oracle) DOES brace-expand case patterns and `[[ ]]` operands at lex
+        // time (`{a}` alone parses on both paths, but the COMMA form `{a,b}`
+        // expands into two Words and BREAKS the oracle's parse). bash itself does
+        // NOT brace-expand in these positions (they stay literal patterns/
+        // operands), so the atom path — which keeps them literal (Finding 1's fix
+        // is applied ONLY at command/for/select assembly, never inside the shared
+        // `parse_word_command`) — matches BASH and is CLOSER TO BASH than the
+        // buggy oracle. Per the established live-flip convention for an "atom ≥
+        // bash, oracle buggy" case (see `atoms_function_assignment_name_divergence`
+        // CF9, and CF8/CF10 in the carry-forward inventory), we KEEP the atom's
+        // correct behavior and PIN the divergence rather than reproduce the
+        // oracle's bug. Auto-resolves in the atom's favor when the oracle scanner
+        // is deleted at the flip.
+        assert!(new_seq("case x in {a,b}) echo m;; esac").is_ok()
+            && old_seq("case x in {a,b}) echo m;; esac").is_err(),
+            "PINNED divergence: atom parses `case … {{a,b}} …` literally (bash-correct); \
+             oracle brace-expands + errors. atom={:?} oracle={:?}",
+            new_seq("case x in {a,b}) echo m;; esac"),
+            old_seq("case x in {a,b}) echo m;; esac"));
+        assert!(new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok()
+            && old_seq("[[ {a,b} == x ]] && echo y || echo n").is_err(),
+            "PINNED divergence: atom parses `[[ {{a,b}} == x ]]` literally (bash-correct); \
+             oracle brace-expands + errors. atom={:?} oracle={:?}",
+            new_seq("[[ {a,b} == x ]] && echo y || echo n"),
+            old_seq("[[ {a,b} == x ]] && echo y || echo n"));
+        // sanity: the NON-comma brace form (which does not expand) IS oracle-parity
+        // in these positions, confirming the divergence is brace-expansion-driven.
+        diff_cmd("case x in {a}) echo m;; esac");
+        diff_cmd("[[ {a} == x ]] && echo y");
+        // Finding 2 — word-start leak after ) :
+        diff_cmd("echo a$(true)#b");
+        diff_cmd("echo $(true)#b");
+        diff_cmd("echo $(echo X)~root");
+        diff_cmd("echo $(echo X) #comment");     // spaced: # IS a comment — stays correct
+        diff_cmd("(echo a); echo b");            // subshell close must still arm word-start
     }
 
     #[test]
