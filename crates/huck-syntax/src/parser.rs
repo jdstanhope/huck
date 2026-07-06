@@ -1238,7 +1238,7 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 
 /// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
 ///
-/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
+/// Pushes `Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
 /// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
 /// parser assembles the body `Word` (literal runs + embedded expansions), stops on
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
@@ -1323,7 +1323,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
     // pull-boundary assert holds.
     let mark = iter.mark();
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
@@ -1354,7 +1354,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 /// `LegacyArithOpen`; `parse_arith_body` assembles the body and returns `Closed` on
 /// `ArithClose`.
 pub(crate) fn parse_legacy_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::LegacyArithOpen) => {}
@@ -1402,7 +1402,7 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
@@ -3177,7 +3177,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
     let result = parse_arith_for_body(iter);
     iter.pop_mode();
     let sections = match result {
@@ -5714,75 +5714,16 @@ mod tests {
 
     #[test]
     fn atoms_legacy_arith_quote_backslash_carryforward() {
-        // v258 LIVE-FLIP CARRY-FORWARD: the atom Mode::Arith{Bracket} treats quotes
-        // (single AND double) and `\` as LITERAL chars (no sub-mode, exactly like
-        // `$((`), so ANY `]` inside a quoted span (`'…'` or `"…"`) or immediately
-        // after a `\` closes the `$[ … ]` EARLY — the atom scanner has no concept
-        // of "inside a quote" while scanning a legacy-arith body, so it can't tell
-        // a quoted `]` from a real terminator. The oracle's scan_legacy_arith_body
-        // protects those spans (`Arith{body:" ] "}` / `Arith{body:" \\] "}` /
-        // equivalent single-quoted forms). `$((` shows no such divergence only
-        // because its early depth-0 `)` ArithBails to a command-sub-of-subshell on
-        // BOTH paths; `$[` has no bail. General class: quotes are literal in the
-        // bracket body, so any `]` inside a quoted span (single OR double) closes
-        // early. Pathological (quotes/backslash-escaped brackets in a legacy
-        // arith); dormant. Two probed shapes below (double-quoted, backslash);
-        // the same reasoning applies uniformly to `$[']']`, `$[ ']' ]`,
-        // `$['x]y']`, `$["x]y"]`, etc.
-        //
-        // `echo $[ "]" ]`: the atom body closes at the FIRST unprotected `]`
-        // (right after the opening `"`), leaving a lone unmatched `"` in the rest
-        // of the command line (`" ]`) — that dangling quote never closes before
-        // EOF, so the atom path errors UnterminatedQuote (the oracle parses fine).
-        assert!(
-            matches!(
-                new_seq("echo $[ \"]\" ]"),
-                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
-            ),
-            "expected UnterminatedQuote for echo $[ \"]\" ], got {:?}",
-            new_seq("echo $[ \"]\" ]")
-        );
-
-        // `echo $[ \] ]`: `\` is a literal body char (no escaping), so the `]`
-        // immediately after it closes the bracket early (body = " \\"); the
-        // trailing ` ]` becomes a SECOND, separate argument word.
-        assert_eq!(
-            new_seq("echo $[ \\] ]").unwrap(),
-            Some(Sequence {
-                first: Command::Pipeline(Pipeline {
-                    negate: false,
-                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
-                        inline_assignments: vec![],
-                        program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
-                        args: vec![
-                            Word(vec![WordPart::Arith {
-                                body: Word(vec![WordPart::Literal { text: " \\".into(), quoted: true }]),
-                                quoted: false,
-                            }]),
-                            Word(vec![WordPart::Literal { text: "]".into(), quoted: false }]),
-                        ],
-                        redirects: vec![],
-                        line: 1,
-                    }))],
-                }),
-                rest: vec![],
-                background: false,
-            })
-        );
-
-        // `echo $[']']`: same class as the double-quoted case above, but with a
-        // single-quoted span — confirms the divergence is quote-KIND-agnostic
-        // (single AND double). The atom body closes at the first `]` (inside the
-        // `'…'`), leaving a dangling unmatched `'` before EOF → UnterminatedQuote
-        // (the oracle parses fine: `Arith{body:"]"}`, probed via new_seq/old_seq).
-        assert!(
-            matches!(
-                new_seq("echo $[']']"),
-                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
-            ),
-            "expected UnterminatedQuote for echo $[']'], got {:?}",
-            new_seq("echo $[']']")
-        );
+        // v261 T1 RESOLUTION (was a v258 LIVE-FLIP CARRY-FORWARD, CF7): the atom
+        // `Mode::Arith{Bracket}` now has a quote/backslash sub-mode (mirrors the
+        // oracle's `scan_legacy_arith_body`/`push_quoted_span`), so a `]` inside a
+        // quoted span (single OR double) or immediately after a `\` no longer
+        // closes the `$[ … ]` early — it's byte-identical to the oracle now.
+        // Three probed shapes (double-quoted, backslash, single-quoted); the same
+        // reasoning applies uniformly to `$[ ']' ]`, `$['x]y']`, `$["x]y"]`, etc.
+        diff_cmd("echo $[ \"]\" ]");
+        diff_cmd("echo $[ \\] ]");
+        diff_cmd("echo $[']']");
     }
 
     #[test]
