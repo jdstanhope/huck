@@ -4466,6 +4466,115 @@ mod tests {
         assert_eq!(new_seq("").unwrap(), None);
     }
 
+    // ── v265 T6: focused, explicit-shape parser AST tests ────────────────────
+    // Structural assertions on the atom parser's output across grammar families.
+    fn t6_first(s: &str) -> Command {
+        new_seq(s).expect("parse").expect("non-empty").first
+    }
+    fn t6_exec(c: &Command) -> &ExecCommand {
+        match c {
+            Command::Pipeline(p) => match &p.commands[0] {
+                Command::Simple(SimpleCommand::Exec(e)) => e,
+                o => panic!("expected Exec stage, got {o:?}"),
+            },
+            o => panic!("expected Pipeline, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_ast_simple_command() {
+        let c = t6_first("echo hi");
+        let e = t6_exec(&c);
+        assert_eq!(e.program, Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]));
+        assert_eq!(e.args, vec![Word(vec![WordPart::Literal { text: "hi".into(), quoted: false }])]);
+    }
+
+    #[test]
+    fn t6_ast_pipeline_and_negation() {
+        match t6_first("a | b") {
+            Command::Pipeline(p) => { assert!(!p.negate); assert_eq!(p.commands.len(), 2); }
+            o => panic!("{o:?}"),
+        }
+        match t6_first("! a") {
+            Command::Pipeline(p) => { assert!(p.negate); assert_eq!(p.commands.len(), 1); }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_ast_and_or_list() {
+        let seq = new_seq("a && b || c").unwrap().unwrap();
+        assert_eq!(seq.rest.len(), 2);
+        assert!(matches!(seq.rest[0].0, Connector::And));
+        assert!(matches!(seq.rest[1].0, Connector::Or));
+    }
+
+    #[test]
+    fn t6_ast_redirect() {
+        assert_eq!(t6_exec(&t6_first("a > f")).redirects.len(), 1);
+        assert_eq!(t6_exec(&t6_first("a 2>&1")).redirects.len(), 1);
+    }
+
+    #[test]
+    fn t6_ast_subshell_and_brace_group() {
+        assert!(matches!(t6_first("( a )"), Command::Subshell { .. }));
+        assert!(matches!(t6_first("{ a; }"), Command::BraceGroup(_)));
+    }
+
+    #[test]
+    fn t6_ast_compounds() {
+        assert!(matches!(t6_first("if x; then y; fi"), Command::If(_)));
+        assert!(matches!(t6_first("while x; do y; done"), Command::While(_)));
+        // `until` reuses the While variant (with the loop sense flipped internally).
+        assert!(matches!(t6_first("until x; do y; done"), Command::While(_)));
+        assert!(matches!(t6_first("for i in a b; do :; done"), Command::For(_)));
+        assert!(matches!(t6_first("select n in a; do :; done"), Command::Select(_)));
+        assert!(matches!(t6_first("case x in a) y;; esac"), Command::Case(_)));
+        assert!(matches!(t6_first("for ((i=0;i<3;i++)); do :; done"), Command::ArithFor(_)));
+        assert!(matches!(t6_first("(( 1+2 ))"), Command::Arith(_)));
+    }
+
+    #[test]
+    fn t6_ast_double_bracket_regex() {
+        match t6_first("[[ a =~ b ]]") {
+            Command::DoubleBracket { expr, .. } => assert!(matches!(*expr, TestExpr::Regex { .. })),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_ast_function_defs_and_coproc() {
+        assert!(matches!(t6_first("f() { :; }"), Command::FunctionDef { .. }));
+        assert!(matches!(t6_first("function g { :; }"), Command::FunctionDef { .. }));
+        assert!(matches!(t6_first("coproc c { :; }"), Command::Coproc { .. }));
+    }
+
+    #[test]
+    fn t6_ast_array_assignment() {
+        match t6_first("a=(1 2)") {
+            Command::Pipeline(p) => match &p.commands[0] {
+                Command::Simple(SimpleCommand::Assign(assigns, _)) => {
+                    assert_eq!(assigns.len(), 1);
+                    assert!(assigns[0].value.0.iter().any(|wp| matches!(wp, WordPart::ArrayLiteral(_))),
+                        "expected an ArrayLiteral WordPart: {:?}", assigns[0].value);
+                }
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_ast_word_part_nesting() {
+        // `$(…)` and `` `…` `` → CommandSub; `$((…))` → Arith.
+        let cs = t6_exec(&t6_first("echo $(x)")).args[0].0.clone();
+        assert!(cs.iter().any(|wp| matches!(wp, WordPart::CommandSub { .. })), "{cs:?}");
+        let bt = t6_exec(&t6_first("echo `x`")).args[0].0.clone();
+        assert!(bt.iter().any(|wp| matches!(wp, WordPart::CommandSub { .. })), "{bt:?}");
+        let ar = t6_exec(&t6_first("echo $((1+2))")).args[0].0.clone();
+        assert!(ar.iter().any(|wp| matches!(wp, WordPart::Arith { .. })), "{ar:?}");
+    }
+
     // v265 smoke-convert: these differential helpers dropped their oracle
     // comparison (the oracle is deleted in T4) but KEEP every call-site as a
     // parse-level Ok/Err regression guard. Exact-AST coverage is backfilled by
