@@ -5762,6 +5762,66 @@ mod tests {
     }
 
     #[test]
+    fn atoms_arith_paren_quote_removal() {
+        // CF6: bash quote-removal in $((/((/for (( arith bodies — quotes are
+        // dropped, single-quote suppresses `$`, double-quote keeps expansion.
+        diff_cmd("echo $(( \"x\" ))");
+        diff_cmd("echo $(( x=\"5\" ))");
+        diff_cmd("echo $(( 1\"2\"3 ))");
+        diff_cmd("echo $(( '$x' ))");        // single-quote → literal $x, no expand
+        diff_cmd("echo $(( \"$x\" ))");      // double-quote → expands, quotes gone
+        diff_cmd("echo $(( \"a\\\"b\" ))");  // dquote \-escape → a"b
+        diff_cmd("echo $(( \"`echo 1`\" ))"); // backtick inside dquote
+        diff_cmd("echo $(( \"${x:-]}\" ))"); // ${…} inside dquote
+        diff_cmd("echo $(( \"a$(( 1 ))b\" ))"); // nested $(( )) inside dquote
+        diff_cmd("echo $(( \"\" ))");        // empty dquote dropped
+        diff_cmd("echo $(( \"a\"'b' ))");    // adjacent quotes concatenate
+        diff_cmd("(( \"x\" ))");             // standalone (( )) command
+    }
+
+    #[test]
+    fn atoms_arith_bare_dollar_split() {
+        // Bare `$` (not an expansion start) is its own literal part in the oracle.
+        diff_cmd("echo $(( 1 $ 2 ))");
+        diff_cmd("echo $(( 1 $+ 2 ))");
+        diff_cmd("echo $(( $'x' ))");   // no ANSI-C in arith: `$` literal + 'x' removed
+    }
+
+    #[test]
+    fn atoms_legacy_arith_quote_protection() {
+        // CF7: `$[ … ]` — quotes and `\` protect the `]` AND are removed
+        // (backslash retained literally).
+        diff_cmd("echo $[ \"]\" ]");    // was UnterminatedQuote → Arith " ] "
+        diff_cmd("echo $[']']");         // was UnterminatedQuote → Arith "]"
+        diff_cmd("echo $[ \\] ]");      // was 2 args → Arith " \\] "
+        diff_cmd("echo $[ \"$x\" ]");   // dquote expands, protects, removed
+        diff_cmd("echo $[ ${x:-]} ]");  // ${…} already protects (regression)
+        diff_cmd("echo $[ $(echo ]) ]"); // $(…) already protects (regression)
+    }
+
+    #[test]
+    fn atoms_arith_for_header_quote() {
+        // Probed edge (v261 T2 Step 6): a quoted for-header section. Both paths
+        // agree byte-for-byte — a quoted `;` inside a for-header section still
+        // counts as a section separator (quote-blind, like the paren-delim bail),
+        // so `"a;b"` splits into 4 sections → ArithForHeader error on both sides;
+        // a fully-quoted section (`"1"`/`"2"`) parses identically with the quotes
+        // stripped from the resulting Word.
+        diff_err("for (( \"a;b\" ; ; )); do :; done");
+        diff_cmd("for (( \"1\" ; \"2\" ; )); do :; done");
+    }
+
+    #[test]
+    fn atoms_arith_quote_blind_bail_unchanged() {
+        // Paren delimiters are quote-BLIND: a `)`/`(` inside a quote still drives
+        // the depth/bail logic (scan_arith_body). These bail to a
+        // cmdsub-of-subshell on BOTH paths — quote-removal must not protect them.
+        diff_cmd("echo $(( \")\" ))");
+        diff_cmd("echo $(( ')' ))");
+        diff_cmd("echo $(( \"(\" ))");
+    }
+
+    #[test]
     fn atoms_legacy_arith_in_param_operand() {
         // v258 whole-branch fix: `$[` inside an unquoted ${…} operand.
         diff_cmd("echo ${a:-$[1+2]}");
