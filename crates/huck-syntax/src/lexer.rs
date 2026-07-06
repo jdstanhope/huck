@@ -566,6 +566,14 @@ struct PendingHeredoc {
     strip_tabs: bool,
     /// Index into `tokens` of the `TokenKind::Heredoc` placeholder to patch.
     token_idx: usize,
+    /// v264 (atom path only): the mode-stack depth (`self.modes.len()`) at which
+    /// the `<<` opener was registered. A heredoc introduced inside a cmdsub/
+    /// backtick body registers at depth ≥ 2 and its body must be emitted at that
+    /// body's own newline — BEFORE a shallower (outer-line) heredoc that was
+    /// registered EARLIER in source but belongs to the enclosing line. Selection
+    /// by matching depth (not FIFO front) keeps the two independent. Unused by
+    /// the oracle `pending_heredocs` queue.
+    reg_depth: usize,
 }
 
 /// Lexer feature toggles resolved from shell state at tokenize time.
@@ -743,6 +751,14 @@ struct HeredocEmit {
     /// runs the close-delimiter check before emitting body atoms; a `\<NL>` line
     /// continuation joins physical lines WITHOUT resetting this to true.
     at_line_start: bool,
+    /// v264: the mode-stack depth (`self.modes.len()`) at the newline that
+    /// triggered this emission. A heredoc registered INSIDE a cmdsub/backtick
+    /// body triggers at depth ≥ 2, and its body must be emitted while that body
+    /// mode is on the stack — `scan_step_command_body` diverts to
+    /// `scan_step_heredoc_body` only when the CURRENT depth matches this, so an
+    /// ENCLOSING heredoc (whose expanding body merely CONTAINS the cmdsub, and
+    /// was triggered at a shallower depth) does NOT hijack the nested body scan.
+    trigger_depth: usize,
 }
 
 /// Incremental tokenizer state (v238 Phase A). Holds what were
@@ -1987,6 +2003,40 @@ impl<'a> Lexer<'a> {
     /// When `body_started == true`, the opener has already been emitted; delegate
     /// entirely to `scan_step_command()` so body tokens are produced one at a time
     /// in Command mode.  The terminating `)` comes out as `Op(RParen)`.
+    /// Route a nested command/backtick BODY step to the same scanner the
+    /// top-level `Mode::Command` dispatch uses (lexer.rs:1032): the atom scanner
+    /// when `command_atoms` is on (production after the v264 flip), else the
+    /// oracle. Before v264 the nested-body sites hardcoded `scan_step_command`
+    /// (oracle), which mis-parsed / hung on `[[ … ]]` and extglob groups inside
+    /// `$( … )` / `` `…` `` because the enclosing parser is the atom parser.
+    ///
+    /// NOTE: this routes to `scan_step_command_atoms_core`, NOT
+    /// `scan_step_command_atoms`, so it BYPASSES the heredoc-body emission guard.
+    /// A nested cmdsub/backtick body embedded in an EXPANDING heredoc body is
+    /// scanned while `emitting_heredoc` is still `Some` (we are mid-body). The
+    /// oracle `scan_step_command` had no such guard, so it scanned the embedded
+    /// `$( … )` body directly; routing through the guarded entry would instead
+    /// re-enter heredoc-body emission and error `UnsupportedExpansion` (v264).
+    fn scan_step_command_body(&mut self) -> Result<Step, LexError> {
+        if self.command_atoms {
+            // A heredoc registered WITHIN this cmdsub/backtick body (`$(sh <<B …)`)
+            // triggers emission at THIS depth; its body must be emitted here (the
+            // guarded `scan_step_command_atoms` entry is only reached at the
+            // `Mode::Command` floor, never for a pushed body mode). Gate on the
+            // trigger depth so an ENCLOSING expanding heredoc — whose body merely
+            // CONTAINS this cmdsub and which triggered at a shallower depth — does
+            // NOT divert here (its cmdsub body is real command text).
+            if let Some(state) = self.emitting_heredoc.as_ref() {
+                if state.trigger_depth == self.modes.len() {
+                    return self.scan_step_heredoc_body();
+                }
+            }
+            self.scan_step_command_atoms_core()
+        } else {
+            self.scan_step_command()
+        }
+    }
+
     fn scan_step_command_sub(&mut self, body_started: bool) -> Result<Step, LexError> {
         if !body_started {
             // Record position BEFORE consuming the opener.
@@ -2035,7 +2085,7 @@ impl<'a> Lexer<'a> {
             Ok(Step::Produced)
         } else {
             // Body is Command-mode tokens; the parser owns the terminating `)`.
-            self.scan_step_command()
+            self.scan_step_command_body()
         }
     }
 
@@ -2191,13 +2241,13 @@ impl<'a> Lexer<'a> {
                     // delegate to Command-mode scanning for the escaped char.  A bare
                     // '`' can no longer reach here: at D=1 it is the close (handled
                     // above), at D≥2 it is body content (handled just above).
-                    self.scan_step_command()
+                    self.scan_step_command_body()
                 }
                 _ => {
                     // Normal body character — delegate to Command-mode scanning.
                     // The '`' arm inside scan_step_command cannot fire because we've
                     // already confirmed the next char is neither '`' nor '\'.
-                    self.scan_step_command()
+                    self.scan_step_command_body()
                 }
             }
         }
@@ -2983,6 +3033,7 @@ impl<'a> Lexer<'a> {
                             expand,
                             strip_tabs,
                             token_idx: placeholder_idx,
+                            reg_depth: self.modes.len(), // unused by the oracle queue
                         });
                     }
                     if let Some(t) = self.history.last_mut() { t.span = Span::new(c_off, c_line, c_col); }
@@ -3248,6 +3299,16 @@ impl<'a> Lexer<'a> {
         if self.emitting_heredoc.is_some() {
             return self.scan_step_heredoc_body();
         }
+        self.scan_step_command_atoms_core()
+    }
+
+    /// The guard-free core of `scan_step_command_atoms`: emits one Command-mode
+    /// atom from the cursor. Split out (v264) so nested cmdsub/backtick body
+    /// delegation (`scan_step_command_body`) can reuse the SAME atom scanning
+    /// WITHOUT the heredoc-body emission short-circuit — a body embedded in an
+    /// expanding heredoc must scan its own `$( … )` tokens, not re-enter the
+    /// heredoc body.
+    fn scan_step_command_atoms_core(&mut self) -> Result<Step, LexError> {
         // Skip a run of inter-word blanks → emit one Blank boundary token. The
         // oracle flushes the word on ANY `char::is_whitespace()` (lexer.rs:2076),
         // handling only `\n` specially (a `Newline` token); every other
@@ -3273,8 +3334,20 @@ impl<'a> Lexer<'a> {
                 // v250: pending heredoc bodies are emitted as atoms after this
                 // newline. Flip on the lexer-internal emission state; the next
                 // scan_step calls emit the body groups (see the top-of-fn check).
-                if !self.atom_pending_heredocs.is_empty() {
-                    self.emitting_heredoc = Some(HeredocEmit { began: false, at_line_start: true });
+                //
+                // v264: do NOT (re-)trigger while a heredoc body is ALREADY being
+                // emitted. This core is reached — via `scan_step_command_body` —
+                // for a nested cmdsub/backtick body; when that body is embedded in
+                // an EXPANDING heredoc body (`emitting_heredoc.is_some()`), the
+                // current heredoc still sits at the front of
+                // `atom_pending_heredocs`, so a multi-line `$( … )`'s internal
+                // newline would falsely re-trigger emission of the SAME heredoc.
+                // (A heredoc registered WITHIN a cmdsub body — `$(sh <<B …)` — is
+                // NOT yet emitting, so its newline still triggers correctly.)
+                if self.emitting_heredoc.is_none()
+                    && self.atom_heredoc_idx_at_depth(self.modes.len()).is_some()
+                {
+                    self.emitting_heredoc = Some(HeredocEmit { began: false, at_line_start: true, trigger_depth: self.modes.len() });
                     self.heredoc_gen += 1; // v250 T6: emitting_heredoc changed (newline trigger)
                 }
                 Ok(Step::Produced)
@@ -3303,20 +3376,31 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// v250: emit atoms for the FRONT `atom_pending_heredocs` body. One
-    /// `scan_step` call: first emits `HeredocBodyBegin`, next emits the body +
-    /// `HeredocBodyEnd` and pops the entry; when the queue drains, clears
+    /// v264: index of the FIRST pending atom heredoc registered at mode-stack
+    /// depth `depth`. Shallower entries (outer-line heredocs) may sit ahead of it
+    /// in the FIFO; they are skipped so a cmdsub/backtick-body heredoc emits at
+    /// its own body's newline. Within a depth, FIFO order is preserved.
+    fn atom_heredoc_idx_at_depth(&self, depth: usize) -> Option<usize> {
+        self.atom_pending_heredocs.iter().position(|ph| ph.reg_depth == depth)
+    }
+
+    /// v250: emit atoms for the current `atom_pending_heredocs` body (the first
+    /// entry matching `emitting_heredoc.trigger_depth`). One `scan_step` call:
+    /// first emits `HeredocBodyBegin`, next emits the body + `HeredocBodyEnd` and
+    /// removes the entry; when no same-depth entry remains, clears
     /// `emitting_heredoc`. Task 2 handles LITERAL bodies (one raw `Lit`); Task 4
     /// extends this for expanding bodies. Detects the close-delimiter line itself.
     fn scan_step_heredoc_body(&mut self) -> Result<Step, LexError> {
-        let Some(state) = self.emitting_heredoc.as_mut() else {
-            return self.scan_step_command_atoms(); // no-op guard
+        let depth = match self.emitting_heredoc.as_ref() {
+            Some(s) => s.trigger_depth,
+            None => return self.scan_step_command_atoms(), // no-op guard
         };
-        let ph = self.atom_pending_heredocs.front().expect("emitting implies a pending entry").clone();
+        let idx = self.atom_heredoc_idx_at_depth(depth).expect("emitting implies a pending entry at this depth");
+        let ph = self.atom_pending_heredocs[idx].clone();
         // Emit the Begin bracket for the current heredoc (carries `expand` so the
         // parser picks the literal vs expanding assembly).
-        if !state.began {
-            state.began = true;
+        if !self.emitting_heredoc.as_ref().expect("emitting").began {
+            self.emitting_heredoc.as_mut().expect("emitting").began = true;
             self.heredoc_gen += 1; // v250 T6 fix: emitting_heredoc.began flip is a state change
             let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
             self.history.push(Token::new(TokenKind::HeredocBodyBegin { expand: ph.expand }, Span::new(off, l, c)));
@@ -3471,12 +3555,20 @@ impl<'a> Lexer<'a> {
     fn emit_heredoc_body_end(&mut self) {
         let (off, l, c) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
         self.history.push(Token::new(TokenKind::HeredocBodyEnd, Span::new(off, l, c)));
-        self.atom_pending_heredocs.pop_front();
+        // v264: remove the entry we just finished (the first at the emitting
+        // depth — NOT necessarily the FIFO front, since a shallower outer-line
+        // heredoc may sit ahead of a cmdsub/backtick-body one), then re-arm for
+        // the NEXT same-depth entry (more heredocs on the same body line) or
+        // clear when none remain at this depth.
+        let depth = self.emitting_heredoc.as_ref().map(|s| s.trigger_depth).unwrap_or_else(|| self.modes.len());
+        if let Some(idx) = self.atom_heredoc_idx_at_depth(depth) {
+            self.atom_pending_heredocs.remove(idx);
+        }
         self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs/emitting_heredoc changed
-        self.emitting_heredoc = if self.atom_pending_heredocs.is_empty() {
-            None
+        self.emitting_heredoc = if self.atom_heredoc_idx_at_depth(depth).is_some() {
+            Some(HeredocEmit { began: false, at_line_start: true, trigger_depth: depth })
         } else {
-            Some(HeredocEmit { began: false, at_line_start: true })
+            None
         };
     }
 
@@ -3672,6 +3764,7 @@ impl<'a> Lexer<'a> {
                         push!(TokenKind::Heredoc { body: Word(Vec::new()), expand, strip_tabs });
                         self.atom_pending_heredocs.push_back(PendingHeredoc {
                             delim, expand, strip_tabs, token_idx: 0, // token_idx unused on the atom path
+                            reg_depth: self.modes.len(),
                         });
                         self.heredoc_gen += 1; // v250 T6: atom_pending_heredocs changed
                     }

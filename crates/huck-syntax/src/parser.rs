@@ -1934,6 +1934,10 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
             | Some(TokenKind::Op(_))
             | Some(TokenKind::RedirFd(_))
             | Some(TokenKind::Heredoc { .. })
+            // v264: a closing keyword (`}`/`done`/`fi`/`esac`) immediately before
+            // the backtick-body terminator (`` `…done` ``) is at a boundary —
+            // EndBacktick is the backtick analogue of `Op(RParen)` for `$( … )`.
+            | Some(TokenKind::EndBacktick)
     );
     Ok(if boundary { Some(kw) } else { None })
 }
@@ -2562,6 +2566,8 @@ fn is_word_boundary_tok(t: Option<&TokenKind>) -> bool {
             | Some(TokenKind::Op(_))
             | Some(TokenKind::RedirFd(_))
             | Some(TokenKind::Heredoc { .. })
+            // v264: backtick-body terminator, the analogue of `Op(RParen)`.
+            | Some(TokenKind::EndBacktick)
     )
 }
 
@@ -7328,5 +7334,31 @@ mod tests {
         // to extglob) — `diff_err` (not `diff_cmd`) is the correct comparison
         // for a case where BOTH sides error the same way rather than succeed.
         diff_err("echo +(a)");               // extglob off: oracle+atom both treat as-is
+    }
+
+    // ── v264 nested-body flip: route cmdsub / backtick bodies to the ATOM
+    // scanner (was hardcoded to the oracle) so `[[ … ]]` / extglob groups parse
+    // instead of mis-parsing or hanging. ───────────────────────────────────────
+    #[test]
+    fn atoms_dbracket_extglob_in_nested_bodies() {
+        // [[ … ]] inside cmdsub / backtick:
+        diff_cmd("echo $( [[ a == a ]] && echo Y )");
+        diff_cmd("echo `[[ a == a ]] && echo Y`");
+        diff_cmd("x=$( [[ a == a ]] && echo Y ); echo $x");
+        diff_cmd("echo $( [[ -n foo && bar == bar ]] && echo Y )");
+        // heredoc-embedded cmdsub (Gap 1 regression guards):
+        diff_cmd("cat <<EOF\n$(echo hi)\nEOF\n");
+        diff_cmd("cat <<EOF\n${y:-d} and $(echo hi)\nEOF\n");
+        // backtick word-splitting (Gap 2 regression guards):
+        diff_cmd("cat <<EOF\n`echo $x`\nEOF\n");
+        diff_cmd("echo `echo $x`");
+        diff_cmd("echo `echo one two three`");
+    }
+
+    #[test]
+    fn atoms_extglob_in_nested_bodies() {
+        diff_eg("shopt -s extglob\necho $( [[ foo == @(foo|bar) ]] && echo 1 )");
+        diff_eg("echo $( [[ z == !(a|b) ]] && echo 7 )");
+        diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
     }
 }
