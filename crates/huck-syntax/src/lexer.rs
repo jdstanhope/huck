@@ -1539,10 +1539,15 @@ impl<'a> Lexer<'a> {
                             Some(ch) => text.push(ch),
                         }
                     }
-                    self.history.push(Token::new(
-                        TokenKind::Lit { text, quoted: true },
-                        Span::new(off, l, c),
-                    ));
+                    // v263: a subscript operand wraps a bare `'…'` in
+                    // Quoted{Single} (oracle scan_subscript). Emit QuoteRun{Single}
+                    // so parse_word wraps it; value families keep the flat Lit.
+                    let tok = if end == ']' {
+                        TokenKind::QuoteRun { style: QuoteStyle::Single, text }
+                    } else {
+                        TokenKind::Lit { text, quoted: true }
+                    };
+                    self.history.push(Token::new(tok, Span::new(off, l, c)));
                     return Ok(Step::Produced);
                 }
 
@@ -1555,6 +1560,16 @@ impl<'a> Lexer<'a> {
                 // closing `"` in this same call, or the first interior char is a
                 // `$`/backtick trigger that the parser must handle before we see `"`).
                 Some('"') => {
+                    // v263: in a subscript operand, wrap a bare `"…"` in
+                    // Quoted{Double} (like the oracle's scan_subscript). Emit a
+                    // zero-width BeginDquote — leave the `"` for parse_dquote,
+                    // exactly like the `$"` arm — so parse_word's F3 arm wraps it;
+                    // the mode switch to Mode::DoubleQuote guarantees forward
+                    // progress. Value families (end == '}') keep the flat inline.
+                    if end == ']' {
+                        self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c)));
+                        return Ok(Step::Produced);
+                    }
                     self.cursor.next(); // consume opening `"`
                     let in_off = self.cursor.offset();
                     let in_l   = self.cursor.line();
