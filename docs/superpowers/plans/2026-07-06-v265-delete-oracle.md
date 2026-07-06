@@ -1,5 +1,44 @@
 # v265 — Delete the Oracle Implementation Plan
 
+> ## ⚠️ RE-SCOPED 2026-07-06 — "delete the oracle" was NOT achievable; milestone re-cut
+>
+> **What was discovered mid-execution:** the plan's core premise — that after T1–T3
+> nothing calls the oracle, so T4 can delete it by following `dead_code` — is FALSE.
+> The atom (production) path is **not self-contained**: four leaf sub-body lexers still
+> delegate to the old whole-buffer `tokenize` (→ the Word scanner → `command::parse`):
+>
+> | Leaf sub-lexer | context | atom-path caller |
+> |---|---|---|
+> | `parse_subscript_body` | `a[…]=` subscript bodies | `scan_command_word_atom`/`scan_subscript` |
+> | `maybe_expand_command_alias` | alias replacement bodies | parser's `expand_command_alias` |
+> | `scan_array_element_word` | `a=(…)` array-literal elements | array-literal scanner |
+> | `parse_substitution_body` | `$(…)`/backtick bodies | reached transitively (also calls `command::parse`) |
+>
+> Because these are live, `command::parse`/`tokenize`/`from_tokens`/the Word scanner are
+> all transitively reachable from production (verified at runtime: `a[$(echo 2)]=hi` runs
+> the oracle). The differential harness never caught it because, for those sub-contexts,
+> the atom path *is* the oracle — "atom == oracle" was circular. (The `dead_code` cascade
+> also would not have fired: mutual recursion hides dead cycles from the lint.)
+>
+> **Delivered this iteration (all committed, green):** T1 (continuation ported + 3 real
+> bugs fixed incl. the OOM), T2 (all direct oracle callers repointed, incl. 2 production
+> fns the plan missed), T3 (differential harness decoupled), T6 (17 focused explicit-value
+> lexer/parser tests). Net effect: the oracle's caller surface collapsed from
+> "engine + REPL + harness" to **four leaf sub-lexers** — it is no longer a top-level
+> parser anywhere.
+>
+> **Deferred (NOT done):** T4 (delete oracle) and T5 (module tidy) — both blocked on the
+> oracle still being live.
+>
+> **Real prerequisite for a future deletion (own milestone):** port those four leaf
+> sub-body lexers onto the atom path so subscript/alias/array/substitution bodies are
+> lexed as atoms and parsed by `parser::parse_sequence`. Once done, the oracle has zero
+> callers and deletion (this plan's T4/T5) becomes real. The re-scoped milestone name for
+> what shipped: **"shrink the oracle to a leaf sub-lexer + decouple the harness."**
+>
+> Everything below is the ORIGINAL plan, retained for the paper trail. T1–T3, T6 map to
+> the delivered work; T4/T5 are the deferred deletion.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the resident `command.rs` oracle parser and the six forward-scanning lexer functions, leaving one parser (the atom path) and one lexing discipline.
@@ -304,7 +343,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Delete the oracle (compiler-guided)
+### Task 4: Delete the oracle (compiler-guided)  — ⛔ DEFERRED (oracle still live; see RE-SCOPED banner)
 
 Nothing calls `command::parse`, `tokenize`/`tokenize_with_opts`, or `from_tokens` now. Remove them and follow the `dead_code` cascade until only shared code survives.
 
@@ -365,7 +404,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-### Task 5: Module tidy — command.rs = AST, lexer.rs = token production
+### Task 5: Module tidy — command.rs = AST, lexer.rs = token production  — ⛔ DEFERRED (needs T4)
 
 Move parser-internal helpers into parser.rs so `command.rs` holds only the AST (types + pure predicates) and `lexer.rs` holds only token-production code.
 
@@ -432,7 +471,7 @@ Backfill AST-shape coverage the smoke-convert dropped, with explicit expected va
 **Interfaces:**
 - Consumes: `Lexer::new_live_atoms`, `Lexer::next_token`, `parser::parse_sequence`, `TokenKind`, `Sequence`/`Command`/`WordPart` (all `Debug + PartialEq`).
 
-- [ ] **Step 1: Add lexer token-stream tests (exact atom `Vec`)**
+- [x] **Step 1: Add lexer token-stream tests (exact atom `Vec`)**
 
 In `lexer.rs` `mod tests`, reuse the existing `command_atoms_of(s) -> Vec<TokenKind>` pattern (or `head_atoms`). Add explicit-expected tests, e.g.:
 
@@ -452,12 +491,12 @@ In `lexer.rs` `mod tests`, reuse the existing `command_atoms_of(s) -> Vec<TokenK
 
 (Use whatever `Word`-constructor the existing token-stream tests use — see `command_atoms_stream_shape` at lexer.rs:12786 for the exact expected-value idiom, and mirror it.) Cover one to three cases in each mode: quotes (`'…'`, `"…"`, `$'…'`), `${…}` (plain + an operator like `${x:-y}`), `$(…)`, backtick, `$((…))`, `$[…]`, `[[ … =~ re ]]`, extglob (`@(a|b)` with `extglob:true` opts), array literal (`a=(1 2)`), heredoc body (literal + expanding), process sub (`<(cmd)`), brace expansion (`{a,b}`), redirect ops (`>`, `>>`, `2>&1`, `<<<`).
 
-- [ ] **Step 2: Run the lexer tests, verify they pass**
+- [x] **Step 2: Run the lexer tests, verify they pass**
 
 Run: `cargo test -p huck-syntax --jobs 1 --lib -- --test-threads 1 atom_stream`
 Expected: PASS. If an expected `Vec` is wrong, correct the expected value to the atom stream the (production, bash-validated) lexer emits — but reason about what it SHOULD be first; a surprising stream is a finding to note, not auto-accept.
 
-- [ ] **Step 3: Add parser AST tests (exact `Sequence`/`Command`)**
+- [x] **Step 3: Add parser AST tests (exact `Sequence`/`Command`)**
 
 In `parser.rs` `mod tests`, add explicit-AST tests using `new_seq(s)`, e.g.:
 
@@ -479,16 +518,16 @@ In `parser.rs` `mod tests`, add explicit-AST tests using `new_seq(s)`, e.g.:
 
 Prefer full-value `assert_eq!` against a constructed expected `Sequence` where the AST is small enough to write out; fall back to structural matching (as above) for large nodes. Cover: simple command (program + args), pipeline (+ negation `! a`), redirects (`>`, `>>`, `<`, `2>&1`, heredoc, `<<<`), and-or (`a && b || c`), subshell `( … )`, brace group `{ …; }`, `if`/`while`/`until`/`for`/`select`/`case`, C-for `for ((…))`, arith command `(( … ))`, `[[ … ]]` + `=~`, function defs (`f() { … }` and `function f { … }`), coproc, assignment + array literal, and word-part nesting (a `${…}`, a `$(…)`, an `$((…))`, a backtick — assert the `WordPart` variants).
 
-- [ ] **Step 4: Run the parser tests, verify they pass**
+- [x] **Step 4: Run the parser tests, verify they pass**
 
 Run: `cargo test -p huck-syntax --jobs 1 --lib -- --test-threads 1 ast_`
 Expected: PASS.
 
-- [ ] **Step 5: Full suite green**
+- [x] **Step 5: Full suite green**
 
 Run: `cargo test -p huck-syntax --jobs 1 --lib -- --test-threads 1` → all pass (count up by the number of new tests), 0 warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/huck-syntax/src/lexer.rs crates/huck-syntax/src/parser.rs
