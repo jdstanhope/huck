@@ -42,6 +42,11 @@ parser owns delimiter-matching, recursion, and structure).
    regression guard while removing the oracle dependency. The `old_seq` /
    `old_seq_al` / `old_unit` / `old_eg` helpers then go unused and are deleted.
 5. Tidy module ownership to the intended end-state (below).
+6. Backfill durable, oracle-independent shape coverage: a curated set of
+   focused tests asserting exact **atom token-streams** (lexer) and exact
+   **ASTs** (parser) for representative inputs across every grammar family.
+   This replaces the AST-shape verification the smoke-convert drops, in a
+   readable form that depends on nothing being deleted.
 
 ## Non-Goals
 
@@ -282,6 +287,38 @@ engine also calls stays in `command.rs`. Drop the now-internal
 word-assembly/expansion code, `parser.rs` owns both. May be committed as two
 sub-steps (command→parser, then lexer→parser) for reviewability.
 
+### Task 6 — Focused, oracle-independent lexer + parser tests
+
+Backfill the AST-shape coverage the smoke-convert drops, in a durable form
+that depends on nothing being deleted. Add two focused test modules with
+**explicit expected values** (no oracle, no snapshot magic):
+
+- **Lexer token-stream tests** — assert the exact atom `Vec` (via
+  `new_live_atoms` driven to completion, or the existing atom-collection test
+  helper) for representative inputs in each lexer mode: plain command words,
+  single/double/ANSI-C quotes, `${…}` param expansion (+ operators), `$(…)`,
+  backtick, `$((…))`, `$[…]`, `[[ ]]` regex, extglob, array literals, heredoc
+  bodies (literal + expanding), process substitution, brace expansion,
+  redirect operators. A handful of cases per mode, each asserting the precise
+  atom sequence including boundaries.
+- **Parser AST tests** — assert the exact `Sequence`/`Command` AST for
+  representative inputs across every grammar family: simple command, pipeline
+  (+ negation), redirects (all ops + fd-dup + heredoc + here-string), and-or
+  lists, subshell, brace group, `if`/`while`/`until`/`for`/`select`/`case`,
+  C-style `for ((…))`, arith command `(( ))`, `[[ ]]` (+ `=~`), function
+  defs (both forms), coproc, assignments + array literals, and the word-part
+  structures (param expansion, cmdsub, arith, backtick nesting). Construct the
+  expected AST by reasoning about the grammar, cross-checked against the
+  production parser's output.
+
+**Bounded scope:** this is a curated *representative* set (target on the order
+of dozens per module), not a re-encoding of the 882-input smoke corpus. The
+smoke corpus + bash-diff sweep carry breadth; these tests carry readable,
+oracle-free shape verification for the constructs most worth locking down.
+Written last, against the final module structure. They must pass on the
+delivered code (the parser/lexer behavior is unchanged by Tasks 4–5, which
+only move code).
+
 ## Testing Strategy
 
 Three-layer verification after **every** task, single-threaded and guarded on
@@ -297,7 +334,9 @@ this box (1 core / 1.9 GB):
 The bash-diff sweep is now the **primary** correctness oracle (the
 differential no longer verifies AST shape after the smoke-convert). This is
 safe precisely because the atom path is already validated against bash — a
-stronger ground truth than the oracle ever was.
+stronger ground truth than the oracle ever was. The Task 6 focused tests add
+back explicit, oracle-independent shape verification for the constructs most
+worth locking down.
 
 `cargo build` must end at **0 warnings** (the deletion's completion signal).
 Trust `cargo`, not rust-analyzer (phantom `dead_code` diagnostics have
