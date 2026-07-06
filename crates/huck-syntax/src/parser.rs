@@ -2435,6 +2435,15 @@ fn parse_coproc(iter: &mut Lexer) -> Result<Command, ParseError> {
 ///   when `!` negate applies (oracle: `parse_command_then_pipeline` returns raw).
 /// - Any command with `|`: all stages collected into `Command::Pipeline(…)`.
 fn parse_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> {
+    // v262 F2: skip any leading inter-token Blank the atom scanner emits after a
+    // compound opener / keyword / connector (`{ ! a; }`, `while ! a`, `then ! a`),
+    // so the bang-count loop below sees the `!` rather than the Blank in front of
+    // it. (The loop already skips blanks BETWEEN successive bangs; this covers the
+    // one before the FIRST bang.) A command never begins with a meaningful Blank,
+    // so this is a no-op for the paths that already arrive blank-free.
+    while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
+        iter.next_kind()?;
+    }
     // Count leading `!` words (each one flips the negate flag). Under the atom
     // scanner successive bangs are separated by `Blank` atoms (`! ! a`), so skip
     // any inter-token blanks after each bang before checking for the next one.
@@ -6795,5 +6804,30 @@ mod tests {
         diff_cmd("a=([$\"k\"]=v)");
         // Regression: bare assignment-target subscript already matched, stays green.
         diff_cmd("a[$\"k\"]=v");
+    }
+
+    #[test]
+    fn atoms_bang_in_compound_body_and_condition() {
+        // v262 F2: a leading `!` preceded by an inter-token Blank (after a
+        // compound opener / keyword / connector) must count as pipeline negation,
+        // not be swallowed into the program word. Conditions AND bodies of every
+        // compound routed through parse_pipeline were divergent (probed EQ=false).
+        diff_cmd("{ ! a; }");
+        diff_cmd("{ ! ! a; }");
+        diff_cmd("if x; then ! ! a; fi");
+        diff_cmd("if ! a; then :; fi");
+        diff_cmd("while ! a; do :; done");
+        diff_cmd("until ! a; do :; done");
+        diff_cmd("while x; do ! a; done");
+        diff_cmd("for i in 1; do ! a; done");
+        diff_cmd("{ ! a && b; }");
+        diff_cmd("{ ! a || b; }");
+        diff_cmd("{ ! a | b; }");
+        // Regression guards — already correct, must STAY byte-identical.
+        diff_cmd("! a");                       // top-level
+        diff_cmd("( ! a )");                   // subshell (bespoke path)
+        diff_cmd("case x in a) ! b;; esac");   // bespoke case-item path
+        diff_cmd("{ a; }");                    // no bang
+        diff_cmd("!a");                        // glued — not a bang word
     }
 }
