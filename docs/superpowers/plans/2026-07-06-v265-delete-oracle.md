@@ -34,12 +34,12 @@ The only non-mechanical production change. `continuation::classify` currently to
 - Consumes: `crate::lexer::Lexer::new_live_atoms(input: &str, aliases: &HashMap<String,String>, opts: LexerOptions) -> Lexer`; `crate::lexer::Lexer::next(&mut self) -> Result<Option<Token>, LexError>`; `crate::parser::parse_sequence(&mut Lexer) -> Result<Option<Sequence>, ParseError>`; `ParseError::Lex(Box<LexError>)`.
 - Produces: unchanged public API — `classify(buffer: &str, extglob: bool) -> Completeness`.
 
-- [ ] **Step 1: Confirm the current test baseline is green**
+- [x] **Step 1: Confirm the current test baseline is green**
 
 Run: `cargo test -p huck-engine --jobs 1 --lib -- --test-threads 1 continuation`
 Expected: PASS (47 continuation tests). Record the exact count.
 
-- [ ] **Step 2: Update the imports**
+- [x] **Step 2: Update the imports**
 
 In `crates/huck-engine/src/continuation.rs`, replace lines 6-7:
 
@@ -56,7 +56,7 @@ use crate::lexer::{self, ends_with_continuation_backslash, LexError, Operator, T
 use crate::parser;
 ```
 
-- [ ] **Step 3: Replace the body of `classify`**
+- [x] **Step 3: Replace the body of `classify`**
 
 Replace the entire `classify` function (lines 46-96) with:
 
@@ -124,12 +124,12 @@ fn buffer_ends_with_connector(buffer: &str, extglob: bool) -> bool {
 
 Note: `is_unterminated_lex` (already in the file) takes `&LexError`; `*e` derefs the `Box`, and `&e` in the guard re-borrows the deref-bound `e` — write `is_unterminated_lex(&e)` where `e: Box<LexError>` auto-derefs, or bind `let le = &*e;` if the borrow checker objects. The `matches!(*e, …)` in the Heredoc arm moves nothing (it matches on the deref). If ordering of the two `Lex` arms matters, Heredoc must come first (it does).
 
-- [ ] **Step 4: Verify `TokenKind::Blank` and `TokenKind::Newline` exist**
+- [x] **Step 4: Verify `TokenKind::Blank` and `TokenKind::Newline` exist**
 
 Run: `grep -n "Blank\|Newline," crates/huck-syntax/src/lexer.rs | head`
 Expected: both variants present in `enum TokenKind`. If `Blank` is named differently, use the actual word-boundary atom variant (the one `command_atoms_of` skips between words).
 
-- [ ] **Step 5: Build and run the full continuation suite**
+- [x] **Step 5: Build and run the full continuation suite**
 
 Run: `cargo build -p huck-engine 2>&1 | tail -5`
 Expected: compiles, 0 warnings.
@@ -138,12 +138,12 @@ Expected: PASS, same count as Step 1 (47).
 
 If any continuation test fails, the signal-mapping is off — diagnose which `ContinuationReason` diverges (the failing test name identifies it) before proceeding. Do NOT weaken a test. An unterminated heredoc/quote not surfacing as the right `ParseError::Lex` variant is the known risk (spec Risks) — if a variant genuinely cannot be produced by the atom path, report BLOCKED with the specific input and both paths' outputs.
 
-- [ ] **Step 6: Run the whole huck-engine suite (nothing else regressed)**
+- [x] **Step 6: Run the whole huck-engine suite (nothing else regressed)**
 
 Run: `cargo test -p huck-engine --jobs 1 --lib -- --test-threads 1`
 Expected: 1738 pass (continuation still uses `command::parse` in `tokenize`? No — Task 1 removed continuation's oracle use; the test-helper sites remain until Task 2). 0 failures.
 
-- [ ] **Step 7: Guarded interactive multiline spot-check**
+- [x] **Step 7: Guarded interactive multiline spot-check**
 
 Run (guarded):
 ```bash
@@ -156,7 +156,7 @@ done
 ```
 Expected: no `diff` output for any fragment (each multiline construct completes and runs identically to bash). This exercises the REPL continuation path end to end.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/huck-engine/src/continuation.rs
