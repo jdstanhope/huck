@@ -77,6 +77,9 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // and scan_step_command_sub(false) owns consuming `$(`.
                 let cs = parse_command_sub(iter, quoted)?;
                 parts.push(cs);
+                // v264 flip-fix (Finding 2): clear the `)`-boundary_reset leak on
+                // the continuing operand word, mirroring `parse_word_command`.
+                iter.clear_cmd_at_word_start();
             }
             TokenKind::BeginBacktick => {
                 // v245 T6: `` `cmd` `` signal from scan_step_param_operand.
@@ -213,6 +216,13 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 iter.next_kind()?;
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_command_sub(iter, quoted)?);
+                // v264 flip-fix (Finding 2): the `)` closing the cmdsub ran
+                // `boundary_reset()` (→ `cmd_at_word_start = true`), which leaks
+                // into this CONTINUING word and mis-classifies a glued `#`/`~`
+                // (`echo a$(true)#b`, `echo $(echo X)~root`). The word continues,
+                // so force mid-word. A following `Blank`/`Newline` re-arms
+                // word-start, so the spaced `$(…) #c` comment case stays correct.
+                iter.clear_cmd_at_word_start();
             }
             // v252: compound array RHS. The prefix part (Literal "name=" or
             // AssignPrefix) is already accumulated; glue the ArrayLiteral after it.
@@ -220,6 +230,19 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 iter.next_kind()?;            // discard the signal (cursor on `(`)
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_array_literal(iter)?);
+            }
+            // v264: extglob group (`+(a|b)`, gated by `LexerOptions::extglob`).
+            // The zero-width `ExtglobOpen` signal is discarded here (mirrors
+            // `ArrayOpen`/`CmdSubOpen`) so `parse_extglob_group`'s own
+            // `push_mode` + first pull re-scans the real `<prefix>(` under the
+            // NEW mode frame. The group is a WORD PART glued mid-word — extend
+            // (not push a single part) and CONTINUE the word so trailing
+            // literals (`+(a|b)*`) glue after it.
+            Some(TokenKind::ExtglobOpen { .. }) => {
+                iter.next_kind()?;            // discard the signal
+                flush_lit(&mut acc, &mut parts);
+                let group = parse_extglob_group(iter)?;
+                parts.extend(group);
             }
             // `<`/`>` are POSIX operator characters — unlike `$(`/`` ` ``, a
             // `<(`/`>(` process substitution ALWAYS ends any word already in
@@ -236,6 +259,9 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 let dir = dir.clone();
                 iter.next_kind()?;            // discard the signal (cursor stays on `(`)
                 parts.push(parse_process_sub(iter, dir)?);
+                // v264 flip-fix (Finding 2): same `)`-boundary_reset leak as the
+                // cmdsub arm — force mid-word for the continuing word (`<(y)z`).
+                iter.clear_cmd_at_word_start();
             }
             Some(TokenKind::BeginBacktick) => {
                 iter.next_kind()?;
@@ -420,6 +446,85 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
     Ok(Word(parts))
 }
 
+/// v264: assemble one extglob group `<prefix>( … )` as a flat list of word
+/// parts (NOT wrapped in a `Word` — the caller glues them into the
+/// surrounding word). The parser has just consumed the zero-width
+/// `ExtglobOpen{prefix}` signal (cursor still sits on `<prefix>(`); push
+/// `Mode::Extglob` and pull atoms until the zero-width `ExtglobEnd` (the lexer
+/// emits it, and pops the mode, in the same call that closes the group — see
+/// `scan_step_extglob`). Mirrors `parse_regex_operand`'s part-assembly arms:
+/// nested `$(…)`/`` `…` ``/`${…}`/`"…"`/`'…'` recurse via the existing
+/// sub-parsers (parser-owned recursion — THE RULE: the lexer never
+/// forward-scans a nested `$(…)`, only tracks paren depth incrementally; the
+/// parser owns delimiter-matching by recursing here).
+fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
+    iter.push_mode(Mode::Extglob { paren_depth: 0 });
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut acc: Option<(String, bool)> = None;
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::ExtglobEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? { push_lit(&mut acc, &mut parts, text, q); }
+            }
+            Some(TokenKind::DollarLit { .. }) => {
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? { flush_lit(&mut acc, &mut parts); parts.push(WordPart::Literal { text: "$".into(), quoted: q }); }
+            }
+            Some(TokenKind::QuoteRun { .. }) => {
+                if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    // Mirrors the oracle's `scan_extglob_group` `'` arm: a
+                    // SINGLE-quoted run inlines FLAT as `Literal{quoted:true}`
+                    // (no `Quoted` wrapper); a `$'…'` ANSI-C run keeps its
+                    // `Quoted{AnsiC,…}` wrapper (same split `parse_regex_operand`
+                    // makes — Backslash/Double never reach here).
+                    match style {
+                        QuoteStyle::Single => parts.push(WordPart::Literal { text, quoted: true }),
+                        _ => parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] }),
+                    }
+                }
+            }
+            Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
+            Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
+            Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
+            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_legacy_arith_expansion(iter, false)?); }
+            Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
+            // Mirrors the oracle's `scan_extglob_group` `"` arm (delegates to
+            // `scan_dquote_expansion_body`, which inlines FLAT, not a `Quoted`
+            // wrapper — same as `parse_regex_operand`'s non-subscript case).
+            // Drop the atom-native `parse_dquote`'s injected empty-`""` marker
+            // (`[Literal{"",true}]`) so an empty `""` contributes no part,
+            // matching `scan_dquote_expansion_body`'s empty-body no-op.
+            Some(TokenKind::BeginDquote) => {
+                iter.next_kind()?; flush_lit(&mut acc, &mut parts);
+                match parse_dquote(iter, false)? {
+                    WordPart::Quoted { parts: inner, .. } => {
+                        let is_empty_marker = inner.len() == 1
+                            && matches!(&inner[0], WordPart::Literal { text, quoted: true } if text.is_empty());
+                        if !is_empty_marker { parts.extend(inner); }
+                    }
+                    other => parts.push(other),
+                }
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted: q, joined: false },
+                        "*" => WordPart::AllArgs { quoted: q, joined: true },
+                        "?" => WordPart::LastStatus { quoted: q },
+                        _   => WordPart::Var { name, quoted: q },
+                    });
+                }
+            }
+            Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
+            other => return Err(ParseError::TestExprBadOperator(format!("extglob group: {other:?}"))),
+        }
+    }
+    flush_lit(&mut acc, &mut parts);
+    Ok(parts)
+}
+
 /// Append a `Lit` atom into the pending coalescible chunk `acc`, matching the
 /// oracle's single-buffer literal accumulation (`flush_literal`): adjacent
 /// literals with the SAME `quoted` flag merge into one. Needed e.g. for a
@@ -551,10 +656,34 @@ fn subscript_kind_from(w: Word) -> SubscriptKind {
 /// the `ParamOpen` token at entry.
 pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
     // 1. Push the mode and consume the `ParamOpen` (`${`) token.
-    iter.push_mode(Mode::ParamExpansion { seen_name: false });
+    iter.push_mode(Mode::ParamExpansion { seen_name: false, indirect: false, start_off: 0 });
+
+    // v264 (M-156): seed the head scanner's extquote double-quote gate. The
+    // oracle gates a `$'…'`-decoded NAME on `quoted || opts.in_dquote`; fold our
+    // `quoted` arg into `opts.in_dquote` for the duration of this expansion so the
+    // lexer resolves the gate. `saved_dq` restores the inherited value on exit;
+    // the pattern-family operands (`#`/`%`/`/`/`^`/`,`) keep the elevated value so
+    // a NESTED `${…}` inside them sees the enclosing dquote (mirrors the oracle's
+    // `opts.with_in_dquote(quoted || opts.in_dquote)`), while value/error/substring
+    // operands are lowered back to `saved_dq` (oracle passes `opts` unchanged).
+    let saved_dq = iter.in_dquote();
+    let m156_dq = quoted || saved_dq;
+    iter.set_in_dquote(m156_dq);
+
+    // Restore-on-exit helper for the M-156 gate flag.
+    macro_rules! restore_dq {
+        () => { iter.set_in_dquote(saved_dq); };
+    }
+
     match iter.next_kind()? {
-        Some(TokenKind::ParamOpen { .. }) => {}
+        Some(TokenKind::ParamOpen { .. }) => {
+            // Record the `${`'s `$` offset for bad-subst raw reconstruction. In
+            // production the enclosing scanner consumes `${` (2 ASCII bytes) and
+            // the cursor now sits just past it, so `$` is at `cursor - 2`.
+            iter.set_param_start_off_from_cursor();
+        }
         _ => {
+            restore_dq!();
             iter.pop_mode();
             return Err(ParseError::UnsupportedExpansion);
         }
@@ -571,24 +700,47 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
         indirect = true;
     }
 
-    // 3. The parameter name (always present; may be "" for bad-subst).
+    // 3. The parameter name (always present; may be "" for bad-subst). A
+    // `$'…'`-decoded name (`ParamNameDecoded`) sets `name_decoded` so the bare
+    // form is promoted to `ParamExpansion{None}` (matching the oracle's `declare
+    // -f` round-trip). A `ParamBadSubst` here is a name-position bad substitution.
+    let mut name_decoded = false;
     let name = match iter.next_kind()? {
         Some(TokenKind::ParamName(n)) => n,
+        Some(TokenKind::ParamNameDecoded(n)) => { name_decoded = true; n }
+        Some(TokenKind::ParamBadSubst { raw }) => {
+            restore_dq!();
+            iter.pop_mode();
+            return Ok(WordPart::ParamExpansion {
+                name: String::new(),
+                modifier: ParamModifier::BadSubst { raw },
+                quoted,
+                subscript: None,
+                indirect: false,
+            });
+        }
         _ => {
+            restore_dq!();
             iter.pop_mode();
             return Err(ParseError::UnsupportedExpansion);
         }
     };
 
+    // The NAME's M-156 gate has now fired. Lower the gate to the inherited value
+    // for the subscript and value/error/substring operands (the oracle scans them
+    // with `opts` unchanged); pattern-family operands re-elevate below.
+    iter.set_in_dquote(saved_dq);
+
     // 4. Optional subscript `[…]`.
     let mut subscript: Option<SubscriptKind> = None;
     if matches!(iter.peek_kind()?, Some(TokenKind::LBracket)) {
         iter.next_kind()?; // consume LBracket
-        iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+        iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
         let sub_word = match parse_word(iter, false) {
             Ok(w) => w,
             Err(e) => {
                 iter.pop_mode(); // ParamSubscriptOperand
+                restore_dq!();
                 iter.pop_mode(); // ParamExpansion
                 return Err(e);
             }
@@ -597,6 +749,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
             Some(TokenKind::RBracket) => {}
             _ => {
                 iter.pop_mode(); // ParamSubscriptOperand
+                restore_dq!();
                 iter.pop_mode(); // ParamExpansion
                 return Err(ParseError::UnsupportedExpansion);
             }
@@ -666,14 +819,58 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     subscript: None,
                     indirect: false,
                 }
+            } else if name_decoded {
+                // `${$'x1'}` / `${a$'b'}` — a `$'…'`-decoded name in bare form.
+                // The oracle promotes the plain `Var` to `ParamExpansion{None}`
+                // so `declare -f` reconstructs the normalised `${x1}` form.
+                WordPart::ParamExpansion {
+                    name,
+                    modifier: ParamModifier::None,
+                    quoted,
+                    subscript: None,
+                    indirect: false,
+                }
             } else {
                 // `${name}` — plain variable reference.
                 WordPart::Var { name, quoted }
             }
         }
 
+        // ── Prefix-name expansion: `${!pfx*}` / `${!pfx@}` (indirect:false).
+        Some(TokenKind::ParamPrefixClose { at }) => {
+            WordPart::ParamExpansion {
+                name,
+                modifier: ParamModifier::PrefixNames { at },
+                quoted,
+                subscript: None,
+                indirect: false,
+            }
+        }
+
+        // ── Post-name bad substitution (`${x!}`, `${V@}`, `${-3}`, `${x@Z}`).
+        Some(TokenKind::ParamBadSubst { raw }) => {
+            WordPart::ParamExpansion {
+                name: String::new(),
+                modifier: ParamModifier::BadSubst { raw },
+                quoted,
+                subscript: None,
+                indirect: false,
+            }
+        }
+
         // ── Operator: pattern removal, substitute, case, transform, substring
         Some(TokenKind::ParamOp(op_kind)) => {
+            // Pattern-family operands (`#`/`%`/`/`/`^`/`,`) re-elevate the M-156
+            // gate so a NESTED `${…}` in the pattern sees the enclosing dquote
+            // (mirrors the oracle's `opts.with_in_dquote(quoted || opts.in_dquote)`).
+            // Value/error/substring operands keep the inherited value (`saved_dq`,
+            // already restored above).
+            if matches!(op_kind,
+                ParamOpKind::RemovePrefix(_) | ParamOpKind::RemoveSuffix(_)
+                | ParamOpKind::Substitute(_) | ParamOpKind::Case(_, _))
+            {
+                iter.set_in_dquote(m156_dq);
+            }
             // Macro: push a mode, parse_word, pop mode. On error pops ParamExpansion too.
             // NOTE: macros are scoped to this function.
             macro_rules! word_in_mode {
@@ -710,7 +907,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // Production: `modifier_with_operand(chars, quoted/false, ...)`.
                 // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
                 ParamOpKind::UseDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::UseDefault { word, colon },
@@ -718,7 +915,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::AssignDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::AssignDefault { word, colon },
@@ -727,7 +924,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 }
                 ParamOpKind::ErrorIfUnset(colon) => {
                     // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::ErrorIfUnset { word, colon },
@@ -735,7 +932,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::UseAlternate(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::UseAlternate { word, colon },
@@ -746,7 +943,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // ── Pattern removal: RemovePrefix / RemoveSuffix
                 // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
                 ParamOpKind::RemovePrefix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::RemovePrefix { pattern, longest },
@@ -754,7 +951,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::RemoveSuffix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::RemoveSuffix { pattern, longest },
@@ -775,7 +972,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     };
 
                     // Pattern in subst-pattern mode (sep = `/`).
-                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false });
+                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false, enclosing_dquote: false });
                     let pattern = match parse_word(iter, false) {
                         Ok(w) => { iter.pop_mode(); w }
                         Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -785,7 +982,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     let replacement =
                         if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
                             iter.next_kind()?; // consume `/`
-                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false)
+                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false)
                         } else {
                             Word(vec![])
                         };
@@ -801,7 +998,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
                 // Production: `scan_optional_braced_operand` — empty body → None.
                 ParamOpKind::Case(direction, all) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     let pattern = if word.0.is_empty() { None } else { Some(word) };
                     WordPart::ParamExpansion {
@@ -827,7 +1024,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // `Some(':') / Some('}') → recover_bad_subst` branch.
                 ParamOpKind::Substring => {
                     // Offset in substring-offset mode (sep = `:`).
-                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false });
+                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false, enclosing_dquote: false });
                     let offset = match parse_word(iter, false) {
                         Ok(w) => { iter.pop_mode(); w }
                         Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -837,7 +1034,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     let length =
                         if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
                             iter.next_kind()?; // consume `:`
-                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false))
+                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false))
                         } else {
                             None
                         };
@@ -866,12 +1063,14 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
         }
 
         _ => {
+            restore_dq!();
             iter.pop_mode(); // ParamExpansion
             return Err(ParseError::UnsupportedExpansion);
         }
     };
 
-    // 6. Pop the ParamExpansion frame.
+    // 6. Restore the M-156 gate flag and pop the ParamExpansion frame.
+    restore_dq!();
     iter.pop_mode();
     Ok(result)
 }
@@ -1059,7 +1258,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
             // expansion (matches `scan_array_literal`).
             Some(TokenKind::LBracket) => {
                 iter.next_kind()?; // consume LBracket
-                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
                 let sub_word = match parse_word(iter, false) {
                     Ok(w) => w,
                     Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -1748,6 +1947,10 @@ fn peek_leading_keyword(iter: &mut Lexer) -> Result<Option<Keyword>, ParseError>
             | Some(TokenKind::Op(_))
             | Some(TokenKind::RedirFd(_))
             | Some(TokenKind::Heredoc { .. })
+            // v264: a closing keyword (`}`/`done`/`fi`/`esac`) immediately before
+            // the backtick-body terminator (`` `…done` ``) is at a boundary —
+            // EndBacktick is the backtick analogue of `Op(RParen)` for `$( … )`.
+            | Some(TokenKind::EndBacktick)
     );
     Ok(if boundary { Some(kw) } else { None })
 }
@@ -1895,6 +2098,33 @@ fn parse_simple(iter: &mut Lexer) -> Result<Command, ParseError> {
     parse_simple_with_leading_word(iter, line, None)
 }
 
+/// v264 flip-fix (Finding 1): brace-expand an assembled COMMAND word and push
+/// the 1→N products onto `dest`, gated on the lexer's brace-expand flag
+/// (`set +B` disables it). Mirrors the oracle's `emit_word_with_braces`
+/// (lexer.rs), which brace-expands command words (program + args) and for/select
+/// in-list words at lex time — BEFORE the parser splits program/args or peels
+/// assignments — emitting N `Word` tokens. Quoted/escaped braces (`"{a,b}"`,
+/// `a\{b\}`) and braces inside expansions (`${x:-{a,b}}`) stay literal because
+/// `brace_expand_parts` sentinel-protects non-literal / quoted parts, so this
+/// reuse gets that for free. Applied ONLY at the command-assembly level (here and
+/// the for/select in-list collection), NEVER inside `parse_word_command` — that
+/// helper is SHARED by `[[ … ]]` operands and `case` patterns, which the oracle
+/// scans through paths that do NOT call `emit_word_with_braces`.
+fn push_command_word_brace_expanded(
+    dest: &mut Vec<Word>,
+    word: Word,
+    iter: &Lexer,
+) -> Result<(), ParseError> {
+    if !iter.brace_expand_enabled() {
+        dest.push(word);
+        return Ok(());
+    }
+    for parts in brace_expand_parts(word.0)? {
+        dest.push(Word(parts));
+    }
+    Ok(())
+}
+
 /// `parse_simple`, optionally seeded with an ALREADY-CONSUMED leading word
 /// (used by the `name()` funcdef lookahead in `parse_command`: it must consume
 /// the leading word to see whether `(` follows, and — when it does NOT —
@@ -1926,10 +2156,38 @@ fn parse_simple_with_leading_word(
     let mut all_words: Vec<Word> = Vec::new();
     let mut redirects: Vec<Redirection> = Vec::new();
     if let Some(w) = leading_word {
-        all_words.push(w);
+        // v264 flip-fix (Finding 1): the program word brace-expands too, matching
+        // the oracle (which emits N Words at lex time BEFORE program/arg split).
+        // The FIRST product becomes the program, the rest leading args — the
+        // program/arg split below reads `all_words[0]`=program, remainder=args.
+        push_command_word_brace_expanded(&mut all_words, w, iter)?;
     }
 
     loop {
+        // Trailing-blank alias chain: mirrors the oracle's arg-loop hook
+        // (`command.rs:2173-2175`). If the last command-position alias
+        // expansion ended with a blank, the next argument word is eligible
+        // for alias expansion too. `take_trailing_eligible()` returns `true`
+        // at most once per expansion (it resets the flag), so this is a
+        // no-op in the overwhelmingly common non-alias/non-trailing-blank
+        // case.
+        //
+        // The oracle's Word-token stream has no atom for inter-word
+        // whitespace (it's silently absorbed between tokens), so its hook
+        // always lands with the cursor ON the next real word. The atom
+        // stream DOES have an explicit `Blank` atom for a 2nd+ argument (the
+        // 1st argument's leading blank is already consumed by the caller —
+        // `parse_command`'s `consume_command_word` + blank-skip, and by
+        // `peek_leading_keyword`'s own leading-blank skip). Consulting
+        // `take_trailing_eligible()` while sitting ON that `Blank` would
+        // consume (and waste — `maybe_expand_command_alias` unconditionally
+        // resets the flag) the one-shot flag before reaching the real word,
+        // so defer to the iteration where the `Blank` has already been
+        // skipped (below) and the cursor sits on the real next atom.
+        let at_blank = matches!(iter.peek_kind()?, Some(TokenKind::Blank));
+        if !at_blank && iter.take_trailing_eligible() {
+            iter.expand_command_alias()?;
+        }
         let Some(token) = iter.peek_kind()? else { break };
         // Stage/list terminators — stop without consuming.
         if matches!(
@@ -2030,9 +2288,13 @@ fn parse_simple_with_leading_word(
                     | TokenKind::Tilde(_)
                     | TokenKind::BeginDquote
                     | TokenKind::AssignPrefix { .. }
+                    | TokenKind::ExtglobOpen { .. }
             )
         ) {
-            all_words.push(parse_word_command(iter, false)?);
+            // v264 flip-fix (Finding 1): argument command words brace-expand
+            // (1→N Words), matching the oracle's lex-time `emit_word_with_braces`.
+            let w = parse_word_command(iter, false)?;
+            push_command_word_brace_expanded(&mut all_words, w, iter)?;
             continue;
         }
         // Consume the token.
@@ -2146,6 +2408,13 @@ fn parse_simple_with_leading_word(
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
     skip_newlines(iter)?;
+    // Read-time alias expansion at command position (mirrors the oracle's
+    // `command.rs:1020` + `:2302` sites — this ONE choke point covers both,
+    // since `parse_pipeline` calls `parse_command` for the first stage and
+    // `finish_pipeline` calls it for every subsequent stage). Must run BEFORE
+    // the ArithBlock/LParen/keyword dispatch below so `alias x=if` expands to
+    // the reserved word before the reserved-word check runs.
+    iter.expand_command_alias()?;
     // EOF with no token.
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::MissingCommand);
@@ -2344,6 +2613,8 @@ fn is_word_boundary_tok(t: Option<&TokenKind>) -> bool {
             | Some(TokenKind::Op(_))
             | Some(TokenKind::RedirFd(_))
             | Some(TokenKind::Heredoc { .. })
+            // v264: backtick-body terminator, the analogue of `Op(RParen)`.
+            | Some(TokenKind::EndBacktick)
     )
 }
 
@@ -2570,6 +2841,19 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
 /// Stops (without consuming) at EOF, case terminators (`;;`/`;&`/`;;&`),
 /// or a `stop_at` keyword.
 pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequence, ParseError> {
+    parse_and_or_opts(iter, stop_at, false)
+}
+
+/// The shared body of [`parse_and_or`]. When `stop_at_top_newline` is set, a
+/// top-level `TokenKind::Newline` terminates the command UNIT (used by
+/// [`parse_one_unit`] for the non-interactive script reader); otherwise a
+/// top-level newline is a Semi-like continue connector. Mirrors the oracle's
+/// `command::parse_sequence_opts`.
+fn parse_and_or_opts(
+    iter: &mut Lexer,
+    stop_at: &[Keyword],
+    stop_at_top_newline: bool,
+) -> Result<Sequence, ParseError> {
     let first = parse_command_then_pipeline(iter)?;
     let mut rest: Vec<(Connector, Command)> = Vec::new();
     let mut background = false;
@@ -2644,6 +2928,18 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
 
             // ── `;` or newline — semi-like connector ─────────────────────────
             TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
+                // v264 unit mode: a top-level NEWLINE ends the command unit
+                // (already consumed as `token`). Drain any heredoc-body atom
+                // groups the lexer emitted for THIS unit's line — the atom path
+                // emits them after the newline, unlike the oracle which
+                // pre-collects during tokenization — so `fill_sequence` can
+                // attach them; then end the unit WITHOUT skipping inter-unit
+                // newlines or parsing the next command. `;` still separates
+                // within a unit.
+                if stop_at_top_newline && matches!(token, TokenKind::Newline) {
+                    collect_heredoc_bodies_after_newline(iter)?;
+                    break;
+                }
                 skip_newlines(iter)?;
                 // ── Stop check 3: stop_at keyword after `;`/newline (~958) ───
                 if peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false) {
@@ -2950,7 +3246,7 @@ fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
 /// `parse_cursor` in `command.rs`.
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
-pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     // v259 CF2: discard any heredoc bodies leaked by a prior parse that errored
     // after pushing them (take_heredoc_bodies drains only on this fn's success
     // path). Safe: the atom parse_sequence is the single non-reentrant top-level
@@ -2977,6 +3273,30 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     }
     // v250 T3: attach every heredoc body collected along the way (in source
     // order == emission order) to its still-empty placeholder.
+    let mut bodies = iter.take_heredoc_bodies().into_iter();
+    fill_sequence(&mut seq, &mut bodies);
+    Ok(Some(seq))
+}
+
+/// v264: parse ONE top-level command unit from the atom stream, stopping at
+/// (and consuming) the next top-level newline or EOF. Skips leading blank
+/// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. The atom
+/// analog of `command::parse_one_unit`, used by the non-interactive script
+/// reader (`run_sourced_contents_in_sinks`).
+pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    // Discard any heredoc bodies leaked by a prior unit that errored after
+    // pushing them (mirrors parse_sequence's CF2 hygiene). take_heredoc_bodies
+    // drains only on the success path below, so on a clean loop this is a no-op.
+    let _ = iter.take_heredoc_bodies();
+    // Skip leading Newline/Blank atoms (and any heredoc-body groups) — mirrors
+    // parse_sequence's leading skip and the oracle's leading-newline skip.
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
+        return Ok(None);
+    }
+    let mut seq = parse_and_or_opts(iter, &[], true)?;
+    // Attach heredoc bodies collected for this unit (no stray-terminator check —
+    // more units may follow; the caller loops).
     let mut bodies = iter.take_heredoc_bodies().into_iter();
     fill_sequence(&mut seq, &mut bodies);
     Ok(Some(seq))
@@ -3272,7 +3592,12 @@ fn parse_for(iter: &mut Lexer) -> Result<Command, ParseError> {
             if stop { break; }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
-                _ => words.push(parse_word_command(iter, false)?),
+                // v264 flip-fix (Finding 1): for-loop in-list words brace-expand
+                // (oracle: `emit_word_with_braces` is called for for/select lists).
+                _ => {
+                    let w = parse_word_command(iter, false)?;
+                    push_command_word_brace_expanded(&mut words, w, iter)?;
+                }
             }
         }
         true
@@ -3321,7 +3646,11 @@ fn parse_select(iter: &mut Lexer) -> Result<Command, ParseError> {
             if stop { break; }
             match iter.peek_kind()? {
                 Some(TokenKind::Op(_)) => return Err(ParseError::UnexpectedToken),
-                _ => list.push(parse_word_command(iter, false)?),
+                // v264 flip-fix (Finding 1): select in-list words brace-expand too.
+                _ => {
+                    let w = parse_word_command(iter, false)?;
+                    push_command_word_brace_expanded(&mut list, w, iter)?;
+                }
             }
         }
         Some(list)
@@ -4002,7 +4331,7 @@ mod tests {
         let _ = TokenKind::ParamOpen { quoted: false };
         let _ = TokenKind::Lit { text: "x".into(), quoted: false };
         let _ = ParamOpKind::Substitute(SubstKind::All);
-        let _ = Mode::ParamWordOperand { in_dquote: false };
+        let _ = Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false };
         let _ = ParseError::UnsupportedExpansion;
     }
 
@@ -4184,6 +4513,125 @@ mod tests {
     /// Error parity: the new parser must return the SAME error as the oracle.
     fn diff_err(s: &str) {
         assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
+    }
+
+    // ── v264 alias differential harness ─────────────────────────────────────
+
+    fn old_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
+        let mut al = std::collections::HashMap::new();
+        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
+        let mut lx = Lexer::new_live(s, &al, LexerOptions::default());
+        crate::command::parse(&mut lx)
+    }
+    fn new_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
+        let mut al = std::collections::HashMap::new();
+        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
+        let mut lx = Lexer::new_live_atoms(s, &al, LexerOptions::default());
+        super::parse_sequence(&mut lx)
+    }
+    fn diff_al(s: &str, pairs: &[(&str, &str)]) {
+        assert_eq!(new_seq_al(s, pairs), old_seq_al(s, pairs), "alias mismatch for {s:?} with {pairs:?}");
+    }
+
+    #[test]
+    fn atoms_alias_expansion_matches_oracle() {
+        diff_al("foo", &[("foo", "echo hi")]);                       // basic
+        diff_al("foo bar", &[("foo", "echo")]);                      // alias + arg
+        diff_al("x true", &[("x", "if")]);                           // alias→keyword
+        diff_al("a c", &[("a", "b "), ("b", "echo"), ("c", "hello")]); // trailing-blank chains to arg
+        diff_al("a hi", &[("a", "b "), ("b", "echo")]);              // trailing-blank, arg not alias
+        diff_al("a c", &[("a", "echo"), ("c", "hello")]);            // NO trailing blank: arg NOT expanded
+        diff_al("a x y", &[("a", "echo "), ("x", "X"), ("y", "Y")]); // trailing-blank stops at 2nd arg
+        diff_al("ls /dev/null", &[("ls", "ls -a")]);                 // recursion guard
+        diff_al("greet", &[("greet", "echo hi")]);                   // simple
+        diff_al("printf x", &[("printf", "echo ALIAS")]);            // unquoted expands
+        diff_al("'printf' x", &[("printf", "echo ALIAS")]);          // quoted does NOT expand
+        diff_al("foo | bar", &[("foo", "echo hi"), ("bar", "cat")]); // pipeline stages both expand
+        diff_al("notanalias", &[("foo", "echo")]);                   // non-alias unchanged
+        diff_al("foo$x", &[("foo", "echo")]);                        // glued expansion: NOT a bare name → no expand
+    }
+
+    #[test]
+    fn atoms_command_word_brace_and_wordstart_gaps() {
+        // Finding 1 — command-word brace expansion:
+        diff_cmd("echo {b,c}");
+        diff_cmd("echo a{1,2,3}z");
+        diff_cmd("echo {1..4}");
+        diff_cmd("cp x{,.bak}");
+        diff_cmd("{echo,ls} x");                 // program word expands
+        diff_cmd("for i in {1..3}; do echo $i; done");
+        // must NOT expand / stay literal (oracle parity):
+        diff_cmd("echo \"{a,b}\"");
+        diff_cmd("echo a\\{b\\}");
+        diff_cmd("echo ${x:-{a,b}}");
+        // case-pattern / `[[ ]]`-operand braces: the brief's regression guard
+        // ASSUMED these were oracle==atom parity (its comment: "oracle does NOT
+        // brace-expand"). Empirically that premise is FALSE — the Word-lexer
+        // (oracle) DOES brace-expand case patterns and `[[ ]]` operands at lex
+        // time (`{a}` alone parses on both paths, but the COMMA form `{a,b}`
+        // expands into two Words and BREAKS the oracle's parse). bash itself does
+        // NOT brace-expand in these positions (they stay literal patterns/
+        // operands), so the atom path — which keeps them literal (Finding 1's fix
+        // is applied ONLY at command/for/select assembly, never inside the shared
+        // `parse_word_command`) — matches BASH and is CLOSER TO BASH than the
+        // buggy oracle. Per the established live-flip convention for an "atom ≥
+        // bash, oracle buggy" case (see `atoms_function_assignment_name_divergence`
+        // CF9, and CF8/CF10 in the carry-forward inventory), we KEEP the atom's
+        // correct behavior and PIN the divergence rather than reproduce the
+        // oracle's bug. Auto-resolves in the atom's favor when the oracle scanner
+        // is deleted at the flip.
+        assert!(new_seq("case x in {a,b}) echo m;; esac").is_ok()
+            && old_seq("case x in {a,b}) echo m;; esac").is_err(),
+            "PINNED divergence: atom parses `case … {{a,b}} …` literally (bash-correct); \
+             oracle brace-expands + errors. atom={:?} oracle={:?}",
+            new_seq("case x in {a,b}) echo m;; esac"),
+            old_seq("case x in {a,b}) echo m;; esac"));
+        assert!(new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok()
+            && old_seq("[[ {a,b} == x ]] && echo y || echo n").is_err(),
+            "PINNED divergence: atom parses `[[ {{a,b}} == x ]]` literally (bash-correct); \
+             oracle brace-expands + errors. atom={:?} oracle={:?}",
+            new_seq("[[ {a,b} == x ]] && echo y || echo n"),
+            old_seq("[[ {a,b} == x ]] && echo y || echo n"));
+        // sanity: the NON-comma brace form (which does not expand) IS oracle-parity
+        // in these positions, confirming the divergence is brace-expansion-driven.
+        diff_cmd("case x in {a}) echo m;; esac");
+        diff_cmd("[[ {a} == x ]] && echo y");
+        // Finding 2 — word-start leak after ) :
+        diff_cmd("echo a$(true)#b");
+        diff_cmd("echo $(true)#b");
+        diff_cmd("echo $(echo X)~root");
+        diff_cmd("echo $(echo X) #comment");     // spaced: # IS a comment — stays correct
+        diff_cmd("(echo a); echo b");            // subshell close must still arm word-start
+    }
+
+    #[test]
+    fn atoms_param_head_matches_oracle() {
+        // (2) extquote in name (dquote context):
+        diff_cmd(r#"x1=not; echo "${$'x1'}""#);
+        diff_cmd(r#"ab=Z; echo "${a$'b'}""#);
+        diff_cmd(r#"x=notOK; x1=not; echo "${x#${$'x1'%$'t'}}""#);
+        diff_cmd(r#"x=foo; echo "${x#$'f'}""#);   // ANSI-C in operand
+        diff_cmd(r#"x=aXb; echo "${x#$'a'}""#);
+        // M-156 gate + invalid names → bad-subst:
+        diff_cmd(r#"echo "${'x1'}""#);
+        diff_cmd(r#"echo "${"x1"}""#);
+        diff_cmd(r#"echo ${$'x1'}"#);             // decoded name UNQUOTED → oracle's call
+        // (3) prefix-name expansion:
+        diff_cmd("echo ${!_Q*}");
+        diff_cmd("echo ${!_Q@}");
+        diff_cmd("echo ${!NOSUCHPFX_ZZ*}");
+        diff_cmd("echo ${!x@Q}");                 // transform on indirect, NOT prefix
+        // (4) bad-subst forms:
+        diff_cmd("echo ${$x}");
+        diff_cmd("echo ${V@}");
+        diff_cmd("echo ${-3}");
+        // regression guards — these must stay UNCHANGED:
+        diff_cmd("echo ${x}");
+        diff_cmd("echo ${#x}");
+        diff_cmd("echo ${!x}");                   // plain indirect
+        diff_cmd("echo ${x@Q}");                  // valid transform
+        diff_cmd("echo ${@}"); diff_cmd("echo ${*}"); diff_cmd("echo ${$}"); diff_cmd("echo ${-}");
+        diff_cmd("echo ${x:-y}");
     }
 
     // v247 T2 tests
@@ -6884,5 +7332,149 @@ mod tests {
         // Guards — must STAY byte-identical.
         diff_cmd("${#a}");           // plain length, no subscript
         diff_cmd("${a[0]}");         // subscript, no length → modifier None
+    }
+
+    #[test]
+    fn atoms_operand_enclosing_dquote_matches_oracle() {
+        // value operands inside "…": single-quotes are literal, dquote backslash rules.
+        diff_cmd(r#"echo "${x:-'a|b'}""#);
+        diff_cmd(r#"echo "${x:='d'}""#);
+        diff_cmd(r#"echo "${x:+'a|b'}""#);
+        diff_cmd(r#"echo "${x-'a'}""#);
+        diff_cmd(r#"echo "${x+'A'}""#);
+        diff_cmd(r#"echo "${x:-\*}""#);      // \* kept
+        diff_cmd(r#"echo "${x:-a\nb}""#);    // \n kept
+        diff_cmd(r#"echo "${x:-a\$b}""#);    // \$ -> $ (coincides; regression guard)
+        diff_cmd(r#"echo "${x:-x\"z}""#);    // \" -> " (regression guard)
+        diff_cmd(r#"echo "${x:-a\\b}""#);    // \\ -> \ (regression guard)
+        diff_cmd(r#"echo "${x:-$y}""#);      // var in dquote operand (regression guard)
+        // UNQUOTED operands must be UNCHANGED (enclosing_dquote=false):
+        diff_cmd("echo ${x:-'a|b'}");        // unquoted: single-quote IS a span
+        diff_cmd(r#"echo ${x:-\*}"#);        // unquoted backslash
+        // enclosing_dquote=false operators unchanged:
+        diff_cmd(r#"echo "${x#'z'}""#);      // RemovePrefix pattern: enclosing_dquote=false
+        diff_cmd(r#"echo "${x:?'m'}""#);     // ErrorIfUnset: enclosing_dquote=false
+    }
+
+    // ── v264 parse_one_unit differential ─────────────────────────────────────
+    // Drive BOTH the oracle `command::parse_one_unit` and the atom
+    // `parse_one_unit` in a loop over the same script, comparing unit-by-unit.
+    fn old_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        let mut lx = Lexer::from_tokens(toks);
+        drive_units(&mut |i: &mut Lexer| crate::command::parse_one_unit(i), &mut lx)
+    }
+    fn new_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        drive_units(&mut super::parse_one_unit, &mut lx)
+    }
+    fn drive_units(
+        f: &mut dyn FnMut(&mut Lexer) -> Result<Option<Sequence>, ParseError>,
+        lx: &mut Lexer,
+    ) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let mut out = Vec::new();
+        loop {
+            let r = f(lx);
+            let stop = matches!(r, Ok(None) | Err(_));
+            out.push(r);
+            if stop { break; }
+        }
+        out
+    }
+    fn diff_unit(s: &str) {
+        assert_eq!(new_unit(s), old_unit(s), "parse_one_unit mismatch for {s:?}");
+    }
+
+    #[test]
+    fn atoms_parse_one_unit_matches_oracle() {
+        diff_unit("a\nb\nc");              // three units on three lines
+        diff_unit("a; b\nc");             // `;` stays intra-unit; newline splits
+        diff_unit("a && b\nc || d");      // connectors intra-unit
+        diff_unit("a &\nb");             // background then newline
+        diff_unit("\n\na\n\nb\n");        // leading/among/trailing blank lines
+        diff_unit("a\n");                // single unit, trailing newline
+        diff_unit("");                    // empty → one Ok(None)
+        diff_unit("   \n  a  \n");        // blank-ish lines + surrounding blanks
+        diff_unit("if x; then y; fi\nz"); // compound spanning `;`, then next unit
+        diff_unit("f() {\n:\n}\ng");      // compound spanning NEWLINES, then next unit
+        diff_unit("for i in 1 2; do echo $i; done\ndone_marker");
+        diff_unit("cat <<EOF\nhi $x\nEOF\necho next"); // heredoc body drained in-unit
+        diff_unit("cat <<'EOF'\nlit\nEOF\nafter");     // literal heredoc, then next unit
+        diff_unit("a | b\nc");            // pipeline intra-unit
+    }
+
+    // ── v264 extglob differential (atom-native vs oracle) ───────────────────
+    // Extglob is gated by `LexerOptions::extglob` (default off); these helpers
+    // turn it ON for both the oracle (`command::parse`, driven by
+    // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
+    fn old_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions { extglob: true, ..Default::default() }).expect("lex");
+        crate::command::parse(&mut Lexer::from_tokens(toks))
+    }
+    fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions { extglob: true, ..Default::default() });
+        super::parse_sequence(&mut lx)
+    }
+    fn diff_eg(s: &str) { assert_eq!(new_eg(s), old_eg(s), "extglob mismatch for {s:?}"); }
+
+    #[test]
+    fn atoms_extglob_matches_oracle() {
+        diff_eg("echo +(a|b)");
+        diff_eg("echo @(a|cd)");
+        diff_eg("echo !(a|ab)");
+        diff_eg("echo *(a)");
+        diff_eg("echo ?(abc)");
+        diff_eg("echo +([a-c])");
+        diff_eg("echo zzz+(q)");            // glued prefix literal
+        diff_eg("echo +(a|b)*");            // glued trailing
+        diff_eg("echo dir*/+(foo|bar).txt"); // multi-component glue
+        diff_eg("echo @(a*(b)c)");           // NESTED extglob group (paren depth > 1)
+        diff_eg("echo +($x)");               // inner param
+        diff_eg("echo @(a|$(echo b))");      // inner COMMAND SUB (the RULE-critical case)
+        diff_eg("echo +(${v})");             // inner ${...}
+        diff_eg("[[ aab == +(a|b) ]] && echo y || echo n");
+        diff_eg("[[ abbbc == @(a*(b)c) ]] && echo y || echo n");
+        diff_eg("[[ file.txt == +([a-z]).txt ]] && echo y || echo n");
+        diff_eg("case hello in +([a-z])) echo lc;; *) echo o;; esac");
+        diff_eg("case cd in @(ab|cd)) echo m;; *) echo o;; esac");
+        // extglob OFF: `+(` is NOT extglob — regression guard (default opts).
+        // Both the oracle and the atom path already reject a bare unquoted `(`
+        // mid-word identically (`Err(UnexpectedToken)`, pre-existing/unrelated
+        // to extglob) — `diff_err` (not `diff_cmd`) is the correct comparison
+        // for a case where BOTH sides error the same way rather than succeed.
+        diff_err("echo +(a)");               // extglob off: oracle+atom both treat as-is
+    }
+
+    // ── v264 nested-body flip: route cmdsub / backtick bodies to the ATOM
+    // scanner (was hardcoded to the oracle) so `[[ … ]]` / extglob groups parse
+    // instead of mis-parsing or hanging. ───────────────────────────────────────
+    #[test]
+    fn atoms_dbracket_extglob_in_nested_bodies() {
+        // [[ … ]] inside cmdsub / backtick:
+        diff_cmd("echo $( [[ a == a ]] && echo Y )");
+        diff_cmd("echo `[[ a == a ]] && echo Y`");
+        diff_cmd("x=$( [[ a == a ]] && echo Y ); echo $x");
+        diff_cmd("echo $( [[ -n foo && bar == bar ]] && echo Y )");
+        // heredoc-embedded cmdsub (Gap 1 regression guards):
+        diff_cmd("cat <<EOF\n$(echo hi)\nEOF\n");
+        diff_cmd("cat <<EOF\n${y:-d} and $(echo hi)\nEOF\n");
+        // backtick word-splitting (Gap 2 regression guards):
+        diff_cmd("cat <<EOF\n`echo $x`\nEOF\n");
+        diff_cmd("echo `echo $x`");
+        diff_cmd("echo `echo one two three`");
+        // v264 follow-up: a `#` at a cmdsub/backtick BODY-START is a comment
+        // (the body begins at a fresh word start), so the `)` inside the
+        // comment does NOT close the cmdsub early. Midword `#` stays literal;
+        // `#` after `;`/`|` (which reset word-start) is a comment.
+        diff_cmd("echo \"[$(# c with ) paren\necho yo)]\"");
+        diff_cmd("echo \"[$(echo a#b)]\"");
+        diff_cmd("x=$(echo a;# c\necho b)");
+    }
+
+    #[test]
+    fn atoms_extglob_in_nested_bodies() {
+        diff_eg("shopt -s extglob\necho $( [[ foo == @(foo|bar) ]] && echo 1 )");
+        diff_eg("echo $( [[ z == !(a|b) ]] && echo 7 )");
+        diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
     }
 }
