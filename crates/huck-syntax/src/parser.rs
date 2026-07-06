@@ -130,6 +130,13 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                     }
                 }
             }
+            // v263: a bare `'…'` inside a SUBSCRIPT operand (scan_step_param_operand
+            // emits QuoteRun{Single} only when end==']') wraps in Quoted{Single} to
+            // match the oracle's scan_subscript. QuoteRun reaches parse_word solely
+            // from Mode::ParamSubscriptOperand; value families keep emitting flat Lit.
+            TokenKind::QuoteRun { style, text } => {
+                parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] });
+            }
             _ => {
                 // Unexpected atom in operand context.
                 return Err(ParseError::UnsupportedExpansion);
@@ -6829,5 +6836,31 @@ mod tests {
         diff_cmd("case x in a) ! b;; esac");   // bespoke case-item path
         diff_cmd("{ a; }");                    // no bang
         diff_cmd("!a");                        // glued — not a bang word
+    }
+
+    #[test]
+    fn atoms_subscript_quote_wrap() {
+        // v263: a bare "…"/'…' in a SUBSCRIPT operand (array-literal [sub]= and
+        // param-expansion ${a[sub]}) wraps in Quoted{Double}/Quoted{Single} to
+        // match the oracle's scan_subscript. Value families stay flat (guards).
+        diff_cmd("a=([\"k\"]=v)");
+        diff_cmd("a=(['k']=v)");
+        diff_cmd("a=([\"\"]=v)");
+        diff_cmd("a=(['']=v)");
+        diff_cmd("a=([\"k$x\"]=v)");
+        diff_cmd("a=([x\"y\"z]=v)");
+        diff_cmd("a=([x'y'z]=v)");
+        diff_cmd("a+=([\"k\"]=v)");
+        diff_cmd("${a[\"k\"]}");
+        diff_cmd("${a['k']}");
+        diff_cmd("${a[x\"y\"]}");
+        diff_cmd("declare -A m=([\"k\"]=v)");
+        // Regression guards — must STAY byte-identical.
+        diff_cmd("${x:-\"y\"}");      // value operand — FLAT (not wrapped)
+        diff_cmd("${x:-'y'}");        // value single-quote — FLAT
+        diff_cmd("a=([$\"k\"]=v)");   // v259 F3 dquote — already wraps
+        diff_cmd("${a[$\"k\"]}");     // F3 in param-expansion subscript
+        diff_cmd("a=([k]=v)");        // plain — flat quoted:false
+        diff_cmd("${a[k]}");          // plain
     }
 }
