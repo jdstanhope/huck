@@ -93,6 +93,9 @@ pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
         LexError::SubstitutionParseError(inner) => {
             format!(" in command substitution: {}", parse_error_message_impl(inner))
         }
+        LexError::SubscriptParseError(inner) => {
+            format!(": {}", parse_error_message_impl(inner))
+        }
         LexError::UnterminatedHeredoc => ": unterminated here-document".to_string(),
         LexError::AnsiCInvalidCodepoint(v) => {
             format!(": invalid Unicode codepoint in $'...' escape: U+{:04X}", v)

@@ -10,6 +10,12 @@ pub enum LexError {
     EmptyParamName,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
+    /// A `[…]` subscript fragment (assignment lvalue) that the atom-parser
+    /// bridge `parser::parse_fragment_word` could not parse (e.g. an
+    /// unterminated quote/substitution inside the subscript). Kept distinct
+    /// from `SubstitutionParseError` so the rendered message does not claim
+    /// "in command substitution" for what is actually a subscript error.
+    SubscriptParseError(crate::command::ParseError),
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
@@ -3273,7 +3279,8 @@ impl<'a> Lexer<'a> {
                             self.parts.is_empty(),
                             "word_is_identifier_so_far guarantees no prior parts"
                         );
-                        let subscript = parse_subscript_body(&raw_subscript, self.opts)?;
+                        let subscript = crate::parser::parse_fragment_word(&raw_subscript, self.opts)
+                            .map_err(LexError::SubscriptParseError)?;
                         self.in_assignment_value = true;
                         self.has_token = true;
                         self.parts.push(WordPart::AssignPrefix {
@@ -4228,7 +4235,8 @@ impl<'a> Lexer<'a> {
                     Some(append) => {
                         // Confirmed indexed assignment. Parse the subscript (leaf
                         // helper), then advance the real cursor to where `bracket` sits.
-                        let subscript = parse_subscript_body(&raw, self.opts)?;
+                        let subscript = crate::parser::parse_fragment_word(&raw, self.opts)
+                            .map_err(LexError::SubscriptParseError)?;
                         self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
                         self.cmd_at_word_start = false;
                         self.in_assignment_value = true;
