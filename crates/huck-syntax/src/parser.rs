@@ -5724,6 +5724,41 @@ mod tests {
         diff_cmd("echo $[ \"]\" ]");
         diff_cmd("echo $[ \\] ]");
         diff_cmd("echo $[']']");
+        // v261 T1 review-B: `\` is retained verbatim and protects ONLY a `]`/`[`
+        // delimiter; a `\` before `$`/other lets the next char re-expand (matches the
+        // oracle two-pass `arith_string_to_word`), so `\$x` → `[" \", Var{x}, " "]`.
+        diff_cmd("echo $[ \\$x ]");
+    }
+
+    #[test]
+    fn atoms_arith_squote_blind_bail() {
+        // v261 T1 review-A regression guard: Paren delimiters (`$((`/`((`/`for ((`)
+        // are quote-BLIND even inside single-quotes — the oracle `scan_arith_body`
+        // counts `(`/`)`/`;` regardless of quotes (quote-removal is a separate second
+        // pass), so a `(`/`)`/for-header `;` inside a `'…'` span must still fire the
+        // depth/close/bail events, NOT be swallowed as a literal.
+        diff_cmd("echo $(( ')' ))");   // bails to CommandSub{Subshell{'...'}}
+        diff_cmd("echo $(( '(' ))");
+        diff_cmd("(( ')' ))");
+        diff_err("for (( '(' ; ; )); do :; done");   // both Err(UnterminatedLoop)
+    }
+
+    #[test]
+    fn atoms_legacy_arith_backslash_quote_carryforward() {
+        // v261 T1 NEW live-flip carry-forward: `\` before a QUOTE char in legacy
+        // `$[ … ]`. The review-B fix retains `\` verbatim and re-processes the next
+        // char (so `$`/backtick re-expand) unless it's a `]`/`[` delimiter. But a
+        // `\'`/`\"` then lets the `'`/`"` OPEN a quote-removal span that is genuinely
+        // unmatchable in the atom's ONE pass — the oracle's TWO-pass model protects
+        // the `\c` in pass 1 (scan_legacy_arith_body) then re-interprets it in pass 2
+        // (arith_string_to_word), yielding body `" \ "`. The atom instead runs off the
+        // end of the (now-quoted) body and lex-errors. Same exotic two-pass-vs-one-pass
+        // class as other source-position pins. `old_seq` panics on this (Ok w/ lex OK,
+        // but the atom errors), so assert the atom side only.
+        assert!(new_seq("echo $[ \\' ]").is_err(),  // oracle: Ok body \" \\ \"
+                "atom one-pass runs off the unmatchable squote-after-backslash span");
+        assert!(new_seq("echo $[ \\\" ]").is_err(), // oracle: Ok body \" \\ \"
+                "atom one-pass runs off the unmatchable dquote-after-backslash span");
     }
 
     #[test]

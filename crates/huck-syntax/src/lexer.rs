@@ -2058,16 +2058,22 @@ impl<'a> Lexer<'a> {
                     }
                     return Err(LexError::UnterminatedArith);
                 }
-                // Inside a single-quoted span: only `'` closes it; everything else
-                // (incl. `$`, `` ` ``, `\`, delimiters) is literal, no expansion.
+                // Inside a single-quoted span single-quote is DELIM-AWARE, exactly
+                // like double-quote: it suppresses `$`/backtick/`\`-escaping (those
+                // arms are `!squote`-guarded → fall to the catch-all as literals) but
+                // does NOT gate the delimiters. A Paren `(`/`)`/for-header `;` still
+                // fires (the oracle `scan_arith_body` is fully quote-blind), while a
+                // Bracket `[`/`]` fails the `(!squote && !dquote)` guard and falls to
+                // the catch-all as a protected literal (the oracle `scan_legacy_arith_body`
+                // tracks quote spans). `'` closes the span; `"` is a literal.
                 Some('\'') if squote => {
                     self.cursor.next();
                     squote = false;
                     sync_quotes!();
                 }
-                Some(ch) if squote => {
+                Some('"') if squote => {
                     self.cursor.next();
-                    text.push(ch);
+                    text.push('"');
                 }
                 // Quote openers/closers (not in single-quote here). A `'` inside a
                 // double-quote is literal; otherwise it OPENS a single-quote (drop
@@ -2087,17 +2093,17 @@ impl<'a> Lexer<'a> {
                     dquote = !dquote;
                     sync_quotes!();
                 }
-                Some(oc) if oc == open_char && (matches!(delim, ArithDelim::Paren) || !dquote) => {
+                Some(oc) if oc == open_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     self.cursor.next();
                     text.push(oc);
                     depth += 1;
                 }
-                Some(cc) if cc == close_char && depth > 0 && (matches!(delim, ArithDelim::Paren) || !dquote) => {
+                Some(cc) if cc == close_char && depth > 0 && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     self.cursor.next();
                     text.push(cc);
                     depth -= 1;
                 }
-                Some(cc) if cc == close_char && (matches!(delim, ArithDelim::Paren) || !dquote) => {
+                Some(cc) if cc == close_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     // depth == 0: flush any pending literal FIRST (emit the
                     // terminator/bail on the NEXT call), else classify now.
                     if !text.is_empty() {
@@ -2129,7 +2135,7 @@ impl<'a> Lexer<'a> {
                     }
                     return Ok(Step::Produced);
                 }
-                Some('`') => {
+                Some('`') if !squote => {
                     if !text.is_empty() {
                         sync_depth!();
                         self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
@@ -2139,7 +2145,7 @@ impl<'a> Lexer<'a> {
                     self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
                     return Ok(Step::Produced);
                 }
-                Some('$') => {
+                Some('$') if !squote => {
                     // Classify what follows `$` (Task 4 adds the `$((` nested-arith branch).
                     // NOTE: arithmetic contexts always treat embedded expansions as
                     // `quoted: true` (matches the production oracle `arith_string_to_word`,
@@ -2273,7 +2279,7 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
-                Some('\\') => {
+                Some('\\') if !squote => {
                     if dquote {
                         // Double-quote `\`-escape table (matches arith_string_to_word):
                         // `\` before `" \ $ ` `` drops the backslash and keeps the
@@ -2286,15 +2292,20 @@ impl<'a> Lexer<'a> {
                         }
                     } else {
                         match delim {
-                            // `$[`: `\` protects the NEXT char (consume it raw, incl. a
-                            // `]`/`[`) so it can't close the bracket — matches
-                            // scan_legacy_arith_body. Both chars are retained literally.
+                            // `$[`: `\` is retained VERBATIM and protects only a
+                            // `]`/`[` DELIMITER (consume+push it so it can't close the
+                            // bracket). For any OTHER next char, do NOT consume it — the
+                            // main loop re-processes it, so `$`/backtick still expand and
+                            // plain chars are pushed literally by the catch-all. This
+                            // matches the oracle two-pass model: scan_legacy_arith_body
+                            // protects only the delimiter in pass 1, then
+                            // arith_string_to_word re-expands the retained `\c` in pass 2.
                             ArithDelim::Bracket => {
                                 self.cursor.next(); // `\`
                                 text.push('\\');
-                                if let Some(n) = self.cursor.peek().copied() {
-                                    self.cursor.next();
-                                    text.push(n);
+                                match self.cursor.peek().copied() {
+                                    Some(nc @ (']' | '[')) => { self.cursor.next(); text.push(nc); }
+                                    _ => { /* do NOT consume — main loop re-processes */ }
                                 }
                             }
                             // `$((`: `\` is a plain literal (scan_arith_body is
