@@ -2303,8 +2303,18 @@ impl<'a> Lexer<'a> {
                             ArithDelim::Bracket => {
                                 self.cursor.next(); // `\`
                                 text.push('\\');
+                                // Consume+retain the next char ONLY if it is a delimiter
+                                // (`]`/`[`) or a second `\`. The oracle scan_legacy_arith_body
+                                // pairs `\` with ANY next char, but for the atom single pass
+                                // only these three matter: `]`/`[` must be protected from
+                                // closing, and a `\` must be paired-and-consumed so a
+                                // following delimiter stays LIVE (`\\]` → oracle keeps `]` a
+                                // delimiter; not consuming the 2nd `\` would re-read it as a
+                                // fresh escape and wrongly protect the `]`). `$`/`` ` ``/others
+                                // are left for the main loop to re-expand (matches pass 2);
+                                // `'`/`"` open a span (the pinned two-pass residual).
                                 match self.cursor.peek().copied() {
-                                    Some(nc @ (']' | '[')) => { self.cursor.next(); text.push(nc); }
+                                    Some(nc @ (']' | '[' | '\\')) => { self.cursor.next(); text.push(nc); }
                                     _ => { /* do NOT consume — main loop re-processes */ }
                                 }
                             }

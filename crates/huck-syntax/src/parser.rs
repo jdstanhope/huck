@@ -5797,6 +5797,13 @@ mod tests {
         diff_cmd("echo $[ \"$x\" ]");   // dquote expands, protects, removed
         diff_cmd("echo $[ ${x:-]} ]");  // ${…} already protects (regression)
         diff_cmd("echo $[ $(echo ]) ]"); // $(…) already protects (regression)
+        // Backslash-RUN before a delimiter: the oracle pairs `\` with any next
+        // char, so an EVEN run leaves the following `]` a LIVE delimiter. The
+        // atom pairs `\`+`\` (and `\`+`]`/`[`) so runs are consumed correctly.
+        diff_cmd("echo $[ \\\\] ]");    // \\]  → Arith " \\\\" + arg "]"
+        diff_cmd("echo $[ \\\\\\] ]");  // \\\] → ] protected (odd run)
+        diff_cmd("echo $[ \\$x ]");     // \$x  → " \\" + Var x (re-expands)
+        diff_cmd("echo $[ \\\\$x ]");   // \\$x → " \\\\" + Var x
     }
 
     #[test]
