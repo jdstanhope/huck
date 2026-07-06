@@ -7353,6 +7353,13 @@ mod tests {
         diff_cmd("cat <<EOF\n`echo $x`\nEOF\n");
         diff_cmd("echo `echo $x`");
         diff_cmd("echo `echo one two three`");
+        // v264 follow-up: a `#` at a cmdsub/backtick BODY-START is a comment
+        // (the body begins at a fresh word start), so the `)` inside the
+        // comment does NOT close the cmdsub early. Midword `#` stays literal;
+        // `#` after `;`/`|` (which reset word-start) is a comment.
+        diff_cmd("echo \"[$(# c with ) paren\necho yo)]\"");
+        diff_cmd("echo \"[$(echo a#b)]\"");
+        diff_cmd("x=$(echo a;# c\necho b)");
     }
 
     #[test]

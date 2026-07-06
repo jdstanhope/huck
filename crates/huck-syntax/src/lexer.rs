@@ -2081,6 +2081,12 @@ impl<'a> Lexer<'a> {
             if let Some(Mode::CommandSub { body_started }) = self.modes.last_mut() {
                 *body_started = true;
             }
+            // v264: the cmdsub body begins at a FRESH command/word start — the
+            // outer `cmd_at_word_start` reflects the mid-word `$(` position
+            // (false), but a `#` at `$(#…` opens a comment (the oracle uses
+            // `!has_token`, which is fresh in the isolated body). Set it so the
+            // first body atom is treated as word-start (comment / keyword / tilde).
+            self.cmd_at_word_start = true;
             self.history.push(Token::new(TokenKind::CmdSubOpen, Span::new(off, l, c)));
             Ok(Step::Produced)
         } else {
@@ -2114,6 +2120,9 @@ impl<'a> Lexer<'a> {
             if let Some(Mode::Backtick { depth: d }) = self.modes.last_mut() {
                 *d = 1;
             }
+            // v264: the backtick body begins at a FRESH command/word start (see
+            // the cmdsub body note) so a `#` at `` `#… `` opens a comment.
+            self.cmd_at_word_start = true;
             self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c)));
             Ok(Step::Produced)
         } else {
