@@ -4481,11 +4481,48 @@ impl<'a> Lexer<'a> {
         self.fill_to(self.pos)?;
         self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
         let Some(tok) = self.history.get(self.pos) else { return Ok(()) };
-        let TokenKind::Word(w) = &tok.kind else { return Ok(()) };
-        let Some(name) = word_literal_text(w) else { return Ok(()) };
+        let name_span = tok.span;
+        // `is_bare_atom_lit`: whether `name` came from a bare atom `Lit` (needs
+        // the boundary re-check below) vs. a legacy `Word` token (already the
+        // whole word by construction — no further check needed).
+        let (name, is_bare_atom_lit) = match &tok.kind {
+            TokenKind::Word(w) => {
+                let Some(name) = word_literal_text(w) else { return Ok(()) };
+                (name, false)
+            }
+            // v264: the atom-command stream (`command_atoms`) has no `Word`
+            // token at command position — the command word is a bare `Lit`
+            // atom. Extract the name here; the boundary check (that this
+            // `Lit` is the ENTIRE word, nothing glued on) happens below, once
+            // the borrow of `self.history` this match holds has ended (the
+            // check itself needs `&mut self` via `fill_to`).
+            TokenKind::Lit { text, quoted: false } if self.command_atoms => {
+                (text.clone(), true)
+            }
+            _ => return Ok(()),
+        };
+        if is_bare_atom_lit {
+            // Only a WORD BOUNDARY immediately after (`Blank`/`Newline`/
+            // `ArrayClose`/`Op(_)`/EOF) means this `Lit` is the entire command
+            // word. Any other follower atom (another `Lit`, `DollarName`,
+            // `ParamOpen`, `CmdSubOpen`, `BeginBacktick`, `BeginDquote`,
+            // `QuoteRun`, `ArithOpen`, `LegacyArithOpen`, `ProcSubOpen`,
+            // `ArrayOpen`, `Tilde`, `AssignPrefix`, `DeferredExpansion`, …)
+            // means the word has more parts and is NOT a bare literal name —
+            // mirrors `word_literal_text` returning `Some` only for a
+            // single-literal word.
+            self.fill_to(self.pos + 1)?;
+            let boundary = matches!(
+                self.history.get(self.pos + 1).map(|t| &t.kind),
+                None | Some(TokenKind::Blank)
+                    | Some(TokenKind::Newline)
+                    | Some(TokenKind::ArrayClose)
+                    | Some(TokenKind::Op(_))
+            );
+            if !boundary { return Ok(()); }
+        }
         if self.active.contains(&name) { return Ok(()); }
         let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
-        let name_span = tok.span;
         let body_tokens = tokenize(&body)?; // bad body → Err, propagated by callers
         self.history.remove(self.pos);
         let mut insert_at = self.pos;

@@ -1930,6 +1930,30 @@ fn parse_simple_with_leading_word(
     }
 
     loop {
+        // Trailing-blank alias chain: mirrors the oracle's arg-loop hook
+        // (`command.rs:2173-2175`). If the last command-position alias
+        // expansion ended with a blank, the next argument word is eligible
+        // for alias expansion too. `take_trailing_eligible()` returns `true`
+        // at most once per expansion (it resets the flag), so this is a
+        // no-op in the overwhelmingly common non-alias/non-trailing-blank
+        // case.
+        //
+        // The oracle's Word-token stream has no atom for inter-word
+        // whitespace (it's silently absorbed between tokens), so its hook
+        // always lands with the cursor ON the next real word. The atom
+        // stream DOES have an explicit `Blank` atom for a 2nd+ argument (the
+        // 1st argument's leading blank is already consumed by the caller —
+        // `parse_command`'s `consume_command_word` + blank-skip, and by
+        // `peek_leading_keyword`'s own leading-blank skip). Consulting
+        // `take_trailing_eligible()` while sitting ON that `Blank` would
+        // consume (and waste — `maybe_expand_command_alias` unconditionally
+        // resets the flag) the one-shot flag before reaching the real word,
+        // so defer to the iteration where the `Blank` has already been
+        // skipped (below) and the cursor sits on the real next atom.
+        let at_blank = matches!(iter.peek_kind()?, Some(TokenKind::Blank));
+        if !at_blank && iter.take_trailing_eligible() {
+            iter.expand_command_alias()?;
+        }
         let Some(token) = iter.peek_kind()? else { break };
         // Stage/list terminators — stop without consuming.
         if matches!(
@@ -2146,6 +2170,13 @@ fn parse_simple_with_leading_word(
 fn parse_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     // Skip leading newlines (mirrors `parse_command_inner` command.rs:1019).
     skip_newlines(iter)?;
+    // Read-time alias expansion at command position (mirrors the oracle's
+    // `command.rs:1020` + `:2302` sites — this ONE choke point covers both,
+    // since `parse_pipeline` calls `parse_command` for the first stage and
+    // `finish_pipeline` calls it for every subsequent stage). Must run BEFORE
+    // the ArithBlock/LParen/keyword dispatch below so `alias x=if` expands to
+    // the reserved word before the reserved-word check runs.
+    iter.expand_command_alias()?;
     // EOF with no token.
     if iter.peek_kind()?.is_none() {
         return Err(ParseError::MissingCommand);
@@ -4233,6 +4264,42 @@ mod tests {
     /// Error parity: the new parser must return the SAME error as the oracle.
     fn diff_err(s: &str) {
         assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
+    }
+
+    // ── v264 alias differential harness ─────────────────────────────────────
+
+    fn old_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
+        let mut al = std::collections::HashMap::new();
+        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
+        let mut lx = Lexer::new_live(s, &al, LexerOptions::default());
+        crate::command::parse(&mut lx)
+    }
+    fn new_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
+        let mut al = std::collections::HashMap::new();
+        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
+        let mut lx = Lexer::new_live_atoms(s, &al, LexerOptions::default());
+        super::parse_sequence(&mut lx)
+    }
+    fn diff_al(s: &str, pairs: &[(&str, &str)]) {
+        assert_eq!(new_seq_al(s, pairs), old_seq_al(s, pairs), "alias mismatch for {s:?} with {pairs:?}");
+    }
+
+    #[test]
+    fn atoms_alias_expansion_matches_oracle() {
+        diff_al("foo", &[("foo", "echo hi")]);                       // basic
+        diff_al("foo bar", &[("foo", "echo")]);                      // alias + arg
+        diff_al("x true", &[("x", "if")]);                           // alias→keyword
+        diff_al("a c", &[("a", "b "), ("b", "echo"), ("c", "hello")]); // trailing-blank chains to arg
+        diff_al("a hi", &[("a", "b "), ("b", "echo")]);              // trailing-blank, arg not alias
+        diff_al("a c", &[("a", "echo"), ("c", "hello")]);            // NO trailing blank: arg NOT expanded
+        diff_al("a x y", &[("a", "echo "), ("x", "X"), ("y", "Y")]); // trailing-blank stops at 2nd arg
+        diff_al("ls /dev/null", &[("ls", "ls -a")]);                 // recursion guard
+        diff_al("greet", &[("greet", "echo hi")]);                   // simple
+        diff_al("printf x", &[("printf", "echo ALIAS")]);            // unquoted expands
+        diff_al("'printf' x", &[("printf", "echo ALIAS")]);          // quoted does NOT expand
+        diff_al("foo | bar", &[("foo", "echo hi"), ("bar", "cat")]); // pipeline stages both expand
+        diff_al("notanalias", &[("foo", "echo")]);                   // non-alias unchanged
+        diff_al("foo$x", &[("foo", "echo")]);                        // glued expansion: NOT a bare name → no expand
     }
 
     // v247 T2 tests
