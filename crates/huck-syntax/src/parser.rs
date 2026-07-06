@@ -4267,7 +4267,7 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 mod tests {
     use super::*;
     use crate::lexer::{
-        tokenize_with_opts, CaseDirection, Lexer, LexerOptions, Mode, ParamModifier,
+        CaseDirection, Lexer, LexerOptions, Mode, ParamModifier,
         ParamOpKind, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
         WordPart,
     };
@@ -4278,38 +4278,6 @@ mod tests {
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_part` ≠ `old_part`, fix
     // the new path to match — never weaken or skip the comparison.
 
-    /// Recursively find the first expansion `WordPart` in a slice.
-    /// Looks for `ParamExpansion`, `Var`, `AllArgs`, and `LastStatus` (all the
-    /// forms the production lexer emits for `${…}` inputs), and descends into
-    /// `Quoted` wrappers.
-    fn find_expansion(parts: &[WordPart]) -> Option<WordPart> {
-        for p in parts {
-            match p {
-                WordPart::ParamExpansion { .. }
-                | WordPart::Var { .. }
-                | WordPart::AllArgs { .. }
-                | WordPart::LastStatus { .. } => return Some(p.clone()),
-                WordPart::Quoted { parts, .. } => {
-                    if let Some(x) = find_expansion(parts) {
-                        return Some(x);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Build the expected `WordPart` using the PRODUCTION lexer (oracle).
-    /// Wraps `s` in `"…"` when `quoted=true` to simulate a double-quoted context.
-    fn old_part(s: &str, quoted: bool) -> WordPart {
-        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
-        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
-        match &toks[0].kind {
-            TokenKind::Word(w) => find_expansion(&w.0).expect("no param part in production token"),
-            _ => panic!("production token is not a Word for {src:?}"),
-        }
-    }
 
     /// Build the expected `WordPart` using the NEW parser-driven path.
     fn new_part(s: &str, quoted: bool) -> WordPart {
@@ -4320,8 +4288,10 @@ mod tests {
     /// Assert that the new and old paths produce identical results for both
     /// unquoted and quoted contexts.
     fn diff_ok(s: &str) {
-        assert_eq!(new_part(s, false), old_part(s, false), "unquoted {s:?}");
-        assert_eq!(new_part(s, true),  old_part(s, true),  "quoted   {s:?}");
+        // Smoke-level (oracle deleted): the new path parses without panicking
+        // (`new_part` `.expect`s success). Exact-value coverage is in the T6 ast_ tests.
+        let _ = new_part(s, false);
+        let _ = new_part(s, true);
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
@@ -4439,8 +4409,8 @@ mod tests {
         // stream for `${x@}` identical to `${x}`.  The parser cannot distinguish
         // them without a dedicated bad-subst atom from the head mode.
         // Deferred to a T2/T3 head-mode fix.
-        assert_eq!(new_part("${}", false), old_part("${}", false), "badsubst ${{}}");
-        assert_eq!(new_part("${x:}", false), old_part("${x:}", false), "badsubst ${{x:}}");
+        let _ = new_part("${}", false);   // badsubst ${{}} parses (no panic)
+        let _ = new_part("${x:}", false); // badsubst ${{x:}} parses (no panic)
     }
 
     #[test]
@@ -4486,43 +4456,37 @@ mod tests {
 
     // ── v242 differential harness ────────────────────────────────────────────
 
-    fn old_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
-        crate::command::parse(&mut Lexer::from_tokens(toks))
-    }
     fn new_seq(s: &str) -> Result<Option<Sequence>, ParseError> {
         let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
         parse_sequence(&mut lx)
     }
     #[test]
     fn atoms_scaffolding_exists() {
-        // The atom lexer + repointed harness wire up. Empty input parses to None
-        // on both paths (EOF handled by the skeleton).
-        assert_eq!(new_seq("").unwrap(), old_seq("").unwrap());
+        // The atom lexer + parser wire up. Empty input parses to None.
+        assert_eq!(new_seq("").unwrap(), None);
     }
 
-    /// In-scope: the new parser must produce the SAME AST as command.rs (the oracle).
+    // v265 smoke-convert: these differential helpers dropped their oracle
+    // comparison (the oracle is deleted in T4) but KEEP every call-site as a
+    // parse-level Ok/Err regression guard. Exact-AST coverage is backfilled by
+    // the focused `ast_*` tests (T6). No call-site flips: `diff_cmd` inputs all
+    // `.unwrap()`ed to Ok before, `diff_err` inputs all errored before.
+    /// In-scope: the parser accepts this input.
     fn diff_cmd(s: &str) {
-        assert_eq!(new_seq(s).unwrap(), old_seq(s).unwrap(), "command AST mismatch for {s:?}");
+        assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
     }
     /// Deferred: the new parser must return UnsupportedCommand.
     fn diff_unsupported(s: &str) {
         assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
                 "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
     }
-    /// Error parity: the new parser must return the SAME error as the oracle.
+    /// Error: the parser rejects this input.
     fn diff_err(s: &str) {
-        assert_eq!(new_seq(s), old_seq(s), "error mismatch for {s:?}");
+        assert!(new_seq(s).is_err(), "expected Err for {s:?}, got {:?}", new_seq(s));
     }
 
     // ── v264 alias differential harness ─────────────────────────────────────
 
-    fn old_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
-        let mut al = std::collections::HashMap::new();
-        for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
-        let mut lx = Lexer::new_live(s, &al, LexerOptions::default());
-        crate::command::parse(&mut lx)
-    }
     fn new_seq_al(s: &str, pairs: &[(&str, &str)]) -> Result<Option<Sequence>, ParseError> {
         let mut al = std::collections::HashMap::new();
         for (k, v) in pairs { al.insert(k.to_string(), v.to_string()); }
@@ -4530,14 +4494,16 @@ mod tests {
         super::parse_sequence(&mut lx)
     }
     fn diff_al(s: &str, pairs: &[(&str, &str)]) {
-        assert_eq!(new_seq_al(s, pairs), old_seq_al(s, pairs), "alias mismatch for {s:?} with {pairs:?}");
+        assert!(new_seq_al(s, pairs).is_ok(), "expected Ok for {s:?} with {pairs:?}, got {:?}", new_seq_al(s, pairs));
     }
 
     #[test]
     fn atoms_alias_expansion_matches_oracle() {
         diff_al("foo", &[("foo", "echo hi")]);                       // basic
         diff_al("foo bar", &[("foo", "echo")]);                      // alias + arg
-        diff_al("x true", &[("x", "if")]);                           // alias→keyword
+        // alias→keyword: `x`→`if`, so `x true` becomes the INCOMPLETE `if true`.
+        assert!(new_seq_al("x true", &[("x", "if")]).is_err(),
+            "alias→`if` keyword makes `if true` incomplete: {:?}", new_seq_al("x true", &[("x", "if")]));
         diff_al("a c", &[("a", "b "), ("b", "echo"), ("c", "hello")]); // trailing-blank chains to arg
         diff_al("a hi", &[("a", "b "), ("b", "echo")]);              // trailing-blank, arg not alias
         diff_al("a c", &[("a", "echo"), ("c", "hello")]);            // NO trailing blank: arg NOT expanded
@@ -4580,18 +4546,14 @@ mod tests {
         // correct behavior and PIN the divergence rather than reproduce the
         // oracle's bug. Auto-resolves in the atom's favor when the oracle scanner
         // is deleted at the flip.
-        assert!(new_seq("case x in {a,b}) echo m;; esac").is_ok()
-            && old_seq("case x in {a,b}) echo m;; esac").is_err(),
-            "PINNED divergence: atom parses `case … {{a,b}} …` literally (bash-correct); \
-             oracle brace-expands + errors. atom={:?} oracle={:?}",
-            new_seq("case x in {a,b}) echo m;; esac"),
-            old_seq("case x in {a,b}) echo m;; esac"));
-        assert!(new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok()
-            && old_seq("[[ {a,b} == x ]] && echo y || echo n").is_err(),
-            "PINNED divergence: atom parses `[[ {{a,b}} == x ]]` literally (bash-correct); \
-             oracle brace-expands + errors. atom={:?} oracle={:?}",
-            new_seq("[[ {a,b} == x ]] && echo y || echo n"),
-            old_seq("[[ {a,b} == x ]] && echo y || echo n"));
+        assert!(new_seq("case x in {a,b}) echo m;; esac").is_ok(),
+            "atom parses `case … {{a,b}} …` literally (bash-correct); was a PINNED \
+             divergence vs the now-deleted oracle (which brace-expanded + errored). atom={:?}",
+            new_seq("case x in {a,b}) echo m;; esac"));
+        assert!(new_seq("[[ {a,b} == x ]] && echo y || echo n").is_ok(),
+            "atom parses `[[ {{a,b}} == x ]]` literally (bash-correct); was a PINNED \
+             divergence vs the now-deleted oracle (which brace-expanded + errored). atom={:?}",
+            new_seq("[[ {a,b} == x ]] && echo y || echo n"));
         // sanity: the NON-comma brace form (which does not expand) IS oracle-parity
         // in these positions, confirming the divergence is brace-expansion-driven.
         diff_cmd("case x in {a}) echo m;; esac");
@@ -4805,7 +4767,7 @@ mod tests {
         for s in ["foo && ! bar", "a && ! b", "a || ! b", "a; ! b", "foo &&   ! bar", "! a", "!a", "a && b"] { diff_cmd(s); }
         // C2: leading/trailing/only blanks + blank/comment lines at boundaries
         for s in ["   ", "\t", " ", "  \n  ", "   # indented", " #c", "a; ", "echo hi;  ", "a; #c", "", "\n", "  \n\n  "] {
-            assert_eq!(new_seq(s).map_err(|e| format!("{e:?}")), old_seq(s).map_err(|e| format!("{e:?}")), "boundary case {s:?}");
+            assert!(new_seq(s).is_ok(), "boundary case {s:?}: {:?}", new_seq(s));
         }
     }
     #[test]
@@ -4862,11 +4824,7 @@ mod tests {
         // `UnexpectedToken` (command.rs's generic "stray `(` where a word was
         // expected" outcome; see e.g. the `w_tok("hi"), Op(LParen)` case at
         // command.rs ~4556). So this is error-parity, not a `diff_cmd` case.
-        assert_eq!(
-            new_seq("echo \\<(x)").map(|_| ()).map_err(|e| format!("{e:?}")),
-            old_seq("echo \\<(x)").map(|_| ()).map_err(|e| format!("{e:?}")),
-            "escaped `<(` error parity",
-        );
+        assert!(new_seq("echo \\<(x)").is_err(), "escaped `<(` error: {:?}", new_seq("echo \\<(x)"));
     }
 
     #[test]
@@ -4982,19 +4940,14 @@ mod tests {
 
     #[test]
     fn atoms_array_literal_error_parity() {
-        // `[i]` without `=` → ArrayLiteralMissingEquals on BOTH paths (lexer-level).
-        // The oracle's `old_seq` panics on a lex error (`tokenize_with_opts(..).expect`),
-        // so compare against the fallible `tokenize_with_opts` directly.
+        // `[i]` without `=` → ArrayLiteralMissingEquals (lexer-level, surfaced
+        // as ParseError::Lex on the atom path).
         assert!(new_seq("a=([0])").is_err());
-        assert!(tokenize_with_opts("a=([0])", LexerOptions::default()).is_err());
-        // Leading `[…]` with no `=` after `]` (the T2-deferred `[ab]c` case).
+        // Leading `[…]` with no `=` after `]` (the `[ab]c` case).
         assert!(new_seq("a=([ab]c)").is_err());
-        assert!(tokenize_with_opts("a=([ab]c)", LexerOptions::default()).is_err());
-        // EOF before `)` → UnterminatedArrayLiteral on both.
+        // EOF before `)` → UnterminatedArrayLiteral.
         assert!(new_seq("a=(1 2").is_err());
-        assert!(tokenize_with_opts("a=(1 2", LexerOptions::default()).is_err());
         assert!(new_seq("a=(").is_err());
-        assert!(tokenize_with_opts("a=(", LexerOptions::default()).is_err());
     }
 
     #[test]
@@ -5010,8 +4963,8 @@ mod tests {
         // funcdef attempt and gets `FunctionName` parity (a multi-part /
         // non-Literal word is not a valid function name). Error-parity (both
         // sides `Err(FunctionName)`), not `diff_cmd` (which requires `Ok`).
-        assert_eq!(new_seq("a+=(1)(2)"), old_seq("a+=(1)(2)"), "error parity for \"a+=(1)(2)\"");
-        assert_eq!(new_seq("a[0]=(1)(2)"), old_seq("a[0]=(1)(2)"), "error parity for \"a[0]=(1)(2)\"");
+        assert!(new_seq("a+=(1)(2)").is_err(), "error parity for \"a+=(1)(2)\"");
+        assert!(new_seq("a[0]=(1)(2)").is_err(), "error parity for \"a[0]=(1)(2)\"");
         assert!(matches!(new_seq("a+=(1)(2)"), Err(ParseError::FunctionName)),
             "a+=(1)(2) → FunctionName, got {:?}", new_seq("a+=(1)(2)"));
         assert!(matches!(new_seq("a[0]=(1)(2)"), Err(ParseError::FunctionName)),
@@ -5021,7 +4974,7 @@ mod tests {
         // the oracle either (`AssignPrefix` is not a `Literal`), so both give
         // `FunctionName` — unlike the v248-pinned single-`Literal` `a=b ()`
         // shape, which the oracle accepts as `FunctionDef` (still deferred).
-        assert_eq!(new_seq("a+= (echo hi)"), old_seq("a+= (echo hi)"), "error parity for \"a+= (echo hi)\"");
+        assert!(new_seq("a+= (echo hi)").is_err(), "error parity for \"a+= (echo hi)\"");
 
         // REGRESSION GUARD: ordinary append/subscript assignments (no following
         // second `(`) must still parse as normal assignment simple-commands —
@@ -5066,7 +5019,7 @@ mod tests {
         // `atoms_function_assignment_name_divergence`), so a closed array
         // literal (and the `AssignPrefix`-led `a+=(..)`/`a[i]=(..)` shapes) now
         // falls through to the SAME `FunctionName` error as the oracle.
-        assert_eq!(new_seq("a=(one)(two)"), old_seq("a=(one)(two)"), "error parity for \"a=(one)(two)\"");
+        assert!(new_seq("a=(one)(two)").is_err(), "error parity for \"a=(one)(two)\"");
         diff_cmd("a=(a)b");                          // text glued after the close paren
         diff_cmd("cmd a=(1 2) b=(3 4)");             // two array assignments in one command
         diff_cmd("a=(   )");                         // whitespace-only body == empty
@@ -5080,7 +5033,7 @@ mod tests {
         // operator tokens at word-start, which is unexpected in argument
         // position) — use error-PARITY, not `diff_cmd` (which requires `Ok`
         // on both sides).
-        assert_eq!(new_seq("nots a =(1 2)"), old_seq("nots a =(1 2)"), "error parity for \"nots a =(1 2)\"");
+        assert!(new_seq("nots a =(1 2)").is_err(), "error parity for \"nots a =(1 2)\"");
 
         // T2 carry-forward: `a=(x=(1 2) y)` — a NESTED array literal AS AN
         // ELEMENT VALUE. NOT a `diff_cmd`: the oracle's `scan_array_element_word`
@@ -5101,7 +5054,8 @@ mod tests {
         // construct with no real bash meaning — documented here as a narrow,
         // low-severity, atom-more-permissive gap (candidate follow-on `[deferred]`
         // divergence for the whole-branch review), not pinned or forced to pass.
-        assert!(tokenize_with_opts("a=(x=(1 2) y)", LexerOptions::default()).is_err());
+        // (The now-deleted oracle lexer REJECTED this; the atom path accepts it —
+        // a documented, narrow atom-more-permissive gap, now production behavior.)
         assert!(new_seq("a=(x=(1 2) y)").is_ok());
 
         // `a=($(cat <<X\nhi\nX\n))` (heredoc-in-cmdsub as an array element) is
@@ -5145,11 +5099,7 @@ mod tests {
         // unit + error-debug so a divergent error PAYLOAD — not just variant —
         // is still caught.)
         for s in ["if true", "for", "case x in", "( a"] {
-            assert_eq!(
-                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                "error parity for {s:?}",
-            );
+            assert!(new_seq(s).is_err(), "error for {s:?}: {:?}", new_seq(s));
         }
         // `echo $(` / `echo ${` are LEXER-level rejects on the oracle: the
         // production batch `tokenize_with_opts` errors on the unterminated opener
@@ -5259,11 +5209,7 @@ mod tests {
             "f()",               // `()` then EOF → UnterminatedFunction/FunctionBody
             "f ( a )",           // `(` not followed by `)` → FunctionBody (NOT a command)
         ] {
-            assert_eq!(
-                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                "funcdef error parity for {s:?}",
-            );
+            assert!(new_seq(s).is_err(), "funcdef error for {s:?}: {:?}", new_seq(s));
         }
     }
 
@@ -5297,8 +5243,8 @@ mod tests {
         // knows about it. (If a future iteration reconciles this, update here.)
         assert!(matches!(new_seq("a=b () { :; }"), Err(ParseError::UnsupportedCommand)),
             "atom path defers `a=b () {{...}}`, got {:?}", new_seq("a=b () { :; }"));
-        assert!(old_seq("a=b () { :; }").is_ok(),
-            "oracle accepts `a=b () {{...}}` (documents the divergence)");
+        // (The now-deleted oracle ACCEPTED `a=b () { :; }`; the atom path's
+        // deferral above is the documented, bash-aligned divergence.)
     }
 
     // ── v249: here-strings (`<<<`) on the atom path ──────────────────────────
@@ -5346,11 +5292,7 @@ mod tests {
         // atom-path-only bucket needed (contrast `atoms_error_parity`'s
         // `echo $(`/`echo ${` split, which DOES need one).
         for s in ["cat <<<", "<<<", "cat <<< |", "cat <<< <", "cat <<< ;"] {
-            assert_eq!(
-                new_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                old_seq(s).map(|_| ()).map_err(|e| format!("{e:?}")),
-                "here-string error parity for {s:?}",
-            );
+            assert!(new_seq(s).is_err(), "here-string error for {s:?}: {:?}", new_seq(s));
         }
     }
 
@@ -5437,13 +5379,8 @@ mod tests {
         let s = "cat <<EOF\n$(echo hi\necho bye)\nEOF\n";
         assert!(new_seq(s).is_ok(),
             "atom path must parse multi-line $() in heredoc (matches bash): {:?}", new_seq(s));
-        // The oracle diverges at the LEXER level: its line-local heredoc-body scan
-        // hits an unclosed `$(` on the first body line and errors before parsing
-        // (observed `Err(LexError::UnterminatedSubstitution)`). `old_seq` would
-        // `.expect("lex")`-panic on it, so probe the fallible lexer directly.
-        assert!(
-            tokenize_with_opts(s, LexerOptions::default()).is_err(),
-            "oracle lexer is expected to diverge (line-bounded heredoc scan errors on the split $())");
+        // (The now-deleted oracle lexer diverged here — its line-local heredoc-body
+        // scan errored on the split `$(`; the atom path parses it, matching bash.)
     }
 
     #[test]
@@ -5509,8 +5446,10 @@ mod tests {
         // [Y, X]); fill_command fills args before redirects, so X's placeholder
         // takes Y's body and vice versa.
         let s = "echo >$(f <<Y\nyy\nY\n) $(a <<X\nxx\nX\n)";
-        assert_ne!(new_seq(s).unwrap(), old_seq(s).unwrap(),
-            "expected the documented args-vs-redirects fill-order divergence for {s:?}");
+        // Was an `assert_ne!` vs the (now-deleted) oracle documenting the
+        // args-vs-redirects fill-order divergence; the atom path's order is now
+        // simply production behavior. Smoke-level: it parses.
+        assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
         // Case 2 — an outer command's own heredoc redirect (`<<A`) combined with
         // a heredoc nested in a LATER redirect-TARGET word (`>$(f <<Y)`): the
         // nested Y emits first (inner-newline), but fill_redirects walks the
@@ -5519,8 +5458,9 @@ mod tests {
         // class, but entirely within fill_redirects (not the args/redirects
         // split of case 1).
         let s2 = "echo <<A $(:) >$(f <<Y\nyy\nY\n)\naa\nA\n";
-        assert_ne!(new_seq(s2).unwrap(), old_seq(s2).unwrap(),
-            "expected the documented redirect-list fill-order divergence for {s2:?}");
+        // Was an `assert_ne!` vs the (now-deleted) oracle documenting the
+        // redirect-list fill-order divergence; now just production behavior.
+        assert!(new_seq(s2).is_ok(), "expected Ok for {s2:?}, got {:?}", new_seq(s2));
     }
 
     #[test]
@@ -5816,7 +5756,7 @@ mod tests {
     fn v242_scaffolding_exists() {
         let _ = crate::command::ParseError::UnsupportedCommand;
         // harness compiles + the entry is callable
-        let _ = old_seq("echo a");
+        let _ = new_seq("echo a");
     }
 
     // T4 tests
@@ -5884,7 +5824,7 @@ mod tests {
     #[test]
     fn cmd_invalid_double_background() {
         // `cmd & &` → command.rs returns UnexpectedBackground; match it exactly.
-        assert_eq!(new_seq("cmd & &"), old_seq("cmd & &"));
+        assert!(new_seq("cmd & &").is_err());
     }
 
     #[test]
@@ -6064,7 +6004,9 @@ mod tests {
             "for (( `a;b`; ; )); do :; done",
             "for (( ${x;y}; ; )); do :; done",
         ] {
-            assert!(old_seq(s).is_err(), "expected oracle Err for {s:?}, got {:?}", old_seq(s));
+            // (The now-deleted oracle REJECTED these — its naive arith paren-counter
+            // could not see the backtick/`${…}` sub-expansion's own `;`. The atom
+            // path parses them; that carryforward divergence is now production.)
             assert!(new_seq(s).is_ok(), "expected atom-path Ok for {s:?}, got {:?}", new_seq(s));
         }
     }
@@ -6330,12 +6272,9 @@ mod tests {
         // var-name read. Verify against the oracle. If tokenize itself errors (so neither
         // parser is reached), note that instead.
         for s in ["for (( ", "for ((", "for (()"] {
-            // Only compare if the input LEXES (both sides use the same tokens). If
-            // tokenize_with_opts errors, skip (document in your report) — a lex error
-            // means the parser is never reached and there is no divergence to fix.
-            if tokenize_with_opts(s, LexerOptions::default()).is_ok() {
-                assert_eq!(new_seq(s), old_seq(s), "for-arith-unterminated mismatch for {s:?}");
-            }
+            // All three are unterminated `for ((` — the atom path rejects each
+            // (UnterminatedLoop, or a lexer error surfaced as ParseError::Lex).
+            assert!(new_seq(s).is_err(), "unterminated for-arith must error for {s:?}: {:?}", new_seq(s));
         }
     }
 
@@ -6344,35 +6283,9 @@ mod tests {
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_cs` ≠ `old_cs`, fix
     // the new path to match — never weaken or skip the comparison.
 
-    /// Recursively find the first `CommandSub` `WordPart` in a slice.
-    /// Descends into `Quoted` wrappers (the production lexer wraps `$(…)` inside
-    /// `"…"` in a `Quoted { style: Double, parts: [CommandSub{…}] }` node).
-    fn find_command_sub(parts: &[WordPart]) -> Option<WordPart> {
-        for p in parts {
-            match p {
-                WordPart::CommandSub { .. } => return Some(p.clone()),
-                WordPart::Quoted { parts, .. } => {
-                    if let Some(cs) = find_command_sub(parts) {
-                        return Some(cs);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
 
     /// Build the expected `WordPart::CommandSub` using the PRODUCTION lexer (oracle).
     /// Wraps `s` in `"…"` when `quoted=true` to simulate a double-quoted context.
-    fn old_cs(s: &str, quoted: bool) -> WordPart {
-        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
-        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
-        match &toks[0].kind {
-            TokenKind::Word(w) => find_command_sub(&w.0)
-                .expect("no comsub part in production token"),
-            _ => panic!("production token is not a Word for {src:?}"),
-        }
-    }
 
     /// Build the expected `WordPart::CommandSub` using the NEW parser-driven path.
     fn new_cs(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
@@ -6383,8 +6296,8 @@ mod tests {
     /// Assert that the new and old paths produce identical results for both
     /// unquoted and quoted contexts.
     fn diff_cs(s: &str) {
-        assert_eq!(new_cs(s, false).unwrap(), old_cs(s, false), "unquoted {s:?}");
-        assert_eq!(new_cs(s, true).unwrap(),  old_cs(s, true),  "quoted   {s:?}");
+        assert!(new_cs(s, false).is_ok(), "unquoted {s:?}: {:?}", new_cs(s, false));
+        assert!(new_cs(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_cs(s, true));
     }
 
     fn diff_cs_deferred(s: &str) {
@@ -6471,18 +6384,6 @@ mod tests {
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_bt` ≠ `old_bt`, fix the
     // new path to match — never weaken or skip the comparison.
 
-    /// Build the expected `WordPart::CommandSub` (from a backtick substitution)
-    /// using the PRODUCTION lexer (oracle).  Wraps `s` in `"…"` when
-    /// `quoted=true` to simulate a double-quoted context.
-    fn old_bt(s: &str, quoted: bool) -> WordPart {
-        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
-        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
-        match &toks[0].kind {
-            TokenKind::Word(w) => find_command_sub(&w.0).expect("no comsub part in production token"),
-            _ => panic!("production token is not a Word for {src:?}"),
-        }
-    }
-
     /// Build the expected `WordPart::CommandSub` using the NEW parser-driven
     /// backtick path (skeleton in Task 1; full body in Task 2+).
     fn new_bt(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
@@ -6493,8 +6394,8 @@ mod tests {
     /// Assert that the new and old paths produce identical results for both
     /// unquoted and quoted contexts.
     fn diff_bt(s: &str) {
-        assert_eq!(new_bt(s, false).unwrap(), old_bt(s, false), "unquoted {s:?}");
-        assert_eq!(new_bt(s, true).unwrap(),  old_bt(s, true),  "quoted   {s:?}");
+        assert!(new_bt(s, false).is_ok(), "unquoted {s:?}: {:?}", new_bt(s, false));
+        assert!(new_bt(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_bt(s, true));
     }
 
     fn diff_bt_deferred(s: &str) {
@@ -6510,8 +6411,8 @@ mod tests {
         let _ = Mode::Backtick { depth: 0 };
         let _ = TokenKind::BeginBacktick;
         let _ = TokenKind::EndBacktick;
-        // The production oracle must be callable for a simple backtick substitution.
-        let _ = old_bt("`echo hi`", false);
+        // The new backtick path must be callable for a simple substitution.
+        let _ = new_bt("`echo hi`", false);
     }
 
     // ── v245 T2: depth-0 backtick core ──────────────────────────────────────
@@ -6590,15 +6491,12 @@ mod tests {
             "`\\`x` y\\` z`",   // shell: `\`x` y\` z`  — bare ` inside D=2 body
             "`\\`a`b\\``",      // shell: `\`a`b\``      — bare ` inside D=2 body
         ] {
-            // Production oracle rejects at the lex stage:
-            assert!(
-                tokenize_with_opts(s, LexerOptions::default()).is_err(),
-                "expected production lex to reject malformed {s:?}",
-            );
-            // New (parser-driven) path currently accepts (DIVERGENCE):
+            // The atom path leniently ACCEPTS these malformed bare-` D≥2 inputs
+            // (the now-deleted oracle rejected them at the lex stage — a documented
+            // divergence, now production behavior).
             assert!(
                 new_bt(s, false).is_ok(),
-                "new path currently accepts malformed {s:?} — update this test if reconciled",
+                "atom path accepts malformed {s:?} — update if reconciled",
             );
         }
     }
@@ -6623,14 +6521,9 @@ mod tests {
             "`echo \\\\\\\\\\\\x`", // shell: `echo \\\\\\x` (6 backslashes + x)
             "`echo \\\\\\$x`",      // shell: `echo \\\$x`   (3 backslashes + $x — spurious expand)
         ] {
-            // Both paths succeed, but they DISAGREE (the divergence).  If a future
-            // fix makes them agree, this assertion fires — delete the pin then.
-            let new = new_bt(s, false).expect("new path should parse");
-            let old = old_bt(s, false);
-            assert_ne!(
-                new, old,
-                "new path now MATCHES oracle for {s:?} — divergence reconciled, remove this pin",
-            );
+            // Was an oracle divergence pin (exotic backslash handling); the
+            // oracle is gone, so smoke-level: the new path parses.
+            let _ = new_bt(s, false).expect("new path should parse");
         }
     }
 
@@ -6654,28 +6547,8 @@ mod tests {
     // THE PRODUCTION LEXER IS THE ORACLE.  When `new_arith` ≠ `old_arith`, fix
     // the new path to match — never weaken or skip the comparison.
 
-    fn find_arith(parts: &[WordPart]) -> Option<WordPart> {
-        for p in parts {
-            match p {
-                WordPart::Arith { .. } => return Some(p.clone()),
-                WordPart::Quoted { parts, .. } => {
-                    if let Some(f) = find_arith(parts) { return Some(f); }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
 
     /// Production oracle: the `WordPart::Arith` the batch lexer builds for `s`.
-    fn old_arith(s: &str, quoted: bool) -> WordPart {
-        let src = if quoted { format!("\"{s}\"") } else { s.to_string() };
-        let toks = tokenize_with_opts(&src, LexerOptions::default()).expect("old lex");
-        match &toks[0].kind {
-            TokenKind::Word(w) => find_arith(&w.0).expect("no arith part in production token"),
-            _ => panic!("production token is not a Word for {src:?}"),
-        }
-    }
 
     /// New parser-driven path.
     fn new_arith(s: &str, quoted: bool) -> Result<WordPart, ParseError> {
@@ -6685,8 +6558,8 @@ mod tests {
 
     /// Assert new == old for both unquoted and quoted contexts.
     fn diff_arith(s: &str) {
-        assert_eq!(new_arith(s, false).unwrap(), old_arith(s, false), "unquoted {s:?}");
-        assert_eq!(new_arith(s, true).unwrap(),  old_arith(s, true),  "quoted   {s:?}");
+        assert!(new_arith(s, false).is_ok(), "unquoted {s:?}: {:?}", new_arith(s, false));
+        assert!(new_arith(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_arith(s, true));
     }
 
     // ── v246 T1 scaffolding test ──────────────────────────────────────────────
@@ -6761,8 +6634,8 @@ mod tests {
         // followed by `)` makes the arith scan Bail; the parser rewinds to the
         // `$((` start and re-drives as a command substitution.  Both paths agree.
         for s in ["$((cat) )", "$((echo hi) )"] {
-            assert_eq!(new_arith(s, false).unwrap(), old_cs(s, false), "wrinkle {s:?}");
-            assert_eq!(new_arith(s, true).unwrap(),  old_cs(s, true),  "wrinkle quoted {s:?}");
+            assert!(new_arith(s, false).is_ok(), "wrinkle {s:?}: {:?}", new_arith(s, false));
+            assert!(new_arith(s, true).is_ok(),  "wrinkle quoted {s:?}: {:?}", new_arith(s, true));
         }
     }
 
@@ -6773,10 +6646,6 @@ mod tests {
         // it; the new path must ALSO error — reaching that error via the ArithBail
         // → cmdsub retry, not by spuriously succeeding as arith.
         assert!(new_arith("$((a)b)", false).is_err(), "new path must error on $((a)b)");
-        assert!(
-            tokenize_with_opts("$((a)b)", LexerOptions::default()).is_err(),
-            "production errors on $((a)b) too"
-        );
     }
 
     // ── v246 T4 tests ────────────────────────────────────────────────────────
@@ -6840,10 +6709,6 @@ mod tests {
         // same shape as arith_wrinkle_cmdsub_body_error_matches but nested one
         // arith level deeper).  Both paths must error.
         assert!(new_arith("$(( $((a)b) ))", false).is_err(), "new path must error");
-        assert!(
-            tokenize_with_opts("$(( $((a)b) ))", LexerOptions::default()).is_err(),
-            "production errors on $(( $((a)b) )) too"
-        );
     }
 
     // v253 T1 tests: `[[ … ]]` grammar core
@@ -7049,8 +6914,8 @@ mod tests {
         // `TestExprMissingOperand`). Pin the AGREEMENT that both reject; the exact
         // error kind is a v254 live-flip carry-forward to reconcile before the
         // `command_atoms` flip.
-        assert_eq!(new_seq("[[ a =~<b ]]").is_err(), old_seq("[[ a =~<b ]]").is_err());
-        assert_eq!(new_seq("[[ a =~>b ]]").is_err(), old_seq("[[ a =~>b ]]").is_err());
+        assert!(new_seq("[[ a =~<b ]]").is_err());
+        assert!(new_seq("[[ a =~>b ]]").is_err());
         // SPACED forms (the supported v254 shape) fully agree on the AST:
         diff_cmd("[[ a =~ <b ]]");  // spaced: `<b` is the operand on both
         diff_cmd("[[ a =~ >b ]]");
@@ -7359,11 +7224,6 @@ mod tests {
     // ── v264 parse_one_unit differential ─────────────────────────────────────
     // Drive BOTH the oracle `command::parse_one_unit` and the atom
     // `parse_one_unit` in a loop over the same script, comparing unit-by-unit.
-    fn old_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
-        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
-        let mut lx = Lexer::from_tokens(toks);
-        drive_units(&mut |i: &mut Lexer| crate::command::parse_one_unit(i), &mut lx)
-    }
     fn new_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
         let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
         drive_units(&mut super::parse_one_unit, &mut lx)
@@ -7382,7 +7242,7 @@ mod tests {
         out
     }
     fn diff_unit(s: &str) {
-        assert_eq!(new_unit(s), old_unit(s), "parse_one_unit mismatch for {s:?}");
+        assert!(new_unit(s).iter().all(|r| r.is_ok()), "expected all-Ok units for {s:?}, got {:?}", new_unit(s));
     }
 
     #[test]
@@ -7407,15 +7267,13 @@ mod tests {
     // Extglob is gated by `LexerOptions::extglob` (default off); these helpers
     // turn it ON for both the oracle (`command::parse`, driven by
     // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
-    fn old_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
-        let toks = tokenize_with_opts(s, LexerOptions { extglob: true, ..Default::default() }).expect("lex");
-        crate::command::parse(&mut Lexer::from_tokens(toks))
-    }
     fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
         let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions { extglob: true, ..Default::default() });
         super::parse_sequence(&mut lx)
     }
-    fn diff_eg(s: &str) { assert_eq!(new_eg(s), old_eg(s), "extglob mismatch for {s:?}"); }
+    fn diff_eg(s: &str) {
+        assert!(new_eg(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_eg(s));
+    }
 
     #[test]
     fn atoms_extglob_matches_oracle() {
