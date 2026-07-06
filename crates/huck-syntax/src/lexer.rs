@@ -489,6 +489,23 @@ pub enum TokenKind {
     /// command mode re-consumes it as a `Blank`/`Newline`); at EOF the cursor is
     /// at end.
     RegexEnd,
+    /// v264: zero-width signal that a command-word atom is one of `? * + @ !`
+    /// directly followed by `(` (an extglob group opener, gated by
+    /// `LexerOptions::extglob`). Mirrors the `CmdSubOpen`/`ArithOpen` pattern:
+    /// the lexer does NOT consume the prefix char or `(` — the parser's
+    /// `parse_extglob_group` pushes `Mode::Extglob`, whose first scan consumes
+    /// both and emits the opening `Lit`. `prefix` is carried only for
+    /// documentation/debugging; the mode's own first-entry scan re-reads it
+    /// from the cursor.
+    ExtglobOpen { prefix: char },
+    /// v264: zero-width terminator of a `Mode::Extglob` group, emitted (and the
+    /// mode popped) by the lexer itself the moment the group's own `(` is
+    /// balanced (`paren_depth` returns to 0 after a `)`). Consumed by
+    /// `parse_extglob_group`. Unlike `RegexEnd`, this is emitted in the SAME
+    /// `scan_step_extglob` call that produced the closing `)`'s `Lit` atom —
+    /// scan_step is never invoked again for a popped mode frame, so there is no
+    /// separate "already closed" state to track between calls.
+    ExtglobEnd,
 }
 
 /// A token paired with its source location. Equality and hashing are by `kind`
@@ -653,6 +670,12 @@ pub(crate) enum Mode {
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
     Regex { paren_depth: u32, body_started: bool },  // v254: RHS of =~ inside [[ … ]]
+    /// v264: an extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/
+    /// `@(...)`/`!(...)`, gated by `LexerOptions::extglob`). `paren_depth == 0`
+    /// on push means "not yet entered" — the first scan consumes the prefix
+    /// char + `(` and sets it to 1; the group closes (and this mode is popped)
+    /// when a `)` brings `paren_depth` back to 0.
+    Extglob { paren_depth: u32 },
     HeredocBody,    // <<EOF …
 }
 
@@ -968,6 +991,7 @@ impl<'a> Lexer<'a> {
             Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
+            Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
             other => unreachable!("Mode::{other:?} not implemented until its Phase C iteration"),
         }
     }
@@ -3606,6 +3630,23 @@ impl<'a> Lexer<'a> {
                 Ok(Step::Produced)
             }
 
+            // v264 extglob (`shopt -s extglob`): one of `? * + @ !` directly
+            // followed by `(` introduces an extglob group. Mirrors the oracle's
+            // trigger (lexer.rs:2467, `scan_step_command`'s pre-dispatch check)
+            // but atom-natively: emit a ZERO-WIDTH `ExtglobOpen{prefix}` signal
+            // WITHOUT consuming the prefix/`(` (left for `Mode::Extglob`'s first
+            // scan, pushed by the parser's `parse_extglob_group`). Checked before
+            // the literal-run catch-all so the group is recognized first; with
+            // extglob off this arm never matches and lexing is unchanged.
+            Some(pc) if self.opts.extglob
+                && matches!(pc, '?' | '*' | '+' | '@' | '!')
+                && self.cursor.peek_nth(1) == Some('(') =>
+            {
+                self.cmd_at_word_start = false;
+                self.history.push(Token::new(TokenKind::ExtglobOpen { prefix: pc }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+
             // `~…` — tilde construct at WORD START (mirrors the oracle's
             // `!has_token` guard) OR in ASSIGNMENT-VALUE position right after an
             // unquoted `=`/`:` (v247 T4; mirrors `tilde_eligible_in_assignment`).
@@ -3661,6 +3702,16 @@ impl<'a> Lexer<'a> {
                     // a stop char either way: mid-word it is literal (`a#b`); a
                     // word-start `#` is a comment, handled before this arm runs.
                     if ch.is_whitespace() { break; }
+                    // v264 extglob: a mid-run `?*+@!` immediately followed by
+                    // `(` must break WITHOUT consuming it, so the top-level
+                    // match's dedicated trigger arm fires on the next call
+                    // (mirrors `zzz+(q)` glued-prefix — the oracle's own
+                    // per-char loop checks this same condition every iteration,
+                    // not only at word start).
+                    if self.opts.extglob
+                        && matches!(ch, '?' | '*' | '+' | '@' | '!')
+                        && self.cursor.peek_nth(1) == Some('(')
+                    { break; }
                     if in_array_value {
                         if ch == ')' || matches!(ch, '\'' | '"' | '\\' | '$' | '`') { break; }
                     } else if matches!(ch, '\'' | '"' | '\\' | '$' | '`'
@@ -4168,6 +4219,130 @@ impl<'a> Lexer<'a> {
                     return self.scan_step_regex(depth, true);
                 }
                 self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+        }
+    }
+
+    /// v264: `Mode::Extglob { paren_depth }` scanner — emits the atoms of an
+    /// extglob group `<prefix>( … )` (`?(...)`/`*(...)`/`+(...)`/`@(...)`/
+    /// `!(...)`, gated by `LexerOptions::extglob`). Mirrors `scan_step_regex`'s
+    /// shape (literal runs + the SAME expansion-opener atoms for inner `$…`/
+    /// `` `…` ``/`"…"`/`'…'`/`$'…'`), adapted for extglob's two differences:
+    ///  1. the boundary is the matching `)` (`paren_depth` returning to 0), not
+    ///     depth-0 whitespace/EOF;
+    ///  2. the prefix char and every structural `(`/`)` are literal TEXT that
+    ///     must stay byte-identical to the oracle's `scan_extglob_group`
+    ///     (lexer.rs `fn scan_extglob_group`), including its quirks: `\`
+    ///     escapes keep BOTH chars verbatim (no `\<NL>` line-continuation
+    ///     deletion, unlike the main word/regex scanners), and a nested
+    ///     extglob prefix (`@(a*(b)c)`) is NOT recognized specially — an inner
+    ///     `(` (even preceded by a bare `*`/`+`/etc., themselves just literal
+    ///     chars here) simply increments `paren_depth`; only the OUTER
+    ///     `scan_command_word_atom` trigger recognizes a fresh `<prefix>(` at
+    ///     word-content position.
+    ///
+    /// On first entry (`paren_depth == 0`) consumes `<prefix>(` and emits it as
+    /// one `Lit` atom (mirrors the oracle's `let mut lit = format!("{prefix}(")`),
+    /// setting `paren_depth` to 1. The literal-run arm can emit the closing `)`
+    /// `Lit` AND the zero-width `ExtglobEnd` terminator (plus popping the mode)
+    /// in the SAME call — no separate "already closed" mode state is needed,
+    /// since `scan_step` is never invoked again for a popped mode frame.
+    fn scan_step_extglob(&mut self, paren_depth: u32) -> Result<Step, LexError> {
+        let off = self.cursor.offset();
+        let l   = self.cursor.line();
+        let c   = self.cursor.column();
+
+        if paren_depth == 0 {
+            // Fresh entry: the trigger guaranteed `<prefix>(` sits at the cursor.
+            let prefix = self.cursor.next().expect("extglob entry: prefix char present (trigger guaranteed it)");
+            debug_assert!(matches!(prefix, '?' | '*' | '+' | '@' | '!'), "extglob entry: unexpected prefix {prefix:?}");
+            debug_assert_eq!(self.cursor.peek(), Some(&'('), "extglob entry: expected '(' after prefix");
+            self.cursor.next(); // consume '('
+            if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() { *p = 1; }
+            self.history.push(Token::new(
+                TokenKind::Lit { text: format!("{prefix}("), quoted: false },
+                Span::new(off, l, c),
+            ));
+            return Ok(Step::Produced);
+        }
+
+        match self.cursor.peek().copied() {
+            // EOF mid-group — mirrors the oracle falling through its
+            // `while let Some(c) = chars.next()` loop without hitting depth 0.
+            None => Err(LexError::UnterminatedExtglob),
+            // Single-quoted run → flat Literal{quoted:true} (mirrors the
+            // oracle's `scan_squote_content` + flat push — NOT a `Quoted`
+            // wrapper — same shape `scan_step_regex` uses).
+            Some('\'') => {
+                self.cursor.next();
+                let mut text = String::new();
+                loop {
+                    match self.cursor.next() {
+                        None => return Err(LexError::UnterminatedQuote),
+                        Some('\'') => break,
+                        Some(ch) => text.push(ch),
+                    }
+                }
+                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::Single, text }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // Double-quoted span → zero-width BeginDquote (parser pushes Mode::DoubleQuote).
+            Some('"') => { self.history.push(Token::new(TokenKind::BeginDquote, Span::new(off, l, c))); Ok(Step::Produced) }
+            // `$'…'` ANSI-C (must precede the general `$` arm).
+            Some('$') if self.cursor.peek_nth(1) == Some('\'') => {
+                self.cursor.next(); self.cursor.next();
+                let text = scan_ansi_c_quoted(&mut self.cursor)?;
+                self.history.push(Token::new(TokenKind::QuoteRun { style: QuoteStyle::AnsiC, text }, Span::new(off, l, c)));
+                Ok(Step::Produced)
+            }
+            // `$…` — same unquoted classification the command scanner uses.
+            Some('$') => { self.emit_unquoted_dollar_atom(off, l, c); Ok(Step::Produced) }
+            // Backtick command-sub → zero-width BeginBacktick.
+            Some('`') => { self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(off, l, c))); Ok(Step::Produced) }
+            // Literal run: accumulate chars, tracking paren depth, until a
+            // quote/`$`/backtick opener interrupts it OR the group's own `)`
+            // brings depth back to 0 (closing the group). No whitespace-stop —
+            // unlike regex, whitespace at ANY depth is ordinary literal content
+            // here (mirrors the oracle: `other => lit.push(other)` has no
+            // whitespace special-case).
+            Some(_) => {
+                let mut text = String::new();
+                let mut depth = paren_depth;
+                let mut closed = false;
+                while let Some(&ch) = self.cursor.peek() {
+                    match ch {
+                        '\'' | '"' | '`' | '$' => break, // quote/expansion openers
+                        '\\' => {
+                            // Oracle's extglob `\` arm keeps BOTH chars verbatim —
+                            // NO `\<NL>` line-continuation deletion (unlike the
+                            // main word/regex scanners' backslash handling).
+                            self.cursor.next(); // consume `\`
+                            text.push('\\');
+                            if let Some(next) = self.cursor.next() { text.push(next); }
+                        }
+                        '(' => { text.push('('); depth += 1; self.cursor.next(); }
+                        ')' => {
+                            text.push(')'); self.cursor.next();
+                            depth -= 1;
+                            if depth == 0 { closed = true; break; }
+                        }
+                        _ => { text.push(ch); self.cursor.next(); } // incl. | and any whitespace
+                    }
+                }
+                if !closed && self.cursor.peek().is_none() {
+                    return Err(LexError::UnterminatedExtglob);
+                }
+                // Persist the running paren depth on the mode for the next step
+                // (only reachable when NOT closed — the mode is popped below on
+                // closure, so writing back afterward would resurrect a stale
+                // frame; harmless either way since nothing reads it once popped).
+                if let Some(Mode::Extglob { paren_depth: p }) = self.modes.last_mut() { *p = depth; }
+                self.history.push(Token::new(TokenKind::Lit { text, quoted: false }, Span::new(off, l, c)));
+                if closed {
+                    self.pop_mode();
+                    self.history.push(Token::new(TokenKind::ExtglobEnd, Span::new(off, l, c)));
+                }
                 Ok(Step::Produced)
             }
         }

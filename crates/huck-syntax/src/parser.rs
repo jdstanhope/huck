@@ -221,6 +221,19 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                 flush_lit(&mut acc, &mut parts);
                 parts.push(parse_array_literal(iter)?);
             }
+            // v264: extglob group (`+(a|b)`, gated by `LexerOptions::extglob`).
+            // The zero-width `ExtglobOpen` signal is discarded here (mirrors
+            // `ArrayOpen`/`CmdSubOpen`) so `parse_extglob_group`'s own
+            // `push_mode` + first pull re-scans the real `<prefix>(` under the
+            // NEW mode frame. The group is a WORD PART glued mid-word — extend
+            // (not push a single part) and CONTINUE the word so trailing
+            // literals (`+(a|b)*`) glue after it.
+            Some(TokenKind::ExtglobOpen { .. }) => {
+                iter.next_kind()?;            // discard the signal
+                flush_lit(&mut acc, &mut parts);
+                let group = parse_extglob_group(iter)?;
+                parts.extend(group);
+            }
             // `<`/`>` are POSIX operator characters — unlike `$(`/`` ` ``, a
             // `<(`/`>(` process substitution ALWAYS ends any word already in
             // progress (oracle: `x<(y)` is TWO words, program "x" + arg
@@ -418,6 +431,85 @@ fn parse_regex_operand(iter: &mut Lexer) -> Result<Word, ParseError> {
     }
     flush_lit(&mut acc, &mut parts);
     Ok(Word(parts))
+}
+
+/// v264: assemble one extglob group `<prefix>( … )` as a flat list of word
+/// parts (NOT wrapped in a `Word` — the caller glues them into the
+/// surrounding word). The parser has just consumed the zero-width
+/// `ExtglobOpen{prefix}` signal (cursor still sits on `<prefix>(`); push
+/// `Mode::Extglob` and pull atoms until the zero-width `ExtglobEnd` (the lexer
+/// emits it, and pops the mode, in the same call that closes the group — see
+/// `scan_step_extglob`). Mirrors `parse_regex_operand`'s part-assembly arms:
+/// nested `$(…)`/`` `…` ``/`${…}`/`"…"`/`'…'` recurse via the existing
+/// sub-parsers (parser-owned recursion — THE RULE: the lexer never
+/// forward-scans a nested `$(…)`, only tracks paren depth incrementally; the
+/// parser owns delimiter-matching by recursing here).
+fn parse_extglob_group(iter: &mut Lexer) -> Result<Vec<WordPart>, ParseError> {
+    iter.push_mode(Mode::Extglob { paren_depth: 0 });
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut acc: Option<(String, bool)> = None;
+    loop {
+        match iter.peek_kind()? {
+            Some(TokenKind::ExtglobEnd) => { iter.next_kind()?; break; }
+            Some(TokenKind::Lit { .. }) => {
+                if let Some(TokenKind::Lit { text, quoted: q }) = iter.next_kind()? { push_lit(&mut acc, &mut parts, text, q); }
+            }
+            Some(TokenKind::DollarLit { .. }) => {
+                if let Some(TokenKind::DollarLit { quoted: q }) = iter.next_kind()? { flush_lit(&mut acc, &mut parts); parts.push(WordPart::Literal { text: "$".into(), quoted: q }); }
+            }
+            Some(TokenKind::QuoteRun { .. }) => {
+                if let Some(TokenKind::QuoteRun { style, text }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    // Mirrors the oracle's `scan_extglob_group` `'` arm: a
+                    // SINGLE-quoted run inlines FLAT as `Literal{quoted:true}`
+                    // (no `Quoted` wrapper); a `$'…'` ANSI-C run keeps its
+                    // `Quoted{AnsiC,…}` wrapper (same split `parse_regex_operand`
+                    // makes — Backslash/Double never reach here).
+                    match style {
+                        QuoteStyle::Single => parts.push(WordPart::Literal { text, quoted: true }),
+                        _ => parts.push(WordPart::Quoted { style, parts: vec![WordPart::Literal { text, quoted: true }] }),
+                    }
+                }
+            }
+            Some(TokenKind::ParamOpen { .. }) => { flush_lit(&mut acc, &mut parts); parts.push(parse_param_expansion(iter, false)?); }
+            Some(TokenKind::CmdSubOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_command_sub(iter, false)?); }
+            Some(TokenKind::ArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_arith_expansion(iter, false)?); }
+            Some(TokenKind::LegacyArithOpen) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_legacy_arith_expansion(iter, false)?); }
+            Some(TokenKind::BeginBacktick) => { iter.next_kind()?; flush_lit(&mut acc, &mut parts); parts.push(parse_backtick_sub(iter, false)?); }
+            // Mirrors the oracle's `scan_extglob_group` `"` arm (delegates to
+            // `scan_dquote_expansion_body`, which inlines FLAT, not a `Quoted`
+            // wrapper — same as `parse_regex_operand`'s non-subscript case).
+            // Drop the atom-native `parse_dquote`'s injected empty-`""` marker
+            // (`[Literal{"",true}]`) so an empty `""` contributes no part,
+            // matching `scan_dquote_expansion_body`'s empty-body no-op.
+            Some(TokenKind::BeginDquote) => {
+                iter.next_kind()?; flush_lit(&mut acc, &mut parts);
+                match parse_dquote(iter, false)? {
+                    WordPart::Quoted { parts: inner, .. } => {
+                        let is_empty_marker = inner.len() == 1
+                            && matches!(&inner[0], WordPart::Literal { text, quoted: true } if text.is_empty());
+                        if !is_empty_marker { parts.extend(inner); }
+                    }
+                    other => parts.push(other),
+                }
+            }
+            Some(TokenKind::DollarName { .. }) => {
+                if let Some(TokenKind::DollarName { name, quoted: q }) = iter.next_kind()? {
+                    flush_lit(&mut acc, &mut parts);
+                    parts.push(match name.as_str() {
+                        "@" => WordPart::AllArgs { quoted: q, joined: false },
+                        "*" => WordPart::AllArgs { quoted: q, joined: true },
+                        "?" => WordPart::LastStatus { quoted: q },
+                        _   => WordPart::Var { name, quoted: q },
+                    });
+                }
+            }
+            Some(TokenKind::DeferredExpansion) => return Err(ParseError::UnsupportedCommand),
+            other => return Err(ParseError::TestExprBadOperator(format!("extglob group: {other:?}"))),
+        }
+    }
+    flush_lit(&mut acc, &mut parts);
+    Ok(parts)
 }
 
 /// Append a `Lit` atom into the pending coalescible chunk `acc`, matching the
@@ -2054,6 +2146,7 @@ fn parse_simple_with_leading_word(
                     | TokenKind::Tilde(_)
                     | TokenKind::BeginDquote
                     | TokenKind::AssignPrefix { .. }
+                    | TokenKind::ExtglobOpen { .. }
             )
         ) {
             all_words.push(parse_word_command(iter, false)?);
@@ -7047,5 +7140,47 @@ mod tests {
         diff_unit("cat <<EOF\nhi $x\nEOF\necho next"); // heredoc body drained in-unit
         diff_unit("cat <<'EOF'\nlit\nEOF\nafter");     // literal heredoc, then next unit
         diff_unit("a | b\nc");            // pipeline intra-unit
+    }
+
+    // ── v264 extglob differential (atom-native vs oracle) ───────────────────
+    // Extglob is gated by `LexerOptions::extglob` (default off); these helpers
+    // turn it ON for both the oracle (`command::parse`, driven by
+    // `scan_extglob_group`) and the atom path, and assert byte-identical ASTs.
+    fn old_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let toks = tokenize_with_opts(s, LexerOptions { extglob: true, ..Default::default() }).expect("lex");
+        crate::command::parse(&mut Lexer::from_tokens(toks))
+    }
+    fn new_eg(s: &str) -> Result<Option<Sequence>, ParseError> {
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions { extglob: true, ..Default::default() });
+        super::parse_sequence(&mut lx)
+    }
+    fn diff_eg(s: &str) { assert_eq!(new_eg(s), old_eg(s), "extglob mismatch for {s:?}"); }
+
+    #[test]
+    fn atoms_extglob_matches_oracle() {
+        diff_eg("echo +(a|b)");
+        diff_eg("echo @(a|cd)");
+        diff_eg("echo !(a|ab)");
+        diff_eg("echo *(a)");
+        diff_eg("echo ?(abc)");
+        diff_eg("echo +([a-c])");
+        diff_eg("echo zzz+(q)");            // glued prefix literal
+        diff_eg("echo +(a|b)*");            // glued trailing
+        diff_eg("echo dir*/+(foo|bar).txt"); // multi-component glue
+        diff_eg("echo @(a*(b)c)");           // NESTED extglob group (paren depth > 1)
+        diff_eg("echo +($x)");               // inner param
+        diff_eg("echo @(a|$(echo b))");      // inner COMMAND SUB (the RULE-critical case)
+        diff_eg("echo +(${v})");             // inner ${...}
+        diff_eg("[[ aab == +(a|b) ]] && echo y || echo n");
+        diff_eg("[[ abbbc == @(a*(b)c) ]] && echo y || echo n");
+        diff_eg("[[ file.txt == +([a-z]).txt ]] && echo y || echo n");
+        diff_eg("case hello in +([a-z])) echo lc;; *) echo o;; esac");
+        diff_eg("case cd in @(ab|cd)) echo m;; *) echo o;; esac");
+        // extglob OFF: `+(` is NOT extglob — regression guard (default opts).
+        // Both the oracle and the atom path already reject a bare unquoted `(`
+        // mid-word identically (`Err(UnexpectedToken)`, pre-existing/unrelated
+        // to extglob) — `diff_err` (not `diff_cmd`) is the correct comparison
+        // for a case where BOTH sides error the same way rather than succeed.
+        diff_err("echo +(a)");               // extglob off: oracle+atom both treat as-is
     }
 }
