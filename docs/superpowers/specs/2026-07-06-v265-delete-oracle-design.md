@@ -32,8 +32,15 @@ parser owns delimiter-matching, recursion, and structure).
    (e.g. `emit_word_with_braces`).
 3. Port the one remaining production oracle consumer, `continuation.rs`,
    onto the atom path.
-4. Delete the differential test harness (~54 `atom == oracle` assertions and
-   the `old_seq` / `old_unit` / `old_eg` / `old_seq_al` helpers).
+4. Decouple the differential test harness from the oracle by **smoke-converting**
+   its helpers. The harness is far larger than a first count suggested — ~882
+   assertions (`diff_cmd` alone has 830 call-sites) across ~150 of parser.rs's
+   182 test fns, the whole atom-parser AST regression corpus. Rather than
+   delete it, change the *helper bodies* so they no longer call the oracle:
+   assert the atom parser returns `Ok`/`Err` (as appropriate) instead of
+   `atom == oracle`. This keeps every curated input as a parse-level
+   regression guard while removing the oracle dependency. The `old_seq` /
+   `old_seq_al` / `old_unit` / `old_eg` helpers then go unused and are deleted.
 5. Tidy module ownership to the intended end-state (below).
 
 ## Non-Goals
@@ -121,7 +128,7 @@ compiler do it. The sequence:
 1. Make **nothing** call the oracle entry points (`command::parse`,
    `command::parse_one_unit`, `tokenize`, `tokenize_with_opts`,
    `from_tokens`). This means porting `continuation.rs`, repointing the ~6
-   test helpers, and deleting the differential harness first.
+   test helpers, and smoke-converting the differential harness first.
 2. Remove those entry points.
 3. `cargo build -p huck-syntax` and `-p huck-engine`. The `dead_code` lint
    flags every function now only-ever-reachable from the deleted oracle.
@@ -225,15 +232,31 @@ Repoint each to the atom parser
 the production pattern in `shell.rs:384`. Mechanical; each file's test suite
 is the gate.
 
-### Task 3 — Delete the differential harness
+### Task 3 — Smoke-convert the differential harness
 
-Remove the ~54 `atom == oracle` assertions and the `old_seq` / `new_seq` /
-`old_seq_al` / `new_seq_al` / `old_unit` / `new_unit` / `old_eg` differential
-helpers from `parser.rs`'s `mod tests`. Per the approved decision (option B),
-these are migration scaffolding whose purpose — proving `atom == oracle` — is
-moot now that the atom path *is* production and is validated against **bash**
-directly by the 1688-case bash-diff sweep. Keep all *non-differential*
-huck-syntax parse tests. The suite count drops; it must stay green.
+The differential harness is ~882 assertions (`diff_cmd` × 830, `diff_eg` × 22,
+`diff_al` × 15, `diff_unit` × 15) across ~150 of parser.rs's 182 test fns —
+the atom parser's entire fast AST regression corpus. Do **not** delete the
+call-sites. Instead change only the **helper bodies** so they stop calling the
+oracle, keeping every curated input alive as a parse-level guard:
+
+- `diff_cmd(s)`: was `assert_eq!(new_seq(s).unwrap(), old_seq(s).unwrap())` →
+  `assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s))`
+- `diff_err(s)`: was `assert_eq!(new_seq(s), old_seq(s))` →
+  `assert!(new_seq(s).is_err(), "expected Err for {s:?}, got {:?}", new_seq(s))`
+- `diff_al(s, pairs)`: → assert `new_seq_al(s, pairs).is_ok()`
+- `diff_unit(s)`: → assert `new_unit(s).iter().all(|r| r.is_ok())`
+- `diff_eg(s)`: → assert `new_eg(s).is_ok()`
+- `diff_unsupported(s)`: unchanged (already checks only `new_seq`).
+
+Then delete the now-unused oracle helpers `old_seq` / `old_seq_al` /
+`old_unit` / `old_eg` (the `command::parse` callers). `new_seq` / `new_seq_al`
+/ `new_unit` / `new_eg` stay. Every existing call passes unchanged: every
+`diff_cmd` input already has `new_seq(s) == Ok` (it currently `.unwrap()`s it)
+and every `diff_err` input already errors, so no test flips. This trades
+AST-*shape* verification (now carried by bash-diff + huck-engine) for
+panic/`Ok`↔`Err`-regression guards, while removing the oracle dependency —
+the actual goal.
 
 ### Task 4 — Delete the oracle (compiler-guided)
 
@@ -272,8 +295,9 @@ this box (1 core / 1.9 GB):
   (`funcnest`, pre-existing intentional L-63) baseline as end-of-v264.
 
 The bash-diff sweep is now the **primary** correctness oracle (the
-differential is gone). Option B is safe precisely because the atom path is
-already validated against bash — a stronger ground truth than the oracle.
+differential no longer verifies AST shape after the smoke-convert). This is
+safe precisely because the atom path is already validated against bash — a
+stronger ground truth than the oracle ever was.
 
 `cargo build` must end at **0 warnings** (the deletion's completion signal).
 Trust `cargo`, not rust-analyzer (phantom `dead_code` diagnostics have
