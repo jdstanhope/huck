@@ -641,13 +641,14 @@ pub(crate) enum Mode {
     ParamSubstPatternOperand    { in_dquote: bool },
     ParamSubstringOffsetOperand { in_dquote: bool },
     ParamSubscriptOperand       { in_dquote: bool },
-    // `in_dquote` is set (by `set_operand_in_dquote`'s callers) for symmetry with
-    // the other operand modes above, but `scan_step_arith` never reads it
-    // (`_in_dquote`) — the oracle hardcodes `quoted: true` for arith bodies (they
-    // are never word-split), so there is no quoted/unquoted branch to select.
-    // Kept for now rather than removed; may carry a future signal (e.g. if arith
-    // ever needs to distinguish a quoted-bit).
-    Arith { paren_depth: u32, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
+    // v261 T1: `in_squote`/`in_dquote` are the scanner's INTERNAL quote-span state
+    // (repurposed from a formerly-dead `in_dquote` field) — NOT the outer
+    // quoted-context of the enclosing word (arith bodies are always emitted as
+    // `quoted: true`, matching the oracle's `arith_string_to_word`, so there is no
+    // outer quoted/unquoted branch to select). Both flags start `false` at every
+    // push site (a fresh body opens outside any quote span) and are written back
+    // to this frame by `sync_quotes!` on every `'`/`"` toggle in `scan_step_arith`.
+    Arith { paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim }, // $(( … )) / (( … )) / for (( … )) / $[ … ]
     DoubleQuote { body_started: bool }, // "…" — v247 T3 (parser-driven word-level mode)
     ArrayLiteral { body_started: bool, expect_subscript_eq: bool, at_element_start: bool },   // a=( … ) — v252; expect_subscript_eq: control returned from a `[expr]` subscript scan, the required `=` must follow. at_element_start: PERSISTENT across scan_step calls — true only after `(`/a separator and before any value/subscript atom of the current element (so a `[` mid-value stays literal).
     DoubleBracket,  // [[ … ]]
@@ -961,8 +962,8 @@ impl<'a> Lexer<'a> {
             Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
-            Mode::Arith { paren_depth, in_dquote, body_started, for_header, delim } =>
-                self.scan_step_arith(paren_depth, in_dquote, body_started, for_header, delim),
+            Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
+                self.scan_step_arith(paren_depth, in_squote, in_dquote, body_started, for_header, delim),
             Mode::DoubleQuote { body_started } => self.scan_step_dquote(body_started),
             Mode::ArrayLiteral { body_started, expect_subscript_eq, at_element_start } =>
                 self.scan_step_array_literal(body_started, expect_subscript_eq, at_element_start),
@@ -1983,11 +1984,11 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// `Mode::Arith { paren_depth, in_dquote, body_started, for_header, delim }` scanner — v246.
+    /// `Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim }` scanner — v246.
     /// Emits `$((` (ArithOpen) on entry, then body atoms, then `))` (ArithClose).
     /// `for_header` (v256) additionally emits `ArithSemi` at a depth-0 `;`.
     /// `delim` (v258) selects `$((`/ArithClose(`))`) vs `$[`/LegacyArithOpen/ArithClose(`]`).
-    fn scan_step_arith(&mut self, paren_depth: u32, _in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim) -> Result<Step, LexError> {
+    fn scan_step_arith(&mut self, paren_depth: u32, in_squote: bool, in_dquote: bool, body_started: bool, for_header: bool, delim: ArithDelim) -> Result<Step, LexError> {
         if !body_started {
             let off = self.cursor.offset();
             let l = self.cursor.line();
@@ -2023,6 +2024,17 @@ impl<'a> Lexer<'a> {
         macro_rules! sync_depth { () => {
             if let Some(Mode::Arith { paren_depth, .. }) = self.modes.last_mut() { *paren_depth = depth; }
         }; }
+        let mut squote = in_squote;
+        let mut dquote = in_dquote;
+        // Write the current quote-span state back to the top Arith frame. Called
+        // on every `'`/`"` toggle so the flag survives a `$`/backtick sub-parse
+        // round-trip WITHOUT adding a sync to every `return` site (mirrors how
+        // `body_started` is set directly on the frame).
+        macro_rules! sync_quotes { () => {
+            if let Some(Mode::Arith { in_squote, in_dquote, .. }) = self.modes.last_mut() {
+                *in_squote = squote; *in_dquote = dquote;
+            }
+        }; }
         let (open_char, close_char) = match delim {
             ArithDelim::Paren => ('(', ')'),
             ArithDelim::Bracket => ('[', ']'),
@@ -2030,6 +2042,15 @@ impl<'a> Lexer<'a> {
         loop {
             match self.cursor.peek().copied() {
                 None => {
+                    if squote || dquote {
+                        // Unterminated quote span inside the arith body. The oracle
+                        // also errors here (scan_arith_body → UnterminatedArith /
+                        // scan_legacy_arith_body/push_quoted_span → UnterminatedLegacyArith).
+                        // Both paths error, so the input is not byte-comparable
+                        // (`old_seq` panics on lex errors) — same non-diff pattern as
+                        // prior iterations' unterminated cases.
+                        return Err(LexError::UnterminatedArith);
+                    }
                     if !text.is_empty() {
                         sync_depth!();
                         self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
@@ -2037,17 +2058,52 @@ impl<'a> Lexer<'a> {
                     }
                     return Err(LexError::UnterminatedArith);
                 }
-                Some(oc) if oc == open_char => {
+                // Inside a single-quoted span single-quote is DELIM-AWARE, exactly
+                // like double-quote: it suppresses `$`/backtick/`\`-escaping (those
+                // arms are `!squote`-guarded → fall to the catch-all as literals) but
+                // does NOT gate the delimiters. A Paren `(`/`)`/for-header `;` still
+                // fires (the oracle `scan_arith_body` is fully quote-blind), while a
+                // Bracket `[`/`]` fails the `(!squote && !dquote)` guard and falls to
+                // the catch-all as a protected literal (the oracle `scan_legacy_arith_body`
+                // tracks quote spans). `'` closes the span; `"` is a literal.
+                Some('\'') if squote => {
+                    self.cursor.next();
+                    squote = false;
+                    sync_quotes!();
+                }
+                Some('"') if squote => {
+                    self.cursor.next();
+                    text.push('"');
+                }
+                // Quote openers/closers (not in single-quote here). A `'` inside a
+                // double-quote is literal; otherwise it OPENS a single-quote (drop
+                // the quote char — bash quote-removal). `"` toggles the double-quote
+                // span (drop the quote char). Both are DROPPED, never pushed.
+                Some('\'') => {
+                    self.cursor.next();
+                    if dquote {
+                        text.push('\'');
+                    } else {
+                        squote = true;
+                        sync_quotes!();
+                    }
+                }
+                Some('"') => {
+                    self.cursor.next();
+                    dquote = !dquote;
+                    sync_quotes!();
+                }
+                Some(oc) if oc == open_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     self.cursor.next();
                     text.push(oc);
                     depth += 1;
                 }
-                Some(cc) if cc == close_char && depth > 0 => {
+                Some(cc) if cc == close_char && depth > 0 && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     self.cursor.next();
                     text.push(cc);
                     depth -= 1;
                 }
-                Some(cc) if cc == close_char => {
+                Some(cc) if cc == close_char && (matches!(delim, ArithDelim::Paren) || (!squote && !dquote)) => {
                     // depth == 0: flush any pending literal FIRST (emit the
                     // terminator/bail on the NEXT call), else classify now.
                     if !text.is_empty() {
@@ -2079,7 +2135,7 @@ impl<'a> Lexer<'a> {
                     }
                     return Ok(Step::Produced);
                 }
-                Some('`') => {
+                Some('`') if !squote => {
                     if !text.is_empty() {
                         sync_depth!();
                         self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
@@ -2089,7 +2145,7 @@ impl<'a> Lexer<'a> {
                     self.history.push(Token::new(TokenKind::BeginBacktick, Span::new(so, sl, sc)));
                     return Ok(Step::Produced);
                 }
-                Some('$') => {
+                Some('$') if !squote => {
                     // Classify what follows `$` (Task 4 adds the `$((` nested-arith branch).
                     // NOTE: arithmetic contexts always treat embedded expansions as
                     // `quoted: true` (matches the production oracle `arith_string_to_word`,
@@ -2207,9 +2263,67 @@ impl<'a> Lexer<'a> {
                             return Ok(Step::Produced);
                         }
                         _ => {
-                            // Bare `$` (e.g. before an operator) — literal.
-                            self.cursor.next();
-                            text.push('$');
+                            // Bare `$` (not `${`/`$(`/`$((`/`$[`/`$name`/special/digit):
+                            // the oracle (arith_string_to_word) flushes the pending
+                            // literal and pushes `$` as its OWN Literal part. Match that
+                            // structure so `$(( 1 $ 2 ))`/`$(( $'x' ))` are byte-identical.
+                            if !text.is_empty() {
+                                sync_depth!();
+                                self.history.push(Token::new(TokenKind::Lit { text, quoted: true }, Span::new(off, l, c)));
+                                return Ok(Step::Produced);
+                            }
+                            let so = self.cursor.offset(); let sl = self.cursor.line(); let sc = self.cursor.column();
+                            self.cursor.next(); // `$`
+                            self.history.push(Token::new(TokenKind::Lit { text: "$".into(), quoted: true }, Span::new(so, sl, sc)));
+                            return Ok(Step::Produced);
+                        }
+                    }
+                }
+                Some('\\') if !squote => {
+                    if dquote {
+                        // Double-quote `\`-escape table (matches arith_string_to_word):
+                        // `\` before `" \ $ ` `` drops the backslash and keeps the
+                        // metachar; otherwise the `\` is literal and the next char is
+                        // reprocessed normally.
+                        self.cursor.next(); // consume `\`
+                        match self.cursor.peek().copied() {
+                            Some(n @ ('"' | '\\' | '$' | '`')) => { self.cursor.next(); text.push(n); }
+                            _ => { text.push('\\'); }
+                        }
+                    } else {
+                        match delim {
+                            // `$[`: `\` is retained VERBATIM and protects only a
+                            // `]`/`[` DELIMITER (consume+push it so it can't close the
+                            // bracket). For any OTHER next char, do NOT consume it — the
+                            // main loop re-processes it, so `$`/backtick still expand and
+                            // plain chars are pushed literally by the catch-all. This
+                            // matches the oracle two-pass model: scan_legacy_arith_body
+                            // protects only the delimiter in pass 1, then
+                            // arith_string_to_word re-expands the retained `\c` in pass 2.
+                            ArithDelim::Bracket => {
+                                self.cursor.next(); // `\`
+                                text.push('\\');
+                                // Consume+retain the next char ONLY if it is a delimiter
+                                // (`]`/`[`) or a second `\`. The oracle scan_legacy_arith_body
+                                // pairs `\` with ANY next char, but for the atom single pass
+                                // only these three matter: `]`/`[` must be protected from
+                                // closing, and a `\` must be paired-and-consumed so a
+                                // following delimiter stays LIVE (`\\]` → oracle keeps `]` a
+                                // delimiter; not consuming the 2nd `\` would re-read it as a
+                                // fresh escape and wrongly protect the `]`). `$`/`` ` ``/others
+                                // are left for the main loop to re-expand (matches pass 2);
+                                // `'`/`"` open a span (the pinned two-pass residual).
+                                match self.cursor.peek().copied() {
+                                    Some(nc @ (']' | '[' | '\\')) => { self.cursor.next(); text.push(nc); }
+                                    _ => { /* do NOT consume — main loop re-processes */ }
+                                }
+                            }
+                            // `$((`: `\` is a plain literal (scan_arith_body is
+                            // quote/escape-blind; arith_string_to_word keeps it).
+                            ArithDelim::Paren => {
+                                self.cursor.next();
+                                text.push('\\');
+                            }
                         }
                     }
                 }
@@ -7876,12 +7990,12 @@ mod tests {
     fn mode_stack_push_pop_current() {
         let mut lx = Lexer::new("echo hi", LexerOptions::default(), true);
         assert_eq!(lx.current_mode(), Mode::Command);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         assert_eq!(lx.pop_mode(), Mode::CommandSub { body_started: false });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 
@@ -7891,7 +8005,7 @@ mod tests {
         // prefix — body_started=true starts at the body loop). Top-level `;`
         // must emit ArithSemi; a `;` nested in `()` stays literal.
         let mut lx = Lexer::new_live_atoms("i=0;i<3;i++))", &Default::default(), LexerOptions::default());
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
         let mut kinds = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
@@ -7911,7 +8025,7 @@ mod tests {
 
         // Nested `;` (depth>0) stays literal — one Lit, no ArithSemi.
         let mut lx2 = Lexer::new_live_atoms("(a;b)))", &Default::default(), LexerOptions::default());
-        lx2.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+        lx2.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
         let mut kinds2 = Vec::new();
         loop {
             match lx2.next_kind().expect("lex") {
@@ -7931,7 +8045,7 @@ mod tests {
         // A Mode::Arith{delim:Bracket} body: `$[a[0]+1]` → LegacyArithOpen, the
         // body Lit "a[0]+1" (inner [0] bracket-nested), then ArithClose.
         let mut lx = Lexer::new_live_atoms("$[a[0]+1]", &Default::default(), LexerOptions::default());
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
         let mut kinds = Vec::new();
         loop {
             match lx.next_kind().expect("lex") {
@@ -13111,13 +13225,13 @@ mod array_parse_tests {
     #[test]
     fn rewind_restores_mode_stack() {
         let mut lx = Lexer::new("x", LexerOptions::default(), true);
-        lx.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        lx.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         let m = lx.mark();
         lx.push_mode(Mode::CommandSub { body_started: false });
         assert_eq!(lx.current_mode(), Mode::CommandSub { body_started: false });
         lx.rewind(&m);
-        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
-        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.current_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
+        assert_eq!(lx.pop_mode(), Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
         assert_eq!(lx.current_mode(), Mode::Command);
     }
 

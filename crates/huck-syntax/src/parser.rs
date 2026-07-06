@@ -1238,7 +1238,7 @@ pub(crate) fn parse_backtick_sub(iter: &mut Lexer, quoted: bool) -> Result<WordP
 
 /// Assemble a `WordPart::Arith` for a `$(( … ))` arithmetic expansion.
 ///
-/// Pushes `Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
+/// Pushes `Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren }`;
 /// the mode's first scan consumes the opening `$((` and emits `ArithOpen`.  The
 /// parser assembles the body `Word` (literal runs + embedded expansions), stops on
 /// `ArithClose`, and on `ArithBail` rewinds to the `$((` start and re-drives as a
@@ -1323,7 +1323,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     // pull boundary (the parser dispatches on a peeked opener), so mark/rewind's
     // pull-boundary assert holds.
     let mark = iter.mark();
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Paren });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::ArithOpen) => {}
@@ -1354,7 +1354,7 @@ pub(crate) fn parse_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
 /// `LegacyArithOpen`; `parse_arith_body` assembles the body and returns `Closed` on
 /// `ArithClose`.
 pub(crate) fn parse_legacy_arith_expansion(iter: &mut Lexer, quoted: bool) -> Result<WordPart, ParseError> {
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: quoted, body_started: false, for_header: false, delim: ArithDelim::Bracket });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: false, for_header: false, delim: ArithDelim::Bracket });
     let result = (|| -> Result<ArithBodyOutcome, ParseError> {
         match iter.next_kind()? {
             Some(TokenKind::LegacyArithOpen) => {}
@@ -1402,7 +1402,7 @@ fn parse_arith_command(iter: &mut Lexer) -> Result<Command, ParseError> {
     let mark = iter.mark();
     iter.next_kind()?; // consume first `(` (buffered Op(LParen))
     iter.next_kind()?; // consume second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: false, delim: ArithDelim::Paren });
     let result = parse_arith_body(iter, false);
     iter.pop_mode();
     match result? {
@@ -3177,7 +3177,7 @@ fn parse_arith_for_body(iter: &mut Lexer) -> Result<Vec<Word>, ParseError> {
 fn parse_arith_for_clause(iter: &mut Lexer) -> Result<Command, ParseError> {
     iter.next_kind()?; // first `(`
     iter.next_kind()?; // second `(`
-    iter.push_mode(Mode::Arith { paren_depth: 0, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
+    iter.push_mode(Mode::Arith { paren_depth: 0, in_squote: false, in_dquote: false, body_started: true, for_header: true, delim: ArithDelim::Paren });
     let result = parse_arith_for_body(iter);
     iter.pop_mode();
     let sections = match result {
@@ -5714,75 +5714,118 @@ mod tests {
 
     #[test]
     fn atoms_legacy_arith_quote_backslash_carryforward() {
-        // v258 LIVE-FLIP CARRY-FORWARD: the atom Mode::Arith{Bracket} treats quotes
-        // (single AND double) and `\` as LITERAL chars (no sub-mode, exactly like
-        // `$((`), so ANY `]` inside a quoted span (`'…'` or `"…"`) or immediately
-        // after a `\` closes the `$[ … ]` EARLY — the atom scanner has no concept
-        // of "inside a quote" while scanning a legacy-arith body, so it can't tell
-        // a quoted `]` from a real terminator. The oracle's scan_legacy_arith_body
-        // protects those spans (`Arith{body:" ] "}` / `Arith{body:" \\] "}` /
-        // equivalent single-quoted forms). `$((` shows no such divergence only
-        // because its early depth-0 `)` ArithBails to a command-sub-of-subshell on
-        // BOTH paths; `$[` has no bail. General class: quotes are literal in the
-        // bracket body, so any `]` inside a quoted span (single OR double) closes
-        // early. Pathological (quotes/backslash-escaped brackets in a legacy
-        // arith); dormant. Two probed shapes below (double-quoted, backslash);
-        // the same reasoning applies uniformly to `$[']']`, `$[ ']' ]`,
-        // `$['x]y']`, `$["x]y"]`, etc.
-        //
-        // `echo $[ "]" ]`: the atom body closes at the FIRST unprotected `]`
-        // (right after the opening `"`), leaving a lone unmatched `"` in the rest
-        // of the command line (`" ]`) — that dangling quote never closes before
-        // EOF, so the atom path errors UnterminatedQuote (the oracle parses fine).
-        assert!(
-            matches!(
-                new_seq("echo $[ \"]\" ]"),
-                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
-            ),
-            "expected UnterminatedQuote for echo $[ \"]\" ], got {:?}",
-            new_seq("echo $[ \"]\" ]")
-        );
+        // v261 T1 RESOLUTION (was a v258 LIVE-FLIP CARRY-FORWARD, CF7): the atom
+        // `Mode::Arith{Bracket}` now has a quote/backslash sub-mode (mirrors the
+        // oracle's `scan_legacy_arith_body`/`push_quoted_span`), so a `]` inside a
+        // quoted span (single OR double) or immediately after a `\` no longer
+        // closes the `$[ … ]` early — it's byte-identical to the oracle now.
+        // Three probed shapes (double-quoted, backslash, single-quoted); the same
+        // reasoning applies uniformly to `$[ ']' ]`, `$['x]y']`, `$["x]y"]`, etc.
+        diff_cmd("echo $[ \"]\" ]");
+        diff_cmd("echo $[ \\] ]");
+        diff_cmd("echo $[']']");
+        // v261 T1 review-B: `\` is retained verbatim and protects ONLY a `]`/`[`
+        // delimiter; a `\` before `$`/other lets the next char re-expand (matches the
+        // oracle two-pass `arith_string_to_word`), so `\$x` → `[" \", Var{x}, " "]`.
+        diff_cmd("echo $[ \\$x ]");
+    }
 
-        // `echo $[ \] ]`: `\` is a literal body char (no escaping), so the `]`
-        // immediately after it closes the bracket early (body = " \\"); the
-        // trailing ` ]` becomes a SECOND, separate argument word.
-        assert_eq!(
-            new_seq("echo $[ \\] ]").unwrap(),
-            Some(Sequence {
-                first: Command::Pipeline(Pipeline {
-                    negate: false,
-                    commands: vec![Command::Simple(SimpleCommand::Exec(ExecCommand {
-                        inline_assignments: vec![],
-                        program: Word(vec![WordPart::Literal { text: "echo".into(), quoted: false }]),
-                        args: vec![
-                            Word(vec![WordPart::Arith {
-                                body: Word(vec![WordPart::Literal { text: " \\".into(), quoted: true }]),
-                                quoted: false,
-                            }]),
-                            Word(vec![WordPart::Literal { text: "]".into(), quoted: false }]),
-                        ],
-                        redirects: vec![],
-                        line: 1,
-                    }))],
-                }),
-                rest: vec![],
-                background: false,
-            })
-        );
+    #[test]
+    fn atoms_arith_squote_blind_bail() {
+        // v261 T1 review-A regression guard: Paren delimiters (`$((`/`((`/`for ((`)
+        // are quote-BLIND even inside single-quotes — the oracle `scan_arith_body`
+        // counts `(`/`)`/`;` regardless of quotes (quote-removal is a separate second
+        // pass), so a `(`/`)`/for-header `;` inside a `'…'` span must still fire the
+        // depth/close/bail events, NOT be swallowed as a literal.
+        diff_cmd("echo $(( ')' ))");   // bails to CommandSub{Subshell{'...'}}
+        diff_cmd("echo $(( '(' ))");
+        diff_cmd("(( ')' ))");
+        diff_err("for (( '(' ; ; )); do :; done");   // both Err(UnterminatedLoop)
+    }
 
-        // `echo $[']']`: same class as the double-quoted case above, but with a
-        // single-quoted span — confirms the divergence is quote-KIND-agnostic
-        // (single AND double). The atom body closes at the first `]` (inside the
-        // `'…'`), leaving a dangling unmatched `'` before EOF → UnterminatedQuote
-        // (the oracle parses fine: `Arith{body:"]"}`, probed via new_seq/old_seq).
-        assert!(
-            matches!(
-                new_seq("echo $[']']"),
-                Err(ParseError::Lex(ref e)) if matches!(**e, crate::lexer::LexError::UnterminatedQuote)
-            ),
-            "expected UnterminatedQuote for echo $[']'], got {:?}",
-            new_seq("echo $[']']")
-        );
+    #[test]
+    fn atoms_legacy_arith_backslash_quote_carryforward() {
+        // v261 T1 NEW live-flip carry-forward: `\` before a QUOTE char in legacy
+        // `$[ … ]`. The review-B fix retains `\` verbatim and re-processes the next
+        // char (so `$`/backtick re-expand) unless it's a `]`/`[` delimiter. But a
+        // `\'`/`\"` then lets the `'`/`"` OPEN a quote-removal span that is genuinely
+        // unmatchable in the atom's ONE pass — the oracle's TWO-pass model protects
+        // the `\c` in pass 1 (scan_legacy_arith_body) then re-interprets it in pass 2
+        // (arith_string_to_word), yielding body `" \ "`. The atom instead runs off the
+        // end of the (now-quoted) body and lex-errors. Same exotic two-pass-vs-one-pass
+        // class as other source-position pins. `old_seq` panics on this (Ok w/ lex OK,
+        // but the atom errors), so assert the atom side only.
+        assert!(new_seq("echo $[ \\' ]").is_err(),  // oracle: Ok body \" \\ \"
+                "atom one-pass runs off the unmatchable squote-after-backslash span");
+        assert!(new_seq("echo $[ \\\" ]").is_err(), // oracle: Ok body \" \\ \"
+                "atom one-pass runs off the unmatchable dquote-after-backslash span");
+    }
+
+    #[test]
+    fn atoms_arith_paren_quote_removal() {
+        // CF6: bash quote-removal in $((/((/for (( arith bodies — quotes are
+        // dropped, single-quote suppresses `$`, double-quote keeps expansion.
+        diff_cmd("echo $(( \"x\" ))");
+        diff_cmd("echo $(( x=\"5\" ))");
+        diff_cmd("echo $(( 1\"2\"3 ))");
+        diff_cmd("echo $(( '$x' ))");        // single-quote → literal $x, no expand
+        diff_cmd("echo $(( \"$x\" ))");      // double-quote → expands, quotes gone
+        diff_cmd("echo $(( \"a\\\"b\" ))");  // dquote \-escape → a"b
+        diff_cmd("echo $(( \"`echo 1`\" ))"); // backtick inside dquote
+        diff_cmd("echo $(( \"${x:-]}\" ))"); // ${…} inside dquote
+        diff_cmd("echo $(( \"a$(( 1 ))b\" ))"); // nested $(( )) inside dquote
+        diff_cmd("echo $(( \"\" ))");        // empty dquote dropped
+        diff_cmd("echo $(( \"a\"'b' ))");    // adjacent quotes concatenate
+        diff_cmd("(( \"x\" ))");             // standalone (( )) command
+    }
+
+    #[test]
+    fn atoms_arith_bare_dollar_split() {
+        // Bare `$` (not an expansion start) is its own literal part in the oracle.
+        diff_cmd("echo $(( 1 $ 2 ))");
+        diff_cmd("echo $(( 1 $+ 2 ))");
+        diff_cmd("echo $(( $'x' ))");   // no ANSI-C in arith: `$` literal + 'x' removed
+    }
+
+    #[test]
+    fn atoms_legacy_arith_quote_protection() {
+        // CF7: `$[ … ]` — quotes and `\` protect the `]` AND are removed
+        // (backslash retained literally).
+        diff_cmd("echo $[ \"]\" ]");    // was UnterminatedQuote → Arith " ] "
+        diff_cmd("echo $[']']");         // was UnterminatedQuote → Arith "]"
+        diff_cmd("echo $[ \\] ]");      // was 2 args → Arith " \\] "
+        diff_cmd("echo $[ \"$x\" ]");   // dquote expands, protects, removed
+        diff_cmd("echo $[ ${x:-]} ]");  // ${…} already protects (regression)
+        diff_cmd("echo $[ $(echo ]) ]"); // $(…) already protects (regression)
+        // Backslash-RUN before a delimiter: the oracle pairs `\` with any next
+        // char, so an EVEN run leaves the following `]` a LIVE delimiter. The
+        // atom pairs `\`+`\` (and `\`+`]`/`[`) so runs are consumed correctly.
+        diff_cmd("echo $[ \\\\] ]");    // \\]  → Arith " \\\\" + arg "]"
+        diff_cmd("echo $[ \\\\\\] ]");  // \\\] → ] protected (odd run)
+        diff_cmd("echo $[ \\$x ]");     // \$x  → " \\" + Var x (re-expands)
+        diff_cmd("echo $[ \\\\$x ]");   // \\$x → " \\\\" + Var x
+    }
+
+    #[test]
+    fn atoms_arith_for_header_quote() {
+        // Probed edge (v261 T2 Step 6): a quoted for-header section. Both paths
+        // agree byte-for-byte — a quoted `;` inside a for-header section still
+        // counts as a section separator (quote-blind, like the paren-delim bail),
+        // so `"a;b"` splits into 4 sections → ArithForHeader error on both sides;
+        // a fully-quoted section (`"1"`/`"2"`) parses identically with the quotes
+        // stripped from the resulting Word.
+        diff_err("for (( \"a;b\" ; ; )); do :; done");
+        diff_cmd("for (( \"1\" ; \"2\" ; )); do :; done");
+    }
+
+    #[test]
+    fn atoms_arith_quote_blind_bail_unchanged() {
+        // Paren delimiters are quote-BLIND: a `)`/`(` inside a quote still drives
+        // the depth/bail logic (scan_arith_body). These bail to a
+        // cmdsub-of-subshell on BOTH paths — quote-removal must not protect them.
+        diff_cmd("echo $(( \")\" ))");
+        diff_cmd("echo $(( ')' ))");
+        diff_cmd("echo $(( \"(\" ))");
     }
 
     #[test]
