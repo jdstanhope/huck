@@ -4961,6 +4961,44 @@ impl<'a> Lexer<'a> {
         self.history.len().saturating_sub(self.pos)
     }
 
+    /// The kind of the last significant token PULLED INTO history (skipping the
+    /// inter-token `Blank`/`Newline` atoms), or `None` if none was pulled.
+    ///
+    /// Reads already-buffered `history` only — it NEVER scans. This is the
+    /// atom-path replacement for the old `tokenize(...).last()` check used by
+    /// REPL continuation classification to detect a trailing `|`/`&&`/`||`
+    /// connector. A fresh standalone lex scan cannot be used for that: the atom
+    /// lexer emits zero-width *opener signals* (`$((`→`ArithOpen`, `$(`→
+    /// `CmdSubOpen`, `${`→`ParamOpen`, backtick→`BeginBacktick`) that the PARSER
+    /// is responsible for consuming and pushing a mode for; driven without a
+    /// parser the cursor never advances past the `$`, so `next()` re-emits the
+    /// same signal forever (unbounded `history` growth). Because the parser has
+    /// already driven mode-pushing while producing `self`, the connector — the
+    /// buffer's last token — is guaranteed to have been pulled (consumed or via
+    /// lookahead), so inspecting `history` here is both correct and bounded.
+    pub fn last_significant_kind(&self) -> Option<&TokenKind> {
+        self.history
+            .iter()
+            .rev()
+            .map(|t| &t.kind)
+            .find(|k| !matches!(k, TokenKind::Blank | TokenKind::Newline))
+    }
+
+    /// True when a heredoc redirect (`<<EOF`) was scanned but its body was never
+    /// supplied — the input ended on the redirect LINE, before any newline could
+    /// trigger body collection, so the heredoc still sits in the atom-path
+    /// pending queue unattached.
+    ///
+    /// Used by REPL continuation classification: in SCRIPT mode a bare `cat
+    /// <<EOF` is a complete (empty-body) command — bash warns and huck's atom
+    /// parser returns `Ok` to match — but INTERACTIVELY bash prompts `>` for the
+    /// body, so the REPL must treat it as incomplete. The old whole-buffer
+    /// `tokenize` reported this as `UnterminatedHeredoc`; the fused atom path
+    /// does not, so classification checks this predicate explicitly.
+    pub fn has_unattached_heredoc(&self) -> bool {
+        !self.atom_pending_heredocs.is_empty()
+    }
+
     pub fn set_aliases(&mut self, aliases: std::collections::HashMap<String, String>) {
         self.aliases = aliases;
     }
