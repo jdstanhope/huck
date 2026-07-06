@@ -2570,6 +2570,19 @@ fn parse_command_then_pipeline(iter: &mut Lexer) -> Result<Command, ParseError> 
 /// Stops (without consuming) at EOF, case terminators (`;;`/`;&`/`;;&`),
 /// or a `stop_at` keyword.
 pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequence, ParseError> {
+    parse_and_or_opts(iter, stop_at, false)
+}
+
+/// The shared body of [`parse_and_or`]. When `stop_at_top_newline` is set, a
+/// top-level `TokenKind::Newline` terminates the command UNIT (used by
+/// [`parse_one_unit`] for the non-interactive script reader); otherwise a
+/// top-level newline is a Semi-like continue connector. Mirrors the oracle's
+/// `command::parse_sequence_opts`.
+fn parse_and_or_opts(
+    iter: &mut Lexer,
+    stop_at: &[Keyword],
+    stop_at_top_newline: bool,
+) -> Result<Sequence, ParseError> {
     let first = parse_command_then_pipeline(iter)?;
     let mut rest: Vec<(Connector, Command)> = Vec::new();
     let mut background = false;
@@ -2644,6 +2657,18 @@ pub(crate) fn parse_and_or(iter: &mut Lexer, stop_at: &[Keyword]) -> Result<Sequ
 
             // ── `;` or newline — semi-like connector ─────────────────────────
             TokenKind::Op(Operator::Semi) | TokenKind::Newline => {
+                // v264 unit mode: a top-level NEWLINE ends the command unit
+                // (already consumed as `token`). Drain any heredoc-body atom
+                // groups the lexer emitted for THIS unit's line — the atom path
+                // emits them after the newline, unlike the oracle which
+                // pre-collects during tokenization — so `fill_sequence` can
+                // attach them; then end the unit WITHOUT skipping inter-unit
+                // newlines or parsing the next command. `;` still separates
+                // within a unit.
+                if stop_at_top_newline && matches!(token, TokenKind::Newline) {
+                    collect_heredoc_bodies_after_newline(iter)?;
+                    break;
+                }
                 skip_newlines(iter)?;
                 // ── Stop check 3: stop_at keyword after `;`/newline (~958) ───
                 if peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false) {
@@ -2977,6 +3002,30 @@ pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, Parse
     }
     // v250 T3: attach every heredoc body collected along the way (in source
     // order == emission order) to its still-empty placeholder.
+    let mut bodies = iter.take_heredoc_bodies().into_iter();
+    fill_sequence(&mut seq, &mut bodies);
+    Ok(Some(seq))
+}
+
+/// v264: parse ONE top-level command unit from the atom stream, stopping at
+/// (and consuming) the next top-level newline or EOF. Skips leading blank
+/// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. The atom
+/// analog of `command::parse_one_unit`, used by the non-interactive script
+/// reader (`run_sourced_contents_in_sinks`).
+pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    // Discard any heredoc bodies leaked by a prior unit that errored after
+    // pushing them (mirrors parse_sequence's CF2 hygiene). take_heredoc_bodies
+    // drains only on the success path below, so on a clean loop this is a no-op.
+    let _ = iter.take_heredoc_bodies();
+    // Skip leading Newline/Blank atoms (and any heredoc-body groups) — mirrors
+    // parse_sequence's leading skip and the oracle's leading-newline skip.
+    skip_newlines(iter)?;
+    if iter.peek_kind()?.is_none() {
+        return Ok(None);
+    }
+    let mut seq = parse_and_or_opts(iter, &[], true)?;
+    // Attach heredoc bodies collected for this unit (no stray-terminator check —
+    // more units may follow; the caller loops).
     let mut bodies = iter.take_heredoc_bodies().into_iter();
     fill_sequence(&mut seq, &mut bodies);
     Ok(Some(seq))
@@ -6884,5 +6933,52 @@ mod tests {
         // Guards — must STAY byte-identical.
         diff_cmd("${#a}");           // plain length, no subscript
         diff_cmd("${a[0]}");         // subscript, no length → modifier None
+    }
+
+    // ── v264 parse_one_unit differential ─────────────────────────────────────
+    // Drive BOTH the oracle `command::parse_one_unit` and the atom
+    // `parse_one_unit` in a loop over the same script, comparing unit-by-unit.
+    fn old_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let toks = tokenize_with_opts(s, LexerOptions::default()).expect("lex");
+        let mut lx = Lexer::from_tokens(toks);
+        drive_units(&mut |i: &mut Lexer| crate::command::parse_one_unit(i), &mut lx)
+    }
+    fn new_unit(s: &str) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let mut lx = Lexer::new_live_atoms(s, &Default::default(), LexerOptions::default());
+        drive_units(&mut super::parse_one_unit, &mut lx)
+    }
+    fn drive_units(
+        f: &mut dyn FnMut(&mut Lexer) -> Result<Option<Sequence>, ParseError>,
+        lx: &mut Lexer,
+    ) -> Vec<Result<Option<Sequence>, ParseError>> {
+        let mut out = Vec::new();
+        loop {
+            let r = f(lx);
+            let stop = matches!(r, Ok(None) | Err(_));
+            out.push(r);
+            if stop { break; }
+        }
+        out
+    }
+    fn diff_unit(s: &str) {
+        assert_eq!(new_unit(s), old_unit(s), "parse_one_unit mismatch for {s:?}");
+    }
+
+    #[test]
+    fn atoms_parse_one_unit_matches_oracle() {
+        diff_unit("a\nb\nc");              // three units on three lines
+        diff_unit("a; b\nc");             // `;` stays intra-unit; newline splits
+        diff_unit("a && b\nc || d");      // connectors intra-unit
+        diff_unit("a &\nb");             // background then newline
+        diff_unit("\n\na\n\nb\n");        // leading/among/trailing blank lines
+        diff_unit("a\n");                // single unit, trailing newline
+        diff_unit("");                    // empty → one Ok(None)
+        diff_unit("   \n  a  \n");        // blank-ish lines + surrounding blanks
+        diff_unit("if x; then y; fi\nz"); // compound spanning `;`, then next unit
+        diff_unit("f() {\n:\n}\ng");      // compound spanning NEWLINES, then next unit
+        diff_unit("for i in 1 2; do echo $i; done\ndone_marker");
+        diff_unit("cat <<EOF\nhi $x\nEOF\necho next"); // heredoc body drained in-unit
+        diff_unit("cat <<'EOF'\nlit\nEOF\nafter");     // literal heredoc, then next unit
+        diff_unit("a | b\nc");            // pipeline intra-unit
     }
 }
