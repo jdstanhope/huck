@@ -6327,7 +6327,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
         let opts = crate::lexer::LexerOptions { extglob, ..Default::default() };
         let empty = std::collections::HashMap::new();
         let aliases_now = if expand { shell.aliases.clone() } else { empty };
-        let mut iter = crate::lexer::Lexer::new_live(&contents[start..], &aliases_now, opts);
+        let mut iter = crate::lexer::Lexer::new_live_atoms(&contents[start..], &aliases_now, opts);
         // Make span line numbers file-absolute (1-based from the start of
         // `contents`) so $LINENO reports the true file line even when start > 0.
         let base_line = contents.as_bytes()[..start].iter().filter(|&&b| b == b'\n').count() as u32;
@@ -6377,7 +6377,7 @@ pub(crate) fn run_sourced_contents_in_sinks(
             // peek_span cannot error here: the newline-skip above broke on an Ok
             // peek of this same token, so it is already scanned into history.
             let unit_start_off = iter.peek_span().ok().flatten().map(|sp| sp.offset).unwrap_or(sentinel);
-            match crate::command::parse_one_unit(&mut iter) {
+            match crate::parser::parse_one_unit(&mut iter) {
                 Ok(None) => {
                     break 'outer;
                 }

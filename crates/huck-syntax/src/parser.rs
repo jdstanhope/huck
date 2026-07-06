@@ -2975,7 +2975,7 @@ fn fill_sequence(seq: &mut Sequence, bodies: &mut impl Iterator<Item = Word>) {
 /// `parse_cursor` in `command.rs`.
 ///
 /// Returns `Ok(None)` on empty input (newlines only or EOF).
-pub(crate) fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
     // v259 CF2: discard any heredoc bodies leaked by a prior parse that errored
     // after pushing them (take_heredoc_bodies drains only on this fn's success
     // path). Safe: the atom parse_sequence is the single non-reentrant top-level

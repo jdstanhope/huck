@@ -7,9 +7,9 @@ use std::sync::atomic::AtomicBool;
 use signal_hook::consts::{SIGCHLD, SIGINT};
 
 use crate::builtins::{ExecOutcome, InterruptReason};
-use crate::command::{self};
 use crate::executor;
 use crate::lexer::{self};
+use crate::parser;
 use crate::shell_state::Shell;
 
 /// How the shell was invoked — resolved by `parse_cli` from argv.
@@ -381,8 +381,8 @@ pub fn process_line_in_sinks(
     // so the live lexer is alias-free (byte-identical to the old token pre-pass).
     let empty = std::collections::HashMap::new();
     let aliases = if expand_aliases { &shell.aliases } else { &empty };
-    let mut lx = lexer::Lexer::new_live(line, aliases, opts);
-    match command::parse(&mut lx) {
+    let mut lx = lexer::Lexer::new_live_atoms(line, aliases, opts);
+    match parser::parse_sequence(&mut lx) {
         Ok(Some(sequence)) => executor::execute_with_sink(&sequence, shell, line, sink, err_sink),
         Ok(None) => ExecOutcome::Continue(0),
         Err(e) => {
