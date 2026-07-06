@@ -620,10 +620,14 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     indirect: false,
                 }
             } else if subscript.is_some() {
-                // `${a[i]}` / `${a[@]}` / `${a[*]}` — bare subscripted reference.
+                // `${a[i]}` / `${a[@]}` / `${a[*]}` — bare subscripted reference,
+                // OR `${#a[i]}` — length OF a subscripted element/array. The
+                // oracle keeps the `Length` modifier alongside the subscript
+                // (`${#a[0]}` = Length{subscript:Index(0)}); honor `length_form`
+                // here so a `#`+subscript is not dropped to `None` (v263).
                 WordPart::ParamExpansion {
                     name,
-                    modifier: ParamModifier::None,
+                    modifier: if length_form { ParamModifier::Length } else { ParamModifier::None },
                     quoted,
                     subscript,
                     indirect,
@@ -6862,5 +6866,23 @@ mod tests {
         diff_cmd("${a[$\"k\"]}");     // F3 in param-expansion subscript
         diff_cmd("a=([k]=v)");        // plain — flat quoted:false
         diff_cmd("${a[k]}");          // plain
+    }
+
+    #[test]
+    fn atoms_length_with_subscript() {
+        // v263 (folded, whole-branch finding): `${#a[i]}` is the LENGTH of a
+        // subscripted element/array — the oracle keeps `modifier: Length`
+        // alongside the subscript. The atom's ParamClose dispatch took the
+        // `subscript.is_some()` branch (modifier: None) BEFORE `length_form`,
+        // silently dropping the length. Now honored.
+        diff_cmd("${#a[0]}");        // Length + subscript Index(0)
+        diff_cmd("${#a[k]}");        // Length + subscript Index(k)
+        diff_cmd("${#a[\"k\"]}");    // Length + subscript Quoted{Double} (v263 wrap too)
+        diff_cmd("${#a['k']}");      // Length + subscript Quoted{Single}
+        diff_cmd("${#a[*]}");        // Length + subscript Star
+        diff_cmd("${#a[@]}");        // Length + subscript All
+        // Guards — must STAY byte-identical.
+        diff_cmd("${#a}");           // plain length, no subscript
+        diff_cmd("${a[0]}");         // subscript, no length → modifier None
     }
 }
