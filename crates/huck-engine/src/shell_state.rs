@@ -680,8 +680,12 @@ fn parse_imported_function(name: &str, value: &str) -> Option<Box<crate::command
         return None;
     }
     let src = format!("{name} {value}");
-    let tokens = crate::lexer::tokenize(&src).ok()?;
-    let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(tokens)).ok()??;
+    let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        &src,
+        &Default::default(),
+        crate::lexer::LexerOptions::default(),
+    ))
+    .ok()??;
     if !seq.rest.is_empty() || seq.background {
         return None;
     }
@@ -2784,7 +2788,7 @@ mod tests {
 
     #[cfg(test)]
     fn test_fn_body() -> Box<crate::command::Command> {
-        let seq = crate::command::parse(&mut crate::lexer::Lexer::from_tokens(crate::lexer::tokenize("f(){ echo hi; }").unwrap()))
+        let seq = crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms("f(){ echo hi; }", &Default::default(), crate::lexer::LexerOptions::default()))
             .unwrap()
             .unwrap();
         match seq.first {

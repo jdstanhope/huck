@@ -246,12 +246,13 @@ fn scan_backtick_close(bytes: &[u8], start: usize) -> Option<usize> {
 /// its output (trailing newlines already stripped by `run_substitution`). On a
 /// lex/parse error returns an empty string.
 fn run_prompt_cmdsub(body: &str, shell: &mut Shell) -> String {
-    let raw = match crate::lexer::tokenize(body) {
-        Ok(toks) => match crate::command::parse(&mut crate::lexer::Lexer::from_tokens(toks)) {
-            Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
+    let raw = match crate::parser::parse_sequence(&mut crate::lexer::Lexer::new_live_atoms(
+        body,
+        &Default::default(),
+        crate::lexer::LexerOptions::default(),
+    )) {
+        Ok(Some(seq)) => crate::expand::run_substitution(&seq, shell),
+        _ => String::new(),
     };
     convert_prompt_markers(&raw)
 }
