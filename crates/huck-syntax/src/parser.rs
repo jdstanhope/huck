@@ -676,7 +676,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
     let mut subscript: Option<SubscriptKind> = None;
     if matches!(iter.peek_kind()?, Some(TokenKind::LBracket)) {
         iter.next_kind()?; // consume LBracket
-        iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+        iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
         let sub_word = match parse_word(iter, false) {
             Ok(w) => w,
             Err(e) => {
@@ -802,7 +802,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // Production: `modifier_with_operand(chars, quoted/false, ...)`.
                 // `ErrorIfUnset` uses `enclosing_dquote=false`; others use `quoted`.
                 ParamOpKind::UseDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::UseDefault { word, colon },
@@ -810,7 +810,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::AssignDefault(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::AssignDefault { word, colon },
@@ -819,7 +819,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 }
                 ParamOpKind::ErrorIfUnset(colon) => {
                     // Production: `modifier_with_operand(chars, false, ...)` — NOT `quoted`.
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::ErrorIfUnset { word, colon },
@@ -827,7 +827,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::UseAlternate(colon) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, quoted);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: quoted }, quoted);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::UseAlternate { word, colon },
@@ -838,7 +838,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // ── Pattern removal: RemovePrefix / RemoveSuffix
                 // Production: `modifier_with_operand(chars, false, ...)` — enclosing_dquote=false.
                 ParamOpKind::RemovePrefix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::RemovePrefix { pattern, longest },
@@ -846,7 +846,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     }
                 }
                 ParamOpKind::RemoveSuffix(longest) => {
-                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let pattern = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     WordPart::ParamExpansion {
                         name, modifier: ParamModifier::RemoveSuffix { pattern, longest },
@@ -867,7 +867,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     };
 
                     // Pattern in subst-pattern mode (sep = `/`).
-                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false });
+                    iter.push_mode(Mode::ParamSubstPatternOperand { in_dquote: false, enclosing_dquote: false });
                     let pattern = match parse_word(iter, false) {
                         Ok(w) => { iter.pop_mode(); w }
                         Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -877,7 +877,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     let replacement =
                         if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
                             iter.next_kind()?; // consume `/`
-                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false)
+                            word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false)
                         } else {
                             Word(vec![])
                         };
@@ -893,7 +893,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // ── Case conversion: ${var^pat} / ${var^^} / ${var,pat} / ${var,,}
                 // Production: `scan_optional_braced_operand` — empty body → None.
                 ParamOpKind::Case(direction, all) => {
-                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false);
+                    let word = word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false);
                     expect_close!();
                     let pattern = if word.0.is_empty() { None } else { Some(word) };
                     WordPart::ParamExpansion {
@@ -919,7 +919,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                 // `Some(':') / Some('}') → recover_bad_subst` branch.
                 ParamOpKind::Substring => {
                     // Offset in substring-offset mode (sep = `:`).
-                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false });
+                    iter.push_mode(Mode::ParamSubstringOffsetOperand { in_dquote: false, enclosing_dquote: false });
                     let offset = match parse_word(iter, false) {
                         Ok(w) => { iter.pop_mode(); w }
                         Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -929,7 +929,7 @@ pub(crate) fn parse_param_expansion(iter: &mut Lexer, quoted: bool) -> Result<Wo
                     let length =
                         if matches!(iter.peek_kind()?, Some(TokenKind::ParamSep)) {
                             iter.next_kind()?; // consume `:`
-                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false }, false))
+                            Some(word_in_mode!(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }, false))
                         } else {
                             None
                         };
@@ -1151,7 +1151,7 @@ pub(crate) fn parse_array_literal(iter: &mut Lexer) -> Result<WordPart, ParseErr
             // expansion (matches `scan_array_literal`).
             Some(TokenKind::LBracket) => {
                 iter.next_kind()?; // consume LBracket
-                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false });
+                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
                 let sub_word = match parse_word(iter, false) {
                     Ok(w) => w,
                     Err(e) => { iter.pop_mode(); iter.pop_mode(); return Err(e); }
@@ -4175,7 +4175,7 @@ mod tests {
         let _ = TokenKind::ParamOpen { quoted: false };
         let _ = TokenKind::Lit { text: "x".into(), quoted: false };
         let _ = ParamOpKind::Substitute(SubstKind::All);
-        let _ = Mode::ParamWordOperand { in_dquote: false };
+        let _ = Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false };
         let _ = ParseError::UnsupportedExpansion;
     }
 
@@ -7093,6 +7093,28 @@ mod tests {
         // Guards — must STAY byte-identical.
         diff_cmd("${#a}");           // plain length, no subscript
         diff_cmd("${a[0]}");         // subscript, no length → modifier None
+    }
+
+    #[test]
+    fn atoms_operand_enclosing_dquote_matches_oracle() {
+        // value operands inside "…": single-quotes are literal, dquote backslash rules.
+        diff_cmd(r#"echo "${x:-'a|b'}""#);
+        diff_cmd(r#"echo "${x:='d'}""#);
+        diff_cmd(r#"echo "${x:+'a|b'}""#);
+        diff_cmd(r#"echo "${x-'a'}""#);
+        diff_cmd(r#"echo "${x+'A'}""#);
+        diff_cmd(r#"echo "${x:-\*}""#);      // \* kept
+        diff_cmd(r#"echo "${x:-a\nb}""#);    // \n kept
+        diff_cmd(r#"echo "${x:-a\$b}""#);    // \$ -> $ (coincides; regression guard)
+        diff_cmd(r#"echo "${x:-x\"z}""#);    // \" -> " (regression guard)
+        diff_cmd(r#"echo "${x:-a\\b}""#);    // \\ -> \ (regression guard)
+        diff_cmd(r#"echo "${x:-$y}""#);      // var in dquote operand (regression guard)
+        // UNQUOTED operands must be UNCHANGED (enclosing_dquote=false):
+        diff_cmd("echo ${x:-'a|b'}");        // unquoted: single-quote IS a span
+        diff_cmd(r#"echo ${x:-\*}"#);        // unquoted backslash
+        // enclosing_dquote=false operators unchanged:
+        diff_cmd(r#"echo "${x#'z'}""#);      // RemovePrefix pattern: enclosing_dquote=false
+        diff_cmd(r#"echo "${x:?'m'}""#);     // ErrorIfUnset: enclosing_dquote=false
     }
 
     // ── v264 parse_one_unit differential ─────────────────────────────────────

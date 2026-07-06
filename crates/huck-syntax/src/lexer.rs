@@ -654,10 +654,14 @@ pub(crate) enum Mode {
     CommandSub { body_started: bool },  // $( … ) / `…`
     Backtick { depth: u32 },           // `…` — v245; depth tracks nested `` `\`…\`` `` escaping
     ParamExpansion { seen_name: bool }, // ${ … }
-    ParamWordOperand            { in_dquote: bool },
-    ParamSubstPatternOperand    { in_dquote: bool },
-    ParamSubstringOffsetOperand { in_dquote: bool },
-    ParamSubscriptOperand       { in_dquote: bool },
+    // `enclosing_dquote` — the OUTER `"…"` context the `${…}` itself sits in
+    // (seeded once at push time from the parser's `quoted` flag), distinct from
+    // `in_dquote` which is the operand scanner's INTERNAL `'…'`/`"…"`-span state
+    // that toggles as the operand text is scanned. See v264 operand-dquote fix.
+    ParamWordOperand            { in_dquote: bool, enclosing_dquote: bool },
+    ParamSubstPatternOperand    { in_dquote: bool, enclosing_dquote: bool },
+    ParamSubstringOffsetOperand { in_dquote: bool, enclosing_dquote: bool },
+    ParamSubscriptOperand       { in_dquote: bool, enclosing_dquote: bool },
     // v261 T1: `in_squote`/`in_dquote` are the scanner's INTERNAL quote-span state
     // (repurposed from a formerly-dead `in_dquote` field) — NOT the outer
     // quoted-context of the enclosing word (arith bodies are always emitted as
@@ -979,10 +983,10 @@ impl<'a> Lexer<'a> {
             Mode::Command if self.command_atoms => self.scan_step_command_atoms(),
             Mode::Command => self.scan_step_command(),
             Mode::ParamExpansion { .. } => self.scan_step_param_head(),
-            Mode::ParamWordOperand            { in_dquote } => self.scan_step_param_operand(None,      '}', in_dquote),
-            Mode::ParamSubstPatternOperand    { in_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote),
-            Mode::ParamSubstringOffsetOperand { in_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote),
-            Mode::ParamSubscriptOperand       { in_dquote } => self.scan_step_param_operand(None,      ']', in_dquote),
+            Mode::ParamWordOperand            { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubstPatternOperand    { in_dquote, enclosing_dquote } => self.scan_step_param_operand(Some('/'), '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubstringOffsetOperand { in_dquote, enclosing_dquote } => self.scan_step_param_operand(Some(':'), '}', in_dquote, enclosing_dquote),
+            Mode::ParamSubscriptOperand       { in_dquote, enclosing_dquote } => self.scan_step_param_operand(None,      ']', in_dquote, enclosing_dquote),
             Mode::CommandSub { body_started } => self.scan_step_command_sub(body_started),
             Mode::Backtick { depth } => self.scan_step_backtick(depth),
             Mode::Arith { paren_depth, in_squote, in_dquote, body_started, for_header, delim } =>
@@ -1290,10 +1294,10 @@ impl<'a> Lexer<'a> {
     fn set_operand_in_dquote(&mut self, val: bool) {
         match self.modes.last_mut() {
             Some(
-                Mode::ParamWordOperand            { in_dquote }
-                | Mode::ParamSubstPatternOperand    { in_dquote }
-                | Mode::ParamSubstringOffsetOperand { in_dquote }
-                | Mode::ParamSubscriptOperand       { in_dquote },
+                Mode::ParamWordOperand            { in_dquote, .. }
+                | Mode::ParamSubstPatternOperand    { in_dquote, .. }
+                | Mode::ParamSubstringOffsetOperand { in_dquote, .. }
+                | Mode::ParamSubscriptOperand       { in_dquote, .. },
             ) => *in_dquote = val,
             _ => {}
         }
@@ -1305,6 +1309,17 @@ impl<'a> Lexer<'a> {
     /// `end`       — the operand terminator: `}` for word/pattern/offset, `]` for subscript.
     /// `in_dquote` — snapshot of this frame's `in_dquote` flag (copied from the mode
     ///               variant by `scan_step`; written back via `set_operand_in_dquote`).
+    ///               This is the scanner's INTERNAL `"…"`-span state, NOT the
+    ///               enclosing quote context — see `enclosing_dquote` below.
+    /// `enclosing_dquote` — v264: whether the `${…}` this operand belongs to is
+    ///               itself inside a double-quoted word (seeded once at the mode's
+    ///               push site from the parser's `quoted` flag; only the
+    ///               UseDefault/AssignDefault/UseAlternate value-operand sites seed
+    ///               `true` for a quoted enclosing `"…"` — see `parse_param_expansion`).
+    ///               When set, the NORMAL (non-`in_dquote`) branch below applies
+    ///               dquote rules instead of unquoted rules: a bare `'` is a
+    ///               literal char (not a `'…'` span), and `\` is special only
+    ///               before `$ ` " \` (mirrors `parse_braced_operand_opts`).
     ///
     /// **Flat, non-recursive tokenization of `"…"` spans:**
     ///
@@ -1319,7 +1334,7 @@ impl<'a> Lexer<'a> {
     /// The critical invariant: inside a `"…"` span, `}`, `/`, `:`, etc. are treated
     /// as ordinary literals and are NOT emitted as `ParamClose`/`ParamSep`.  Only
     /// `"`, `$`, `` ` ``, and `\` are special.
-    fn scan_step_param_operand(&mut self, sep: Option<char>, end: char, in_dquote: bool) -> Result<Step, LexError> {
+    fn scan_step_param_operand(&mut self, sep: Option<char>, end: char, in_dquote: bool, enclosing_dquote: bool) -> Result<Step, LexError> {
         let off = self.cursor.offset();
         let l   = self.cursor.line();
         let c   = self.cursor.column();
@@ -1553,7 +1568,13 @@ impl<'a> Lexer<'a> {
                 }
 
                 // Single-quoted span: everything literal (backslash NOT special inside `'…'`).
-                Some('\'') => {
+                // v264: NOT reached when `enclosing_dquote` — a `'` is just an
+                // ordinary literal char in dquote context (dquote semantics: single
+                // quotes don't quote anything), so it falls through to the
+                // "Unquoted literal run" arm below, which excludes `'` from its
+                // stop-set in that case. Mirrors `parse_braced_operand_opts`'s
+                // `'\'' if enclosing_dquote => cur.push('\'')` arm.
+                Some('\'') if !enclosing_dquote => {
                     self.cursor.next(); // consume opening `'`
                     let mut text = String::new();
                     loop {
@@ -1727,6 +1748,35 @@ impl<'a> Lexer<'a> {
                     }
                 }
 
+                // Backslash escape outside `"…"`.
+                //
+                // v264: when `enclosing_dquote`, apply DOUBLE-QUOTE escape rules
+                // (mirrors the internal-span branch above and
+                // `parse_braced_operand_opts`'s `'\\' if enclosing_dquote` arm):
+                // only `$ ` " \` are escape targets (emit just that char); any
+                // other char keeps the backslash (`\` + char both literal).
+                Some('\\') if enclosing_dquote => {
+                    self.cursor.next(); // consume `\`
+                    match self.cursor.peek().copied() {
+                        Some(e @ ('$' | '`' | '"' | '\\')) => {
+                            self.cursor.next();
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: e.to_string(), quoted: true },
+                                Span::new(off, l, c),
+                            ));
+                        }
+                        _ => {
+                            let mut s = String::from("\\");
+                            if let Some(ch) = self.cursor.next() { s.push(ch); }
+                            self.history.push(Token::new(
+                                TokenKind::Lit { text: s, quoted: true },
+                                Span::new(off, l, c),
+                            ));
+                        }
+                    }
+                    return Ok(Step::Produced);
+                }
+
                 // Backslash escape outside `"…"`: the next char is always literal
                 // (mirrors `parse_braced_operand_opts` for the unquoted path).
                 Some('\\') => {
@@ -1743,11 +1793,41 @@ impl<'a> Lexer<'a> {
                 }
 
                 // Unquoted literal run: accumulate until the next special char or terminator.
+                //
+                // v264: when `enclosing_dquote`, dquote rules apply INSIDE this run
+                // (rather than as separate one-char/one-atom arms) so consecutive
+                // dquote-literal text merges into ONE `Lit` atom — matching
+                // `parse_braced_operand_opts`'s single flushed `cur` buffer:
+                //   - `'` is not special — accumulated like any other char (see the
+                //     guarded single-quote arm above, which only fires `!enclosing_dquote`).
+                //   - `\` followed by a non-escape-target char (not `$ ` " \`) keeps
+                //     BOTH chars literally and the run continues (mirrors the
+                //     oracle's `_ => cur.push('\\')` arm, which does NOT flush).
+                //   - `\` followed by an escape target (or at EOF) stops the run so
+                //     the dedicated backslash arm below can flush+emit its own atom
+                //     (mirrors the oracle's `flush_literal` there).
                 Some(_) => {
                     let mut text = String::new();
                     while let Some(&ch) = self.cursor.peek() {
                         let is_term = ch == end || Some(ch) == sep;
-                        if is_term || matches!(ch, '$' | '\'' | '"' | '\\' | '`') { break; }
+                        if is_term { break; }
+                        if ch == '\\' {
+                            if !enclosing_dquote { break; }
+                            let mut probe = self.cursor.clone();
+                            probe.next(); // skip `\`
+                            match probe.peek().copied() {
+                                Some('$' | '`' | '"' | '\\') | None => break,
+                                Some(next_ch) => {
+                                    self.cursor.next(); // consume `\`
+                                    self.cursor.next(); // consume next_ch
+                                    text.push('\\');
+                                    text.push(next_ch);
+                                    continue;
+                                }
+                            }
+                        }
+                        if ch == '\'' && !enclosing_dquote { break; }
+                        if matches!(ch, '$' | '"' | '`') { break; }
                         text.push(ch);
                         self.cursor.next();
                     }
@@ -12363,7 +12443,7 @@ mod tests {
     #[test]
     fn operand_plain_literal() {
         assert_eq!(
-            operand_atoms("foo}", Mode::ParamWordOperand { in_dquote: false }),
+            operand_atoms("foo}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }),
             vec![
                 TokenKind::Lit { text: "foo".into(), quoted: false },
                 TokenKind::ParamClose,
@@ -12375,19 +12455,19 @@ mod tests {
     fn operand_var_and_nested() {
         // Plain `$a` followed by terminator.
         assert_eq!(
-            operand_atoms("$a}", Mode::ParamWordOperand { in_dquote: false }),
+            operand_atoms("$a}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false }),
             vec![TokenKind::DollarName { name: "a".into(), quoted: false }, TokenKind::ParamClose]
         );
         // Nested `${b}` — the parser would push ParamExpansion mode on ParamOpen;
         // in this standalone test the first atom is ParamOpen and that is sufficient.
-        let nested = operand_atoms("${b}}", Mode::ParamWordOperand { in_dquote: false });
+        let nested = operand_atoms("${b}}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(nested[0], TokenKind::ParamOpen { quoted: false });
     }
 
     #[test]
     fn operand_subst_separator() {
         assert_eq!(
-            operand_atoms("pat/", Mode::ParamSubstPatternOperand { in_dquote: false }),
+            operand_atoms("pat/", Mode::ParamSubstPatternOperand { in_dquote: false, enclosing_dquote: false }),
             vec![
                 TokenKind::Lit { text: "pat".into(), quoted: false },
                 TokenKind::ParamSep,
@@ -12398,7 +12478,7 @@ mod tests {
     #[test]
     fn operand_substring_separator() {
         assert_eq!(
-            operand_atoms("1:", Mode::ParamSubstringOffsetOperand { in_dquote: false }),
+            operand_atoms("1:", Mode::ParamSubstringOffsetOperand { in_dquote: false, enclosing_dquote: false }),
             vec![
                 TokenKind::Lit { text: "1".into(), quoted: false },
                 TokenKind::ParamSep,
@@ -12411,22 +12491,22 @@ mod tests {
         // v244 T4: unquoted `$(cmd)` in an operand emits CmdSubOpen (signal to parse_command_sub).
         // v245 T6: backtick emits BeginBacktick (signal to parse_backtick_sub).
         // v246 T6: `$((` emits ArithOpen (signal to parse_arith_expansion).
-        let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false });
+        let a = operand_atoms("$(x)}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(a[0], TokenKind::CmdSubOpen, "$(cmd) must emit CmdSubOpen signal");
 
         // `$((` now emits ArithOpen (v246 T6) — no longer DeferredExpansion.
-        let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
+        let b = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(b[0], TokenKind::ArithOpen, "$((…)) must emit ArithOpen signal");
 
         // Backtick now emits BeginBacktick signal (v245 T6).
-        let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false });
+        let c = operand_atoms("`echo x`}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(c[0], TokenKind::BeginBacktick, "backtick must emit BeginBacktick signal");
     }
 
     #[test]
     fn operand_arith_signal() {
         // v246 T6: `$((` in an unquoted operand emits ArithOpen (zero-width signal).
-        let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false });
+        let a = operand_atoms("$((1+1))}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(a[0], TokenKind::ArithOpen, "$(( must emit ArithOpen signal");
     }
 
@@ -12538,7 +12618,7 @@ mod tests {
     #[test]
     fn operand_subscript_close() {
         assert_eq!(
-            operand_atoms("3]", Mode::ParamSubscriptOperand { in_dquote: false }),
+            operand_atoms("3]", Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false }),
             vec![
                 TokenKind::Lit { text: "3".into(), quoted: false },
                 TokenKind::RBracket,
@@ -12550,7 +12630,7 @@ mod tests {
     fn operand_dquote_simple_is_one_lit() {
         // `"a}b"` — no expansion: ONE quoted Lit (the `}` is literal because it's
         // inside `"…"`), then ParamClose.
-        let a = operand_atoms("\"a}b\"}", Mode::ParamWordOperand { in_dquote: false });
+        let a = operand_atoms("\"a}b\"}", Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(
             a,
             vec![
@@ -12566,7 +12646,7 @@ mod tests {
         // DeferredExpansion).  The parser would push ParamExpansion on ParamOpen;
         // this test confirms the lexer emits the correct flat tokens.
         let mut lx = Lexer::new("\"a${y}b\"}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamWordOperand { in_dquote: false });
+        lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
             TokenKind::Lit { text: "a".into(), quoted: true }
@@ -12581,7 +12661,7 @@ mod tests {
     fn operand_dquote_var_inside() {
         // `"$a"` — a DollarName token, not a DeferredExpansion.
         let mut lx = Lexer::new("\"$a\"}", LexerOptions::default(), true);
-        lx.push_mode(Mode::ParamWordOperand { in_dquote: false });
+        lx.push_mode(Mode::ParamWordOperand { in_dquote: false, enclosing_dquote: false });
         assert_eq!(
             lx.next_token().unwrap().unwrap().kind,
             TokenKind::DollarName { name: "a".into(), quoted: true }
