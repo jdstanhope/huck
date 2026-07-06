@@ -9,6 +9,8 @@
 **Tech Stack:** Rust (huck-syntax + huck-engine crates), single-threaded per-crate test runner, bash-diff harnesses.
 
 > **DEVIATION FROM SPEC (subscript, Task 1):** The spec's Bridge 2 proposed "lexer carries raw text, parser assembles, no lexer→parser dependency." Code analysis showed the subscript `Word` has **no single parser choke point** — it is consumed by `command::try_split_assignment` (×2), `generate.rs`, and `expand.rs` directly, plus the final AST. The only single-point-correct assembly site is where the lexer builds it. This plan therefore assembles by calling `crate::parser::parse_fragment_word` from the two lexer subscript sites (a contained lexer→parser call), which is a 2-call-site change with zero type/AST/engine churn. The spec's approach would require touching every consumer or a whole-AST post-pass (higher risk). The AST type `AssignTarget::Indexed { subscript: Word }` and all engine code stay **unchanged**, exactly as the spec required.
+>
+> **FOLLOW-UP (deferred, user-agreed):** the introduced lexer→parser call (`lexer.rs` → `crate::parser::parse_fragment_word`) is an accepted architectural wart for this iteration. A subsequent iteration will remove the cycle — most likely by having the lexer carry the raw subscript text on the atom and assembling it at the (then-refactored) single parser choke point. Do NOT expand this iteration to do it.
 
 ## Global Constraints
 
