@@ -317,10 +317,21 @@ a bash-parity harness case and a note in the iteration log (and
   `assign_val_tilde_ok = false`; `begin_assignment_value` (§4) sets it `true`,
   matching the scalar arm. Colon-tilde (`a[i]=a:~/y`) was and stays correct.
 
+- **I3 (found during implementation, accepted) — unquoted nested-bracket
+  subscripts `a[b[i]]=v` no longer recognized.** The old forward-scan
+  depth-counted `[`; `Mode::ParamSubscriptOperand` terminates on the first `]`, so
+  `a[a[0]]=v` folds to a glob (→ command-not-found) instead of an assignment. This
+  UNIFIES behavior with the two sibling subscript contexts (`${a[a[0]]}`,
+  array-literal `([a[0]]=x)`), which already rejected unquoted nested brackets —
+  the command-word lvalue was the lone exception. Quoted / command-sub subscripts
+  are unaffected. Narrow indirect-index idiom; accepted and tracked as **L-73** in
+  `docs/bash-divergences.md`. A real fix (balanced nested-bracket subscripts across
+  all contexts) is a separate iteration.
+
 ## Non-goals
 
 - No change to scalar/bare assignment, array literals, `${…}`, or any expansion
-  semantics **beyond D1/D2 above**.
+  semantics **beyond D1/D2 above and the accepted I3/L-73 consequence**.
 - Not fixing any *other* latent divergence (e.g. the internal error-*variant* shift
   when a malformed subscript stops going through `SubscriptParseError` — the
   bash-observable message is what the harness asserts).
