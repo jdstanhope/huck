@@ -1,19 +1,19 @@
-//! Parser-driven front-end (Phase C). Consumes the stack-mode lexer's atoms and
-//! builds the existing AST (`WordPart`/`Word`). DORMANT in v241: reached only by
-//! tests; production still uses the lexer's pre-built Words + command.rs.
-#![allow(dead_code, unused_imports)]
+//! Parser-driven front-end. Consumes the stack-mode lexer's atoms and builds the
+//! AST (`WordPart`/`Word` + `command.rs` command types). Live in production since
+//! the v264 flip and the sole front-end since v266 (the old Word-lexer/`command::parse`
+//! oracle is deleted): `parse_sequence` is the entry point.
 
 use crate::command::{
     Command, Sequence, Pipeline, SimpleCommand, ExecCommand, Assignment, Connector, ParseError,
     AssignTarget,
-    Redirection, RedirFd, RedirOp, FileMode, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
+    Redirection, RedirOp, word_literal_text, valid_identifier_text, IfClause, ElifBranch, WhileClause,
     ForClause, SelectClause, CaseClause, CaseItem, CaseTerminator, ArithForClause,
     TestExpr, TestUnaryOp, TestBinaryOp, try_unary_op, skip_test_newlines, is_compound_opener,
 };
 use crate::lexer::{
-    brace_expand_parts, ArithDelim, ArrayLiteralElement, CaseDirection, Lexer, Mode, Operator,
+    brace_expand_parts, ArithDelim, ArrayLiteralElement, Lexer, Mode, Operator,
     ParamModifier, ParamOpKind, ProcDir, QuoteStyle, SubstAnchor, SubstKind, SubscriptKind,
-    TokenKind, TransformOp, Word, WordPart,
+    TokenKind, Word, WordPart,
 };
 
 /// Assemble a `Word` (Vec<WordPart>) from atoms in the CURRENT mode, stopping
@@ -1981,19 +1981,12 @@ fn keyword_of_consumed(token: &TokenKind) -> Option<Keyword> {
 }
 
 /// Extract a `for`/`select` loop-variable name from an assembled `Word`: it must
-/// be a single unquoted `Literal`.  Mirrors `for_variable_name`'s rule.
+/// be a single unquoted `Literal`.
 fn for_variable_name_word(w: &Word) -> Option<String> {
     if w.0.len() != 1 { return None; }
     let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
     if text.is_empty() { return None; }
     Some(text.clone())
-}
-
-/// Returns `true` if `token` is a reserved word (keyword).  Delegates to
-/// `keyword_kind` so there is ONE keyword table.  `time` is NOT a keyword
-/// (see `cmd_time_is_plain_command`).
-fn keyword_of_tok(token: &TokenKind) -> bool {
-    keyword_kind(token).is_some()
 }
 
 
@@ -3455,16 +3448,6 @@ fn parse_if(iter: &mut Lexer) -> Result<Command, ParseError> {
     maybe_wrap_redirects(Command::If(Box::new(clause)), iter)
 }
 
-/// Validates a `for`/`select` loop variable name token.  Mirrors
-/// `for_variable_name` in `command.rs`: must be an unquoted single-literal Word.
-fn for_variable_name(token: &TokenKind) -> Option<String> {
-    let TokenKind::Word(w) = token else { return None };
-    if w.0.len() != 1 { return None; }
-    let WordPart::Literal { text, quoted: false } = &w.0[0] else { return None; };
-    if text.is_empty() { return None; }
-    Some(text.clone())
-}
-
 /// Skips `;`/newline separators before `do`, then consumes `do`, the loop body,
 /// and `done`.  Returns the parsed body `Sequence`.  Shared by `parse_for` and
 /// `parse_select`.  Mirrors `parse_do_body_done` (~1522) in `command.rs`.
@@ -4305,9 +4288,7 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 mod tests {
     use super::*;
     use crate::lexer::{
-        CaseDirection, Lexer, LexerOptions, Mode, ParamModifier,
-        ParamOpKind, SubstAnchor, SubstKind, SubscriptKind, TokenKind, TransformOp, Word,
-        WordPart,
+        Lexer, LexerOptions, Mode, ParamOpKind, SubstKind, TokenKind, Word, WordPart,
     };
     use crate::command::ParseError;
 
@@ -4621,11 +4602,6 @@ mod tests {
     /// In-scope: the parser accepts this input.
     fn diff_cmd(s: &str) {
         assert!(new_seq(s).is_ok(), "expected Ok for {s:?}, got {:?}", new_seq(s));
-    }
-    /// Deferred: the new parser must return UnsupportedCommand.
-    fn diff_unsupported(s: &str) {
-        assert!(matches!(new_seq(s), Err(ParseError::UnsupportedCommand)),
-                "expected UnsupportedCommand for {s:?}, got {:?}", new_seq(s));
     }
     /// Error: the parser rejects this input.
     fn diff_err(s: &str) {
@@ -6518,11 +6494,6 @@ mod tests {
     fn diff_bt(s: &str) {
         assert!(new_bt(s, false).is_ok(), "unquoted {s:?}: {:?}", new_bt(s, false));
         assert!(new_bt(s, true).is_ok(),  "quoted   {s:?}: {:?}", new_bt(s, true));
-    }
-
-    fn diff_bt_deferred(s: &str) {
-        assert!(matches!(new_bt(s, false), Err(ParseError::UnsupportedExpansion)),
-                "expected deferred for {s:?}, got {:?}", new_bt(s, false));
     }
 
     // ── v245 T1 scaffolding test ─────────────────────────────────────────────
