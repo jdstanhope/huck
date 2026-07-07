@@ -418,8 +418,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
-            let prefix = shell.error_prefix(Some("cd"));
-            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error!(shell, Some("cd"), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
@@ -442,8 +441,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
         };
         let normalized = normalize_logical(&curpath);
         if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            let prefix = shell.error_prefix(Some("cd"));
-            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error!(shell, Some("cd"), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         normalized
@@ -459,8 +457,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     if print_new_pwd
         && let Err(e) = writeln!(out, "{new_pwd}")
     {
-        let prefix = shell.error_prefix(Some("cd"));
-        e!(err, "{prefix}{}", crate::bash_io_error(&e));
+        crate::sh_error!(shell, Some("cd"), "{}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -4930,7 +4927,7 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     if let Some(first) = args.first() {
         if first.starts_with('-') && first != "-" && first != "--" {
             let c = first.chars().nth(1).unwrap();
-            e!(err, "{}-{c}: invalid option", shell.error_prefix(Some("getopts")));
+            crate::sh_error!(shell, Some("getopts"), "-{c}: invalid option");
             e!(err, "{USAGE}");
             return ExecOutcome::Continue(2);
         }
@@ -4985,7 +4982,7 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     // invalid optstring option AND an invalid name var together print only the
     // identifier error (bash prints both — an untested edge, accepted by spec).
     if !is_valid_name(&name) {
-        e!(err, "{}`{name}': not a valid identifier", shell.error_prefix(Some("getopts")));
+        crate::sh_error!(shell, Some("getopts"), "`{name}': not a valid identifier");
         return ExecOutcome::Continue(1);
     }
 
@@ -5566,8 +5563,7 @@ fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecO
         match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
             Ok(v) => last = v,
             Err(e) => {
-                let prefix = shell.error_prefix(Some("let"));
-                e!(err, "{prefix}{}", crate::arith::render_error_body(a, &e));
+                crate::sh_error!(shell, Some("let"), "{}", crate::arith::render_error_body(a, &e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -6182,13 +6178,9 @@ pub(crate) fn source_in_sink(
             // bash distinguishes a directory (opened, unusable → `.:` prefix) from a
             // genuinely-missing file (open fails → no `.:`, redirect-style).
             if std::path::Path::new(filename).is_dir() {
-                let prefix = shell.error_prefix(Some("."));
-                let mut err = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *err, "{prefix}{filename}: is a directory");
+                crate::sh_error!(shell, Some("."), "{filename}: is a directory");
             } else {
-                let prefix = shell.error_prefix(None);
-                let mut err = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *err, "{prefix}{filename}: No such file or directory");
+                crate::sh_error!(shell, None, "{filename}: No such file or directory");
             }
             shell.posix_fatal(1);
             return ExecOutcome::Continue(1);
@@ -6200,16 +6192,12 @@ pub(crate) fn source_in_sink(
             if e.kind() == std::io::ErrorKind::InvalidData {
                 // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`
                 // and exits with status 126.
-                let prefix = shell.error_prefix(Some("."));
-                let mut errw = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *errw, "{prefix}{}: cannot execute binary file", path.display());
+                crate::sh_error!(shell, Some("."), "{}: cannot execute binary file", path.display());
                 return ExecOutcome::Continue(126);
             } else {
                 // Open/read io error (permission, …): bash reports `<path>: <strerror>`
                 // (redirect-style, no `.:`).
-                let prefix = shell.error_prefix(None);
-                let mut errw = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *errw, "{prefix}{}: {}", path.display(), crate::bash_io_error(&e));
+                crate::sh_error!(shell, None, "{}: {}", path.display(), crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -13209,8 +13197,7 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                     'S' => symbolic = true,
                     'p' => posix = true,
                     other => {
-                        let prefix = shell.error_prefix(Some("umask"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error!(shell, Some("umask"), "-{other}: invalid option");
                         e!(err, "umask: usage: umask [-p] [-S] [mode]");
                         return ExecOutcome::Continue(2);
                     }
@@ -13229,8 +13216,7 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
             match parse_octal_umask(mode) {
                 Ok(m) => m,
                 Err(()) => {
-                    let prefix = shell.error_prefix(Some("umask"));
-                    e!(err, "{prefix}{mode}: octal number out of range");
+                    crate::sh_error!(shell, Some("umask"), "{mode}: octal number out of range");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -13238,10 +13224,9 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
             match parse_symbolic_umask(mode, cur) {
                 Ok(m) => m,
                 Err(se) => {
-                    let prefix = shell.error_prefix(Some("umask"));
                     match se {
-                        SymErr::Char(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode character"),
-                        SymErr::Operator(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode operator"),
+                        SymErr::Char(ch) => crate::sh_error!(shell, Some("umask"), "`{ch}': invalid symbolic mode character"),
+                        SymErr::Operator(ch) => crate::sh_error!(shell, Some("umask"), "`{ch}': invalid symbolic mode operator"),
                     }
                     return ExecOutcome::Continue(1);
                 }
@@ -13364,8 +13349,7 @@ fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                     'p' => letters.push('p'),
                     other if ulimit_lookup(other).is_some() => letters.push(other),
                     other => {
-                        let prefix = shell.error_prefix(Some("ulimit"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error!(shell, Some("ulimit"), "-{other}: invalid option");
                         e!(err, "{USAGE}");
                         return ExecOutcome::Continue(2);
                     }
@@ -13409,15 +13393,13 @@ fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                 s => match s.parse::<u64>() {
                     Ok(n) => n,
                     Err(_) => {
-                        let prefix = shell.error_prefix(Some("ulimit"));
-                        e!(err, "{prefix}{val}: invalid number");
+                        crate::sh_error!(shell, Some("ulimit"), "{val}: invalid number");
                         return ExecOutcome::Continue(1);
                     }
                 },
             };
             if let Err(e) = ulimit_set(res, raw, set_soft, set_hard) {
-                let prefix = shell.error_prefix(Some("ulimit"));
-                e!(err, "{prefix}{val}: cannot modify limit: {}", crate::bash_io_error(&e));
+                crate::sh_error!(shell, Some("ulimit"), "{val}: cannot modify limit: {}", crate::bash_io_error(&e));
                 status = 1;
             }
         }
@@ -13483,8 +13465,7 @@ fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                     's' => special = true,
                     'p' => {} // print format — the listing default
                     other => {
-                        let prefix = shell.error_prefix(Some("enable"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error!(shell, Some("enable"), "-{other}: invalid option");
                         e!(err, "{USAGE}");
                         return ExecOutcome::Continue(2);
                     }
@@ -13513,8 +13494,7 @@ fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
     let mut status = 0;
     for name in names {
         if !is_builtin(name) {
-            let prefix = shell.error_prefix(Some("enable"));
-            e!(err, "{prefix}{name}: not a shell builtin");
+            crate::sh_error!(shell, Some("enable"), "{name}: not a shell builtin");
             status = 1;
             continue;
         }

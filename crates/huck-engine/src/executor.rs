@@ -123,22 +123,23 @@ pub(crate) fn err_writer<'a>(
 }
 
 /// Emit a path-bearing redirect-open failure in bash's format:
-/// `<error_prefix>{path}: {strerror}` — the non-interactive prologue
-/// (`<src>: line N: `) or interactive `huck: ` from `error_prefix(None)`, the
-/// offending path, and `bash_io_error` (strerror with no Rust `(os error N)`
-/// suffix). Single home for every `File::open`/`open_resolved`/`OpenOptions`
-/// redirect-open error so the format stays identical across execution contexts.
-/// Compute is done before taking the writer so the `&shell` borrow ends first.
+/// `<prologue>{path}: {strerror}` via `sh_error!` — the non-interactive
+/// prologue (`<src>: line N: `) or interactive `huck: `, the offending path,
+/// and `bash_io_error` (strerror with no Rust `(os error N)` suffix). Single
+/// home for every `File::open`/`open_resolved`/`OpenOptions` redirect-open
+/// error so the format stays identical across execution contexts. The sink
+/// params are unused now that emission routes through the thread-local sink
+/// (`with_err`, installed for the whole top-level execution) rather than the
+/// directly-threaded `err_sink`/`out_sink` — kept so the ~27 call sites don't
+/// need updating.
 pub(crate) fn redir_open_error(
     shell: &Shell,
-    err_sink: &mut StderrSink,
-    out_sink: &mut StdoutSink,
+    _err_sink: &mut StderrSink,
+    _out_sink: &mut StdoutSink,
     path: &str,
     e: &std::io::Error,
 ) {
-    let prefix = shell.error_prefix(None);
-    let mut err = err_writer(err_sink, out_sink);
-    e!(&mut *err, "{prefix}{path}: {}", crate::bash_io_error(e));
+    crate::sh_error!(shell, None, "{path}: {}", crate::bash_io_error(e));
 }
 
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
@@ -800,8 +801,7 @@ fn run_command(
             // POSIX: a function may not be named after a special builtin; a
             // non-interactive posix shell errors and exits (default mode allows it).
             if shell.shell_options.posix && builtins::is_special_builtin(name) {
-                { let mut err = err_writer(err_sink, sink);
-                  e!(&mut *err, "{}{name}: is a special builtin", shell.error_prefix(None)); }
+                crate::sh_error!(shell, None, "{name}: is a special builtin");
                 shell.posix_fatal(2);
                 return ExecOutcome::Continue(2);
             }
@@ -1961,8 +1961,8 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 fn run_arith(
     body: &crate::lexer::Word,
     shell: &mut Shell,
-    sink: &mut StdoutSink,
-    err_sink: &mut StderrSink,
+    _sink: &mut StdoutSink,
+    _err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
     let (src, res) = crate::expand::eval_arith_word_src(body, shell);
@@ -1970,9 +1970,7 @@ fn run_arith(
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
-            let prefix = shell.error_prefix(Some("(("));
-            { let mut err = err_writer(err_sink, sink);
-              e!(&mut *err, "{prefix}{}", crate::arith::render_error_body(&src, &e)); }
+            crate::sh_error!(shell, Some("(("), "{}", crate::arith::render_error_body(&src, &e));
             ExecOutcome::Continue(1)
         }
     }
@@ -3679,11 +3677,7 @@ pub(crate) fn call_function(
         .filter(|f| matches!(f.kind, crate::shell_state::FrameKind::Function))
         .count();
     if depth >= limit {
-        let prefix = shell.error_prefix(Some(name));
-        {
-            let mut err = err_writer(err_sink, sink);
-            e!(&mut *err, "{prefix}maximum function nesting level exceeded ({limit})");
-        }
+        crate::sh_error!(shell, Some(name), "maximum function nesting level exceeded ({limit})");
         return ExecOutcome::Continue(1);
     }
     let saved = std::mem::take(&mut shell.positional_args);
@@ -3891,8 +3885,7 @@ fn run_assignment_list(
         // For namerefs, skip the early readonly check and let assign() check the
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            let prefix = shell.error_prefix(None);
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{prefix}{name}: readonly variable"); }
+            crate::sh_error!(shell, None, "{name}: readonly variable");
             shell.posix_fatal(127);
             st = 1;
             break;
@@ -5301,11 +5294,7 @@ fn run_subprocess(
             }
             // bash format: `<src>: line N: <name>: command not found` (the name
             // precedes the phrase; error_prefix supplies the prologue + mode split).
-            {
-                let prefix = shell.error_prefix(None);
-                let mut err = err_writer(err_sink, sink);
-                e!(&mut *err, "{prefix}{}: command not found", cmd.program);
-            }
+            crate::sh_error!(shell, None, "{}: command not found", cmd.program);
             ExecOutcome::Continue(127)
         }
         Err(e) => {

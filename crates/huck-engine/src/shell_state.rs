@@ -486,6 +486,13 @@ pub struct Shell {
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
 
+    /// True when the shell was invoked as `huck -c '<command>'`. Drives the
+    /// `-c:` prologue segment on syntax/parser diagnostics
+    /// (`error_prefix(Diag::Syntax { .. })`) — bash attributes a `-c`-mode
+    /// syntax error to `<name>: -c: line N:` but omits the segment for
+    /// script-file/stdin mode and for runtime errors entirely.
+    pub is_command_string: bool,
+
     /// True when this process is a forked subshell child. A subshell must NOT
     /// perform interactive job-control process-grouping for its inner pipelines
     /// (that deadlocks on a controlling terminal — M-104).
@@ -780,6 +787,7 @@ impl Shell {
             pending_fatal_status: None,
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
+            is_command_string: false,
             in_subshell: false,
             in_completion: false,
             xtrace_depth: 0,
@@ -884,10 +892,13 @@ impl Shell {
         self.shopt_options.get("extglob").unwrap_or(false)
     }
 
-    /// Bash-compatible error prologue: `<name>: [line N: ][cmd: ]`.
+    /// Bash-compatible error prologue — the complete matrix of
+    /// `docs/superpowers/specs/2026-07-07-unified-error-emitter-design.md` §3.
     /// Mirrors bash `get_name_for_error` + `error_prolog`/`builtin_error_prolog`.
-    /// `cmd` is the command context (`let`, `((`) or `None` for `$(( ))`.
-    pub fn error_prefix(&self, cmd: Option<&str>) -> String {
+    /// Reachable only through the emitter family (`error_emit.rs`) — no other
+    /// call site composes `prefix + tail` by hand.
+    pub(crate) fn error_prefix(&self, kind: crate::error_emit::Diag) -> String {
+        use crate::error_emit::Diag;
         let name = if !self.is_interactive {
             self.get_indexed("BASH_SOURCE")
                 .and_then(|m| m.get(&0))
@@ -898,11 +909,23 @@ impl Shell {
             "huck".to_string()
         };
         let mut out = format!("{name}: ");
-        if !self.is_interactive && self.current_lineno > 0 {
-            out.push_str(&format!("line {}: ", self.current_lineno));
-        }
-        if let Some(c) = cmd {
-            out.push_str(&format!("{c}: "));
+        match kind {
+            Diag::Runtime(cmd) => {
+                if !self.is_interactive && self.current_lineno > 0 {
+                    out.push_str(&format!("line {}: ", self.current_lineno));
+                }
+                if let Some(c) = cmd {
+                    out.push_str(&format!("{c}: "));
+                }
+            }
+            Diag::Syntax { line } => {
+                if !self.is_interactive {
+                    if self.is_command_string {
+                        out.push_str("-c: ");
+                    }
+                    out.push_str(&format!("line {line}: "));
+                }
+            }
         }
         out
     }
@@ -1665,8 +1688,7 @@ impl Shell {
             // bash prefixes the readonly-assignment error with the
             // non-interactive prologue (`<src>: line N:`); interactive keeps
             // `huck:` (error_prefix handles the mode split).
-            let prefix = self.error_prefix(None);
-            with_err(|err| e!(err, "{prefix}{name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
 
@@ -3580,6 +3602,7 @@ mod ifs_helper_tests {
 #[cfg(test)]
 mod shopt_tests {
     use super::*;
+    use crate::error_emit::Diag;
 
     #[test]
     fn shopt_table_has_57_entries() {
@@ -3965,9 +3988,9 @@ mod shopt_tests {
         sh.is_interactive = false;
         sh.shell_argv0 = "./arith.tests".to_string();
         sh.current_lineno = 168;
-        assert_eq!(sh.error_prefix(None), "./arith.tests: line 168: ");
-        assert_eq!(sh.error_prefix(Some("let")), "./arith.tests: line 168: let: ");
-        assert_eq!(sh.error_prefix(Some("((")), "./arith.tests: line 168: ((: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./arith.tests: line 168: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("let"))), "./arith.tests: line 168: let: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("(("))), "./arith.tests: line 168: ((: ");
     }
 
     #[test]
@@ -3976,8 +3999,8 @@ mod shopt_tests {
         sh.is_interactive = true;
         sh.shell_argv0 = "huck".to_string();
         sh.current_lineno = 5;
-        assert_eq!(sh.error_prefix(None), "huck: ");
-        assert_eq!(sh.error_prefix(Some("((")), "huck: ((: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "huck: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("(("))), "huck: ((: ");
     }
 
     #[test]
@@ -3987,6 +4010,42 @@ mod shopt_tests {
         sh.shell_argv0 = "huck".to_string();
         sh.current_lineno = 3;
         sh.seed_array_for_tests("BASH_SOURCE", &[(0, "./sourced.sh")]);
-        assert_eq!(sh.error_prefix(None), "./sourced.sh: line 3: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./sourced.sh: line 3: ");
+    }
+
+    #[test]
+    fn error_prefix_runtime_matrix() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "s.sh".into();
+        sh.current_lineno = 5;
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "s.sh: line 5: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("cd"))), "s.sh: line 5: cd: ");
+        sh.is_interactive = true;
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "huck: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_matrix() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "s.sh".into();
+        // script mode: no -c:
+        sh.is_command_string = false;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "s.sh: line 2: ");
+        // -c mode: -c: present
+        sh.is_command_string = true;
+        sh.shell_argv0 = "bash5".into();
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 1 }), "bash5: -c: line 1: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_interactive_has_no_c_segment_or_line() {
+        // Interactive syntax errors get plain `huck: ` — no line, no `-c:`,
+        // even if `is_command_string` were somehow left set.
+        let mut sh = Shell::new();
+        sh.is_interactive = true;
+        sh.is_command_string = true;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 9 }), "huck: ");
     }
 }

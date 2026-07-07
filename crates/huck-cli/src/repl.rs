@@ -95,6 +95,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 engine.set_arg0(&a0);
             }
             engine.set_args(args);
+            engine.set_is_command_string(true);
             return engine.run(&command);
         }
         RunMode::File { path, args } => {

@@ -654,7 +654,7 @@ fn expand_indirect(
         && !n.bytes().all(|b| b.is_ascii_digit())
         && !is_element_ref
     {
-        with_err(|err| e!(err, "{}{}: invalid variable name", shell.error_prefix(None), n));
+        crate::sh_error!(shell, None, "{}: invalid variable name", n);
         return ExpansionResult::Fatal { status: 1 };
     }
     if through.is_empty() {
@@ -1172,8 +1172,7 @@ fn expand_part(
                     // $((..)) value on error. (-c mode divergence: L-55 in
                     // bash-divergences.md.) POSIX non-interactive: the shell
                     // exits (127) via posix_fatal (a no-op in default mode).
-                    let prefix = shell.error_prefix(None);
-                    with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                    crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
                     shell.posix_fatal(127);
                     *has_emitted = true;
                 }
@@ -1456,9 +1455,8 @@ pub(crate) fn reconstruct_word_source_inner(word: &Word) -> String {
 /// expands a modifier without a surrounding word, e.g. arithmetic operands.)
 fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &mut Shell) -> bool {
     if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
-        let prefix = shell.error_prefix(None);
         let src = reconstruct_word_source_inner(word);
-        with_err(|err| e!(err, "{prefix}{src}: bad substitution"));
+        crate::sh_error!(shell, None, "{src}: bad substitution");
         shell.pending_fatal_status = Some(1);
         true
     } else {
@@ -1723,8 +1721,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // mode prints and continues. Empty contribution to
                         // the assignment value matches bash. (-c mode
                         // divergence: L-55.)
-                        let prefix = shell.error_prefix(None);
-                        with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                        crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
                     }
                 }
             }

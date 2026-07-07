@@ -181,6 +181,15 @@ impl Engine {
         self.cell.borrow_mut().shell_argv0 = name.to_string();
     }
 
+    /// Mark the shell as invoked `huck -c '<command>'`. Drives the `-c:`
+    /// prologue segment on syntax/parser diagnostics
+    /// (`Diag::Syntax` — see `error_emit.rs`); bash attributes a `-c`-mode
+    /// syntax error to `<name>: -c: line N:` but omits the segment for
+    /// script-file/stdin mode.
+    pub fn set_is_command_string(&mut self, v: bool) {
+        self.cell.borrow_mut().is_command_string = v;
+    }
+
     /// `$?` after the last run.
     pub fn last_status(&self) -> i32 {
         self.cell.borrow().last_status()
