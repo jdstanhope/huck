@@ -152,5 +152,25 @@ h=$("$HUCK_BIN" --badoption 2>&1)
 checkshape "pre-shell CLI --badoption: 'huck: ' prefix" "$h" '^huck: '
 checknotshape "pre-shell CLI --badoption: no line number" "$h" 'line [0-9]+:'
 
+# ---------------------------------------------------------------------------
+# 7. Builtin bare-redirect capture regression (v269 T3b, the sh_error_to!
+#    writer-based emitter). A bare builtin's `2>&1` inside `$(...)` must land
+#    in the SAME writer the executor's in-memory route_err_to_out swap
+#    targets. Builtins converted to the thread-local sh_error! (instead of the
+#    writer-based sh_error_to!) lose the diagnostic here, because the swap
+#    lives only in the `out`/`err` writer params `run_builtin` hands the
+#    builtin, not in the thread-local sink. Verified bug (pre-fix): `x=$(cd
+#    /nonexistent 2>&1); echo "$x"` printed `[]` (empty) instead of capturing
+#    the error.
+# ---------------------------------------------------------------------------
+b=$("$BASH_BIN" -c 'x=$(cd /nonexistent_xyz 2>&1); echo "$x"')
+h=$("$HUCK_BIN" -c 'x=$(cd /nonexistent_xyz 2>&1); echo "$x"')
+checkdiff "builtin bare-redirect capture: cd /nonexistent_xyz" "$b" "$h"
+checkshape "builtin bare-redirect capture: cd capture is non-empty" "$h" '.'
+
+h=$("$HUCK_BIN" -c 'x=$(type -Z 2>&1); echo "$x"')
+checkshape "builtin bare-redirect capture: type -Z capture is non-empty" "$h" '.'
+checkshape "builtin bare-redirect capture: type -Z carries the message body" "$h" 'invalid option'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -530,6 +530,30 @@ mod tests {
         assert!(out.stdout.contains("NOPE_NOT_DEFINED"), "got stdout=[{:?}]", out.stdout);
     }
 
+    #[test]
+    fn cmdsub_bare_builtin_2to1_capture_is_nonempty() {
+        // v269 T3b regression: a builtin error emitted under `$(... 2>&1)`
+        // must reach the CALLER's writer (the executor's in-memory
+        // route_err_to_out swap for the bare-builtin redirect), not the
+        // thread-local sink — sh_error_to!, not sh_error!. Verified bug
+        // (pre-fix): `x=$(cd /nonexistent 2>&1); echo "$x"` printed an empty
+        // string instead of capturing `cd`'s diagnostic.
+        let mut e = Engine::new();
+        let out = e
+            .exec(r#"x=$(cd /nonexistent_xyz_engine_test 2>&1); echo "$x""#)
+            .capture();
+        assert_eq!(out.stderr, "");
+        assert!(
+            !out.stdout.trim().is_empty(),
+            "expected the cd error to be captured, got empty stdout"
+        );
+        assert!(
+            out.stdout.contains("No such file or directory"),
+            "expected the captured cd diagnostic body, got stdout=[{:?}]",
+            out.stdout
+        );
+    }
+
     // ============== CWD ==============
 
     #[test]

@@ -87,6 +87,31 @@ macro_rules! sh_error {
     };
 }
 
+/// Emit a runtime diagnostic to a CALLER-PROVIDED writer (redirect-aware).
+/// Prologue: `<name>: [line N: ][cmd: ]`, same as [`emit_error`], but written
+/// directly to `w` instead of the thread-local sink. This is the builtin
+/// path: builtins receive `out`/`err` writer parameters from
+/// `run_builtin(program, args, out, err, shell)`, and those writers (not the
+/// thread-local sink) carry the in-memory `route_err_to_out`/`route_out_to_err`
+/// swap that a bare-builtin `2>&1`/`>&2` redirect performs. A site that holds
+/// such a writer MUST emit to it — see the design spec's §1(a2) — otherwise
+/// the diagnostic is lost under `$(builtin 2>&1)` capture.
+pub fn emit_error_to(shell: &Shell, w: &mut dyn std::io::Write, cmd: Option<&str>, body: std::fmt::Arguments) {
+    let _ = write!(w, "{}", shell.error_prefix(Diag::Runtime(cmd)));
+    let _ = w.write_fmt(body);
+    let _ = w.write_all(b"\n");
+}
+
+/// `eprintln!`-shaped wrapper around [`emit_error_to`]: `sh_error_to!(shell,
+/// w, cmd, "fmt", args...)`. Use at any builtin site that holds an `out`/`err`
+/// writer descending from `run_builtin` — see [`emit_error_to`].
+#[macro_export]
+macro_rules! sh_error_to {
+    ($shell:expr, $w:expr, $cmd:expr, $($arg:tt)*) => {
+        $crate::emit_error_to($shell, $w, $cmd, format_args!($($arg)*))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
