@@ -1,6 +1,5 @@
 //! Parameter-expansion modifier evaluation (`${var:-w}`, `${#var}`, etc.).
 
-use crate::err_thread_local::with_err;
 use crate::lexer::{CaseDirection, ParamModifier, SubstAnchor, Word};
 use crate::shell_state::Shell;
 
@@ -147,7 +146,7 @@ pub fn expand_modifier_with_value(
                 if matches!(source, ParamLookup::Scalar)
                     && shell.try_set(name, v.clone()).is_err()
                 {
-                    with_err(|err| e!(err, "huck: {name}: readonly variable"));
+                    crate::sh_error!(shell, None, "{name}: readonly variable");
                     return ExpansionResult::Fatal { status: 1 };
                 }
                 ExpansionResult::Value(v)
@@ -165,9 +164,9 @@ pub fn expand_modifier_with_value(
                     } else {
                         "parameter not set"
                     };
-                    with_err(|err| e!(err, "huck: {}: {}", name, default));
+                    crate::sh_error!(shell, None, "{}: {}", name, default);
                 } else {
-                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
+                    crate::sh_error!(shell, None, "{}: {}", name, msg);
                 }
                 ExpansionResult::Fatal { status: 1 }
             } else {
@@ -224,7 +223,7 @@ pub fn expand_modifier_with_value(
             match substring(&value, off_n, len_n) {
                 Ok(s) => ExpansionResult::Value(s),
                 Err(msg) => {
-                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
+                    crate::sh_error!(shell, None, "{}: {}", name, msg);
                     ExpansionResult::Fatal { status: 1 }
                 }
             }

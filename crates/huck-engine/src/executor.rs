@@ -3417,7 +3417,7 @@ fn glob_expand_word(
     // borrow, so the immutable borrow ends first.
     let opts = shell.glob_opts();
     let fields = expand(word, shell);
-    let exp = glob_expand_fields_opts(fields, opts);
+    let exp = glob_expand_fields_opts(fields, opts, shell);
     if !exp.failglob_unmatched.is_empty() {
         crate::sh_error_to!(shell, err, None, "no match: {}", exp.failglob_unmatched.join(" "));
         return Err(());

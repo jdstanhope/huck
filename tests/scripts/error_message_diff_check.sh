@@ -230,6 +230,18 @@ checkcapture "capture matrix: arith division by zero" "echo \$((1/0))"
 checkcapture "capture matrix: bad-fd redirect" "echo x >&9"
 checkcapture "capture matrix: readonly reassignment" "readonly r=1; r=2"
 
+# v269 T5: param_expansion.rs / expand.rs / completion_builtins.rs sites,
+# converted from with_err(|err| e!(err, "huck: ...")) / e!(err, "huck: ...")
+# to sh_error!/sh_error_to! respectively. None of these hold a local writer
+# (param_expansion.rs/expand.rs sites only ever had `shell` in scope, so they
+# route through the thread-local sh_error!; the completion builtins DO hold
+# an `err` writer from run_builtin, so they route through sh_error_to!) —
+# these cases prove both choices are actually redirect-capture-correct, not
+# just compile-clean.
+checkcapture "capture matrix: param-expansion \${VAR:?msg}" "echo \${UNSET_VAR_PE_XYZ:?boom}"
+checkcapture "capture matrix: nounset unbound variable (expand.rs)" "set -u; echo \$UNSET_XYZ_NOUNSET"
+checkcapture "capture matrix: complete -A invalid action name" "complete -A bogus_action_xyz -- foo"
+
 # Ambiguous redirect: bash's own body includes the offending word (`$y:
 # ambiguous redirect`) while huck's omits it (a pre-existing, unrelated
 # message-wording gap — not a routing regression). Assert routing parity
