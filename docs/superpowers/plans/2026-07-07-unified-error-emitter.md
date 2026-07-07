@@ -218,7 +218,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/huck-engine/src/executor.rs`, `crates/huck-engine/src/cwd_scope.rs`
 
-- [ ] **Step 1: Convert `executor.rs` sites** per the transform rule (`sh_error!(shell, None, "REST")`; the executor has `shell` in scope at emission sites).
+- [ ] **Step 1: Convert `executor.rs` sites** — nearly all are local redirect-aware `{ let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: REST") }`. KEEP the `err_writer` local writer and emit via `sh_error_to!(shell, &mut *err, None, "REST")` (NOT thread-local `sh_error!` — that misroutes under inner `2>&1`). Use `sh_error!` only where a site genuinely has NO local `err_sink`/`sink`/writer.
 - [ ] **Step 2: Convert `cwd_scope.rs:29`** `eprintln!("huck: cwd: {}: {}", …)` → `sh_error!(shell, None, "cwd: {}: {}", …)` (routes through the sink — a `2>&1` correctness fix). Confirm a `&Shell` is reachable here; if not, thread one in (flag if a signature change is required).
 - [ ] **Step 3: Fix any pinned-prefix test breakage** (as Task 3 Step 2).
 - [ ] **Step 4: Run the lib suite** (`huck-engine`, per Global Constraints) → PASS.
