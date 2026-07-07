@@ -5071,14 +5071,6 @@ fn build_child_extra_ops(
     Ok((ops, held))
 }
 
-/// v156 task 4: the single (non-pipeline) external command path. `plan` is the
-/// ordered `dup2`/`close` replay list lowered from `cmd.redirects` by
-/// `build_child_redir_plan` in the PARENT (files already opened, heredoc writers
-/// already forked). The child replays `plan.ops` IN SOURCE ORDER in a `pre_exec`
-/// after the signal-reset hook, so e.g. `3>&1 1>&2 2>&3` performs the fd swap
-/// correctly. fds 0/1/2 and fd>2 are all handled uniformly by the replay; this
-/// function no longer wires `.stdin/.stdout/.stderr` from opened files (only the
-/// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
 /// Emit a spawn-failure diagnostic (command-not-found / exec error) for an
 /// external command whose redirects were lowered into a CHILD-only replay
 /// plan (`ChildRedirPlan`) that never ran (the fork never happened). Since
@@ -5107,6 +5099,14 @@ fn emit_exec_spawn_diag(
     }
 }
 
+/// v156 task 4: the single (non-pipeline) external command path. `plan` is the
+/// ordered `dup2`/`close` replay list lowered from `cmd.redirects` by
+/// `build_child_redir_plan` in the PARENT (files already opened, heredoc writers
+/// already forked). The child replays `plan.ops` IN SOURCE ORDER in a `pre_exec`
+/// after the signal-reset hook, so e.g. `3>&1 1>&2 2>&3` performs the fd swap
+/// correctly. fds 0/1/2 and fd>2 are all handled uniformly by the replay; this
+/// function no longer wires `.stdin/.stdout/.stderr` from opened files (only the
+/// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
 fn run_subprocess(
     cmd: &ResolvedCommand,
     mut plan: ChildRedirPlan,
