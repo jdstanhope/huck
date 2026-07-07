@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crate::completion_spec::{CompletionSpec, CompletionSpecs};
-use crate::err_thread_local::with_err;
 use crate::jobs::JobTable;
 
 /// What kind of call-stack frame this is.
@@ -170,9 +169,10 @@ impl AssignDest {
 
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
-/// Callers translate these into a "huck: {cmd}: ..." diagnostic via
-/// [`declare_err_message`] so that `local -A` and `readonly -A` print the
-/// correct command name (not a misleading "declare" prefix).
+/// Callers translate these into a "{cmd}: ..." diagnostic (emitted via
+/// `sh_error!`/`sh_error_to!`) via [`declare_err_message`] so that `local -A`
+/// and `readonly -A` print the correct command name (not a misleading
+/// "declare" prefix).
 #[derive(Debug)]
 pub enum DeclareErr {
     /// `declare -A NAME` where NAME is already an indexed array.
@@ -186,10 +186,10 @@ pub enum DeclareErr {
 pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
     match err {
         DeclareErr::IndexedExists => {
-            format!("huck: {cmd}: {name}: cannot convert indexed to associative array")
+            format!("{cmd}: {name}: cannot convert indexed to associative array")
         }
         DeclareErr::ScalarExists => {
-            format!("huck: {cmd}: {name}: cannot convert scalar to associative array")
+            format!("{cmd}: {name}: cannot convert scalar to associative array")
         }
     }
 }
@@ -1064,8 +1064,8 @@ impl Shell {
     /// User-facing assignments must use `assign()` / `try_set` instead.
     ///
     /// In restricted mode, assignment to SHELL/PATH/ENV/BASH_ENV is refused
-    /// with a diagnostic emitted via `err_thread_local::with_err`; if no
-    /// executor sink is installed (e.g. direct unit tests), the diagnostic
+    /// with a diagnostic emitted via `sh_error!` (the thread-local sink); if
+    /// no executor sink is installed (e.g. direct unit tests), the diagnostic
     /// falls through to `io::stderr()`.
     pub fn set(&mut self, name: &str, value: String) {
         if is_write_protected_var(name) {
@@ -1074,7 +1074,7 @@ impl Shell {
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(name)
         {
-            crate::err_thread_local::with_err(|err| e!(err, "{msg}"));
+            crate::sh_error!(self, None, "{msg}");
             return;
         }
         self.store_scalar(name, value);
@@ -1118,7 +1118,9 @@ impl Shell {
 
     /// Saves history to the histfile, applying the `$HISTFILESIZE` cap. (v139)
     pub fn save_history(&self) {
-        self.history.save_capped(self.resolve_histfilesize());
+        if let Some(msg) = self.history.save_capped(self.resolve_histfilesize()) {
+            crate::sh_error!(self, None, "{msg}");
+        }
     }
 
     /// True if the named variable/parameter is currently **set** (a
@@ -1331,8 +1333,11 @@ impl Shell {
         if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => {
-                install_scalar_value(existing, value);
+                let assoc_mismatch = install_scalar_value(existing, value);
                 existing.exported = true;
+                if assoc_mismatch {
+                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                }
             }
             None => {
                 self.vars.insert(
@@ -1520,7 +1525,11 @@ impl Shell {
             return;
         }
         match self.vars.get_mut(name) {
-            Some(existing) => install_scalar_value(existing, value),
+            Some(existing) => {
+                if install_scalar_value(existing, value) {
+                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                }
+            }
             None => {
                 self.vars.insert(name.to_string(), Variable::scalar(value));
             }
@@ -1544,7 +1553,7 @@ impl Shell {
                     v.value = VarValue::Indexed(m);
                 }
                 VarValue::Associative(_) => {
-                    with_err(|err| e!(err, "huck: {name}: set_indexed_element on associative variable"));
+                    crate::sh_error!(self, None, "{name}: set_indexed_element on associative variable");
                     return Err(AssignErr::TypeMismatch);
                 }
             },
@@ -1597,7 +1606,7 @@ impl Shell {
             for (idx, val) in entries { m.insert(idx, val); }
             Ok(())
         } else {
-            with_err(|err| e!(err, "huck: {name}: cannot append array literal to associative array"));
+            crate::sh_error!(self, None, "{name}: cannot append array literal to associative array");
             Err(AssignErr::TypeMismatch)
         }
     }
@@ -1615,12 +1624,12 @@ impl Shell {
                     }
                 }
                 _ => {
-                    with_err(|err| e!(err, "huck: {name}: set_associative_element on non-associative variable"));
+                    crate::sh_error!(self, None, "{name}: set_associative_element on non-associative variable");
                     return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
-                with_err(|err| e!(err, "huck: {name}: set_associative_element on unset variable"));
+                crate::sh_error!(self, None, "{name}: set_associative_element on unset variable");
                 return Err(AssignErr::TypeMismatch);
             }
         }
@@ -1678,7 +1687,7 @@ impl Shell {
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(&name)
         {
-            with_err(|err| e!(err, "{msg}"));
+            crate::sh_error!(self, None, "{msg}");
             return Err(AssignErr::Readonly);
         }
 
@@ -1902,7 +1911,7 @@ impl Shell {
         let mut visited = std::collections::HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
-                with_err(|err| e!(err, "huck: warning: {current}: circular name reference"));
+                crate::sh_error!(self, None, "warning: {current}: circular name reference");
                 return ResolvedName::Cycle;
             }
             match self.vars.get(&current) {
@@ -2292,7 +2301,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            with_err(|err| e!(err, "huck: {name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2373,7 +2382,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            with_err(|err| e!(err, "huck: {name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2543,17 +2552,23 @@ fn quote_keyseq(k: &str) -> String {
 /// `assign()` and the raw `set()`) and `Shell::export_set`, so every
 /// scalar-store path applies the "scalar assignment to an array
 /// overwrites a[0]" rule identically (matches bash).
-fn install_scalar_value(existing: &mut Variable, value: String) {
+///
+/// Returns `true` when the associative-mismatch diagnostic needs emitting.
+/// No `&Shell` is threaded in here: both call sites hold `existing` as a
+/// `&mut` sub-borrow of `self.vars`, so a `&Shell` (whole-`self`) argument
+/// would overlap it — the caller checks the return value and emits AFTER
+/// this call returns (and the sub-borrow has ended).
+fn install_scalar_value(existing: &mut Variable, value: String) -> bool {
     match &mut existing.value {
         VarValue::Indexed(m) => {
             m.insert(0, value);
+            false
         }
         VarValue::Scalar(_) => {
             existing.value = VarValue::Scalar(value);
+            false
         }
-        VarValue::Associative(_) => {
-            with_err(|err| e!(err, "huck: internal: install_scalar_value on associative array"));
-        }
+        VarValue::Associative(_) => true,
     }
 }
 
@@ -3470,15 +3485,15 @@ mod assoc_value_tests {
         use super::declare_err_message;
         assert_eq!(
             declare_err_message("declare", "a", &DeclareErr::IndexedExists),
-            "huck: declare: a: cannot convert indexed to associative array",
+            "declare: a: cannot convert indexed to associative array",
         );
         assert_eq!(
             declare_err_message("local", "s", &DeclareErr::ScalarExists),
-            "huck: local: s: cannot convert scalar to associative array",
+            "local: s: cannot convert scalar to associative array",
         );
         assert_eq!(
             declare_err_message("readonly", "s", &DeclareErr::ScalarExists),
-            "huck: readonly: s: cannot convert scalar to associative array",
+            "readonly: s: cannot convert scalar to associative array",
         );
     }
 

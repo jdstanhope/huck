@@ -178,7 +178,7 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
     };
     if !path.exists() {
         if explicit {
-            eprintln!("huck: {}: No such file or directory", path.display());
+            crate::sh_error!(shell, None, "{}: No such file or directory", path.display());
             return Some(1);
         }
         return None;
@@ -186,7 +186,7 @@ pub fn maybe_source_rc_file(shell: &mut Shell, opts: &CliOptions) -> Option<i32>
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("huck: {}: {}", path.display(), e);
+            crate::sh_error!(shell, None, "{}: {}", path.display(), e);
             return Some(1);
         }
     };
@@ -289,17 +289,19 @@ pub fn run_program(
 /// Installs a SIGINT handler that sets the supplied flag. Called once at
 /// startup after `Shell::new()`; the flag lives on the `Shell` so the wait
 /// builtin can poll it to break out of its loop when Ctrl-C is pressed.
-pub fn install_sigint_handler(flag: Arc<AtomicBool>) {
+/// `shell` is threaded in solely so a registration failure can emit through
+/// the unified emitter (`sh_error!`) rather than a raw `eprintln!`.
+pub fn install_sigint_handler(flag: Arc<AtomicBool>, shell: &Shell) {
     if let Err(e) = signal_hook::flag::register(SIGINT, flag) {
-        eprintln!("huck: warning: could not install SIGINT handler: {}", crate::bash_io_error(&e));
+        crate::sh_error!(shell, None, "warning: could not install SIGINT handler: {}", crate::bash_io_error(&e));
     }
 }
 
 /// Installs a SIGCHLD handler that toggles the supplied flag. Called once
 /// at startup; the flag lives on the `Shell` so the reap path can poll it.
-pub fn install_sigchld_handler(flag: Arc<AtomicBool>) {
+pub fn install_sigchld_handler(flag: Arc<AtomicBool>, shell: &Shell) {
     if let Err(e) = signal_hook::flag::register(SIGCHLD, flag) {
-        eprintln!("huck: warning: could not install SIGCHLD handler: {}", crate::bash_io_error(&e));
+        crate::sh_error!(shell, None, "warning: could not install SIGCHLD handler: {}", crate::bash_io_error(&e));
     }
 }
 
@@ -313,11 +315,15 @@ pub fn install_sigchld_handler(flag: Arc<AtomicBool>) {
 /// `SIG_DFL` via a `CommandExt::pre_exec` hook — otherwise Ctrl-Z would
 /// not stop `vim`/`less`/etc., and a backgrounded reader would never
 /// get SIGTTIN.
-pub fn install_job_control_signals() {
+///
+/// Called before a `Shell` exists (pre-`Shell::new()`), so a failure here
+/// emits via `emit_cli_error` (the pre-shell diagnostic path) rather than
+/// `sh_error!` — `prog` is the CLI's own invocation basename.
+pub fn install_job_control_signals(prog: &str) {
     for sig in [libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
         let prev = unsafe { libc::signal(sig, libc::SIG_IGN) };
         if prev == libc::SIG_ERR {
-            eprintln!("huck: warning: could not ignore signal {sig}");
+            crate::emit_cli_error(prog, format_args!("warning: could not ignore signal {sig}"));
         }
     }
     // Rust's runtime sets SIGPIPE to SIG_IGN at startup; restore the OS default

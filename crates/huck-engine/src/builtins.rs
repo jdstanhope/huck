@@ -369,7 +369,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_cd()
     {
-        e!(err, "{msg}");
+        crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
     // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
@@ -1442,7 +1442,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     if shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        e!(err,
+                        crate::sh_error_to!(shell, err, None,
                             "{}",
                             crate::shell_state::declare_err_message("local", name, &e)
                         );
@@ -1545,7 +1545,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     && shell.get_associative(&name).is_none()
                     && let Err(e) = shell.declare_associative(&name)
                 {
-                    e!(err,
+                    crate::sh_error_to!(shell, err, None,
                         "{}",
                         crate::shell_state::declare_err_message("local", &name, &e)
                     );
@@ -1655,7 +1655,7 @@ fn builtin_readonly_decl(
                     && shell.get_associative(name).is_none()
                     && let Err(e) = shell.declare_associative(name)
                 {
-                    e!(err,
+                    crate::sh_error_to!(shell, err, None,
                         "{}",
                         crate::shell_state::declare_err_message("readonly", name, &e)
                     );
@@ -1679,7 +1679,7 @@ fn builtin_readonly_decl(
                         && shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        e!(err,
+                        crate::sh_error_to!(shell, err, None,
                             "{}",
                             crate::shell_state::declare_err_message("readonly", name, &e)
                         );
@@ -1988,7 +1988,7 @@ fn builtin_declare_decl(
             && shell.get_associative(name).is_none()
             && let Err(e) = shell.declare_associative(name)
         {
-            e!(err,
+            crate::sh_error_to!(shell, err, None,
                 "{}",
                 crate::shell_state::declare_err_message("declare", name, &e)
             );
@@ -5170,7 +5170,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
         && args.iter().any(|a| a == "+r")
         && let Err(msg) = crate::restricted::check_set_plus_r()
     {
-        e!(err, "{msg}");
+        crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
     if args.is_empty() {
@@ -6144,7 +6144,7 @@ pub(crate) fn source_in_sink(
         && let Err(msg) = crate::restricted::check_source_path(path)
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
-        e!(&mut *err, "{msg}");
+        crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
     // Materialize the redirect-aware err writer for the early-bail diagnostics

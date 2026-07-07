@@ -87,6 +87,31 @@ check 'r-bare-true' restricted --restricted  'true; echo ok'
 # Restricted: source with slash refused.
 check_exit_only 'r-source-slash'  restricted --restricted   '. /etc/profile'
 
+# v269 T6: channel-routing proof for the restricted.rs value-constructor
+# conversion (builtins.rs::builtin_cd's `check_cd()` call site, now emitting
+# via `sh_error_to!` using the LOCAL writer from `run_builtin`, not the
+# thread-local sink). A bare builtin's own `2>&1` must land the diagnostic
+# in STDOUT, not STDERR — both bash and huck agree on this routing (they
+# still differ on the message wording itself, which is the pre-existing,
+# out-of-scope divergence `check_exit_only` above works around).
+check_capture_channel() {
+    local label=$1 frag=$2
+    local h_out b_out b_err
+    h_out=$("$DRIVER" restricted "$frag")
+    local h_stdout_n h_stderr_n
+    h_stdout_n=$(printf '%s\n' "$h_out" | sed -n 's/^STDOUT:\([0-9]*\)$/\1/p')
+    h_stderr_n=$(printf '%s\n' "$h_out" | sed -n 's/^STDERR:\([0-9]*\)$/\1/p')
+    b_out=$(bash --restricted -c "$frag" 2>/tmp/engine_sandbox_diff_check.berr)
+    b_err=$(cat /tmp/engine_sandbox_diff_check.berr); rm -f /tmp/engine_sandbox_diff_check.berr
+    if [ "$h_stdout_n" -gt 0 ] && [ "$h_stderr_n" -eq 0 ] && [ -n "$b_out" ] && [ -z "$b_err" ]; then
+        echo "PASS [$label] both sides route 2>&1 to the captured channel"
+    else
+        echo "FAIL [$label] huck stdout_n=$h_stdout_n stderr_n=$h_stderr_n; bash stdout=[$b_out] stderr=[$b_err]"
+        FAIL=1
+    fi
+}
+check_capture_channel 'r-cd-2>&1-channel' 'cd /tmp 2>&1'
+
 # CWD fragment: bash equivalent uses `cd $tmp` prefix.
 TMP=$(mktemp -d)
 check_exit_only 'cwd-pwd'         "cwd:$TMP"  ''         "cd $TMP; pwd"

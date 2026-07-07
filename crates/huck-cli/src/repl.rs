@@ -73,7 +73,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
         return 0;
     }
 
-    install_job_control_signals();
+    install_job_control_signals(&prog);
 
     let shell_cell = Rc::new(RefCell::new(Shell::new()));
 
@@ -84,8 +84,8 @@ pub fn run(args: &[String], version: &str) -> i32 {
 
     {
         let shell = shell_cell.borrow();
-        install_sigint_handler(Arc::clone(&shell.sigint_flag));
-        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
+        install_sigint_handler(Arc::clone(&shell.sigint_flag), &shell);
+        install_sigchld_handler(Arc::clone(&shell.sigchld_flag), &shell);
     }
 
     // `-n`: parse-only (noexec). Honored only in non-interactive modes; the
@@ -152,7 +152,10 @@ pub fn run(args: &[String], version: &str) -> i32 {
 
     {
         let mut shell = shell_cell.borrow_mut();
-        Rc::make_mut(&mut shell.history).load();
+        let load_err = Rc::make_mut(&mut shell.history).load();
+        if let Some(msg) = load_err {
+            huck_engine::sh_error!(&shell, None, "{msg}");
+        }
         for (_, command) in shell.history.entries() {
             let _ = editor.add_history_entry(command);
         }

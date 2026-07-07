@@ -264,5 +264,19 @@ h=$("$HUCK_BIN" -c 'x=$(type -Z 2>&1); printf "%s" "$x"')
 checkshape "capture matrix: type -Z capture is non-empty" "$h" '.'
 checkshape "capture matrix: type -Z body matches bash wording" "$h" 'invalid option'
 
+# v269 T6: shell_state.rs's `declare_err_message` error-VALUE CONSTRUCTOR
+# (spec §6) — the "callers translate" contract. bash 5.2 itself does NOT
+# error on `declare -A` over an existing nonempty scalar (a pre-existing,
+# unrelated body/behavior divergence — out of scope here, same as the
+# ambiguous-redirect and `type -Z` cases above), so this asserts ONLY huck's
+# own routing: the translating caller (`builtin_declare_decl` in
+# builtins.rs) holds a local `err` writer from `run_builtin`, so it must
+# route through `sh_error_to!` — proven by both the `2>&1`-captured AND the
+# real-fd-leaked forms carrying the identical body.
+h_cap=$("$HUCK_BIN" -c 'x=$(y=1; declare -A y 2>&1); printf "%s" "$x"')
+h_leak=$("$HUCK_BIN" -c 'y=1; declare -A y' 2>&1 >/dev/null)
+checkshape "capture matrix: declare -A on existing scalar — capture carries the body" "$h_cap" 'cannot convert scalar to associative array'
+checkshape "capture matrix: declare -A on existing scalar — leaks to real fd 2 without capture" "$h_leak" 'cannot convert scalar to associative array'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

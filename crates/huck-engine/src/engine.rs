@@ -150,12 +150,16 @@ impl Engine {
     }
 
     /// Read and run a script FILE with script semantics (`$0` = the path).
-    /// A read failure prints `huck: <path>: <err>` and returns 127.
+    /// A read failure emits `<path>: <err>` (via the unified error emitter)
+    /// and returns 127.
     pub fn run_file(&mut self, path: &Path) -> i32 {
         match std::fs::read_to_string(path) {
             Ok(contents) => self.run_script(&contents, &path.display().to_string()),
             Err(e) => {
-                eprintln!("huck: {}: {}", path.display(), e);
+                // Short-lived borrow: dropped before returning, so it can
+                // never overlap a later `cell.borrow_mut()` (the `Shell` is
+                // never re-entered on this path).
+                crate::sh_error!(&*self.cell.borrow(), None, "{}: {}", path.display(), e);
                 127
             }
         }

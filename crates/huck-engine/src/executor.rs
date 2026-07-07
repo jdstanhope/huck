@@ -62,7 +62,7 @@ fn check_restricted_redirect(
     }
     if let Err(msg) = crate::restricted::check_redirect_path(path) {
         let mut err = err_writer(err_sink, sink);
-        e!(&mut *err, "{msg}");
+        crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return Err(());
     }
     Ok(())
@@ -4291,7 +4291,7 @@ fn run_exec_single_inner(
         if crate::restricted::is_restricted(shell)
             && let Err(msg) = crate::restricted::check_exec()
         {
-            { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
             drain_procsubs(shell, procsub_base);
             return ExecOutcome::Continue(1);
         }
@@ -4317,7 +4317,7 @@ fn run_exec_single_inner(
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_command_name(&resolved.program)
     {
-        { let mut err = err_writer(err_sink, sink); e!(&mut *err, "{msg}"); }
+        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
         finalize_inline_scope(snap, persistent, shell);
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
