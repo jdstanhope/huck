@@ -2859,6 +2859,9 @@ fn parse_and_or_opts(
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
         }
+        // Bound history within a long sequence; safe here — no Mark is outstanding
+        // at a command boundary (the arith disambiguation never straddles it).
+        iter.maybe_prune_history();
         // ── Stop check 1: before consuming any connector (mirrors ~890) ──────
         // Atom-aware keyword recognition (a bare `Lit` keyword, not a `Word`).
         if peek_leading_keyword(iter)?.map(|k| stop_at.contains(&k)).unwrap_or(false) {
@@ -3315,6 +3318,7 @@ pub fn parse_fragment_word(
 /// analog of `command::parse_one_unit`, used by the non-interactive script
 /// reader (`run_sourced_contents_in_sinks`).
 pub fn parse_one_unit(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> {
+    iter.maybe_prune_history(); // bound history across units on the shared lexer
     // Discard any heredoc bodies leaked by a prior unit that errored after
     // pushing them (mirrors parse_sequence's CF2 hygiene). take_heredoc_bodies
     // drains only on the success path below, so on a clean loop this is a no-op.
@@ -4288,7 +4292,8 @@ fn parse_test_atom(iter: &mut Lexer) -> Result<TestExpr, ParseError> {
 mod tests {
     use super::*;
     use crate::lexer::{
-        Lexer, LexerOptions, Mode, ParamOpKind, SubstKind, TokenKind, Word, WordPart,
+        HISTORY_PRUNE_THRESHOLD, Lexer, LexerOptions, Mode, ParamOpKind, SubstKind, TokenKind,
+        Word, WordPart,
     };
     use crate::command::ParseError;
 
@@ -7479,5 +7484,86 @@ mod tests {
             },
             other => panic!("expected ParseError::Lex, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_one_unit_prunes_history_across_units() {
+        // 5000 single-command lines on ONE lexer (the source-reader pattern). Without
+        // pruning, history grows ~linearly; with the parse_one_unit prune it stays
+        // bounded near HISTORY_PRUNE_THRESHOLD.
+        let empty = std::collections::HashMap::new();
+        let src: String = (0..5000).map(|i| format!("echo {i}\n")).collect();
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let mut units = 0;
+        while parse_one_unit(&mut lx).unwrap().is_some() {
+            units += 1;
+            assert!(
+                lx.scanned_token_count() < HISTORY_PRUNE_THRESHOLD + 64,
+                "history unbounded: {} tokens after {units} units",
+                lx.scanned_token_count()
+            );
+        }
+        assert_eq!(units, 5000);
+    }
+
+    #[test]
+    fn parse_and_or_prunes_long_semicolon_chain() {
+        let empty = std::collections::HashMap::new();
+        let n = HISTORY_PRUNE_THRESHOLD + 200;
+        let src: String = (0..n).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let seq = parse_sequence(&mut lx).unwrap().unwrap();
+        assert_eq!(1 + seq.rest.len(), n, "all commands parsed");
+        assert!(lx.scanned_token_count() < 2 * HISTORY_PRUNE_THRESHOLD, "pruned during parse");
+    }
+
+    #[test]
+    fn prune_does_not_break_arith_backoff_marks() {
+        // A threshold-crossing chain forces a prune, then an arith-backoff construct
+        // whose mark/rewind must still work relative to the pruned (pos-reset) history:
+        // `$( (echo x) )` = cmdsub w/ leading subshell → parse_arith_expansion bail.
+        let empty = std::collections::HashMap::new();
+        let filler: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
+            .map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+        let src = format!("{filler}; echo $( (echo x) )");
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        assert!(parse_sequence(&mut lx).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_inside_nested_command_sub() {
+        let empty = std::collections::HashMap::new();
+        let inner: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
+            .map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
+        let src = format!("x=$({inner})");
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        assert!(parse_sequence(&mut lx).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_preserves_heredoc_body_across_threshold() {
+        // Heredoc redirect, then enough `;`-commands on the SAME line to cross the
+        // threshold BEFORE the body, then the body. The prune must skip while the
+        // heredoc is pending, so the body still attaches.
+        use crate::command::{Command, SimpleCommand, RedirOp};
+        use crate::lexer::WordPart;
+        let empty = std::collections::HashMap::new();
+        let filler: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
+            .map(|i| format!("; echo {i}")).collect();
+        let src = format!("cat <<EOF{filler}\nBODYLINE\nEOF\n");
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let seq = parse_one_unit(&mut lx).unwrap().unwrap();
+        // Extract the first heredoc body from the first command.
+        let Command::Pipeline(p) = &seq.first else { panic!("expected pipeline") };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("expected exec") };
+        let body = e.redirects.iter().find_map(|r| match &r.op {
+            RedirOp::Heredoc { body, .. } => Some(body.clone()),
+            _ => None,
+        }).expect("heredoc redirect present");
+        let text: String = body.0.iter().filter_map(|part| match part {
+            WordPart::Literal { text, .. } => Some(text.clone()),
+            _ => None,
+        }).collect();
+        assert!(text.contains("BODYLINE"), "heredoc body lost across prune: {text:?}");
     }
 }
