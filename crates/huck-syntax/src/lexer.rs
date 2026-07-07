@@ -1189,15 +1189,20 @@ impl<'a> Lexer<'a> {
     /// the buffer to the live (unconsumed) tail. Acts only once `pos` crosses
     /// `HISTORY_PRUNE_THRESHOLD`, to avoid churn.
     ///
-    /// PRECONDITION (guaranteed at every call site): no `Mark` is outstanding — a
-    /// Mark stores an absolute `pos` this would invalidate. The parser only marks
-    /// inside the arith disambiguation (`parse_arith_expansion`/`parse_arith_command`),
-    /// and that mark is resolved before control returns to a command/unit boundary.
-    /// No-op for a replay lexer, and skipped while any heredoc body is pending
-    /// (`pending_heredocs` stores history `token_idx`; a mid-collection body must
-    /// not have its prefix shifted).
+    /// SAFETY (why `pos`-reset can't invalidate an outstanding `Mark`): the only
+    /// `Mark`s the parser takes are the arith disambiguation marks in
+    /// `parse_arith_expansion` / `parse_arith_command`, and an arith mark's entire
+    /// lifetime is spent with `Mode::Arith` pushed (`modes.len() >= 2`). By pruning
+    /// only at genuine top level (`modes.len() == 1`), no prune can ever fire while
+    /// such a mark is live, so a later `rewind(&mark)` never sees a stale `pos`.
+    /// (A nested `$((… $({compound})…))` reaches `parse_and_or_opts` — hence this
+    /// call site — with the arith mark still outstanding; the depth guard is what
+    /// makes that safe.) No-op for a replay lexer, and skipped while any heredoc
+    /// body is pending (`pending_heredocs` stores history `token_idx`; a
+    /// mid-collection body must not have its prefix shifted).
     pub(crate) fn maybe_prune_history(&mut self) {
         if self.replay
+            || self.modes.len() > 1
             || self.pos < HISTORY_PRUNE_THRESHOLD
             || !self.pending_heredocs.is_empty()
             || !self.atom_pending_heredocs.is_empty()

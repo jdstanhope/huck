@@ -7519,13 +7519,18 @@ mod tests {
 
     #[test]
     fn prune_does_not_break_arith_backoff_marks() {
-        // A threshold-crossing chain forces a prune, then an arith-backoff construct
-        // whose mark/rewind must still work relative to the pruned (pos-reset) history:
-        // `$( (echo x) )` = cmdsub w/ leading subshell → parse_arith_expansion bail.
+        // A threshold-crossing chain forces a top-level prune (modes.len()==1, so
+        // it's safe — no mark is outstanding yet), then an arith-backoff construct
+        // whose mark/rewind must still work relative to the pruned (pos-reset)
+        // history. Must be GLUED `$((` (not `$( (echo x) )` with a space — that
+        // lexes as CmdSubOpen + `(` and never takes an arith mark at all): `$((echo
+        // x) )` opens as arith (`$((`), the body's single `)` is followed by a
+        // space rather than another `)`, so it bails and backs off to a cmdsub
+        // wrapping a subshell, exactly like the original oracle construct.
         let empty = std::collections::HashMap::new();
         let filler: String = (0..HISTORY_PRUNE_THRESHOLD + 50)
             .map(|i| format!("echo {i}")).collect::<Vec<_>>().join("; ");
-        let src = format!("{filler}; echo $( (echo x) )");
+        let src = format!("{filler}; echo $((echo x) )");
         let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
         assert!(parse_sequence(&mut lx).unwrap().is_some());
     }
@@ -7565,5 +7570,36 @@ mod tests {
             _ => None,
         }).collect();
         assert!(text.contains("BODYLINE"), "heredoc body lost across prune: {text:?}");
+    }
+
+    #[test]
+    fn prune_across_outstanding_arith_mark_does_not_corrupt() {
+        // Nested `$(( $({ <>THRESHOLD statements> }) x)`: the inner compound body
+        // crosses the history-prune threshold while the arith `$((` mark is still
+        // outstanding. The single, unmatched trailing `)` (no second `)` follows —
+        // not even EOF supplies one) makes the arith bail -> rewind(&mark). Before
+        // the mode-depth guard this panicked (rewind target beyond history: the
+        // mark's stale absolute `pos` outran the post-drain, pos-reset history);
+        // with the guard, the top-level-only prune never fires under the live
+        // mark, so `history.len()` at rewind time is still consistent with `pos`.
+        //
+        // After the bail, the parser retries the `$((` opener as `$(` + `(` and
+        // re-drives `parse_command_sub`, which now needs a SECOND closing paren
+        // (for the outer `$(`) that this deliberately-unbalanced source never
+        // supplies — so the fixed parse legitimately errors with
+        // `UnterminatedSubshell` (determined by running the fixed build) rather
+        // than panicking. That is the outcome under test, not a vacuous pass.
+        let empty = std::collections::HashMap::new();
+        let prefix: String = (0..2000).map(|i| format!("w{i} ")).collect();
+        let inner: String = std::iter::repeat(":; ")
+            .take(HISTORY_PRUNE_THRESHOLD + 200)
+            .collect();
+        let src = format!("echo {prefix}$(( $({{ {inner} echo HI; }}) x)");
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        let result = parse_sequence(&mut lx);
+        assert!(
+            matches!(result, Err(ParseError::UnterminatedSubshell)),
+            "expected Err(UnterminatedSubshell), got {result:?}"
+        );
     }
 }
