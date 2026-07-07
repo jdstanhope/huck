@@ -51,6 +51,11 @@ impl std::error::Error for LexError {}
 /// token while consuming zero input chars before `LexError::NoProgress`.
 const SCAN_STALL_CAP: u32 = 1024;
 
+/// History prune threshold: prune the consumed prefix once `pos` reaches this
+/// many tokens, bounding the buffer to ~one command's worth (the "at most ~1000
+/// tokens" target). Not a hard cap — a single giant command still buffers O(command).
+pub(crate) const HISTORY_PRUNE_THRESHOLD: usize = 1024;
+
 /// A char cursor over a `&str` that also tracks the byte offset and 1-based
 /// line number of the next char to be produced. Drop-in for the
 /// `Peekable<Chars>` the lexer used: implements `Iterator<Item = char>`, a
@@ -1178,6 +1183,29 @@ impl<'a> Lexer<'a> {
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
         );
+    }
+
+    /// Drop the consumed prefix `history[0..pos]` and reset `pos` to 0, bounding
+    /// the buffer to the live (unconsumed) tail. Acts only once `pos` crosses
+    /// `HISTORY_PRUNE_THRESHOLD`, to avoid churn.
+    ///
+    /// PRECONDITION (guaranteed at every call site): no `Mark` is outstanding — a
+    /// Mark stores an absolute `pos` this would invalidate. The parser only marks
+    /// inside the arith disambiguation (`parse_arith_expansion`/`parse_arith_command`),
+    /// and that mark is resolved before control returns to a command/unit boundary.
+    /// No-op for a replay lexer, and skipped while any heredoc body is pending
+    /// (`pending_heredocs` stores history `token_idx`; a mid-collection body must
+    /// not have its prefix shifted).
+    pub(crate) fn maybe_prune_history(&mut self) {
+        if self.replay
+            || self.pos < HISTORY_PRUNE_THRESHOLD
+            || !self.pending_heredocs.is_empty()
+            || !self.atom_pending_heredocs.is_empty()
+        {
+            return;
+        }
+        self.history.drain(0..self.pos);
+        self.pos = 0;
     }
 
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
@@ -7297,6 +7325,33 @@ mod array_parse_tests {
         aliases.insert("x".to_string(), format!("echo {body}"));
         let mut lx = Lexer::new_live_atoms("x", &aliases, LexerOptions::default());
         assert!(crate::parser::parse_sequence(&mut lx).is_ok());
+    }
+
+    #[test]
+    fn maybe_prune_history_drops_consumed_prefix() {
+        let empty = std::collections::HashMap::new();
+        let src = "a ".repeat(HISTORY_PRUNE_THRESHOLD + 50); // many simple words + blanks
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        for _ in 0..(HISTORY_PRUNE_THRESHOLD + 1) { let _ = lx.next().unwrap(); }
+        assert!(lx.pos >= HISTORY_PRUNE_THRESHOLD);
+        let frontier = lx.peek_kind().unwrap().cloned(); // fill + capture next token
+        lx.maybe_prune_history();
+        assert_eq!(lx.pos, 0, "pos reset to 0");
+        assert!(lx.scanned_token_count() <= 8, "consumed prefix drained");
+        assert_eq!(lx.peek_kind().unwrap().cloned(), frontier, "frontier token preserved");
+    }
+
+    #[test]
+    fn maybe_prune_history_noop_below_threshold() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("echo a b c", &empty, LexerOptions::default());
+        let _ = lx.next().unwrap();
+        let _ = lx.next().unwrap();
+        let pos = lx.pos;
+        let len = lx.scanned_token_count();
+        lx.maybe_prune_history(); // pos < threshold → no-op
+        assert_eq!(lx.pos, pos);
+        assert_eq!(lx.scanned_token_count(), len);
     }
 }
 
