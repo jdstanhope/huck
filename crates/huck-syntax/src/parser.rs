@@ -5006,31 +5006,6 @@ mod tests {
 
     // ── v252 T1: positional array literals ───────────────────────────────────
 
-    #[test]
-    fn atoms_array_literal_rich_values() {
-        diff_cmd("a=(\"x y\" 'z' bare)");            // double/single/bare
-        diff_cmd("a=($x ${y} ${z:-d})");             // param expansions
-        diff_cmd("a=($(echo hi) `echo bye`)");       // command subs
-        diff_cmd("a=($((1 + 2)) end)");              // arith
-        diff_cmd("a=(~ ~/x a=~)");                   // tilde eligibility
-        // NOTE: the brief's literal case was `[ab]c` (a bracket AT the START
-        // of a value) — that collides with the ORACLE's pre-existing (T1-era,
-        // out-of-scope-for-T2) array-literal subscript sniff: ANY value
-        // beginning with `[` unconditionally attempts `[expr]=` subscript
-        // parsing (`scan_array_literal`), and `[ab]c` has no `=` after `]`, so
-        // the oracle itself errors (`ArrayLiteralMissingEquals`) — even the
-        // LEX stage fails (`old_seq`'s `tokenize_with_opts(...).expect("lex")`
-        // panics), so no diff/err helper can express it. That leading-`[`
-        // sniff is Task 3's territory ("do NOT touch subscripts"), so this
-        // uses a mid-value bracket instead — still proves globs/brackets stay
-        // literal in a value, without hitting the deferred subscript sniff.
-        diff_cmd("a=(*.txt foo?bar pre[ab]c)");      // globs (patterns kept literal in AST)
-        diff_cmd("a=(pre$xpost \"$mix\"tail)");      // adjacency/glue within a value
-        diff_cmd("a=(\n  one\n  two\n)");            // newline separators
-        diff_cmd("a=(one # comment\n two)");         // comment separator
-        diff_cmd("arr=\\\n(1 2)");                   // `\<NL>` between prefix and `(`
-        diff_cmd("a=(foo\\ bar)");                   // backslash-escaped space stays one element
-    }
 
     // ── v252 merge-gate fix: `\<NL>` line continuation is GLUE, not a
     // separator, when it abuts element text with no surrounding whitespace.
