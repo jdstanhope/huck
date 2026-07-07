@@ -366,7 +366,7 @@ impl<'a> ExecBuilder<'a> {
 
             // 2. Compose stdin -> cwd -> restricted+run via nested matches.
             let code = match stdin {
-                Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, || {
+                Some(bytes) => crate::stdin_pipe::with_stdin_fd0(&bytes, &cell, || {
                     run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err)
                 }),
                 None => run_cwd_then_inner(&cell, cwd.as_deref(), restricted, &src, out, err),

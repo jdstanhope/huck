@@ -13,7 +13,10 @@
 - **Commit trailer** on every commit: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - **Tests (memory-constrained box):** run per-crate single-threaded, never `--workspace`: `( ulimit -v 2500000; cargo test -p <crate> --jobs 1 --lib -- --test-threads 1 )`. Integration tests: `( ulimit -v 2500000; cargo test -p huck-engine --jobs 1 --test <name> -- --test-threads 1 )`. Build the binary with `cargo build -p huck` (huck-cli does NOT build it). Guard bash-diff harnesses with `ulimit -v 1500000` + `timeout` per harness.
 - **The prologue matrix is the spec** — `docs/superpowers/specs/2026-07-07-unified-error-emitter-design.md` §3. `-c:` appears **iff** (syntax error **and** `-c` mode); runtime errors never get `-c:`; pre-shell CLI = basename + no line.
-- **The conversion transform is mechanical and output-preserving:** `with_err(|err| e!(err, "huck: REST"))` → `sh_error!(shell, None, "REST")`. Strip only the literal `"huck: "`; everything after it (including any `cd:`/`<builtin>:` segment) stays verbatim in the body. Interactive output is unchanged (`error_prefix` returns `"huck: "` interactively); non-interactive output gains the bash `<name>: line N:` prologue. Do NOT reflow the body or hoist a `cmd` segment into the `Some(..)` arg — `None` + full body is byte-identical and keeps the transform judgment-free.
+- **The conversion transform (HYBRID — updated after the T3 route_err_to_out finding):** strip only the literal `"huck: "`; everything after it (including any `cd:`/`<builtin>:` segment) stays verbatim in the body — do NOT reflow or hoist a `cmd` segment into the `Some(..)` arg (`None` + full body is byte-identical). Then pick the variant by **whether a writer is in scope**:
+  - **Writer in hand (the builtin path):** if an `out`/`err` writer descending from `run_builtin(program, args, out, err, shell)` is reachable, use `sh_error_to!(shell, err, None, "REST")`. This is the redirect-aware channel; it is MANDATORY for builtins because the bare-builtin `2>&1`/`>&2` in-memory swap (`route_err_to_out`) lives only in that writer, not in the thread-local. A converted `e!(err, "huck: REST")` → `sh_error_to!(shell, err, None, "REST")`.
+  - **No writer (deep helpers / non-builtin executor paths):** use the thread-local `sh_error!(shell, None, "REST")`.
+  Interactive output is unchanged (`error_prefix` returns `"huck: "` interactively); non-interactive gains the bash `<name>: line N:` prologue. Regression gate for the builtin path: `x=$(<builtin that errors> 2>&1); [ -n "$x" ]` must capture the diagnostic (matches bash).
 - **No message-body changes.** Only the prologue and emission path change.
 - **GPL:** never copy bash test-suite bytes into committed files; per-category `.diff` inspection stays local.
 
@@ -215,7 +218,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `crates/huck-engine/src/executor.rs`, `crates/huck-engine/src/cwd_scope.rs`
 
-- [ ] **Step 1: Convert `executor.rs` sites** per the transform rule (`sh_error!(shell, None, "REST")`; the executor has `shell` in scope at emission sites).
+- [ ] **Step 1: Convert `executor.rs` sites** — nearly all are local redirect-aware `{ let mut err = err_writer(err_sink, sink); e!(&mut *err, "huck: REST") }`. KEEP the `err_writer` local writer and emit via `sh_error_to!(shell, &mut *err, None, "REST")` (NOT thread-local `sh_error!` — that misroutes under inner `2>&1`). Use `sh_error!` only where a site genuinely has NO local `err_sink`/`sink`/writer.
 - [ ] **Step 2: Convert `cwd_scope.rs:29`** `eprintln!("huck: cwd: {}: {}", …)` → `sh_error!(shell, None, "cwd: {}: {}", …)` (routes through the sink — a `2>&1` correctness fix). Confirm a `&Shell` is reachable here; if not, thread one in (flag if a signature change is required).
 - [ ] **Step 3: Fix any pinned-prefix test breakage** (as Task 3 Step 2).
 - [ ] **Step 4: Run the lib suite** (`huck-engine`, per Global Constraints) → PASS.

@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 /// Run `f` with the process cwd set to `path`. On return (or panic), restore
 /// the prior cwd and the shell's `PWD` / `OLDPWD` variables.
 ///
-/// On chdir failure prints `huck: cwd: <path>: <err>` to real fd 2 and runs
-/// `f` anyway with the embedder's original cwd (best-effort, matches the
-/// `with_stdin_fd0` posture in v205).
+/// On chdir failure emits `cwd: <path>: <err>` via `sh_error!` (the current
+/// error sink, honoring `2>&1`/capture) and runs `f` anyway with the
+/// embedder's original cwd (best-effort, matches the `with_stdin_fd0`
+/// posture in v205).
 ///
 /// The closure takes no arguments — it's expected to re-borrow whatever
 /// shared state it needs through normal channels (e.g. `Rc<RefCell<Shell>>`).
@@ -26,7 +27,7 @@ pub fn with_cwd<R>(path: &Path, shell: &mut Shell, f: impl FnOnce() -> R) -> R {
     let saved_oldpwd = shell.lookup_var("OLDPWD");
 
     if let Err(e) = std::env::set_current_dir(path) {
-        eprintln!("huck: cwd: {}: {}", path.display(), crate::bash_io_error(&e));
+        crate::sh_error!(shell, None, "cwd: {}: {}", path.display(), crate::bash_io_error(&e));
         return f();
     }
 

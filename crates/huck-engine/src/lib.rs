@@ -6,7 +6,7 @@
 
 #[macro_use]
 mod macros;
-pub(crate) use macros::bash_io_error;
+pub use macros::bash_io_error;
 
 pub mod arith;
 pub(crate) mod array_transforms;
@@ -19,6 +19,7 @@ pub mod continuation;
 pub(crate) mod cwd_scope;
 pub mod engine;
 pub mod err_thread_local;
+pub mod error_emit;
 pub mod exec_builder;
 pub mod executor;
 pub mod expand;
@@ -46,6 +47,7 @@ pub mod test_support;
 
 pub use completion::{Candidate, CandidateKind};
 pub use engine::{Completion, Engine, EngineBuilder, Output};
+pub use error_emit::{emit_cli_error, emit_error, emit_error_to, emit_syntax_error, Diag};
 pub use exec_builder::ExecBuilder;
 pub use executor::{StderrSink, StdoutSink};
 

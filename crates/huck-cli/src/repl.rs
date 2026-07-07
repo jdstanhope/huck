@@ -17,6 +17,7 @@ use huck_engine::shell::{
     install_sigint_handler, maybe_source_rc_file, parse_cli, process_line, RunMode,
 };
 use huck_engine::shell_state::Shell;
+use huck_engine::{emit_cli_error, emit_error, emit_syntax_error};
 
 use crate::completion_helper::HuckHelper;
 use crate::readline_apply::{function_to_cmd, parse_keyseq};
@@ -33,18 +34,35 @@ enum ReadResult {
     Interrupted,
     /// Ctrl-D at an empty first-line prompt — exit the shell cleanly.
     Eof,
-    /// EOF while a partial command was pending — a truncated command.
-    EofMidCommand,
+    /// EOF while a partial command was pending — a truncated command. Carries
+    /// the accumulated buffer so the caller can derive a `line N:` (bash
+    /// counts the line the next, never-arriving, line would have been).
+    EofMidCommand(String),
     /// A rustyline read error — exit the shell.
     ReadError(String),
 }
 
+/// The invocation basename bash uses for pre-shell (no-`Shell`-yet)
+/// diagnostics: `get_name_for_error`'s basename form, not the raw path.
+/// `argv[0]` here is the REAL process argv[0] (unlike `args`, which is
+/// `argv[1..]` — see `src/main.rs`), with a `"huck"` fallback.
+fn cli_prog_name() -> String {
+    std::env::args()
+        .next()
+        .as_deref()
+        .and_then(|a0| std::path::Path::new(a0).file_name())
+        .and_then(|f| f.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "huck".to_string())
+}
+
 /// Runs the interactive shell loop. Returns the process exit code.
 pub fn run(args: &[String], version: &str) -> i32 {
+    let prog = cli_prog_name();
     let opts = match parse_cli(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("huck: {e}");
+            emit_cli_error(&prog, format_args!("{e}"));
             return 2;
         }
     };
@@ -55,7 +73,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
         return 0;
     }
 
-    install_job_control_signals();
+    install_job_control_signals(&prog);
 
     let shell_cell = Rc::new(RefCell::new(Shell::new()));
 
@@ -66,8 +84,8 @@ pub fn run(args: &[String], version: &str) -> i32 {
 
     {
         let shell = shell_cell.borrow();
-        install_sigint_handler(Arc::clone(&shell.sigint_flag));
-        install_sigchld_handler(Arc::clone(&shell.sigchld_flag));
+        install_sigint_handler(Arc::clone(&shell.sigint_flag), &shell);
+        install_sigchld_handler(Arc::clone(&shell.sigchld_flag), &shell);
     }
 
     // `-n`: parse-only (noexec). Honored only in non-interactive modes; the
@@ -95,6 +113,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 engine.set_arg0(&a0);
             }
             engine.set_args(args);
+            engine.set_is_command_string(true);
             return engine.run(&command);
         }
         RunMode::File { path, args } => {
@@ -104,9 +123,9 @@ pub fn run(args: &[String], version: &str) -> i32 {
                     let (msg, code) = if e.kind() == std::io::ErrorKind::NotFound {
                         ("No such file or directory".to_string(), 127)
                     } else {
-                        (e.to_string(), 126)
+                        (huck_engine::bash_io_error(&e), 126)
                     };
-                    eprintln!("huck: {}: {msg}", path.display());
+                    emit_cli_error(&prog, format_args!("{}: {msg}", path.display()));
                     return code;
                 }
             };
@@ -126,14 +145,17 @@ pub fn run(args: &[String], version: &str) -> i32 {
     let mut editor: Editor<HuckHelper, FileHistory> = match Editor::with_config(config) {
         Ok(editor) => editor,
         Err(e) => {
-            eprintln!("huck: failed to initialize line editor: {e}");
+            emit_cli_error(&prog, format_args!("failed to initialize line editor: {e}"));
             return 1;
         }
     };
 
     {
         let mut shell = shell_cell.borrow_mut();
-        Rc::make_mut(&mut shell.history).load();
+        let load_err = Rc::make_mut(&mut shell.history).load();
+        if let Some(msg) = load_err {
+            huck_engine::sh_error!(&shell, None, "{msg}");
+        }
         for (_, command) in shell.history.entries() {
             let _ = editor.add_history_entry(command);
         }
@@ -225,14 +247,18 @@ pub fn run(args: &[String], version: &str) -> i32 {
                 let code = shell.last_status();
                 return shell_exit(&mut shell, code);
             }
-            ReadResult::EofMidCommand => {
-                eprintln!("huck: syntax error: unexpected end of input");
+            ReadResult::EofMidCommand(buffer) => {
+                // bash's line count for an EOF-truncated command is the line
+                // the next (never-arriving) physical line would have been:
+                // 1 (first line) + newlines already read + 1 (the missing one).
+                let line = buffer.matches('\n').count() as u32 + 2;
                 let mut shell = shell_cell.borrow_mut();
+                emit_syntax_error(&shell, line, format_args!("syntax error: unexpected end of input"));
                 return shell_exit(&mut shell, 2);
             }
             ReadResult::ReadError(msg) => {
-                eprintln!("huck: input error: {msg}");
                 let mut shell = shell_cell.borrow_mut();
+                emit_error(&shell, None, format_args!("input error: {msg}"));
                 return shell_exit(&mut shell, 1);
             }
         }
@@ -364,7 +390,7 @@ fn read_logical_command(
                             expanded
                         }
                         Err(e) => {
-                            eprintln!("huck: {e}");
+                            emit_error(&shell, None, format_args!("{e}"));
                             shell.set_last_status(1);
                             return ReadResult::Interrupted;
                         }
@@ -415,7 +441,7 @@ fn read_logical_command(
                 return if buffer.is_empty() {
                     ReadResult::Eof
                 } else {
-                    ReadResult::EofMidCommand
+                    ReadResult::EofMidCommand(buffer)
                 };
             }
             Err(e) => return ReadResult::ReadError(e.to_string()),

@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use crate::err_thread_local::with_err;
-
 pub(crate) const HISTORY_MAX: usize = 1000;
 
 /// A history-expansion failure. The shell prints these and refuses to
@@ -120,13 +118,18 @@ impl History {
 
     /// Reads the histfile into `entries`, keeping the most recent `max`
     /// lines. A missing file loads as empty history. Other I/O errors
-    /// print a warning and leave history empty.
+    /// return a warning-diagnostic BODY (no invocation-name prefix) for the
+    /// caller to emit via `sh_error!` — `History` holds no `&Shell`, and the
+    /// production caller (`repl.rs`) already holds a mutable borrow of the
+    /// enclosing `Shell` (via `Rc::make_mut(&mut shell.history)`) for the
+    /// duration of this call, so emitting from in here would need a second,
+    /// overlapping borrow of that same `Shell`.
     ///
     /// Each line is unescape-decoded: `\\` → `\`, `\n` → newline; any
     /// other `\X` stays as literal `\X` (backward-compat with pre-v24
     /// files that contain raw backslashes).
-    pub fn load(&mut self) {
-        let Some(path) = &self.file else { return };
+    pub fn load(&mut self) -> Option<String> {
+        let Some(path) = &self.file else { return None };
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut lines: Vec<String> =
@@ -138,21 +141,21 @@ impl History {
                 }
                 self.entries = lines;
                 self.base_number = 1;
+                None
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                with_err(|err| e!(err, "huck: warning: could not read history file: {}", crate::bash_io_error(&e)));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(format!("warning: could not read history file: {}", crate::bash_io_error(&e))),
         }
     }
 
     /// Writes the last `file_cap` entries to the histfile, one command per
     /// line, overwriting (all when `None`, empty when `Some(0)`). Embedded
     /// `\` and `\n` are escape-encoded so multi-line entries round-trip
-    /// losslessly. A write error prints a warning; it never aborts the
-    /// shell. (v139)
-    pub fn save_capped(&self, file_cap: Option<usize>) {
-        let Some(path) = &self.file else { return };
+    /// losslessly. A write error never aborts the shell; it returns a
+    /// warning-diagnostic BODY (no invocation-name prefix, see `load` above) for
+    /// the caller to emit via `sh_error!`. (v139)
+    pub fn save_capped(&self, file_cap: Option<usize>) -> Option<String> {
+        let Some(path) = &self.file else { return None };
         let start = match file_cap {
             Some(cap) => self.entries.len().saturating_sub(cap),
             None => 0,
@@ -163,8 +166,9 @@ impl History {
             out.push('\n');
         }
         if let Err(e) = std::fs::write(path, out) {
-            with_err(|err| e!(err, "huck: warning: could not write history file: {}", crate::bash_io_error(&e)));
+            return Some(format!("warning: could not write history file: {}", crate::bash_io_error(&e)));
         }
+        None
     }
 
     /// Test-only helper: write all in-memory entries (capped by the in-memory

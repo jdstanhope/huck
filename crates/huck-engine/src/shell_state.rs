@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crate::completion_spec::{CompletionSpec, CompletionSpecs};
-use crate::err_thread_local::with_err;
 use crate::jobs::JobTable;
 
 /// What kind of call-stack frame this is.
@@ -170,9 +169,10 @@ impl AssignDest {
 
 /// Errors specific to declaration-builtin paths (declare -A on existing
 /// indexed/scalar, etc.) that distinguish themselves from assignment errors.
-/// Callers translate these into a "huck: {cmd}: ..." diagnostic via
-/// [`declare_err_message`] so that `local -A` and `readonly -A` print the
-/// correct command name (not a misleading "declare" prefix).
+/// Callers translate these into a "{cmd}: ..." diagnostic (emitted via
+/// `sh_error!`/`sh_error_to!`) via [`declare_err_message`] so that `local -A`
+/// and `readonly -A` print the correct command name (not a misleading
+/// "declare" prefix).
 #[derive(Debug)]
 pub enum DeclareErr {
     /// `declare -A NAME` where NAME is already an indexed array.
@@ -186,10 +186,10 @@ pub enum DeclareErr {
 pub fn declare_err_message(cmd: &str, name: &str, err: &DeclareErr) -> String {
     match err {
         DeclareErr::IndexedExists => {
-            format!("huck: {cmd}: {name}: cannot convert indexed to associative array")
+            format!("{cmd}: {name}: cannot convert indexed to associative array")
         }
         DeclareErr::ScalarExists => {
-            format!("huck: {cmd}: {name}: cannot convert scalar to associative array")
+            format!("{cmd}: {name}: cannot convert scalar to associative array")
         }
     }
 }
@@ -486,6 +486,13 @@ pub struct Shell {
     /// errors exit the shell or just return to the prompt.
     pub is_interactive: bool,
 
+    /// True when the shell was invoked as `huck -c '<command>'`. Drives the
+    /// `-c:` prologue segment on syntax/parser diagnostics
+    /// (`error_prefix(Diag::Syntax { .. })`) — bash attributes a `-c`-mode
+    /// syntax error to `<name>: -c: line N:` but omits the segment for
+    /// script-file/stdin mode and for runtime errors entirely.
+    pub is_command_string: bool,
+
     /// True when this process is a forked subshell child. A subshell must NOT
     /// perform interactive job-control process-grouping for its inner pipelines
     /// (that deadlocks on a controlling terminal — M-104).
@@ -780,6 +787,7 @@ impl Shell {
             pending_fatal_status: None,
             builtin_usage_error: None,
             is_interactive: std::io::stdin().is_terminal(),
+            is_command_string: false,
             in_subshell: false,
             in_completion: false,
             xtrace_depth: 0,
@@ -884,10 +892,13 @@ impl Shell {
         self.shopt_options.get("extglob").unwrap_or(false)
     }
 
-    /// Bash-compatible error prologue: `<name>: [line N: ][cmd: ]`.
+    /// Bash-compatible error prologue — the complete matrix of
+    /// `docs/superpowers/specs/2026-07-07-unified-error-emitter-design.md` §3.
     /// Mirrors bash `get_name_for_error` + `error_prolog`/`builtin_error_prolog`.
-    /// `cmd` is the command context (`let`, `((`) or `None` for `$(( ))`.
-    pub fn error_prefix(&self, cmd: Option<&str>) -> String {
+    /// Reachable only through the emitter family (`error_emit.rs`) — no other
+    /// call site composes `prefix + tail` by hand.
+    pub(crate) fn error_prefix(&self, kind: crate::error_emit::Diag) -> String {
+        use crate::error_emit::Diag;
         let name = if !self.is_interactive {
             self.get_indexed("BASH_SOURCE")
                 .and_then(|m| m.get(&0))
@@ -898,11 +909,23 @@ impl Shell {
             "huck".to_string()
         };
         let mut out = format!("{name}: ");
-        if !self.is_interactive && self.current_lineno > 0 {
-            out.push_str(&format!("line {}: ", self.current_lineno));
-        }
-        if let Some(c) = cmd {
-            out.push_str(&format!("{c}: "));
+        match kind {
+            Diag::Runtime(cmd) => {
+                if !self.is_interactive && self.current_lineno > 0 {
+                    out.push_str(&format!("line {}: ", self.current_lineno));
+                }
+                if let Some(c) = cmd {
+                    out.push_str(&format!("{c}: "));
+                }
+            }
+            Diag::Syntax { line } => {
+                if !self.is_interactive {
+                    if self.source_depth == 0 && self.is_command_string {
+                        out.push_str("-c: ");
+                    }
+                    out.push_str(&format!("line {line}: "));
+                }
+            }
         }
         out
     }
@@ -1041,8 +1064,8 @@ impl Shell {
     /// User-facing assignments must use `assign()` / `try_set` instead.
     ///
     /// In restricted mode, assignment to SHELL/PATH/ENV/BASH_ENV is refused
-    /// with a diagnostic emitted via `err_thread_local::with_err`; if no
-    /// executor sink is installed (e.g. direct unit tests), the diagnostic
+    /// with a diagnostic emitted via `sh_error!` (the thread-local sink); if
+    /// no executor sink is installed (e.g. direct unit tests), the diagnostic
     /// falls through to `io::stderr()`.
     pub fn set(&mut self, name: &str, value: String) {
         if is_write_protected_var(name) {
@@ -1051,7 +1074,7 @@ impl Shell {
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(name)
         {
-            crate::err_thread_local::with_err(|err| e!(err, "{msg}"));
+            crate::sh_error!(self, None, "{msg}");
             return;
         }
         self.store_scalar(name, value);
@@ -1095,7 +1118,9 @@ impl Shell {
 
     /// Saves history to the histfile, applying the `$HISTFILESIZE` cap. (v139)
     pub fn save_history(&self) {
-        self.history.save_capped(self.resolve_histfilesize());
+        if let Some(msg) = self.history.save_capped(self.resolve_histfilesize()) {
+            crate::sh_error!(self, None, "{msg}");
+        }
     }
 
     /// True if the named variable/parameter is currently **set** (a
@@ -1308,8 +1333,11 @@ impl Shell {
         if self.reseed_special_on_assign(name, &value) { return; }
         match self.vars.get_mut(name) {
             Some(existing) => {
-                install_scalar_value(existing, value);
+                let assoc_mismatch = install_scalar_value(existing, value);
                 existing.exported = true;
+                if assoc_mismatch {
+                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                }
             }
             None => {
                 self.vars.insert(
@@ -1497,7 +1525,11 @@ impl Shell {
             return;
         }
         match self.vars.get_mut(name) {
-            Some(existing) => install_scalar_value(existing, value),
+            Some(existing) => {
+                if install_scalar_value(existing, value) {
+                    crate::sh_error!(self, None, "internal: install_scalar_value on associative array");
+                }
+            }
             None => {
                 self.vars.insert(name.to_string(), Variable::scalar(value));
             }
@@ -1521,7 +1553,7 @@ impl Shell {
                     v.value = VarValue::Indexed(m);
                 }
                 VarValue::Associative(_) => {
-                    with_err(|err| e!(err, "huck: {name}: set_indexed_element on associative variable"));
+                    crate::sh_error!(self, None, "{name}: set_indexed_element on associative variable");
                     return Err(AssignErr::TypeMismatch);
                 }
             },
@@ -1574,7 +1606,7 @@ impl Shell {
             for (idx, val) in entries { m.insert(idx, val); }
             Ok(())
         } else {
-            with_err(|err| e!(err, "huck: {name}: cannot append array literal to associative array"));
+            crate::sh_error!(self, None, "{name}: cannot append array literal to associative array");
             Err(AssignErr::TypeMismatch)
         }
     }
@@ -1592,12 +1624,12 @@ impl Shell {
                     }
                 }
                 _ => {
-                    with_err(|err| e!(err, "huck: {name}: set_associative_element on non-associative variable"));
+                    crate::sh_error!(self, None, "{name}: set_associative_element on non-associative variable");
                     return Err(AssignErr::TypeMismatch);
                 }
             },
             None => {
-                with_err(|err| e!(err, "huck: {name}: set_associative_element on unset variable"));
+                crate::sh_error!(self, None, "{name}: set_associative_element on unset variable");
                 return Err(AssignErr::TypeMismatch);
             }
         }
@@ -1655,7 +1687,7 @@ impl Shell {
         if self.restricted
             && let Err(msg) = crate::restricted::check_special_assign(&name)
         {
-            with_err(|err| e!(err, "{msg}"));
+            crate::sh_error!(self, None, "{msg}");
             return Err(AssignErr::Readonly);
         }
 
@@ -1665,8 +1697,7 @@ impl Shell {
             // bash prefixes the readonly-assignment error with the
             // non-interactive prologue (`<src>: line N:`); interactive keeps
             // `huck:` (error_prefix handles the mode split).
-            let prefix = self.error_prefix(None);
-            with_err(|err| e!(err, "{prefix}{name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
 
@@ -1880,7 +1911,7 @@ impl Shell {
         let mut visited = std::collections::HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
-                with_err(|err| e!(err, "huck: warning: {current}: circular name reference"));
+                crate::sh_error!(self, None, "warning: {current}: circular name reference");
                 return ResolvedName::Cycle;
             }
             match self.vars.get(&current) {
@@ -2270,7 +2301,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            with_err(|err| e!(err, "huck: {name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2351,7 +2382,7 @@ impl Shell {
         if let Some(existing) = self.vars.get(name)
             && existing.readonly
         {
-            with_err(|err| e!(err, "huck: {name}: readonly variable"));
+            crate::sh_error!(self, None, "{name}: readonly variable");
             return Err(AssignErr::Readonly);
         }
         if let Some(v) = self.vars.get_mut(name)
@@ -2521,17 +2552,23 @@ fn quote_keyseq(k: &str) -> String {
 /// `assign()` and the raw `set()`) and `Shell::export_set`, so every
 /// scalar-store path applies the "scalar assignment to an array
 /// overwrites a[0]" rule identically (matches bash).
-fn install_scalar_value(existing: &mut Variable, value: String) {
+///
+/// Returns `true` when the associative-mismatch diagnostic needs emitting.
+/// No `&Shell` is threaded in here: both call sites hold `existing` as a
+/// `&mut` sub-borrow of `self.vars`, so a `&Shell` (whole-`self`) argument
+/// would overlap it — the caller checks the return value and emits AFTER
+/// this call returns (and the sub-borrow has ended).
+fn install_scalar_value(existing: &mut Variable, value: String) -> bool {
     match &mut existing.value {
         VarValue::Indexed(m) => {
             m.insert(0, value);
+            false
         }
         VarValue::Scalar(_) => {
             existing.value = VarValue::Scalar(value);
+            false
         }
-        VarValue::Associative(_) => {
-            with_err(|err| e!(err, "huck: internal: install_scalar_value on associative array"));
-        }
+        VarValue::Associative(_) => true,
     }
 }
 
@@ -3448,15 +3485,15 @@ mod assoc_value_tests {
         use super::declare_err_message;
         assert_eq!(
             declare_err_message("declare", "a", &DeclareErr::IndexedExists),
-            "huck: declare: a: cannot convert indexed to associative array",
+            "declare: a: cannot convert indexed to associative array",
         );
         assert_eq!(
             declare_err_message("local", "s", &DeclareErr::ScalarExists),
-            "huck: local: s: cannot convert scalar to associative array",
+            "local: s: cannot convert scalar to associative array",
         );
         assert_eq!(
             declare_err_message("readonly", "s", &DeclareErr::ScalarExists),
-            "huck: readonly: s: cannot convert scalar to associative array",
+            "readonly: s: cannot convert scalar to associative array",
         );
     }
 
@@ -3580,6 +3617,7 @@ mod ifs_helper_tests {
 #[cfg(test)]
 mod shopt_tests {
     use super::*;
+    use crate::error_emit::Diag;
 
     #[test]
     fn shopt_table_has_57_entries() {
@@ -3965,9 +4003,9 @@ mod shopt_tests {
         sh.is_interactive = false;
         sh.shell_argv0 = "./arith.tests".to_string();
         sh.current_lineno = 168;
-        assert_eq!(sh.error_prefix(None), "./arith.tests: line 168: ");
-        assert_eq!(sh.error_prefix(Some("let")), "./arith.tests: line 168: let: ");
-        assert_eq!(sh.error_prefix(Some("((")), "./arith.tests: line 168: ((: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./arith.tests: line 168: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("let"))), "./arith.tests: line 168: let: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("(("))), "./arith.tests: line 168: ((: ");
     }
 
     #[test]
@@ -3976,8 +4014,8 @@ mod shopt_tests {
         sh.is_interactive = true;
         sh.shell_argv0 = "huck".to_string();
         sh.current_lineno = 5;
-        assert_eq!(sh.error_prefix(None), "huck: ");
-        assert_eq!(sh.error_prefix(Some("((")), "huck: ((: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "huck: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("(("))), "huck: ((: ");
     }
 
     #[test]
@@ -3987,6 +4025,58 @@ mod shopt_tests {
         sh.shell_argv0 = "huck".to_string();
         sh.current_lineno = 3;
         sh.seed_array_for_tests("BASH_SOURCE", &[(0, "./sourced.sh")]);
-        assert_eq!(sh.error_prefix(None), "./sourced.sh: line 3: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "./sourced.sh: line 3: ");
+    }
+
+    #[test]
+    fn error_prefix_runtime_matrix() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "s.sh".into();
+        sh.current_lineno = 5;
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "s.sh: line 5: ");
+        assert_eq!(sh.error_prefix(Diag::Runtime(Some("cd"))), "s.sh: line 5: cd: ");
+        sh.is_interactive = true;
+        assert_eq!(sh.error_prefix(Diag::Runtime(None)), "huck: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_matrix() {
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.shell_argv0 = "s.sh".into();
+        // script mode: no -c:
+        sh.is_command_string = false;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "s.sh: line 2: ");
+        // -c mode: -c: present
+        sh.is_command_string = true;
+        sh.shell_argv0 = "bash5".into();
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 1 }), "bash5: -c: line 1: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_interactive_has_no_c_segment_or_line() {
+        // Interactive syntax errors get plain `huck: ` — no line, no `-c:`,
+        // even if `is_command_string` were somehow left set.
+        let mut sh = Shell::new();
+        sh.is_interactive = true;
+        sh.is_command_string = true;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 9 }), "huck: ");
+    }
+
+    #[test]
+    fn error_prefix_syntax_no_c_segment_when_sourced_under_dash_c() {
+        // `-c:` must not leak into a file sourced under `-c` — bash:
+        // `bash -c 'source /tmp/bad.sh'` → `/tmp/bad.sh: line 2: ...` (no `-c:`).
+        // `is_command_string` stays true for the whole `-c` invocation, so the
+        // gate must additionally require top-level source depth (0).
+        let mut sh = Shell::new();
+        sh.is_interactive = false;
+        sh.is_command_string = true;
+        sh.shell_argv0 = "badfile".into();
+        sh.source_depth = 1;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: line 2: ");
+        sh.source_depth = 0;
+        assert_eq!(sh.error_prefix(Diag::Syntax { line: 2 }), "badfile: -c: line 2: ");
     }
 }

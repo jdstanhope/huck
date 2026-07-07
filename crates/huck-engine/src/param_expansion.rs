@@ -1,6 +1,5 @@
 //! Parameter-expansion modifier evaluation (`${var:-w}`, `${#var}`, etc.).
 
-use crate::err_thread_local::with_err;
 use crate::lexer::{CaseDirection, ParamModifier, SubstAnchor, Word};
 use crate::shell_state::Shell;
 
@@ -147,7 +146,7 @@ pub fn expand_modifier_with_value(
                 if matches!(source, ParamLookup::Scalar)
                     && shell.try_set(name, v.clone()).is_err()
                 {
-                    with_err(|err| e!(err, "huck: {name}: readonly variable"));
+                    crate::sh_error!(shell, None, "{name}: readonly variable");
                     return ExpansionResult::Fatal { status: 1 };
                 }
                 ExpansionResult::Value(v)
@@ -165,9 +164,9 @@ pub fn expand_modifier_with_value(
                     } else {
                         "parameter not set"
                     };
-                    with_err(|err| e!(err, "huck: {}: {}", name, default));
+                    crate::sh_error!(shell, None, "{}: {}", name, default);
                 } else {
-                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
+                    crate::sh_error!(shell, None, "{}: {}", name, msg);
                 }
                 ExpansionResult::Fatal { status: 1 }
             } else {
@@ -224,7 +223,7 @@ pub fn expand_modifier_with_value(
             match substring(&value, off_n, len_n) {
                 Ok(s) => ExpansionResult::Value(s),
                 Err(msg) => {
-                    with_err(|err| e!(err, "huck: {}: {}", name, msg));
+                    crate::sh_error!(shell, None, "{}: {}", name, msg);
                     ExpansionResult::Fatal { status: 1 }
                 }
             }
@@ -327,8 +326,7 @@ pub fn expand_modifier_with_value(
             // error matching bash. Evaluated lazily — only errors when this
             // node is actually expanded (e.g. short-circuited `||` never
             // reaches here).
-            let prefix = shell.error_prefix(None);
-            with_err(|err| e!(err, "{}{}: bad substitution", prefix, raw));
+            crate::sh_error!(shell, None, "{}: bad substitution", raw);
             ExpansionResult::Fatal { status: 1 }
         }
         _ => {
@@ -416,7 +414,7 @@ pub(crate) fn ansi_c_quote(v: &str) -> String {
 
 /// Expands `word` to a string (no field-splitting), parses it as
 /// arithmetic, evaluates it. On any error, prints the bash-format
-/// diagnostic — `error_prefix(None)` prologue followed by
+/// diagnostic — `sh_error!` (runtime prologue) followed by
 /// `render_error_body` (`<expr>: <msg> (error token is "<tok>")`) — and
 /// sets `$? = 1`, returning `Err(())`.
 fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
@@ -424,8 +422,7 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     let expr = match crate::arith::parse(&s) {
         Ok(e) => e,
         Err(e) => {
-            let prefix = shell.error_prefix(None);
-            with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&s, &e)));
+            crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
             shell.set_last_status(1);
             return Err(());
         }
@@ -433,8 +430,7 @@ fn eval_substring_index(word: &Word, shell: &mut Shell) -> Result<i64, ()> {
     match crate::arith::eval(&expr, shell) {
         Ok(n) => Ok(n),
         Err(e) => {
-            let prefix = shell.error_prefix(None);
-            with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&s, &e)));
+            crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&s, &e));
             shell.set_last_status(1);
             Err(())
         }

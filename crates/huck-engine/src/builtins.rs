@@ -109,7 +109,7 @@ pub fn run_builtin(
     match name {
         "cd" => builtin_cd(args, out, err, shell),
         "pwd" => builtin_pwd(args, out, err, shell),
-        "echo" => builtin_echo(args, out, err),
+        "echo" => builtin_echo(args, out, err, shell),
         "exit" => {
             let outcome = builtin_exit(args, err, shell);
             // POSIX case #1: `exit <non-numeric>` is a usage error (the only
@@ -153,7 +153,7 @@ pub fn run_builtin(
         // this (name, args, out, shell) signature can't express. Guard against a
         // future refactor routing it here so it degrades instead of panicking.
         "exec" => {
-            e!(err, "huck: exec: not supported in this context");
+            crate::sh_error_to!(shell, err, None, "exec: not supported in this context");
             ExecOutcome::Continue(1)
         }
         "type" => builtin_type(args, out, err, shell),
@@ -214,20 +214,20 @@ enum LoopArg {
 
 /// Classifies break/continue args per bash 5.2, printing the matching
 /// diagnostic. Caller has already verified loop_depth > 0.
-fn classify_loop_arg(args: &[String], cmd: &str, err: &mut dyn Write) -> LoopArg {
+fn classify_loop_arg(args: &[String], cmd: &str, err: &mut dyn Write, shell: &Shell) -> LoopArg {
     if args.len() > 1 {
-        e!(err, "huck: {cmd}: too many arguments");
+        crate::sh_error_to!(shell, err, None, "{cmd}: too many arguments");
         return LoopArg::BreakAll;
     }
     let Some(arg) = args.first() else { return LoopArg::Level(1) };
     match arg.parse::<i64>() {
         Ok(n) if n >= 1 => LoopArg::Level(n.min(u32::MAX as i64) as u32),
         Ok(_) => {
-            e!(err, "huck: {cmd}: {arg}: loop count out of range");
+            crate::sh_error_to!(shell, err, None, "{cmd}: {arg}: loop count out of range");
             LoopArg::BreakAll
         }
         Err(_) => {
-            e!(err, "huck: {cmd}: {arg}: numeric argument required");
+            crate::sh_error_to!(shell, err, None, "{cmd}: {arg}: numeric argument required");
             LoopArg::Fatal
         }
     }
@@ -235,10 +235,10 @@ fn classify_loop_arg(args: &[String], cmd: &str, err: &mut dyn Write) -> LoopArg
 
 fn builtin_break(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
-        e!(err, "huck: break: only meaningful in a `for', `while', or `until' loop");
+        crate::sh_error_to!(shell, err, None, "break: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    match classify_loop_arg(args, "break", err) {
+    match classify_loop_arg(args, "break", err, shell) {
         LoopArg::Level(n) => ExecOutcome::LoopBreak(n.min(shell.loop_depth), 0),
         LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
         LoopArg::Fatal => ExecOutcome::Exit(128),
@@ -247,10 +247,10 @@ fn builtin_break(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOut
 
 fn builtin_continue(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     if shell.loop_depth == 0 {
-        e!(err, "huck: continue: only meaningful in a `for', `while', or `until' loop");
+        crate::sh_error_to!(shell, err, None, "continue: only meaningful in a `for', `while', or `until' loop");
         return ExecOutcome::Continue(0);
     }
-    match classify_loop_arg(args, "continue", err) {
+    match classify_loop_arg(args, "continue", err, shell) {
         LoopArg::Level(n) => ExecOutcome::LoopContinue(n.min(shell.loop_depth)),
         // out-of-range/too-many continue breaks all loops, like bash
         LoopArg::BreakAll => ExecOutcome::LoopBreak(shell.loop_depth, 1),
@@ -366,10 +366,20 @@ fn normalize_logical(path: &str) -> String {
 }
 
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    builtin_cd_as("cd", args, out, err, shell)
+}
+
+/// The `cd` implementation, parameterized on the reporting name. `pushd`/
+/// `popd` delegate their actual directory-change step here (bash's own
+/// `pushd`/`popd` are NOT thin `cd` wrappers — they have entirely separate
+/// option grammars for `-n`/`+N`/`-N` — but the successful-parse chdir
+/// failure path (`<dir>: No such file or directory`, etc.) is the same
+/// underlying operation bash reports under the CALLER's name, not `cd:`).
+fn builtin_cd_as(caller: &str, args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_cd()
     {
-        e!(err, "{msg}");
+        crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
     // 1. Parse leading -L/-P flags (last wins) and `--`. `-` is NOT a flag (it
@@ -383,8 +393,8 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
             "--" => { idx += 1; break; }
             "-" => break, // OLDPWD shortcut, handled as the target below
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: cd: {s}: invalid option");
-                e!(err, "huck: cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                crate::sh_error_to!(shell, err, None, "cd: {s}: invalid option");
+                e!(err, "cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
                 return ExecOutcome::Continue(2);
             }
             _ => break, // a target
@@ -392,7 +402,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     }
     let rest = &args[idx..];
     if rest.len() > 1 {
-        e!(err, "huck: cd: too many arguments");
+        crate::sh_error_to!(shell, err, None, "cd: too many arguments");
         return ExecOutcome::Continue(1);
     }
 
@@ -404,12 +414,12 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     let target = match rest.first() {
         Some(dir) if dir == "-" => match shell.get("OLDPWD") {
             Some(oldpwd) if !oldpwd.is_empty() => { print_new_pwd = true; oldpwd.to_string() }
-            _ => { e!(err, "huck: cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
+            _ => { crate::sh_error_to!(shell, err, None, "cd: OLDPWD not set"); return ExecOutcome::Continue(1); }
         },
         Some(dir) => dir.clone(),
         None => match shell.get("HOME") {
             Some(home) => home.to_string(),
-            None => { e!(err, "huck: cd: HOME not set"); return ExecOutcome::Continue(1); }
+            None => { crate::sh_error_to!(shell, err, None, "cd: HOME not set"); return ExecOutcome::Continue(1); }
         },
     };
 
@@ -418,14 +428,13 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
-            let prefix = shell.error_prefix(Some("cd"));
-            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, Some(caller), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
             Ok(p) => p.to_string_lossy().into_owned(),
             Err(e) => {
-                e!(err, "huck: cd: warning: could not read current dir: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "cd: warning: could not read current dir: {}", crate::bash_io_error(&e));
                 prev_pwd.clone().unwrap_or_default()
             }
         }
@@ -442,8 +451,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
         };
         let normalized = normalize_logical(&curpath);
         if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            let prefix = shell.error_prefix(Some("cd"));
-            e!(err, "{prefix}{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, Some(caller), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         normalized
@@ -459,8 +467,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     if print_new_pwd
         && let Err(e) = writeln!(out, "{new_pwd}")
     {
-        let prefix = shell.error_prefix(Some("cd"));
-        e!(err, "{prefix}{}", crate::bash_io_error(&e));
+        crate::sh_error_to!(shell, err, Some(caller), "{}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -476,8 +483,8 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
             "-P" => physical_flag = Some(true),
             "--" => break,
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: pwd: {s}: invalid option");
-                e!(err, "huck: pwd: usage: pwd [-LP]");
+                crate::sh_error_to!(shell, err, None, "pwd: {s}: invalid option");
+                e!(err, "pwd: usage: pwd [-LP]");
                 return ExecOutcome::Continue(2);
             }
             _ => {} // ignore non-flag args
@@ -518,13 +525,13 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
     };
 
     if let Err(e) = writeln!(out, "{path}") {
-        e!(err, "huck: pwd: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(shell, err, None, "pwd: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
 }
 
-fn builtin_echo(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExecOutcome {
+fn builtin_echo(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     let (mut suppress_newline, process_escapes, consumed) = parse_echo_flags(args);
     let joined = args[consumed..].join(" ");
     let bytes = if process_escapes {
@@ -538,13 +545,13 @@ fn builtin_echo(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Ex
     };
 
     if let Err(e) = out.write_all(&bytes) {
-        e!(err, "huck: echo: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     if !suppress_newline
         && let Err(e) = out.write_all(b"\n")
     {
-        e!(err, "huck: echo: {}", crate::bash_io_error(&e));
+        crate::sh_error_to!(shell, err, None, "echo: {}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -638,7 +645,7 @@ fn builtin_exit(args: &[String], err: &mut dyn Write, shell: &Shell) -> ExecOutc
         Some(code_str) => match code_str.parse::<i32>() {
             Ok(code) => ExecOutcome::Exit(code.rem_euclid(256)),
             Err(_) => {
-                e!(err, "huck: exit: {code_str}: numeric argument required");
+                crate::sh_error_to!(shell, err, None, "exit: {code_str}: numeric argument required");
                 ExecOutcome::Continue(2)
             }
         },
@@ -680,7 +687,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 break;
             }
             s if s.len() > 1 && s.starts_with('-') => {
-                e!(err, "huck: unset: {s}: invalid option");
+                crate::sh_error_to!(shell, err, None, "unset: {s}: invalid option");
                 // POSIX case #1: bad option is a usage error (the "cannot unset
                 // readonly" path below is runtime and stays unmarked).
                 shell.builtin_usage_error = Some(2);
@@ -698,7 +705,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
             // absent function name is success (no error), matching bash. No
             // readonly/array-subscript handling applies here.
             if !is_valid_name(arg) {
-                e!(err, "huck: unset: '{arg}': not a valid identifier");
+                crate::sh_error_to!(shell, err, None, "unset: '{arg}': not a valid identifier");
                 any_error = true;
                 continue;
             }
@@ -713,12 +720,12 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                 continue;
             }
             if !is_valid_name(arg) {
-                e!(err, "huck: unset: '{arg}': not a valid identifier");
+                crate::sh_error_to!(shell, err, None, "unset: '{arg}': not a valid identifier");
                 any_error = true;
                 continue;
             }
             if shell.is_readonly(arg) {
-                e!(err, "huck: unset: {arg}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "unset: {arg}: readonly variable");
                 any_error = true;
                 continue;
             }
@@ -769,7 +776,7 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
                             }
                         }
                         Err(e) => {
-                            e!(err, "huck: unset: {e}");
+                            crate::sh_error_to!(shell, err, None, "unset: {e}");
                             any_error = true;
                         }
                     }
@@ -778,18 +785,18 @@ fn builtin_unset(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
             }
             Ok(None) => {}
             Err(e) => {
-                e!(err, "huck: unset: {e}");
+                crate::sh_error_to!(shell, err, None, "unset: {e}");
                 any_error = true;
                 continue;
             }
         }
         if !is_valid_name(effective_arg) {
-            e!(err, "huck: unset: '{effective_arg}': not a valid identifier");
+            crate::sh_error_to!(shell, err, None, "unset: '{effective_arg}': not a valid identifier");
             any_error = true;
             continue;
         }
         if shell.is_readonly(effective_arg) {
-            e!(err, "huck: unset: {effective_arg}: readonly variable");
+            crate::sh_error_to!(shell, err, None, "unset: {effective_arg}: readonly variable");
             any_error = true;
             continue;
         }
@@ -995,7 +1002,7 @@ fn list_exported(out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> Exe
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, var) in entries {
         if let Err(e) = writeln!(out, "{}", format_declare_line(name, var)) {
-            e!(err, "huck: export: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, None, "export: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
     }
@@ -1009,7 +1016,7 @@ fn list_exported_functions(out: &mut dyn Write, err: &mut dyn Write, shell: &She
             && (writeln!(out, "{}", crate::generate::function_to_source(&name, body)).is_err()
                 || writeln!(out, "declare -fx {name}").is_err())
         {
-            e!(err, "huck: export: write error");
+            crate::sh_error_to!(shell, err, None, "export: write error");
             return ExecOutcome::Continue(1);
         }
     }
@@ -1195,7 +1202,7 @@ fn builtin_export_decl(
                             'n' => unexport = true,
                             'f' => func = true,
                             _ => {
-                                e!(err, "huck: export: -{c}: invalid option");
+                                crate::sh_error_to!(shell, err, None, "export: -{c}: invalid option");
                                 e!(err,
                                     "export: usage: export [-fn] [name[=value] ...] or export -p"
                                 );
@@ -1245,7 +1252,7 @@ fn builtin_export_decl(
             } else if shell.functions.contains_key(name) {
                 shell.mark_function_exported(name);
             } else {
-                e!(err, "huck: export: {name}: not a function");
+                crate::sh_error_to!(shell, err, None, "export: {name}: not a function");
                 any_error = true;
             }
             continue;
@@ -1256,12 +1263,12 @@ fn builtin_export_decl(
                     let name = &s[..eq];
                     let value = &s[eq + 1..];
                     if !is_valid_name(name) {
-                        e!(err, "huck: export: '{s}': not a valid identifier");
+                        crate::sh_error_to!(shell, err, None, "export: '{s}': not a valid identifier");
                         any_error = true;
                         continue;
                     }
                     if shell.is_readonly(name) {
-                        e!(err, "huck: export: {name}: readonly variable");
+                        crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
                         any_error = true;
                         continue;
                     }
@@ -1274,7 +1281,7 @@ fn builtin_export_decl(
                 }
                 None => {
                     if !is_valid_name(s) {
-                        e!(err, "huck: export: '{s}': not a valid identifier");
+                        crate::sh_error_to!(shell, err, None, "export: '{s}': not a valid identifier");
                         any_error = true;
                         continue;
                     }
@@ -1287,13 +1294,13 @@ fn builtin_export_decl(
             },
             DeclArg::Assign(a) => {
                 if assign_value_is_array(a) {
-                    e!(err, "huck: export: cannot export arrays");
+                    crate::sh_error_to!(shell, err, None, "export: cannot export arrays");
                     any_error = true;
                     continue;
                 }
                 if matches!(&a.target, crate::command::AssignTarget::Indexed { .. }) {
                     let name = a.target.name();
-                    e!(err, "huck: export: `{name}': not a valid identifier");
+                    crate::sh_error_to!(shell, err, None, "export: `{name}': not a valid identifier");
                     // POSIX case #1: an invalid-identifier ASSIGNMENT (`AA[4]=1`)
                     // is a bad-assignment usage error → exit status 1. A bad name
                     // WITHOUT `=` (the Plain branches above) stays unmarked.
@@ -1303,7 +1310,7 @@ fn builtin_export_decl(
                 }
                 let name = a.target.name().to_string();
                 if shell.is_readonly(&name) {
-                    e!(err, "huck: export: {name}: readonly variable");
+                    crate::sh_error_to!(shell, err, None, "export: {name}: readonly variable");
                     any_error = true;
                     continue;
                 }
@@ -1332,7 +1339,7 @@ fn builtin_export_decl(
 /// function return.
 fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if shell.local_scopes.is_empty() {
-        e!(err, "huck: local: can only be used in a function");
+        crate::sh_error_to!(shell, err, None, "local: can only be used in a function");
         return ExecOutcome::Continue(1);
     }
     let mut want_array = false;
@@ -1364,7 +1371,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                 b'u' => saw_minus_u = true,
                 b'n' => saw_minus_n = true,
                 other => {
-                    e!(err, "huck: local: -{}: invalid option", other as char);
+                    crate::sh_error_to!(shell, err, None, "local: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -1372,7 +1379,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
         idx += 1;
     }
     if want_array && want_associative {
-        e!(err, "huck: local: cannot specify both -a and -A");
+        crate::sh_error_to!(shell, err, None, "local: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
     }
 
@@ -1397,12 +1404,12 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                 // as an invalid identifier.
                 let name = s.as_str();
                 if !is_valid_name(name) {
-                    e!(err, "huck: local: `{s}': not a valid identifier");
+                    crate::sh_error_to!(shell, err, None, "local: `{s}': not a valid identifier");
                     exit = 1;
                     continue;
                 }
                 if shell.is_readonly(name) {
-                    e!(err, "huck: local: {name}: readonly variable");
+                    crate::sh_error_to!(shell, err, None, "local: {name}: readonly variable");
                     exit = 1;
                     continue;
                 }
@@ -1445,7 +1452,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     if shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        e!(err,
+                        crate::sh_error_to!(shell, err, None,
                             "{}",
                             crate::shell_state::declare_err_message("local", name, &e)
                         );
@@ -1499,14 +1506,13 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
             DeclArg::Assign(a) => {
                 let name = a.target.name().to_string();
                 if !is_valid_name(&name) {
-                    e!(err,
-                        "huck: local: `{name}': not a valid identifier"
+                    crate::sh_error_to!(shell, err, None, "local: `{name}': not a valid identifier"
                     );
                     exit = 1;
                     continue;
                 }
                 if shell.is_readonly(&name) {
-                    e!(err, "huck: local: {name}: readonly variable");
+                    crate::sh_error_to!(shell, err, None, "local: {name}: readonly variable");
                     exit = 1;
                     continue;
                 }
@@ -1517,8 +1523,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     // Expand the RHS word to obtain the target name string.
                     let target = crate::expand::expand_assignment(&a.value, shell);
                     if target == name {
-                        e!(err,
-                            "huck: local: {name}: nameref variable self references not allowed"
+                        crate::sh_error_to!(shell, err, None, "local: {name}: nameref variable self references not allowed"
                         );
                         exit = 1;
                         continue;
@@ -1526,8 +1531,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     let valid = is_valid_name(&target)
                         || matches!(parse_subscripted_arg(&target), Ok(Some((b, _))) if is_valid_name(b));
                     if !valid {
-                        e!(err,
-                            "huck: local: `{target}': invalid variable name for name reference"
+                        crate::sh_error_to!(shell, err, None, "local: `{target}': invalid variable name for name reference"
                         );
                         exit = 1;
                         continue;
@@ -1551,7 +1555,7 @@ fn builtin_local_decl(args: &[DeclArg], err: &mut dyn Write, shell: &mut Shell) 
                     && shell.get_associative(&name).is_none()
                     && let Err(e) = shell.declare_associative(&name)
                 {
-                    e!(err,
+                    crate::sh_error_to!(shell, err, None,
                         "{}",
                         crate::shell_state::declare_err_message("local", &name, &e)
                     );
@@ -1612,7 +1616,7 @@ fn builtin_readonly_decl(
                 break;
             }
             o if o.starts_with('-') && o.len() > 1 => {
-                e!(err, "huck: readonly: {o}: invalid option");
+                crate::sh_error_to!(shell, err, None, "readonly: {o}: invalid option");
                 // POSIX case #1: bad option is a usage error.
                 shell.builtin_usage_error = Some(2);
                 return ExecOutcome::Continue(2);
@@ -1637,7 +1641,7 @@ fn builtin_readonly_decl(
                 }
             };
             if let Err(e) = writeln!(out, "{line}") {
-                e!(err, "huck: readonly: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "readonly: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -1650,8 +1654,7 @@ fn builtin_readonly_decl(
             DeclArg::Plain(s) => {
                 let name = s.as_str();
                 if !is_valid_name(name) {
-                    e!(err,
-                        "huck: readonly: `{s}': not a valid identifier"
+                    crate::sh_error_to!(shell, err, None, "readonly: `{s}': not a valid identifier"
                     );
                     exit = 1;
                     continue;
@@ -1662,7 +1665,7 @@ fn builtin_readonly_decl(
                     && shell.get_associative(name).is_none()
                     && let Err(e) = shell.declare_associative(name)
                 {
-                    e!(err,
+                    crate::sh_error_to!(shell, err, None,
                         "{}",
                         crate::shell_state::declare_err_message("readonly", name, &e)
                     );
@@ -1674,8 +1677,7 @@ fn builtin_readonly_decl(
             DeclArg::Assign(a) => match &a.target {
                 crate::command::AssignTarget::Bare(name) => {
                     if shell.is_readonly(name) {
-                        e!(err,
-                            "huck: readonly: {name}: readonly variable"
+                        crate::sh_error_to!(shell, err, None, "readonly: {name}: readonly variable"
                         );
                         exit = 1;
                         continue;
@@ -1687,7 +1689,7 @@ fn builtin_readonly_decl(
                         && shell.get_associative(name).is_none()
                         && let Err(e) = shell.declare_associative(name)
                     {
-                        e!(err,
+                        crate::sh_error_to!(shell, err, None,
                             "{}",
                             crate::shell_state::declare_err_message("readonly", name, &e)
                         );
@@ -1701,8 +1703,7 @@ fn builtin_readonly_decl(
                     shell.mark_readonly(name);
                 }
                 crate::command::AssignTarget::Indexed { name, .. } => {
-                    e!(err,
-                        "huck: readonly: `{name}': cannot make subscripted-assignment target readonly"
+                    crate::sh_error_to!(shell, err, None, "readonly: `{name}': cannot make subscripted-assignment target readonly"
                     );
                     // POSIX case #1: invalid-identifier ASSIGNMENT (`AA[4]=1`) →
                     // bad-assignment usage error, exit status 1. A bad name without
@@ -1759,8 +1760,7 @@ fn builtin_declare_decl(
             match c {
                 b'r' if minus => want_readonly = true,
                 b'r' if plus => {
-                    e!(err,
-                        "huck: declare: +r: readonly attribute cannot be removed"
+                    crate::sh_error_to!(shell, err, None, "declare: +r: readonly attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -1770,8 +1770,7 @@ fn builtin_declare_decl(
                 b'i' if plus => want_remove_integer = true,
                 b'a' if minus => want_array = true,
                 b'a' if plus => {
-                    e!(err,
-                        "huck: declare: +a: array attribute cannot be removed"
+                    crate::sh_error_to!(shell, err, None, "declare: +a: array attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -1782,8 +1781,7 @@ fn builtin_declare_decl(
                     // removed once set). We mirror `+a`'s conservative
                     // rejection for now; revisit if real scripts need
                     // silent-ignore behavior.
-                    e!(err,
-                        "huck: declare: +A: associative attribute cannot be removed"
+                    crate::sh_error_to!(shell, err, None, "declare: +A: associative attribute cannot be removed"
                     );
                     return ExecOutcome::Continue(1);
                 }
@@ -1802,8 +1800,7 @@ fn builtin_declare_decl(
                 b'g' if minus => global = true,
                 other => {
                     let sign = if plus { '+' } else { '-' };
-                    e!(err,
-                        "huck: declare: {sign}{}: invalid option",
+                    crate::sh_error_to!(shell, err, None, "declare: {sign}{}: invalid option",
                         other as char
                     );
                     return ExecOutcome::Continue(2);
@@ -1828,7 +1825,7 @@ fn builtin_declare_decl(
 
     // Reject the combinations we haven't implemented yet.
     if want_array && want_associative {
-        e!(err, "huck: declare: cannot specify both -a and -A");
+        crate::sh_error_to!(shell, err, None, "declare: cannot specify both -a and -A");
         return ExecOutcome::Continue(1);
     }
 
@@ -1920,7 +1917,7 @@ fn builtin_declare_decl(
             DeclArg::Assign(a) => (a.target.name(), Some(a)),
         };
         if !is_valid_name(name) {
-            e!(err, "huck: declare: `{name}': not a valid identifier");
+            crate::sh_error_to!(shell, err, None, "declare: `{name}': not a valid identifier");
             exit = 1;
             continue;
         }
@@ -1931,7 +1928,16 @@ fn builtin_declare_decl(
                     let _ = writeln!(out, "{}", format_declare_line(name, &var));
                 }
                 None => {
-                    e!(err, "huck: declare: {name}: not found");
+                    // v269 T3b: now uses sh_error_to! (writer-based emitter),
+                    // which writes directly to the `err` writer this arm
+                    // already holds — the same writer the executor's
+                    // in-memory route_err_to_out/route_out_to_err builtin
+                    // redirect fixup (bare-builtin `2>&1`/`>&2` under a
+                    // Capture sink) swaps, so the diagnostic lands in the
+                    // redirect target regardless of the ambient thread-local
+                    // sink. (The prior `sh_error!` conversion broke this by
+                    // going through the thread-local sink instead.)
+                    crate::sh_error_to!(shell, err, None, "declare: {name}: not found");
                     exit = 1;
                 }
             }
@@ -1950,7 +1956,7 @@ fn builtin_declare_decl(
 
         // Integer-attribute changes on readonly variable are rejected.
         if (want_integer || want_remove_integer) && shell.is_readonly(name) {
-            e!(err, "huck: declare: {name}: readonly variable");
+            crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
             exit = 1;
             continue;
         }
@@ -1978,7 +1984,7 @@ fn builtin_declare_decl(
                 empty.insert(0, scalar.to_string());
             }
             if shell.replace_indexed(name, empty).is_err() {
-                e!(err, "huck: declare: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -1992,7 +1998,7 @@ fn builtin_declare_decl(
             && shell.get_associative(name).is_none()
             && let Err(e) = shell.declare_associative(name)
         {
-            e!(err,
+            crate::sh_error_to!(shell, err, None,
                 "{}",
                 crate::shell_state::declare_err_message("declare", name, &e)
             );
@@ -2034,8 +2040,7 @@ fn builtin_declare_decl(
             if let Some(ref target) = target_opt {
                 // Direct self-reference is a hard error.
                 if target == name {
-                    e!(err,
-                        "huck: declare: {name}: nameref variable self references not allowed"
+                    crate::sh_error_to!(shell, err, None, "declare: {name}: nameref variable self references not allowed"
                     );
                     exit = 1;
                     continue;
@@ -2044,8 +2049,7 @@ fn builtin_declare_decl(
                 let valid = is_valid_name(target)
                     || matches!(parse_subscripted_arg(target), Ok(Some((b, _))) if is_valid_name(b));
                 if !valid {
-                    e!(err,
-                        "huck: declare: `{target}': invalid variable name for name reference"
+                    crate::sh_error_to!(shell, err, None, "declare: `{target}': invalid variable name for name reference"
                     );
                     exit = 1;
                     continue;
@@ -2094,12 +2098,12 @@ fn builtin_declare_decl(
             // readonly. Other =VALUE assignments rely on
             // apply_one_assignment's internal readonly check.
             if want_readonly && shell.is_readonly(name) {
-                e!(err, "huck: declare: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "declare: {name}: readonly variable");
                 exit = 1;
                 continue;
             }
             if shell.is_readonly(name) {
-                e!(err, "huck: {name}: readonly variable");
+                crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                 exit = 1;
                 continue;
             }
@@ -2451,13 +2455,14 @@ fn take_opt_value(
     cmd: &str,
     opt: char,
     err: &mut dyn Write,
+    shell: &Shell,
 ) -> Result<String, i32> {
     if j + 1 < bytes.len() {
         Ok(String::from_utf8_lossy(&bytes[j + 1..]).into_owned())
     } else {
         *i += 1;
         if *i >= args.len() {
-            e!(err, "huck: {cmd}: -{opt}: option requires an argument");
+            crate::sh_error_to!(shell, err, None, "{cmd}: -{opt}: option requires an argument");
             return Err(2);
         }
         Ok(args[*i].clone())
@@ -2477,13 +2482,13 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     let mut i = 0;
 
     // Parse a numeric option value (rest-of-arg or next arg).
-    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char, err: &mut dyn Write) -> Result<usize, ()> {
+    fn num_val(args: &[String], i: &mut usize, j: usize, bytes: &[u8], opt: char, err: &mut dyn Write, shell: &Shell) -> Result<usize, ()> {
         let s = if j + 1 < bytes.len() {
             String::from_utf8_lossy(&bytes[j + 1..]).into_owned()
         } else {
             *i += 1;
             if *i >= args.len() {
-                e!(err, "huck: mapfile: -{opt}: option requires an argument");
+                crate::sh_error_to!(shell, err, None, "mapfile: -{opt}: option requires an argument");
                 return Err(());
             }
             args[*i].clone()
@@ -2491,7 +2496,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
         match s.trim().parse::<usize>() {
             Ok(n) => Ok(n),
             Err(_) => {
-                e!(err, "huck: mapfile: {s}: invalid number");
+                crate::sh_error_to!(shell, err, None, "mapfile: {s}: invalid number");
                 Err(())
             }
         }
@@ -2513,27 +2518,27 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             match bytes[j] {
                 b't' => strip_t = true,
                 b'd' => {
-                    let s = match take_opt_value(args, &mut i, bytes, j, "mapfile", 'd', err) {
+                    let s = match take_opt_value(args, &mut i, bytes, j, "mapfile", 'd', err, shell) {
                         Ok(v) => v,
                         Err(rc) => return ExecOutcome::Continue(rc),
                     };
                     delim = s.bytes().next().unwrap_or(0u8); // empty -> NUL
                     consumed_rest = true;
                 }
-                b'n' => match num_val(args, &mut i, j, bytes, 'n', err) {
+                b'n' => match num_val(args, &mut i, j, bytes, 'n', err, shell) {
                     Ok(n) => { count = n; consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
-                b's' => match num_val(args, &mut i, j, bytes, 's', err) {
+                b's' => match num_val(args, &mut i, j, bytes, 's', err, shell) {
                     Ok(n) => { skip = n; consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
-                b'O' => match num_val(args, &mut i, j, bytes, 'O', err) {
+                b'O' => match num_val(args, &mut i, j, bytes, 'O', err, shell) {
                     Ok(n) => { origin = Some(n); consumed_rest = true; }
                     Err(()) => return ExecOutcome::Continue(2),
                 },
                 c => {
-                    e!(err, "huck: mapfile: -{}: invalid option", c as char);
+                    crate::sh_error_to!(shell, err, None, "mapfile: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -2547,7 +2552,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
 
     let array_name = args.get(i).cloned().unwrap_or_else(|| "MAPFILE".to_string());
     if !is_valid_name(&array_name) {
-        e!(err, "huck: mapfile: `{array_name}': not a valid array name");
+        crate::sh_error_to!(shell, err, None, "mapfile: `{array_name}': not a valid array name");
         return ExecOutcome::Continue(1);
     }
 
@@ -2558,7 +2563,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(e) => {
-                e!(err, "huck: mapfile: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "mapfile: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2579,7 +2584,7 @@ fn builtin_mapfile(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
             }
             Ok(None) => break,
             Err(e) => {
-                e!(err, "huck: mapfile: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, None, "mapfile: {}", crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2649,7 +2654,7 @@ fn builtin_read(
                     } else {
                         i += 1;
                         if i >= args.len() {
-                            e!(err, "huck: read: -p: option requires an argument");
+                            crate::sh_error_to!(shell, err, None, "read: -p: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         prompt = Some(args[i].clone());
@@ -2657,7 +2662,7 @@ fn builtin_read(
                     break;
                 }
                 b'd' => {
-                    let d_val = match take_opt_value(args, &mut i, bytes, j, "read", 'd', err) {
+                    let d_val = match take_opt_value(args, &mut i, bytes, j, "read", 'd', err, shell) {
                         Ok(v) => v,
                         Err(rc) => return ExecOutcome::Continue(rc),
                     };
@@ -2666,7 +2671,7 @@ fn builtin_read(
                     break;
                 }
                 b'a' => {
-                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'a', err) {
+                    let v = match take_opt_value(args, &mut i, bytes, j, "read", 'a', err, shell) {
                         Ok(v) => v,
                         Err(rc) => return ExecOutcome::Continue(rc),
                     };
@@ -2674,7 +2679,7 @@ fn builtin_read(
                     break;
                 }
                 c => {
-                    e!(err, "huck: read: -{}: invalid option", c as char);
+                    crate::sh_error_to!(shell, err, None, "read: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -2687,14 +2692,14 @@ fn builtin_read(
     // Validate names BEFORE reading (POSIX ordering).
     for name in &names {
         if !is_valid_name(name) {
-            e!(err, "huck: read: `{name}': not a valid identifier");
+            crate::sh_error_to!(shell, err, None, "read: `{name}': not a valid identifier");
             return ExecOutcome::Continue(1);
         }
     }
     if let Some(arr) = &array_name
         && !is_valid_name(arr)
     {
-        e!(err, "huck: read: `{arr}': not a valid identifier");
+        crate::sh_error_to!(shell, err, None, "read: `{arr}': not a valid identifier");
         return ExecOutcome::Continue(1);
     }
 
@@ -2726,7 +2731,7 @@ fn builtin_read(
     let line_opt = match read_one_line(&mut handle, raw, delim) {
         Ok(opt) => opt,
         Err(e) => {
-            e!(err, "huck: read: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, None, "read: {}", crate::bash_io_error(&e));
             #[cfg(unix)]
             if let Some(s) = saved_term {
                 unsafe {
@@ -2781,7 +2786,7 @@ fn builtin_read(
     let mut exit = 0;
     for (name, value) in assignments {
         if shell.try_set(&name, value).is_err() {
-            e!(err, "huck: read: {name}: readonly variable");
+            crate::sh_error_to!(shell, err, None, "read: {name}: readonly variable");
             exit = 1;
         }
     }
@@ -3414,7 +3419,7 @@ fn builtin_printf(
             "-v" => {
                 i += 1;
                 if i >= args.len() {
-                    e!(err, "huck: printf: -v: option requires an argument");
+                    crate::sh_error_to!(shell, err, None, "printf: -v: option requires an argument");
                     return ExecOutcome::Continue(2);
                 }
                 let target = &args[i];
@@ -3423,7 +3428,7 @@ fn builtin_printf(
                         .map(|(name, sub)| is_valid_name(&name) && !sub.is_empty())
                         .unwrap_or(false);
                 if !valid {
-                    e!(err, "huck: printf: `{target}': not a valid identifier");
+                    crate::sh_error_to!(shell, err, None, "printf: `{target}': not a valid identifier");
                     return ExecOutcome::Continue(1);
                 }
                 v_var = Some(target.clone());
@@ -3436,7 +3441,7 @@ fn builtin_printf(
             s if s.starts_with('-') && s.len() > 1 && s != "-" => {
                 // Bash's printf rejects unknown flags but accepts a
                 // lone "-" as a format. We do the same.
-                e!(err, "huck: printf: {s}: invalid option");
+                crate::sh_error_to!(shell, err, None, "printf: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -3444,7 +3449,7 @@ fn builtin_printf(
     }
 
     if i >= args.len() {
-        e!(err, "huck: printf: usage: printf [-v var] format [arguments]");
+        e!(err, "printf: usage: printf [-v var] format [arguments]");
         return ExecOutcome::Continue(2);
     }
 
@@ -3454,7 +3459,7 @@ fn builtin_printf(
     let parts = match parse_format(&format) {
         Ok(p) => p,
         Err(e) => {
-            e!(err, "huck: printf: {e}");
+            crate::sh_error_to!(shell, err, None, "printf: {e}");
             return ExecOutcome::Continue(1);
         }
     };
@@ -3499,7 +3504,7 @@ fn builtin_printf(
                     if spec.width_star {
                         let (n, perr) = parse_printf_int(next_arg(&mut arg_idx));
                         if let Some(msg) = perr {
-                            e!(err, "huck: printf: {msg}");
+                            crate::sh_error_to!(shell, err, None, "printf: {msg}");
                             exit = 1;
                         }
                         if n < 0 {
@@ -3512,7 +3517,7 @@ fn builtin_printf(
                     if spec.prec_star {
                         let (n, perr) = parse_printf_int(next_arg(&mut arg_idx));
                         if let Some(msg) = perr {
-                            e!(err, "huck: printf: {msg}");
+                            crate::sh_error_to!(shell, err, None, "printf: {msg}");
                             exit = 1;
                         }
                         spec.precision = if n < 0 { None } else { Some(n as usize) };
@@ -3522,7 +3527,7 @@ fn builtin_printf(
                         Ok(true) => {}
                         Ok(false) => halted = true,
                         Err(msg) => {
-                            e!(err, "huck: printf: {msg}");
+                            crate::sh_error_to!(shell, err, None, "printf: {msg}");
                             exit = 1;
                         }
                     }
@@ -3567,11 +3572,11 @@ fn builtin_printf(
                 return ExecOutcome::Continue(1);
             }
         } else if shell.try_set(&var, s).is_err() {
-            e!(err, "huck: printf: {var}: readonly variable");
+            crate::sh_error_to!(shell, err, None, "printf: {var}: readonly variable");
             return ExecOutcome::Continue(1);
         }
     } else if let Err(e) = out.write_all(&buf) {
-        e!(err, "huck: printf: {e}");
+        crate::sh_error_to!(shell, err, None, "printf: {e}");
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(exit)
@@ -3616,8 +3621,8 @@ fn parse_jobs_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
                     'r' => only_running = true,
                     's' => only_stopped = true,
                     _ => {
-                        e!(err, "huck: jobs: -{c}: invalid option");
-                        e!(err, "huck: jobs: usage: jobs [-lpnrs] [%spec ...]");
+                        crate::sh_error_to!(shell, err, None, "jobs: -{c}: invalid option");
+                        e!(err, "jobs: usage: jobs [-lpnrs] [%spec ...]");
                         return Err(ExecOutcome::Continue(2));
                     }
                 }
@@ -3631,7 +3636,7 @@ fn parse_jobs_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
     let mut targets = Vec::new();
     for arg in &args[idx..] {
         if !arg.starts_with('%') {
-            e!(err, "huck: jobs: {arg}: no such job");
+            crate::sh_error_to!(shell, err, None, "jobs: {arg}: no such job");
             return Err(ExecOutcome::Continue(1));
         }
         let id = resolve_spec_or_error(arg, "jobs", err, shell)?;
@@ -3698,7 +3703,7 @@ fn builtin_jobs(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             writeln!(out, "{}", crate::jobs::notification_line(job, flag))
         };
         if let Err(e) = write_result {
-            e!(err, "huck: jobs: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, None, "jobs: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         printed_ids.push(job.id);
@@ -3740,7 +3745,7 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
             }
             "-p" => {
                 if idx + 1 >= args.len() {
-                    e!(err, "huck: wait: -p: option requires a variable name");
+                    crate::sh_error_to!(shell, err, None, "wait: -p: option requires a variable name");
                     return Err(ExecOutcome::Continue(2));
                 }
                 pid_var = Some(args[idx + 1].clone());
@@ -3751,8 +3756,8 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
                 break;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: wait: {s}: invalid option");
-                e!(err, "huck: wait: usage: wait [-n] [-p var] [id ...]");
+                crate::sh_error_to!(shell, err, None, "wait: {s}: invalid option");
+                e!(err, "wait: usage: wait [-n] [-p var] [id ...]");
                 return Err(ExecOutcome::Continue(2));
             }
             _ => break,
@@ -3760,7 +3765,7 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
     }
 
     if pid_var.is_some() && !wait_any {
-        e!(err, "huck: wait: -p: option requires -n");
+        crate::sh_error_to!(shell, err, None, "wait: -p: option requires -n");
         return Err(ExecOutcome::Continue(2));
     }
 
@@ -3774,7 +3779,7 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
             match arg.parse::<i32>() {
                 Ok(pid) if pid > 0 => targets.push(WaitTarget::Pid(pid)),
                 _ => {
-                    e!(err, "huck: wait: {arg}: not a pid or valid job spec");
+                    crate::sh_error_to!(shell, err, None, "wait: {arg}: not a pid or valid job spec");
                     return Err(ExecOutcome::Continue(2));
                 }
             }
@@ -3885,7 +3890,7 @@ fn wait_for_pid(pid: i32, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome
             // surface as "not a child." On a subsequent call, treat as a
             // race we can't recover from.
             if first {
-                e!(err, "huck: wait: pid {pid} is not a child of this shell");
+                crate::sh_error_to!(shell, err, None, "wait: pid {pid} is not a child of this shell");
                 return ExecOutcome::Continue(127);
             }
             return ExecOutcome::Continue(1);
@@ -4111,7 +4116,7 @@ fn print_sig_listing(out: &mut dyn Write, table: &[(&str, i32)]) {
     }
 }
 
-fn handle_kill_l(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> ExecOutcome {
+fn handle_kill_l(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &Shell) -> ExecOutcome {
     if args.is_empty() {
         print_killable_table(out);
         return ExecOutcome::Continue(0);
@@ -4128,7 +4133,7 @@ fn handle_kill_l(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> E
                     let _ = writeln!(out, "{name}");
                 }
                 None => {
-                    e!(err, "huck: kill: {arg}: invalid signal specification");
+                    crate::sh_error_to!(shell, err, None, "kill: {arg}: invalid signal specification");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -4143,7 +4148,7 @@ fn handle_kill_l(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> E
                     let _ = writeln!(out, "{num}");
                 }
                 None => {
-                    e!(err, "huck: kill: {arg}: invalid signal specification");
+                    crate::sh_error_to!(shell, err, None, "kill: {arg}: invalid signal specification");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -4176,17 +4181,17 @@ fn resolve_spec_or_error(
     shell: &Shell,
 ) -> Result<u32, ExecOutcome> {
     let spec = crate::job_spec::parse_job_spec(arg).map_err(|_| {
-        e!(err, "huck: {builtin}: {arg}: bad job spec");
+        crate::sh_error_to!(shell, err, None, "{builtin}: {arg}: bad job spec");
         ExecOutcome::Continue(1)
     })?;
     match shell.jobs.resolve(&spec) {
         Ok(id) => Ok(id),
         Err(crate::jobs::JobSpecResolveError::NotFound) => {
-            e!(err, "huck: {builtin}: {arg}: no such job");
+            crate::sh_error_to!(shell, err, None, "{builtin}: {arg}: no such job");
             Err(ExecOutcome::Continue(1))
         }
         Err(crate::jobs::JobSpecResolveError::Ambiguous) => {
-            e!(err, "huck: {builtin}: {arg}: ambiguous job spec");
+            crate::sh_error_to!(shell, err, None, "{builtin}: {arg}: ambiguous job spec");
             Err(ExecOutcome::Continue(1))
         }
     }
@@ -4194,7 +4199,7 @@ fn resolve_spec_or_error(
 
 fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if matches!(args.first().map(|s| s.as_str()), Some("-l")) {
-        return handle_kill_l(&args[1..], out, err);
+        return handle_kill_l(&args[1..], out, err, shell);
     }
     match args.first().map(|s| s.as_str()) {
         Some("-s") => return kill_with_s_flag(&args[1..], err, shell),
@@ -4207,19 +4212,19 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             let sig = match rest.parse::<i32>() {
                 Ok(n) if (0..=64).contains(&n) => n,
                 Ok(_) => {
-                    e!(err, "huck: kill: {rest}: invalid signal number");
+                    crate::sh_error_to!(shell, err, None, "kill: {rest}: invalid signal number");
                     return ExecOutcome::Continue(1);
                 }
                 Err(_) => match signal_by_name(rest) {
                     Some(n) => n,
                     None => {
-                        e!(err, "huck: kill: {rest}: invalid signal");
+                        crate::sh_error_to!(shell, err, None, "kill: {rest}: invalid signal");
                         return ExecOutcome::Continue(1);
                     }
                 },
             };
             if args.len() < 2 {
-                e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+                e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
                 return ExecOutcome::Continue(2);
             }
             (sig, &args[1..])
@@ -4227,7 +4232,7 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             (libc::SIGTERM, args)
         }
     } else {
-        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     };
 
@@ -4240,20 +4245,20 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     let name = match args.first() {
         Some(n) => n,
         None => {
-            e!(err, "huck: kill: -s: option requires an argument");
+            crate::sh_error_to!(shell, err, None, "kill: -s: option requires an argument");
             return ExecOutcome::Continue(2);
         }
     };
     let sig = match signal_by_name(name) {
         Some(n) => n,
         None => {
-            e!(err, "huck: kill: {name}: invalid signal specification");
+            crate::sh_error_to!(shell, err, None, "kill: {name}: invalid signal specification");
             return ExecOutcome::Continue(1);
         }
     };
     let targets = &args[1..];
     if targets.is_empty() {
-        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
     send_signal_to_targets(sig, targets, err, shell)
@@ -4266,14 +4271,14 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     let num_arg = match args.first() {
         Some(s) => s,
         None => {
-            e!(err, "huck: kill: -n: option requires an argument");
+            crate::sh_error_to!(shell, err, None, "kill: -n: option requires an argument");
             return ExecOutcome::Continue(2);
         }
     };
     let n = match num_arg.parse::<i32>() {
         Ok(n) if (1..=64).contains(&n) => n,
         _ => {
-            e!(err, "huck: kill: {num_arg}: invalid signal specification");
+            crate::sh_error_to!(shell, err, None, "kill: {num_arg}: invalid signal specification");
             return ExecOutcome::Continue(1);
         }
     };
@@ -4281,12 +4286,12 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
         .iter()
         .any(|(_, num)| *num == n)
     {
-        e!(err, "huck: kill: {num_arg}: invalid signal specification");
+        crate::sh_error_to!(shell, err, None, "kill: {num_arg}: invalid signal specification");
         return ExecOutcome::Continue(1);
     }
     let targets = &args[1..];
     if targets.is_empty() {
-        e!(err, "huck: kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
     send_signal_to_targets(n, targets, err, shell)
@@ -4314,7 +4319,7 @@ fn send_signal_to_targets(
             let (own_pgroup, pgid, pids) = match shell.jobs.iter().find(|j| j.id == id) {
                 Some(j) => (j.own_pgroup, j.pgid, j.pids.clone()),
                 None => {
-                    e!(err, "huck: kill: {target}: no such job");
+                    crate::sh_error_to!(shell, err, None, "kill: {target}: no such job");
                     any_failed = true;
                     continue;
                 }
@@ -4335,7 +4340,7 @@ fn send_signal_to_targets(
             };
             if rc != 0 {
                 let errno = std::io::Error::last_os_error();
-                e!(err, "huck: kill: ({target}) - {errno}");
+                crate::sh_error_to!(shell, err, None, "kill: ({target}) - {errno}");
                 any_failed = true;
             }
         } else {
@@ -4344,12 +4349,12 @@ fn send_signal_to_targets(
                     let rc = unsafe { libc::kill(pid, sig) };
                     if rc != 0 {
                         let errno = std::io::Error::last_os_error();
-                        e!(err, "huck: kill: ({pid}) - {errno}");
+                        crate::sh_error_to!(shell, err, None, "kill: ({pid}) - {errno}");
                         any_failed = true;
                     }
                 }
                 _ => {
-                    e!(err, "huck: kill: {target}: arguments must be process or job IDs");
+                    crate::sh_error_to!(shell, err, None, "kill: {target}: arguments must be process or job IDs");
                     any_failed = true;
                 }
             }
@@ -4383,8 +4388,8 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                     'r' => running_only = true,
                     'h' => mark_nohup = true,
                     _ => {
-                        e!(err, "huck: disown: -{c}: invalid option");
-                        e!(err, "huck: disown: usage: disown [-ahr] [%job ...]");
+                        crate::sh_error_to!(shell, err, None, "disown: -{c}: invalid option");
+                        e!(err, "disown: usage: disown [-ahr] [%job ...]");
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -4413,13 +4418,13 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                         match shell.jobs.iter().find(|j| j.pids.contains(&pid)) {
                             Some(job) => ids.push(job.id),
                             None => {
-                                e!(err, "huck: disown: {arg}: no such job");
+                                crate::sh_error_to!(shell, err, None, "disown: {arg}: no such job");
                                 return ExecOutcome::Continue(1);
                             }
                         }
                     }
                     _ => {
-                        e!(err, "huck: disown: {arg}: not a valid job spec");
+                        crate::sh_error_to!(shell, err, None, "disown: {arg}: not a valid job spec");
                         return ExecOutcome::Continue(1);
                     }
                 }
@@ -4433,7 +4438,7 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
         match shell.jobs.current_id() {
             Some(id) => vec![id],
             None => {
-                e!(err, "huck: disown: no current job");
+                crate::sh_error_to!(shell, err, None, "disown: no current job");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4469,7 +4474,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
         0 => match shell.jobs.current_id() {
             Some(id) => id,
             None => {
-                e!(err, "huck: fg: no current job");
+                crate::sh_error_to!(shell, err, None, "fg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -4478,7 +4483,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             Err(outcome) => return outcome,
         },
         _ => {
-            e!(err, "huck: fg: usage: fg [%job]");
+            e!(err, "fg: usage: fg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4488,7 +4493,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             job.notified = true;
             (job.pgid, job.pids.clone(), job.command.clone())
         } else {
-            e!(err, "huck: fg: no current job");
+            crate::sh_error_to!(shell, err, None, "fg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
@@ -4558,7 +4563,7 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Writ
         0 => match shell.jobs.current_stopped_id() {
             Some(id) => id,
             None => {
-                e!(err, "huck: bg: no current job");
+                crate::sh_error_to!(shell, err, None, "bg: no current job");
                 return ExecOutcome::Continue(1);
             }
         },
@@ -4573,13 +4578,13 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Writ
                 .map(|j| matches!(j.state, crate::jobs::JobState::Stopped(_)))
                 .unwrap_or(false);
             if !is_stopped {
-                e!(err, "huck: bg: job %{id} already running");
+                crate::sh_error_to!(shell, err, None, "bg: job %{id} already running");
                 return ExecOutcome::Continue(1);
             }
             id
         }
         _ => {
-            e!(err, "huck: bg: usage: bg [%job]");
+            e!(err, "bg: usage: bg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4589,7 +4594,7 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Writ
             job.notified = true;
             (job.pgid, job.command.clone())
         } else {
-            e!(err, "huck: bg: no current job");
+            crate::sh_error_to!(shell, err, None, "bg: no current job");
             return ExecOutcome::Continue(1);
         }
     };
@@ -4620,7 +4625,7 @@ fn builtin_history(
             ExecOutcome::Continue(0)
         }
         Some(other) => {
-            e!(err, "huck: history: {other}: invalid option");
+            crate::sh_error_to!(shell, err, None, "history: {other}: invalid option");
             ExecOutcome::Continue(1)
         }
     }
@@ -4638,7 +4643,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
     // -l: list signal name/number pairs.
     if args[0] == "-l" {
         if args.len() != 1 {
-            e!(err, "huck: trap: -l takes no arguments");
+            crate::sh_error_to!(shell, err, None, "trap: -l takes no arguments");
             return ExecOutcome::Continue(1);
         }
         print_signal_table(out);
@@ -4656,7 +4661,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             match parse_trap_signal(name) {
                 Ok(sig) => filter.push(sig),
                 Err(msg) => {
-                    e!(err, "huck: trap: {msg}");
+                    crate::sh_error_to!(shell, err, None, "trap: {msg}");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -4668,19 +4673,19 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
     // `trap - SIGNAL...`: reset each signal.
     if args[0] == "-" {
         if args.len() < 2 {
-            e!(err, "huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+            e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
             return ExecOutcome::Continue(1);
         }
         for name in &args[1..] {
             let sig = match parse_trap_signal(name) {
                 Ok(s) => s,
                 Err(msg) => {
-                    e!(err, "huck: trap: {msg}");
+                    crate::sh_error_to!(shell, err, None, "trap: {msg}");
                     return ExecOutcome::Continue(1);
                 }
             };
             if let Err(msg) = reset(shell, sig) {
-                e!(err, "huck: trap: {msg}");
+                crate::sh_error_to!(shell, err, None, "trap: {msg}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -4689,7 +4694,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
 
     // `trap ACTION SIGNAL...`: install action for each signal.
     if args.len() < 2 {
-        e!(err, "huck: trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
         return ExecOutcome::Continue(1);
     }
     let action_text = args[0].clone();
@@ -4702,12 +4707,12 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
         let sig = match parse_trap_signal(name) {
             Ok(s) => s,
             Err(msg) => {
-                e!(err, "huck: trap: {msg}");
+                crate::sh_error_to!(shell, err, None, "trap: {msg}");
                 return ExecOutcome::Continue(1);
             }
         };
         if let Err(msg) = install(shell, sig, action.clone()) {
-            e!(err, "huck: trap: {msg}");
+            crate::sh_error_to!(shell, err, None, "trap: {msg}");
             return ExecOutcome::Continue(1);
         }
     }
@@ -4930,7 +4935,7 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     if let Some(first) = args.first() {
         if first.starts_with('-') && first != "-" && first != "--" {
             let c = first.chars().nth(1).unwrap();
-            e!(err, "{}-{c}: invalid option", shell.error_prefix(Some("getopts")));
+            crate::sh_error_to!(shell, err, Some("getopts"), "-{c}: invalid option");
             e!(err, "{USAGE}");
             return ExecOutcome::Continue(2);
         }
@@ -4985,7 +4990,7 @@ fn builtin_getopts(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     // invalid optstring option AND an invalid name var together print only the
     // identifier error (bash prints both — an untested edge, accepted by spec).
     if !is_valid_name(&name) {
-        e!(err, "{}`{name}': not a valid identifier", shell.error_prefix(Some("getopts")));
+        crate::sh_error_to!(shell, err, Some("getopts"), "`{name}': not a valid identifier");
         return ExecOutcome::Continue(1);
     }
 
@@ -5013,13 +5018,13 @@ fn builtin_shift(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Exe
         Some(s) => match s.trim().parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
-                e!(err, "huck: shift: {s}: numeric argument required");
+                crate::sh_error_to!(shell, err, None, "shift: {s}: numeric argument required");
                 return ExecOutcome::Continue(1);
             }
         },
     };
     if n < 0 {
-        e!(err, "huck: shift: {n}: shift count out of range");
+        crate::sh_error_to!(shell, err, None, "shift: {n}: shift count out of range");
         return ExecOutcome::Continue(1);
     }
     // A count larger than $# is a SILENT failure in bash (rc 1, no message);
@@ -5175,7 +5180,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
         && args.iter().any(|a| a == "+r")
         && let Err(msg) = crate::restricted::check_set_plus_r()
     {
-        e!(err, "{msg}");
+        crate::sh_error_to!(shell, err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
     if args.is_empty() {
@@ -5210,11 +5215,11 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             match option_set(shell, &args[i], true) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    e!(err, "huck: set: {}: not yet supported in this version", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
                     return ExecOutcome::Continue(2);
                 }
                 Err(OptSetErr::Unknown) => {
-                    e!(err, "huck: set: -o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5230,11 +5235,11 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
             match option_set(shell, &args[i], false) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    e!(err, "huck: set: {}: not yet supported in this version", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version", args[i]);
                     return ExecOutcome::Continue(2);
                 }
                 Err(OptSetErr::Unknown) => {
-                    e!(err, "huck: set: +o: invalid option name: {}", args[i]);
+                    crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}", args[i]);
                     shell.builtin_usage_error = Some(2);
                     return ExecOutcome::Continue(2);
                 }
@@ -5263,15 +5268,13 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         match option_set(shell, &args[i], true) {
                             Ok(()) => {}
                             Err(OptSetErr::Unimplemented) => {
-                                e!(err,
-                                    "huck: set: {}: not yet supported in this version",
+                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
                                     args[i]
                                 );
                                 return ExecOutcome::Continue(2);
                             }
                             Err(OptSetErr::Unknown) => {
-                                e!(err,
-                                    "huck: set: -o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: -o: invalid option name: {}",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5280,8 +5283,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                     }
                     other => {
-                        e!(err,
-                            "huck: set: -{}: not yet supported in this version",
+                        crate::sh_error_to!(shell, err, None, "set: -{}: not yet supported in this version",
                             other as char
                         );
                         return ExecOutcome::Continue(2);
@@ -5309,15 +5311,13 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         match option_set(shell, &args[i], false) {
                             Ok(()) => {}
                             Err(OptSetErr::Unimplemented) => {
-                                e!(err,
-                                    "huck: set: {}: not yet supported in this version",
+                                crate::sh_error_to!(shell, err, None, "set: {}: not yet supported in this version",
                                     args[i]
                                 );
                                 return ExecOutcome::Continue(2);
                             }
                             Err(OptSetErr::Unknown) => {
-                                e!(err,
-                                    "huck: set: +o: invalid option name: {}",
+                                crate::sh_error_to!(shell, err, None, "set: +o: invalid option name: {}",
                                     args[i]
                                 );
                                 shell.builtin_usage_error = Some(2);
@@ -5326,8 +5326,7 @@ fn builtin_set_inner(args: &[String], out: &mut dyn Write, err: &mut dyn Write, 
                         }
                     }
                     other => {
-                        e!(err,
-                            "huck: set: +{}: not yet supported in this version",
+                        crate::sh_error_to!(shell, err, None, "set: +{}: not yet supported in this version",
                             other as char
                         );
                         return ExecOutcome::Continue(2);
@@ -5374,7 +5373,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                     'p' => print_f = true,
                     'o' => o_bridge = true,
                     _ => {
-                        e!(err, "huck: shopt: -{c}: invalid option");
+                        crate::sh_error_to!(shell, err, None, "shopt: -{c}: invalid option");
                         e!(err, "shopt: usage: shopt [-pqsu] [-o] [optname ...]");
                         return ExecOutcome::Continue(2);
                     }
@@ -5386,7 +5385,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
         }
     }
     if set_f && unset_f {
-        e!(err, "huck: shopt: cannot set and unset shell options simultaneously");
+        crate::sh_error_to!(shell, err, None, "shopt: cannot set and unset shell options simultaneously");
         return ExecOutcome::Continue(1);
     }
     let names = &args[i..];
@@ -5418,7 +5417,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
         let mut rc = 0;
         for name in names {
             if !shell.shopt_options.set(name, set_f) {
-                e!(err, "huck: shopt: {name}: invalid shell option name");
+                crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 rc = 1;
             }
         }
@@ -5440,7 +5439,7 @@ fn builtin_shopt(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                 }
             }
             None => {
-                e!(err, "huck: shopt: {name}: invalid shell option name");
+                crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 all_set = false;
             }
         }
@@ -5478,11 +5477,11 @@ fn shopt_o_bridge(
             match option_set(shell, name, set_f) {
                 Ok(()) => {}
                 Err(OptSetErr::Unimplemented) => {
-                    e!(err, "huck: shopt: {name}: not yet supported in this version");
+                    crate::sh_error_to!(shell, err, None, "shopt: {name}: not yet supported in this version");
                     rc = 1;
                 }
                 Err(OptSetErr::Unknown) => {
-                    e!(err, "huck: shopt: {name}: invalid shell option name");
+                    crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                     rc = 1;
                 }
             }
@@ -5505,7 +5504,7 @@ fn shopt_o_bridge(
                 }
             }
             None => {
-                e!(err, "huck: shopt: {name}: invalid shell option name");
+                crate::sh_error_to!(shell, err, None, "shopt: {name}: invalid shell option name");
                 all_set = false;
             }
         }
@@ -5558,7 +5557,7 @@ fn builtin_eval(args: &[String], shell: &mut Shell) -> ExecOutcome {
 /// Not a special builtin.
 fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
-        e!(err, "huck: let: expression expected");
+        crate::sh_error_to!(shell, err, None, "let: expression expected");
         return ExecOutcome::Continue(1);
     }
     let mut last: i64 = 0;
@@ -5566,8 +5565,7 @@ fn builtin_let(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecO
         match crate::arith::parse(a).and_then(|e| crate::arith::eval(&e, shell)) {
             Ok(v) => last = v,
             Err(e) => {
-                let prefix = shell.error_prefix(Some("let"));
-                e!(err, "{prefix}{}", crate::arith::render_error_body(a, &e));
+                crate::sh_error_to!(shell, err, Some("let"), "{}", crate::arith::render_error_body(a, &e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -6089,7 +6087,7 @@ fn builtin_help(
     args: &[String],
     out: &mut dyn std::io::Write,
     err: &mut dyn Write,
-    _shell: &mut Shell,
+    shell: &mut Shell,
 ) -> ExecOutcome {
     let mut want_synopsis = false;
     let mut want_description = false;
@@ -6110,7 +6108,7 @@ fn builtin_help(
                 b'd' => want_description = true,
                 b'm' => want_man = true,
                 other => {
-                    e!(err, "huck: help: -{}: invalid option", other as char);
+                    crate::sh_error_to!(shell, err, None, "help: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -6137,7 +6135,7 @@ fn builtin_help(
                 want_man,
             ),
             None => {
-                e!(err, "huck: help: no help topics match `{name}'");
+                crate::sh_error_to!(shell, err, None, "help: no help topics match `{name}'");
                 exit = 1;
             }
         }
@@ -6156,22 +6154,25 @@ pub(crate) fn source_in_sink(
         && let Err(msg) = crate::restricted::check_source_path(path)
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
-        e!(&mut *err, "{msg}");
+        crate::sh_error_to!(shell, &mut *err, None, "{msg}");
         return ExecOutcome::Continue(1);
     }
-    // Materialize a fallback err writer for the early-bail diagnostics that don't
-    // recurse into the executor.
+    // Materialize the redirect-aware err writer for the early-bail diagnostics
+    // below (these don't recurse into the executor, so they must emit here
+    // rather than via the thread-local sink — same reasoning as sh_error_to!
+    // elsewhere: `sink`/`err_sink` carry the executor's in-memory redirect
+    // swap for this `source`/`.` invocation).
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         if args.is_empty() {
-            e!(&mut *err, "huck: .: usage: . filename [arguments]");
+            e!(&mut *err, ".: usage: . filename [arguments]");
             // POSIX case #1: missing-filename usage error (the not-found case at
             // resolve_source_path below was Task 2 and stays posix_fatal(1)).
             shell.builtin_usage_error = Some(2);
             return ExecOutcome::Continue(2);
         }
         if shell.source_depth >= 64 {
-            e!(&mut *err, "huck: .: maximum source depth (64) exceeded");
+            crate::sh_error_to!(shell, &mut *err, None, ".: maximum source depth (64) exceeded");
             return ExecOutcome::Continue(1);
         }
     }
@@ -6179,16 +6180,13 @@ pub(crate) fn source_in_sink(
     let path = match resolve_source_path(filename, shell) {
         Some(p) => p,
         None => {
+            let mut err = crate::executor::err_writer(err_sink, sink);
             // bash distinguishes a directory (opened, unusable → `.:` prefix) from a
             // genuinely-missing file (open fails → no `.:`, redirect-style).
             if std::path::Path::new(filename).is_dir() {
-                let prefix = shell.error_prefix(Some("."));
-                let mut err = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *err, "{prefix}{filename}: is a directory");
+                crate::sh_error_to!(shell, &mut *err, Some("."), "{filename}: is a directory");
             } else {
-                let prefix = shell.error_prefix(None);
-                let mut err = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *err, "{prefix}{filename}: No such file or directory");
+                crate::sh_error_to!(shell, &mut *err, None, "{filename}: No such file or directory");
             }
             shell.posix_fatal(1);
             return ExecOutcome::Continue(1);
@@ -6197,19 +6195,16 @@ pub(crate) fn source_in_sink(
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
+            let mut err = crate::executor::err_writer(err_sink, sink);
             if e.kind() == std::io::ErrorKind::InvalidData {
                 // Non-UTF-8 content: bash reports `.: <path>: cannot execute binary file`
                 // and exits with status 126.
-                let prefix = shell.error_prefix(Some("."));
-                let mut errw = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *errw, "{prefix}{}: cannot execute binary file", path.display());
+                crate::sh_error_to!(shell, &mut *err, Some("."), "{}: cannot execute binary file", path.display());
                 return ExecOutcome::Continue(126);
             } else {
                 // Open/read io error (permission, …): bash reports `<path>: <strerror>`
                 // (redirect-style, no `.:`).
-                let prefix = shell.error_prefix(None);
-                let mut errw = crate::executor::err_writer(err_sink, sink);
-                e!(&mut *errw, "{prefix}{}: {}", path.display(), crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, &mut *err, None, "{}: {}", path.display(), crate::bash_io_error(&e));
                 return ExecOutcome::Continue(1);
             }
         }
@@ -6291,7 +6286,7 @@ fn resolve_source_path(
 
 pub(crate) fn run_sourced_contents_in_sinks(
     contents: &str,
-    path: &std::path::Path,
+    _path: &std::path::Path,
     shell: &mut crate::shell_state::Shell,
     sink: &mut crate::executor::StdoutSink,
     err_sink: &mut crate::executor::StderrSink,
@@ -6355,17 +6350,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     }
                     Ok(_) => break,
                     Err(le) => {
-                        {
-                            let mut err = crate::executor::err_writer(err_sink, sink);
-                            e!(&mut *err,
-                                "huck: {}: line {}: syntax error: {}",
-                                path.display(),
-                                line_of(start + tok_off),
-                                crate::parse_error_message(
-                                    &crate::command::ParseError::Lex(Box::new(le))
-                                )
-                            );
-                        }
+                        let line = line_of(start + tok_off) as u32;
+                        let msg = crate::parse_error_message(
+                            &crate::command::ParseError::Lex(Box::new(le)),
+                        );
+                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                            crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                        });
                         last_status = 2;
                         start = next_line_start(start + tok_off);
                         prev_end = start;
@@ -6478,17 +6469,13 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     if let Some((le, tok_off)) = pending_lex_err {
                         // Report at the failing token's START line (not the cursor's
                         // post-scan EOF position), and restart just past that line.
-                        {
-                            let mut err = crate::executor::err_writer(err_sink, sink);
-                            e!(&mut *err,
-                                "huck: {}: line {}: syntax error: {}",
-                                path.display(),
-                                line_of(start + tok_off),
-                                crate::parse_error_message(
-                                    &crate::command::ParseError::Lex(Box::new(le))
-                                )
-                            );
-                        }
+                        let line = line_of(start + tok_off) as u32;
+                        let msg = crate::parse_error_message(
+                            &crate::command::ParseError::Lex(Box::new(le)),
+                        );
+                        crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                            crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                        });
                         last_status = 2;
                         start = next_line_start(start + tok_off);
                         prev_end = start;
@@ -6502,15 +6489,11 @@ pub(crate) fn run_sourced_contents_in_sinks(
                     // the old tokenize_partial foff path.
                     let is_lex = matches!(e, crate::command::ParseError::Lex(_));
                     let foff = if is_lex { iter.cursor_pos() } else { unit_start_off };
-                    {
-                        let mut err = crate::executor::err_writer(err_sink, sink);
-                        e!(&mut *err,
-                            "huck: {}: line {}: syntax error: {}",
-                            path.display(),
-                            line_of(start + foff),
-                            crate::parse_error_message(&e)
-                        );
-                    }
+                    let line = line_of(start + foff) as u32;
+                    let msg = crate::parse_error_message(&e);
+                    crate::err_thread_local::install_err_sinks(sink, err_sink, || {
+                        crate::emit_syntax_error(shell, line, format_args!("syntax error: {msg}"));
+                    });
                     last_status = 2;
                     if is_lex {
                         start = next_line_start(start + foff);
@@ -6581,7 +6564,7 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
             let name = &arg[..eq];
             let value = &arg[eq + 1..];
             if !is_valid_alias_name(name) {
-                e!(err, "huck: alias: `{name}': invalid alias name");
+                crate::sh_error_to!(shell, err, None, "alias: `{name}': invalid alias name");
                 any_failed = true;
                 continue;
             }
@@ -6592,7 +6575,7 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                     let _ = writeln!(out, "alias {}='{}'", arg, escape_alias_value(v));
                 }
                 None => {
-                    e!(err, "huck: alias: {arg}: not found");
+                    crate::sh_error_to!(shell, err, None, "alias: {arg}: not found");
                     any_failed = true;
                 }
             }
@@ -6603,7 +6586,7 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
 
 fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
-        e!(err, "huck: unalias: usage: unalias [-a] name [name ...]");
+        e!(err, "unalias: usage: unalias [-a] name [name ...]");
         return ExecOutcome::Continue(2);
     }
     if args[0] == "-a" {
@@ -6613,7 +6596,7 @@ fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> E
     let mut any_failed = false;
     for name in args {
         if shell.aliases.remove(name).is_none() {
-            e!(err, "huck: unalias: {name}: not found");
+            crate::sh_error_to!(shell, err, None, "unalias: {name}: not found");
             any_failed = true;
         }
     }
@@ -6859,7 +6842,7 @@ fn builtin_type(
                 }
                 b'f' => skip_func = true,
                 other => {
-                    e!(err, "huck: type: -{}: invalid option", other as char);
+                    crate::sh_error_to!(shell, err, None, "type: -{}: invalid option", other as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -6889,7 +6872,7 @@ fn builtin_type(
 
         if resolutions.is_empty() {
             if !type_only && !path_only {
-                e!(err, "huck: type: {name}: not found");
+                crate::sh_error_to!(shell, err, None, "type: {name}: not found");
             }
             exit = 1;
             continue;
@@ -6948,7 +6931,7 @@ fn builtin_hash(
                         // -p separate: next arg
                         i += 1;
                         if i >= args.len() {
-                            e!(err, "huck: hash: -p: option requires an argument");
+                            crate::sh_error_to!(shell, err, None, "hash: -p: option requires an argument");
                             return ExecOutcome::Continue(2);
                         }
                         explicit_path = Some(args[i].clone());
@@ -6956,7 +6939,7 @@ fn builtin_hash(
                     }
                 }
                 c => {
-                    e!(err, "huck: hash: -{}: invalid option", c as char);
+                    crate::sh_error_to!(shell, err, None, "hash: -{}: invalid option", c as char);
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -6973,16 +6956,22 @@ fn builtin_hash(
 
     if delete {
         if names.is_empty() {
-            e!(err, "huck: hash: -d: at least one name required");
+            crate::sh_error_to!(shell, err, None, "hash: -d: at least one name required");
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
-        let h = Rc::make_mut(&mut shell.command_hash);
-        for name in names {
-            if h.remove(name).is_none() {
-                e!(err, "huck: hash: {name}: not found");
-                exit = 1;
+        let mut not_found: Vec<&String> = Vec::new();
+        {
+            let h = Rc::make_mut(&mut shell.command_hash);
+            for name in names {
+                if h.remove(name).is_none() {
+                    not_found.push(name);
+                    exit = 1;
+                }
             }
+        }
+        for name in not_found {
+            crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
         }
         return ExecOutcome::Continue(exit);
     }
@@ -6990,12 +6979,12 @@ fn builtin_hash(
     if set_path {
         // Exactly one name required.
         if names.len() != 1 {
-            e!(err, "huck: hash: -p: exactly one name required");
+            crate::sh_error_to!(shell, err, None, "hash: -p: exactly one name required");
             return ExecOutcome::Continue(2);
         }
         let name = &names[0];
         if name.contains('/') {
-            e!(err, "huck: hash: {name}: must not contain `/'");
+            crate::sh_error_to!(shell, err, None, "hash: {name}: must not contain `/'");
             return ExecOutcome::Continue(1);
         }
         let path = explicit_path.unwrap(); // safe: set_path implies Some
@@ -7019,7 +7008,7 @@ fn builtin_hash(
 
     if type_only {
         if names.is_empty() {
-            e!(err, "huck: hash: -t: at least one name required");
+            crate::sh_error_to!(shell, err, None, "hash: -t: at least one name required");
             return ExecOutcome::Continue(2);
         }
         let mut exit: i32 = 0;
@@ -7033,7 +7022,7 @@ fn builtin_hash(
                     }
                 }
                 None => {
-                    e!(err, "huck: hash: {name}: not found");
+                    crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
                     exit = 1;
                 }
             }
@@ -7060,7 +7049,7 @@ fn builtin_hash(
     let mut exit: i32 = 0;
     for name in names {
         if name.contains('/') {
-            e!(err, "huck: hash: {name}: must not contain `/'");
+            crate::sh_error_to!(shell, err, None, "hash: {name}: must not contain `/'");
             exit = 1;
             continue;
         }
@@ -7069,7 +7058,7 @@ fn builtin_hash(
                 Rc::make_mut(&mut shell.command_hash).insert(name.clone(), (path, 0u32));
             }
             None => {
-                e!(err, "huck: hash: {name}: not found");
+                crate::sh_error_to!(shell, err, None, "hash: {name}: not found");
                 exit = 1;
             }
         }
@@ -7093,7 +7082,7 @@ fn builtin_command(
             "-p" => { i += 1; } // accept; introspection uses current $PATH
             "--" => { i += 1; break; }
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: command: {s}: invalid option");
+                crate::sh_error_to!(shell, err, None, "command: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -7108,8 +7097,7 @@ fn builtin_command(
         if names.is_empty() {
             return ExecOutcome::Continue(0);
         }
-        e!(err,
-            "huck: command: bare form (without -v/-V) is not supported in this version"
+        crate::sh_error_to!(shell, err, None, "command: bare form (without -v/-V) is not supported in this version"
         );
         return ExecOutcome::Continue(2);
     }
@@ -7162,7 +7150,7 @@ fn builtin_command(
             CommandResolution::NotFound => {
                 any_not_found = true;
                 if verbose {
-                    e!(err, "huck: command: {name}: not found");
+                    crate::sh_error_to!(shell, err, None, "command: {name}: not found");
                 }
             }
         }
@@ -7175,7 +7163,7 @@ fn builtin_test(name: &str, args: &[String], err: &mut dyn Write, shell: &Shell)
         match args.last() {
             Some(last) if last == "]" => &args[..args.len() - 1],
             _ => {
-                e!(err, "huck: [: missing ']'");
+                crate::sh_error_to!(shell, err, None, "[: missing ']'");
                 return ExecOutcome::Continue(2);
             }
         }
@@ -7186,7 +7174,7 @@ fn builtin_test(name: &str, args: &[String], err: &mut dyn Write, shell: &Shell)
         Ok(true) => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg) => {
-            e!(err, "huck: {name}: {msg}");
+            crate::sh_error_to!(shell, err, None, "{name}: {msg}");
             ExecOutcome::Continue(2)
         }
     }
@@ -7310,13 +7298,13 @@ fn builtin_pushd(
     if args.is_empty() {
         // Swap top two.
         if shell.dir_stack.len() < 2 {
-            e!(err, "huck: pushd: no other directory");
+            crate::sh_error_to!(shell, err, None, "pushd: no other directory");
             return ExecOutcome::Continue(1);
         }
         shell.dir_stack.swap(0, 1);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
             && c != 0
         {
             // Undo the swap on failure.
@@ -7331,7 +7319,7 @@ fn builtin_pushd(
         let idx = match parse_signed_index(arg, shell.dir_stack.len()) {
             Ok(i) => i,
             Err(e) => {
-                e!(err, "huck: pushd: {e}");
+                crate::sh_error_to!(shell, err, None, "pushd: {e}");
                 return ExecOutcome::Continue(1);
             }
         };
@@ -7341,7 +7329,7 @@ fn builtin_pushd(
         shell.dir_stack.rotate_left(idx);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
             && c != 0
         {
             // Undo rotation on cd failure.
@@ -7353,7 +7341,7 @@ fn builtin_pushd(
 
     // pushd DIR
     let cd_args = vec![arg.clone()];
-    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+    if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
         && c != 0
     {
         return ExecOutcome::Continue(c);
@@ -7375,7 +7363,7 @@ fn builtin_popd(
 ) -> ExecOutcome {
     sync_stack_top(shell);
     if shell.dir_stack.len() <= 1 {
-        e!(err, "huck: popd: directory stack empty");
+        crate::sh_error_to!(shell, err, None, "popd: directory stack empty");
         return ExecOutcome::Continue(1);
     }
 
@@ -7384,13 +7372,13 @@ fn builtin_popd(
     } else {
         let arg = &args[0];
         if !is_signed_index_arg(arg) {
-            e!(err, "huck: popd: {arg}: invalid argument");
+            crate::sh_error_to!(shell, err, None, "popd: {arg}: invalid argument");
             return ExecOutcome::Continue(1);
         }
         match parse_signed_index(arg, shell.dir_stack.len()) {
             Ok(i) => i,
             Err(e) => {
-                e!(err, "huck: popd: {e}");
+                crate::sh_error_to!(shell, err, None, "popd: {e}");
                 return ExecOutcome::Continue(1);
             }
         }
@@ -7405,7 +7393,7 @@ fn builtin_popd(
     if idx == 0 {
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("popd", &cd_args, out, err, shell)
             && c != 0
         {
             // Restore the entry we just popped so the stack is
@@ -7456,14 +7444,14 @@ fn builtin_dirs(
                 match parse_signed_index(s, shell.dir_stack.len()) {
                     Ok(idx) => index = Some(idx),
                     Err(e) => {
-                        e!(err, "huck: dirs: {e}");
+                        crate::sh_error_to!(shell, err, None, "dirs: {e}");
                         return ExecOutcome::Continue(1);
                     }
                 }
                 i += 1;
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: dirs: {s}: invalid option");
+                crate::sh_error_to!(shell, err, None, "dirs: {s}: invalid option");
                 return ExecOutcome::Continue(2);
             }
             _ => break,
@@ -7503,14 +7491,14 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
                 if let Some(seq) = args.get(i) {
                     shell.add_unbind(seq);
                 } else {
-                    e!(err, "huck: bind: -r: option requires an argument");
+                    crate::sh_error_to!(shell, err, None, "bind: -r: option requires an argument");
                     rc = 2;
                 }
             }
             "-x" => { i += 1; /* keyseq:shell-command — deferred no-op */ }
             s if s.starts_with('-') && s.len() > 1 => {
-                e!(err, "huck: bind: {s}: invalid option");
-                e!(err, "huck: {USAGE}");
+                crate::sh_error_to!(shell, err, None, "bind: {s}: invalid option");
+                e!(err, "{USAGE}");
                 return ExecOutcome::Continue(2);
             }
             // Non-flag argument: `set VAR VALUE` (3-arg or inline), or `keyseq:function`.
@@ -7521,7 +7509,7 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
                     let val = args.get(i + 2).cloned();
                     if let (Some(var), Some(val)) = (var, val) {
                         if !validate_readline_var(&var, &val) {
-                            e!(err, "huck: bind: {val}: invalid value for {var}");
+                            crate::sh_error_to!(shell, err, None, "bind: {val}: invalid value for {var}");
                             rc = 1;
                         } else {
                             shell.set_readline_var(&var, &val);
@@ -7533,7 +7521,7 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
                     let mut it = rest.split_whitespace();
                     if let (Some(var), Some(val)) = (it.next(), it.next()) {
                         if !validate_readline_var(var, val) {
-                            e!(err, "huck: bind: {val}: invalid value for {var}");
+                            crate::sh_error_to!(shell, err, None, "bind: {val}: invalid value for {var}");
                             rc = 1;
                         } else {
                             shell.set_readline_var(var, val);
@@ -7541,16 +7529,16 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
                     }
                 } else if let Some((seq, func)) = a.split_once(':') {
                     if !keyseq_is_valid(seq) {
-                        e!(err, "huck: bind: {seq}: cannot parse key sequence");
+                        crate::sh_error_to!(shell, err, None, "bind: {seq}: cannot parse key sequence");
                         rc = 1;
                     } else if !is_known_function(func) {
-                        e!(err, "huck: bind: {func}: unknown function name");
+                        crate::sh_error_to!(shell, err, None, "bind: {func}: unknown function name");
                         rc = 1;
                     } else {
                         shell.add_bind(seq, func);
                     }
                 } else {
-                    e!(err, "huck: bind: {a}: unknown command");
+                    crate::sh_error_to!(shell, err, None, "bind: {a}: unknown command");
                     rc = 1;
                 }
             }
@@ -7859,7 +7847,7 @@ mod tests {
     #[test]
     fn echo_writes_args_joined_by_spaces() {
         let mut out: Vec<u8> = Vec::new();
-        let outcome = builtin_echo(&["hello".to_string(), "world".to_string()], &mut out, &mut std::io::stderr());
+        let outcome = builtin_echo(&["hello".to_string(), "world".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert!(matches!(outcome, ExecOutcome::Continue(0)));
         assert_eq!(out, b"hello world\n");
     }
@@ -7867,56 +7855,56 @@ mod tests {
     #[test]
     fn echo_with_no_args_writes_a_blank_line() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&[], &mut out, &mut std::io::stderr());
+        builtin_echo(&[], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"\n");
     }
 
     #[test]
     fn echo_n_suppresses_trailing_newline() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-n".to_string(), "hello".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-n".to_string(), "hello".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"hello");
     }
 
     #[test]
     fn echo_n_alone_writes_nothing() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-n".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-n".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"");
     }
 
     #[test]
     fn echo_e_processes_basic_escapes() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"a\tb\nc".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-e".to_string(), r"a\tb\nc".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"a\tb\nc\n");
     }
 
     #[test]
     fn echo_capital_e_keeps_backslashes_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-E".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-E".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"a\\tb\n");
     }
 
     #[test]
     fn echo_default_keeps_backslashes_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&[r"a\tb".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&[r"a\tb".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"a\\tb\n");
     }
 
     #[test]
     fn echo_combined_ne_flag() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-ne".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-ne".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"a\tb");
     }
 
     #[test]
     fn echo_e_then_capital_e_disables_escapes() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-eE".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-eE".to_string(), r"a\tb".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"a\\tb\n");
     }
 
@@ -7925,7 +7913,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         builtin_echo(
             &["-n".to_string(), "foo".to_string(), "-n".to_string(), "bar".to_string()],
-            &mut out, &mut std::io::stderr(),
+            &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new(),
         );
         assert_eq!(out, b"foo -n bar");
     }
@@ -7933,49 +7921,49 @@ mod tests {
     #[test]
     fn echo_unknown_flag_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-x".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-x".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"-x foo\n");
     }
 
     #[test]
     fn echo_single_dash_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"-\n");
     }
 
     #[test]
     fn echo_double_dash_is_literal() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["--".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["--".to_string(), "foo".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"-- foo\n");
     }
 
     #[test]
     fn echo_e_c_escape_terminates_output() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"abc\cdef".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-e".to_string(), r"abc\cdef".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"abc");
     }
 
     #[test]
     fn echo_e_octal_escape() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\0101".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-e".to_string(), r"\0101".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"A\n");
     }
 
     #[test]
     fn echo_e_hex_escape() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\x41".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-e".to_string(), r"\x41".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"A\n");
     }
 
     #[test]
     fn echo_e_unknown_escape_keeps_backslash() {
         let mut out: Vec<u8> = Vec::new();
-        builtin_echo(&["-e".to_string(), r"\z".to_string()], &mut out, &mut std::io::stderr());
+        builtin_echo(&["-e".to_string(), r"\z".to_string()], &mut out, &mut std::io::stderr(), &crate::shell_state::Shell::new());
         assert_eq!(out, b"\\z\n");
     }
 
@@ -13209,8 +13197,7 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
                     'S' => symbolic = true,
                     'p' => posix = true,
                     other => {
-                        let prefix = shell.error_prefix(Some("umask"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error_to!(shell, err, Some("umask"), "-{other}: invalid option");
                         e!(err, "umask: usage: umask [-p] [-S] [mode]");
                         return ExecOutcome::Continue(2);
                     }
@@ -13229,8 +13216,7 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
             match parse_octal_umask(mode) {
                 Ok(m) => m,
                 Err(()) => {
-                    let prefix = shell.error_prefix(Some("umask"));
-                    e!(err, "{prefix}{mode}: octal number out of range");
+                    crate::sh_error_to!(shell, err, Some("umask"), "{mode}: octal number out of range");
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -13238,10 +13224,9 @@ fn builtin_umask(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
             match parse_symbolic_umask(mode, cur) {
                 Ok(m) => m,
                 Err(se) => {
-                    let prefix = shell.error_prefix(Some("umask"));
                     match se {
-                        SymErr::Char(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode character"),
-                        SymErr::Operator(ch) => e!(err, "{prefix}`{ch}': invalid symbolic mode operator"),
+                        SymErr::Char(ch) => crate::sh_error_to!(shell, err, Some("umask"), "`{ch}': invalid symbolic mode character"),
+                        SymErr::Operator(ch) => crate::sh_error_to!(shell, err, Some("umask"), "`{ch}': invalid symbolic mode operator"),
                     }
                     return ExecOutcome::Continue(1);
                 }
@@ -13364,8 +13349,7 @@ fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                     'p' => letters.push('p'),
                     other if ulimit_lookup(other).is_some() => letters.push(other),
                     other => {
-                        let prefix = shell.error_prefix(Some("ulimit"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error_to!(shell, err, Some("ulimit"), "-{other}: invalid option");
                         e!(err, "{USAGE}");
                         return ExecOutcome::Continue(2);
                     }
@@ -13409,15 +13393,13 @@ fn builtin_ulimit(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                 s => match s.parse::<u64>() {
                     Ok(n) => n,
                     Err(_) => {
-                        let prefix = shell.error_prefix(Some("ulimit"));
-                        e!(err, "{prefix}{val}: invalid number");
+                        crate::sh_error_to!(shell, err, Some("ulimit"), "{val}: invalid number");
                         return ExecOutcome::Continue(1);
                     }
                 },
             };
             if let Err(e) = ulimit_set(res, raw, set_soft, set_hard) {
-                let prefix = shell.error_prefix(Some("ulimit"));
-                e!(err, "{prefix}{val}: cannot modify limit: {}", crate::bash_io_error(&e));
+                crate::sh_error_to!(shell, err, Some("ulimit"), "{val}: cannot modify limit: {}", crate::bash_io_error(&e));
                 status = 1;
             }
         }
@@ -13483,8 +13465,7 @@ fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
                     's' => special = true,
                     'p' => {} // print format — the listing default
                     other => {
-                        let prefix = shell.error_prefix(Some("enable"));
-                        e!(err, "{prefix}-{other}: invalid option");
+                        crate::sh_error_to!(shell, err, Some("enable"), "-{other}: invalid option");
                         e!(err, "{USAGE}");
                         return ExecOutcome::Continue(2);
                     }
@@ -13513,8 +13494,7 @@ fn builtin_enable(args: &[String], out: &mut dyn Write, err: &mut dyn Write, she
     let mut status = 0;
     for name in names {
         if !is_builtin(name) {
-            let prefix = shell.error_prefix(Some("enable"));
-            e!(err, "{prefix}{name}: not a shell builtin");
+            crate::sh_error_to!(shell, err, Some("enable"), "{name}: not a shell builtin");
             status = 1;
             continue;
         }

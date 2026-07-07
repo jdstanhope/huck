@@ -43,15 +43,15 @@ enum FlagError {
 impl FlagError {
     fn diag(&self, cmd: &str) -> String {
         match self {
-            FlagError::Usage(msg) => format!("huck: {cmd}: {msg}"),
+            FlagError::Usage(msg) => format!("{cmd}: {msg}"),
             FlagError::InvalidAction(name) => {
-                format!("huck: {cmd}: {name}: invalid action name")
+                format!("{cmd}: {name}: invalid action name")
             }
             FlagError::InvalidOption(name) => {
-                format!("huck: {cmd}: {name}: invalid completion option")
+                format!("{cmd}: {name}: invalid completion option")
             }
             FlagError::MissingArg(c) => {
-                format!("huck: {cmd}: -{c}: option requires an argument")
+                format!("{cmd}: -{c}: option requires an argument")
             }
         }
     }
@@ -190,7 +190,7 @@ pub fn builtin_complete(
     let parsed = match parse_flags(args, true) {
         Ok(p) => p,
         Err(pe) => {
-            e!(err, "{}", pe.diag("complete"));
+            crate::sh_error_to!(shell, err, None, "{}", pe.diag("complete"));
             return ExecOutcome::Continue(pe.status());
         }
     };
@@ -241,7 +241,7 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(d, None, Some("-D")));
             }
             None => {
-                e!(err, "huck: complete: no completion specification for -D");
+                crate::sh_error_to!(shell, err, None, "complete: no completion specification for -D");
                 status = 1;
             }
         }
@@ -252,7 +252,7 @@ fn print_complete(
                 let _ = writeln!(out, "{}", format_spec_for_print(es, None, Some("-E")));
             }
             None => {
-                e!(err, "huck: complete: no completion specification for -E");
+                crate::sh_error_to!(shell, err, None, "complete: no completion specification for -E");
                 status = 1;
             }
         }
@@ -285,7 +285,7 @@ fn print_complete(
                     let _ = writeln!(out, "{}", format_spec_for_print(s, Some(n.as_str()), None));
                 }
                 None => {
-                    e!(err, "huck: complete: {n}: no completion specification");
+                    crate::sh_error_to!(shell, err, None, "complete: {n}: no completion specification");
                     status = 1;
                 }
             }
@@ -311,14 +311,22 @@ fn remove_complete(
     if names.is_empty() && !parsed.is_default && !parsed.is_empty {
         specs.by_command.clear();
     } else {
+        // Collect misses first: `specs` borrows `shell.completion_specs`
+        // mutably for the whole loop, so the diagnostic (which needs
+        // `shell` itself, for the error prologue) must be emitted after
+        // the loop, once that borrow has ended.
+        let mut missing: Vec<&String> = Vec::new();
         for n in names {
             if specs.by_command.remove(n).is_none()
                 && !parsed.is_default
                 && !parsed.is_empty
             {
-                e!(err, "huck: complete: {n}: no completion specification");
+                missing.push(n);
                 status = 1;
             }
+        }
+        for n in missing {
+            crate::sh_error_to!(shell, err, None, "complete: {n}: no completion specification");
         }
     }
     ExecOutcome::Continue(status)
@@ -326,14 +334,14 @@ fn remove_complete(
 
 fn register_complete(parsed: &ParsedFlags, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if (parsed.is_default || parsed.is_empty) && !parsed.positional.is_empty() {
-        e!(err, "huck: complete: cannot use -D or -E with command names");
+        crate::sh_error_to!(shell, err, None, "complete: cannot use -D or -E with command names");
         return ExecOutcome::Continue(2);
     }
     if !parsed.positional.is_empty()
         && parsed.spec == CompletionSpec::default()
         && !parsed.options_touched
     {
-        e!(err, "huck: complete: nothing to complete");
+        crate::sh_error_to!(shell, err, None, "complete: nothing to complete");
         return ExecOutcome::Continue(1);
     }
     let specs = Rc::make_mut(&mut shell.completion_specs);
@@ -431,7 +439,7 @@ pub fn builtin_compgen(
     let parsed = match parse_flags(args, false) {
         Ok(p) => p,
         Err(pe) => {
-            e!(err, "{}", pe.diag("compgen"));
+            crate::sh_error_to!(shell, err, None, "{}", pe.diag("compgen"));
             return ExecOutcome::Continue(pe.status());
         }
     };
@@ -501,7 +509,7 @@ pub fn builtin_compopt(
             break;
         }
         if arg == "-" || arg == "+" {
-            e!(err, "huck: compopt: bad option: {arg}");
+            crate::sh_error_to!(shell, err, None, "compopt: bad option: {arg}");
             return ExecOutcome::Continue(2);
         }
         let leading = arg.chars().next().unwrap();
@@ -520,14 +528,14 @@ pub fn builtin_compopt(
                         ci = chars.len();
                         args[i].clone()
                     } else {
-                        e!(err, "huck: compopt: -o: option requires an argument");
+                        crate::sh_error_to!(shell, err, None, "compopt: -o: option requires an argument");
                         return ExecOutcome::Continue(2);
                     };
                     let off = leading == '+';
                     if !["default", "nospace", "filenames", "bashdefault", "dirnames"]
                         .contains(&arg_value.as_str())
                     {
-                        e!(err, "huck: compopt: {arg_value}: invalid completion option");
+                        crate::sh_error_to!(shell, err, None, "compopt: {arg_value}: invalid completion option");
                         return ExecOutcome::Continue(2);
                     }
                     option_set.push((arg_value, off));
@@ -539,7 +547,7 @@ pub fn builtin_compopt(
                     is_empty = true;
                 }
                 other => {
-                    e!(err, "huck: compopt: -{other}: invalid option");
+                    crate::sh_error_to!(shell, err, None, "compopt: -{other}: invalid option");
                     return ExecOutcome::Continue(2);
                 }
             }
@@ -550,7 +558,7 @@ pub fn builtin_compopt(
     let names: Vec<String> = args[i..].to_vec();
 
     if is_default || is_empty {
-        e!(err, "huck: compopt: -D/-E not yet supported");
+        crate::sh_error_to!(shell, err, None, "compopt: -D/-E not yet supported");
         return ExecOutcome::Continue(2);
     }
 
@@ -560,7 +568,7 @@ pub fn builtin_compopt(
         // it out, mutate, and put it back so dispatch's later .take()
         // observes the change.
         let Some(mut live) = shell.current_completion_spec.take() else {
-            e!(err, "huck: compopt: not currently executing completion function");
+            crate::sh_error_to!(shell, err, None, "compopt: not currently executing completion function");
             return ExecOutcome::Continue(1);
         };
         apply_compopt_options(&mut live.options, &option_set);
@@ -574,7 +582,7 @@ pub fn builtin_compopt(
         match Rc::make_mut(&mut shell.completion_specs).by_command.get_mut(n) {
             Some(spec) => apply_compopt_options(&mut spec.options, &option_set),
             None => {
-                e!(err, "huck: compopt: {n}: no completion specification");
+                crate::sh_error_to!(shell, err, None, "compopt: {n}: no completion specification");
                 status = 1;
             }
         }

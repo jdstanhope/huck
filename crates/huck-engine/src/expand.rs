@@ -1,5 +1,4 @@
 use crate::command::Sequence;
-use crate::err_thread_local::with_err;
 use crate::executor;
 use crate::lexer::{TildeSpec, Word, WordPart};
 use crate::shell_state::Shell;
@@ -233,7 +232,7 @@ fn expand_positional_substring(
     let off_n = match crate::arith::parse(&off_s).and_then(|e| crate::arith::eval(&e, shell)) {
         Ok(n) => n,
         Err(_) => {
-            with_err(|err| e!(err, "huck: {name}: bad slice offset"));
+            crate::sh_error!(shell, None, "{name}: bad slice offset");
             return ExpansionResult::Fatal { status: 1 };
         }
     };
@@ -260,7 +259,7 @@ fn expand_positional_substring(
             let len_n = match crate::arith::parse(&len_s).and_then(|e| crate::arith::eval(&e, shell)) {
                 Ok(n) => n,
                 Err(_) => {
-                    with_err(|err| e!(err, "huck: {name}: bad slice length"));
+                    crate::sh_error!(shell, None, "{name}: bad slice length");
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
@@ -386,7 +385,7 @@ fn expand_assoc_param(
             let key = eval_subscript_key(w, shell);
             let val = shell.lookup_associative_element(name, &key);
             if val.is_none() && shell.shell_options.nounset {
-                with_err(|err| e!(err, "huck: {name}[{key}]: unbound variable"));
+                crate::sh_error!(shell, None, "{name}[{key}]: unbound variable");
                 shell.pending_fatal_status = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
@@ -427,7 +426,7 @@ fn expand_assoc_param(
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: {name}: {e}"));
+                    crate::sh_error!(shell, None, "{name}: {e}");
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -552,10 +551,12 @@ fn expand_assoc_param(
         // Other scalar modifiers on @/* — explicit error for v72 scope
         // (per-element modifiers across the whole array are deferred).
         (other, SK::All | SK::Star) => {
-            with_err(|err| e!(err,
-                "huck: ${{{name}[…]}}: modifier {:?} not supported on associative array in v72",
+            crate::sh_error!(
+                shell,
+                None,
+                "${{{name}[…]}}: modifier {:?} not supported on associative array in v72",
                 other
-            ));
+            );
             ExpansionResult::Value(String::new())
         }
     }
@@ -607,7 +608,7 @@ fn expand_indirect(
         let valid = crate::builtins::is_valid_name(&through)
             || through.bytes().all(|b| b.is_ascii_digit());
         if !valid {
-            with_err(|err| e!(err, "huck: {through}: invalid variable name"));
+            crate::sh_error!(shell, None, "{through}: invalid variable name");
             return ExpansionResult::Fatal { status: 1 };
         }
         return crate::param_expansion::expand_modifier_quoted(&through, modifier, quoted, shell);
@@ -654,7 +655,7 @@ fn expand_indirect(
         && !n.bytes().all(|b| b.is_ascii_digit())
         && !is_element_ref
     {
-        with_err(|err| e!(err, "{}{}: invalid variable name", shell.error_prefix(None), n));
+        crate::sh_error!(shell, None, "{}: invalid variable name", n);
         return ExpansionResult::Fatal { status: 1 };
     }
     if through.is_empty() {
@@ -667,7 +668,7 @@ fn expand_indirect(
             // bash prints "<name>: invalid variable name" (here the effective
             // name is the empty string).
             if shell.is_set(name) {
-                with_err(|err| e!(err, "huck: : invalid variable name"));
+                crate::sh_error!(shell, None, ": invalid variable name");
                 return ExpansionResult::Fatal { status: 1 };
             }
             // Source UNSET and a POSITIONAL parameter ($1.. beyond $#): bash
@@ -680,7 +681,7 @@ fn expand_indirect(
                 // bash reports the indirect spec under the `!N` name for the
                 // positional path's diagnostics.
                 if shell.shell_options.nounset && matches!(modifier, PM::None) {
-                    with_err(|err| e!(err, "huck: !{name}: unbound variable"));
+                    crate::sh_error!(shell, None, "!{name}: unbound variable");
                     return ExpansionResult::Fatal { status: 1 };
                 }
                 match modifier {
@@ -689,7 +690,7 @@ fn expand_indirect(
                     // forward with an empty effective name (would write
                     // `vars[""]`).
                     PM::AssignDefault { .. } => {
-                        with_err(|err| e!(err, "huck: !{name}: invalid indirect expansion"));
+                        crate::sh_error!(shell, None, "!{name}: invalid indirect expansion");
                         return ExpansionResult::Fatal { status: 1 };
                     }
                     // `:?`/`?`: the parameter is reported unset under `!N` —
@@ -714,7 +715,7 @@ fn expand_indirect(
         }
         // Source UNSET and a named variable (or a subscripted source): fatal
         // "invalid indirect expansion".
-        with_err(|err| e!(err, "huck: {name}: invalid indirect expansion"));
+        crate::sh_error!(shell, None, "{name}: invalid indirect expansion");
         return ExpansionResult::Fatal { status: 1 };
     }
     // Step 2: parse N into (effective_name, effective_subscript) and
@@ -735,7 +736,7 @@ fn expand_indirect(
         && shell.shell_options.nounset
         && shell.lookup_var(n).is_none()
     {
-        with_err(|err| e!(err, "huck: {n}: unbound variable"));
+        crate::sh_error!(shell, None, "{n}: unbound variable");
         return ExpansionResult::Fatal { status: 1 };
     }
     crate::param_expansion::expand_modifier_quoted(n, modifier, quoted, shell)
@@ -840,14 +841,14 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: {e}"));
+                    crate::sh_error!(shell, None, "{e}");
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
             };
             let val = shell.lookup_indexed_element(name, idx);
             if val.is_none() && shell.shell_options.nounset {
-                with_err(|err| e!(err, "huck: {name}[{idx}]: unbound variable"));
+                crate::sh_error!(shell, None, "{name}[{idx}]: unbound variable");
                 shell.pending_fatal_status = Some(1);
                 return ExpansionResult::Fatal { status: 1 };
             }
@@ -862,7 +863,7 @@ fn expand_array_param(
             let idx = match eval_subscript(w, shell, name) {
                 Ok(i) => i,
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: {e}"));
+                    crate::sh_error!(shell, None, "{e}");
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -893,7 +894,7 @@ fn expand_array_param(
             let sliced = match slice_word_list(&values, offset, length.as_ref(), shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: {name}: {e}"));
+                    crate::sh_error!(shell, None, "{name}: {e}");
                     shell.pending_fatal_status = Some(1);
                     return ExpansionResult::Fatal { status: 1 };
                 }
@@ -1035,10 +1036,12 @@ fn expand_array_param(
         }
         // Other scalar modifiers on @/* — explicit error for v71 scope.
         (other, SK::All | SK::Star) => {
-            with_err(|err| e!(err,
-                "huck: ${{{name}[…]}}: modifier {:?} not supported on array in v71",
+            crate::sh_error!(
+                shell,
+                None,
+                "${{{name}[…]}}: modifier {:?} not supported on array in v71",
                 other
-            ));
+            );
             ExpansionResult::Value(String::new())
         }
     }
@@ -1076,7 +1079,7 @@ fn expand_part(
                 Some(value) => current.push_str(&value, true),
                 None => {
                     if shell.shell_options.nounset {
-                        with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                        crate::sh_error!(shell, None, "{name}: unbound variable");
                         shell.pending_fatal_status = Some(1);
                         return ControlFlow::Break(());
                     }
@@ -1095,7 +1098,7 @@ fn expand_part(
                 Some(v) => v,
                 None => {
                     if shell.shell_options.nounset {
-                        with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                        crate::sh_error!(shell, None, "{name}: unbound variable");
                         shell.pending_fatal_status = Some(1);
                         return ControlFlow::Break(());
                     }
@@ -1172,8 +1175,7 @@ fn expand_part(
                     // $((..)) value on error. (-c mode divergence: L-55 in
                     // bash-divergences.md.) POSIX non-interactive: the shell
                     // exits (127) via posix_fatal (a no-op in default mode).
-                    let prefix = shell.error_prefix(None);
-                    with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                    crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
                     shell.posix_fatal(127);
                     *has_emitted = true;
                 }
@@ -1193,7 +1195,7 @@ fn expand_part(
                 && !*indirect
             {
                 if shell.lookup_var(name).is_none() && shell.shell_options.nounset {
-                    with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                    crate::sh_error!(shell, None, "{name}: unbound variable");
                     shell.pending_fatal_status = Some(1);
                     return ControlFlow::Break(());
                 }
@@ -1302,7 +1304,7 @@ fn expand_part(
                     *has_emitted = true;
                 }
                 Err(e) => {
-                    with_err(|err| e!(err, "huck: process substitution: {}", crate::bash_io_error(&e)));
+                    crate::sh_error!(shell, None, "process substitution: {}", crate::bash_io_error(&e));
                     // Emit nothing; the field stays empty if no other parts.
                 }
             }
@@ -1456,9 +1458,8 @@ pub(crate) fn reconstruct_word_source_inner(word: &Word) -> String {
 /// expands a modifier without a surrounding word, e.g. arithmetic operands.)
 fn emit_bad_subst(modifier: &crate::lexer::ParamModifier, word: &Word, shell: &mut Shell) -> bool {
     if let crate::lexer::ParamModifier::BadSubst { .. } = modifier {
-        let prefix = shell.error_prefix(None);
         let src = reconstruct_word_source_inner(word);
-        with_err(|err| e!(err, "{prefix}{src}: bad substitution"));
+        crate::sh_error!(shell, None, "{src}: bad substitution");
         shell.pending_fatal_status = Some(1);
         true
     } else {
@@ -1701,7 +1702,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                     Some(value) => result.push_str(&value),
                     None => {
                         if shell.shell_options.nounset {
-                            with_err(|err| e!(err, "huck: {name}: unbound variable"));
+                            crate::sh_error!(shell, None, "{name}: unbound variable");
                             shell.pending_fatal_status = Some(1);
                             return result;
                         }
@@ -1723,8 +1724,7 @@ pub fn expand_assignment(word: &Word, shell: &mut Shell) -> String {
                         // mode prints and continues. Empty contribution to
                         // the assignment value matches bash. (-c mode
                         // divergence: L-55.)
-                        let prefix = shell.error_prefix(None);
-                        with_err(|err| e!(err, "{prefix}{}", crate::arith::render_error_body(&src, &e)));
+                        crate::sh_error!(shell, None, "{}", crate::arith::render_error_body(&src, &e));
                     }
                 }
             }
@@ -2139,7 +2139,7 @@ pub struct GlobExpansion {
 /// crate. No-match behavior depends on `opts`: `failglob` records the pattern
 /// for the caller to abort, `nullglob` contributes nothing, otherwise the
 /// literal field survives (bash default).
-pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpansion {
+pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts, shell: &Shell) -> GlobExpansion {
     let mut words = Vec::new();
     let mut failglob_unmatched = Vec::new();
     for field in fields {
@@ -2191,7 +2191,7 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
                         let Ok(path) = entry else { continue };
                         match path.into_os_string().into_string() {
                             Ok(s) => m.push(s),
-                            Err(_) => with_err(|err| e!(err, "huck: skipping non-UTF8 path")),
+                            Err(_) => crate::sh_error!(shell, None, "skipping non-UTF8 path"),
                         }
                     }
                     // Defensive: filter `.` and `..` if the glob crate ever emits
@@ -2232,8 +2232,8 @@ pub fn glob_expand_fields_opts(fields: Vec<Field>, opts: GlobOpts) -> GlobExpans
 /// default (pre-v86) behavior is preserved. Production call sites now go
 /// through `glob_expand_fields_opts` (via `executor::glob_expand_word`).
 #[cfg(test)]
-pub fn glob_expand_fields(fields: Vec<Field>) -> Vec<String> {
-    glob_expand_fields_opts(fields, GlobOpts::default()).words
+pub fn glob_expand_fields(fields: Vec<Field>, shell: &Shell) -> Vec<String> {
+    glob_expand_fields_opts(fields, GlobOpts::default(), shell).words
 }
 
 /// Builds the glob pattern string for a `Field`: quoted metacharacters
@@ -2857,7 +2857,7 @@ mod tests {
     #[test]
     fn glob_expand_no_metachar_returns_chars_as_string() {
         let f = Field::from_unquoted("plain.txt");
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
         assert_eq!(out, vec!["plain.txt".to_string()]);
     }
 
@@ -2865,7 +2865,7 @@ mod tests {
     fn glob_expand_quoted_metachar_treated_as_literal() {
         // All chars quoted including the `*` → no globbing.
         let f = Field::from_quoted("*.txt");
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
         assert_eq!(out, vec!["*.txt".to_string()]);
     }
 
@@ -2880,7 +2880,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("a");
         f.push_str("?", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -2892,7 +2892,7 @@ mod tests {
     fn glob_expand_preserves_field_order() {
         let f1 = Field::from_unquoted("first");
         let f2 = Field::from_unquoted("second");
-        let out = glob_expand_fields(vec![f1, f2]);
+        let out = glob_expand_fields(vec![f1, f2], &Shell::new());
         assert_eq!(out, vec!["first".to_string(), "second".to_string()]);
     }
 
@@ -2918,7 +2918,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("*");
         f.push_str(".txt", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -2935,7 +2935,7 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let f = Field::from_unquoted("*");
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -2952,7 +2952,7 @@ mod tests {
 
         let mut f = Field::from_unquoted(".");
         f.push_str("*", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -2971,7 +2971,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("[.]");
         f.push_str("hidden", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -2990,7 +2990,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("[ab]");
         f.push_str(".txt", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -3007,7 +3007,7 @@ mod tests {
         let mut f = Field::from_unquoted("nonex");
         f.push_str("*", false);
         f.push_str(".xyz", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -3027,7 +3027,7 @@ mod tests {
         // `"foo"*` — first three chars quoted, then unquoted `*`.
         let mut f = Field::from_quoted("foo");
         f.push_str("*", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -3046,7 +3046,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("[!a]");
         f.push_str(".txt", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -3061,7 +3061,7 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let f = Field::from_unquoted("[abc"); // no closing ]
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 
@@ -3072,7 +3072,7 @@ mod tests {
     fn expand_then_glob_end_to_end_for_literal() {
         let mut shell = Shell::new();
         let word = Word(vec![WordPart::Literal { text: "hello".to_string(), quoted: false }]);
-        let argv = glob_expand_fields(expand(&word, &mut shell));
+        let argv = glob_expand_fields(expand(&word, &mut shell), &shell);
         assert_eq!(argv, vec!["hello".to_string()]);
     }
 
@@ -3283,7 +3283,7 @@ mod tests {
 
         let mut f = Field::from_unquoted("*");
         f.push_str(".txt", false);
-        let out = glob_expand_fields(vec![f]);
+        let out = glob_expand_fields(vec![f], &Shell::new());
 
         std::env::set_current_dir(saved).unwrap();
 

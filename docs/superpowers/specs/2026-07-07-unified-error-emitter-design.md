@@ -87,10 +87,14 @@ iteration.
 
 ### 1. The emitter family
 
-Three entry points cover every diagnostic huck emits; they are the *only* code
-that writes the invocation-name/prologue text. All three live in huck-engine
-(new `error_emit.rs`), route through the thread-local sink, and share one
-prologue builder (`error_prefix`, now taking a `Diag` kind — §3).
+A small family covers every diagnostic huck emits; these functions are the
+*only* code that writes the invocation-name/prologue text. They live in
+huck-engine (new `error_emit.rs`) and share one prologue builder (`error_prefix`,
+now taking a `Diag` kind — §3). Two emit to a **caller-provided writer**
+(`emit_error_to`/`sh_error_to!` — the builtin path, redirect-aware) and the rest
+route through the **thread-local sink** (`emit_error`/`sh_error!`,
+`emit_syntax_error`, `emit_cli_error`) for sites with no writer in hand. See §1(a2)
+for why the writer variant is mandatory for builtins.
 
 **(a) Runtime errors — the common case (`sh_error!`).** `eprintln!`-shaped:
 shell, context, format string + args.
@@ -113,6 +117,43 @@ macro_rules! sh_error {
     };
 }
 ```
+
+**(a2) Runtime errors WITH a writer in hand — `sh_error_to!` (the builtin path).**
+This is the variant most builtins use, and it is why the family is a hybrid.
+Builtins receive `out`/`err` **writer parameters** from the executor
+(`run_builtin(program, args, out, err, shell)`). Those writers are the
+redirect-aware channel: for a *bare* builtin with a trailing `2>&1`/`>&2`, the
+executor's `run_builtin_with_redirects` does an **in-memory stream swap**
+(`route_err_to_out` / `route_out_to_err`, resolving L-25) that exists ONLY in
+those writer params — the thread-local sink is not told about it. So a builtin
+that emits via the thread-local (`sh_error!`) instead of its `err` param loses
+the diagnostic under captured `2>&1` (verified: `x=$(cd /nope 2>&1)` captures the
+error in bash but was empty in huck when routed thread-local). Therefore a site
+that HOLDS a writer must emit to THAT writer:
+
+```rust
+/// Emit a runtime diagnostic to a CALLER-PROVIDED writer (redirect-aware).
+pub fn emit_error_to(shell: &Shell, w: &mut dyn std::io::Write, cmd: Option<&str>, body: std::fmt::Arguments) {
+    let _ = write!(w, "{}", shell.error_prefix(Diag::Runtime(cmd)));
+    let _ = w.write_fmt(body);
+    let _ = w.write_all(b"\n");
+}
+
+#[macro_export]
+macro_rules! sh_error_to {
+    ($shell:expr, $w:expr, $cmd:expr, $($arg:tt)*) => {
+        $crate::emit_error_to($shell, $w, $cmd, format_args!($($arg)*))
+    };
+}
+```
+
+**The rule (which variant a site uses):** if an `out`/`err` writer param
+descending from `run_builtin` is in scope, use `sh_error_to!(shell, err, cmd, …)`
+— this is the redirect-correct channel and covers the overwhelming majority of
+builtin error sites. Only when NO writer is reachable (deep helpers in
+`shell_state.rs`/`expand.rs` internals, non-builtin executor paths) use the
+thread-local `sh_error!(shell, cmd, …)`. Both share `error_prefix`; the choice
+is purely "do I have the writer the executor handed me?"
 
 **(b) Syntax/parser errors (`emit_syntax_error`).** Prologue is
 `<name>: [-c: ]line N:` — the `-c:` segment present iff the shell was invoked
@@ -194,7 +235,7 @@ script path, else `bash`→`huck` for stdin/default.
 | Error class | `-c` mode | script-file mode | stdin (non-interactive) | interactive |
 |---|---|---|---|---|
 | **Runtime** (builtin, cd, cmd-not-found, arith, `set -o`) | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: <cmd>: <msg>` (no line) |
-| **Syntax/parser** | `<name>: -c: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` |
+| **Syntax/parser** | `<name>: -c: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` | `<name>: <msg>` (no line) |
 | **Pre-shell CLI** (bad option, editor init) | `<basename>: <msg>` (no line) | — | — | — |
 
 Rules distilled:
@@ -357,7 +398,11 @@ the first task and the double-prefix/`-c:`/central-printer work as its own task.
 ## Success criteria
 
 1. The emitter family (`sh_error!`/`emit_error`, `emit_syntax_error`,
-   `emit_cli_error`) exists and is the sole error-emission path in production.
+   `emit_cli_error`, plus the writer variant `sh_error_to!`/`emit_error_to`)
+   exists and is the sole error-emission path in production. Builtin sites (any
+   site holding an `out`/`err` writer from `run_builtin`) use `sh_error_to!` so
+   the bare-builtin `2>&1`/`>&2` redirect swap is respected — verified by a
+   `$(builtin 2>&1)` capture test.
 2. `error_prefix` is `pub(crate)`, takes `Diag`, and has no non-emitter caller.
 3. The invariant test passes (zero literal invocation-name text outside the
    emitter family).

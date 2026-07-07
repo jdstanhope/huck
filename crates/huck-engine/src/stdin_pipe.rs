@@ -11,19 +11,31 @@
 //! Because fd 0 is process-global, callers must not invoke this helper
 //! concurrently — tests gate on `test_support::STDIN_LOCK`.
 
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::os::fd::RawFd;
+use std::rc::Rc;
+
+use crate::shell_state::Shell;
 
 const INLINE_STDIN_THRESHOLD: usize = 4096;
 
 /// Runs `f` with fd 0 backed by `input`. fd 0 is restored to its pre-call
 /// value on return (even on panic).
-pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
+///
+/// `shell_cell` is used ONLY for the (essentially unreachable) pipe/dup
+/// error diagnostics below, and each use is a fresh, short-lived
+/// `.borrow()` that ends before `f()` runs — never held across it. Holding
+/// it across `f()` would risk a `BorrowMutError` panic, since `f()` (the
+/// caller's closure) typically re-enters the same `Shell` via its own
+/// `.borrow_mut()` (see `exec_builder::run_cwd_inner`'s doc comment on this
+/// exact hazard).
+pub fn with_stdin_fd0<R>(input: &[u8], shell_cell: &Rc<RefCell<Shell>>, f: impl FnOnce() -> R) -> R {
     let (r, w) = match make_pipe() {
         Ok(pair) => pair,
         Err(e) => {
             // Hard-fail before any state change.
-            eprintln!("huck: pipe: {}", crate::bash_io_error(&e));
+            crate::sh_error!(&*shell_cell.borrow(), None, "pipe: {}", crate::bash_io_error(&e));
             return f(); // run anyway with caller's fd 0; matches "best effort"
         }
     };
@@ -31,7 +43,7 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
     let saved = unsafe { libc::dup(0) };
     if saved < 0 {
         let e = io::Error::last_os_error();
-        eprintln!("huck: dup: {}", crate::bash_io_error(&e));
+        crate::sh_error!(&*shell_cell.borrow(), None, "dup: {}", crate::bash_io_error(&e));
         unsafe {
             libc::close(r);
             libc::close(w);
@@ -41,7 +53,7 @@ pub fn with_stdin_fd0<R>(input: &[u8], f: impl FnOnce() -> R) -> R {
 
     if unsafe { libc::dup2(r, 0) } < 0 {
         let e = io::Error::last_os_error();
-        eprintln!("huck: dup2: {}", crate::bash_io_error(&e));
+        crate::sh_error!(&*shell_cell.borrow(), None, "dup2: {}", crate::bash_io_error(&e));
         unsafe {
             libc::close(r);
             libc::close(w);
@@ -107,10 +119,14 @@ mod tests {
     use super::*;
     use crate::test_support::STDIN_LOCK;
 
+    fn test_shell_cell() -> Rc<RefCell<Shell>> {
+        Rc::new(RefCell::new(Shell::new()))
+    }
+
     #[test]
     fn short_input_round_trip() {
         let _guard = STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let captured = with_stdin_fd0(b"hello\n", || {
+        let captured = with_stdin_fd0(b"hello\n", &test_shell_cell(), || {
             let mut buf = [0u8; 16];
             let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
             assert!(n >= 0);
@@ -123,7 +139,7 @@ mod tests {
     fn fd0_is_restored_after_call() {
         let _guard = STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = unsafe { libc::dup(0) };
-        with_stdin_fd0(b"x", || ());
+        with_stdin_fd0(b"x", &test_shell_cell(), || ());
         // After the call, fd 0 should still be a valid descriptor; reading
         // from it shouldn't be EBADF.
         let buf = [0u8; 1];
@@ -147,7 +163,7 @@ mod tests {
     fn large_input_uses_writer_thread() {
         let _guard = STDIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let big = vec![b'a'; INLINE_STDIN_THRESHOLD + 100];
-        let captured = with_stdin_fd0(&big, || {
+        let captured = with_stdin_fd0(&big, &test_shell_cell(), || {
             let mut got = Vec::new();
             let mut buf = [0u8; 1024];
             loop {

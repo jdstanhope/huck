@@ -16,7 +16,7 @@ macro_rules! e {
 /// their Display text. The Display of an OS error is the documented
 /// `"{strerror} (os error {errno})"`, so stripping that exact suffix yields the
 /// same text bash gets from strerror(errno).
-pub(crate) fn bash_io_error(e: &std::io::Error) -> String {
+pub fn bash_io_error(e: &std::io::Error) -> String {
     match e.raw_os_error() {
         Some(n) => {
             let s = e.to_string();

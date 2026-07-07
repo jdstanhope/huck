@@ -4,8 +4,10 @@
 //! slash-bearing source paths, absolute or `..` redirect paths, assignment
 //! to SHELL/PATH/ENV/BASH_ENV, and `set +r`.
 //!
-//! Each helper returns Result so the caller can emit the diagnostic through
-//! its in-scope `err: &mut dyn Write` writer via the `e!` macro.
+//! Each helper returns `Result` with a body-only message (no invocation-name
+//! prefix) so the caller can emit the diagnostic through the unified emitter
+//! (`sh_error!`/`sh_error_to!`) — the "callers translate" contract, same
+//! shape as `shell_state::declare_err_message`.
 
 use crate::shell_state::Shell;
 use std::path::Path;
@@ -16,16 +18,16 @@ pub fn is_restricted(shell: &Shell) -> bool {
 }
 
 pub fn check_cd() -> Result<(), &'static str> {
-    Err("huck: restricted: cd")
+    Err("restricted: cd")
 }
 
 pub fn check_exec() -> Result<(), &'static str> {
-    Err("huck: restricted: exec")
+    Err("restricted: exec")
 }
 
 pub fn check_command_name(name: &str) -> Result<(), String> {
     if name.contains('/') {
-        Err(format!("huck: restricted: {name}: restricted"))
+        Err(format!("restricted: {name}: restricted"))
     } else {
         Ok(())
     }
@@ -33,7 +35,7 @@ pub fn check_command_name(name: &str) -> Result<(), String> {
 
 pub fn check_source_path(path: &str) -> Result<(), &'static str> {
     if path.contains('/') {
-        Err("huck: restricted: source: paths with '/'")
+        Err("restricted: source: paths with '/'")
     } else {
         Ok(())
     }
@@ -47,7 +49,7 @@ pub fn check_redirect_path(path: &str) -> Result<(), String> {
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        Err(format!("huck: restricted: {path}"))
+        Err(format!("restricted: {path}"))
     } else {
         Ok(())
     }
@@ -55,14 +57,14 @@ pub fn check_redirect_path(path: &str) -> Result<(), String> {
 
 pub fn check_special_assign(name: &str) -> Result<(), String> {
     if matches!(name, "SHELL" | "PATH" | "ENV" | "BASH_ENV") {
-        Err(format!("huck: restricted: {name}: readonly variable"))
+        Err(format!("restricted: {name}: readonly variable"))
     } else {
         Ok(())
     }
 }
 
 pub fn check_set_plus_r() -> Result<(), &'static str> {
-    Err("huck: restricted: cannot turn off restricted mode")
+    Err("restricted: cannot turn off restricted mode")
 }
 
 #[cfg(test)]
