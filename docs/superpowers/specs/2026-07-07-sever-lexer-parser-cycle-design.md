@@ -1,9 +1,16 @@
 # Sever the lexer→parser cycle (command-word subscript lvalue) — design
 
 **Date:** 2026-07-07
-**Status:** design (brainstormed, approved section-by-section)
+**Status:** design (brainstormed, approved section-by-section; revised after
+planning uncovered two pre-existing divergences in the code being removed — see
+"Behavior changes").
 **Iteration:** the follow-up committed after v267 — make the huck front-end
 dependency strictly one-way (parser → lexer) and rule-clean.
+
+**Approach chosen (of three surfaced during planning):** full rule-clean removal
+that lets the two incidental divergences resolve *toward bash* (rather than adding
+machinery to preserve the current buggy behavior). The clean architecture fixes
+them for free; see "Behavior changes (intended fixes)".
 
 ## Goal
 
@@ -158,10 +165,16 @@ On `Lit name` immediately followed by `LBracket`:
    - **anything else (glob fold-back)** → the brackets were an ordinary glob.
      Fold the pieces back into the word: append a literal `[`, the subscript
      `Word`'s parts, and a literal `]` to the word under assembly, then continue
-     normal word scanning. The atoms lexed under `ParamSubscriptOperand` for a
-     glob body (`bc`, `$x`, `$(…)`, quotes) are the same parts an ordinary word
-     scan would have produced, so the reconstructed glob word is byte-identical to
-     today's fall-through result.
+     normal word scanning. The subscript body was lexed under
+     `ParamSubscriptOperand`, so its expansions (`$x`, `$(…)`, `${…}`, quotes) are
+     assembled parts — i.e. the fold-back word **expands** them. This matches
+     huck's ordinary word-glob path (verified: `./a[$x]` → `a[2]` in both huck and
+     bash) and is a behavior change vs today's literal-swallow — see D1 under
+     "Behavior changes". Char-class / nested-bracket globs (`a[[:alpha:]]`)
+     self-heal: `ParamSubscriptOperand` terminates on the inner `]`, but the
+     leftover `]` re-coalesces into the following word run, reproducing the same
+     literal text globbing sees in bash (the no-`=` branch is still taken, so it is
+     correctly a glob, not an assignment).
 
 The result is that the lexer emits the *same* `LBracket`+subscript atoms whether
 the construct is an assignment or a glob; the **parser** decides, by the presence
@@ -171,15 +184,16 @@ lexer's old forward-scan.
 ### §4 Value-mode handshake — `Lexer::begin_assignment_value`
 
 Add `pub(crate) fn begin_assignment_value(&mut self, append: bool)` to the lexer.
-It replicates exactly what the old Indexed arm set immediately before the value
-(`lexer.rs:3776-3794`), so value lexing is byte-identical:
+It replicates what the old Indexed arm set immediately before the value
+(`lexer.rs:3776-3794`), with ONE intended change (the tilde flag, D2):
 
 - `self.cmd_at_word_start = false;`
 - `self.in_assignment_value = true;`
-- `self.assign_val_tilde_ok = …` — set to **the same value the old Indexed arm
-  used** (it set `false`; the plan MUST preserve whatever the old arm did so that
-  e.g. `a[i]=~/x` behaves identically — if a latent tilde divergence exists it is
-  preserved here, not "fixed", and noted as a possible future item).
+- `self.assign_val_tilde_ok = true;` — **changed from the old Indexed arm's
+  `false`**, so a leading `~` in the value expands, matching the scalar `name=`
+  arm and bash. This fixes divergence D2 (see "Behavior changes"). The colon-tilde
+  re-enable (`a[i]=a:~/y`, already correct today) is unaffected — it is handled by
+  the value scanner's own `:`-reset, not this flag's initial value.
 - the compound-array `(` probe: `skip_line_continuations(&mut self.cursor)`; if
   the cursor is on `(`, emit a zero-width `ArrayOpen` so the parser pushes
   `Mode::ArrayLiteral` for `a[i]=(…)` / `a[i]+=(…)`. Cursor left on `(`.
@@ -226,12 +240,14 @@ huck, and identical ASTs where covered by unit tests:
   `a['x']=v` / `a["y"]=v` (quoted subscripts), `a[i+1]=v` (arithmetic text).
 - Compound RHS: `a[i]=(x y)`, `a[i]+=(z)`, and with a `\<newline>` between `]=`
   and `(`.
-- Value tilde: `a[i]=~/x`, `a[i]=a:~/y` (whatever the current behavior is —
-  preserved, not changed).
+- Colon-tilde value: `a[i]=a:~/y` (already correct; stays correct). *(Leading
+  tilde `a[i]=~/x` is intentionally CHANGED — see D2.)*
 - Assoc keys: `declare -A m; m[key]=v`, `m[$k]=v`.
-- **Glob fold-back (the risk):** `a[bc]` / `[abc]` / `a[b-c]` / `a[!x]` as a
-  **command word** with no `=` (must remain a glob, byte-identical), plus mixed
-  shapes `a[b] c`, `a[b]c=` (name is `a[b]c`? — match bash), `a[b]=c d`.
+- **Glob fold-back:** `a[bc]` / `[abc]` / `a[b-c]` / `a[!x]` / `a[[:alpha:]]` as a
+  **command word** with no `=` (glob, matching **bash**), plus mixed shapes
+  `a[b] c`, `a[b]c=` (name `a[b]c` — match bash), `a[b]=c d`. *(Literal-subscript
+  globs like `a[bc]` are already byte-identical to both; expansion-bearing ones
+  like `a[$x]` are intentionally CHANGED — see D1.)*
 - Inline-assignment lists and command-prefixed assignments: `a[i]=v cmd`,
   `x=1 a[i]=2 cmd`.
 - Error parity: `a[$(echo 1]=x` (unterminated `$(` in a subscript) and
@@ -261,9 +277,13 @@ huck, and identical ASTs where covered by unit tests:
 ## Risks & invariants
 
 - **Glob fold-back is the one behavior-sensitive path** (a common construct). The
-  same-atoms-either-way argument (§3) is the safety story; the new harness is the
-  proof. If any glob case diverges, the fold-back reconstruction is wrong and must
-  match the ordinary word-scan output exactly.
+  safety target is now huck's **ordinary word-glob path** (which already matches
+  bash — verified: `./a[$x]` → `a[2]`, `./a[[:alpha:]]` → the char-class match).
+  The fold-back must produce the same parts that path would; the new harness
+  (asserting bash-parity) is the proof. A *degenerate* char-class SUBSCRIPT in an
+  actual assignment (`a[[:alpha:]]=x`) may mis-classify as a glob (the inner `]`
+  ends the subscript before the `=`); this is nonsensical input and is documented,
+  not handled.
 - **`pending_lvalue_subscript` lifetime** — must survive the subscript-body mode
   excursion and be cleared on exactly the assignment / glob outcomes; a leaked
   flag would mis-tokenize the *next* word's `=`. Covered by the mixed-shape tests.
@@ -275,12 +295,34 @@ huck, and identical ASTs where covered by unit tests:
   matching and the `=` decision. No speculative delimiter scan, no lexer→parser
   call.
 
+## Behavior changes (intended fixes)
+
+The clean architecture resolves two pre-existing huck→bash divergences that live
+in the very code being deleted. Both move huck *toward* bash. They are the only
+observable behavior changes; everything else is byte-identical to today. Both get
+a bash-parity harness case and a note in the iteration log (and
+`docs/bash-divergences.md` if either had an entry — neither currently does).
+
+- **D1 — command-position `name[…]` with no `=` now expands its subscript.**
+  Today huck literal-swallows the whole `name[…]` region (`$`, `` ` ``, quotes stay
+  LITERAL). Example: `x=2; echo a[$x]` → today `a[$x]`, after `a[2]` (bash: `a[2]`).
+  Root: the deleted forward-scan's `None =>` literal-swallow arm
+  (`lexer.rs:3799-3820`). After the change the region flows through ordinary
+  word-part assembly (the glob fold-back, §3), so it expands like every other
+  word — matching bash. Literal-only subscripts (`a[bc]`) are unchanged.
+
+- **D2 — leading `~` in an indexed-assignment value now expands.**
+  Example: `a[0]=~/y` → today `~/y`, after `/home/…/y` (bash: expands; scalar
+  `x=~/y` already expands). Root: the old Indexed arm set
+  `assign_val_tilde_ok = false`; `begin_assignment_value` (§4) sets it `true`,
+  matching the scalar arm. Colon-tilde (`a[i]=a:~/y`) was and stays correct.
+
 ## Non-goals
 
 - No change to scalar/bare assignment, array literals, `${…}`, or any expansion
-  semantics.
-- Not fixing any latent tilde/error-variant divergence — behavior is preserved
-  byte-for-byte; any such gap is documented as a possible future item, not
-  addressed here.
+  semantics **beyond D1/D2 above**.
+- Not fixing any *other* latent divergence (e.g. the internal error-*variant* shift
+  when a malformed subscript stops going through `SubscriptParseError` — the
+  bash-observable message is what the harness asserts).
 - Not touching the `#[cfg(test)]` lexer→parser test references (the one-way
   invariant is a production-code property).
