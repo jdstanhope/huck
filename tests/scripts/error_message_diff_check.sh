@@ -172,5 +172,85 @@ h=$("$HUCK_BIN" -c 'x=$(type -Z 2>&1); echo "$x"')
 checkshape "builtin bare-redirect capture: type -Z capture is non-empty" "$h" '.'
 checkshape "builtin bare-redirect capture: type -Z carries the message body" "$h" 'invalid option'
 
+# ---------------------------------------------------------------------------
+# 8. Capture matrix (v269 T4fix): the durable regression gate for the
+#    executor.rs misconversion (commit f03e8b5) — 84 sites that held a LOCAL
+#    redirect-aware writer (`err_writer(err_sink, sink)`) were switched to the
+#    thread-local `sh_error!`, which does not see an inner per-command
+#    redirect (`$(cmd 2>&1)`) at all.
+#
+#    IMPORTANT (verified against the bash oracle, not assumed): a trailing
+#    `2>&1` on the SAME simple command does NOT make every one of its own
+#    diagnostics land in the `$(...)` capture buffer, even in real bash —
+#    expansion-time errors (arith `$((1/0))`), redirect-processing errors
+#    (a bad fd, an ambiguous redirect), and the readonly-reassignment check
+#    all fire before that command's own redirect list has taken effect, so
+#    bash itself leaks them to the real fd 2, empty-handed on the capture
+#    side. Only command-resolution failures (command-not-found) and builtin
+#    errors (cd, tested in §7) are captured. So the gate compares huck
+#    against bash on BOTH channels — the `$(...)` capture AND the real-fd
+#    leak — for each fragment, rather than assuming "must always capture".
+#    This is what actually catches the misconversion: a misrouted site
+#    leaks on huck while bash captures (or vice versa), which shows up as a
+#    channel/content mismatch between the two here.
+# ---------------------------------------------------------------------------
+
+# checkcapture: run `frag` as `x=$(frag 2>&1); printf '%s' "$x"` under both
+# shells, ALSO capturing each side's real stderr (the "leak" channel). Passes
+# when the two sides route the diagnostic to the SAME channel (both capture,
+# or both leak) with matching content (tail after the leading "<name>: "
+# field, normalized).
+checkcapture() {
+    local label="$1" frag="$2"
+    local bleakfile hleakfile
+    bleakfile=$(mktemp "${TMPDIR:-/tmp}/huck-errmsg-leak.XXXXXX")
+    hleakfile=$(mktemp "${TMPDIR:-/tmp}/huck-errmsg-leak.XXXXXX")
+    local b_cap h_cap
+    b_cap=$("$BASH_BIN" -c "x=\$($frag 2>&1); printf '%s' \"\$x\"" 2>"$bleakfile")
+    h_cap=$("$HUCK_BIN" -c "x=\$($frag 2>&1); printf '%s' \"\$x\"" 2>"$hleakfile")
+    local b_leak h_leak
+    b_leak=$(cat "$bleakfile")
+    h_leak=$(normalize "$(cat "$hleakfile")")
+    rm -f "$bleakfile" "$hleakfile"
+    local b_cap_tail="${b_cap#*: }" h_cap_tail="${h_cap#*: }"
+    local b_leak_tail="${b_leak#*: }" h_leak_tail="${h_leak#*: }"
+    if [[ "$b_cap_tail" == "$h_cap_tail" && "$b_leak_tail" == "$h_leak_tail" && -n "$b_cap$b_leak" ]]; then
+        printf 'PASS: %s\n' "$label"; PASS=$((PASS+1))
+    else
+        printf 'FAIL: %s\n' "$label"
+        printf '    bash  capture=[%s] leak=[%s]\n' "$b_cap" "$b_leak"
+        printf '    huck  capture=[%s] leak=[%s]\n' "$h_cap" "$h_leak"
+        FAIL=$((FAIL+1))
+    fi
+}
+
+checkcapture "capture matrix: command not found" "nosuchcmd_xyz"
+checkcapture "capture matrix: cd nonexistent" "cd /nonexistent_capture_xyz"
+checkcapture "capture matrix: arith division by zero" "echo \$((1/0))"
+checkcapture "capture matrix: bad-fd redirect" "echo x >&9"
+checkcapture "capture matrix: readonly reassignment" "readonly r=1; r=2"
+
+# Ambiguous redirect: bash's own body includes the offending word (`$y:
+# ambiguous redirect`) while huck's omits it (a pre-existing, unrelated
+# message-wording gap — not a routing regression). Assert routing parity
+# (both sides leak to the real fd, capture stays empty) and that huck's own
+# leaked body carries "ambiguous redirect", without requiring a byte-exact
+# match against bash's wording.
+b_cap=$("$BASH_BIN" -c 'y="a b"; x=$(echo x > $y 2>&1); printf "%s" "$x"' 2>/dev/null)
+h_cap=$("$HUCK_BIN" -c 'y="a b"; x=$(echo x > $y 2>&1); printf "%s" "$x"' 2>/dev/null)
+h_leak=$("$HUCK_BIN" -c 'y="a b"; x=$(echo x > $y 2>&1); printf "%s" "$x"' 2>&1 >/dev/null)
+checkshape "capture matrix: ambiguous redirect — capture stays empty (bash) too" "$b_cap" '^$'
+checkshape "capture matrix: ambiguous redirect — capture stays empty (huck)" "$h_cap" '^$'
+checkshape "capture matrix: ambiguous redirect — huck leaks to real fd 2" "$h_leak" 'ambiguous redirect'
+
+# type -Z: bash's own usage-dump second line is out of scope (message-body
+# wording is a non-goal elsewhere in this harness too) — assert non-empty
+# capture and that the shared "invalid option" wording matches instead of a
+# full-body diff.
+b=$("$BASH_BIN" -c 'x=$(type -Z 2>&1); printf "%s" "$x"')
+h=$("$HUCK_BIN" -c 'x=$(type -Z 2>&1); printf "%s" "$x"')
+checkshape "capture matrix: type -Z capture is non-empty" "$h" '.'
+checkshape "capture matrix: type -Z body matches bash wording" "$h" 'invalid option'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -123,23 +123,23 @@ pub(crate) fn err_writer<'a>(
 }
 
 /// Emit a path-bearing redirect-open failure in bash's format:
-/// `<prologue>{path}: {strerror}` via `sh_error!` — the non-interactive
+/// `<prologue>{path}: {strerror}` via `sh_error_to!` — the non-interactive
 /// prologue (`<src>: line N: `) or interactive `huck: `, the offending path,
 /// and `bash_io_error` (strerror with no Rust `(os error N)` suffix). Single
 /// home for every `File::open`/`open_resolved`/`OpenOptions` redirect-open
-/// error so the format stays identical across execution contexts. The sink
-/// params are unused now that emission routes through the thread-local sink
-/// (`with_err`, installed for the whole top-level execution) rather than the
-/// directly-threaded `err_sink`/`out_sink` — kept so the ~27 call sites don't
-/// need updating.
+/// error so the format stays identical across execution contexts. Routes
+/// through the CALLER's redirect-aware writer (built from `err_sink`/`out_sink`)
+/// rather than the thread-local sink, so an inner `2>&1`/capture on the
+/// surrounding command is honored (v269 T4fix).
 pub(crate) fn redir_open_error(
     shell: &Shell,
-    _err_sink: &mut StderrSink,
-    _out_sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    out_sink: &mut StdoutSink,
     path: &str,
     e: &std::io::Error,
 ) {
-    crate::sh_error!(shell, None, "{path}: {}", crate::bash_io_error(e));
+    let mut err = err_writer(err_sink, out_sink);
+    crate::sh_error_to!(shell, &mut *err, None, "{path}: {}", crate::bash_io_error(e));
 }
 
 /// Flush huck's buffered stdout (Rust wraps fd 1 in a `LineWriter`, so a trailing
@@ -596,7 +596,7 @@ fn run_command(
                 StdoutSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         return ExecOutcome::Continue(1);
                     }
                 },
@@ -613,7 +613,7 @@ fn run_command(
                 StderrSink::Capture(_) => match make_pipe() {
                     Ok((r, w)) => (w, Some(r)),
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         if let Some(r) = capture_read_fd { unsafe { libc::close(r); } }
                         if stdout_fd != libc::STDOUT_FILENO { unsafe { libc::close(stdout_fd); } }
                         return ExecOutcome::Continue(1);
@@ -634,7 +634,7 @@ fn run_command(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
                     if let Some(r) = capture_read_fd {
                         unsafe { libc::close(r); }
                     }
@@ -801,7 +801,7 @@ fn run_command(
             // POSIX: a function may not be named after a special builtin; a
             // non-interactive posix shell errors and exits (default mode allows it).
             if shell.shell_options.posix && builtins::is_special_builtin(name) {
-                crate::sh_error!(shell, None, "{name}: is a special builtin");
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: is a special builtin"); }
                 shell.posix_fatal(2);
                 return ExecOutcome::Continue(2);
             }
@@ -819,7 +819,7 @@ fn run_command(
         }
         Command::Coproc { name, body } => run_coproc(name, body, shell, sink, err_sink),
         _ => {
-            crate::sh_error!(shell, None, "unsupported command variant");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "unsupported command variant"); }
             ExecOutcome::Continue(1)
         }
     }
@@ -856,8 +856,8 @@ impl RedirectScope {
         shell: &Shell,
         new_fd: RawFd,
         target_fd: RawFd,
-        _sink: &mut StdoutSink,
-        _err_sink: &mut StderrSink,
+        sink: &mut StdoutSink,
+        err_sink: &mut StderrSink,
     ) -> Result<(), ()> {
         unsafe {
             // `dup` fails with EBADF when target_fd is not open (e.g. a fresh
@@ -865,7 +865,7 @@ impl RedirectScope {
             // -1 so Drop closes target_fd back to its unopened state.
             let saved = libc::dup(target_fd);
             if libc::dup2(new_fd, target_fd) < 0 {
-                crate::sh_error!(shell, None, "dup2: {}", io::Error::last_os_error());
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "dup2: {}", io::Error::last_os_error()); }
                 if saved >= 0 {
                     libc::close(saved);
                 }
@@ -902,7 +902,7 @@ impl RedirectScope {
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            crate::sh_error!(shell, None, "ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
             return Err(ExecOutcome::Continue(1));
         };
         let target = target as RawFd;
@@ -981,13 +981,13 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 // Validate the source fd is open before dup2 (bash: bad fd error).
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    crate::sh_error!(shell, None, "{src}: Bad file descriptor");
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor"); }
                     return Err(ExecOutcome::Continue(1));
                 }
                 if self.redirect(shell, src, target, sink, err_sink).is_err() {
@@ -1016,7 +1016,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1035,7 +1035,7 @@ impl RedirectScope {
                         Ok(())
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                         Err(ExecOutcome::Continue(1))
                     }
                 }
@@ -1065,7 +1065,7 @@ impl RedirectScope {
             let fd: RawFd = match cur.trim().parse::<i32>() {
                 Ok(n) if n >= 0 => n,
                 _ => {
-                    crate::sh_error!(shell, None, "{name}: ambiguous redirect");
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect"); }
                     return Err(ExecOutcome::Continue(1));
                 }
             };
@@ -1127,12 +1127,12 @@ impl RedirectScope {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
                     Err(e) => {
-                        crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 };
                 if unsafe { libc::fcntl(src, libc::F_GETFD) } < 0 {
-                    crate::sh_error!(shell, None, "{src}: Bad file descriptor");
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{src}: Bad file descriptor"); }
                     return Err(ExecOutcome::Continue(1));
                 }
                 (src, false)
@@ -1145,7 +1145,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1159,7 +1159,7 @@ impl RedirectScope {
                         (rfd, true)
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                         return Err(ExecOutcome::Continue(1));
                     }
                 }
@@ -1175,7 +1175,7 @@ impl RedirectScope {
                 if owns_src {
                     unsafe { libc::close(src) };
                 }
-                crate::sh_error!(shell, None, "{name}: {}", crate::bash_io_error(&e));
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: {}", crate::bash_io_error(&e)); }
                 return Err(ExecOutcome::Continue(1));
             }
         };
@@ -1797,7 +1797,7 @@ fn run_for_inner(
     // body not run, the surrounding list continues). Reserved words like `if`
     // are valid identifiers and fall through to run normally.
     if !crate::builtins::is_valid_name(&clause.var) {
-        crate::sh_error!(shell, None, "`{}': not a valid identifier", clause.var);
+        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "`{}': not a valid identifier", clause.var); }
         return ExecOutcome::Continue(1);
     }
 
@@ -1837,7 +1837,7 @@ fn run_for_inner(
             return o;
         }
         if shell.try_set(&clause.var, value).is_err() {
-            crate::sh_error!(shell, None, "{}: readonly variable", clause.var);
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var); }
             shell.posix_fatal(127);
             return ExecOutcome::Continue(1);
         }
@@ -1962,8 +1962,8 @@ fn format_select_menu(items: &[String], cols_width: usize) -> String {
 fn run_arith(
     body: &crate::lexer::Word,
     shell: &mut Shell,
-    _sink: &mut StdoutSink,
-    _err_sink: &mut StderrSink,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     xtrace_compound(shell, &format!("(( {} ))", crate::expand::reconstruct_word_source_inner(body)));
     let (src, res) = crate::expand::eval_arith_word_src(body, shell);
@@ -1971,7 +1971,8 @@ fn run_arith(
         Ok(0) => ExecOutcome::Continue(1),
         Ok(_) => ExecOutcome::Continue(0),
         Err(e) => {
-            crate::sh_error!(shell, Some("(("), "{}", crate::arith::render_error_body(&src, &e));
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(shell, &mut *err, Some("(("), "{}", crate::arith::render_error_body(&src, &e));
             ExecOutcome::Continue(1)
         }
     }
@@ -2007,7 +2008,7 @@ fn run_arith_for_inner(
     if let Some(init) = &clause.init
         && let Err(e) = crate::expand::eval_arith_word(init, shell)
     {
-        crate::sh_error!(shell, None, "((: {e}");
+        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
         return ExecOutcome::Continue(1);
     }
 
@@ -2027,7 +2028,7 @@ fn run_arith_for_inner(
             Some(c) => match crate::expand::eval_arith_word(c, shell) {
                 Ok(v) => v,
                 Err(e) => {
-                    crate::sh_error!(shell, None, "((: {e}");
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
                     return ExecOutcome::Continue(1);
                 }
             },
@@ -2068,7 +2069,7 @@ fn run_arith_for_inner(
         if let Some(step) = &clause.step
             && let Err(e) = crate::expand::eval_arith_word(step, shell)
         {
-            crate::sh_error!(shell, None, "((: {e}");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "((: {e}"); }
             return ExecOutcome::Continue(1);
         }
     }
@@ -2205,7 +2206,7 @@ fn run_select_inner(
 
         // 3c. Bind NAME (honor readonly like the other loop runners).
         if shell.try_set(&clause.var, selection).is_err() {
-            crate::sh_error!(shell, None, "{}: readonly variable", clause.var);
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: readonly variable", clause.var); }
             return ExecOutcome::Continue(1);
         }
 
@@ -2394,7 +2395,7 @@ fn run_double_bracket(
         Ok(true)  => ExecOutcome::Continue(0),
         Ok(false) => ExecOutcome::Continue(1),
         Err(msg)  => {
-            crate::sh_error!(shell, None, "[[: {msg}");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "[[: {msg}"); }
             ExecOutcome::Continue(2)
         }
     };
@@ -2719,7 +2720,7 @@ fn run_background_subshell(
             ExecOutcome::Continue(0)
         }
         Err(e) => {
-            crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
             ExecOutcome::Continue(1)
         }
     }
@@ -2757,7 +2758,7 @@ fn run_background_sequence(
         match File::open("/dev/null") {
             Ok(f) => f.into_raw_fd(),
             Err(e) => {
-                crate::sh_error!(shell, None, "/dev/null: {}", crate::bash_io_error(&e));
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "/dev/null: {}", crate::bash_io_error(&e)); }
                 return ExecOutcome::Continue(1);
             }
         }
@@ -2797,7 +2798,7 @@ fn run_background_sequence(
                         w
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                     }
                 }
@@ -2828,7 +2829,7 @@ fn run_background_sequence(
                     spawned_pids.push(pid);
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
                     return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                 }
@@ -2892,7 +2893,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
@@ -2910,7 +2911,7 @@ fn run_background_sequence(
                     match spawn_heredoc_writer(&bytes) {
                         Ok((r, _pid)) => r,
                         Err(e) => {
-                            crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
                         }
@@ -3046,7 +3047,7 @@ fn run_background_sequence(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
@@ -3068,7 +3069,7 @@ fn run_background_sequence(
                     w
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -3100,7 +3101,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
@@ -3114,7 +3115,7 @@ fn run_background_sequence(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 return bail_teardown_bg(shell, procsub_base, first_pid, &spawned_pids, &mut parent_held);
@@ -3145,7 +3146,7 @@ fn run_background_sequence(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                 if !went_external {
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if stdout_fd > 2 { unsafe { libc::close(stdout_fd); } }
@@ -3380,7 +3381,7 @@ enum ResolvedRedirect {
 fn expand_single(
     word: &crate::lexer::Word,
     shell: &mut Shell,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Result<String, ()> {
     // Redirect targets do NOT undergo pathname expansion in v10 (per spec).
     // We call `expand` directly and require exactly one field, preserving the
@@ -3389,7 +3390,7 @@ fn expand_single(
     if fields.len() == 1 {
         Ok(fields.into_iter().next().unwrap().chars)
     } else {
-        crate::sh_error!(shell, None, "ambiguous redirect");
+        crate::sh_error_to!(shell, err, None, "ambiguous redirect");
         Err(())
     }
 }
@@ -3410,7 +3411,7 @@ fn resolve_fd_target(source: &crate::lexer::Word, shell: &mut Shell) -> Result<i
 fn glob_expand_word(
     word: &crate::lexer::Word,
     shell: &mut Shell,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Result<Vec<String>, ()> {
     // Borrow note: take the owned `Copy` opts before the mutable `expand`
     // borrow, so the immutable borrow ends first.
@@ -3418,7 +3419,7 @@ fn glob_expand_word(
     let fields = expand(word, shell);
     let exp = glob_expand_fields_opts(fields, opts);
     if !exp.failglob_unmatched.is_empty() {
-        crate::sh_error!(shell, None, "no match: {}", exp.failglob_unmatched.join(" "));
+        crate::sh_error_to!(shell, err, None, "no match: {}", exp.failglob_unmatched.join(" "));
         return Err(());
     }
     Ok(exp.words)
@@ -3437,7 +3438,7 @@ fn resolve(
         return Err(status);
     }
     if prog_fields.is_empty() {
-        crate::sh_error!(shell, None, "command not found:");
+        crate::sh_error_to!(shell, err, None, "command not found:");
         return Err(127);
     }
     let mut iter = prog_fields.into_iter();
@@ -3678,7 +3679,7 @@ pub(crate) fn call_function(
         .filter(|f| matches!(f.kind, crate::shell_state::FrameKind::Function))
         .count();
     if depth >= limit {
-        crate::sh_error!(shell, Some(name), "maximum function nesting level exceeded ({limit})");
+        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, Some(name), "maximum function nesting level exceeded ({limit})"); }
         return ExecOutcome::Continue(1);
     }
     let saved = std::mem::take(&mut shell.positional_args);
@@ -3886,7 +3887,7 @@ fn run_assignment_list(
         // For namerefs, skip the early readonly check and let assign() check the
         // RESOLVED target's readonly — a readonly nameref lets you write through.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            crate::sh_error!(shell, None, "{name}: readonly variable");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable"); }
             shell.posix_fatal(127);
             st = 1;
             break;
@@ -4101,7 +4102,7 @@ fn run_exec_single_inner(
                     break;
                 }
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
-                    crate::sh_error!(shell, None, "command: {s}: invalid option");
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "command: {s}: invalid option"); }
                     drain_procsubs(shell, procsub_base);
                     return ExecOutcome::Continue(2);
                 }
@@ -4157,17 +4158,21 @@ fn run_exec_single_inner(
     // a documented divergence — bash runs it. The `builtin`-led forms are handled
     // by the pre-resolve interception with decl_args rebuilt.)
     if require_builtin && builtins::is_declaration_command(&resolved.program) {
-        crate::sh_error!(
-            shell,
-            None,
-            "builtin: {}: declaration builtins must not be wrapped by `command builtin`",
-            resolved.program
-        );
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                None,
+                "builtin: {}: declaration builtins must not be wrapped by `command builtin`",
+                resolved.program
+            );
+        }
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
     if require_builtin && !builtins::is_builtin(&resolved.program) {
-        crate::sh_error!(shell, None, "builtin: {}: not a shell builtin", resolved.program);
+        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "builtin: {}: not a shell builtin", resolved.program); }
         drain_procsubs(shell, procsub_base);
         return ExecOutcome::Continue(1);
     }
@@ -4584,7 +4589,7 @@ fn run_exec_builtin(
     let flags = match parse_exec_flags(&resolved.args) {
         Ok(f) => f,
         Err(msg) => {
-            crate::sh_error!(shell, None, "{msg}");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{msg}"); }
             // POSIX case #1: bad option is a usage error (the exec interception
             // consumes this for a bare invocation).
             shell.builtin_usage_error = Some(2);
@@ -4621,7 +4626,7 @@ fn run_exec_builtin(
             } else {
                 ("not found", 127)
             };
-            crate::sh_error!(shell, None, "exec: {name}: {msg}");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "exec: {name}: {msg}"); }
             return exit_or_continue(code, shell);
         }
     };
@@ -4650,7 +4655,7 @@ fn run_exec_builtin(
         Some(libc::ENOENT) => 127,
         _ => 126, // EACCES / ENOEXEC / EISDIR / etc.: "cannot execute".
     };
-    crate::sh_error!(shell, None, "exec: {name}: {err}");
+    { let mut errw = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *errw, None, "exec: {name}: {err}"); }
     exit_or_continue(code, shell)
 }
 
@@ -4784,7 +4789,7 @@ fn build_child_redir_plan(
                 let fd: i32 = match cur.trim().parse::<i32>() {
                     Ok(n) if n >= 0 => n,
                     _ => {
-                        crate::sh_error!(shell, None, "{name}: ambiguous redirect");
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: ambiguous redirect"); }
                         return Err(1);
                     }
                 };
@@ -4834,7 +4839,7 @@ fn build_child_redir_plan(
                 RedirOp::Dup { source, .. } => {
                     let src = match resolve_fd_target(source, shell) {
                         Ok(fd) => fd,
-                        Err(e) => { crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e)); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
                     };
                     (src, false)
                 }
@@ -4842,7 +4847,7 @@ fn build_child_redir_plan(
                     let bytes = expand_assignment(body, shell).into_bytes();
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e)); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                     }
                 }
                 RedirOp::HereString(w) => {
@@ -4850,7 +4855,7 @@ fn build_child_redir_plan(
                     bytes.push(b'\n');
                     match spawn_heredoc_writer(&bytes) {
                         Ok((rfd, pid)) => { plan.heredoc_writers.push(pid); (rfd, true) }
-                        Err(e) => { crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e)); return Err(1); }
+                        Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                     }
                 }
                 RedirOp::Close => unreachable!("Close handled above"),
@@ -4859,7 +4864,7 @@ fn build_child_redir_plan(
                 Ok(h) => h,
                 Err(e) => {
                     if owns_src { unsafe { libc::close(src) }; }
-                    crate::sh_error!(shell, None, "{name}: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: {}", crate::bash_io_error(&e)); }
                     return Err(1);
                 }
             };
@@ -4882,7 +4887,7 @@ fn build_child_redir_plan(
         }
         let Some(target) = redir.target_fd() else {
             // RedirFd::Var is handled above; any other None is unexpected.
-            crate::sh_error!(shell, None, "ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
             return Err(1);
         };
         let target = target as i32;
@@ -4943,7 +4948,7 @@ fn build_child_redir_plan(
                 // number is valid in the child after fork.
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e)); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
                 };
                 plan.ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -4960,7 +4965,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e)); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                 }
             }
             RedirOp::HereString(w) => {
@@ -4974,7 +4979,7 @@ fn build_child_redir_plan(
                         plan.ops.push(ChildRedirOp::Dup { target, source: rfd });
                         plan.held.push(owned);
                     }
-                    Err(e) => { crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e)); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); } return Err(1); }
                 }
             }
         }
@@ -5008,7 +5013,7 @@ fn build_child_extra_ops(
     let mut held: Vec<OwnedFd> = Vec::new();
     for redir in &extra {
         let Some(target) = redir.target_fd() else {
-            crate::sh_error!(shell, None, "ambiguous redirect");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "ambiguous redirect"); }
             return Err(1);
         };
         let target = target as i32;
@@ -5052,7 +5057,7 @@ fn build_child_extra_ops(
             RedirOp::Dup { source, .. } => {
                 let src = match resolve_fd_target(source, shell) {
                     Ok(fd) => fd,
-                    Err(e) => { crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e)); return Err(1); }
+                    Err(e) => { { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); } return Err(1); }
                 };
                 ops.push(ChildRedirOp::Dup { target, source: src });
             }
@@ -5074,6 +5079,34 @@ fn build_child_extra_ops(
 /// correctly. fds 0/1/2 and fd>2 are all handled uniformly by the replay; this
 /// function no longer wires `.stdin/.stdout/.stderr` from opened files (only the
 /// capture pipe, which any explicit fd-1 redirect in the replay then overrides).
+/// Emit a spawn-failure diagnostic (command-not-found / exec error) for an
+/// external command whose redirects were lowered into a CHILD-only replay
+/// plan (`ChildRedirPlan`) that never ran (the fork never happened). Since
+/// the real fds were never touched, route through the OUTER sink as usual —
+/// UNLESS `stderr_follows_stdout` (this command's own trailing `2>&1`, with
+/// no later fd-1 override) is set while stdout is captured, in which case
+/// write into the stdout capture buffer instead, so a `$(cmd 2>&1)` still
+/// sees the diagnostic. Mirrors `run_builtin_with_redirects`'s in-memory
+/// `route_err_to_out` (v205/L-25) for this one pre-fork external-command site.
+fn emit_exec_spawn_diag(
+    shell: &Shell,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
+    stderr_follows_stdout: bool,
+    body: std::fmt::Arguments,
+) {
+    match sink {
+        StdoutSink::Capture(obuf) if stderr_follows_stdout => {
+            let mut w = LineDispatchWriter { inner: obuf, stream: LineStream::Stdout };
+            crate::emit_error_to(shell, &mut w, None, body);
+        }
+        _ => {
+            let mut err = err_writer(err_sink, sink);
+            crate::emit_error_to(shell, &mut *err, None, body);
+        }
+    }
+}
+
 fn run_subprocess(
     cmd: &ResolvedCommand,
     mut plan: ChildRedirPlan,
@@ -5100,6 +5133,24 @@ fn run_subprocess(
     // pre_exec). All ops are pure dup2/close (async-signal-safe). On any failure
     // return Err so spawn() fails cleanly.
     let ops = std::mem::take(&mut plan.ops);
+    // Detect whether this command's OWN `2>&1` (with no later fd-1 override)
+    // would, once replayed, route the child's stderr back onto its stdout.
+    // Needed for the spawn-failure diagnostics below: those fire BEFORE any
+    // fork happens, so `replay_redir_ops` never runs and the real fds are
+    // never touched — a `$(cmd 2>&1)` capture would otherwise miss a
+    // command-not-found/exec diagnostic entirely. Mirrors
+    // `run_builtin_with_redirects`'s in-memory `route_err_to_out` (v205/L-25).
+    let stderr_follows_stdout = {
+        let last_2_from_1 = ops
+            .iter()
+            .rev()
+            .find(|op| matches!(op, ChildRedirOp::Dup { target: 2, .. } | ChildRedirOp::Close { target: 2 }))
+            .is_some_and(|op| matches!(op, ChildRedirOp::Dup { source: 1, .. }));
+        let fd1_overridden = ops
+            .iter()
+            .any(|op| matches!(op, ChildRedirOp::Dup { target: 1, .. } | ChildRedirOp::Close { target: 1 }));
+        last_2_from_1 && !fd1_overridden
+    };
     unsafe {
         process.pre_exec(move || replay_redir_ops(&ops));
     }
@@ -5276,7 +5327,7 @@ fn run_subprocess(
                         ExecOutcome::Continue(code)
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "{}: {}", cmd.program, crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}: {}", cmd.program, crate::bash_io_error(&e)); }
                         ExecOutcome::Continue(1)
                     }
                 }
@@ -5297,7 +5348,7 @@ fn run_subprocess(
             }
             // bash format: `<src>: line N: <name>: command not found` (the name
             // precedes the phrase; error_prefix supplies the prologue + mode split).
-            crate::sh_error!(shell, None, "{}: command not found", cmd.program);
+            emit_exec_spawn_diag(shell, sink, err_sink, stderr_follows_stdout, format_args!("{}: command not found", cmd.program));
             ExecOutcome::Continue(127)
         }
         Err(e) => {
@@ -5305,7 +5356,7 @@ fn run_subprocess(
                 let mut st = 0;
                 unsafe { libc::waitpid(wpid, &mut st, 0); }
             }
-            crate::sh_error!(shell, None, "{}: {}", cmd.program, crate::bash_io_error(&e));
+            emit_exec_spawn_diag(shell, sink, err_sink, stderr_follows_stdout, format_args!("{}: {}", cmd.program, crate::bash_io_error(&e)));
             ExecOutcome::Continue(1)
         }
     }
@@ -5327,17 +5378,21 @@ fn run_coproc(
     name: &str,
     body: &Command,
     shell: &mut Shell,
-    _sink: &mut StdoutSink,
-    _err_sink: &mut StderrSink,
+    sink: &mut StdoutSink,
+    err_sink: &mut StderrSink,
 ) -> ExecOutcome {
     // v157 single-active: warn (but proceed) if a coproc is already live.
     if let Some(existing) = shell.coprocs.first() {
-        crate::sh_error!(
-            shell,
-            None,
-            "warning: execute_coproc: coproc [{}:{}] still exists",
-            existing.pid, existing.name
-        );
+        {
+            let mut err = err_writer(err_sink, sink);
+            crate::sh_error_to!(
+                shell,
+                &mut *err,
+                None,
+                "warning: execute_coproc: coproc [{}:{}] still exists",
+                existing.pid, existing.name
+            );
+        }
     }
     // make_pipe() returns (read_end, write_end).
     // pipe_in: shell writes in_w -> coproc reads in_r (its stdin).
@@ -5345,7 +5400,7 @@ fn run_coproc(
     let (in_r, in_w) = match make_pipe() {
         Ok(p) => p,
         Err(e) => {
-            crate::sh_error!(shell, None, "coproc: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5356,7 +5411,7 @@ fn run_coproc(
                 libc::close(in_r);
                 libc::close(in_w);
             }
-            crate::sh_error!(shell, None, "coproc: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5382,7 +5437,7 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(out_w);
             }
-            crate::sh_error!(shell, None, "coproc: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5404,7 +5459,7 @@ fn run_coproc(
                 libc::close(out_r);
                 libc::close(in_w);
             }
-            crate::sh_error!(shell, None, "coproc: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5421,7 +5476,7 @@ fn run_coproc(
                 libc::close(read_fd);
                 libc::close(in_w);
             }
-            crate::sh_error!(shell, None, "coproc: {}", crate::bash_io_error(&e));
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "coproc: {}", crate::bash_io_error(&e)); }
             return ExecOutcome::Continue(1);
         }
     };
@@ -5538,7 +5593,7 @@ fn run_multi_stage(
                     (Some(w), Some(r))
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                     return ExecOutcome::Continue(1);
                 }
             }
@@ -5588,7 +5643,7 @@ fn run_multi_stage(
                         w
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         // Clean up all held fds.
                         return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                     }
@@ -5603,7 +5658,7 @@ fn run_multi_stage(
                                 w
                             }
                             Err(e) => {
-                                crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                                 return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                             }
                         }
@@ -5630,7 +5685,7 @@ fn run_multi_stage(
                     pipeline_stages.push(PipelineStage::Forked(pid));
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "fork: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "fork: {}", crate::bash_io_error(&e)); }
                     return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                 }
             }
@@ -5710,7 +5765,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
@@ -5733,7 +5788,7 @@ fn run_multi_stage(
                             r
                         }
                         Err(e) => {
-                            crate::sh_error!(shell, None, "heredoc: {}", crate::bash_io_error(&e));
+                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "heredoc: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             return bail_teardown_stage(shell, procsub_base, &mut parent_held);
                         }
@@ -5876,7 +5931,7 @@ fn run_multi_stage(
                         parent_held.push(r);
                     }
                     Err(e) => {
-                        crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if let Some(efd) = explicit_stderr_fd { unsafe { libc::close(efd); } }
@@ -5899,7 +5954,7 @@ fn run_multi_stage(
                     w
                 }
                 Err(e) => {
-                    crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                    { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                     restore_inline_assignments(snap, shell);
                     if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                     if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -5916,7 +5971,7 @@ fn run_multi_stage(
                             w
                         }
                         Err(e) => {
-                            crate::sh_error!(shell, None, "pipe: {}", crate::bash_io_error(&e));
+                            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "pipe: {}", crate::bash_io_error(&e)); }
                             restore_inline_assignments(snap, shell);
                             if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                             if let Some(fd) = explicit_stderr_fd { unsafe { libc::close(fd); } }
@@ -5953,7 +6008,7 @@ fn run_multi_stage(
                     let fd = unsafe { libc::dup(shared) };
                     if fd < 0 {
                         let e = io::Error::last_os_error();
-                        crate::sh_error!(shell, None, "dup: {}", crate::bash_io_error(&e));
+                        { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "dup: {}", crate::bash_io_error(&e)); }
                         restore_inline_assignments(snap, shell);
                         if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                         if stdout_fd > 2 {
@@ -5994,7 +6049,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -6012,7 +6067,7 @@ fn run_multi_stage(
                         match resolve_fd_target(source, shell) {
                             Ok(fd) => Some(fd),
                             Err(e) => {
-                                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                                 restore_inline_assignments(snap, shell);
                                 if stdin_fd > 2 { unsafe { libc::close(stdin_fd); } }
                                 if let Some(r) = capture_read_fd {
@@ -6075,7 +6130,7 @@ fn run_multi_stage(
         let pid = match spawn_result {
             Ok(p) => p,
             Err(e) => {
-                crate::sh_error!(shell, None, "{}", crate::bash_io_error(&e));
+                { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{}", crate::bash_io_error(&e)); }
                 // For InProcess (fork failed), close the fds we were going to
                 // pass. For External, they were already consumed by OwnedFd.
                 if !went_external {
@@ -6425,7 +6480,7 @@ fn apply_inline_assignments(
         let prior = shell.snapshot_var(&snap_name);
         // For namerefs, skip the early readonly check; assign() checks the resolved target.
         if !shell.is_nameref(name) && shell.is_readonly(name) {
-            crate::sh_error!(shell, None, "{name}: readonly variable");
+            { let mut err = err_writer(err_sink, sink); crate::sh_error_to!(shell, &mut *err, None, "{name}: readonly variable"); }
             return Err(snap);
         }
         if apply_one_assignment(a, shell, &mut *err_writer(err_sink, sink)).is_err() {
@@ -6583,7 +6638,7 @@ pub(crate) fn apply_one_assignment(
                     // Skip for namerefs — the individual element writes go through
                     // assign() which checks the resolved target.
                     if !shell.is_nameref(target_name) && shell.is_readonly(target_name) {
-                        crate::sh_error!(shell, None, "{target_name}: readonly variable");
+                        crate::sh_error_to!(shell, err, None, "{target_name}: readonly variable");
                         return Err(());
                     }
                     let new_pairs = build_associative_map(elements, shell, err)?;
@@ -6599,8 +6654,9 @@ pub(crate) fn apply_one_assignment(
                 }
             }
             (AssignTarget::Bare(name), None) => {
-                crate::sh_error!(
+                crate::sh_error_to!(
                     shell,
+                    err,
                     None,
                     "{name}: {} not valid on associative array",
                     if a.append { "scalar append" } else { "scalar assignment" }
@@ -6621,8 +6677,9 @@ pub(crate) fn apply_one_assignment(
                 }
             }
             (AssignTarget::Indexed { name, .. }, Some(_)) => {
-                crate::sh_error!(
+                crate::sh_error_to!(
                     shell,
+                    err,
                     None,
                     "{name}: cannot assign array literal to associative array element"
                 );
@@ -6640,7 +6697,7 @@ pub(crate) fn apply_one_assignment(
                 // [i]=v elements. Readonly pre-check avoids a partial write.
                 // Skip for namerefs — assign() checks the resolved target.
                 if !shell.is_nameref(name) && shell.is_readonly(name) {
-                    crate::sh_error!(shell, None, "{name}: readonly variable");
+                    crate::sh_error_to!(shell, err, None, "{name}: readonly variable");
                     return Err(());
                 }
                 // Starting auto-index: max+1 for an existing array; 1 for a
@@ -6708,7 +6765,7 @@ pub(crate) fn apply_one_assignment(
             let idx = match crate::expand::eval_subscript(subscript, shell, name) {
                 Ok(i) => i,
                 Err(msg) => {
-                    crate::sh_error!(shell, None, "{msg}");
+                    crate::sh_error_to!(shell, err, None, "{msg}");
                     return Err(());
                 }
             };
@@ -6730,7 +6787,7 @@ pub(crate) fn apply_one_assignment(
         }
         // Subscripted lvalue + compound array RHS: bash rejects this.
         (AssignTarget::Indexed { name, .. }, Some(_)) => {
-            crate::sh_error!(shell, None, "{name}: cannot assign array literal to array element");
+            crate::sh_error_to!(shell, err, None, "{name}: cannot assign array literal to array element");
             Err(())
         }
     }
@@ -6742,14 +6799,14 @@ pub(crate) fn apply_one_assignment(
 fn build_associative_map(
     elements: &[crate::lexer::ArrayLiteralElement],
     shell: &mut Shell,
-    _err: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> Result<Vec<(String, String)>, ()> {
     let mut out: Vec<(String, String)> = Vec::new();
     for elem in elements {
         let key = match &elem.subscript {
             Some(sw) => crate::expand::eval_subscript_key(sw, shell),
             None => {
-                crate::sh_error!(shell, None, "associative array initializer requires [key]=value form");
+                crate::sh_error_to!(shell, err, None, "associative array initializer requires [key]=value form");
                 return Err(());
             }
         };
@@ -6792,7 +6849,7 @@ fn expand_array_elements(
                 let idx = match crate::expand::eval_subscript(sw, shell, name) {
                     Ok(i) => i,
                     Err(msg) => {
-                        crate::sh_error!(shell, None, "{msg}");
+                        crate::sh_error_to!(shell, err, None, "{msg}");
                         return Err(());
                     }
                 };
