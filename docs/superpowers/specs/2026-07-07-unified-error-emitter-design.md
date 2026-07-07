@@ -194,7 +194,7 @@ script path, else `bash`→`huck` for stdin/default.
 | Error class | `-c` mode | script-file mode | stdin (non-interactive) | interactive |
 |---|---|---|---|---|
 | **Runtime** (builtin, cd, cmd-not-found, arith, `set -o`) | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: line N: <cmd>: <msg>` | `<name>: <cmd>: <msg>` (no line) |
-| **Syntax/parser** | `<name>: -c: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` |
+| **Syntax/parser** | `<name>: -c: line N: <msg>` | `<name>: line N: <msg>` | `<name>: line N: <msg>` | `<name>: <msg>` (no line) |
 | **Pre-shell CLI** (bad option, editor init) | `<basename>: <msg>` (no line) | — | — | — |
 
 Rules distilled:
