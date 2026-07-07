@@ -3373,44 +3373,6 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     Ok(Some(seq))
 }
 
-/// Assemble a bounded fragment (a `[…]` subscript body) into a single `Word`
-/// using the atom parser. Replaces the oracle `parse_subscript_body`. The
-/// fragment is balanced by construction (the lexer captured a bracket-matched
-/// interior), so `$i` / `${j}` / `$((n))` / `$(…)` / quotes all assemble
-/// correctly here — the parser drives the zero-width opener signals a standalone
-/// lexer could not. If the fragment is empty or lexes to more than one word
-/// (e.g. `1 + 2`), collapse to a single unquoted `Literal` carrying the raw
-/// text, matching `parse_subscript_body`'s historical fallback (arithmetic
-/// evaluation tolerates the joined text; literal keys see it verbatim).
-pub fn parse_fragment_word(
-    raw: &str,
-    opts: crate::lexer::LexerOptions,
-) -> Result<crate::lexer::Word, ParseError> {
-    use crate::command::{Command, SimpleCommand};
-    let empty = std::collections::HashMap::new();
-    let mut lx = crate::lexer::Lexer::new_live_atoms(raw, &empty, opts);
-    let parsed = parse_sequence(&mut lx)?;
-    // Single-word fragment: exactly one simple Exec command whose program is the
-    // whole word, with no args / redirects / inline-assignments / list tail.
-    if let Some(seq) = &parsed
-        && seq.rest.is_empty()
-        && !seq.background
-        && let Command::Pipeline(p) = &seq.first
-        && !p.negate
-        && p.commands.len() == 1
-        && let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0]
-        && e.args.is_empty()
-        && e.redirects.is_empty()
-        && e.inline_assignments.is_empty()
-    {
-        return Ok(e.program.clone());
-    }
-    Ok(crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
-        text: raw.to_string(),
-        quoted: false,
-    }]))
-}
-
 /// v264: parse ONE top-level command unit from the atom stream, stopping at
 /// (and consuming) the next top-level newline or EOF. Skips leading blank
 /// lines. Returns `Ok(None)` when only newlines/blanks/EOF remain. The atom
@@ -7531,65 +7493,6 @@ mod tests {
         diff_eg("shopt -s extglob\necho $( [[ foo == @(foo|bar) ]] && echo 1 )");
         diff_eg("echo $( [[ z == !(a|b) ]] && echo 7 )");
         diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
-    }
-
-    // ── v266 T1: parse_fragment_word (subscript bridge) ────────────────────
-
-    #[test]
-    fn fragment_word_single_expansion() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("$i", LexerOptions::default()).unwrap();
-        // A single `$i` becomes a one-part Word with a variable expansion (not a raw literal).
-        assert!(w.0.iter().any(|p| !matches!(p, WordPart::Literal { .. })), "got {:?}", w);
-    }
-
-    #[test]
-    fn fragment_word_command_sub() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("$(echo 2)", LexerOptions::default()).unwrap();
-        assert!(w.0.iter().any(|p| matches!(p, WordPart::CommandSub { .. })), "got {:?}", w);
-    }
-
-    #[test]
-    fn fragment_word_multiword_collapses_to_raw_literal() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("1 + 2", LexerOptions::default()).unwrap();
-        assert_eq!(w.0, vec![WordPart::Literal { text: "1 + 2".to_string(), quoted: false }]);
-    }
-
-    #[test]
-    fn fragment_word_plain_index() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("i+1", LexerOptions::default()).unwrap();
-        assert_eq!(w.0, vec![WordPart::Literal { text: "i+1".to_string(), quoted: false }]);
-    }
-
-    /// A malformed subscript (`a[1"]=x` — unterminated quote inside `[...]`)
-    /// is still a parse ERROR (matches bash: `a=(x y z); a[1"]=x` →
-    /// "unexpected EOF while looking for matching `"`", rc=2) — but which
-    /// `LexError` variant carries it changed with v268 T1. Before, the OLD
-    /// lexer-side bridge raw-char-counted the brackets WITHOUT quote
-    /// awareness (so `[1"]` "closed" at the first `]`), then handed the raw
-    /// text `1"` to `parse_fragment_word` in isolation, which failed and
-    /// surfaced as the dedicated `LexError::SubscriptParseError`. Now the
-    /// PARSER assembles the subscript with the same quote-aware `parse_word`
-    /// used everywhere else, so the unterminated `"` fails exactly like any
-    /// other unterminated quote in the grammar: `LexError::UnterminatedQuote`.
-    /// `SubscriptParseError` (and the `parse_fragment_word` bridge itself) is
-    /// dead now that this was its last production call site — scheduled for
-    /// deletion in a follow-on task, not this one.
-    #[test]
-    fn fragment_word_malformed_subscript_uses_dedicated_error_variant() {
-        use crate::lexer::{LexError, LexerOptions};
-        let mut lx = Lexer::new_live_atoms("a[1\"]=x\n", &Default::default(), LexerOptions::default());
-        let err = parse_sequence(&mut lx).expect_err("malformed subscript should error");
-        match err {
-            ParseError::Lex(boxed) => match *boxed {
-                LexError::UnterminatedQuote => {}
-                other => panic!("expected UnterminatedQuote, got {other:?}"),
-            },
-            other => panic!("expected ParseError::Lex, got {other:?}"),
-        }
     }
 
     #[test]

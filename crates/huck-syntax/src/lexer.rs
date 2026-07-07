@@ -10,12 +10,6 @@ pub enum LexError {
     EmptyParamName,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
-    /// A `[…]` subscript fragment (assignment lvalue) that the atom-parser
-    /// bridge `parser::parse_fragment_word` could not parse (e.g. an
-    /// unterminated quote/substitution inside the subscript). Kept distinct
-    /// from `SubstitutionParseError` so the rendered message does not claim
-    /// "in command substitution" for what is actually a subscript error.
-    SubscriptParseError(crate::command::ParseError),
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
@@ -5659,6 +5653,18 @@ pub fn line_at_offset(src: &str, off: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lexer_has_no_production_parser_dependency() {
+        // The one-way front-end invariant: no `crate::parser` reference in non-test
+        // lexer code. Reads this source file and checks every `crate::parser` line is
+        // inside the `#[cfg(test)]` tests module.
+        let src = include_str!("lexer.rs");
+        let test_mod = src.find("mod tests").unwrap_or(src.len());
+        let prod = &src[..test_mod];
+        assert!(!prod.contains("crate::parser"),
+            "lexer production code must not reference crate::parser (one-way invariant)");
+    }
 
     #[test]
     fn begin_assignment_value_sets_value_mode_and_tilde() {
