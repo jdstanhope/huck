@@ -1,15 +1,17 @@
 # bash 5.2.21 test-suite baseline
 
 bash source: 5.2.21 (GNU, GPLv3+; not vendored, run from `$BASH_SOURCE_DIR`).
-huck commit: 670581b (v220 task 1: declare -p ANSI-C value quoting for control chars).
-Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers provisioned; v219 targeted re-run of cprint+herestr after the WordPart::Quoted quote-provenance fix — cprint flips to PASS; v220 targeted re-run of herestr after the declare -p ANSI-C control-char value-quoting fix — herestr flips to PASS; v225 targeted re-run of func after the posix-gated special-builtin persistence fix — func flips to PASS; all other categories carried over from the v218 full sweep).
+huck commit: f8068b6 (v268: sever the lexer→parser cycle — command-word subscript lvalue).
+Sweep date: 2026-07-07 UTC (v268 full re-sweep after the v266–v268 parser-driven front-end rearchitecture — oracle deletion, history prune, cycle-sever). Two rows drifted vs the prior recorded sweep and are updated below; all other categories carried forward (their FAIL notes below predate v268 and may have drifted in detail — this refresh updated the STATUS column via a full 82-category re-run, not a full re-triage of the 68 FAIL notes). Prior sweep provenance: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers; v219 cprint+herestr flip to PASS; v220 herestr flip; v225 func flip).
+
+Front-end-rearchitecture check (v266–v268): NO regression. The parser-driven front-end (oracle deletion, `${…}`/subscript/assignment paths) cost zero bash-suite compatibility — every previously-passing category still passes, no new TIMEOUTs, and the array/subscript/assignment categories (`array`, `array2`, `assoc`, `appendop`, `tilde`, `posixpat`) stay FAIL for the same pre-existing non-front-end reasons recorded below.
 
 ## Summary
 
 - Categories run: 82
-- PASS: 9
+- PASS: 10
 - FAIL: 68
-- TIMEOUT: 5
+- TIMEOUT: 4
 - ERROR: 0
 - SKIP (from known-skips.txt): 4
 
@@ -39,7 +41,7 @@ Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers pr
 | dbg-support | FAIL | `set -o functrace` (DEBUG/RETURN/ERR trap inheritance through function calls) not yet supported. Entire debug-trap test suite fails from the first rejected option. |
 | dbg-support2 | FAIL | `LINENO` inside functions reports the logical-command start line (often line 1) rather than the actual in-function source line. New bug: LINENO tracking accuracy inside function bodies. |
 | dirstack | FAIL | `pushd -m` / `popd -m` / `dirs -m` argument is treated as an invalid option rather than a numeric argument (huck and bash differ on which flags these commands accept). Error-message prefix and format differences throughout. |
-| dollars | TIMEOUT | A sub-test hangs (no diff captured); likely a blocking read or process-wait triggered by `${!*}` or `${!@}` indirect expansion handling. The category reliably times out. |
+| dollars | FAIL | No longer TIMEOUTs (the v220-recorded hang — a blocking read/process-wait around `${!*}`/`${!@}` indirect expansion — is resolved): the category now runs to completion with output divergences across the `$@`/`$*`/`${!*}` dollar-special tests (error-message wording and expansion-count differences). |
 | dynvar | FAIL | `BASH_ARGV0` is not updated to reflect the running script's `$0` — tests that check `BASH_ARGV0` report a mismatch. `EPOCHREALTIME` not implemented (L-41 computed-dynamics gap). |
 | errors | FAIL | Multiple `set -o <option>: not yet supported` rejections misconfigure the test environment (posix, allexport, etc.). Also `alias -x` / `unalias -x` flags not recognized. Cascading from missing set options. |
 | execscript | FAIL | Error-message format differences — huck uses its own name as prefix rather than the script-file-and-line-number form bash uses. Executing a binary file produces a UTF-8 decoding error instead of bash's "cannot execute binary file" message. |
@@ -56,7 +58,7 @@ Sweep date: 2026-06-25 UTC (v218 full sweep with recho/zecho/printenv helpers pr
 | herestr | PASS | v219's `WordPart::Quoted` quote-provenance fix removed the reconstruction hunks (adjacent double-quoted here-string operands and double-quoted-vs-single-quoted function-body lines now match bash); v220 task 1 resolved the last runner residual — `declare -p` of an indexed array whose element holds an embedded control byte now renders the value in bash's ANSI-C `$'i\n'` escape form. 0-diff PASS (verified via the runner 2026-06-25). A separate empty-leading-word `command not found:` bug (L-57; an empty-expanded command name, e.g. `${THIS_SH} ./herestr1.sub` with `THIS_SH` unset) surfaces only on a direct invocation and is masked under the runner, which exports `THIS_SH=$HUCK`. |
 | histexpand | FAIL | `set: history: not yet supported`, and history-expansion flags (`-p`, `-a`, `-s`, `-w`) not implemented (M-46). Entire test suite fails from the first rejected option. |
 | history | FAIL | M-46 (`history -d/-w/-r/-a` not supported), M-47 (`history N` numeric argument not supported), `fc` not found as a command, `set: history: not yet supported`. Multiple history-command gaps. |
-| ifs | FAIL | One remaining divergence after the helper unblock: when `IFS` is set to a non-whitespace character (e.g., `:`), joining array elements via `${a[*]}` or `$*` uses a space separator instead of the first IFS character. |
+| ifs | PASS | Flipped FAIL→PASS since the v220 sweep: the v220-recorded divergence (joining `${a[*]}`/`$*` with a space instead of the first `IFS` character when `IFS` is non-whitespace) is resolved; the category is now byte-identical. |
 | ifs-posix | FAIL | IFS splitting semantics with the `read` builtin diverge when IFS contains both whitespace and non-whitespace characters — huck does not correctly handle certain adjacent mixed-class IFS-separator edge cases. New bug, separate from the unimplemented posix set option. |
 | input-test | FAIL | A line piped to a sub-script via a process pipeline is not read correctly — the sub-script's `read` sees an empty value instead of the piped content. New bug in how huck passes piped input to a child script invocation. |
 | invert | PASS | |
