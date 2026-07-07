@@ -31,6 +31,19 @@ checkf "bad dollar name"  'echo before; echo ${$x}; echo after'
 checkf "bad empty xform"  'V=42; echo ${V@}; echo after'
 checkf "bad dash digit"   'echo "[${-3}]"; echo after'
 checkf "short-circuit"    '[[ -n yes || -z ${H*} ]]; echo rc=$?'
+# v266 bad-substitution / invalid-modifier edge cases (append; runtime error + prologue)
+checkf "empty name"       'echo ${}'
+checkf "empty before mod" 'echo ${:-x}'
+checkf "positional invmod" 'set -- a b; echo ${1foo}'
+# P4  ${!!} / ${!$} — DIVERGENCE (reported): huck treats !/$  as valid indirect
+#     (${!!} -> "huck: !: invalid indirect expansion"; ${!$} -> empty, exit 0),
+#     bash rejects both as bad substitution. Excluded to keep harness green.
+# P8  ${X:&Y} — DIVERGENCE (reported): both hit an arith operand-expected error, but
+#     huck omits bash's leading "X: " param-name in the message.
+# P9  ${#?} ${#-} ${#$} ${#!} — DIVERGENCE (reported): huck's $- is empty, so ${#-}=0
+#     vs bash's ${#-}=2 (bash $- = "hB").
+# P10 ${!*} / ${!@} — DIVERGENCE (reported): on invalid var name huck uses the "huck:"
+#     prefix, bash uses the "file: line N:" script prologue.
 
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))
