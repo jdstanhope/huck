@@ -3,7 +3,6 @@
 //! 5.2.21's `print_cmd.c` output byte-for-byte (see `declare_f_diff_check.sh`
 //! and the `declf_*` tests); correctness is also round-trip idempotence (see
 //! the `rt_*` tests). Built across v146 Tasks 1-3; bash-faithful port in v218.
-#![allow(dead_code)] // entry points wired in Task 4; some helpers land in Tasks 2-3
 use crate::command::{
     Assignment, CaseClause, CaseItem, CaseTerminator, Command, Connector, ElifBranch, ExecCommand,
     ForClause, IfClause, Pipeline, Redirect, SelectClause, Sequence, SimpleCommand, TestBinaryOp,

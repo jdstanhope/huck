@@ -15,12 +15,12 @@
 //! ## Quick example
 //!
 //! ```rust
-//! use huck_syntax::{parse, tokenize};
-//! use huck_syntax::lexer::Lexer;
+//! use huck_syntax::parser::parse_sequence;
+//! use huck_syntax::lexer::{Lexer, LexerOptions};
 //!
 //! let src = "echo hello";
-//! let tokens = tokenize(src).expect("lex");
-//! let seq = parse(&mut Lexer::from_tokens(tokens)).expect("parse").expect("non-empty");
+//! let mut lx = Lexer::new_live_atoms(src, &Default::default(), LexerOptions::default());
+//! let seq = parse_sequence(&mut lx).expect("parse").expect("non-empty");
 //! // The Sequence has a first Command and no trailing commands.
 //! assert!(seq.rest.is_empty());
 //! assert!(!seq.background);
@@ -74,13 +74,13 @@ pub mod util;
 // `huck_syntax::brace_expand::expand(...)` explicitly.
 pub use brace_expand::BraceError;
 pub use command::{
-    parse, try_split_assignment, try_split_assignment_ref, AssignTarget,
+    try_split_assignment, AssignTarget,
     Assignment, Command, ExecCommand, ParseError, Pipeline, Sequence, SimpleCommand,
 };
 pub use errors::{lex_error_message, parse_error_message};
 pub use generate::{command_to_source, function_to_source};
 pub use lexer::{
-    tokenize, tokenize_with_opts, LexError, LexerOptions, ParamModifier, Span, SubscriptKind,
+    LexError, LexerOptions, ParamModifier, Span, SubscriptKind,
     Token, TokenKind, TransformOp, Word, WordPart,
 };
 pub use util::escape_double_quote_value;
