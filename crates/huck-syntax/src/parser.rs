@@ -2859,8 +2859,11 @@ fn parse_and_or_opts(
         while matches!(iter.peek_kind()?, Some(TokenKind::Blank)) {
             iter.next_kind()?;
         }
-        // Bound history within a long sequence; safe here — no Mark is outstanding
-        // at a command boundary (the arith disambiguation never straddles it).
+        // Bound history within a long sequence. `maybe_prune_history` only acts at
+        // genuine top level (`modes.len() == 1`); a live arith Mark CAN straddle
+        // this call in a nested `$((… $({compound})…))`, but only ever at
+        // `modes.len() >= 2`, so the depth guard suppresses the prune there. See
+        // the SAFETY note on `maybe_prune_history`.
         iter.maybe_prune_history();
         // ── Stop check 1: before consuming any connector (mirrors ~890) ──────
         // Atom-aware keyword recognition (a bare `Lit` keyword, not a `Word`).
