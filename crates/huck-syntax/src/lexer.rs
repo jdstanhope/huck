@@ -10,12 +10,6 @@ pub enum LexError {
     EmptyParamName,
     Substitution(Box<LexError>),
     SubstitutionParseError(crate::command::ParseError),
-    /// A `[…]` subscript fragment (assignment lvalue) that the atom-parser
-    /// bridge `parser::parse_fragment_word` could not parse (e.g. an
-    /// unterminated quote/substitution inside the subscript). Kept distinct
-    /// from `SubstitutionParseError` so the rendered message does not claim
-    /// "in command substitution" for what is actually a subscript error.
-    SubscriptParseError(crate::command::ParseError),
     UnterminatedHeredoc,
     AnsiCInvalidCodepoint(u32),
     BraceExpansionLimit,
@@ -575,6 +569,11 @@ pub enum TokenKind {
     // --- Phase C parser-driven atoms (dormant in v241; emitted only under the
     // ParamExpansion/operand modes, consumed only by parser.rs). ---
     ParamOpen { quoted: bool }, ParamClose, LBracket, RBracket, ParamSep,
+    /// v268: the `=` / `+=` that follows a command-word-start subscript
+    /// (`name[sub]=`). Emitted by the command scanner ONLY when
+    /// `pending_lvalue_subscript` is set; the parser consumes it to confirm an
+    /// indexed assignment and then calls `begin_assignment_value`.
+    AssignEq { append: bool },
     ParamName(String),
     /// v264: a braced parameter NAME assembled with `extquote` `$'…'` decoding
     /// (`${a$'b'}` → `ab`). Distinct from `ParamName` so the parser can apply
@@ -870,6 +869,9 @@ pub(crate) struct Mark {
     retokenize_arith_as_cmdsub: bool,
     cmd_at_word_start: bool,
     assign_val_tilde_ok: bool,
+    /// v268: see `Lexer::pending_lvalue_subscript`. Captured/restored so an
+    /// arith mark/rewind spanning the flag's brief lifetime cannot desync it.
+    pending_lvalue_subscript: bool,
     /// v250 T6: see `Lexer::heredoc_gen`. Captured so `rewind` can assert the
     /// mark did not span an atom-path heredoc-state change.
     heredoc_gen: u64,
@@ -967,6 +969,11 @@ pub struct Lexer<'a> {
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
     assign_val_tilde_ok: bool,
+    /// v268: set when the command scanner emitted a word-start `name[` `LBracket`;
+    /// checked once, on the first command scan step after the parser assembles the
+    /// subscript and consumes `RBracket`, to emit `AssignEq` (→ indexed assignment)
+    /// or clear (→ ordinary glob word).
+    pending_lvalue_subscript: bool,
     /// Consecutive `Produced` scan steps that consumed no input (see
     /// `scan_step_guarded` / `SCAN_STALL_CAP`).
     stall_steps: u32,
@@ -1015,6 +1022,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
+            pending_lvalue_subscript: false,
             stall_steps: 0,
             heredoc_gen: 0,
         }
@@ -1146,6 +1154,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: self.retokenize_arith_as_cmdsub,
             cmd_at_word_start: self.cmd_at_word_start,
             assign_val_tilde_ok: self.assign_val_tilde_ok,
+            pending_lvalue_subscript: self.pending_lvalue_subscript,
             heredoc_gen: self.heredoc_gen,
         }
     }
@@ -1179,10 +1188,26 @@ impl<'a> Lexer<'a> {
         self.retokenize_arith_as_cmdsub = m.retokenize_arith_as_cmdsub;
         self.cmd_at_word_start = m.cmd_at_word_start;
         self.assign_val_tilde_ok = m.assign_val_tilde_ok;
+        self.pending_lvalue_subscript = m.pending_lvalue_subscript;
         debug_assert_eq!(
             self.heredoc_gen, m.heredoc_gen,
             "mark/rewind must not span heredoc-body emission (v250)"
         );
+    }
+
+    /// v268 fix: clear `pending_lvalue_subscript` after a rewind on the
+    /// "never validly closed" path in the parser's `LBracket` arm
+    /// (`parse_word_command`). The mark there is taken AFTER the lexer sets
+    /// the flag `true` (emitting the zero-width `LBracket` for `name[`), so a
+    /// plain `rewind(&mark)` restores it to `true` — and the flag-check hook
+    /// in `scan_step_command_atoms` then re-fires on the very next scan,
+    /// misreading a bare `=`/`+=` right after `[` as a spurious `AssignEq`
+    /// even though the parser has just decided this is NOT an assignment.
+    /// Call this right after `rewind` on that path only; the success
+    /// (assignment) and glob-fold-back paths never take this route and don't
+    /// need it.
+    pub(crate) fn clear_pending_lvalue_subscript(&mut self) {
+        self.pending_lvalue_subscript = false;
     }
 
     /// Drop the consumed prefix `history[0..pos]` and reset `pos` to 0, bounding
@@ -2856,6 +2881,36 @@ impl<'a> Lexer<'a> {
     /// Atom-native: at `$(`/`${`/`` ` ``/`$((` it emits the opener SIGNAL and the
     /// parser pushes the sub-mode — it never calls the fat scanners.
     fn scan_step_command_atoms(&mut self) -> Result<Step, LexError> {
+        // v268: first command scan step after the parser assembled a word-start
+        // `name[sub]` subscript, back at the TRUE `Mode::Command` floor (this
+        // wrapper — unlike `scan_step_command_atoms_core` — is reached ONLY via
+        // `scan_step`'s `Mode::Command` dispatch arm, i.e. exactly when
+        // `self.modes.len() == 1`; nested cmdsub/backtick body scanning reuses
+        // the core through `scan_step_command_body` instead, at a deeper mode
+        // stack, so it never sees this check even though the flag stays `true`
+        // for the subscript's full lifetime, e.g. across a `$(...)` inside it —
+        // `a[$(echo 2)]=v`'s nested "echo" atom must NOT consume the flag).
+        // If `=`/`+=` immediately follows `]`, emit AssignEq (→ indexed
+        // assignment); otherwise it was a glob word — clear and fall through to
+        // ordinary scanning. Checked BEFORE the blank-skip so `a[i] =v` (space)
+        // is NOT an assignment.
+        if self.pending_lvalue_subscript {
+            self.pending_lvalue_subscript = false;
+            let off = self.cursor.offset(); let l = self.cursor.line(); let c = self.cursor.column();
+            match self.cursor.peek().copied() {
+                Some('=') => {
+                    self.cursor.next();
+                    self.history.push(Token::new(TokenKind::AssignEq { append: false }, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+                Some('+') if { let mut p = self.cursor.clone(); p.next(); p.peek() == Some(&'=') } => {
+                    self.cursor.next(); self.cursor.next(); // `+` `=`
+                    self.history.push(Token::new(TokenKind::AssignEq { append: true }, Span::new(off, l, c)));
+                    return Ok(Step::Produced);
+                }
+                _ => { /* glob: fall through to normal scanning below */ }
+            }
+        }
         // v250: while emitting heredoc bodies, the lexer drives body-atom output
         // from its own state (never the parser). Only in plain Command scanning;
         // a pushed sub-mode (CommandSub/Arith/etc., used by expanding bodies in
@@ -2871,7 +2926,9 @@ impl<'a> Lexer<'a> {
     /// delegation (`scan_step_command_body`) can reuse the SAME atom scanning
     /// WITHOUT the heredoc-body emission short-circuit — a body embedded in an
     /// expanding heredoc must scan its own `$( … )` tokens, not re-enter the
-    /// heredoc body.
+    /// heredoc body. (v268: also — deliberately — without the
+    /// `pending_lvalue_subscript` check above, which lives in the wrapper so it
+    /// fires only at the TRUE `Mode::Command` floor; see that check's comment.)
     fn scan_step_command_atoms_core(&mut self) -> Result<Step, LexError> {
         // Skip a run of inter-word blanks → emit one Blank boundary token. The
         // oracle flushes the word on ANY `char::is_whitespace()` (lexer.rs:2076),
@@ -3650,16 +3707,20 @@ impl<'a> Lexer<'a> {
     ///                        the literal run and `try_split_assignment` splits on
     ///                        the first unquoted `=` — byte-identical to the oracle.
     ///   - `name+=`        → `AssignPrefix { Bare(name), append: true }`.
-    ///   - `name[sub]=` / `name[sub]+=`
-    ///                     → `AssignPrefix { Indexed { name, subscript }, append }`,
-    ///                        `subscript` parsed by the `parse_subscript_body` leaf.
+    ///   - `name[`         → (v268) the lexer no longer decides indexed-lvalue vs.
+    ///                        glob word itself: it emits `Lit name` + a zero-width
+    ///                        `LBracket` and sets `pending_lvalue_subscript`. The
+    ///                        PARSER assembles the subscript under
+    ///                        `Mode::ParamSubscriptOperand` and, once it sees the
+    ///                        closing `]`, the lexer's `pending_lvalue_subscript`
+    ///                        hook (top of `scan_step_command_atoms_core`) emits
+    ///                        `AssignEq` iff `=`/`+=` immediately follows — that is
+    ///                        what the parser uses to decide assignment-vs-glob.
     ///
-    /// The bracket form is speculative: if the `[…]` is not closed, or is not
-    /// followed by `=`/`+=` (e.g. glob `a[abc]*`), NOTHING is consumed and `None`
-    /// is returned so the caller falls back to ordinary word scanning (the oracle's
-    /// fallback treats the `[` and its body as literal). Sets `in_assignment_value`
-    /// and seeds `assign_val_tilde_ok` (true only after the bare `name=`, whose
-    /// buffer ends in `=`; false after `+=`/`[sub]=`, whose buffer is empty).
+    /// Sets `in_assignment_value` and seeds `assign_val_tilde_ok` (true only after
+    /// the bare `name=`, whose buffer ends in `=`; false after `+=`, whose buffer
+    /// is empty). The `name[` arm does neither — that happens later, in
+    /// `begin_assignment_value`, once the parser has confirmed the assignment.
     ///
     /// ARRAY LITERALS (`name=(…)`, `name+=(…)`, `name[i]=(…)`) are DEFERRED: the
     /// compound `(` RHS is left unconsumed for a later task (do NOT scan it here).
@@ -3728,100 +3789,38 @@ impl<'a> Lexer<'a> {
                 }
                 Ok(Some(Step::Produced))
             }
-            // `name[sub]=` / `name[sub]+=` — subscripted lvalue. Speculatively scan
-            // the bounded `[…]`; only an assignment if `=`/`+=` follows.
+            // `name[` at command-word-start — a possible indexed lvalue OR an
+            // ordinary glob word (`a[bc]`). The lexer no longer decides: emit the
+            // name and a zero-width `LBracket`, set `pending_lvalue_subscript`, and
+            // let the PARSER assemble the subscript and decide by the trailing
+            // `AssignEq` (v268 — severs the old forward-scan + parse_fragment_word).
             Some('[') => {
-                let mut bracket = probe.clone();
-                bracket.next(); // consume `[`
-                let mut raw = String::new();
-                let mut depth: usize = 1;
-                let mut closed = false;
-                while let Some(&ch) = bracket.peek() {
-                    if ch == '[' { depth += 1; raw.push(ch); bracket.next(); }
-                    else if ch == ']' {
-                        bracket.next();
-                        depth -= 1;
-                        if depth == 0 { closed = true; break; }
-                        raw.push(ch);
-                    } else { raw.push(ch); bracket.next(); }
-                }
-                // Decide: an indexed assignment only if the bracket CLOSED and
-                // `=`/`+=` follows the `]`. Otherwise (unclosed bracket, or no
-                // `=`/`+=`) this is NOT an assignment.
-                let append: Option<bool> = if closed {
-                    match bracket.peek().copied() {
-                        Some('=') => { bracket.next(); Some(false) }
-                        Some('+') => {
-                            let mut p2 = bracket.clone();
-                            p2.next();
-                            if p2.peek() == Some(&'=') { bracket.next(); bracket.next(); Some(true) }
-                            else { None }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                match append {
-                    Some(append) => {
-                        // Confirmed indexed assignment. Parse the subscript (leaf
-                        // helper), then advance the real cursor to where `bracket` sits.
-                        let subscript = crate::parser::parse_fragment_word(&raw, self.opts)
-                            .map_err(LexError::SubscriptParseError)?;
-                        // v266: sync the real cursor to `bracket` by assignment (not
-                        // `seek`) so this works when the assignment prefix is being
-                        // lexed from an injected alias body — `bracket` carries the
-                        // full source-stack state advanced past `name[sub]=`, whereas
-                        // `seek` operates on the base offset only.
-                        self.cursor = bracket;
-                        self.cmd_at_word_start = false;
-                        self.in_assignment_value = true;
-                        self.assign_val_tilde_ok = false; // buffer empty after the prefix
-                        self.history.push(Token::new(
-                            TokenKind::AssignPrefix {
-                                target: crate::command::AssignTarget::Indexed { name, subscript },
-                                append,
-                            },
-                            Span::new(off, l, c),
-                        ));
-                        // v252: compound array RHS `name[sub]=(...)` / `name[sub]+=(...)`.
-                        // A `\<NL>` may sit between the prefix and `(` (bash deletes it).
-                        // Mirror the scalar `=`/`+=` arms' inline `(` probe: emit a
-                        // zero-width ArrayOpen so the parser pushes Mode::ArrayLiteral.
-                        // Cursor is LEFT on `(`.
-                        skip_line_continuations(&mut self.cursor);
-                        if self.cursor.peek() == Some(&'(') {
-                            let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
-                            self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
-                        }
-                        Ok(Some(Step::Produced))
-                    }
-                    None => {
-                        // NOT an indexed assignment (unclosed bracket, or no
-                        // `=`/`+=` after `]`). Mirror the oracle's literal-swallow
-                        // fallback (`scan_step_command`'s `None =>` arm): the WHOLE
-                        // `name[…]` region becomes ONE raw literal atom — `$`,
-                        // backtick, and quotes inside stay LITERAL (never re-lexed).
-                        // Advance the real cursor past `name` + `[` + raw + `]?` so
-                        // scanning resumes just after the region; downstream literal
-                        // coalescing merges any following literal run.
-                        let mut text = name;
-                        text.push('[');
-                        text.push_str(&raw);
-                        if closed { text.push(']'); }
-                        // v266: sync via assignment (see the sibling arm above) so the
-                        // literal-swallow fallback works from an injected alias body.
-                        self.cursor = bracket;
-                        self.cmd_at_word_start = false;
-                        self.history.push(Token::new(
-                            TokenKind::Lit { text, quoted: false },
-                            Span::new(off, l, c),
-                        ));
-                        Ok(Some(Step::Produced))
-                    }
-                }
+                for _ in 0..name.len() { self.cursor.next(); }
+                self.cursor.next(); // consume `[`
+                self.cmd_at_word_start = false;
+                self.pending_lvalue_subscript = true;
+                self.history.push(Token::new(TokenKind::Lit { text: name, quoted: false }, Span::new(off, l, c)));
+                let (bo, bl, bc) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+                self.history.push(Token::new(TokenKind::LBracket, Span::new(bo, bl, bc)));
+                Ok(Some(Step::Produced))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// v268: enter assignment-value lexing for an indexed lvalue whose `AssignEq`
+    /// the parser just consumed. Mirrors the value-mode state the old Indexed arm
+    /// of `try_scan_assign_prefix` set, with `assign_val_tilde_ok = true` (D2 fix:
+    /// a leading `~` in `a[i]=~/x` now expands, matching the scalar `name=` arm).
+    /// Also runs the compound-array `(` probe so `a[i]=(…)` pushes `Mode::ArrayLiteral`.
+    pub(crate) fn begin_assignment_value(&mut self, _append: bool) {
+        self.cmd_at_word_start = false;
+        self.in_assignment_value = true;
+        self.assign_val_tilde_ok = true;
+        skip_line_continuations(&mut self.cursor);
+        if self.cursor.peek() == Some(&'(') {
+            let (ao, al, ac) = (self.cursor.offset(), self.cursor.line(), self.cursor.column());
+            self.history.push(Token::new(TokenKind::ArrayOpen, Span::new(ao, al, ac)));
         }
     }
 
@@ -5656,6 +5655,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lexer_has_no_production_parser_dependency() {
+        // The one-way front-end invariant: no `crate::parser` reference in non-test
+        // lexer code. Reads this source file and checks every `crate::parser` line is
+        // inside the `#[cfg(test)]` tests module.
+        let src = include_str!("lexer.rs");
+        let test_mod = src.find("mod tests").unwrap_or(src.len());
+        let prod = &src[..test_mod];
+        assert!(!prod.contains("crate::parser"),
+            "lexer production code must not reference crate::parser (one-way invariant)");
+    }
+
+    #[test]
+    fn begin_assignment_value_sets_value_mode_and_tilde() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("x", &empty, LexerOptions::default());
+        lx.begin_assignment_value(false);
+        assert!(lx.in_assignment_value);
+        assert!(lx.assign_val_tilde_ok, "D2: tilde enabled for indexed value");
+        assert!(!lx.cmd_at_word_start);
+    }
+
+    #[test]
     fn char_cursor_tracks_offset_line_column() {
         let mut c = CharCursor::new("ab\ncé\td");
         // before consuming: at 'a'
@@ -6885,11 +6906,21 @@ mod tests {
             TokenKind::Lit { text: "2".into(), quoted: false },
             TokenKind::Op(Operator::RParen),
         ]);
-        // `a[0]=v` → an AssignPrefix atom carrying the parsed subscript.
-        assert!(matches!(
-            command_atoms_of("a[0]=v").first(),
-            Some(TokenKind::AssignPrefix { .. })
-        ), "{:?}", command_atoms_of("a[0]=v"));
+        // `a[0]=v` → (v268) the lexer no longer assembles the subscript itself:
+        // it emits `Lit "a"` + a zero-width `LBracket` and defers to the PARSER
+        // (which pushes `Mode::ParamSubscriptOperand`, assembles the subscript,
+        // and — seeing the confirmed `AssignEq` after the parser-driven `]` —
+        // builds the `AssignPrefix { Indexed, .. } ` atom itself; see
+        // `parser::tests::cmdword_indexed_assignment_builds_indexed_target`).
+        // Driving the RAW lexer alone (no parser mode-push) past `LBracket`
+        // just continues plain Command-mode literal scanning, so `0]=v` comes
+        // back as one literal run — that is the new, correct lexer-only
+        // contract, not a regression.
+        assert_eq!(command_atoms_of("a[0]=v"), vec![
+            TokenKind::Lit { text: "a".into(), quoted: false },
+            TokenKind::LBracket,
+            TokenKind::Lit { text: "0]=v".into(), quoted: false },
+        ]);
     }
 
     #[test]

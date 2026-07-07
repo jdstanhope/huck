@@ -296,13 +296,109 @@ fn parse_word_command(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseError
                     parts.push(WordPart::Tilde(spec));
                 }
             }
-            // v247 T4: an assignment-prefix atom (`name+=` / `name[sub]=` /
-            // `name[sub]+=`). Carried into the Word unchanged as the leading
-            // `WordPart::AssignPrefix`; `try_split_assignment` consumes it later.
+            // v247 T4: a bare scalar-append assignment-prefix atom (`name+=`).
+            // Carried into the Word unchanged as the leading `WordPart::AssignPrefix`;
+            // `try_split_assignment` consumes it later. (The `name[sub]=` /
+            // `name[sub]+=` indexed form is no longer lexer-assembled — see the
+            // `LBracket` arm below, v268.)
             Some(TokenKind::AssignPrefix { .. }) => {
                 if let Some(TokenKind::AssignPrefix { target, append }) = iter.next_kind()? {
                     flush_lit(&mut acc, &mut parts);
                     parts.push(WordPart::AssignPrefix { target, append });
+                }
+            }
+            // v268: `name[` at command-word start — the lexer emitted `Lit name`
+            // then this zero-width `LBracket` and set `pending_lvalue_subscript`
+            // (see `try_scan_assign_prefix`'s `Some('[')` arm). Assemble the
+            // subscript Word under `Mode::ParamSubscriptOperand` — the same
+            // machinery `${a[i]}`/array-literal `[i]=` use — then decide by the
+            // token that follows the closing `]`: an `AssignEq` (the lexer's
+            // `pending_lvalue_subscript` hook only emits it when `=`/`+=`
+            // immediately follows, no space) confirms an indexed assignment;
+            // anything else means this was an ordinary glob word (`a[bc]`,
+            // `a[$x]` with no `=`) and the whole `name[sub]` folds back into
+            // this word's parts.
+            Some(TokenKind::LBracket) => {
+                iter.next_kind()?; // consume LBracket
+                // The name is whatever literal was accumulated immediately before
+                // `[` (the lexer emits `Lit name` then `LBracket`, and nothing else
+                // can sit between them at true word-start). If for some reason
+                // there is none, fall back to treating `[` as a literal char.
+                let name = match acc.take() {
+                    Some((n, false)) => n,
+                    other => {
+                        acc = other;
+                        push_lit(&mut acc, &mut parts, "[".to_string(), quoted);
+                        continue;
+                    }
+                };
+                // Mark BEFORE pushing the subscript mode so an unclosed/malformed
+                // bracket (`a[$x` with no `]`, or a lex error partway through, e.g.
+                // an unterminated quote) can rewind cleanly to just after `[` and
+                // fall through to ORDINARY command-word scanning over the rest —
+                // mirrors the old lexer bridge's forgiving fallback ("NOTHING is
+                // consumed... falls back to ordinary word scanning"). Unlike that
+                // old fallback, the rewound content is no longer literal-swallowed:
+                // it re-scans as normal word atoms, so `$x` EXPANDS — confirmed
+                // against real bash (`a=(1 2); echo a[$x` prints `a5`, not `a$x`),
+                // so this is a correctness improvement, not a regression.
+                let mark = iter.mark();
+                iter.push_mode(Mode::ParamSubscriptOperand { in_dquote: false, enclosing_dquote: false });
+                let closed: Result<Word, ParseError> = (|| {
+                    let sub_word = parse_word(iter, false)?;
+                    match iter.next_kind()? {
+                        Some(TokenKind::RBracket) => Ok(sub_word),
+                        _ => Err(ParseError::UnsupportedExpansion),
+                    }
+                })();
+                iter.pop_mode(); // ParamSubscriptOperand
+                match closed {
+                    Ok(sub_word) => match iter.peek_kind()? {
+                        Some(TokenKind::AssignEq { append }) => {
+                            let append = *append;
+                            iter.next_kind()?;                    // consume AssignEq
+                            iter.begin_assignment_value(append);  // value-mode BEFORE value pull
+                            parts.push(WordPart::AssignPrefix {
+                                target: AssignTarget::Indexed { name, subscript: sub_word },
+                                append,
+                            });
+                            // The value flows into this SAME word next; the caller's
+                            // `try_split_assignment` splits on the leading AssignPrefix.
+                        }
+                        _ => {
+                            // Glob fold-back: name + `[` + subscript parts + `]` → one
+                            // word. Literal subscript parts (`a[bc]`) merge into the
+                            // surrounding literal run through the SAME `acc` buffer
+                            // (byte-identical to the old lexer's literal-swallow
+                            // fallback); a non-literal part (`a[$x]`, D1 fix) simply
+                            // ends the run and is pushed as its own part, exactly like
+                            // any other glued expansion (`a$x]`).
+                            push_lit(&mut acc, &mut parts, name, quoted);
+                            push_lit(&mut acc, &mut parts, "[".to_string(), quoted);
+                            for part in sub_word.0 {
+                                match part {
+                                    WordPart::Literal { text, quoted: q } => push_lit(&mut acc, &mut parts, text, q || quoted),
+                                    other => { flush_lit(&mut acc, &mut parts); parts.push(other); }
+                                }
+                            }
+                            push_lit(&mut acc, &mut parts, "]".to_string(), quoted);
+                        }
+                    },
+                    Err(_) => {
+                        // Never validly closed: rewind to right after `[` and let
+                        // the outer loop's ordinary dispatch re-scan from there.
+                        iter.rewind(&mark);
+                        // v268 fix: `mark` was taken AFTER the lexer set
+                        // `pending_lvalue_subscript = true` for this `name[`, so the
+                        // rewind above just restored the flag to `true`. We've
+                        // decided this is NOT an assignment (never validly closed),
+                        // so clear it — otherwise the very next command-scan step
+                        // would misread a bare `=`/`+=` right after `[` as a
+                        // spurious AssignEq the parser can't place (e.g. `a[=x`).
+                        iter.clear_pending_lvalue_subscript();
+                        push_lit(&mut acc, &mut parts, name, quoted);
+                        push_lit(&mut acc, &mut parts, "[".to_string(), quoted);
+                    }
                 }
             }
             // `"…"` — parser-driven double-quote mode. `parse_dquote` consumes the
@@ -3275,44 +3371,6 @@ pub fn parse_sequence(iter: &mut Lexer) -> Result<Option<Sequence>, ParseError> 
     let mut bodies = iter.take_heredoc_bodies().into_iter();
     fill_sequence(&mut seq, &mut bodies);
     Ok(Some(seq))
-}
-
-/// Assemble a bounded fragment (a `[…]` subscript body) into a single `Word`
-/// using the atom parser. Replaces the oracle `parse_subscript_body`. The
-/// fragment is balanced by construction (the lexer captured a bracket-matched
-/// interior), so `$i` / `${j}` / `$((n))` / `$(…)` / quotes all assemble
-/// correctly here — the parser drives the zero-width opener signals a standalone
-/// lexer could not. If the fragment is empty or lexes to more than one word
-/// (e.g. `1 + 2`), collapse to a single unquoted `Literal` carrying the raw
-/// text, matching `parse_subscript_body`'s historical fallback (arithmetic
-/// evaluation tolerates the joined text; literal keys see it verbatim).
-pub fn parse_fragment_word(
-    raw: &str,
-    opts: crate::lexer::LexerOptions,
-) -> Result<crate::lexer::Word, ParseError> {
-    use crate::command::{Command, SimpleCommand};
-    let empty = std::collections::HashMap::new();
-    let mut lx = crate::lexer::Lexer::new_live_atoms(raw, &empty, opts);
-    let parsed = parse_sequence(&mut lx)?;
-    // Single-word fragment: exactly one simple Exec command whose program is the
-    // whole word, with no args / redirects / inline-assignments / list tail.
-    if let Some(seq) = &parsed
-        && seq.rest.is_empty()
-        && !seq.background
-        && let Command::Pipeline(p) = &seq.first
-        && !p.negate
-        && p.commands.len() == 1
-        && let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0]
-        && e.args.is_empty()
-        && e.redirects.is_empty()
-        && e.inline_assignments.is_empty()
-    {
-        return Ok(e.program.clone());
-    }
-    Ok(crate::lexer::Word(vec![crate::lexer::WordPart::Literal {
-        text: raw.to_string(),
-        quoted: false,
-    }]))
 }
 
 /// v264: parse ONE top-level command unit from the atom stream, stopping at
@@ -7437,58 +7495,6 @@ mod tests {
         diff_eg("echo `[[ ab == @(ab|cd) ]] && echo 3`");
     }
 
-    // ── v266 T1: parse_fragment_word (subscript bridge) ────────────────────
-
-    #[test]
-    fn fragment_word_single_expansion() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("$i", LexerOptions::default()).unwrap();
-        // A single `$i` becomes a one-part Word with a variable expansion (not a raw literal).
-        assert!(w.0.iter().any(|p| !matches!(p, WordPart::Literal { .. })), "got {:?}", w);
-    }
-
-    #[test]
-    fn fragment_word_command_sub() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("$(echo 2)", LexerOptions::default()).unwrap();
-        assert!(w.0.iter().any(|p| matches!(p, WordPart::CommandSub { .. })), "got {:?}", w);
-    }
-
-    #[test]
-    fn fragment_word_multiword_collapses_to_raw_literal() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("1 + 2", LexerOptions::default()).unwrap();
-        assert_eq!(w.0, vec![WordPart::Literal { text: "1 + 2".to_string(), quoted: false }]);
-    }
-
-    #[test]
-    fn fragment_word_plain_index() {
-        use crate::lexer::{WordPart, LexerOptions};
-        let w = parse_fragment_word("i+1", LexerOptions::default()).unwrap();
-        assert_eq!(w.0, vec![WordPart::Literal { text: "i+1".to_string(), quoted: false }]);
-    }
-
-    /// A malformed subscript (`a[1"]=x` — unterminated quote inside `[...]`)
-    /// surfaces through the real assignment-lvalue atom scanner (not just
-    /// `parse_fragment_word` in isolation) as `LexError::SubscriptParseError`,
-    /// NOT the pre-existing `SubstitutionParseError` used for `$(...)` — the
-    /// two are kept distinct so the rendered message doesn't misreport a
-    /// subscript error as "in command substitution" (v266 T1 error-mapping
-    /// fix; the reused-variant version regressed this exact wording).
-    #[test]
-    fn fragment_word_malformed_subscript_uses_dedicated_error_variant() {
-        use crate::lexer::{LexError, LexerOptions};
-        let mut lx = Lexer::new_live_atoms("a[1\"]=x\n", &Default::default(), LexerOptions::default());
-        let err = parse_sequence(&mut lx).expect_err("malformed subscript should error");
-        match err {
-            ParseError::Lex(boxed) => match *boxed {
-                LexError::SubscriptParseError(_) => {}
-                other => panic!("expected SubscriptParseError, got {other:?}"),
-            },
-            other => panic!("expected ParseError::Lex, got {other:?}"),
-        }
-    }
-
     #[test]
     fn parse_one_unit_prunes_history_across_units() {
         // 5000 single-command lines on ONE lexer (the source-reader pattern). Without
@@ -7604,5 +7610,112 @@ mod tests {
             matches!(result, Err(ParseError::UnterminatedSubshell)),
             "expected Err(UnterminatedSubshell), got {result:?}"
         );
+    }
+
+    // ── v268 T1: command-word indexed lvalue (sever the forward-scan) ───────
+
+    #[test]
+    fn cmdword_indexed_assignment_builds_indexed_target() {
+        // Regression: a[i]=v and a[$(echo 2)]=v still produce AssignTarget::Indexed
+        // with the right subscript Word (was the lexer bridge; now parser-assembled).
+        use crate::command::{Command, SimpleCommand, AssignTarget};
+        for (src, want_sub_lit) in [("a[0]=v", Some("0")), ("a[$(echo 2)]=v", None)] {
+            let empty = std::collections::HashMap::new();
+            let mut lx = crate::lexer::Lexer::new_live_atoms(src, &empty, crate::lexer::LexerOptions::default());
+            let seq = parse_sequence(&mut lx).unwrap().unwrap();
+            // Bare assignment → Command::Simple(SimpleCommand::Assign([a], _))
+            let Command::Pipeline(p) = &seq.first else { panic!("pipeline") };
+            let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!("assign, got {:?}", p.commands[0]) };
+            assert_eq!(items.len(), 1);
+            let AssignTarget::Indexed { name, subscript } = &items[0].target else { panic!("indexed") };
+            assert_eq!(name, "a");
+            if let Some(lit) = want_sub_lit {
+                assert_eq!(subscript.0, vec![crate::lexer::WordPart::Literal { text: lit.into(), quoted: false }]);
+            }
+        }
+    }
+
+    #[test]
+    fn cmdword_bracket_no_eq_is_a_glob_word_not_assignment() {
+        // D1: a[bc] and a[$x] with NO '=' are ordinary (glob) words — NOT assignments.
+        // a[$x] now EXPANDS (fold-back), so its parts include a Var (was literal-swallowed).
+        use crate::command::{Command, SimpleCommand};
+        use crate::lexer::WordPart;
+        let empty = std::collections::HashMap::new();
+        // a[bc]: single literal word, program "a[bc]", no inline assignment.
+        let mut lx = crate::lexer::Lexer::new_live_atoms("a[bc]", &empty, crate::lexer::LexerOptions::default());
+        let seq = parse_sequence(&mut lx).unwrap().unwrap();
+        let Command::Pipeline(p) = &seq.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else { panic!("exec, got {:?}", p.commands[0]) };
+        assert!(e.inline_assignments.is_empty(), "a[bc] must NOT be an assignment");
+        assert_eq!(e.program.0, vec![WordPart::Literal { text: "a[bc]".into(), quoted: false }]);
+        // a[$x]: program parts must contain a Var (proves expansion, D1 fix), not a literal "$x".
+        let mut lx2 = crate::lexer::Lexer::new_live_atoms("a[$x]", &empty, crate::lexer::LexerOptions::default());
+        let seq2 = parse_sequence(&mut lx2).unwrap().unwrap();
+        let Command::Pipeline(p2) = &seq2.first else { panic!() };
+        let Command::Simple(SimpleCommand::Exec(e2)) = &p2.commands[0] else { panic!() };
+        assert!(e2.program.0.iter().any(|p| matches!(p, WordPart::Var { name, .. } if name == "x")),
+            "a[$x] subscript must EXPAND (D1): {:?}", e2.program.0);
+    }
+
+    #[test]
+    fn cmdword_indexed_value_leading_tilde_expands() {
+        // D2: a[0]=~/y — the value's leading ~ becomes a Tilde part (was literal).
+        use crate::command::{Command, SimpleCommand, AssignTarget};
+        use crate::lexer::WordPart;
+        let empty = std::collections::HashMap::new();
+        let mut lx = crate::lexer::Lexer::new_live_atoms("a[0]=~/y", &empty, crate::lexer::LexerOptions::default());
+        let seq = parse_sequence(&mut lx).unwrap().unwrap();
+        let Command::Pipeline(p) = &seq.first else { panic!() };
+        let Command::Simple(SimpleCommand::Assign(items, _)) = &p.commands[0] else { panic!() };
+        let AssignTarget::Indexed { .. } = &items[0].target else { panic!("indexed") };
+        assert!(matches!(items[0].value.0.first(), Some(WordPart::Tilde(_))),
+            "D2: leading ~ must be a Tilde part, got {:?}", items[0].value.0);
+    }
+
+    #[test]
+    fn cmdword_unclosed_bracket_eq_leaks_no_stale_flag() {
+        // v268 T2 CRITICAL fix: the LBracket arm's rewind-on-error path took
+        // `mark` AFTER the lexer set `pending_lvalue_subscript = true` (for
+        // `name[`), so `iter.rewind(&mark)` restored the flag to `true`. The
+        // very next command-scan step then misread a bare `=`/`+=` right
+        // after `[` as a spurious AssignEq the parser can't place, aborting
+        // the whole line with a parse error. Bash treats all of these as
+        // ordinary (glob) words with no assignment — `a[=x` etc. never close
+        // the bracket, so it's never an indexed lvalue.
+        use crate::command::{Command, SimpleCommand};
+        use crate::lexer::WordPart;
+        let empty = std::collections::HashMap::new();
+
+        fn part_text(p: &WordPart) -> String {
+            match p {
+                WordPart::Literal { text, .. } => text.clone(),
+                WordPart::Quoted { parts, .. } => parts.iter().map(part_text).collect(),
+                other => format!("<{other:?}>"),
+            }
+        }
+        fn word_text(w: &crate::lexer::Word) -> String {
+            w.0.iter().map(part_text).collect()
+        }
+
+        for (src, prog, args) in [
+            ("echo a[=x", "echo", vec!["a[=x"]),
+            ("echo x[+=y", "echo", vec!["x[+=y"]),
+            ("printf '%s\\n' a[=1", "printf", vec!["%s\\n", "a[=1"]),
+            ("echo one a[=x two", "echo", vec!["one", "a[=x", "two"]),
+        ] {
+            let mut lx = crate::lexer::Lexer::new_live_atoms(src, &empty, crate::lexer::LexerOptions::default());
+            let result = parse_sequence(&mut lx);
+            assert!(result.is_ok(), "{src:?} must parse without error, got {result:?}");
+            let seq = result.unwrap().expect("non-empty sequence");
+            let Command::Pipeline(p) = &seq.first else { panic!("{src:?}: not a pipeline") };
+            let Command::Simple(SimpleCommand::Exec(e)) = &p.commands[0] else {
+                panic!("{src:?}: not a plain Exec (got {:?}) — must NOT be an assignment", p.commands[0])
+            };
+            assert!(e.inline_assignments.is_empty(), "{src:?}: must NOT be an assignment");
+            assert_eq!(word_text(&e.program), prog, "{src:?}: program mismatch");
+            let got_args: Vec<String> = e.args.iter().map(word_text).collect();
+            assert_eq!(got_args, args, "{src:?}: args mismatch");
+        }
     }
 }
