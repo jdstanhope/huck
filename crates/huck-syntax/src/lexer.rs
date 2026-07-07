@@ -33,6 +33,10 @@ pub enum LexError {
     /// `+(a|b` — EOF before the closing `)` of an extglob group (only
     /// reachable when `LexerOptions::extglob` is set).
     UnterminatedExtglob,
+    /// The scan produced tokens without consuming any input for
+    /// `SCAN_STALL_CAP` steps in a row — a forward-progress safety net against a
+    /// zero-width opener signal re-emitted with no parser to consume it.
+    NoProgress,
 }
 
 impl std::fmt::Display for LexError {
@@ -42,6 +46,15 @@ impl std::fmt::Display for LexError {
 }
 
 impl std::error::Error for LexError {}
+
+/// Forward-progress guard: max consecutive `scan_step` calls that PRODUCE a
+/// token while consuming zero input chars before `LexError::NoProgress`.
+const SCAN_STALL_CAP: u32 = 1024;
+
+/// History prune threshold: prune the consumed prefix once `pos` reaches this
+/// many tokens, bounding the buffer to ~one command's worth (the "at most ~1000
+/// tokens" target). Not a hard cap — a single giant command still buffers O(command).
+pub(crate) const HISTORY_PRUNE_THRESHOLD: usize = 1024;
 
 /// A char cursor over a `&str` that also tracks the byte offset and 1-based
 /// line number of the next char to be produced. Drop-in for the
@@ -91,11 +104,15 @@ pub struct CharCursor<'a> {
     /// v266: alias input-source stack. Top of stack is the active source;
     /// empty ⇒ read the base `s`. See [`Injected`].
     injected: Vec<Injected>,
+    /// Monotonic count of chars yielded by `next()` — main string AND injected
+    /// (alias-body) chars. Progress metric for the forward-progress guard; never
+    /// decremented (rewind/seek reposition, they do not consume).
+    consumed: u64,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new() }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new(), consumed: 0 }
     }
 
     /// v266: inject `body` as the active input source, read fully before the
@@ -257,18 +274,18 @@ impl Iterator for CharCursor<'_> {
         while self.injected.last().is_some_and(Injected::exhausted) {
             self.injected.pop();
         }
-        if let Some(f) = self.injected.last_mut() {
+        let c = if let Some(f) = self.injected.last_mut() {
             if let Some(c) = f.peeked.take() {
                 f.pos += f.peeked_len;
                 f.peeked_len = 0;
-                return Some(c);
+                Some(c)
+            } else {
+                // Not exhausted (the pop loop above guaranteed remaining content).
+                let c = f.body[f.pos..].chars().next().expect("injected frame has content");
+                f.pos += c.len_utf8();
+                Some(c)
             }
-            // Not exhausted (the pop loop above guaranteed remaining content).
-            let c = f.body[f.pos..].chars().next().expect("injected frame has content");
-            f.pos += c.len_utf8();
-            return Some(c);
-        }
-        if let Some(c) = self.peeked.take() {
+        } else if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
             if c == '\n' { self.line += 1; self.column = 1; } else { self.column += 1; }
@@ -279,7 +296,11 @@ impl Iterator for CharCursor<'_> {
             Some(c)
         } else {
             None
+        };
+        if c.is_some() {
+            self.consumed += 1;
         }
+        c
     }
 }
 
@@ -946,6 +967,9 @@ pub struct Lexer<'a> {
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
     assign_val_tilde_ok: bool,
+    /// Consecutive `Produced` scan steps that consumed no input (see
+    /// `scan_step_guarded` / `SCAN_STALL_CAP`).
+    stall_steps: u32,
     /// v250 T6 (+ fix pass): monotonic counter bumped on EVERY mutation of
     /// `atom_pending_heredocs`/`emitting_heredoc`: the push at the atom `<<`
     /// opener site, `emitting_heredoc` set at the newline trigger, the
@@ -991,6 +1015,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
+            stall_steps: 0,
             heredoc_gen: 0,
         }
     }
@@ -1160,6 +1185,34 @@ impl<'a> Lexer<'a> {
         );
     }
 
+    /// Drop the consumed prefix `history[0..pos]` and reset `pos` to 0, bounding
+    /// the buffer to the live (unconsumed) tail. Acts only once `pos` crosses
+    /// `HISTORY_PRUNE_THRESHOLD`, to avoid churn.
+    ///
+    /// SAFETY (why `pos`-reset can't invalidate an outstanding `Mark`): the only
+    /// `Mark`s the parser takes are the arith disambiguation marks in
+    /// `parse_arith_expansion` / `parse_arith_command`, and an arith mark's entire
+    /// lifetime is spent with `Mode::Arith` pushed (`modes.len() >= 2`). By pruning
+    /// only at genuine top level (`modes.len() == 1`), no prune can ever fire while
+    /// such a mark is live, so a later `rewind(&mark)` never sees a stale `pos`.
+    /// (A nested `$((… $({compound})…))` reaches `parse_and_or_opts` — hence this
+    /// call site — with the arith mark still outstanding; the depth guard is what
+    /// makes that safe.) No-op for a replay lexer, and skipped while any heredoc
+    /// body is pending (`pending_heredocs` stores history `token_idx`; a
+    /// mid-collection body must not have its prefix shifted).
+    pub(crate) fn maybe_prune_history(&mut self) {
+        if self.replay
+            || self.modes.len() > 1
+            || self.pos < HISTORY_PRUNE_THRESHOLD
+            || !self.pending_heredocs.is_empty()
+            || !self.atom_pending_heredocs.is_empty()
+        {
+            return;
+        }
+        self.history.drain(0..self.pos);
+        self.pos = 0;
+    }
+
     /// Scan one step under the current mode. v241 T2 implements `ParamExpansion`;
     /// v241 T3 implements the four operand modes; remaining Phase C modes are
     /// forward declarations (never pushed in production).
@@ -1181,6 +1234,28 @@ impl<'a> Lexer<'a> {
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
         }
+    }
+
+    /// Wraps `scan_step` with a forward-progress guard: if a step PRODUCES a
+    /// token without consuming any input char (`cursor.consumed` unchanged) more
+    /// than `SCAN_STALL_CAP` times in a row, return `LexError::NoProgress` instead
+    /// of looping forever. Catches a zero-width opener signal re-emitted with no
+    /// parser to consume it (the v266-resume OOM). Any step that consumes input
+    /// resets the counter, so normal parser-driven flow never trips it.
+    fn scan_step_guarded(&mut self) -> Result<Step, LexError> {
+        let before = self.cursor.consumed;
+        let step = self.scan_step()?;
+        if matches!(step, Step::Produced) {
+            if self.cursor.consumed == before {
+                self.stall_steps += 1;
+                if self.stall_steps > SCAN_STALL_CAP {
+                    return Err(LexError::NoProgress);
+                }
+            } else {
+                self.stall_steps = 0;
+            }
+        }
+        Ok(step)
     }
 
     /// Emits one head atom of a `${…}` expansion under `Mode::ParamExpansion`.
@@ -4322,7 +4397,7 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 return Ok(Some(t));
             }
-            match self.scan_step()? {
+            match self.scan_step_guarded()? {
                 Step::Eof => return Ok(None),
                 Step::Produced => {}
             }
@@ -4356,7 +4431,7 @@ impl<'a> Lexer<'a> {
             if self.history.len() > idx && !self.backfill_pending_at(idx) {
                 return Ok(());
             }
-            match self.scan_step()? {
+            match self.scan_step_guarded()? {
                 Step::Produced => {}
                 Step::Eof => return Ok(()),
             }
@@ -5597,6 +5672,19 @@ mod tests {
         assert_eq!((c.offset(), c.line(), c.column()), (6, 2, 3)); // at '\t'
         c.next();                       // consume tab -> one column
         assert_eq!((c.offset(), c.line(), c.column()), (7, 2, 4)); // at 'd'
+    }
+
+    #[test]
+    fn char_cursor_consumed_counts_yielded_chars() {
+        let mut c = CharCursor::new("abc");
+        assert_eq!(c.consumed, 0);
+        c.next();
+        c.next();
+        assert_eq!(c.consumed, 2);
+        c.next(); // "c"
+        assert_eq!(c.consumed, 3);
+        assert_eq!(c.next(), None); // EOF must NOT bump
+        assert_eq!(c.consumed, 3);
     }
 
 
@@ -7204,5 +7292,71 @@ mod array_parse_tests {
     // (the lexer emits `[[` as a plain `Op`), so a raw `next_token` drain never
     // moves it. Scalar-flag rewind is still guaranteed by the `Mark` snapshot and
     // exercised by `rewind_restores_mode_stack` / `rewind_reproduces_tokens_same_mode`.
+
+    #[test]
+    fn scan_stall_guard_stops_zero_width_opener_runaway() {
+        // A bare `$((` at command position with NO parser to consume the ArithOpen
+        // signal: scan_step re-emits it without advancing the cursor. The guard must
+        // surface Err(NoProgress) within a bounded number of pulls, not loop/OOM.
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("$((", &empty, LexerOptions::default());
+        let mut err = None;
+        for _ in 0..(SCAN_STALL_CAP as usize + 100) {
+            match lx.next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => { err = Some(e); break; }
+            }
+        }
+        assert!(matches!(err, Some(LexError::NoProgress)), "expected NoProgress, got {err:?}");
+    }
+
+    #[test]
+    fn scan_stall_guard_allows_normal_openers() {
+        for src in ["$((1+2))", "${x}", "$(echo hi)", "`echo hi`", "$(( $(( 1 + 1 )) + 1 ))"] {
+            let empty = std::collections::HashMap::new();
+            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            assert!(crate::parser::parse_sequence(&mut lx).is_ok(), "false NoProgress on {src:?}");
+        }
+    }
+
+    #[test]
+    fn scan_stall_guard_counts_injected_alias_body() {
+        // An alias whose body is far longer than SCAN_STALL_CAP tokens. Each injected
+        // char advances `consumed`, so the guard never fires — proving the metric is
+        // injected-aware (a raw main-offset metric would false-stall here).
+        let body = "a ".repeat(SCAN_STALL_CAP as usize + 500);
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("x".to_string(), format!("echo {body}"));
+        let mut lx = Lexer::new_live_atoms("x", &aliases, LexerOptions::default());
+        assert!(crate::parser::parse_sequence(&mut lx).is_ok());
+    }
+
+    #[test]
+    fn maybe_prune_history_drops_consumed_prefix() {
+        let empty = std::collections::HashMap::new();
+        let src = "a ".repeat(HISTORY_PRUNE_THRESHOLD + 50); // many simple words + blanks
+        let mut lx = Lexer::new_live_atoms(&src, &empty, LexerOptions::default());
+        for _ in 0..(HISTORY_PRUNE_THRESHOLD + 1) { let _ = lx.next().unwrap(); }
+        assert!(lx.pos >= HISTORY_PRUNE_THRESHOLD);
+        let frontier = lx.peek_kind().unwrap().cloned(); // fill + capture next token
+        lx.maybe_prune_history();
+        assert_eq!(lx.pos, 0, "pos reset to 0");
+        assert!(lx.scanned_token_count() <= 8, "consumed prefix drained");
+        assert_eq!(lx.peek_kind().unwrap().cloned(), frontier, "frontier token preserved");
+    }
+
+    #[test]
+    fn maybe_prune_history_noop_below_threshold() {
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("echo a b c", &empty, LexerOptions::default());
+        let _ = lx.next().unwrap();
+        let _ = lx.next().unwrap();
+        let pos = lx.pos;
+        let len = lx.scanned_token_count();
+        lx.maybe_prune_history(); // pos < threshold → no-op
+        assert_eq!(lx.pos, pos);
+        assert_eq!(lx.scanned_token_count(), len);
+    }
 }
 
