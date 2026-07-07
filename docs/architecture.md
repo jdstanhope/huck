@@ -5,15 +5,18 @@ starting point for anyone (human or LLM) extending the shell. It
 covers the load-bearing types, the execution pipeline, the
 iteration workflow, and where to add common new features. For the
 list of pending bash-compat work see `docs/bash-divergences.md`.
-For the iteration history see the table in `README.md`.
+For the iteration history see `git log` + the long-running memory notes
+(`project_huck_iterations.md`); there is no per-version table.
 
 ## Module map
 
 The repo is a **4-member Cargo workspace** (v202 → v203), a layered stack with a
 compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bin`:
 
-- **`huck-syntax`** (`crates/huck-syntax/`) — the Shell-free **frontend**: `lexer`,
-  `command` (AST + parser), `brace_expand`, `generate` (AST→source), plus
+- **`huck-syntax`** (`crates/huck-syntax/`) — the Shell-free **frontend**: `lexer`
+  (the incremental atom-emitting `Lexer`), `parser` (the parser — pulls from the
+  lexer, owns delimiter-matching), `command` (AST types), `brace_expand`,
+  `generate` (AST→source), plus
   `errors.rs` (`lex_error_message`/`parse_error_message`) and `util.rs`
   (`escape_double_quote_value`). No dependencies. As of v211 it ships polished
   public-API ergonomics (`Display` + `std::error::Error` on the error types,
@@ -78,17 +81,22 @@ compiler-enforced acyclic dependency direction `syntax ← engine ← cli ← bi
 
 `huck-engine/src/lib.rs` re-exports the frontend (`pub use huck_syntax::{lexer,
 command, …}`) so `crate::lexer::`/`crate::command::` paths inside the engine
-resolve unchanged. **Run the suite with `cargo test --workspace`** — a bare
-`cargo test` from the root only runs the `huck` *bin* package's integration tests,
-not the unit tests in the member crates.
+resolve unchanged. **Run the suite per-crate, single-threaded** —
+`cargo test -p huck-syntax --lib` / `cargo test -p huck-engine --lib`
+(a bare `cargo test` from the root only runs the `huck` *bin* package's
+integration tests, not the member crates' unit tests). Avoid
+`cargo test --workspace` on memory-constrained machines: the parallel fan-out
+can OOM; add `--jobs 1 -- --test-threads 1` under an `ulimit -v` guard there.
+Build the `huck` binary with `cargo build -p huck`.
 
 Two-tier layout within the engine: lexer/parser/AST (the `huck-syntax` crate) at
 the bottom, expansion + execution above, builtins at the top.
 
 | Module | Responsibility |
 |---|---|
-| `lexer.rs` | Tokenize input + scan word-parts. Owns the `Word` / `WordPart` types and all subscript / paramexp / array-literal recognition. Also contains the parser entry point (`tokenize` → `parse` → `Sequence`). |
-| `command.rs` | AST types: `Sequence`, `Pipeline`, `Command`, `SimpleCommand`, `ExecCommand`, `AssignTarget`, `Assignment`, `DeclArg`, `IfClause` / `WhileClause` / `ForClause` / `CaseClause`, `TestExpr` (for `[[ ]]`). |
+| `lexer.rs` | The incremental `Lexer`: pulls one token/word-part atom at a time. Owns the `Word` / `WordPart` / `SubscriptKind` types. Driven by a parser-controlled **mode stack** (`Mode::Command`/`ParamExpansion`/`CommandSub`/…); it emits *small atoms* and **never forward-scans for a matching delimiter** — the parser owns all delimiter-matching and recursion (front-end is strictly one-way, `parser → lexer`, since v268; the old fat-lexer "oracle" was deleted in v266). |
+| `parser.rs` | The parser. Pulls live from a `&mut Lexer` and assembles both **words** (subscripts, param-expansions, array literals) and **structure** into the `command.rs` AST. Entry points `parse_sequence` / `parse_one_unit`. Owns delimiter-matching + recursion (nested `$( )`, `${ }`, `( )`, subscripts). |
+| `command.rs` | AST types: `Sequence`, `Pipeline`, `Command`, `SimpleCommand`, `ExecCommand`, `Redirect`/`Redirection`, `AssignTarget`, `Assignment`, `DeclArg`, `IfClause` / `WhileClause` / `ForClause` / `CaseClause`, `TestExpr` (for `[[ ]]`) + assignment-word helpers (`try_split_assignment`, `is_assignment_word`). |
 | `shell_state.rs` | `Shell` struct (all session state) + `Variable` + `VarValue` (`Scalar`/`Indexed`/`Associative`) + `ShellOptions` + `AssignErr` / `DeclareErr`. Snapshot/restore primitives (`snapshot_var`/`restore_var`, `snapshot_for_local_scope`). |
 | `expand.rs` | Word → Field expansion pipeline. Owns `Field`, `expand`, `emit_split_fields` (IFS-driven), `eval_subscript` (arith), `eval_subscript_key` (string), `slice_word_list`, `expand_array_param`, `expand_assoc_param`. |
 | `param_expansion.rs` | Modifier-aware parameter expansion (`${var:-w}`, `${#var}`, `${var/pat/repl}`, `${var^^}`, etc.). `ExpansionResult` enum (`Value` / `Empty` / `Fatal` / `WordList`) + `ParamLookup` enum (`Scalar` / `Element(Option<&str>)`). |
@@ -122,10 +130,10 @@ alias expansion           (alias_expand.rs)        — interactive only
 brace expansion           (brace_expand.rs)        — {a,b}/{1..N}
     │
     ▼
-lex → Word stream         (lexer.rs::tokenize)     — quoting, $-expansions, subscripts, here-doc bodies
-    │
-    ▼
-parse → Sequence          (lexer.rs::parse → command.rs types) — AST
+parse → Sequence          (parser.rs::parse_sequence pulls from a &mut lexer.rs::Lexer)
+    │                                                 — the parser drives the lexer's mode stack, assembling
+    │                                                   words (quoting, $-expansions, subscripts, here-doc bodies)
+    ▼                                                   AND structure into the command.rs AST
     │
     ▼
 executor walk             (executor.rs::run_sequence/run_pipeline/run_command/run_exec_single)
@@ -236,12 +244,12 @@ These appear in many call-site signatures; learn them once.
   POSIX special set (`:`, `.`, `break`, `continue`, `eval`, `exit`,
   `export`, `readonly`, `return`, `set`, `shift`, `source`, `trap`,
   `unset`). These DO mutate parent shell state in pipelines.
-- **Bash-diff harnesses** — three executable scripts under
-  `tests/scripts/` run the same fragments through bash and huck and
-  diff: `arrays_diff_check.sh` (v71/v72 + the element-default fix),
-  `ifs_diff_check.sh` (v74), `test_combinators_diff_check.sh` (v75).
-  Adding a new feature with a `*_diff_check.sh` is the gold standard
-  for bash-compat verification.
+- **Bash-diff harnesses** — ~160 executable `*_diff_check.sh` scripts under
+  `tests/scripts/` run the same fragments through bash and huck and assert
+  byte-identical output (e.g. `arrays_diff_check.sh`, `ifs_diff_check.sh`,
+  `error_message_diff_check.sh`). Adding a `<feature>_diff_check.sh` is the
+  gold standard for bash-compat verification. On a memory-constrained box,
+  guard a sweep with `ulimit -v 1500000` + a per-harness `timeout`.
 - **Bash test-suite integration** — opt-in runner at `tests/bash-test-suite/`
   that consumes upstream bash's own test suite via `$BASH_SOURCE_DIR`;
   baseline triaged at `docs/bash-test-suite-baseline.md`.
@@ -249,18 +257,37 @@ These appear in many call-site signatures; learn them once.
   the bottom of each source file. Integration tests are binary-driven
   scripts in `tests/*.rs` using the `run_capture` helper pattern
   (spawn `huck_binary()`, write to stdin, capture stdout/stderr/exit).
-- **Error-message prologue** — bash's `name: [line N: ][cmd: ]` prefix
-  is produced by `Shell::error_prefix(cmd: Option<&str>) -> String`
-  (`shell_state.rs`). `name` is `BASH_SOURCE[0]` / `$0` in script mode
-  or `"huck"` in interactive mode; `line N:` appears only in script mode;
-  `cmd:` is the command context (e.g. `Some("let")` for `let`, `None` for
-  `$(( ))`). Arith error bodies are rendered by
-  `arith::render_error_body(expr: &str, err: &ArithError) -> String`
-  (leading-trimmed expression + `(error token is "tok")`). v216 converted
-  the four arith emission sites (`$(( ))`, `(( ))` command, `let`, and
-  substring offset/length); shell-wide adoption of `error_prefix` for
-  builtins, parser, and other `huck:`-prefixed sites is staged across
-  future iterations.
+- **Error emission (the `sh_error!` family)** — since v269 EVERY error
+  diagnostic goes through one emitter family in `error_emit.rs`; there are no
+  hand-rolled `"huck: "` literals (an `include_str!` invariant test,
+  `prologue_literal_invariant`, enforces this). All share
+  `Shell::error_prefix(kind: Diag) -> String` (`shell_state.rs`, `pub(crate)`),
+  which builds bash's full prologue matrix `<name>: [-c: ][line N: ][cmd: ]`.
+  `Diag` is `Runtime(Option<&str> cmd)` or `Syntax { line }`; `<name>` is `$0`
+  verbatim (or `"huck"` interactive); `line N:` only when non-interactive; `-c:`
+  only for a syntax error under `-c` (and not sourced); `cmd:` only on runtime
+  (e.g. `Some("let")`). **Pick the variant by whether a redirect-aware writer is
+  in scope** (this is load-bearing — see below):
+  - `sh_error_to!(shell, writer, cmd, "…")` / `emit_error_to` — writes to a
+    **caller-provided writer**. MANDATORY for builtins and the executor: they
+    emit through the `out`/`err` writer the executor hands them (which carries
+    per-command `2>&1` and the bare-builtin `route_err_to_out` swap). A
+    thread-local emit there would LEAK the diagnostic to the real stderr under
+    `$(cmd 2>&1)` capture.
+  - `sh_error!(shell, cmd, "…")` / `emit_error` — writes to the **thread-local
+    sink** (`err_thread_local.rs::with_err`). Only for writer-less deep helpers
+    (expansion, param-expansion, most `shell_state` methods) that emit in the
+    outer context.
+  - `emit_syntax_error(shell, line, "…")` — `Diag::Syntax`; adds `-c:` per the
+    gate above.
+  - `emit_cli_error(prog, "…")` — pre-shell CLI errors (`<basename>: msg`, no
+    line), before a `Shell` exists.
+
+  Arith error bodies still render via
+  `arith::render_error_body(expr, err) -> String` (leading-trimmed expression +
+  `(error token is "tok")`), passed as the body to `sh_error!`. The
+  `tests/scripts/error_message_diff_check.sh` harness (incl. a `$(err 2>&1)`
+  capture matrix) is the objective guard against a mis-routed emitter site.
 
 ## Naming conventions
 
@@ -273,9 +300,11 @@ naming review). New code should match them:
   (namerefs, paths — e.g. `resolve_nameref`, `resolve_dir`).
 - **Lexing/scanning** — `scan_*` advances a `CharCursor` and collects a span
   (e.g. `scan_cmdsub_body`, `scan_subscript`); `split_*` partitions an
-  already-collected `&str` (e.g. `split_modifier_operand`); `parse_*` produces
-  AST/structure from tokens; `tokenize` turns source into tokens. The thin
-  `consume_…_verbatim` wrappers re-emit a closing delimiter around a `scan_*`.
+  already-collected `&str` (e.g. `split_modifier_operand`); `parse_*` (in
+  `parser.rs`) produces AST/structure by pulling atoms from the incremental
+  `Lexer` (there is no batch `tokenize` — the lexer yields one atom at a time).
+  The thin `consume_…_verbatim` wrappers re-emit a closing delimiter around a
+  `scan_*`.
 - **Execution** — `run_*` executes an AST node/construct (`run_command`,
   `run_pipeline`); `execute*` are the public crate entry points
   (`execute`/`execute_with_sink`/`execute_capturing`); `eval_*` computes a value
@@ -293,7 +322,8 @@ naming review). New code should match them:
 ## Iteration workflow
 
 The project is built one numbered iteration at a time
-(`v1`, `v2`, ..., `v75` as of this writing). The cadence is:
+(`v1`, `v2`, …, `v269` as of this writing). `CLAUDE.md` holds the authoritative
+version of this loop; the cadence is:
 
 1. **Brainstorm** the next feature via the `superpowers:brainstorming`
    skill. Produces a design doc at
@@ -306,30 +336,35 @@ The project is built one numbered iteration at a time
    between tasks, fix-up loops as needed.
 4. **Merge** the iteration branch (`vNN-<topic>`) to main via
    `--no-ff` after user confirmation; push to origin.
-5. **Update docs**: flip the corresponding `M-*` / `B-*` entry in
-   `docs/bash-divergences.md` from `[deferred]` to `[fixed vNN]`,
-   add a change-log entry, add a row to README's iteration table.
-6. **Update memory**: edit
-   `/home/john/.claude/projects/-home-john-projects-shuck/memory/`
-   files to capture the new iteration's design choices and gotchas.
+5. **Update docs**: `docs/bash-divergences.md` is a *current-divergences-only*
+   doc — DELETE the resolved `M-*` / `L-*` entry (resolved history lives in git,
+   not the doc), and add a new `[deferred]` entry for any follow-on gap
+   discovered. (There is no `[fixed vNN]` change-log and no README iteration
+   table any more.)
+6. **Update memory**: edit the long-running notes under
+   `/home/john/.claude/projects/-home-john-projects-huck/memory/`
+   (`project_huck_iterations.md` + the `MEMORY.md` index) to capture the new
+   iteration's design choices and gotchas.
 
 Commits use the trailer
-`Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
-The "(1M context)" parenthetical is canonical — do not remove it.
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+(update the model version to whichever Claude is doing the work; was 4.7 through
+v136, 4.8 from v137). The "(1M context)" parenthetical is canonical — do not
+remove it.
 
 ## Where to add common features
 
 | Want to add… | Touch these files |
 |---|---|
 | New builtin | `builtins.rs`: add to `BUILTIN_NAMES`, add `builtin_NAME` function, add arm to `run_builtin` match. If it's POSIX special, also add to `is_special_builtin`. If it's a declaration command, add a `_decl` variant and route via `run_declaration_builtin` + update `is_declaration_command`. |
-| New `${...}` modifier | `lexer.rs`: add a `ParamModifier` variant + scanner. `param_expansion.rs::expand_modifier_with_value`: add the arm. Update array-aware paths in `expand.rs::expand_array_param` / `expand_assoc_param` if the modifier composes with subscripts. |
+| New `${...}` modifier | `lexer.rs`: add a `ParamModifier` variant (+ any new atom the `ParamExpansion` mode must emit); `parser.rs`: assemble it when building the `ParamExpansion` word-part. `param_expansion.rs::expand_modifier_with_value`: add the arm. Update array-aware paths in `expand.rs::expand_array_param` / `expand_assoc_param` if the modifier composes with subscripts. |
 | Whole-array `${var@OP}` transform (`@A`/`@K`/`@k`/`@a`) | New op variants land in `huck-syntax`'s `TransformOp` enum, then route through `is_whole_array_transform_op` in `expand.rs` for `[@]`/`[*]` subscripts or through `param_expansion.rs`'s `Transform { op }` arm for the scalar / single-element form. Render bodies live in `crates/huck-engine/src/array_transforms.rs`. |
 | New `test` operator | `test_builtin.rs`: add to `is_unary_op` or `is_binary_op` + add the matching arm in `apply_unary` / `apply_binary`. The recursive-descent parser handles dispatch automatically. |
-| New control-flow construct | `lexer.rs`: add token recognition + AST construction (in `command.rs`). `executor.rs`: add `run_*` walker for the new `Command` variant. |
+| New control-flow construct | `lexer.rs`: emit any new keyword/atom the construct needs. `parser.rs`: parse it (delimiter-matching/recursion) and build the AST node (defined in `command.rs`). `executor.rs`: add a `run_*` walker for the new `Command` variant. |
 | New `set -o` option | `shell_state.rs::ShellOptions`: add the bool field. `builtins.rs::builtin_set`: add to the OptionInfo registry and the get/set/print helpers. Wire into the executor at the relevant action site. |
 | New trap signal / pseudo-signal | `traps.rs`: add to the signal name table. `executor.rs`: add a `fire_*_trap` call at the appropriate spot. |
 | Array follow-on (e.g. `read -a`) | `builtins.rs`: extend the existing builtin with the flag. Use `Shell::set_indexed_element` / `Shell::extend_indexed` / etc. (or the associative siblings). The expansion side is already wired. |
-| Bash-compatible error prologue | Call `Shell::error_prefix(cmd)` for the `name: [line N: ][cmd: ]` prefix. For arith errors, use `arith::render_error_body(expr, err)` for the body. See the error-message prologue note in Cross-cutting conventions above. |
+| Emit an error message | Use the `sh_error!` family (`error_emit.rs`), never a literal `"huck: "` (the invariant test rejects it). If a redirect-aware `out`/`err` writer is in scope (builtins, executor) use `sh_error_to!(shell, writer, cmd, "…")`; otherwise `sh_error!(shell, cmd, "…")`. Syntax errors → `emit_syntax_error`; pre-shell CLI → `emit_cli_error`. See the "Error emission" note in Cross-cutting conventions above. |
 
 ## Pointers for new sessions
 
@@ -339,8 +374,9 @@ The "(1M context)" parenthetical is canonical — do not remove it.
 - **Past iteration design notes**: `docs/superpowers/specs/` and
   `docs/superpowers/plans/` have the full per-iteration paper trail.
   Search for the M-* / feature name.
-- **What's in v22 vs v75**: README's iteration table is the index.
+- **What shipped in a given `vNN`**: `git log` + the
+  `project_huck_iterations.md` memory note (newest at top).
 - **Memory across sessions**: the user maintains long-running notes
-  at `/home/john/.claude/projects/-home-john-projects-shuck/memory/`.
-  The `project_huck_iterations.md` file has detailed per-iteration
-  summaries with the design choices that aren't in the code.
+  at `/home/john/.claude/projects/-home-john-projects-huck/memory/`.
+  `MEMORY.md` is the index; `project_huck_iterations.md` has detailed
+  per-iteration summaries with the design choices that aren't in the code.

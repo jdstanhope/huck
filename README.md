@@ -32,7 +32,7 @@ system `bash-completion` package.
 
 Actively developed, one coherent feature at a time. Current scope:
 
-- **~2,900 tests** (unit + integration) and **49 bash-diff harnesses**, all
+- **~3,400 tests** (unit + integration) and **160 bash-diff harnesses**, all
   green; `cargo clippy --all-targets` clean.
 - Command-substitution-heavy scripts run at near-bash speed: per-`$()` Shell
   clone is O(1) via copy-on-write (Rc + make_mut); 2000× `$(true)` after
@@ -136,24 +136,38 @@ Note: a *fully* working `mise<TAB>` additionally requires `bash-completion`
 
 ## Project layout
 
+huck is a 4-member Cargo workspace with a compiler-enforced acyclic dependency
+direction `syntax ← engine ← cli ← bin`:
+
 ```
-src/
-  main.rs            entry point
-  shell.rs           REPL loop, signal install, source reader
-  shell_state.rs     Shell struct (env, vars, jobs, options)
-  lexer.rs           tokenizer (with offsets, extglob, regex-operand state)
-  command.rs         parser → AST (Sequence/Pipeline/SimpleCommand/compound)
-  expand.rs          word/parameter/command/brace/tilde/pathname expansion
-  param_expansion.rs ${…} modifiers, transforms, substitution
-  arith.rs           $(( )) Pratt parser + evaluator
-  executor.rs        fork/exec, pipes, redirects, job control, function calls
-  builtins.rs        builtin dispatch (incl. printf, set, declare, read, getopts)
-  glob_match.rs      extglob + POSIX-class matcher (string + pathname)
-  completion.rs      tab-completion driver
-  completion_spec.rs complete/compgen spec model + function invocation
-  jobs.rs            JobTable + SIGCHLD reaping
-  traps.rs           trap/signal dispatch
+crates/
+  huck-syntax/src/      Shell-free front-end (no dependencies)
+    lexer.rs              incremental Lexer: emits small atoms/word-parts; owns
+                          Word/WordPart/SubscriptKind (with a parser-driven mode
+                          stack; never forward-scans for a matching delimiter)
+    parser.rs            the parser — pulls tokens from the Lexer and owns all
+                          delimiter-matching/recursion; parse_sequence → Sequence
+    command.rs           AST types (Sequence/Pipeline/Command/SimpleCommand/
+                          ExecCommand/Redirect…) + assignment-word helpers
+    brace_expand.rs      {a,b}/{1..N} brace expansion
+    generate.rs          AST → source (for `type`, `declare -f`, …)
+    errors.rs, util.rs   error Display + quoting helpers
+  huck-engine/src/      terminal-free execution core (depends on huck-syntax)
+    shell_state.rs       Shell struct (env, vars, jobs, options); error_prefix
+    expand.rs            word/parameter/command/brace/tilde/pathname expansion
+    param_expansion.rs   ${…} modifiers, transforms, substitution
+    arith.rs             $(( )) Pratt parser + evaluator
+    executor.rs          fork/exec, pipes, redirects, job control, function calls
+    builtins.rs          builtin dispatch (printf, set, declare, read, getopts…)
+    error_emit.rs        the error-emitter family (sh_error!/sh_error_to!/emit_*)
+    glob_match.rs        extglob + POSIX-class matcher (string + pathname)
+    completion*.rs       tab-completion driver + complete/compgen spec model
+    jobs.rs, traps.rs    JobTable + SIGCHLD reaping; trap/signal dispatch
+    engine.rs            embeddable Engine/ExecBuilder API
+  huck-cli/src/         interactive REPL + rustyline adapters (depends on engine)
+  huck (root)/src/      thin binary: main.rs → huck_cli::run(args)
 docs/
+  architecture.md       module map, key types, pipeline, where-to-add cheatsheet
   bash-divergences.md   exhaustive, tiered list of differences from bash
   superpowers/specs/    design spec per iteration
   superpowers/plans/    implementation plan per iteration
