@@ -30,5 +30,16 @@ checkf "cross-unit def-then-use" $'shopt -s expand_aliases\nalias greet=\'echo h
 checkf "cross-unit same-unit no-expand" $'shopt -s expand_aliases\nalias greet=\'echo hi\'; greet'
 checkf "cross-unit unalias mid-run" $'shopt -s expand_aliases\nalias g=\'echo GO\'\ng\nunalias g\ng'
 
+# v266: alias bodies carrying word-part openers ($()/backtick/${}). The input-
+# source stack lexes the body inline as atoms, so the openers flow to the parser
+# instead of spinning a standalone re-lexer (the old batch-tokenize spin case).
+checkf "body has \$()"     $'shopt -s expand_aliases\nalias now=\'echo $(echo 2)\'\nnow'
+checkf "body has backtick" $'shopt -s expand_aliases\nalias b=\'echo `echo bt`\'\nb'
+checkf "body has \${}"     $'shopt -s expand_aliases\nX=home\nalias q=\'echo ${X:+yes}\'\nq'
+# v266: recursion guard spans the whole body frame (a ;-reuse of NAME in its own
+# body is guarded), and a mutual a->b->a chain terminates.
+checkf "self-recursion once" $'shopt -s expand_aliases\nalias ls=\'ls -a\'\ntype ls'
+checkf "body \$() with arg"  $'shopt -s expand_aliases\nalias g=\'grep -n\'\nprintf \'a\\nb\\n\' | g b'
+
 echo ""; echo "Total: $((PASS+FAIL)), Pass: $PASS, Fail: $FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

@@ -51,6 +51,35 @@ impl std::error::Error for LexError {}
 /// will yield (or `s.len()` at end). `line()` is the 1-based line of that same
 /// char — it advances to the next line immediately after a `'\n'` is consumed,
 /// exactly mirroring how `offset()` advances after each byte.
+/// One injected input source pushed onto `CharCursor`'s source stack (v266:
+/// the alias input-source stack). While a frame is active the cursor reads its
+/// `body` inline — emitting normal atoms + zero-width opener signals the parser
+/// consumes — instead of the base `s`; when the body is exhausted the frame is
+/// popped and reading resumes in the parent source. An injected body has no
+/// base-input offset space of its own, so every token produced while it is
+/// active reports the FROZEN `anchor_*` coordinates captured at push time (the
+/// span of the alias-name invocation), exactly as the old history-splice set
+/// `name_span` on each spliced token. `alias_name` lets the recursion guard
+/// derive the active-set membership directly from the live stack.
+#[derive(Clone)]
+struct Injected {
+    body: String,
+    pos: usize,
+    peeked: Option<char>,
+    peeked_len: usize,
+    anchor_off: usize,
+    anchor_line: u32,
+    anchor_col: u32,
+    alias_name: String,
+}
+
+impl Injected {
+    /// True when the body is fully read (no buffered peek and `pos` at the end).
+    fn exhausted(&self) -> bool {
+        self.peeked.is_none() && self.pos >= self.body.len()
+    }
+}
+
 #[derive(Clone)]
 pub struct CharCursor<'a> {
     s: &'a str,
@@ -59,15 +88,64 @@ pub struct CharCursor<'a> {
     column: u32,            // NEW: 1-based character column
     peeked: Option<char>,
     peeked_len: usize,
+    /// v266: alias input-source stack. Top of stack is the active source;
+    /// empty ⇒ read the base `s`. See [`Injected`].
+    injected: Vec<Injected>,
 }
 
 impl<'a> CharCursor<'a> {
     pub fn new(s: &'a str) -> Self {
-        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0 }
+        CharCursor { s, pos: 0, line: 1, column: 1, peeked: None, peeked_len: 0, injected: Vec::new() }
     }
 
-    /// Peek the next char without consuming it.
+    /// v266: inject `body` as the active input source, read fully before the
+    /// current source resumes. `anchor` is the span the produced tokens report
+    /// (the alias-NAME invocation site) — frozen for the frame's lifetime, since
+    /// the body has no base-offset space of its own. `alias_name` anchors the
+    /// recursion guard to this stack frame.
+    fn push_injection(&mut self, body: String, alias_name: String, anchor: Span) {
+        self.injected.push(Injected {
+            body,
+            pos: 0,
+            peeked: None,
+            peeked_len: 0,
+            anchor_off: anchor.offset,
+            anchor_line: anchor.line,
+            anchor_col: anchor.column,
+            alias_name,
+        });
+    }
+
+    /// v266: true iff some frame currently on the injection stack was pushed for
+    /// alias `name`. The recursion guard reads this INSTEAD of a separate `active`
+    /// set: a frame is on the stack for exactly as long as its body is being lexed,
+    /// so membership == "this alias is mid-expansion" with no manual insert/remove.
+    fn injected_has_alias(&self, name: &str) -> bool {
+        self.injected.iter().any(|f| f.alias_name == name)
+    }
+
+
+    /// Peek the next char without consuming it. v266: reads from the topmost
+    /// injected frame that still has content, seeing THROUGH fully-exhausted
+    /// frames to the parent WITHOUT popping them (popping — and the matching
+    /// recursion-guard release — is `next()`'s job, so a lookahead peek never
+    /// releases an alias early).
     pub fn peek(&mut self) -> Option<&char> {
+        // Find the topmost frame with remaining content (skip exhausted ones).
+        let mut idx = self.injected.len();
+        while idx > 0 && self.injected[idx - 1].exhausted() {
+            idx -= 1;
+        }
+        if idx > 0 {
+            let f = &mut self.injected[idx - 1];
+            if f.peeked.is_none()
+                && let Some(c) = f.body[f.pos..].chars().next()
+            {
+                f.peeked = Some(c);
+                f.peeked_len = c.len_utf8();
+            }
+            return self.injected[idx - 1].peeked.as_ref();
+        }
         if self.peeked.is_none()
             && let Some(c) = self.s[self.pos..].chars().next()
         {
@@ -79,28 +157,59 @@ impl<'a> CharCursor<'a> {
 
     /// Byte offset of the next char to be produced (start of the next token
     /// when the cursor sits on a token boundary). Equals `s.len()` at EOF.
+    /// v266: while an injected alias body is active AND still has content, this
+    /// reports the frozen anchor (the alias-name site) so body tokens pin there;
+    /// once all injected frames are drained it reports the base position again
+    /// (all nested frames share the same anchor, so the topmost-with-content
+    /// frame's anchor is the outermost alias-name span).
     pub fn offset(&self) -> usize {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_off;
+            }
+        }
         self.pos
     }
 
     /// 1-based line of the next char to be produced (mirrors `offset()`).
     /// After consuming a `'\n'`, this reflects the NEXT line.
     pub fn line(&self) -> u32 {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_line;
+            }
+        }
         self.line
     }
 
     /// 1-based character column of the next char to be produced.
-    pub fn column(&self) -> u32 { self.column }
+    pub fn column(&self) -> u32 {
+        for f in self.injected.iter().rev() {
+            if !f.exhausted() {
+                return f.anchor_col;
+            }
+        }
+        self.column
+    }
 
-    /// Byte slice of the source from `start` to the current offset. Used to
-    /// reconstruct the raw `${…}` text for a deferred bad-substitution.
+    /// Byte slice of the base source from `start` to the current offset. Used to
+    /// reconstruct the raw `${…}` text for a deferred bad-substitution. v266:
+    /// base-only — a raw-slice reconstruction is not expected to straddle an
+    /// injected alias body (a malformed `${` inside an alias body is out of
+    /// scope; see the module note). Debug builds assert the assumption.
     pub fn slice_from(&self, start: usize) -> &str {
+        debug_assert!(self.injected.is_empty(), "slice_from must not straddle an injected alias body");
         &self.s[start..self.pos]
     }
 
     /// Reposition the cursor to a byte offset with explicit line/column, clearing
     /// any pending 1-char peek. Used by `Lexer::rewind` to re-lex from a checkpoint.
+    /// v266: base-only — mark/rewind is not expected to straddle an injected alias
+    /// body (the only live command-path rewind is the arith `$((`-bail, which does
+    /// not occur mid-alias-body in practice; see the module note). Debug builds
+    /// assert the assumption.
     pub fn seek(&mut self, offset: usize, line: u32, column: u32) {
+        debug_assert!(self.injected.is_empty(), "seek must not straddle an injected alias body");
         self.pos = offset;
         self.line = line;
         self.column = column;
@@ -114,10 +223,24 @@ impl<'a> CharCursor<'a> {
     ///
     /// Bounded: scans at most `n+1` chars forward; does NOT advance `pos` or modify
     /// `peeked`.  Never panics — returns `None` when fewer than `n+1` chars remain.
+    /// v266: reads the topmost injected frame with content (a buffered `peeked`
+    /// equals `body[pos]`, so reading `body[pos..]` covers it); does not chain a
+    /// bounded lookahead across a frame boundary into the parent (alias bodies do
+    /// not end mid-lookahead in practice).
     pub fn peek_nth(&self, n: usize) -> Option<char> {
-        // `self.pos` always points at the raw byte offset of the next character
-        // (the `peeked` buffer, if any, starts at `self.pos`).
-        let mut it = self.s[self.pos..].chars();
+        let src: &str = {
+            let mut chosen: Option<&str> = None;
+            for f in self.injected.iter().rev() {
+                if f.pos < f.body.len() {
+                    chosen = Some(&f.body[f.pos..]);
+                    break;
+                }
+            }
+            // `self.pos` always points at the raw byte offset of the next char
+            // (the base `peeked` buffer, if any, starts at `self.pos`).
+            chosen.unwrap_or(&self.s[self.pos..])
+        };
+        let mut it = src.chars();
         for _ in 0..n {
             it.next()?;
         }
@@ -128,6 +251,23 @@ impl<'a> CharCursor<'a> {
 impl Iterator for CharCursor<'_> {
     type Item = char;
     fn next(&mut self) -> Option<char> {
+        // v266: pop fully-exhausted injected frames (their bodies are drained);
+        // dropping a frame releases its alias from the recursion guard, since the
+        // guard derives membership from the live stack (`injected_has_alias`).
+        while self.injected.last().is_some_and(Injected::exhausted) {
+            self.injected.pop();
+        }
+        if let Some(f) = self.injected.last_mut() {
+            if let Some(c) = f.peeked.take() {
+                f.pos += f.peeked_len;
+                f.peeked_len = 0;
+                return Some(c);
+            }
+            // Not exhausted (the pop loop above guaranteed remaining content).
+            let c = f.body[f.pos..].chars().next().expect("injected frame has content");
+            f.pos += c.len_utf8();
+            return Some(c);
+        }
         if let Some(c) = self.peeked.take() {
             self.pos += self.peeked_len;
             self.peeked_len = 0;
@@ -807,7 +947,6 @@ pub struct Lexer<'a> {
     /// call-sites as a parameter) so no caller signature changes.
     parsed_heredoc_bodies: Vec<Word>,
     aliases: std::collections::HashMap<String, String>,
-    active: std::collections::HashSet<String>,
     /// Carries bash's trailing-blank rule across one expansion: a body ending in
     /// whitespace makes the NEXT word command-position eligible.
     alias_trailing_eligible: bool,
@@ -882,7 +1021,6 @@ impl<'a> Lexer<'a> {
             emitting_heredoc: None,
             parsed_heredoc_bodies: Vec::new(),
             aliases: std::collections::HashMap::new(),
-            active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
@@ -4237,7 +4375,12 @@ impl<'a> Lexer<'a> {
                         // helper), then advance the real cursor to where `bracket` sits.
                         let subscript = crate::parser::parse_fragment_word(&raw, self.opts)
                             .map_err(LexError::SubscriptParseError)?;
-                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        // v266: sync the real cursor to `bracket` by assignment (not
+                        // `seek`) so this works when the assignment prefix is being
+                        // lexed from an injected alias body — `bracket` carries the
+                        // full source-stack state advanced past `name[sub]=`, whereas
+                        // `seek` operates on the base offset only.
+                        self.cursor = bracket;
                         self.cmd_at_word_start = false;
                         self.in_assignment_value = true;
                         self.assign_val_tilde_ok = false; // buffer empty after the prefix
@@ -4273,7 +4416,9 @@ impl<'a> Lexer<'a> {
                         text.push('[');
                         text.push_str(&raw);
                         if closed { text.push(']'); }
-                        self.cursor.seek(bracket.offset(), bracket.line(), bracket.column());
+                        // v266: sync via assignment (see the sibling arm above) so the
+                        // literal-swallow fallback works from an injected alias body.
+                        self.cursor = bracket;
                         self.cmd_at_word_start = false;
                         self.history.push(Token::new(
                             TokenKind::Lit { text, quoted: false },
@@ -4899,7 +5044,6 @@ impl<'a> Lexer<'a> {
             emitting_heredoc: None,
             parsed_heredoc_bodies: Vec::new(),
             aliases: std::collections::HashMap::new(),
-            active: std::collections::HashSet::new(),
             alias_trailing_eligible: false,
             modes: vec![Mode::Command],
             retokenize_arith_as_cmdsub: false,
@@ -5028,9 +5172,22 @@ impl<'a> Lexer<'a> {
         self.token_start_line = 1 + base_line;
     }
 
-    /// Expand a registered alias at command position by splicing its body tokens into
-    /// `history` ahead of `pos`. Implements bash's read-time alias rules (recursion
-    /// guard, trailing-blank, span inheritance). Body tokens take the alias-name span.
+    /// Expand a registered alias at command position by pushing its body onto the
+    /// lexer's input-source stack (v266). Implements bash's read-time alias rules
+    /// (recursion guard, trailing-blank, span inheritance).
+    ///
+    /// The body is NOT re-lexed standalone (that would spin forever on a `$(`/`${`
+    /// opener — those atoms are zero-width signals the PARSER consumes). Instead
+    /// `CharCursor::push_injection` makes the body the active input source; the
+    /// next parser-driven pull lexes it inline, emitting normal atoms + openers
+    /// the parser drains, and the cursor pops back to the parent source at the
+    /// body's end. Every token produced while the body is active reports the
+    /// alias-NAME span (the frozen `anchor_*` on the injected frame). The
+    /// recursion guard is the live injection stack itself: `name` is "active" for
+    /// exactly as long as its body frame is on the stack, so a body whose leading
+    /// word is `name` cannot re-expand it (`injected_has_alias`), and a body
+    /// containing a `;`-separated re-use of `name` is guarded too — matching
+    /// bash's whole-body recursion prevention.
     fn maybe_expand_command_alias(&mut self) -> Result<(), LexError> {
         self.fill_to(self.pos)?;
         self.alias_trailing_eligible = false;   // default: a non-expanding word leaves it false
@@ -5047,48 +5204,72 @@ impl<'a> Lexer<'a> {
             // v264: the atom-command stream (`command_atoms`) has no `Word`
             // token at command position — the command word is a bare `Lit`
             // atom. Extract the name here; the boundary check (that this
-            // `Lit` is the ENTIRE word, nothing glued on) happens below, once
-            // the borrow of `self.history` this match holds has ended (the
-            // check itself needs `&mut self` via `fill_to`).
+            // `Lit` is the ENTIRE word, nothing glued on) happens below.
             TokenKind::Lit { text, quoted: false } if self.command_atoms => {
                 (text.clone(), true)
             }
             _ => return Ok(()),
         };
         if is_bare_atom_lit {
-            // Only a WORD BOUNDARY immediately after (`Blank`/`Newline`/
-            // `ArrayClose`/`Op(_)`/EOF) means this `Lit` is the entire command
-            // word. Any other follower atom (another `Lit`, `DollarName`,
-            // `ParamOpen`, `CmdSubOpen`, `BeginBacktick`, `BeginDquote`,
-            // `QuoteRun`, `ArithOpen`, `LegacyArithOpen`, `ProcSubOpen`,
-            // `ArrayOpen`, `Tilde`, `AssignPrefix`, `DeferredExpansion`, …)
-            // means the word has more parts and is NOT a bare literal name —
-            // mirrors `word_literal_text` returning `Some` only for a
-            // single-literal word.
-            self.fill_to(self.pos + 1)?;
-            let boundary = matches!(
-                self.history.get(self.pos + 1).map(|t| &t.kind),
-                None | Some(TokenKind::Blank)
-                    | Some(TokenKind::Newline)
-                    | Some(TokenKind::ArrayClose)
-                    | Some(TokenKind::Op(_))
-            );
+            // The `Lit` is a maximal unquoted run; it is the ENTIRE command word
+            // iff what follows it is a WORD BOUNDARY. There are two ways to read
+            // the follower, and which is correct depends on whether the parser
+            // has already looked ahead:
+            //
+            // * If a follower is ALREADY buffered (`history.len() > pos + 1`, e.g.
+            //   `case`'s `peek2` for `;;`), the char cursor sits after the LAST
+            //   buffered token — NOT after this word — so consulting it would
+            //   sample the wrong char. Read the buffered follower TOKEN instead:
+            //   boundary iff its kind is `Blank`/`Newline`/`ArrayClose`/`Op`/EOF
+            //   (the atom analogue of the old oracle follower check). Any other
+            //   atom (`Lit`/`DollarName`/`ParamOpen`/`CmdSubOpen`/`BeginDquote`/…)
+            //   means the word has more parts and is not a bare literal name.
+            // * If NOTHING is buffered past the command word (`history.len() ==
+            //   pos + 1`), the cursor sits exactly on the stop char; read it
+            //   directly (whitespace / `; | & < > ( )` / EOF). This avoids
+            //   scanning a follower into `history` ahead of the injection point
+            //   in the common no-lookahead case (a scanned follower would shift
+            //   to `pos` on `history.remove` and be emitted before the body).
+            let boundary = if self.history.len() > self.pos + 1 {
+                matches!(
+                    self.history.get(self.pos + 1).map(|t| &t.kind),
+                    None | Some(TokenKind::Blank)
+                        | Some(TokenKind::Newline)
+                        | Some(TokenKind::ArrayClose)
+                        | Some(TokenKind::Op(_))
+                )
+            } else {
+                match self.cursor.peek().copied() {
+                    None => true,
+                    Some(c) => c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')'),
+                }
+            };
             if !boundary { return Ok(()); }
         }
-        if self.active.contains(&name) { return Ok(()); }
+        // Recursion guard: `name` is active iff its body frame is still on the
+        // injection stack (derived, not a separate set) — no re-expand while
+        // mid-expansion. The leading body word is checked below during the
+        // re-drive, when this just-pushed frame is present, so it cannot loop.
+        if self.cursor.injected_has_alias(&name) { return Ok(()); }
         let Some(body) = self.aliases.get(&name).cloned() else { return Ok(()) };
-        let body_tokens = tokenize(&body)?; // bad body → Err, propagated by callers
+        // Remove the already-produced command-word `Lit`/`Word` token; the pushed
+        // body re-lexes atoms in its place. The cursor was NOT advanced past the
+        // name's follower (no `fill_to(pos+1)`), so pushing the body and reading
+        // it, then popping back, resumes the parent source exactly after `name`.
         self.history.remove(self.pos);
-        let mut insert_at = self.pos;
-        for bt in body_tokens {
-            self.history.insert(insert_at, Token::new(bt.kind, name_span));
-            insert_at += 1;
-        }
-        // Recursion guard: re-enter with `name` active so the body's own first word
-        // expands if it is a *different* alias, but `name` cannot re-expand itself.
-        self.active.insert(name.clone());
+        // Push the body as the active source, pinning its tokens to the
+        // alias-name span. For a NESTED expansion `name_span` is already the
+        // outer frozen anchor (the nested name `Lit` was produced under the outer
+        // frame), so the anchor propagates outward-most automatically.
+        self.cursor.push_injection(body.clone(), name.clone(), name_span);
+        // Re-drive: lex the body's first command word so a DIFFERENT leading alias
+        // still expands. `name` is now on the stack, so it cannot re-expand itself.
         self.maybe_expand_command_alias()?;
-        self.active.remove(&name);
+        // bash's trailing-blank rule: a body ending in whitespace makes the NEXT
+        // command-word eligible for expansion (carried by `take_trailing_eligible`).
+        // Set AFTER the re-drive so the OUTERMOST body in a nested chain wins (the
+        // re-drive's own assignment for an inner body is overwritten here), exactly
+        // as the old post-recursion ordering did.
         self.alias_trailing_eligible = body.chars().last().is_some_and(|c| c.is_whitespace());
         Ok(())
     }
@@ -13779,86 +13960,145 @@ mod array_parse_tests {
 
     // --- Task 4: alias storage + command-position expansion ---
 
-    fn lx_with_alias(input: &str, pairs: &[(&str, &str)]) -> Lexer<'static> {
-        let toks = tokenize(input).unwrap();
-        let mut lx = Lexer::from_tokens(toks);
+    // v266: alias expansion is now an INPUT-SOURCE stack push (the body is
+    // re-lexed inline by the live cursor), not a history splice of pre-tokenized
+    // Word tokens. The old `lx_with_alias` replay helper (`from_tokens`) never
+    // scans, so it cannot drive expansion; these tests use the live atom path
+    // (`new_live_atoms`) — the production front-end.
+
+    /// Build a LIVE atom lexer with `pairs` registered as aliases.
+    fn lx_atoms_with_alias(input: &'static str, pairs: &[(&str, &str)]) -> Lexer<'static> {
         let mut m = std::collections::HashMap::new();
         for (k, v) in pairs { m.insert(k.to_string(), v.to_string()); }
-        lx.set_aliases(m);
-        lx
+        Lexer::new_live_atoms(input, &m, LexerOptions::default())
     }
 
-    fn wtext(k: &TokenKind) -> String {
-        // Test helper: extract all literal text (including quoted parts) so that
-        // quoted words like `'ll'` show as "ll" for assertion display. Recurses into
-        // WordPart::Quoted wrappers (single/double/etc). Distinct from
-        // word_literal_text (which returns None for quoted parts to block alias
-        // expansion); this is for verifying WHAT was returned, not WHETHER to expand.
-        fn extract(parts: &[WordPart], s: &mut String) {
-            for part in parts {
-                match part {
-                    WordPart::Literal { text, .. } => s.push_str(text),
-                    WordPart::Quoted { parts: inner, .. } => extract(inner, s),
-                    _ => {}
+    /// Literal text of a command-word atom (`Lit`/`QuoteRun`), else `None`.
+    fn atom_word_text(k: &TokenKind) -> Option<String> {
+        match k {
+            TokenKind::Lit { text, .. } => Some(text.clone()),
+            TokenKind::QuoteRun { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drive `lx` the way the parser does at command position: expand at the
+    /// start, re-expand at a fresh command position (after `;`, skipping blanks)
+    /// and after a trailing-blank-eligible boundary. Returns the word texts.
+    fn drive_alias_words(lx: &mut Lexer) -> Vec<String> {
+        let mut out = Vec::new();
+        lx.expand_command_alias().unwrap();
+        while let Some(k) = lx.peek_kind().unwrap().cloned() {
+            match k {
+                TokenKind::Blank | TokenKind::Newline => {
+                    lx.next().unwrap();
+                    if lx.take_trailing_eligible() {
+                        lx.expand_command_alias().unwrap();
+                    }
+                }
+                TokenKind::Op(Operator::Semi) => {
+                    lx.next().unwrap();
+                    while matches!(lx.peek_kind().unwrap(), Some(TokenKind::Blank)) {
+                        lx.next().unwrap();
+                    }
+                    lx.expand_command_alias().unwrap();
+                }
+                _ => {
+                    if let Some(t) = atom_word_text(&k) { out.push(t); }
+                    lx.next().unwrap();
                 }
             }
         }
-        if let TokenKind::Word(w) = k {
-            let mut s = String::new();
-            extract(&w.0, &mut s);
-            s
-        } else {
-            String::new()
-        }
+        out
     }
 
     #[test]
     fn alias_expands_at_command_position() {
-        let mut lx = lx_with_alias("ll /tmp", &[("ll", "ls -l")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.peek_kind().unwrap().map(|k| wtext(k)), Some("ls".into()));
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-l".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("/tmp".into()));
+        let mut lx = lx_atoms_with_alias("ll /tmp", &[("ll", "ls -l")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ls", "-l", "/tmp"]);
     }
 
     #[test]
     fn alias_not_expanded_at_argument_position() {
-        let mut lx = lx_with_alias("echo ll", &[("ll", "ls -l")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("echo".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("ll".into()));
+        let mut lx = lx_atoms_with_alias("echo ll", &[("ll", "ls -l")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["echo", "ll"]);
     }
 
     #[test]
     fn alias_recursion_guard_terminates() {
-        let mut lx = lx_with_alias("ls", &[("ls", "ls -a")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ls".into()));
-        assert_eq!(lx.next_kind().unwrap().map(|k| wtext(&k)), Some("-a".into()));
+        // The body's own leading `ls` is in the active frame → not re-expanded.
+        let mut lx = lx_atoms_with_alias("ls", &[("ls", "ls -a")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ls", "-a"]);
+    }
+
+    #[test]
+    fn alias_semicolon_reuse_terminates() {
+        // v266: `name` stays active for the WHOLE body frame, so a `;`-separated
+        // re-use of `name` inside its own body is guarded too. (The old
+        // synchronous guard released `name` after the leading word and looped
+        // forever here — see the report's RED evidence.)
+        let mut lx = lx_atoms_with_alias("r", &[("r", "echo hi; r")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["echo", "hi", "r"]);
+    }
+
+    #[test]
+    fn alias_mutual_chain_terminates() {
+        // a→"b x"; b (active a) →"a y"; the leading `a` of b's body is in the
+        // active frame → not re-expanded. Result: command `a`, args `y` then `x`.
+        let mut lx = lx_atoms_with_alias("a", &[("a", "b x"), ("b", "a y")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["a", "y", "x"]);
     }
 
     #[test]
     fn alias_trailing_blank_makes_next_word_eligible() {
-        let mut lx = lx_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        let mut lx = lx_atoms_with_alias("a c", &[("a", "b "), ("c", "d")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["b", "d"]);
+    }
+
+    #[test]
+    fn alias_body_tokens_pin_to_name_span() {
+        // Every atom produced from the body carries the alias-NAME invocation
+        // span (base offset of `ll`), not a body-relative offset — exactly as the
+        // old history-splice set `name_span` on each spliced token. `ll` is at
+        // offset 2 (after two leading blanks the parser skips before expanding).
+        let mut lx = lx_atoms_with_alias("  ll", &[("ll", "ls -l")]);
+        while matches!(lx.peek_kind().unwrap(), Some(TokenKind::Blank)) {
+            lx.next().unwrap();
+        }
         lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("b".into()));
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("d".into()));
+        let mut saw_body_word = false;
+        while let Some(t) = lx.next().unwrap() {
+            if let Some(txt) = atom_word_text(&t.kind) {
+                saw_body_word = true;
+                assert_eq!(t.span.offset, 2, "body atom {txt:?} must pin to the name span (offset 2)");
+                assert_eq!(t.span.line, 1, "body atom {txt:?} must pin to the name line");
+            }
+        }
+        assert!(saw_body_word, "expected the body to produce word atoms");
     }
 
     #[test]
     fn quoted_word_not_expanded() {
-        let mut lx = lx_with_alias("'ll'", &[("ll", "ls")]);
-        lx.expand_command_alias().unwrap();
-        assert_eq!(lx.next().unwrap().map(|t| wtext(&t.kind)), Some("ll".into()));
+        let mut lx = lx_atoms_with_alias("'ll'", &[("ll", "ls")]);
+        assert_eq!(drive_alias_words(&mut lx), vec!["ll"]);
     }
 
     #[test]
-    fn bad_alias_body_returns_err() {
-        let mut lx = lx_with_alias("x", &[("x", "echo \"")]); // unterminated quote in body
-        assert!(lx.expand_command_alias().is_err());
+    fn bad_alias_body_surfaces_on_drain() {
+        // The body is no longer tokenized up front, so `expand_command_alias`
+        // returns Ok; the unterminated quote in the injected body surfaces when
+        // the PARSER drives the lexer. Driving through `parse_sequence` (not a
+        // raw `next()` drain) is the ONLY valid discipline: the atom lexer emits
+        // zero-width word-part opener signals (`BeginDquote` here) that only the
+        // parser consumes — pushing `Mode::DoubleQuote`, whose scan then reaches
+        // EOF and errors. A raw drain past a `"` never advances the mode, so it
+        // would re-emit the opener forever (alias or not); that is not how the
+        // lexer is ever consumed in production.
+        let mut m = std::collections::HashMap::new();
+        m.insert("x".to_string(), "echo \"".to_string()); // unterminated quote in body
+        let mut lx = Lexer::new_live_atoms("x", &m, LexerOptions::default());
+        let r = crate::parser::parse_sequence(&mut lx);
+        assert!(matches!(r, Err(crate::command::ParseError::Lex(_))), "got {r:?}");
     }
 
     // --- Task 7: incrementality + live-lexer error tests ---
