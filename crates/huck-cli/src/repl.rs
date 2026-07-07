@@ -123,7 +123,7 @@ pub fn run(args: &[String], version: &str) -> i32 {
                     let (msg, code) = if e.kind() == std::io::ErrorKind::NotFound {
                         ("No such file or directory".to_string(), 127)
                     } else {
-                        (e.to_string(), 126)
+                        (huck_engine::bash_io_error(&e), 126)
                     };
                     emit_cli_error(&prog, format_args!("{}: {msg}", path.display()));
                     return code;

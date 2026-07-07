@@ -366,6 +366,16 @@ fn normalize_logical(path: &str) -> String {
 }
 
 pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
+    builtin_cd_as("cd", args, out, err, shell)
+}
+
+/// The `cd` implementation, parameterized on the reporting name. `pushd`/
+/// `popd` delegate their actual directory-change step here (bash's own
+/// `pushd`/`popd` are NOT thin `cd` wrappers — they have entirely separate
+/// option grammars for `-n`/`+N`/`-N` — but the successful-parse chdir
+/// failure path (`<dir>: No such file or directory`, etc.) is the same
+/// underlying operation bash reports under the CALLER's name, not `cd:`).
+fn builtin_cd_as(caller: &str, args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if crate::restricted::is_restricted(shell)
         && let Err(msg) = crate::restricted::check_cd()
     {
@@ -384,7 +394,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
             "-" => break, // OLDPWD shortcut, handled as the target below
             s if s.starts_with('-') && s.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "cd: {s}: invalid option");
-                crate::sh_error_to!(shell, err, None, "cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
+                e!(err, "cd: usage: cd [-L|[-P [-e]] [-@]] [dir]");
                 return ExecOutcome::Continue(2);
             }
             _ => break, // a target
@@ -418,7 +428,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     let new_pwd: String = if physical {
         // Physical: chdir to the target, store the canonical cwd.
         if let Err(e) = env::set_current_dir(Path::new(&target)) {
-            crate::sh_error_to!(shell, err, Some("cd"), "{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, Some(caller), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         match env::current_dir() {
@@ -441,7 +451,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
         };
         let normalized = normalize_logical(&curpath);
         if let Err(e) = env::set_current_dir(Path::new(&normalized)) {
-            crate::sh_error_to!(shell, err, Some("cd"), "{target}: {}", crate::bash_io_error(&e));
+            crate::sh_error_to!(shell, err, Some(caller), "{target}: {}", crate::bash_io_error(&e));
             return ExecOutcome::Continue(1);
         }
         normalized
@@ -457,7 +467,7 @@ pub(crate) fn builtin_cd(args: &[String], out: &mut dyn Write, err: &mut dyn Wri
     if print_new_pwd
         && let Err(e) = writeln!(out, "{new_pwd}")
     {
-        crate::sh_error_to!(shell, err, Some("cd"), "{}", crate::bash_io_error(&e));
+        crate::sh_error_to!(shell, err, Some(caller), "{}", crate::bash_io_error(&e));
         return ExecOutcome::Continue(1);
     }
     ExecOutcome::Continue(0)
@@ -474,7 +484,7 @@ fn builtin_pwd(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell:
             "--" => break,
             s if s.starts_with('-') && s.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "pwd: {s}: invalid option");
-                crate::sh_error_to!(shell, err, None, "pwd: usage: pwd [-LP]");
+                e!(err, "pwd: usage: pwd [-LP]");
                 return ExecOutcome::Continue(2);
             }
             _ => {} // ignore non-flag args
@@ -3439,7 +3449,7 @@ fn builtin_printf(
     }
 
     if i >= args.len() {
-        crate::sh_error_to!(shell, err, None, "printf: usage: printf [-v var] format [arguments]");
+        e!(err, "printf: usage: printf [-v var] format [arguments]");
         return ExecOutcome::Continue(2);
     }
 
@@ -3612,7 +3622,7 @@ fn parse_jobs_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
                     's' => only_stopped = true,
                     _ => {
                         crate::sh_error_to!(shell, err, None, "jobs: -{c}: invalid option");
-                        crate::sh_error_to!(shell, err, None, "jobs: usage: jobs [-lpnrs] [%spec ...]");
+                        e!(err, "jobs: usage: jobs [-lpnrs] [%spec ...]");
                         return Err(ExecOutcome::Continue(2));
                     }
                 }
@@ -3747,7 +3757,7 @@ fn parse_wait_args(args: &[String], err: &mut dyn Write, shell: &Shell) -> Resul
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "wait: {s}: invalid option");
-                crate::sh_error_to!(shell, err, None, "wait: usage: wait [-n] [-p var] [id ...]");
+                e!(err, "wait: usage: wait [-n] [-p var] [id ...]");
                 return Err(ExecOutcome::Continue(2));
             }
             _ => break,
@@ -4214,7 +4224,7 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
                 },
             };
             if args.len() < 2 {
-                crate::sh_error_to!(shell, err, None, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+                e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
                 return ExecOutcome::Continue(2);
             }
             (sig, &args[1..])
@@ -4222,7 +4232,7 @@ fn builtin_kill(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             (libc::SIGTERM, args)
         }
     } else {
-        crate::sh_error_to!(shell, err, None, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     };
 
@@ -4248,7 +4258,7 @@ fn kill_with_s_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     };
     let targets = &args[1..];
     if targets.is_empty() {
-        crate::sh_error_to!(shell, err, None, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
     send_signal_to_targets(sig, targets, err, shell)
@@ -4281,7 +4291,7 @@ fn kill_with_n_flag(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> 
     }
     let targets = &args[1..];
     if targets.is_empty() {
-        crate::sh_error_to!(shell, err, None, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
+        e!(err, "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | %job ...");
         return ExecOutcome::Continue(2);
     }
     send_signal_to_targets(n, targets, err, shell)
@@ -4379,7 +4389,7 @@ fn builtin_disown(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> Ex
                     'h' => mark_nohup = true,
                     _ => {
                         crate::sh_error_to!(shell, err, None, "disown: -{c}: invalid option");
-                        crate::sh_error_to!(shell, err, None, "disown: usage: disown [-ahr] [%job ...]");
+                        e!(err, "disown: usage: disown [-ahr] [%job ...]");
                         return ExecOutcome::Continue(2);
                     }
                 }
@@ -4473,7 +4483,7 @@ fn builtin_fg(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOu
             Err(outcome) => return outcome,
         },
         _ => {
-            crate::sh_error_to!(shell, err, None, "fg: usage: fg [%job]");
+            e!(err, "fg: usage: fg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4574,7 +4584,7 @@ fn builtin_bg(args: &[String], _out: &mut dyn std::io::Write, err: &mut dyn Writ
             id
         }
         _ => {
-            crate::sh_error_to!(shell, err, None, "bg: usage: bg [%job]");
+            e!(err, "bg: usage: bg [%job]");
             return ExecOutcome::Continue(2);
         }
     };
@@ -4663,7 +4673,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
     // `trap - SIGNAL...`: reset each signal.
     if args[0] == "-" {
         if args.len() < 2 {
-            crate::sh_error_to!(shell, err, None, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
+            e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
             return ExecOutcome::Continue(1);
         }
         for name in &args[1..] {
@@ -4684,7 +4694,7 @@ fn builtin_trap(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
 
     // `trap ACTION SIGNAL...`: install action for each signal.
     if args.len() < 2 {
-        crate::sh_error_to!(shell, err, None, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
+        e!(err, "trap: usage: trap [-lp] [[arg] signal_spec ...]");
         return ExecOutcome::Continue(1);
     }
     let action_text = args[0].clone();
@@ -6155,7 +6165,7 @@ pub(crate) fn source_in_sink(
     {
         let mut err = crate::executor::err_writer(err_sink, sink);
         if args.is_empty() {
-            crate::sh_error_to!(shell, &mut *err, None, ".: usage: . filename [arguments]");
+            e!(&mut *err, ".: usage: . filename [arguments]");
             // POSIX case #1: missing-filename usage error (the not-found case at
             // resolve_source_path below was Task 2 and stays posix_fatal(1)).
             shell.builtin_usage_error = Some(2);
@@ -6576,7 +6586,7 @@ fn builtin_alias(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shel
 
 fn builtin_unalias(args: &[String], err: &mut dyn Write, shell: &mut Shell) -> ExecOutcome {
     if args.is_empty() {
-        crate::sh_error_to!(shell, err, None, "unalias: usage: unalias [-a] name [name ...]");
+        e!(err, "unalias: usage: unalias [-a] name [name ...]");
         return ExecOutcome::Continue(2);
     }
     if args[0] == "-a" {
@@ -7294,7 +7304,7 @@ fn builtin_pushd(
         shell.dir_stack.swap(0, 1);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
             && c != 0
         {
             // Undo the swap on failure.
@@ -7319,7 +7329,7 @@ fn builtin_pushd(
         shell.dir_stack.rotate_left(idx);
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
             && c != 0
         {
             // Undo rotation on cd failure.
@@ -7331,7 +7341,7 @@ fn builtin_pushd(
 
     // pushd DIR
     let cd_args = vec![arg.clone()];
-    if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+    if let ExecOutcome::Continue(c) = builtin_cd_as("pushd", &cd_args, out, err, shell)
         && c != 0
     {
         return ExecOutcome::Continue(c);
@@ -7383,7 +7393,7 @@ fn builtin_popd(
     if idx == 0 {
         let target = shell.dir_stack[0].clone();
         let cd_args = vec![target.display().to_string()];
-        if let ExecOutcome::Continue(c) = builtin_cd(&cd_args, out, err, shell)
+        if let ExecOutcome::Continue(c) = builtin_cd_as("popd", &cd_args, out, err, shell)
             && c != 0
         {
             // Restore the entry we just popped so the stack is
@@ -7488,7 +7498,7 @@ fn builtin_bind(args: &[String], out: &mut dyn Write, err: &mut dyn Write, shell
             "-x" => { i += 1; /* keyseq:shell-command — deferred no-op */ }
             s if s.starts_with('-') && s.len() > 1 => {
                 crate::sh_error_to!(shell, err, None, "bind: {s}: invalid option");
-                crate::sh_error_to!(shell, err, None, "{USAGE}");
+                e!(err, "{USAGE}");
                 return ExecOutcome::Continue(2);
             }
             // Non-flag argument: `set VAR VALUE` (3-arg or inline), or `keyseq:function`.

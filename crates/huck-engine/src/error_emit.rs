@@ -169,3 +169,108 @@ mod tests {
         assert_eq!(buf, b"huck: readonly variable\n");
     }
 }
+
+/// The v269 enforcement invariant: every production emission source has been
+/// converted onto the emitter family (`sh_error!`/`sh_error_to!`/`emit_error`/
+/// `emit_error_to`/`emit_syntax_error`/`emit_cli_error`) — no call site
+/// composes the interactive `"huck: "` prologue by hand as a literal string.
+/// Models v268's `lexer_has_no_production_parser_dependency`
+/// (`crates/huck-syntax/src/lexer.rs`): `include_str!` each source, strip
+/// `#[cfg(test)]` code and comment lines, then assert the literal is gone
+/// from what remains.
+///
+/// `Shell::error_prefix` (this crate's `shell_state.rs`) is exempt by
+/// construction, not by exclusion: it builds the interactive prefix from the
+/// literal `"huck"` (no colon) and appends a *formatted* `": "` at runtime
+/// (`format!("{name}: ")`), so no `"huck: "` literal ever appears in its
+/// source — this file (`error_emit.rs`) is itself in the source list below
+/// and passing proves that.
+#[cfg(test)]
+mod prologue_literal_invariant {
+    const SOURCES: &[(&str, &str)] = &[
+        ("builtins.rs", include_str!("builtins.rs")),
+        ("executor.rs", include_str!("executor.rs")),
+        ("expand.rs", include_str!("expand.rs")),
+        ("param_expansion.rs", include_str!("param_expansion.rs")),
+        ("completion_builtins.rs", include_str!("completion_builtins.rs")),
+        ("shell_state.rs", include_str!("shell_state.rs")),
+        ("restricted.rs", include_str!("restricted.rs")),
+        ("shell.rs", include_str!("shell.rs")),
+        ("stdin_pipe.rs", include_str!("stdin_pipe.rs")),
+        ("history.rs", include_str!("history.rs")),
+        ("engine.rs", include_str!("engine.rs")),
+        ("cwd_scope.rs", include_str!("cwd_scope.rs")),
+        ("error_emit.rs", include_str!("error_emit.rs")),
+        ("../huck-cli/src/repl.rs", include_str!("../../../crates/huck-cli/src/repl.rs")),
+    ];
+
+    /// Strips every `#[cfg(test)]`-guarded item (a standalone attribute line
+    /// followed by a brace-delimited `fn`/`impl`/`mod`, or a semicolon-only
+    /// item like `#[cfg(test)] use …;`) from `src`, brace-matching each one
+    /// individually rather than assuming a single trailing test module —
+    /// several of these files interleave small `#[cfg(test)]` helpers among
+    /// production code before their final `mod tests { … }` block.
+    fn strip_test_blocks(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() == "#[cfg(test)]" {
+                i += 1;
+                let mut depth = 0i32;
+                let mut opened = false;
+                while i < lines.len() {
+                    let l = lines[i];
+                    for ch in l.chars() {
+                        match ch {
+                            '{' => { depth += 1; opened = true; }
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                    if opened && depth <= 0 {
+                        break;
+                    }
+                    if !opened && l.trim_end().ends_with(';') {
+                        break; // e.g. `#[cfg(test)] use foo::Bar;`
+                    }
+                }
+                continue;
+            }
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+        out
+    }
+
+    /// Drops whole-line comments (`///`, `//!`, `//`) so prose that mentions
+    /// `"huck: "` (design notes, e.g. `builtins.rs`'s job-spec-resolution doc
+    /// or the `restricted.rs`/`history.rs` reworked comments) doesn't
+    /// false-positive. Does not attempt trailing end-of-line `//` comments —
+    /// none of these files use that style for prose mentioning the prefix.
+    fn strip_comment_lines(src: &str) -> String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("///") || t.starts_with("//!") || t.starts_with("//"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn no_production_site_composes_huck_colon_by_hand() {
+        for (name, src) in SOURCES {
+            let stripped = strip_comment_lines(&strip_test_blocks(src));
+            assert!(
+                !stripped.contains("huck: "),
+                "{name}: found a literal `\"huck: \"` in production code outside \
+                 the emitter family (sh_error!/sh_error_to!/emit_error/emit_error_to/\
+                 emit_syntax_error/emit_cli_error) — route this site through the \
+                 emitter instead of composing the prologue by hand",
+            );
+        }
+    }
+}

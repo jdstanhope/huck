@@ -6,7 +6,7 @@
 
 #[macro_use]
 mod macros;
-pub(crate) use macros::bash_io_error;
+pub use macros::bash_io_error;
 
 pub mod arith;
 pub(crate) mod array_transforms;
