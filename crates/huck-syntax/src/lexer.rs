@@ -33,6 +33,10 @@ pub enum LexError {
     /// `+(a|b` — EOF before the closing `)` of an extglob group (only
     /// reachable when `LexerOptions::extglob` is set).
     UnterminatedExtglob,
+    /// The scan produced tokens without consuming any input for
+    /// `SCAN_STALL_CAP` steps in a row — a forward-progress safety net against a
+    /// zero-width opener signal re-emitted with no parser to consume it.
+    NoProgress,
 }
 
 impl std::fmt::Display for LexError {
@@ -42,6 +46,10 @@ impl std::fmt::Display for LexError {
 }
 
 impl std::error::Error for LexError {}
+
+/// Forward-progress guard: max consecutive `scan_step` calls that PRODUCE a
+/// token while consuming zero input chars before `LexError::NoProgress`.
+const SCAN_STALL_CAP: u32 = 1024;
 
 /// A char cursor over a `&str` that also tracks the byte offset and 1-based
 /// line number of the next char to be produced. Drop-in for the
@@ -954,6 +962,9 @@ pub struct Lexer<'a> {
     /// cleared whenever a non-literal part is emitted (which flushes the
     /// oracle's buffer). Only meaningful under `command_atoms`.
     assign_val_tilde_ok: bool,
+    /// Consecutive `Produced` scan steps that consumed no input (see
+    /// `scan_step_guarded` / `SCAN_STALL_CAP`).
+    stall_steps: u32,
     /// v250 T6 (+ fix pass): monotonic counter bumped on EVERY mutation of
     /// `atom_pending_heredocs`/`emitting_heredoc`: the push at the atom `<<`
     /// opener site, `emitting_heredoc` set at the newline trigger, the
@@ -999,6 +1010,7 @@ impl<'a> Lexer<'a> {
             retokenize_arith_as_cmdsub: false,
             cmd_at_word_start: true,
             assign_val_tilde_ok: false,
+            stall_steps: 0,
             heredoc_gen: 0,
         }
     }
@@ -1189,6 +1201,28 @@ impl<'a> Lexer<'a> {
             Mode::Regex { paren_depth, body_started } => self.scan_step_regex(paren_depth, body_started),
             Mode::Extglob { paren_depth } => self.scan_step_extglob(paren_depth),
         }
+    }
+
+    /// Wraps `scan_step` with a forward-progress guard: if a step PRODUCES a
+    /// token without consuming any input char (`cursor.consumed` unchanged) more
+    /// than `SCAN_STALL_CAP` times in a row, return `LexError::NoProgress` instead
+    /// of looping forever. Catches a zero-width opener signal re-emitted with no
+    /// parser to consume it (the v266-resume OOM). Any step that consumes input
+    /// resets the counter, so normal parser-driven flow never trips it.
+    fn scan_step_guarded(&mut self) -> Result<Step, LexError> {
+        let before = self.cursor.consumed;
+        let step = self.scan_step()?;
+        if matches!(step, Step::Produced) {
+            if self.cursor.consumed == before {
+                self.stall_steps += 1;
+                if self.stall_steps > SCAN_STALL_CAP {
+                    return Err(LexError::NoProgress);
+                }
+            } else {
+                self.stall_steps = 0;
+            }
+        }
+        Ok(step)
     }
 
     /// Emits one head atom of a `${…}` expansion under `Mode::ParamExpansion`.
@@ -4330,7 +4364,7 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 return Ok(Some(t));
             }
-            match self.scan_step()? {
+            match self.scan_step_guarded()? {
                 Step::Eof => return Ok(None),
                 Step::Produced => {}
             }
@@ -4364,7 +4398,7 @@ impl<'a> Lexer<'a> {
             if self.history.len() > idx && !self.backfill_pending_at(idx) {
                 return Ok(());
             }
-            match self.scan_step()? {
+            match self.scan_step_guarded()? {
                 Step::Produced => {}
                 Step::Eof => return Ok(()),
             }
@@ -7225,5 +7259,44 @@ mod array_parse_tests {
     // (the lexer emits `[[` as a plain `Op`), so a raw `next_token` drain never
     // moves it. Scalar-flag rewind is still guaranteed by the `Mark` snapshot and
     // exercised by `rewind_restores_mode_stack` / `rewind_reproduces_tokens_same_mode`.
+
+    #[test]
+    fn scan_stall_guard_stops_zero_width_opener_runaway() {
+        // A bare `$((` at command position with NO parser to consume the ArithOpen
+        // signal: scan_step re-emits it without advancing the cursor. The guard must
+        // surface Err(NoProgress) within a bounded number of pulls, not loop/OOM.
+        let empty = std::collections::HashMap::new();
+        let mut lx = Lexer::new_live_atoms("$((", &empty, LexerOptions::default());
+        let mut err = None;
+        for _ in 0..(SCAN_STALL_CAP as usize + 100) {
+            match lx.next() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => { err = Some(e); break; }
+            }
+        }
+        assert!(matches!(err, Some(LexError::NoProgress)), "expected NoProgress, got {err:?}");
+    }
+
+    #[test]
+    fn scan_stall_guard_allows_normal_openers() {
+        for src in ["$((1+2))", "${x}", "$(echo hi)", "`echo hi`", "$(( $(( 1 + 1 )) + 1 ))"] {
+            let empty = std::collections::HashMap::new();
+            let mut lx = Lexer::new_live_atoms(src, &empty, LexerOptions::default());
+            assert!(crate::parser::parse_sequence(&mut lx).is_ok(), "false NoProgress on {src:?}");
+        }
+    }
+
+    #[test]
+    fn scan_stall_guard_counts_injected_alias_body() {
+        // An alias whose body is far longer than SCAN_STALL_CAP tokens. Each injected
+        // char advances `consumed`, so the guard never fires — proving the metric is
+        // injected-aware (a raw main-offset metric would false-stall here).
+        let body = "a ".repeat(SCAN_STALL_CAP as usize + 500);
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("x".to_string(), format!("echo {body}"));
+        let mut lx = Lexer::new_live_atoms("x", &aliases, LexerOptions::default());
+        assert!(crate::parser::parse_sequence(&mut lx).is_ok());
+    }
 }
 

@@ -116,6 +116,7 @@ pub(crate) fn lex_error_message_impl(error: &LexError) -> String {
         LexError::UnterminatedExtglob => {
             ": unterminated extglob group".to_string()
         }
+        LexError::NoProgress => ": lexer made no forward progress".to_string(),
     }
 }
 
