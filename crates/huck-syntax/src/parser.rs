@@ -75,7 +75,11 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // v244 T4: `$(cmd)` signal from scan_step_param_operand.
                 // The cursor is at `$(` — parse_command_sub pushes Mode::CommandSub
                 // and scan_step_command_sub(false) owns consuming `$(`.
-                let cs = parse_command_sub(iter, quoted)?;
+                // G1/v270: a `$(…)` inside a `"…"` span within the operand is
+                // quoted (must not word-split) — OR the enclosing `quoted` with the
+                // operand frame's live `in_dquote` (see `Lexer::operand_in_dquote`).
+                let q = quoted || iter.operand_in_dquote();
+                let cs = parse_command_sub(iter, q)?;
                 parts.push(cs);
                 // v264 flip-fix (Finding 2): clear the `)`-boundary_reset leak on
                 // the continuing operand word, mirroring `parse_word_command`.
@@ -85,14 +89,18 @@ pub(crate) fn parse_word(iter: &mut Lexer, quoted: bool) -> Result<Word, ParseEr
                 // v245 T6: `` `cmd` `` signal from scan_step_param_operand.
                 // The cursor is at `` ` `` — parse_backtick_sub pushes Mode::Backtick
                 // and scan_step_backtick(depth=0) owns consuming the opening `` ` ``.
-                let bt = parse_backtick_sub(iter, quoted)?;
+                // G1/v270: quoted when inside a `"…"` operand span.
+                let q = quoted || iter.operand_in_dquote();
+                let bt = parse_backtick_sub(iter, q)?;
                 parts.push(bt);
             }
             TokenKind::ArithOpen => {
                 // v246 T6: `$((…))` signal from scan_step_param_operand.
                 // Cursor is at `$((` — parse_arith_expansion pushes Mode::Arith
                 // whose first scan consumes `$((`.
-                let a = parse_arith_expansion(iter, quoted)?;
+                // G1/v270: quoted when inside a `"…"` operand span.
+                let q = quoted || iter.operand_in_dquote();
+                let a = parse_arith_expansion(iter, q)?;
                 parts.push(a);
             }
             TokenKind::LegacyArithOpen => {
@@ -4517,24 +4525,23 @@ mod tests {
     }
 
     #[test]
-    fn diff_deferred_returns_unsupported() {
+    fn diff_deferred_now_parses() {
         use crate::lexer::{Lexer, LexerOptions};
-        // `$(…)` inside `"…"` in an operand is deferred (only the unquoted-operand
-        // `$(` path is wired — for CmdSubOpen in v244 T4 and for ArithOpen in v246
-        // T6; both in-dquote sites remain deferred for `$(cmd)` and `$((`).
-        // `${x:-$(cmd)}` (unquoted operand) is now in-scope — moved to cs_in_param_operand.
-        // `${x:-`cmd`}` (unquoted-operand backtick) is now in-scope — moved to bt_in_param_operand (v245 T6).
-        // `${x:-$((1+1))}` (unquoted operand) is now in-scope — moved to arith_in_param_operand (v246 T6).
+        // G1/v270: `$(cmd)`/`$((expr))`/`` `cmd` `` inside a `"…"` span within a
+        // `${…}` operand USED to return `UnsupportedExpansion` (the old
+        // `DeferredExpansion` reject). It now parses cleanly — the lexer emits a
+        // real opener signal and the parser assembles the sub-expansion.
         for s in [
             "${x:-\"$(cmd)\"}",
+            "${x:-\"$((1+1))\"}",
+            "${x:-\"`cmd`\"}",
+            "${x#\"$(cmd)\"}",
+            "${x/y/\"$(cmd)\"}",
         ] {
             let mut lx = Lexer::new_live(s, &Default::default(), LexerOptions::default());
             assert!(
-                matches!(
-                    parse_param_expansion(&mut lx, false),
-                    Err(crate::command::ParseError::UnsupportedExpansion)
-                ),
-                "expected UnsupportedExpansion for {s}"
+                parse_param_expansion(&mut lx, false).is_ok(),
+                "expected a clean parse for {s}"
             );
         }
     }
@@ -4658,6 +4665,57 @@ mod tests {
         assert!(bt.iter().any(|wp| matches!(wp, WordPart::CommandSub { .. })), "{bt:?}");
         let ar = t6_exec(&t6_first("echo $((1+2))")).args[0].0.clone();
         assert!(ar.iter().any(|wp| matches!(wp, WordPart::Arith { .. })), "{ar:?}");
+    }
+
+    // G1/v270: a `$(…)`/`$((…))`/`` `…` `` inside a `"…"` span within a `${…}`
+    // modifier operand parses (was `UnsupportedExpansion`) and is marked
+    // `quoted: true` so it is not word-split; an UNQUOTED-operand sibling stays
+    // `quoted: false`. Covers the operand families' `Word` fields.
+    #[test]
+    fn g1_ast_operand_dquote_cmdsub_quoted() {
+        // Return the first expansion WordPart's `quoted` flag found in `parts`.
+        fn expansion_quoted(parts: &[WordPart]) -> bool {
+            for wp in parts {
+                match wp {
+                    WordPart::CommandSub { quoted, .. }
+                    | WordPart::Arith { quoted, .. } => return *quoted,
+                    _ => {}
+                }
+            }
+            panic!("no CommandSub/Arith WordPart in {parts:?}");
+        }
+        // Dig the operand `Word`'s parts out of the sole ParamExpansion arg.
+        fn operand_of(src: &str) -> Vec<WordPart> {
+            let arg = t6_exec(&t6_first(src)).args[0].0.clone();
+            let pe = arg.into_iter().find_map(|wp| match wp {
+                WordPart::ParamExpansion { modifier, .. } => Some(modifier),
+                _ => None,
+            }).expect("ParamExpansion");
+            let word = match pe {
+                ParamModifier::UseDefault { word, .. }
+                | ParamModifier::AssignDefault { word, .. }
+                | ParamModifier::UseAlternate { word, .. }
+                | ParamModifier::ErrorIfUnset { word, .. }
+                | ParamModifier::RemovePrefix { pattern: word, .. }
+                | ParamModifier::RemoveSuffix { pattern: word, .. } => word,
+                ParamModifier::Substitute { replacement, .. } => replacement,
+                o => panic!("unexpected modifier {o:?}"),
+            };
+            word.0
+        }
+        // Quoted operand span → quoted:true across families/positions/expansions.
+        // (Outer quotes dropped so the ParamExpansion is a top-level WordPart; the
+        // INNER `"…"` operand span is what exercises the fix.)
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:-"$(echo a)"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:-"a$(echo a)b"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:-"$((1+2))"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:-"`echo a`"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:="$(echo a)"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x:+"$(echo a)"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x#"$(echo a)"}"#)));
+        assert!(expansion_quoted(&operand_of(r#"echo ${x/y/"$(echo a)"}"#)));
+        // Regression: unquoted operand cmdsub stays quoted:false (splittable).
+        assert!(!expansion_quoted(&operand_of(r#"echo ${x:-$(echo a)}"#)));
     }
 
     // v265 smoke-convert: these differential helpers dropped their oracle
